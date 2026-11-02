@@ -23,9 +23,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import cast, func, select
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
 from app.api.v1.dhcp._leases import LeaseResponse, apply_lease_filters, enrich_leases
 from app.api.v1.dhcp.lease_history import (
@@ -36,6 +37,11 @@ from app.api.v1.dhcp.lease_history import (
 )
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPLease, DHCPLeaseHistory, DHCPServer, DHCPServerGroup
+from app.services.dhcp.reprovision import (
+    ReprovisionError,
+    commit_reprovision,
+    preview_reprovision,
+)
 
 router = APIRouter(
     tags=["dhcp"],
@@ -204,6 +210,80 @@ async def list_all_lease_history(
         per_page=per_page,
         items=[LeaseHistoryRow.model_validate(r) for r in rows],
     )
+
+
+class ReprovisionPlanOut(BaseModel):
+    """A re-provision plan (#1287); the commit adds the two ids it created."""
+
+    lease_id: str
+    scope_id: str
+    subnet: str
+    mac_address: str
+    old_ip: str
+    old_hostname: str
+    target_ip: str
+    target_source: str = Field(description="requested | reserved_pool | outside_dynamic_pools")
+    target_reason: str
+    hostname: str
+    fqdn: str | None
+    dns_create: list[str]
+    dns_remove: list[str]
+    ipam_remove: list[str]
+    ipam_create: str
+    old_lease: str = Field(description="kept_until_moved | removed_now")
+    servers: list[str]
+    expected_move: str
+    t1_at: datetime | None
+    warnings: list[str]
+    static_assignment_id: str | None = None
+    ip_address_id: str | None = None
+
+
+class ReprovisionCommit(BaseModel):
+    """Commit body: the target from the preview, and the name it showed."""
+
+    target_ip: str = Field(description="Static address to move the device to (from the preview).")
+    hostname: str | None = Field(
+        default=None, description="New host name (single label); default: the lease's."
+    )
+
+
+@router.get("/leases/{lease_id}/reprovision/preview", response_model=ReprovisionPlanOut)
+async def preview_lease_reprovision(
+    lease_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    target_ip: str | None = Query(None, description="override the picked static address"),
+    hostname: str | None = Query(None, description="new host name; default: the lease's"),
+) -> dict[str, Any]:
+    """What re-provisioning this lease onto a static address would do (#1287).
+
+    Read-only. Picks the first free address in the scope's reserved pools (or,
+    without one, outside every dynamic pool), and lists the reservation, the
+    DNS records created and removed, and when the device is expected to move.
+    """
+    try:
+        plan = await preview_reprovision(db, lease_id, target_ip=target_ip, hostname=hostname)
+    except ReprovisionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return plan.as_dict()
+
+
+@router.post("/leases/{lease_id}/reprovision", response_model=ReprovisionPlanOut)
+async def commit_lease_reprovision(
+    lease_id: uuid.UUID, body: ReprovisionCommit, db: DB, user: SuperAdmin
+) -> dict[str, Any]:
+    """Move a leased device to a static address: reservation + DNS, lease gone.
+
+    Re-validates everything the preview checked. Superadmin, like the two
+    steps it replaces (creating a reservation, deleting a lease).
+    """
+    try:
+        return await commit_reprovision(
+            db, user, lease_id, target_ip=body.target_ip, hostname=body.hostname
+        )
+    except ReprovisionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 def _normalized_mac(value: str) -> str:
