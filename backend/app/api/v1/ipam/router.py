@@ -94,6 +94,7 @@ from app.services.dns.sync_check import (
 from app.services.feature_modules import is_module_enabled, require_module
 from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
+    assert_not_boundary_address,
     assert_static_dhcp_has_mac,
     assert_subnet_takes_addresses,
     holds_address,
@@ -120,6 +121,7 @@ from app.services.ipam.hygiene import (
 )
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
+from app.services.ipam.subnet_boundary import boundary_addresses
 from app.services.ipam.subnet_placeholders import (
     add_gateway_row,
     create_placeholder_rows,
@@ -9964,6 +9966,7 @@ async def create_address(
     assert_static_dhcp_has_mac(body.status, body.mac_address)
 
     # Check address not already in use
+    assert_not_boundary_address(subnet, body.address)
     await assert_address_unallocated(db, subnet_id, body.address)
 
     # GHSA-875w — a zone named in the body must be one the token may write.
@@ -11415,9 +11418,24 @@ async def _build_bulk_allocate_candidates(
     dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
 
     existing_rows = await db.execute(
-        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
+        # An ``available`` row is a free slot (#2980, #3319): the commit takes it
+        # over, as Next available and Specific IP do, so it is not "in use".
+        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id, holds_address())
     )
     existing_ips = {str(addr) for (addr,) in existing_rows.all()}
+    if isinstance(net, ipaddress.IPv4Network):
+        # A subnet made with skip_auto_addresses holds no network / broadcast
+        # rows, but its total leaves both out (#3321): refuse them, as a single
+        # create does, rather than store a host the figures cannot count.
+        for edge in sorted(boundary_addresses(net, subnet.kind) - existing_ips):
+            if start <= ipaddress.ip_address(edge) <= end:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{edge} is the network or broadcast address of {subnet.network} "
+                        "and cannot hold a host; leave it out of the range."
+                    ),
+                )
 
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
@@ -11452,6 +11470,8 @@ async def _build_bulk_allocate_candidates(
             select(IPAddress.hostname).where(
                 func.lower(IPAddress.hostname).in_(host_set),
                 IPAddress.forward_zone_id == effective_zone,
+                # A free ``available`` row's leftover name is not a taken one.
+                holds_address(),
             )
         )
         taken_hosts = {h.lower() for (h,) in rows.all() if h}
@@ -11640,9 +11660,11 @@ async def bulk_allocate_commit(
                 continue
             if _no_perm(item.address):
                 continue
-            ip = IPAddress(
-                subnet_id=subnet_id,
-                address=item.address,
+            ip = await take_address_row(
+                db,
+                subnet,
+                item.address,
+                current_user,
                 status=body.status,
                 hostname=item.hostname,
                 # Coalesce: description is `str | None` on the request but the
@@ -11654,8 +11676,6 @@ async def bulk_allocate_commit(
                 custom_fields=dict(body.custom_fields),
                 created_by_user_id=current_user.id,
             )
-            db.add(ip)
-            await db.flush()
 
             if body.create_dns_records:
                 await _sync_dns_record(

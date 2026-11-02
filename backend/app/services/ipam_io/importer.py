@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
 from app.services.ipam.subnet_placeholders import (
     add_gateway_row,
@@ -997,6 +998,12 @@ async def preview_address_import(
         row_hostname = fields.get("hostname") or ""
         existing_ip = existing.get(canonical)
         if existing_ip is None:
+            boundary = _boundary_host_refusal(subnet, canonical, fields)
+            if boundary is not None:
+                preview.errors.append(
+                    DiffRow(kind="address", action="error", network=canonical, reason=boundary)
+                )
+                continue
             create_details: dict[str, Any] = {"fields": fields}
             create_details.update(await _dhcp_flag(canonical, fields, None))
             preview.creates.append(
@@ -1052,6 +1059,15 @@ async def preview_address_import(
                 )
             )
     return preview
+
+
+def _boundary_host_refusal(subnet: Any, canonical: str, fields: dict[str, Any]) -> str | None:
+    """A new imported host on an IPv4 network / broadcast address is refused,
+    as the REST create refuses it (#3321). The ``network`` / ``broadcast``
+    placeholder rows themselves are what belongs there, so they import."""
+    if (fields.get("status") or "allocated") in ("network", "broadcast"):
+        return None
+    return boundary_address_refusal(subnet, canonical)
 
 
 def _count_dns_sync(result_obj: Any, canonical: str, ip: Any, published: bool) -> None:
@@ -1263,6 +1279,10 @@ async def commit_address_import(
             )
 
         # New row
+        boundary = _boundary_host_refusal(subnet, canonical, fields)
+        if boundary is not None:
+            result_obj.errors.append(boundary)
+            continue
         ip_status = fields.get("status") or "allocated"
         new_ip = IPAddress(
             subnet_id=subnet.id,

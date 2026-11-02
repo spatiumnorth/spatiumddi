@@ -969,7 +969,9 @@ the 60 s alert tick.
 
 **Operator surface.** `GET /new-devices/{summary,sightings,allowlist}` +
 acknowledge / baseline-import / allowlist / block actions
-(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`). The
+(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`; **Block** additionally needs `write` `dhcp_mac_block` in every
+target DHCP group, and is refused whole (403, audited `denied`) otherwise
+— with `group_id` omitted that means every group). The
 **Tools → New Devices** review queue lists sightings with one-click
 **Acknowledge / Add to allowlist / Block** (block creates a
 `DHCPMACBlock` — arpwatch with teeth). Run a **baseline import** when
@@ -1051,7 +1053,7 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 
 ## 9. Utilization Tracking
 
-- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
+- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). A host is refused (409) on those two addresses even when the subnet was made with skip auto addresses and holds no rows for them (#3321); the Copilot / request-portal create and the address import refuse it too. Rows recorded from the wire (DHCP lease mirrors, discovery, integrations) are not refused, and a host stored there before #3321 stays, so such a subnet can still read over its total. Bulk allocate takes over an `available` row in its range as Next available does, and refuses (422) a range covering such an edge address (#3319). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
 - `IPBlock.utilization_percent` is the share of the block's **whole CIDR** in use (#2982). `total_ips` is the CIDR size (clamped to 2^63 - 1 for huge IPv6 blocks). `allocated_ips` rolls up every descendant subnet's `allocated_ips` **plus that subnet's non-usable addresses** — network and broadcast for IPv4 below /31, the network address for IPv6 below /127, nothing for /31, /32, /127 and /128 — each counted once even when a row already sits on it. So a /30 block holding one full /30 subnet reads 4 / 4, 100%, while the subnet itself reads 2 / 2. A block is clamped to its CIDR size and never reads over 100%. Both counters are rewritten on every write under the block and by the hourly `recount_ipam_utilization` sweep.
 - Alerts are configured in the notification system when utilization exceeds thresholds (default: warn at 80%, critical at 95%)
 
@@ -1958,8 +1960,9 @@ advisory locks held through commit:
   re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
   are the safe union (true when any source has it, and the preview
   says so); sources that disagree on kind, customer or site are a
-  conflict; any other disagreeing setting (role, discovery, ...) is a
-  preview warning and the target's value is kept. Service in
+  conflict; any other disagreeing setting (role, discovery, tags, custom
+  fields, VXLAN ID, domain, DNS servers, ...) is a
+  preview warning naming each value and the target's value is kept. Service in
   `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the
