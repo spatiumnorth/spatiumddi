@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.api.deps import CurrentUser
+from app.services.api_token_scopes import token_outbound
 from app.services.bgp import (
     fetch_announced_prefixes,
     fetch_as_overview,
@@ -121,6 +122,7 @@ class ASNIxpPresence(_UpstreamEnvelope):
 
 
 @router.get("/asn/{asn}/announced-prefixes", response_model=ASNAnnouncedPrefixes)
+@token_outbound
 async def asn_announced_prefixes(
     asn: int,
     _: CurrentUser,
@@ -129,6 +131,7 @@ async def asn_announced_prefixes(
 
 
 @router.get("/asn/{asn}/overview", response_model=ASNOverview)
+@token_outbound
 async def asn_overview(
     asn: int,
     _: CurrentUser,
@@ -137,6 +140,7 @@ async def asn_overview(
 
 
 @router.get("/asn/{asn}/network", response_model=ASNNetwork)
+@token_outbound
 async def asn_network(
     asn: int,
     _: CurrentUser,
@@ -146,6 +150,7 @@ async def asn_network(
 
 
 @router.get("/asn/{asn}/ixps", response_model=ASNIxpPresence)
+@token_outbound
 async def asn_ixps(
     asn: int,
     _: CurrentUser,
@@ -155,6 +160,7 @@ async def asn_ixps(
 
 
 @router.get("/prefix/origin")
+@token_outbound
 async def prefix_origin(
     _: CurrentUser,
     resource: str = Query(..., description="IPv4/v6 address or CIDR"),
@@ -166,6 +172,7 @@ async def prefix_origin(
 
 
 @router.get("/prefix/routing-history")
+@token_outbound
 async def prefix_routing_history(
     _: CurrentUser,
     resource: str = Query(..., description="IPv4/v6 address or CIDR"),

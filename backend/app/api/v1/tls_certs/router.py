@@ -35,6 +35,7 @@ from app.models.tls_cert import (
     TLSCertProbe,
     TLSCertTarget,
 )
+from app.services.api_token_scopes import token_outbound
 from app.services.nettools.schemas import assert_target_allowed
 from app.services.tls_cert.probe import parse_chain_pem, probe_one
 
@@ -485,6 +486,7 @@ async def get_chain(target_id: uuid.UUID, db: DB, _: CurrentUser) -> CertChainRe
 
 
 @router.get("/{target_id}/ct-log")
+@token_outbound
 async def ct_log(
     target_id: uuid.UUID,
     db: DB,

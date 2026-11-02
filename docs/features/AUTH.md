@@ -662,7 +662,30 @@ checked against `TOKEN_SCOPE_VOCABULARY` at create time so a typo is
 rejected with `422` rather than silently locking the operator out:
 
 - `read` — restricts the token to safe-method requests
-  (`GET` / `HEAD` / `OPTIONS`); any mutation `401`s.
+  (`GET` / `HEAD` / `OPTIONS`), the POST routes marked read-only (a filter or
+  preview body that changes nothing), and the Operator Copilot MCP endpoint;
+  any other mutation gets `403`. **A `read` token never makes SpatiumDDI send
+  traffic outward** (#3302): a GET that probes a host, pulls live state from
+  a managed server or looks something up off-prem is refused to it with a
+  `403` saying so — zone drift (`/dns/groups/{g}/zones/{z}/drift`), FortiGate
+  interfaces (`/dhcp/servers/{id}/fortigate-interfaces`), backup archive
+  listing / download / manifest preview (`/backup/targets/{id}/archives…`),
+  the BGP lookups (`/bgp/asn/*`, `/bgp/prefix/*`), CT-log search
+  (`/tls-certs/{id}/ct-log`), the GitHub release listings
+  (`/appliance/releases`, `/appliance/upgrade-images/available`), an AI
+  provider's model list (`/ai/providers/{id}/models`) and the appliance
+  kubeapi proxy reads (`/appliance/appliances/{id}/k8s/{workloads,pods,logs}`)
+  and the diagnostics bundle (`/appliance/diagnostics/bundle`). Over MCP the
+  matching tools (`network_*`, `ping_host`, `forward_dns` / `reverse_dns`,
+  `find_dns_zone_drift`, the WHOIS / RDAP / BGP / CT-log lookups, live import
+  and cutover-parity previews, backup archive listing, available upgrade
+  images, support-bundle preview) are neither listed nor callable for a
+  scoped token. Those routes need a write scope covering the path, or an
+  unrestricted token; over MCP the same rule holds per tool, so `dns:write`
+  keeps `find_dns_zone_drift` and the DNS import preview, `dhcp:write` the
+  DHCP import preview and `ipam:write` the NetBox import preview, while a
+  probe or an off-prem lookup needs an unrestricted token whatever the
+  scopes, as its REST route (`/tools/*`, `/bgp/*`, …) does.
 - `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
   `/vrfs/*`, `/network-devices/*`.
 - `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,

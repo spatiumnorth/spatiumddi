@@ -18,9 +18,11 @@ Each tool declares the budget bucket of its ``/api/v1/tools/*`` route
 (``rate_limit=``), so a copilot or MCP call spends the same per-user
 budget a Tools-page call does (see ``app.services.nettools.budgets``).
 
-These are reads, not writes — they don't mutate state. Touching the
-network is read-only here (a ping is observation, not a change), so no
-``propose_*`` preview/apply contract is needed.
+These are reads, not writes — they don't mutate state, so no
+``propose_*`` preview/apply contract is needed. They do send traffic
+outward, so each (bar ``lookup_mac_vendor``, a database lookup) is
+``outbound=True``: a ``read``-scoped API token never makes SpatiumDDI send
+traffic outward, and MCP hides these from one (#3302).
 """
 
 from __future__ import annotations
@@ -88,6 +90,7 @@ class NetworkPingArgs(BaseModel):
 
 @register_tool(
     name="network_ping",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
@@ -130,6 +133,7 @@ class NetworkTracerouteArgs(BaseModel):
 
 @register_tool(
     name="network_traceroute",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
@@ -193,6 +197,7 @@ class NetworkDigArgs(BaseModel):
 
 @register_tool(
     name="network_dig",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
@@ -235,6 +240,7 @@ class NetworkPortTestArgs(BaseModel):
 
 @register_tool(
     name="network_port_test",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
@@ -279,6 +285,7 @@ class NetworkTlsCertArgs(BaseModel):
 
 @register_tool(
     name="network_tls_cert",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
@@ -368,6 +375,7 @@ class NetworkWhoisArgs(BaseModel):
 
 @register_tool(
     name="network_whois",
+    outbound=True,
     rate_limit="offprem",
     permission=("read", "use_network_tools"),
     module=_MODULE,

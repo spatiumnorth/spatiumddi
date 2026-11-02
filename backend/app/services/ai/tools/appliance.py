@@ -1127,6 +1127,7 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
 
 @register_tool(
     name="find_available_upgrade_images",
+    outbound=True,
     permission="superadmin",
     description=(
         "List GitHub releases that carry an importable appliance upgrade "

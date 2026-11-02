@@ -127,6 +127,7 @@ from app.services.agents.container_oom import (
     carry_restart_history,
     verdict_needs_write,
 )
+from app.services.api_token_scopes import token_outbound
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
     ensure_ca,
@@ -8734,6 +8735,7 @@ class ApplianceWorkloadsResponse(BaseModel):
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List restartable Deployments / DaemonSets / StatefulSets on an appliance",
 )
+@token_outbound
 async def k8s_list_workloads(
     appliance_id: uuid.UUID,
     current_user: SuperAdmin,
@@ -9173,6 +9175,7 @@ class K8sPodListResponse(BaseModel):
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List pods on the appliance's local k3s (via the supervisor proxy)",
 )
+@token_outbound
 async def k8s_list_pods(
     appliance_id: uuid.UUID,
     current_user: SuperAdmin,
@@ -9253,6 +9256,7 @@ async def k8s_list_pods(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch recent pod logs from the appliance's local k3s",
 )
+@token_outbound
 async def k8s_get_pod_logs(
     appliance_id: uuid.UUID,
     pod: str,
