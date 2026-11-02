@@ -173,6 +173,13 @@ export function IPDetailModal({
   // while core.dns is off (the stored values are untouched).
   const dnsOn = useModuleOn("core.dns");
   const zoneNames = zoneNameById ?? {};
+  // A scan is started with write on 'manage_nmap_scans' and watched with
+  // read; a role holding only write would start one it cannot see (#3279).
+  const nmapPerms = usePermissions();
+  const nmapOn = useModuleOn("tools.nmap");
+  const canNmap =
+    nmapPerms.can("write", "manage_nmap_scans") &&
+    nmapPerms.can("read", "manage_nmap_scans");
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
   // Fire-and-forget: no data changes, so no query invalidation; we just
@@ -301,14 +308,20 @@ export function IPDetailModal({
               tooltip="Ask AI about this IP"
               prompt="Summarise this IP — owner, last-seen, services, vendor, and anything flagged."
             />
-            <button
-              type="button"
-              onClick={onScan}
-              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent"
-              title="Run an nmap scan against this IP"
-            >
-              <Radar className="h-3.5 w-3.5" /> Scan with Nmap
-            </button>
+            {nmapOn && (
+              <button
+                type="button"
+                onClick={onScan}
+                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                title="Run an nmap scan against this IP"
+                {...permissionGate(
+                  canNmap,
+                  "Requires write and read permission on nmap scans (read shows the result)",
+                )}
+              >
+                <Radar className="h-3.5 w-3.5" /> Scan with Nmap
+              </button>
+            )}
             {addr.mac_address && (
               <div className="inline-flex items-center gap-2">
                 <button
@@ -1180,6 +1193,18 @@ function DeviceProfileSection({
   canEdit: boolean;
 }) {
   const qc = useQueryClient();
+  // The profile route starts a scan, but reading it back takes read on
+  // 'manage_nmap_scans', which the IPAM/DNS/DHCP Editor roles lack. A user
+  // who cannot read the scan is not offered the press (it would sit on
+  // "Scanning…" for a scan it can never see end) and is not asked for it (#3271).
+  // The tools.nmap module being off refuses every scan route with "Feature
+  // 'tools.nmap' is disabled.", so it closes the same door (#3271).
+  const nmapOn = useModuleOn("tools.nmap");
+  const canReadScans =
+    usePermissions().can("read", "manage_nmap_scans") && nmapOn;
+  const scansUnavailable = nmapOn
+    ? "You don't have permission to see this IP's profile scan."
+    : "Nmap scanning is turned off, so this IP's profile scan is not shown.";
   const [error, setError] = useState<string | null>(null);
   const [showRawSig, setShowRawSig] = useState(false);
   // Track the scan dispatched by clicking "Re-profile now" so we can
@@ -1196,7 +1221,7 @@ function DeviceProfileSection({
   const [sessionScan, setSessionScan] = useState<NmapScanRead | null>(null);
 
   const scanQuery = useQuery({
-    enabled: !!addr.last_profile_scan_id,
+    enabled: !!addr.last_profile_scan_id && canReadScans,
     queryKey: ["nmap-scan", addr.last_profile_scan_id],
     queryFn: () => nmapApi.getScan(addr.last_profile_scan_id as string),
     staleTime: 30_000,
@@ -1248,6 +1273,21 @@ function DeviceProfileSection({
     addr.last_profile_scan_id,
     qc,
   ]);
+
+  // A scan whose progress cannot be read (refused, gone, or the read
+  // failing) never reaches a terminal status above, so without this the
+  // button would stay on "Scanning…" for as long as the modal is open
+  // (#3271). Stop tracking it and say why.
+  useEffect(() => {
+    if (!activeScanId || !activeScanQuery.isError) return;
+    setError(
+      formatApiError(
+        activeScanQuery.error,
+        "The scan started, but its progress could not be read",
+      ),
+    );
+    setActiveScanId(null);
+  }, [activeScanId, activeScanQuery.isError, activeScanQuery.error]);
 
   // Passive fingerprint — Phase 2. The endpoint 404s when no MAC or
   // no fingerprint has been observed; treat 404 as "no data" rather
@@ -1327,7 +1367,7 @@ function DeviceProfileSection({
         <div className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
           <Radar className="h-3 w-3" /> Device profile
         </div>
-        {canEdit && (
+        {canEdit && canReadScans && (
           <button
             type="button"
             onClick={() => reprofile.mutate()}
@@ -1440,9 +1480,13 @@ function DeviceProfileSection({
           return (
             <p className="text-xs text-muted-foreground italic">
               No active profile yet.{" "}
-              {dhcpOn
-                ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`
-                : "Run one ad-hoc via the button above."}
+              {!canReadScans
+                ? nmapOn
+                  ? "You don't have permission to run or see profile scans."
+                  : "Nmap scanning is turned off."
+                : dhcpOn
+                  ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`
+                  : "Run one ad-hoc via the button above."}
             </p>
           );
         }
@@ -1452,6 +1496,8 @@ function DeviceProfileSection({
             lastProfiledAt={displayProfiledAt}
             scan={displayScan}
             loading={scanQuery.isLoading && !sessionScan}
+            scanHidden={!canReadScans}
+            hiddenReason={scansUnavailable}
           />
         );
       })()}
@@ -1494,11 +1540,25 @@ function DeviceProfileScanPanel({
   lastProfiledAt,
   scan,
   loading,
+  scanHidden = false,
+  hiddenReason = "You don't have permission to see this IP's profile scan.",
 }: {
   lastProfiledAt: string | null;
   scan: NmapScanRead | null;
   loading: boolean;
+  scanHidden?: boolean;
+  hiddenReason?: string;
 }) {
+  if (scanHidden && !scan) {
+    return (
+      <p className="text-xs text-muted-foreground italic">
+        {lastProfiledAt
+          ? `Last scanned ${new Date(lastProfiledAt).toLocaleString()}. `
+          : ""}
+        {hiddenReason}
+      </p>
+    );
+  }
   if (loading) {
     return (
       <p className="text-xs text-muted-foreground">

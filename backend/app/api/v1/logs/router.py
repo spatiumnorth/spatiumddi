@@ -691,6 +691,7 @@ def _rows(pairs: list[tuple[str, int]]) -> list[DNSQueryAnalyticsRow]:
     response_model=DNSQueryAnalyticsResponse,
     dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
+@honours_token_binding
 @read_only_post
 async def query_dns_analytics(
     body: DNSQueryAnalyticsRequest, db: DB, current_user: CurrentUser

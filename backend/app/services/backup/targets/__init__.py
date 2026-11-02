@@ -42,6 +42,7 @@ from app.services.backup.targets.secrets_config import (
     encrypt_config_secrets,
     merge_config_for_update,
     redact_config_secrets,
+    secret_field_names,
 )
 from app.services.backup.targets.smb import SmbDestination
 from app.services.backup.targets.webdav import WebDAVDestination
@@ -92,4 +93,5 @@ __all__ = [
     "merge_config_for_update",
     "redact_config_secrets",
     "safe_filename",
+    "secret_field_names",
 ]

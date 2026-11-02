@@ -218,10 +218,12 @@ export const ADD_DNS_RECORD: Shortcut = {
   id: "dns-add-record",
   combos: [{ key: "n" }],
   description: "Add a record to the open zone",
-  // The handler's `canWriteRecords` in DNSPage.tsx (#2529).
+  // The handler's `canWriteRecords` in DNSPage.tsx (#2529): write on
+  // dns_record alone since #3100, so a role that writes zones but not
+  // records is not offered a key that does nothing (#3167).
   requires: {
     action: "write",
-    resourceTypes: ["dns_group", "dns_zone", "dns_record"],
+    resourceTypes: ["dns_record"],
   },
 };
 

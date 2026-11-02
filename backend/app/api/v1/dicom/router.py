@@ -56,7 +56,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_permission, require_resource_permission
 from app.models.auth import User
 from app.models.dicom import (
     DICOM_AE_ROLES,
@@ -1120,7 +1120,13 @@ def _rows_out(plan: list[PlannedRow]) -> list[DICOMAEImportRow]:
     ]
 
 
-@router.post("/aes/import/preview", response_model=DICOMAEImportPreviewResponse)
+@router.post(
+    "/aes/import/preview",
+    response_model=DICOMAEImportPreviewResponse,
+    # ``@read_only_post`` relaxes the router gate to ``read``; an import
+    # preview still needs what the commit needs (#3302).
+    dependencies=[Depends(require_permission("write", "dicom_ae"))],
+)
 @read_only_post
 async def import_preview(
     body: DICOMAEImportRequest, db: DB, user: CurrentUser
