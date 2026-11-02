@@ -13751,6 +13751,7 @@ export function BlockDetailView({
   ancestors,
   allBlocks,
   allSubnets,
+  readError,
   space,
   onSelectSpace,
   onSelectBlock,
@@ -13761,6 +13762,9 @@ export function BlockDetailView({
   ancestors: IPBlock[];
   allBlocks: IPBlock[];
   allSubnets: Subnet[];
+  /** The error of the block or subnet list behind this view, when its read
+   *  was refused or failed: an empty list is then not an empty block (#3337). */
+  readError?: unknown;
   space?: IPSpace;
   onSelectSpace: () => void;
   onSelectBlock: (b: IPBlock) => void;
@@ -14533,9 +14537,16 @@ export function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {hasBlockFilter || hasTagFilter || hasRoleFilter
-                    ? "No results match the active filters."
-                    : "This block has no child blocks or subnets yet."}
+                  {readError != null ? (
+                    <ListReadError
+                      error={readError}
+                      what="this block's child blocks and subnets"
+                    />
+                  ) : hasBlockFilter || hasTagFilter || hasRoleFilter ? (
+                    "No results match the active filters."
+                  ) : (
+                    "This block has no child blocks or subnets yet."
+                  )}
                 </p>
               </div>
             );
@@ -15211,12 +15222,20 @@ export function SpaceTableView({
   const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
-  const { data: blocks, isLoading: blocksLoading } = useQuery({
+  const {
+    data: blocks,
+    isLoading: blocksLoading,
+    error: blocksError,
+  } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
   });
 
-  const { data: subnets, isLoading: subnetsLoading } = useQuery({
+  const {
+    data: subnets,
+    isLoading: subnetsLoading,
+    error: subnetsError,
+  } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
   });
@@ -15572,7 +15591,20 @@ export function SpaceTableView({
           <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>
         ) : isEmpty ? (
           <p className="px-6 py-4 text-sm text-muted-foreground">
-            No blocks or subnets in this space yet.
+            {blocksError != null || subnetsError != null ? (
+              <ListReadError
+                error={blocksError ?? subnetsError}
+                what={
+                  blocksError != null && subnetsError != null
+                    ? "this space's blocks and subnets"
+                    : blocksError != null
+                      ? "this space's blocks"
+                      : "this space's subnets"
+                }
+              />
+            ) : (
+              "No blocks or subnets in this space yet."
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -16246,13 +16278,17 @@ export function SpaceSection({
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
 
-  const { data: subnets, isLoading } = useQuery({
+  const {
+    data: subnets,
+    isLoading,
+    error: subnetsError,
+  } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
     enabled: expanded || filtering,
   });
 
-  const { data: blocks } = useQuery({
+  const { data: blocks, error: blocksError } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
     enabled: expanded || filtering,
@@ -16600,11 +16636,27 @@ export function SpaceSection({
                 );
               })()}
 
-            {!isLoading && !subnets?.length && !blocks?.length && (
-              <p className="py-1 pl-2 text-xs text-muted-foreground">
-                No blocks yet.
-              </p>
-            )}
+            {/* A refused or failed read says so, not "No blocks yet" (#3337). */}
+            {!isLoading &&
+              !subnets?.length &&
+              !blocks?.length &&
+              (blocksError != null || subnetsError != null) && (
+                <p className="py-1 pl-2 text-xs">
+                  <ListReadError
+                    error={blocksError ?? subnetsError}
+                    what="this space's blocks and subnets"
+                  />
+                </p>
+              )}
+            {!isLoading &&
+              !subnets?.length &&
+              !blocks?.length &&
+              blocksError == null &&
+              subnetsError == null && (
+                <p className="py-1 pl-2 text-xs text-muted-foreground">
+                  No blocks yet.
+                </p>
+              )}
           </div>
         </DndContext>
       )}
@@ -17365,13 +17417,13 @@ export function IPAMPage() {
   const activeSpaceId =
     selectedBlock?.space_id ?? selectedSubnet?.space_id ?? selectedSpace?.id;
 
-  const { data: detailBlocks } = useQuery({
+  const { data: detailBlocks, error: detailBlocksError } = useQuery({
     queryKey: ["blocks", activeSpaceId],
     queryFn: () => ipamApi.listBlocks(activeSpaceId!),
     enabled: !!activeSpaceId,
   });
 
-  const { data: detailSubnets } = useQuery({
+  const { data: detailSubnets, error: detailSubnetsError } = useQuery({
     queryKey: ["subnets", activeSpaceId],
     queryFn: () => ipamApi.listSubnets({ space_id: activeSpaceId }),
     enabled: !!activeSpaceId,
@@ -17679,6 +17731,7 @@ export function IPAMPage() {
             ancestors={selectedBlockAncestors}
             allBlocks={detailBlocks ?? []}
             allSubnets={detailSubnets ?? []}
+            readError={detailSubnetsError ?? detailBlocksError}
             onSelectSpace={() => {
               const sp = spaces?.find(
                 (s: IPSpace) => s.id === selectedBlock.space_id,

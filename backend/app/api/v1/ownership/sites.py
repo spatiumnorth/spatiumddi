@@ -20,7 +20,11 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission, user_has_permission
+from app.core.permissions import (
+    require_resource_permission,
+    scoped_grant_refusal,
+    user_has_permission,
+)
 from app.models.dns import DNSPool, DNSPoolMember
 from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ownership import SITE_KINDS, Site
@@ -264,7 +268,7 @@ async def update_site(site_id: uuid.UUID, body: SiteUpdate, db: DB, user: Curren
     ):
         raise HTTPException(
             status_code=403,
-            detail="Permission denied: changing 'parent_site_id' needs 'write' on 'site'",
+            detail=scoped_grant_refusal("parent_site_id", "site"),
         )
     if "parent_site_id" in changes:
         await _validate_parent(db, changes["parent_site_id"], site_id)

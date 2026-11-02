@@ -1,0 +1,3 @@
+### Fixed
+
+- A list the server refused is no longer drawn as an empty one: the DNS and DHCP server group lists, a DNS group's zone tree and Zones tab, a DHCP group's Scopes tab, an IP space's tree node and view, a block's contents and its allocation map now say "You don't have permission to see …" instead of "No server groups yet.", "No zones", "No blocks yet." and the like. A holder of a grant scoped to one block, space, subnet, site or provider who changes a setting the items under it inherit, or a pointer at another resource, is now told the change needs `write` on every item of that type, not that it lacks the `write` it holds (#3337, #3338).

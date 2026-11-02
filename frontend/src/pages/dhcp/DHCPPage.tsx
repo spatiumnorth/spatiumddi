@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -157,7 +158,11 @@ function GroupSidebar({
     "spatium.dhcp.expandedGroups",
     new Set(),
   );
-  const { data: groups = [], isLoading } = useQuery({
+  const {
+    data: groups = [],
+    isLoading,
+    error: groupsError,
+  } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
   });
@@ -216,7 +221,13 @@ function GroupSidebar({
         {isLoading && (
           <p className="px-4 py-2 text-xs text-muted-foreground">Loading…</p>
         )}
-        {groups.length === 0 && !isLoading && (
+        {/* A refused or failed read says so, not an empty estate (#3337). */}
+        {groups.length === 0 && !isLoading && groupsError != null && (
+          <p className="px-4 pt-6 text-center text-xs">
+            <ListReadError error={groupsError} what="DHCP server groups" />
+          </p>
+        )}
+        {groups.length === 0 && !isLoading && groupsError == null && (
           <div className="px-4 pt-6 text-center">
             <Wifi className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
             <p className="text-xs text-muted-foreground mb-3">
@@ -1395,7 +1406,7 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
   // Scopes live on the DHCP server group, not on individual servers — every
   // peer in the group renders the same set. Both the group detail view and
   // the (legacy) Windows-server detail view feed in the same group id.
-  const { data: groupScopes = [] } = useQuery({
+  const { data: groupScopes = [], error: groupScopesError } = useQuery({
     queryKey: ["dhcp-scopes-group", groupId, tagFilters],
     queryFn: () =>
       groupId
@@ -1471,7 +1482,9 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
       />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {tagFilters.length === 0
+          {groupScopesError != null ? (
+            <ListReadError error={groupScopesError} what="this group's scopes" />
+          ) : tagFilters.length === 0
             ? `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
             : unfilteredCount === undefined
               ? allScopes.length === 1
@@ -1516,9 +1529,16 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
       <div className="rounded-lg border">
         {allScopes.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            {tagFilters.length > 0 && unfilteredCount !== 0
-              ? "No scopes match the current tag filter."
-              : "No scopes on this server."}
+            {groupScopesError != null ? (
+              <ListReadError
+                error={groupScopesError}
+                what="this group's scopes"
+              />
+            ) : tagFilters.length > 0 && unfilteredCount !== 0 ? (
+              "No scopes match the current tag filter."
+            ) : (
+              "No scopes on this server."
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">

@@ -23,7 +23,11 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission, user_has_permission
+from app.core.permissions import (
+    require_resource_permission,
+    scoped_grant_refusal,
+    user_has_permission,
+)
 from app.models.asn import ASN
 from app.models.circuit import Circuit
 from app.models.ownership import PROVIDER_KINDS, Provider
@@ -227,7 +231,7 @@ async def update_provider(
     ):
         raise HTTPException(
             status_code=403,
-            detail="Permission denied: changing 'default_asn_id' needs 'write' on 'provider'",
+            detail=scoped_grant_refusal("default_asn_id", "provider"),
         )
     if "default_asn_id" in changes:
         await _check_default_asn(db, changes["default_asn_id"])

@@ -9456,7 +9456,11 @@ function ZonesTab({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
-  const { data: zones = [], isFetching } = useQuery({
+  const {
+    data: zones = [],
+    isFetching,
+    error: zonesError,
+  } = useQuery({
     queryKey: ["dns-zones", group.id, tagFilters],
     queryFn: () =>
       dnsApi.listZones(
@@ -9863,7 +9867,9 @@ function ZonesTab({
       )}
       {zones.length === 0 && !isFetching && (
         <p className="text-sm text-muted-foreground italic">
-          {tagFilters.length > 0 ? (
+          {zonesError != null ? (
+            <ListReadError error={zonesError} what="this group's zones" />
+          ) : tagFilters.length > 0 ? (
             <>
               No zones match the selected tags.{" "}
               <button
@@ -12073,7 +12079,7 @@ function ZoneTreeRows({
   );
   const [createZoneName, setCreateZoneName] = useState<string | null>(null);
 
-  const { data: zones = [] } = useQuery({
+  const { data: zones = [], error: zonesError } = useQuery({
     queryKey: ["dns-zones", groupId],
     queryFn: () => dnsApi.listZones(groupId),
   });
@@ -12088,7 +12094,11 @@ function ZoneTreeRows({
   if (tree.length === 0)
     return (
       <p className="px-3 py-1.5 text-xs text-muted-foreground italic">
-        No zones
+        {zonesError != null ? (
+          <ListReadError error={zonesError} what="this group's zones" />
+        ) : (
+          "No zones"
+        )}
       </p>
     );
 
@@ -12299,7 +12309,11 @@ export function DNSPage() {
     );
   }
 
-  const { data: groups = [], isLoading } = useQuery({
+  const {
+    data: groups = [],
+    isLoading,
+    error: groupsError,
+  } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
   });
@@ -12474,7 +12488,13 @@ export function DNSPage() {
           {isLoading && (
             <p className="px-4 py-2 text-xs text-muted-foreground">Loading…</p>
           )}
-          {groups.length === 0 && !isLoading && (
+          {/* A refused or failed read says so, not an empty estate (#3337). */}
+          {groups.length === 0 && !isLoading && groupsError != null && (
+            <p className="px-4 pt-6 text-center text-xs">
+              <ListReadError error={groupsError} what="DNS server groups" />
+            </p>
+          )}
+          {groups.length === 0 && !isLoading && groupsError == null && (
             <div className="px-4 pt-6 text-center">
               <Globe className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
               <p className="text-xs text-muted-foreground mb-3">
