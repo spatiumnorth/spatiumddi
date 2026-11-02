@@ -969,7 +969,9 @@ the 60 s alert tick.
 
 **Operator surface.** `GET /new-devices/{summary,sightings,allowlist}` +
 acknowledge / baseline-import / allowlist / block actions
-(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`). The
+(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`; **Block** additionally needs `write` `dhcp_mac_block` in every
+target DHCP group, and is refused whole (403, audited `denied`) otherwise
+— with `group_id` omitted that means every group). The
 **Tools → New Devices** review queue lists sightings with one-click
 **Acknowledge / Add to allowlist / Block** (block creates a
 `DHCPMACBlock` — arpwatch with teeth). Run a **baseline import** when
