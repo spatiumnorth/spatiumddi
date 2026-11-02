@@ -16,7 +16,6 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.token_binding import route_honours_token_binding  # noqa: F401
 from app.core.security import create_access_token, generate_api_token, hash_password
 from app.models.auth import APIToken, Group, Role, User
 from app.models.dns import DNSServerGroup, DNSServerOptions, DNSZone
