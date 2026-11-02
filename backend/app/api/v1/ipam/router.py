@@ -117,6 +117,7 @@ from app.services.ipam.hygiene import (
     DEFAULT_STALE_RESERVATION_DAYS,
     build_hygiene_report,
 )
+from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
 from app.services.ipam.utilization import (
@@ -2229,18 +2230,6 @@ async def _create_alias_records(
         await _enqueue_dns_op(db, zone, "create", name, rtype, value, None)
 
 
-# #2604 — the namespace of the deletion batch an orphaned address's aliases
-# are withdrawn under. One batch id per address, derived rather than stored,
-# so the restore finds exactly the aliases the orphan withdrew (and not one
-# the operator trashed by hand) with no column to carry it.
-_ORPHAN_ALIAS_BATCH_NS = uuid.UUID("5b0f3c2e-8a41-4d6e-9f27-2604a11a5e00")
-
-
-def orphan_alias_batch_id(ip_id: uuid.UUID) -> uuid.UUID:
-    """The ``deletion_batch_id`` Mark as Orphan stamps on the address's aliases."""
-    return uuid.uuid5(_ORPHAN_ALIAS_BATCH_NS, str(ip_id))
-
-
 async def _withdraw_aliases_for_orphan(db: AsyncSession, user: Any, ip: IPAddress) -> int:
     """Take the address's aliases out of DNS without losing them (#2604).
 
@@ -2764,6 +2753,7 @@ async def _sync_dns_record(
     skip_own_alias: bool = False,
     skip_create: frozenset[tuple[str, uuid.UUID]] = frozenset(),
     skip_existing: frozenset[uuid.UUID] = frozenset(),
+    marking_orphan: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -2859,8 +2849,16 @@ async def _sync_dns_record(
         # DNS while keeping the row (reservation removed, hostname / zone
         # cleared, DDNS revoked, Mark as Orphan) comes through here. The
         # aliases Mark as Orphan withdrew into the row's own batch stay, for
-        # its Restore (#2604).
-        await purge_trashed_address_records(db, [ip.id], keep_batch_id=orphan_alias_batch_id(ip.id))
+        # its Restore (#2604). Mark as Orphan also leaves the records the
+        # operator trashed through the record API (#3189): they are Trash
+        # rows of their own, and the Trash refuses their restore while the
+        # address is an orphan.
+        await purge_trashed_address_records(
+            db,
+            [ip.id],
+            keep_batch_id=orphan_alias_batch_id(ip.id),
+            keep_record_deletes=marking_orphan,
+        )
         ip.dns_record_id = None
         # Preserve ``ip.fqdn`` and ``forward_zone_id`` / ``reverse_zone_id`` so
         # the orphan row keeps showing what was published before the delete
@@ -10956,7 +10954,7 @@ async def delete_address(
         # Restore brings them back (#2604).
         await _withdraw_aliases_for_orphan(db, current_user, ip)
         if subnet:
-            await _sync_dns_record(db, ip, subnet, action="delete")
+            await _sync_dns_record(db, ip, subnet, action="delete", marking_orphan=True)
         old_status = ip.status
         ip.status = "orphan"
         db.add(
@@ -12559,7 +12557,9 @@ async def bulk_delete_addresses(
         subnet = await db.get(Subnet, ip.subnet_id)
         if subnet is not None:
             try:
-                await _sync_dns_record(db, ip, subnet, action="delete")
+                await _sync_dns_record(
+                    db, ip, subnet, action="delete", marking_orphan=not body.permanent
+                )
             except Exception:  # noqa: BLE001
                 pass
         if body.permanent:

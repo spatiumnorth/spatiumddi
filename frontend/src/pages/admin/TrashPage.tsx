@@ -387,7 +387,9 @@ export function TrashPage() {
             Soft-deleted IPAM, DNS, DHCP, customer, overlay and service rows.
             Restore by row to bring back every cascaded child in the same batch.
             The nightly purge sweep permanently removes anything older than the
-            platform retention window (default 30 days).
+            platform retention window (default 30 days). DNS aliases withdrawn
+            when an IP address was marked as orphan are not listed: they come
+            back when the address is restored and are deleted with it.
           </p>
         </div>
 
