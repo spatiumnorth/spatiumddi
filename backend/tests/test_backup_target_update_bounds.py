@@ -274,7 +274,13 @@ async def test_audit_row_names_the_cleared_secret_never_its_value(
         .first()
     )
     assert row is not None
-    assert row.new_value["config_secrets_cleared"] == ["connection_string"]
+    assert row.new_value["config_fields_cleared"] == ["connection_string"]
+    # The audit API serves rows through the read-side redactor, which hides the
+    # value of any key whose name looks secret. The cleared-field names must
+    # survive it, or the row says "[redacted]" instead of what was cleared.
+    from app.services.audit_redact import redact_audit_value
+
+    assert redact_audit_value(row.new_value)["config_fields_cleared"] == ["connection_string"]
     blob = json.dumps(row.new_value)
     assert "CONNSTR-OLD-VALUE" not in blob and "ACCOUNTKEY-NEW-VALUE" not in blob
     assert ENC_PREFIX not in blob

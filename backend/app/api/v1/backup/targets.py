@@ -632,7 +632,7 @@ async def update_target(
                     if "config" in payload
                     else {}
                 ),
-                **({"config_secrets_cleared": secrets_cleared} if secrets_cleared else {}),
+                **({"config_fields_cleared": secrets_cleared} if secrets_cleared else {}),
             },
         )
     )
