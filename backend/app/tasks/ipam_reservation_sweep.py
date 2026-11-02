@@ -29,8 +29,9 @@ from sqlalchemy import select
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
-from app.models.ipam import IPAddress, Subnet
+from app.models.ipam import IPAddress
 from app.models.settings import PlatformSettings
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -85,29 +86,10 @@ async def _sweep() -> dict[str, int]:
             )
             released += 1
 
-        if rows:
-            # An ``available`` row is free for the counters (#2981), so freeing
-            # a reservation lowers its subnet's and its blocks' figures: recount
-            # them in this pass rather than leaving it to the hourly recount.
-            # Imported here — the router module is heavy for a task to load.
-            from app.api.v1.ipam.router import (
-                _update_blocks_utilization,
-                _update_subnets_utilization,
-            )
-
-            await db.flush()
-            subnet_ids = list(dict.fromkeys(ip.subnet_id for ip in rows))
-            await _update_subnets_utilization(db, subnet_ids)
-            block_ids = [
-                bid
-                for bid in (
-                    await db.execute(select(Subnet.block_id).where(Subnet.id.in_(subnet_ids)))
-                )
-                .scalars()
-                .all()
-                if bid is not None
-            ]
-            await _update_blocks_utilization(db, block_ids)
+        # An ``available`` row is free for the counters (#2981), so freeing a
+        # reservation lowers its subnet's and its blocks' figures: recount them
+        # in this pass rather than leaving it to the hourly recount (#3320).
+        await recount_subnets_and_blocks(db, (ip.subnet_id for ip in rows))
 
         await db.commit()
         return {"checked": len(rows), "released": released, "skipped_disabled": 0}

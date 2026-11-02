@@ -135,6 +135,10 @@ import { useSessionState } from "@/lib/useSessionState";
 import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import {
+  useUtilizationThresholds,
+  utilizationColor,
+} from "@/hooks/useUtilizationThresholds";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -436,33 +440,6 @@ function UsedIps({ allocated, total }: { allocated: number; total: number }) {
       {allocated.toLocaleString()} / {total.toLocaleString()}
     </>
   );
-}
-
-// Settings → IPAM "Warning Threshold" / "Critical Threshold" (#3327): the
-// bands the tree's dots and bars draw amber and red from. Defaults match the
-// backend's (80 / 95) until the settings arrive.
-function useUtilizationThresholds(): { warn: number; critical: number } {
-  const { data } = useQuery({
-    queryKey: ["settings"],
-    queryFn: () => settingsApi.get(),
-    staleTime: 30_000,
-    retry: false,
-  });
-  return {
-    warn: data?.utilization_warn_threshold ?? 80,
-    critical: data?.utilization_critical_threshold ?? 95,
-  };
-}
-
-function utilizationColor(
-  percent: number,
-  t: { warn: number; critical: number },
-): string {
-  return percent >= t.critical
-    ? "bg-red-500"
-    : percent >= t.warn
-      ? "bg-amber-400"
-      : "bg-green-500";
 }
 
 export function UtilizationBar({
@@ -5155,6 +5132,9 @@ export function SubnetDetail({
     onSuccess: () => {
       setInlineEditError(null);
       qc.invalidateQueries({ queryKey: ["addresses"] });
+      // A status edit moves the subnet's and its blocks' counts (#3325).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       // A static assignment's hostname / MAC mirror onto its address, so the
       // statics lists cache the same object (#3076).
       qc.invalidateQueries({ queryKey: ["dhcp-statics"] });
@@ -9656,6 +9636,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
     },
     onSuccess: ({ staticError }) => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      // A status edit moves the subnet's and its blocks' counts (#3325).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });

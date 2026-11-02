@@ -57,6 +57,7 @@ from app.models.ipam import (
     Subnet,
 )
 from app.models.nmap import NmapScan
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.nmap import NmapArgError, build_argv
 
 from .schemas import (
@@ -492,6 +493,7 @@ async def stamp_discovered(
     skipped_no_subnet = 0
     skipped_address: list[str] = []
     skipped_ambiguous: list[str] = []
+    counted_subnets: list[uuid.UUID] = []  # rows that now count toward utilization
 
     for host in hosts:
         if host.get("host_state") != "up":
@@ -546,6 +548,7 @@ async def stamp_discovered(
                 )
             )
             created += 1
+            counted_subnets.append(subnet.id)
             continue
 
         # Existing row policy:
@@ -561,6 +564,7 @@ async def stamp_discovered(
             if row.status != "discovered":
                 row.status = "discovered"
                 bumped += 1
+                counted_subnets.append(subnet.id)
             else:
                 refreshed += 1
         elif (
@@ -570,6 +574,10 @@ async def stamp_discovered(
             refreshed += 1
         else:
             refreshed += 1
+
+    # A ``discovered`` row counts toward utilization (an ``available`` one
+    # does not), so the touched subnets' and blocks' figures follow (#3320).
+    await recount_subnets_and_blocks(db, counted_subnets)
 
     await _audit(
         db,
