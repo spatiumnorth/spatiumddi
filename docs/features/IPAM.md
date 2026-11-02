@@ -1139,7 +1139,7 @@ The same column customization applies to IP address lists, DHCP scope lists, and
 ### Gateway Auto-Assignment
 
 When creating a subnet, the **first usable IP** (network address + 1) is automatically designated as the gateway (`status = reserved`, `description = "Gateway"`). This can be:
-- Changed to any other IP in the subnet
+- Changed to any other IP in the subnet. Editing the gateway follows New Subnet's rules: the network and broadcast address are refused with a 422, the new address gets its own reserved `Gateway` row (so Next available never offers it), and the old default `Gateway` row is retired — a renamed or otherwise operator-owned row is kept (#3317, #3318)
 - Deleted if no gateway is needed (e.g., transit link)
 - Overridden during import
 
