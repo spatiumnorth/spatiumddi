@@ -51,7 +51,11 @@ from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
-from app.services.ipam.address_create_rules import holds_address, take_address_row
+from app.services.ipam.address_create_rules import (
+    boundary_address_refusal,
+    holds_address,
+    take_address_row,
+)
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
 from app.services.pcap import (
@@ -461,6 +465,12 @@ async def _preview_create_ip_address(
             ),
         )
 
+    # #3321 — a host on an IPv4 network / broadcast address is refused at
+    # apply (and by the REST create), so say so here rather than propose it.
+    boundary = boundary_address_refusal(subnet, args.address)
+    if boundary is not None:
+        return PreviewResult(ok=False, detail=boundary)
+
     # Check for existing allocation — a non-blocking cue that apply
     # will likely 409. The preview deliberately doesn't reject; the
     # operator might be replacing a stale row.
@@ -679,6 +689,13 @@ async def _apply_create_ip_address(
             f"Subnet {subnet.network} is a multicast subnet — addresses are stream "
             "identities. Create a multicast group under /multicast/groups instead."
         )
+
+    # #3321 — the REST create's network / broadcast refusal. A named apply
+    # meets it in ``create_address``; this one inserts directly, and a request
+    # queued before the rule must still not land there.
+    boundary = boundary_address_refusal(subnet, args.address)
+    if boundary is not None:
+        raise ValueError(boundary)
 
     # Re-check for existing allocation under the apply transaction.
     existing = (
