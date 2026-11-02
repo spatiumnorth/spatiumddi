@@ -42,6 +42,7 @@ from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.ai.tools.scope import token_allows_subnet, token_subnet_ids, token_zone_ids
 from app.services.integration_ownership import owning_integration
+from app.services.ipam.host_name import current_fqdn, fqdn_matches
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -714,7 +715,7 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
                 "status": ip.status,
                 "role": ip.role,
                 "hostname": ip.hostname,
-                "fqdn": ip.fqdn,
+                "fqdn": current_fqdn(ip.hostname, ip.fqdn),
                 "mac_address": str(ip.mac_address) if ip.mac_address else None,
                 "mac_vendor": vendor,
                 "is_voip_phone": is_voip_phone_vendor(vendor),
@@ -817,7 +818,7 @@ async def find_ip_addresses(
             or_(
                 func.host(IPAddress.address).ilike(pat),
                 IPAddress.hostname.ilike(pat),
-                IPAddress.fqdn.ilike(pat),
+                fqdn_matches(IPAddress.fqdn.ilike(pat)),
                 IPAddress.description.ilike(pat),
                 cast(IPAddress.mac_address, String).ilike(pat),
             )
@@ -840,7 +841,7 @@ async def find_ip_addresses(
                 "id": str(ip.id),
                 "address": str(ip.address),
                 "hostname": ip.hostname,
-                "fqdn": ip.fqdn,
+                "fqdn": current_fqdn(ip.hostname, ip.fqdn),
                 "mac_address": str(ip.mac_address) if ip.mac_address else None,
                 "mac_vendor": vendor,
                 "is_voip_phone": is_voip_phone_vendor(vendor),
