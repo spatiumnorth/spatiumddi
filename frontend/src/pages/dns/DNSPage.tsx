@@ -7293,6 +7293,12 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
           title="Rotate TSIG Key"
           description={`Generate a new secret for "${confirmRotate.name}"? The old secret stops working immediately on the next BIND9 push — every consuming client must be updated with the new value.`}
           checkLabel={`I understand consumers of "${confirmRotate.name}" will break until reconfigured.`}
+          // A rotate deletes nothing: step 2 must not use the delete wording
+          // (#3277). The key stays and a new secret replaces the old one.
+          confirmTitle="Confirm TSIG Key Rotation"
+          warning="The old secret is replaced and stops working on the next config push."
+          confirmButtonLabel="Rotate key"
+          pendingLabel="Rotating…"
           onConfirm={() => rotateMut.mutate(confirmRotate.id)}
           onClose={() => setConfirmRotate(null)}
           isPending={rotateMut.isPending}

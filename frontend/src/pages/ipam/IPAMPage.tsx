@@ -114,6 +114,7 @@ import {
   hostnameError,
   nameInZoneError,
   parseTtlInput,
+  reversePointerName,
   summarizeZoneNames,
   zoneKindForName,
 } from "@/lib/dnsNames";
@@ -4558,7 +4559,10 @@ const NEEDS_BLOCK_WRITE = "Requires write permission on IP blocks";
 const NEEDS_SUBNET_WRITE = "Requires write permission on subnets";
 const NEEDS_ADDRESS_WRITE =
   "Requires write permission on this subnet or on an address set in it";
-const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
+// A scan is started with write and watched with read: a role holding only
+// write would start one it cannot see (#3279).
+const NEEDS_NMAP_WRITE =
+  "Requires write and read permission on nmap scans (read shows the result)";
 const NEEDS_ADDRESS_DELETE =
   "Requires delete permission on subnets, and write on this subnet or on an address set in it";
 const NEEDS_DNS_SYNC =
@@ -4620,6 +4624,9 @@ function ToolsMenu({
   onAskAi?: () => void;
 }) {
   const aiAvailable = useAiAvailable();
+  // #3279 — every nmap route answers "Feature 'tools.nmap' is disabled."
+  // with the module off, so the entry is not offered at all.
+  const nmapOn = useModuleOn("tools.nmap");
   const reshape = permissionGate(can.reshape, NEEDS_SUBNET_WRITE);
   return (
     <HeaderMenu
@@ -4661,13 +4668,17 @@ function ToolsMenu({
           onSelect: onResize,
           ...reshape,
         },
-        {
-          key: "scan",
-          label: "Scan with nmap",
-          icon: Radar,
-          onSelect: onScan,
-          ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
-        },
+        ...(nmapOn
+          ? [
+              {
+                key: "scan",
+                label: "Scan with nmap",
+                icon: Radar,
+                onSelect: onScan,
+                ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
+              },
+            ]
+          : []),
         {
           key: "split",
           label: "Split…",
@@ -5066,7 +5077,9 @@ export function SubnetDetail({
   // the type-level ask: the server still refuses them to a scoped holder.
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
-  const canScan = perms.can("write", "manage_nmap_scans");
+  const canScan =
+    perms.can("write", "manage_nmap_scans") &&
+    perms.can("read", "manage_nmap_scans");
   // #2571 — DNS sync: the drift preview reads the subnet and its addresses
   // and the commit is write on subnets, all at the type level (a grant scoped
   // to one subnet reaches neither, #2497; #3058).
@@ -7348,7 +7361,7 @@ export function SubnetDetail({
       {confirmPurgeAddr && (
         <ConfirmDeleteModal
           title="Permanently Delete"
-          message={`Permanently delete ${confirmPurgeAddr.address}? This cannot be undone.`}
+          message={`Permanently delete ${addressWithHost(confirmPurgeAddr)}? This cannot be undone.`}
           confirmLabel="Delete Forever"
           onConfirm={() => purgeAddr.mutate(confirmPurgeAddr.id)}
           onClose={() => setConfirmPurgeAddr(null)}
@@ -7369,6 +7382,7 @@ export function SubnetDetail({
       {showBulkDelete && (
         <BulkDeleteAddressesModal
           ipIds={[...selectedIpIds]}
+          addresses={addresses}
           subnetId={subnet.id}
           onClose={() => setShowBulkDelete(false)}
           onDone={() => {
@@ -9668,6 +9682,11 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const { data: networkRows } = useNetworkContext(address.id);
   const networkCount = networkRows?.length ?? 0;
   const [nmapOpen, setNmapOpen] = useState(false);
+  const nmapPerms = usePermissions();
+  const nmapOn = useModuleOn("tools.nmap");
+  const canNmap =
+    nmapPerms.can("write", "manage_nmap_scans") &&
+    nmapPerms.can("read", "manage_nmap_scans");
 
   return (
     <Modal title={`Edit ${address.address}`} onClose={onClose}>
@@ -9697,15 +9716,18 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           Network
           <NetworkTabBadge count={networkCount} />
         </button>
-        <button
-          type="button"
-          onClick={() => setNmapOpen(true)}
-          className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
-          title="Run an nmap scan against this IP"
-        >
-          <Radar className="h-3.5 w-3.5" />
-          Scan with Nmap
-        </button>
+        {nmapOn && (
+          <button
+            type="button"
+            onClick={() => setNmapOpen(true)}
+            className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            title="Run an nmap scan against this IP"
+            {...permissionGate(canNmap, NEEDS_NMAP_WRITE)}
+          >
+            <Radar className="h-3.5 w-3.5" />
+            Scan with Nmap
+          </button>
+        )}
       </div>
       {nmapOpen && (
         <NmapScanModal
@@ -11378,13 +11400,23 @@ function BulkEditAddressesModal({
   );
 }
 
-function BulkDeleteAddressesModal({
+export function BulkDeleteAddressesModal({
   ipIds,
+  addresses,
   subnetId,
   onClose,
   onDone,
 }: {
   ipIds: string[];
+  // The rows behind ipIds that the page has loaded, so the dialog can name
+  // them (#3210); ids with no loaded row are counted, not named.
+  addresses?: {
+    id: string;
+    address: string;
+    hostname?: string | null;
+    fqdn?: string | null;
+    alias_count?: number;
+  }[];
   // Absent for a cross-subnet selection from the global IP search (#520).
   subnetId?: string;
   onClose: () => void;
@@ -11393,6 +11425,9 @@ function BulkDeleteAddressesModal({
   const qc = useQueryClient();
   const [permanent, setPermanent] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const chosen = (addresses ?? []).filter((a) => ipIds.includes(a.id));
+  const named = chosen.slice(0, RECORDS_SHOWN);
+  const unnamed = ipIds.length - named.length;
 
   const mutation = useMutation({
     mutationFn: () => ipamApi.bulkDeleteAddresses({ ip_ids: ipIds, permanent }),
@@ -11442,6 +11477,34 @@ function BulkDeleteAddressesModal({
             </>
           )}
         </p>
+        {named.length > 0 && (
+          <ul className="space-y-0.5 text-xs" aria-label="Selected addresses">
+            {named.map((a) => {
+              const h = rowHost(a);
+              return (
+                <li key={a.id}>
+                  <span className="font-mono">{a.address}</span>
+                  {h && (
+                    <span className="break-all font-mono text-muted-foreground">
+                      {" "}
+                      ({h})
+                    </span>
+                  )}
+                  {(a.alias_count ?? 0) > 0 && (
+                    <span className="text-muted-foreground">
+                      {" "}
+                      + {a.alias_count} alias
+                      {a.alias_count === 1 ? "" : "es"}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+            {unnamed > 0 && (
+              <li className="text-muted-foreground">and {unnamed} more</li>
+            )}
+          </ul>
+        )}
         <label className="flex items-center gap-2 text-xs">
           <input
             type="checkbox"
@@ -11618,7 +11681,7 @@ function ConfirmDeleteModal({
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">{message}</p>
+        <p className="break-words text-sm text-muted-foreground">{message}</p>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11636,6 +11699,80 @@ function ConfirmDeleteModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+const RECORDS_SHOWN = 5;
+
+/** The name a row answers to. A cleared hostname leaves `fqdn` behind on
+ *  older rows, so without a hostname the row has no name (#3210). */
+function rowHost(a: {
+  hostname?: string | null;
+  fqdn?: string | null;
+}): string {
+  return a.hostname ? a.fqdn || a.hostname : "";
+}
+
+/** "192.168.0.22 (printer-3.corp.example.com)", or the bare IP when the row
+ *  carries no name — how a delete confirmation names the address (#3210). */
+function addressWithHost(a: {
+  address: string;
+  hostname?: string | null;
+  fqdn?: string | null;
+}): string {
+  const host = rowHost(a);
+  return host ? `${a.address} (${host})` : a.address;
+}
+
+/** The DNS records a delete takes with it, by name and type, capped (#3210).
+ *  Says so when the list could not be read; says nothing when there are none,
+ *  so an address without records keeps the dialog's older wording. */
+function RecordsNote({
+  records,
+  extraZones = 0,
+  loading,
+  error,
+}: {
+  records: string[];
+  // Additional zones the host record is also published into; the row
+  // carries only their ids, so they are counted rather than named.
+  extraZones?: number;
+  loading: boolean;
+  error: unknown;
+}) {
+  if (loading) return null;
+  const refused = error ? (
+    <p className="mt-1 text-xs text-muted-foreground">
+      <ListReadError error={error} what="this address's DNS aliases" /> Its
+      records may still be removed with it.
+    </p>
+  ) : null;
+  if (records.length === 0) return refused;
+  const shown = records.slice(0, RECORDS_SHOWN);
+  const more = records.length - shown.length;
+  return (
+    <>
+      <p className="mt-1 text-xs">
+        <span className="text-muted-foreground">DNS records: </span>
+        {shown.map((r, i) => (
+          <span key={r}>
+            {i > 0 && ", "}
+            <code className="break-all">{r}</code>
+          </span>
+        ))}
+        {more > 0 && (
+          <span className="text-muted-foreground"> and {more} more</span>
+        )}
+        {extraZones > 0 && (
+          <span className="text-muted-foreground">
+            {" "}
+            (the host record also in {extraZones} additional zone
+            {extraZones === 1 ? "" : "s"})
+          </span>
+        )}
+      </p>
+      {refused}
+    </>
   );
 }
 
@@ -11658,12 +11795,53 @@ export function DeleteOrOrphanModal({
   isOrphanPending?: boolean;
   isPurgePending?: boolean;
 }) {
+  // #3210 — name the host and the records the consequence touches. The
+  // primary record is known from the row; aliases need a read, which may
+  // fail or be refused without the dialog losing its choices.
+  const host = rowHost(address);
+  const hasAliases = address.alias_count !== 0;
+  const aliasesQ = useQuery({
+    queryKey: ["address-aliases", address.id],
+    queryFn: () => ipamApi.listAliases(address.id),
+    enabled: hasAliases,
+    retry: false,
+  });
+  const records: string[] = [];
+  // A delete retracts every record IPAM published for the row: the host
+  // record, its PTR, any copy in an additional zone, and the aliases.
+  const published = !!address.dns_record_id && !!host;
+  if (published) {
+    records.push(`${host} ${address.address.includes(":") ? "AAAA" : "A"}`);
+  }
+  const ptr = reversePointerName(address.address);
+  if (published && address.reverse_zone_id && ptr) {
+    records.push(`${ptr} PTR`);
+  }
+  for (const a of aliasesQ.data ?? []) {
+    records.push(`${(a.fqdn || a.name).replace(/\.$/, "")} ${a.record_type}`);
+  }
+  const extraZones = published ? (address.extra_zone_ids?.length ?? 0) : 0;
+  const recordsNote = (
+    <RecordsNote
+      records={records}
+      extraZones={extraZones}
+      loading={hasAliases && aliasesQ.isLoading}
+      error={hasAliases ? aliasesQ.error : null}
+    />
+  );
   return (
     <Modal title="Delete IP Address" onClose={onClose}>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">
           What should happen to{" "}
-          <span className="font-mono font-medium">{address.address}</span>?
+          <span className="font-mono font-medium">{address.address}</span>
+          {host && (
+            <>
+              {" "}
+              (<span className="break-all font-mono font-medium">{host}</span>)
+            </>
+          )}
+          ?
         </p>
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
           <div className="text-xs font-medium text-amber-700 dark:text-amber-400">
@@ -11676,6 +11854,7 @@ export function DeleteOrOrphanModal({
             restore or permanently delete it later from the orphans view;
             restoring it publishes its DNS records and aliases again.
           </p>
+          {recordsNote}
         </div>
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
           <div className="text-xs font-medium text-destructive">
@@ -11686,6 +11865,7 @@ export function DeleteOrOrphanModal({
             assignments tied to this IP are also cascaded. There's no undo —
             skip the orphan state entirely.
           </p>
+          {recordsNote}
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <button
@@ -16942,6 +17122,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
       {showBulkDelete && (
         <BulkDeleteAddressesModal
           ipIds={[...selected]}
+          addresses={items}
           onClose={() => setShowBulkDelete(false)}
           onDone={() => {
             setShowBulkDelete(false);
