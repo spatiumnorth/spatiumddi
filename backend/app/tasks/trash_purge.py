@@ -105,6 +105,21 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
         await remove_ipam_for_static(db, st)
     if statics:
         await db.flush()
+        # The mirrors left their subnets' cached counters stale (#3354).
+        from app.services.ipam.utilization import recount_subnets_and_blocks  # noqa: PLC0415
+
+        subnet_ids = (
+            (
+                await db.execute(
+                    select(DHCPScope.subnet_id)
+                    .where(DHCPScope.id.in_({st.scope_id for st in statics}))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await recount_subnets_and_blocks(db, subnet_ids)
     return len(statics)
 
 

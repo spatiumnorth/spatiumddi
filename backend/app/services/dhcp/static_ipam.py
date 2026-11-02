@@ -56,6 +56,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -735,11 +736,16 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
         }
 
     freed = 0
+    touched: list[uuid.UUID] = []
     for row, static_id in parsed:
         if static_id is not None and static_id in live:
             continue
+        touched.append(row.subnet_id)
         await _delete_mirror_row(db, row, await _load_reservation_any(db, row.static_assignment_id))
         freed += 1
+    # Freed rows leave the subnet's and its blocks' cached counters stale until
+    # the hourly recount; settle them once for the whole run (#3354).
+    await recount_subnets_and_blocks(db, touched)
     return freed
 
 
@@ -790,6 +796,16 @@ async def remove_ipam_for_scope_statics(db: AsyncSession, scope_id: uuid.UUID) -
     removed = 0
     for st in res.scalars().all():
         removed += await remove_ipam_for_static(db, st)
+    if removed:
+        subnet_id = (
+            await db.execute(
+                select(DHCPScope.subnet_id)
+                .where(DHCPScope.id == scope_id)
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one_or_none()
+        if subnet_id is not None:
+            await recount_subnets_and_blocks(db, [subnet_id])
     return removed
 
 

@@ -94,6 +94,7 @@ from app.services.dhcp.windows_failover import (
     record_failover_observation,
     record_scope_observation,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 
 def _refresh_lease_owned_row(
@@ -1070,6 +1071,7 @@ async def _merge_statics(
     re-syncs DNS, and this runs on the beat.
     """
     wire = _dedupe_wire_statics(wscope.get("statics") or [])
+    changes_before = result.statics_removed + result.statics_synced
     existing = list(
         (
             await db.execute(
@@ -1177,6 +1179,11 @@ async def _merge_statics(
         await upsert_ipam_for_static(db, scope, st, action="create")
         occupied[ip_key] = st
         result.statics_synced += 1
+
+    # Mirrors were created, moved or deleted above; settle the subnet's and its
+    # blocks' cached counters now rather than at the hourly recount (#3354).
+    if result.statics_removed + result.statics_synced != changes_before:
+        await recount_subnets_and_blocks(db, [scope.subnet_id])
 
 
 def _dedupe_wire_statics(raw: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
