@@ -1346,6 +1346,22 @@ async def _commit_subnet(
     )
 
 
+def _address_name(imported: ImportedAddress) -> tuple[str | None, str | None]:
+    """``(hostname, fqdn)`` for an imported address, or ``(None, None)``.
+
+    The NetBox ``dns_name`` is folded to a valid LDH name (#597) and the fqdn
+    is that folded name, so it always starts with the stored hostname. A host
+    label that folds to nothing stores neither (#3348): an fqdn alone reads as
+    no name at all (#3297).
+    """
+    hostname = sanitize_hostname(imported.hostname)
+    if not hostname:
+        return None, None
+    rest = (imported.fqdn or "").split(".", 1)[1:]
+    domain = sanitize_hostname(rest[0]) if rest else ""
+    return hostname, f"{hostname}.{domain}" if domain else hostname
+
+
 async def _commit_address(
     db: AsyncSession,
     imported: ImportedAddress,
@@ -1391,11 +1407,13 @@ async def _commit_address(
         # Fold a NetBox device/dns name to a valid LDH host name (#597) — a
         # migration should keep the IP with a cleaned name rather than store a
         # non-conforming one; a valid FQDN passes through unchanged.
-        existing.hostname = sanitize_hostname(imported.hostname) or existing.hostname
-        # An fqdn only reads as current with a hostname (#3297, #3348): don't
-        # store one a name that sanitised to nothing can't back.
-        if imported.fqdn and existing.hostname:
-            existing.fqdn = imported.fqdn
+        # The hostname and fqdn move together (#3348): an fqdn only reads as
+        # current with a hostname (#3297), and one whose host label sanitised
+        # to nothing would sit beside a hostname it does not name.
+        new_hostname, new_fqdn = _address_name(imported)
+        if new_hostname:
+            existing.hostname = new_hostname
+            existing.fqdn = new_fqdn
         if imported.description:
             existing.description = imported.description
         if imported.custom_fields:
@@ -1416,7 +1434,7 @@ async def _commit_address(
             kind="ip_address", key=key, action_taken="overwrote", entity_id=str(existing.id)
         )
 
-    new_hostname = sanitize_hostname(imported.hostname) or None
+    new_hostname, new_fqdn = _address_name(imported)
     managed_by = None
     cf = dict(imported.custom_fields or {})
     if "netbox_managed_by" in cf:
@@ -1427,7 +1445,7 @@ async def _commit_address(
         status=imported.status or "allocated",
         role=imported.role,
         hostname=new_hostname,
-        fqdn=imported.fqdn if new_hostname else None,
+        fqdn=new_fqdn,
         description=imported.description or "",
         managed_by=managed_by,
         custom_fields=cf,

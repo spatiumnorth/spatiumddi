@@ -31,7 +31,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,7 +42,6 @@ from app.core.dns_names import (
     primary_ns_error,
     record_value_error,
     validate_fqdn,
-    validate_hostname,
     validate_optional_hostname,
     validate_record_owner,
 )
@@ -387,7 +386,11 @@ class CreateIPAddressArgs(BaseModel):
     )
     hostname: str | None = Field(default=None, description="Hostname (e.g. web01)")
     fqdn: str | None = Field(
-        default=None, description="Fully-qualified domain name (e.g. web01.prod.example.com)"
+        default=None,
+        description=(
+            "Fully-qualified domain name in the subnet's DNS zone (e.g. "
+            "web01.prod.example.com); the hostname is the part before the zone"
+        ),
     )
     mac_address: str | None = Field(default=None, description="MAC address in any standard format")
     description: str = Field(default="", description="Free-form description")
@@ -417,22 +420,53 @@ class CreateIPAddressArgs(BaseModel):
             return None
         return validate_fqdn(v, field="fqdn", allow_underscore=False)
 
-    @model_validator(mode="after")
-    def _hostname_from_fqdn(self) -> CreateIPAddressArgs:
-        # An address's ``fqdn`` only reads as current with a ``hostname``
-        # (#3297), so an fqdn alone would be stored and then shown as
-        # nothing (#3348). Take the hostname from the fqdn's first label,
-        # as the REST create's hostname is the host label of the name.
-        if self.fqdn and not self.hostname:
-            self.hostname = validate_hostname(self.fqdn.split(".", 1)[0])
-        return self
-
     @field_validator("mac_address")
     @classmethod
     def _mac(cls, v: str | None) -> str | None:
         if v is None or v.strip() == "":
             return None
         return canonicalize_mac(v)
+
+
+async def _hostname_from_fqdn(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+) -> tuple[CreateIPAddressArgs, str | None]:
+    """The args with the hostname an ``fqdn`` names, or why it names none (#3348).
+
+    The REST create takes only a hostname and publishes ``<hostname>.<zone>``
+    in the subnet's effective forward zone, which is also the ``fqdn`` it
+    stores. An address's ``fqdn`` reads as current only with a hostname
+    (#3297), so an ``fqdn`` is turned into the hostname that publishes exactly
+    that name: the part before the zone, which may be more than one label. An
+    ``fqdn`` outside the zone, or in a subnet with no zone, would be replaced
+    by a different name (or by none), so it is refused, as is a hostname that
+    names a different host than the ``fqdn``.
+    """
+    if not args.fqdn:
+        return args, None
+    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415 — avoid cycle
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    zone_id = await _resolve_effective_zone(db, subnet)
+    zone = await db.get(DNSZone, zone_id) if zone_id else None
+    if zone is None:
+        return args, (
+            f"fqdn {args.fqdn} cannot be published: subnet {subnet.network} has no "
+            "DNS zone. Give a hostname without an fqdn."
+        )
+    zone_name = zone.name.rstrip(".").lower()
+    if not args.fqdn.endswith("." + zone_name):
+        return args, (
+            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone this "
+            f"address publishes in. Give a hostname, or an fqdn ending in .{zone_name}."
+        )
+    hostname = args.fqdn[: -len(zone_name) - 1]
+    if args.hostname and args.hostname != hostname:
+        return args, (
+            f"hostname {args.hostname} and fqdn {args.fqdn} name different hosts: "
+            f"the address publishes {args.hostname}.{zone_name}. Give one of them."
+        )
+    return args.model_copy(update={"hostname": hostname}), None
 
 
 async def _preview_create_ip_address(
@@ -481,6 +515,10 @@ async def _preview_create_ip_address(
     boundary = boundary_address_refusal(subnet, args.address)
     if boundary is not None:
         return PreviewResult(ok=False, detail=boundary)
+
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:
+        return PreviewResult(ok=False, detail=fqdn_err)
 
     # Check for existing allocation — a non-blocking cue that apply
     # will likely 409. The preview deliberately doesn't reject; the
@@ -645,6 +683,9 @@ async def _validate_submit_create_ip_address(
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:  # preview already refused; defensive
         return
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:  # preview already refused; defensive
+        raise HTTPException(status_code=422, detail=fqdn_err)
     assert_subnet_takes_addresses(subnet)
     assert_static_dhcp_has_mac(args.status, args.mac_address)
     assert_not_boundary_address(subnet, args.address)
@@ -707,6 +748,12 @@ async def _apply_create_ip_address(
     boundary = boundary_address_refusal(subnet, args.address)
     if boundary is not None:
         raise ValueError(boundary)
+
+    # #3348 — an fqdn becomes the hostname that publishes it, re-resolved
+    # against the zone as it is now, not as it was when the request was made.
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:
+        raise ValueError(fqdn_err)
 
     # Re-check for existing allocation under the apply transaction.
     existing = (
