@@ -6,8 +6,10 @@ configured with a whole URL and the protocol names this path; the ACME
 ``.well-known`` route is mounted the same way for the same reason.
 
 **Authenticated like any other API surface.** A third-party caller — a
-PBX, Cisco Emergency Responder, RedSky — uses an API token scoped to
-``/held`` with the ``e911_location`` read permission. The unauthenticated
+PBX, Cisco Emergency Responder, RedSky — uses an API token with the ``read``
+scope, owned by an account holding ``e911_location`` read. ``POST /held`` is
+``@read_only_post`` (it writes only the lookup trail), so the permission
+gate asks for ``read`` (#3302). The unauthenticated
 device-self-query mode RFC 5985 §6 describes is Phase 2 and is off by
 default (see ``E911_SELF_QUERY_ENABLED``), because an unauthenticated
 endpoint that answers "where is the device at this IP" is one an attacker

@@ -8,7 +8,18 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,8 +27,12 @@ from app.api.deps import DB, CurrentUser
 from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.content_disposition import content_disposition
 from app.core.permissions import (
+    has_any_grant_for,
+    refuse_and_audit,
+    require_type_level,
     token_scope_allows,
     token_scoped_resource_ids,
+    type_level_allows,
     user_has_permission,
 )
 from app.core.responses import PdfResponse
@@ -83,16 +98,43 @@ def _refuse_bound_token(user: Any, what: str) -> None:
         )
 
 
-def _require_import_write(current_user: Any) -> None:
-    """The import creates / updates blocks and subnets, so the coarse router
-    gate (which also admits any address_set grant) is not enough. The previews
-    take it too: ``@read_only_post`` only relaxes the router gate (#3302)."""
-    for rtype in ("ip_block", "subnet"):
-        if not user_has_permission(current_user, "write", rtype):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Permission denied: need 'write' on '{rtype}'",
-            )
+async def _address_import_preview_writer(
+    request: Request,
+    current_user: CurrentUser,
+    db: DB,
+) -> User:
+    """``write`` on ``subnet`` at type level, or any ``address_set`` write grant
+    (#103): what the IPAM router gate asked of the address-import preview
+    before ``@read_only_post`` relaxed it to ``read`` (#3302). The handler's
+    ``_address_import_write_gate`` stays the per-subnet / per-IP boundary."""
+    if type_level_allows(current_user, "write", "subnet") or has_any_grant_for(
+        current_user, "write", "address_set"
+    ):
+        return current_user
+    await refuse_and_audit(
+        db,
+        current_user,
+        request,
+        action="write",
+        resource_type="subnet",
+        resource_id="",
+        resource_display="subnet:*",
+        reason="permission denied (write on subnet)",
+        detail="Permission denied: need 'write' on 'subnet'",
+    )
+
+
+_address_import_preview_writer.spatium_requires = (  # type: ignore[attr-defined]
+    "exact",
+    [("write", "subnet")],
+)
+
+# The previews are ``@read_only_post``, so the router gate asks only for
+# ``read``; they still need the ``write`` the IPAM gate asked of them before
+# (#3302). Declared as dependencies, not checked in the handler, so
+# ``PreBodyAuthRoute`` refuses a reader before the upload is read (#2780).
+_IMPORT_PREVIEW_WRITE = [Depends(require_type_level("write", "ip_block", "subnet"))]
+_ADDRESS_IMPORT_PREVIEW_WRITE = [Depends(_address_import_preview_writer)]
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -105,7 +147,7 @@ async def _read_upload(file: UploadFile) -> bytes:
     return data
 
 
-@router.post("/import/preview")
+@router.post("/import/preview", dependencies=_IMPORT_PREVIEW_WRITE)
 @read_only_post
 async def import_preview(
     current_user: CurrentUser,
@@ -117,7 +159,6 @@ async def import_preview(
 ) -> dict:
     """Dry-run an import and return the would-create / would-update / conflict diff."""
     _refuse_bound_token(current_user, "a whole-space import")
-    _require_import_write(current_user)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_import(
@@ -150,7 +191,14 @@ async def import_commit(
 ) -> dict:
     """Commit the import in a single transaction. Writes audit entries per mutation."""
     _refuse_bound_token(current_user, "a whole-space import")
-    _require_import_write(current_user)
+    # The import creates / updates blocks and subnets, so the coarse router
+    # gate (which also admits any address_set grant) is not enough.
+    for rtype in ("ip_block", "subnet"):
+        if not user_has_permission(current_user, "write", rtype):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: need 'write' on '{rtype}'",
+            )
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     result = await commit_import(
@@ -165,7 +213,7 @@ async def import_commit(
     return result.as_dict()
 
 
-@router.post("/import/preview-json")
+@router.post("/import/preview-json", dependencies=_IMPORT_PREVIEW_WRITE)
 @read_only_post
 async def import_preview_json(
     current_user: CurrentUser,
@@ -187,7 +235,6 @@ async def import_preview_json(
     from app.services.ipam_io.parser import ParsedPayload
 
     _refuse_bound_token(current_user, "a whole-space import")
-    _require_import_write(current_user)
     raw = body.get("payload")
     if not isinstance(raw, dict):
         raise HTTPException(status_code=422, detail="Missing 'payload' object")
@@ -239,7 +286,7 @@ async def _address_import_write_gate(
     return _can_write
 
 
-@router.post("/import/addresses/preview")
+@router.post("/import/addresses/preview", dependencies=_ADDRESS_IMPORT_PREVIEW_WRITE)
 @read_only_post
 async def import_addresses_preview(
     current_user: CurrentUser,

@@ -113,6 +113,37 @@ async def test_viewer_reaches_find_free_plan_allocation_and_av_preview(
     assert r.status_code == 200, r.text
 
 
+async def test_a_write_only_role_keeps_the_marked_routes_it_had(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The relaxation adds ``read``; it does not take ``write`` away. Write does
+    not imply read here, so a role holding only ``write`` would otherwise lose
+    find-free / plan-allocation, which it has always been able to run."""
+    space, block, _ = await _ipam(db_session)
+    u = await _user(
+        db_session,
+        [
+            {"action": "write", "resource_type": "ip_block"},
+            {"action": "write", "resource_type": "subnet"},
+        ],
+    )
+    await db_session.commit()
+    h = {"Authorization": f"Bearer {create_access_token(str(u.id))}"}
+    r = await client.post(
+        f"/api/v1/ipam/spaces/{space.id}/find-free", json={"prefix_length": 24}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/plan-allocation",
+        json={"items": [{"count": 1, "prefix_len": 24}]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    # ...and a plain GET of the same data is still refused: write is not read.
+    r = await client.get(f"/api/v1/ipam/blocks/{block.id}/free-space", headers=h)
+    assert r.status_code == 403, r.text
+
+
 async def test_viewer_is_still_refused_on_write_gated_previews(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -305,7 +336,14 @@ async def test_get_options_returns_defaults_without_persisting(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["group_id"] == str(grp.id)
-    assert body["recursion_enabled"] is True or body["recursion_enabled"] is False
+    # No row exists, so no row id is invented; the values are the column defaults.
+    assert body["id"] is None
+    assert body["modified_at"] is None
+    assert body["forward_policy"] == "first"
+    assert body["allow_query"] == ["any"]
+    assert body["allow_transfer"] == ["none"]
+    assert body["dot_port"] == 853
+    assert body["trust_anchors"] == []
     assert await _rows() == 0
 
     # PUT still creates it.
@@ -315,3 +353,67 @@ async def test_get_options_returns_defaults_without_persisting(
     r = await client.put(f"/api/v1/dns/groups/{grp.id}/options", json={}, headers=sh)
     assert r.status_code == 200, r.text
     assert await _rows() == 1
+    row_id = r.json()["id"]
+    assert row_id is not None
+    r = await client.get(f"/api/v1/dns/groups/{grp.id}/options", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == row_id
+
+
+# ── Write-gated upload previews refuse a reader before reading the body ──
+#
+# ``@read_only_post`` relaxes the router gate to ``read``, so the write check a
+# preview still needs has to be a declared dependency: ``PreBodyAuthRoute`` runs
+# the declared ones from the headers alone, before a multipart part is spooled
+# (#2780). An inline check in the handler runs only after the whole body (up to
+# 26 MiB here) has been read.
+
+from tests.test_pre_body_auth import (  # noqa: E402
+    _MULTIPART,
+    _UNPARSEABLE,
+    _Body,
+    _multipart,
+    spools,  # noqa: F401  (fixture)
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "fields", "content_type"),
+    [
+        ("/api/v1/ipam/import/preview", {"strategy": "skip"}, _MULTIPART),
+        (
+            "/api/v1/ipam/import/addresses/preview",
+            {"subnet_id": "00000000-0000-4000-8000-000000000001"},
+            _MULTIPART,
+        ),
+        (
+            "/api/v1/dns/groups/00000000-0000-4000-8000-000000000001/zones/"
+            "00000000-0000-4000-8000-000000000001/import/spreadsheet/preview",
+            {},
+            _MULTIPART,
+        ),
+        ("/api/v1/ipam/import/preview-json", None, "application/json"),
+    ],
+)
+async def test_a_reader_is_refused_a_write_gated_upload_preview_unread(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    spools: list[object],  # noqa: F811
+    path: str,
+    fields: dict[str, str] | None,
+    content_type: str,
+) -> None:
+    h = await _viewer(db_session)
+    if fields is None:
+        body = _Body(_UNPARSEABLE)
+    else:
+        body = _Body(_multipart(fields, "file", b"network\n10.0.0.0/24\n" * 10_000))
+    resp = await client.post(
+        path,
+        content=body.stream(),
+        headers={**h, "Content-Type": content_type, "Content-Length": str(len(body.payload))},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"].startswith("Permission denied"), resp.text
+    assert body.read is False
+    assert spools == []

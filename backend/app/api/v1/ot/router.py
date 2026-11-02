@@ -54,7 +54,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission, user_has_permission
+from app.core.permissions import require_permission, require_resource_permission
 from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.ot import (
     OT_DEVICE_SOURCES,
@@ -1012,7 +1012,13 @@ def _rows_out(plan: list[PlannedRow]) -> list[OTDeviceImportRow]:
     ]
 
 
-@router.post("/devices/import/preview", response_model=OTDeviceImportPreviewResponse)
+@router.post(
+    "/devices/import/preview",
+    response_model=OTDeviceImportPreviewResponse,
+    # ``@read_only_post`` relaxes the router gate to ``read``; an import
+    # preview still needs what the commit needs (#3302).
+    dependencies=[Depends(require_permission("write", "ot_device"))],
+)
 @read_only_post
 async def import_preview(
     body: OTDeviceImportRequest, db: DB, user: CurrentUser
@@ -1024,12 +1030,6 @@ async def import_preview(
     is unusable. Unknown IP addresses are errors, not silent creates:
     this importer enriches IPAM, it never invents it.
     """
-    # ``@read_only_post`` relaxes the router gate to ``read``; an import
-    # preview still needs what the commit needs (#3302).
-    if not user_has_permission(user, "write", "ot_device"):
-        raise HTTPException(
-            status_code=403, detail="Permission denied: need 'write' on 'ot_device'"
-        )
     plan = await _build_plan(db, user, body)
     return OTDeviceImportPreviewResponse(
         rows=_rows_out(plan),
