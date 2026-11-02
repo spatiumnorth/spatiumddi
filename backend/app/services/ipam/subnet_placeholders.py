@@ -270,8 +270,14 @@ async def sync_mirror_gateway_row(
     A subnet New Subnet gives no gateway row (Kubernetes semantics, /31, /127,
     multicast) gets none, and nor does a gateway that is the network or
     broadcast address or outside the subnet. An address held by another
-    (non-reserved) row is never overwritten: the problem text is returned for
-    the reconciler's own warning list and the gateway row is not created."""
+    (non-reserved) row is never overwritten: when the gateway moves onto it,
+    the problem text is returned for the reconciler's own warning list and the
+    gateway row is not created.
+
+    An operator who deletes the placeholder gets it back on the next sync (the
+    integration's gateway is authoritative, as for the Docker / OPNsense
+    gateway rows); one who edits it makes it theirs, and it is then neither
+    moved nor removed."""
     if subnet.kubernetes_semantics:
         return None
     net = ipaddress.ip_network(str(subnet.network), strict=False)
@@ -297,8 +303,14 @@ async def sync_mirror_gateway_row(
     if old is not None and target is not None and str(old.address) == target:
         return None
 
+    # A gateway that did not move and whose address a row already holds (the
+    # operator's edit of the placeholder, or a row that was there first) is
+    # left as it stands, silently: nothing changed, and a warning on every
+    # sync would only be noise. Only a gateway moving onto a held address is
+    # reported, once, when it moves.
+    stored = str(subnet.gateway) if subnet.gateway is not None else None
     problem: str | None = None
-    if target is not None:
+    if target is not None and target != stored:
         problem = await gateway_target_problem(db, subnet, target)
     if old is not None:
         # Same retraction every other row removal does (a PTR it published).

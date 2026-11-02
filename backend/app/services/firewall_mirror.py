@@ -607,12 +607,33 @@ async def apply_addresses(
     for row in gone:
         await db.delete(row)
 
+    # Rows at a desired address that this target does not own: the subnet's
+    # reserved gateway row (#3347), an operator's row, another integration's.
+    # Inserting beside one would violate ``uq_ip_address_subnet_address`` and
+    # fail the whole sync, so that address is skipped with a warning.
+    space_subnet_ids = [s.id for s in subnets]
+    new_addrs = [a for a in desired if a not in current]
+    foreign_at: set[tuple[Any, str]] = set()
+    if space_subnet_ids and new_addrs:
+        held = await db.execute(
+            select(IPAddress.subnet_id, IPAddress.address).where(
+                IPAddress.subnet_id.in_(space_subnet_ids), IPAddress.address.in_(new_addrs)
+            )
+        )
+        foreign_at = {(sid, str(a)) for sid, a in held.all()}
+
     for addr, ma in desired.items():
         subnet = _find_subnet_for_ip(subnets, addr)
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
         row = current.get(addr)
+        if row is None and (subnet.id, addr) in foreign_at:
+            summary.warnings.append(
+                f"address {addr} is already held by another row in subnet "
+                f"{subnet.network}; not mirroring it"
+            )
+            continue
         if row is None:
             db.add(
                 IPAddress(
