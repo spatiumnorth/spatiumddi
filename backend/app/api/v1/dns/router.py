@@ -6657,6 +6657,40 @@ async def update_zone(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # #3265 — a record's fqdn, the fqdn IPAM keeps on each address and every PTR
+    # value IPAM published are stored absolute under the zone's name, so a rename
+    # of a zone that holds records leaves all of them on the old name (and can put
+    # an A owner under an underscore label BIND refuses). The console disables the
+    # name in Edit Zone; the API now agrees. Empty the zone, or create the new zone
+    # and move the records. Records in the Trash count too: a restore brings a
+    # record back with the fqdn it was deleted under, i.e. on the old name.
+    if (
+        "name" in changes
+        and (changes["name"] or "").rstrip(".").lower() != zone.name.rstrip(".").lower()
+    ):
+        held, trashed = (
+            await db.execute(
+                select(
+                    func.count(),
+                    func.count().filter(DNSRecord.deleted_at.is_not(None)),
+                )
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == zone.id)
+                .execution_options(include_deleted=True)
+            )
+        ).one()
+        if held:
+            in_trash = f", {trashed} of them in the Trash" if trashed else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} holds {held} record(s){in_trash}, and a zone's name "
+                    "cannot be changed while it does: each record's name, the name IPAM keeps "
+                    "on its addresses and the PTR values it published would stay on the old "
+                    "name. Create a zone under the new name and move the records, or delete "
+                    "them first (and purge them from the Trash)."
+                ),
+            )
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
