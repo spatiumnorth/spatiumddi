@@ -6,8 +6,10 @@ configured with a whole URL and the protocol names this path; the ACME
 ``.well-known`` route is mounted the same way for the same reason.
 
 **Authenticated like any other API surface.** A third-party caller — a
-PBX, Cisco Emergency Responder, RedSky — uses an API token scoped to
-``/held`` with the ``e911_location`` read permission. The unauthenticated
+PBX, Cisco Emergency Responder, RedSky — uses an API token with the ``read``
+scope, owned by an account holding ``e911_location`` read. ``POST /held`` is
+``@read_only_post`` (it writes only the lookup trail), so the permission
+gate asks for ``read`` (#3302). The unauthenticated
 device-self-query mode RFC 5985 §6 describes is Phase 2 and is off by
 default (see ``E911_SELF_QUERY_ENABLED``), because an unauthenticated
 endpoint that answers "where is the device at this IP" is one an attacker
@@ -42,6 +44,7 @@ from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
 from app.models.auth import User
+from app.services.api_token_scopes import read_only_post
 from app.services.e911.held import (
     ERROR_CANNOT_PROVIDE,
     ERROR_LOCATION_UNKNOWN,
@@ -183,6 +186,7 @@ async def _answer(
     dependencies=[Depends(require_resource_permission("e911_location"))],
     summary="HELD locationRequest (RFC 5985) — returns PIDF-LO",
 )
+@read_only_post
 async def held_third_party(request: Request, db: DB, user: CurrentUser) -> Response:
     """Third-party HELD: the caller names the device (RFC 6155 identity)."""
     try:

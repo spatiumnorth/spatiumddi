@@ -48,7 +48,7 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_permission, require_resource_permission
 from app.models.ipam import IPAddress, IPSpace
 from app.models.multicast import (
     MEMBERSHIP_ROLES,
@@ -1136,6 +1136,9 @@ async def _build_bulk_candidates(
 @router.post(
     "/groups/bulk-allocate/preview",
     response_model=MulticastBulkAllocatePreviewResponse,
+    # ``@read_only_post`` relaxes the router gate to ``read``; the preview
+    # still needs what the bulk-allocate commit needs (#3302).
+    dependencies=[Depends(require_permission("write", "multicast"))],
 )
 @read_only_post
 async def bulk_allocate_preview(

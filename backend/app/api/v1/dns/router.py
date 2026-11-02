@@ -72,6 +72,7 @@ from app.core.permissions import (
     refuse_and_audit,
     require_permission,
     require_route_types,
+    require_type_level,
     token_scope_allows,
     token_scoped_resource_ids,
     type_level_allows,
@@ -404,9 +405,10 @@ router = APIRouter(
 
 
 # The router gate takes the action from the HTTP method, so a POST asks for
-# ``write``. A POST that answers with the zone's existing records (an import
-# preview / commit, a sync-with-server) also needs what a GET of those records
-# needs: ``read`` on ``dns_record``, as the record list asks.
+# ``write`` (``read`` for one marked ``@read_only_post``). A POST that answers
+# with the zone's existing records (an import preview / commit, a
+# sync-with-server) also needs what a GET of those records needs: ``read`` on
+# ``dns_record``, as the record list asks.
 async def _dns_records_read(request: Request, current_user: CurrentUser, db: DB) -> Any:
     if not type_level_allows(current_user, "read", "dns_record"):
         await refuse_and_audit(
@@ -424,6 +426,13 @@ async def _dns_records_read(request: Request, current_user: CurrentUser, db: DB)
 
 
 _dns_records_read.spatium_requires = ("exact", [("read", "dns_record")])  # type: ignore[attr-defined]
+
+# An import preview is ``@read_only_post``, so the router gate asks only for
+# ``read``; it still needs the ``write`` on ``dns_record`` its commit needs
+# (#3302). A dependency rather than a handler check, so the upload route's
+# ``PreBodyAuthUploadRoute`` refuses a reader before the sheet is read (#2780).
+_RECORD_WRITE_FOR_PREVIEW = Depends(require_type_level("write", "dns_record"))
+
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
 # don't also need a schema edit to be accepted on create/update.
@@ -1188,7 +1197,9 @@ class ServerOptionsUpdate(BaseModel):
 
 
 class ServerOptionsResponse(BaseModel):
-    id: uuid.UUID
+    # Null when the group has no options row yet: the answer is the defaults,
+    # and the row is created by the first PUT (#3302).
+    id: uuid.UUID | None
     group_id: uuid.UUID
     forwarders: list[str]
     forward_policy: str
@@ -1242,7 +1253,8 @@ class ServerOptionsResponse(BaseModel):
     forward_tls_hostname: str | None
     forward_tls_verify: bool
     trust_anchors: list[TrustAnchorResponse]
-    modified_at: datetime
+    # Null, like ``id``, while the group has no options row (#3302).
+    modified_at: datetime | None
     # Stored values a Technitium server in this group will not apply (#1763).
     # Empty for a group with no agent-managed Technitium server.
     technitium_warnings: list[str] = Field(default_factory=list)
@@ -4008,6 +4020,23 @@ async def _load_options(group_id: uuid.UUID, db: DB) -> DNSServerOptions | None:
     return result.scalar_one_or_none()
 
 
+def _default_options(group_id: uuid.UUID) -> DNSServerOptions:
+    """A transient, never-persisted options row holding the column defaults,
+    for a group that has no row yet. SQLAlchemy fills ``default=`` only at
+    INSERT, so they are applied here by hand."""
+    opts = DNSServerOptions(group_id=group_id, trust_anchors=[])
+    for col in DNSServerOptions.__table__.columns:
+        default = col.default
+        if default is None or getattr(opts, col.key) is not None:
+            continue
+        if getattr(default, "is_scalar", False):
+            setattr(opts, col.key, default.arg)
+        elif getattr(default, "is_callable", False):
+            # SQLAlchemy wraps a column default callable to take the exec context.
+            setattr(opts, col.key, default.arg(None))
+    return opts
+
+
 async def _options_response(
     db: DB, group_id: uuid.UUID, opts: DNSServerOptions
 ) -> ServerOptionsResponse:
@@ -4072,12 +4101,17 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerOpti
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     if not opts:
-        # Auto-create defaults on first access
-        opts = DNSServerOptions(group_id=group_id)
-        db.add(opts)
-        await db.commit()
-        opts = await _load_options(group_id, db)
-    assert opts is not None
+        # No row yet (a group made before options were created with the group):
+        # answer with the column defaults WITHOUT keeping them. A GET must not
+        # write (a ``read`` token reaches it), and a persisted default row would
+        # move this group's rendered config for every agent (#3302). The row is
+        # built in memory and never added to the session, and ``id`` /
+        # ``modified_at`` are null because no row exists; the PUT creates it
+        # when the operator saves.
+        opts = _default_options(group_id)
+        out = await _options_response(db, group_id, opts)
+        out.id = None
+        return out
     return await _options_response(db, group_id, opts)
 
 
@@ -10067,7 +10101,7 @@ async def _queue_import_ops(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
-    dependencies=[Depends(_dns_records_read)],
+    dependencies=[Depends(_dns_records_read), _RECORD_WRITE_FOR_PREVIEW],
 )
 @read_only_post
 async def import_zone_preview(
@@ -10780,7 +10814,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
     response_model=SheetImportPreviewResponse,
-    dependencies=[Depends(_dns_records_read)],
+    dependencies=[Depends(_dns_records_read), _RECORD_WRITE_FOR_PREVIEW],
 )
 @read_only_post
 async def import_zone_spreadsheet_preview(

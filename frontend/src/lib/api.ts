@@ -3072,7 +3072,8 @@ export interface BackupManifestPreviewResponse {
    *  a selective restore of. */
   selective_restore_supported?: boolean;
   /** False when the restore itself would refuse this archive (no dump, no
-   *  secrets.enc, a newer format_version); `restore_refusal` says why.
+   *  secrets.enc, a newer format_version, a schema head this install
+   *  cannot migrate forward); `restore_refusal` says why.
    *  Absent from a server older than #2949. */
   restorable?: boolean;
   restore_refusal?: string | null;
@@ -5713,7 +5714,7 @@ export interface DNSServer {
 }
 
 export interface DNSServerOptions {
-  id: string;
+  id: string | null; // null until the group's options are first saved (#3302)
   group_id: string;
   forwarders: string[];
   forward_policy: string;
@@ -5779,7 +5780,7 @@ export interface DNSServerOptions {
   forward_tls_hostname: string | null;
   forward_tls_verify: boolean;
   trust_anchors: DNSTrustAnchor[];
-  modified_at: string;
+  modified_at: string | null;
   // Stored values a Technitium server in this group will not apply (#1763).
   technitium_warnings?: string[];
   // #2128: stored forwarders pinned to port 53 in an encrypted group.

@@ -56,6 +56,7 @@ from app.models.firewall import (
     FirewallRule,
 )
 from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance.access import (
     SSH_REACHABILITY_CAVEAT,
     console_only_detail,
@@ -962,6 +963,7 @@ async def effective(
 
 
 @router.post("/preview", response_model=PreviewResponse)
+@read_only_post
 async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> PreviewResponse:
     _require_read(current_user)
     row = await db.get(Appliance, body.appliance_id)
