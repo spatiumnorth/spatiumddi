@@ -279,7 +279,7 @@ async def test_mcp_tools_call_rejects_propose_tool(db_session: AsyncSession) -> 
         "method": "tools/call",
         "params": {"name": target, "arguments": {}},
     }
-    resp = await mcp_mod._dispatch_one(frame, db_session, user, outbound_allowed=True)
+    resp = await mcp_mod._dispatch_one(frame, db_session, user, token_scopes=[])
     assert "error" in resp, resp
     # -32601 = method not found (we deliberately mask disabled→not-found
     # so the existence of non-exposed tools doesn't leak).
@@ -310,7 +310,7 @@ async def test_mcp_tools_call_rejects_write_tool(db_session: AsyncSession) -> No
         "method": "tools/call",
         "params": {"name": write_names[0], "arguments": {}},
     }
-    resp = await mcp_mod._dispatch_one(frame, db_session, user, outbound_allowed=True)
+    resp = await mcp_mod._dispatch_one(frame, db_session, user, token_scopes=[])
     assert resp["error"]["code"] == mcp_mod._METHOD_NOT_FOUND
 
 
@@ -321,11 +321,9 @@ async def test_mcp_tools_list_excludes_write_and_propose(db_session: AsyncSessio
     advertised (single source of truth: _mcp_tools)."""
     user = await _user(db_session, superadmin=True, name="mcp2")
     frame = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
-    resp = await mcp_mod._dispatch_one(frame, db_session, user, outbound_allowed=True)
+    resp = await mcp_mod._dispatch_one(frame, db_session, user, token_scopes=[])
     listed = {t["name"] for t in resp["result"]["tools"]}
     excluded = {t.name for t in REGISTRY.all() if t.writes or t.name.startswith("propose_")}
     assert listed.isdisjoint(excluded)
-    assert listed == {
-        t.name for t in await mcp_mod._mcp_tools(db_session, user, outbound_allowed=True)
-    }
-    assert listed <= await mcp_mod._mcp_tool_names(db_session, outbound_allowed=True)
+    assert listed == {t.name for t in await mcp_mod._mcp_tools(db_session, user, token_scopes=[])}
+    assert listed <= await mcp_mod._mcp_tool_names(db_session, token_scopes=[])

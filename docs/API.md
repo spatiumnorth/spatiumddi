@@ -860,8 +860,12 @@ frame even though it is a write method. A `read` token never makes
 SpatiumDDI send traffic outward (#3302), so for a token with no write scope
 the tools that probe a host, pull live state from a managed server or look
 something up off-prem are neither listed by `tools/list` nor callable by
-`tools/call`; a session, an unrestricted token or a token holding a write
-scope keeps them.
+`tools/call` for any scoped token (a scoped token reaches MCP only through
+`read`). The one exception follows REST: a token also holding the write
+scope that covers a tool's REST route keeps that tool (`dns:write` keeps
+`find_dns_zone_drift`, as it reaches `GET /dns/.../drift`). A probe or an
+off-prem lookup needs a session or an unrestricted token, as `/tools/*`,
+`/bgp/*` and the rest do over REST.
 
 A bare `GET /api/v1/ai/mcp` returns server identity (handy for a sanity
 check; auth still required):

@@ -22,11 +22,12 @@ Auth:
     in ``app/services/api_token_scopes`` admits POST to ``/api/v1/ai/mcp``
     under ``read``, because this transport never dispatches a write or
     ``propose_*`` tool. A ``read`` token never makes SpatiumDDI send
-    traffic outward (#3302), so for a scoped token with no write scope the
-    tools registered ``outbound=True`` (probes, live pulls from managed
-    servers, off-prem lookups) are neither advertised nor callable. A
-    session, an unrestricted token, or a token holding a write scope keeps
-    them.
+    traffic outward (#3302), so for a scoped token the tools registered
+    ``outbound=True`` (probes, live pulls from managed servers, off-prem
+    lookups) are neither advertised nor callable, unless the token also
+    holds the write scope that covers the tool's REST equivalent
+    (``Tool.outbound_scope``) — the same tokens the REST route admits. A
+    session or an unrestricted token keeps them all.
 
     Authentication is not authorization (GHSA-4wrc-78rq-vgcg): the
     advertised and callable set is the same effective set the in-app chat
@@ -59,7 +60,7 @@ from app.services.ai.tools import (
     effective_tool_names,
     is_rate_limit_refusal,
 )
-from app.services.api_token_scopes import scopes_allow_outbound
+from app.services.api_token_scopes import scopes_allow_outbound_tool
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -99,19 +100,17 @@ def _err(req_id: int | str | None, code: int, message: str, data: Any = None) ->
     return {"jsonrpc": "2.0", "id": req_id, "error": payload}
 
 
-def _outbound_allowed(request: Request) -> bool:
-    """Whether this caller may reach ``outbound=True`` tools (#3302).
+def _token_scopes(request: Request) -> list[str]:
+    """The API token's scopes for this request (#3302); ``[]`` when there
+    are none to apply.
 
-    The token gate stashes an API token's scopes on ``request.state``; a
-    session never sets it, and an unrestricted token stores ``[]``. Both of
-    those, and a token holding any write scope, keep every tool. A scoped
-    token with no write scope is read-only, and a read-only token never
-    makes SpatiumDDI send traffic outward.
+    The token gate stashes them on ``request.state``. A session never sets
+    it, and an unrestricted token stores ``[]``: both keep every tool.
     """
-    return scopes_allow_outbound(getattr(request.state, "api_token_scopes", None) or [])
+    return list(getattr(request.state, "api_token_scopes", None) or [])
 
 
-async def _mcp_tool_names(db: Any, *, outbound_allowed: bool) -> set[str]:
+async def _mcp_tool_names(db: Any, *, token_scopes: list[str]) -> set[str]:
     """The tools the MCP transport may dispatch — genuinely read-only only.
 
     SECURITY (GHSA-4wrc-78rq-vgcg): the same effective set the in-app chat
@@ -129,10 +128,11 @@ async def _mcp_tool_names(db: Any, *, outbound_allowed: bool) -> set[str]:
     ``tools/call`` (dispatch gate) both consume this single source of truth
     so they can never drift apart.
 
-    SECURITY (#3302): with ``outbound_allowed`` False (a read-only API
-    token) the ``outbound=True`` tools are dropped too — a probe, a live
-    pull from a managed server or an off-prem lookup is traffic a ``read``
-    token never causes, matching ``@token_outbound`` on the REST side.
+    SECURITY (#3302): for a scoped API token (``token_scopes`` non-empty)
+    the ``outbound=True`` tools are dropped too, unless the token holds the
+    tool's ``outbound_scope`` — a probe, a live pull from a managed server or
+    an off-prem lookup is traffic a ``read`` token never causes, matching
+    ``@token_outbound`` on the REST side.
     """
     platform_settings = await db.get(PlatformSettings, 1)
     platform_enabled = platform_settings.ai_tools_enabled if platform_settings is not None else None
@@ -142,15 +142,20 @@ async def _mcp_tool_names(db: Any, *, outbound_allowed: bool) -> set[str]:
         enabled_modules=await fm_svc.get_enabled_modules(db),
     )
     names = {n for n in effective if not n.startswith("propose_")}
-    if not outbound_allowed:
-        names = {n for n in names if not ((t := REGISTRY.get(n)) is not None and t.outbound)}
+    if token_scopes:
+        names = {
+            n
+            for n in names
+            if (t := REGISTRY.get(n)) is not None
+            and (not t.outbound or scopes_allow_outbound_tool(token_scopes, t.outbound_scope))
+        }
     return names
 
 
-async def _mcp_tools(db: Any, user: User, *, outbound_allowed: bool) -> list[Tool]:
+async def _mcp_tools(db: Any, user: User, *, token_scopes: list[str]) -> list[Tool]:
     """The tools ``tools/list`` advertises to ``user``: the effective set,
     narrowed to the ones the caller's permissions allow."""
-    names = await _mcp_tool_names(db, outbound_allowed=outbound_allowed)
+    names = await _mcp_tool_names(db, token_scopes=token_scopes)
     return REGISTRY.callable_by(user, [t for t in REGISTRY.read_only() if t.name in names])
 
 
@@ -174,7 +179,7 @@ async def mcp_get(request: Request, current_user: CurrentUser, db: DB) -> dict[s
         "server": _SERVER_INFO,
         "protocol_version": _PROTOCOL_VERSION,
         "available_tools": len(
-            await _mcp_tools(db, current_user, outbound_allowed=_outbound_allowed(request))
+            await _mcp_tools(db, current_user, token_scopes=_token_scopes(request))
         ),
         "transport": "streamable_http",
     }
@@ -204,16 +209,15 @@ async def mcp_post(
             detail="Request body is not valid JSON.",
         ) from None
 
-    outbound_allowed = _outbound_allowed(request)
+    token_scopes = _token_scopes(request)
     if isinstance(raw, list):
         return [
-            await _dispatch_one(item, db, current_user, outbound_allowed=outbound_allowed)
-            for item in raw
+            await _dispatch_one(item, db, current_user, token_scopes=token_scopes) for item in raw
         ]
-    return await _dispatch_one(raw, db, current_user, outbound_allowed=outbound_allowed)
+    return await _dispatch_one(raw, db, current_user, token_scopes=token_scopes)
 
 
-async def _dispatch_one(raw: Any, db: Any, user: Any, *, outbound_allowed: bool) -> dict[str, Any]:
+async def _dispatch_one(raw: Any, db: Any, user: Any, *, token_scopes: list[str]) -> dict[str, Any]:
     try:
         req = JSONRPCRequest.model_validate(raw)
     except Exception:
@@ -264,7 +268,7 @@ async def _dispatch_one(raw: Any, db: Any, user: Any, *, outbound_allowed: bool)
                 {
                     "tools": [
                         t.to_mcp_tool()
-                        for t in await _mcp_tools(db, user, outbound_allowed=outbound_allowed)
+                        for t in await _mcp_tools(db, user, token_scopes=token_scopes)
                     ]
                 },
             )
@@ -282,7 +286,7 @@ async def _dispatch_one(raw: Any, db: Any, user: Any, *, outbound_allowed: bool)
             # refuse anything outside the advertised set. Passing
             # effective={MCP tool names} makes the registry raise
             # ToolDisabled for write / propose / catalog-disabled /
-            # module-disabled tools — and, for a read-only token, outbound
+            # module-disabled tools — and, for a scoped token, outbound
             # tools (#3302) — and the registry itself enforces each tool's
             # declared permission against the caller.
             try:
@@ -291,7 +295,7 @@ async def _dispatch_one(raw: Any, db: Any, user: Any, *, outbound_allowed: bool)
                     arguments,
                     db=db,
                     user=user,
-                    effective=await _mcp_tool_names(db, outbound_allowed=outbound_allowed),
+                    effective=await _mcp_tool_names(db, token_scopes=token_scopes),
                 )
             except ToolNotFound as exc:
                 return _err(
@@ -301,7 +305,7 @@ async def _dispatch_one(raw: Any, db: Any, user: Any, *, outbound_allowed: bool)
                 )
             except ToolDisabled as exc:
                 # A registered tool the MCP surface doesn't expose (write /
-                # propose / outbound for a read-only token). Report it as
+                # propose / outbound for a scoped token). Report it as
                 # method-not-found so we don't leak
                 # the existence of tools outside the advertised set.
                 return _err(

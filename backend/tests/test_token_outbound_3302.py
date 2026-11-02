@@ -9,15 +9,19 @@ Two surfaces let a ``read`` token cause outbound traffic that the REST
 * GET routes that probe, pull live state from a managed server or look
   something up off-prem, which ``read`` covered because they are GETs.
 
-Now a tool sets ``outbound=True`` and MCP hides it from a token with no write
-scope, and a GET carries ``@token_outbound`` and the scope gate stops ``read``
-covering it. A session, an unrestricted token, or a write scope whose prefix
-covers the path keeps today's behaviour.
+Now a tool sets ``outbound=True`` and MCP hides it from a scoped token unless
+the token holds the tool's ``outbound_scope`` (the write scope its REST route
+needs), and a GET carries ``@token_outbound`` and the scope gate stops
+``read`` covering it. A session, an unrestricted token, or a write scope
+whose prefix covers the path keeps today's behaviour.
 """
 
 from __future__ import annotations
 
 import ast
+import functools
+import importlib
+import importlib.util
 import inspect
 import re
 import textwrap
@@ -35,9 +39,10 @@ from app.services.ai.tools import REGISTRY
 from app.services.api_token_scopes import (
     is_token_outbound,
     scope_matches_request,
-    scopes_allow_outbound,
+    scopes_allow_outbound_tool,
 )
 from app.services.nettools.schemas import CommandResult
+from app.services.upgrades.preflight import run_all as preflight_run_all
 
 # Every route carrying ``@token_outbound``, verified to contact another host.
 # Pinned so that adding (or dropping) the marker is a reviewed decision.
@@ -70,6 +75,8 @@ EXPECTED_OUTBOUND_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/appliance/appliances/{appliance_id}/k8s/workloads"),
         ("GET", "/api/v1/appliance/appliances/{appliance_id}/k8s/pods"),
         ("GET", "/api/v1/appliance/appliances/{appliance_id}/k8s/logs"),
+        # The self-test resolves registry-1.docker.io through the host resolver.
+        ("GET", "/api/v1/appliance/diagnostics/bundle"),
     }
 )
 
@@ -105,22 +112,37 @@ EXPECTED_OUTBOUND_TOOLS: frozenset[str] = frozenset(
         "prefix_routing_history",
         "find_ct_log_entries",
         "find_available_upgrade_images",
+        # The self-test resolves registry-1.docker.io (appliance only).
+        "get_support_bundle_preview",
     }
 )
 
-# Fully-qualified helpers (or helper prefixes) that send traffic off the
-# SpatiumDDI host. A tool executor that reaches one — directly, or through a
-# helper in its own module — must be ``outbound=True``.
-_OUTBOUND_HELPERS: tuple[str, ...] = (
+# Network / subprocess libraries. Reaching one anywhere below a tool or a GET
+# handler — through any chain of ``app.*`` functions — counts as outbound.
+_NETWORK_LIBS: tuple[str, ...] = (
     "socket",
     "ssl",
     "httpx",
+    "aiohttp",
+    "requests",
     "subprocess",
     "asyncio.create_subprocess_exec",
     "asyncio.create_subprocess_shell",
+    "asyncio.open_connection",
     "dns.resolver",
+    "dns.asyncresolver",
     "dns.query",
+    "dns.asyncquery",
     "winrm",
+    "paramiko",
+    "asyncssh",
+    "boto3",
+)
+
+# Service-level helpers (or prefixes) that send traffic off the host through
+# an object the AST walk cannot follow (a driver instance, a destination). A
+# tool executor that names one in its own module must be ``outbound=True``.
+_OUTBOUND_HELPERS: tuple[str, ...] = (
     "app.services.nettools.run_",
     "app.services.nettools.test_port",
     "app.services.nettools.inspect_tls_cert",
@@ -141,60 +163,34 @@ _OUTBOUND_HELPERS: tuple[str, ...] = (
 # A tool that spends a network-tool budget but only reads the database.
 _RATE_LIMITED_NOT_OUTBOUND: frozenset[str] = frozenset({"lookup_mac_vendor"})
 
+# Tools / GET routes that reach a network library but only talk to SpatiumDDI's
+# own infrastructure, so are not outbound. Each is a reviewed decision.
+_LOCAL_INFRA_TOOLS: dict[str, str] = {
+    "find_cluster_metrics": "cluster DNS + the cluster's own nodes' kubelets",
+    "find_services": "the local docker socket (compose service control)",
+    "find_upgrade_preflight": "the in-cluster slot-image mirror",
+}
+_LOCAL_INFRA_GET_ROUTES: dict[str, str] = {
+    "/api/v1/admin/containers/stats": "the local docker socket",
+    "/api/v1/appliance/cluster/health": "cluster DNS + the cluster's own nodes' kubelets",
+    "/api/v1/appliance/cluster/health/stream": "as /appliance/cluster/health",
+    "/api/v1/appliance/containers/workloads/{component}/logs/stream": "the local kubeapi",
+    "/api/v1/appliance/containers/{name}/logs/stream": "the local kubeapi",
+    "/api/v1/appliance/upgrade-images/{image_id}/raw.xz": "the in-cluster slot-image mirror",
+    "/api/v1/system/services": "the local docker socket",
+    "/api/v1/upgrades/preflight": "the in-cluster slot-image mirror",
+    # Unauthenticated OIDC redirect leg: no API token ever reaches it.
+    "/api/v1/auth/{provider_id}/authorize": "OIDC discovery; not token-authenticated",
+    "/api/v1/auth/{provider_id}/callback": "OIDC token exchange; not token-authenticated",
+}
 
-def _references(fn: Any) -> set[str]:
-    """Fully-qualified names the executor reaches, following helpers defined
-    in its own module. Resolves both module-level and function-local
-    imports, and ``module.attr`` on an imported module."""
-    module = inspect.getmodule(fn)
-    tree = ast.parse(textwrap.dedent(inspect.getsource(module)))
-    imports: dict[str, str] = {}
-
-    def note_import(node: ast.AST) -> None:
-        if isinstance(node, ast.ImportFrom) and node.module:
-            for a in node.names:
-                imports.setdefault(a.asname or a.name, f"{node.module}.{a.name}")
-        elif isinstance(node, ast.Import):
-            for a in node.names:
-                # ``import a.b`` binds ``a``; the chain resolves from there.
-                if a.asname:
-                    imports.setdefault(a.asname, a.name)
-                else:
-                    head = a.name.split(".")[0]
-                    imports.setdefault(head, head)
-
-    for node in tree.body:
-        note_import(node)
-    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    refs: set[str] = set()
-    seen: set[str] = set()
-    stack = [funcs[fn.__name__]]
-    while stack:
-        g = stack.pop()
-        if g.name in seen:
-            continue
-        seen.add(g.name)
-        for n in ast.walk(g):
-            note_import(n)
-        for n in ast.walk(g):
-            if isinstance(n, ast.Name):
-                if n.id in funcs and n.id not in seen:
-                    stack.append(funcs[n.id])
-                if n.id in imports:
-                    refs.add(imports[n.id])
-            elif isinstance(n, ast.Attribute):
-                chain = [n.attr]
-                v = n.value
-                while isinstance(v, ast.Attribute):
-                    chain.append(v.attr)
-                    v = v.value
-                if isinstance(v, ast.Name) and v.id in imports:
-                    refs.add(".".join([imports[v.id], *reversed(chain)]))
-    return refs
+# Modules the walk does not descend into: they name a network library only to
+# classify an error (``socket.gaierror``), never to open a connection.
+_NOT_FOLLOWED: tuple[str, ...] = ("app.core.db_transient",)
 
 
-def _is_outbound_helper(ref: str) -> bool:
-    for h in _OUTBOUND_HELPERS:
+def _matches(ref: str, prefixes: tuple[str, ...]) -> bool:
+    for h in prefixes:
         if h.endswith(("_", ".")):
             if ref.startswith(h):
                 return True
@@ -203,8 +199,102 @@ def _is_outbound_helper(ref: str) -> bool:
     return False
 
 
+@functools.cache
+def _module_index(modname: str) -> tuple[dict[str, str], dict[str, ast.AST]] | None:
+    """(name -> fully-qualified import, function name -> def node) for a module."""
+    try:
+        module = importlib.import_module(modname)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(module)))
+    except (ImportError, OSError, TypeError):
+        return None
+    package = modname if hasattr(module, "__path__") else modname.rpartition(".")[0]
+    imports: dict[str, str] = {}
+    funcs: dict[str, ast.AST] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            base = node.module
+            if node.level:
+                base = importlib.util.resolve_name("." * node.level + node.module, package)
+            for a in node.names:
+                imports.setdefault(a.asname or a.name, f"{base}.{a.name}")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                # ``import a.b`` binds ``a``; the chain resolves from there.
+                head = a.name if a.asname else a.name.split(".")[0]
+                imports.setdefault(a.asname or head, head)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.setdefault(node.name, node)
+    return imports, funcs
+
+
+def _resolve_function(dotted: str) -> tuple[str, str] | None:
+    """``app.x.y.f`` -> (module, name) when it names a function."""
+    parts = dotted.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        try:
+            obj: Any = importlib.import_module(".".join(parts[:i]))
+        except ImportError:
+            continue
+        for attr in parts[i:]:
+            obj = getattr(obj, attr, None)
+        if inspect.isfunction(obj):
+            obj = inspect.unwrap(obj)
+            return obj.__module__, obj.__name__
+        return None
+    return None
+
+
+def _references(fn: Any) -> list[tuple[str, int]]:
+    """Fully-qualified names ``fn`` reaches, with the call depth at which each
+    is named: 0 for ``fn``'s own module (its local helpers included), +1 for
+    each ``app.*`` function followed into another module."""
+    fn = inspect.unwrap(fn)
+    found: list[tuple[str, int]] = []
+    seen: set[tuple[str, str]] = set()
+    stack: list[tuple[str, str, int]] = [(fn.__module__, fn.__name__, 0)]
+    while stack:
+        modname, fname, depth = stack.pop()
+        if (modname, fname) in seen or depth > 6:
+            continue
+        seen.add((modname, fname))
+        index = _module_index(modname)
+        if index is None or fname not in index[1]:
+            continue
+        imports, funcs = index
+        for n in ast.walk(funcs[fname]):
+            ref = None
+            if isinstance(n, ast.Name):
+                if n.id in funcs and n.id != fname:
+                    stack.append((modname, n.id, depth))
+                ref = imports.get(n.id)
+            elif isinstance(n, ast.Attribute):
+                chain = [n.attr]
+                v = n.value
+                while isinstance(v, ast.Attribute):
+                    chain.append(v.attr)
+                    v = v.value
+                if isinstance(v, ast.Name) and v.id in imports:
+                    ref = ".".join([imports[v.id], *reversed(chain)])
+            if ref is None:
+                continue
+            found.append((ref, depth))
+            if (
+                ref.startswith("app.")
+                and not _matches(ref, _NOT_FOLLOWED)
+                and (target := _resolve_function(ref)) is not None
+            ):
+                stack.append((*target, depth + 1))
+    return found
+
+
 def _reaches_outbound_helper(fn: Any) -> list[str]:
-    return sorted(r for r in _references(fn) if _is_outbound_helper(r))
+    return sorted(
+        {
+            ref
+            for ref, depth in _references(fn)
+            if _matches(ref, _NETWORK_LIBS) or (depth == 0 and _matches(ref, _OUTBOUND_HELPERS))
+        }
+    )
 
 
 def test_outbound_tools_are_exactly_the_reviewed_set() -> None:
@@ -226,7 +316,7 @@ def test_no_tool_reaching_a_network_helper_is_left_unflagged() -> None:
     ``outbound=True``, or a ``read`` token could drive it over MCP."""
     missing = {}
     for tool in REGISTRY.read_only():
-        if tool.outbound or tool.name.startswith("propose_"):
+        if tool.outbound or tool.name.startswith("propose_") or tool.name in _LOCAL_INFRA_TOOLS:
             continue
         hits = _reaches_outbound_helper(tool.executor)
         if hits:
@@ -277,10 +367,59 @@ def test_scope_matching_on_an_outbound_route() -> None:
     # A write scope that does not cover the path does not.
     assert not scope_matches_request(["ipam:write"], "GET", drift, outbound_route=True)
 
-    assert scopes_allow_outbound([]) is True
-    assert scopes_allow_outbound(["read", "ipam:write"]) is True
-    assert scopes_allow_outbound(["read"]) is False
-    assert scopes_allow_outbound(["read", "agent"]) is False
+    # MCP: a scoped token gets an outbound tool only with the write scope its
+    # REST equivalent needs; a probe (``/tools/*``, no write scope) never.
+    assert scopes_allow_outbound_tool([], None) is True
+    assert scopes_allow_outbound_tool(["read"], "dns:write") is False
+    assert scopes_allow_outbound_tool(["read", "dns:write"], "dns:write") is True
+    assert scopes_allow_outbound_tool(["read", "ipam:write"], "dns:write") is False
+    assert (
+        scopes_allow_outbound_tool(["read", "ipam:write", "dns:write", "dhcp:write"], None) is False
+    )
+
+
+# Outbound tools whose REST equivalent a write scope covers. Pinned against
+# the REST prefix it mirrors, so the two surfaces cannot drift apart.
+EXPECTED_OUTBOUND_SCOPES: dict[str, tuple[str, str]] = {
+    "find_dns_zone_drift": ("dns:write", "/api/v1/dns/groups/g/zones/z/drift"),
+    "find_dns_import_preview": ("dns:write", "/api/v1/dns/import/cloud/preview"),
+    "find_dhcp_import_preview": ("dhcp:write", "/api/v1/dhcp/import/windows/preview"),
+    "find_netbox_import_preview": ("ipam:write", "/api/v1/ipam/import/netbox/preview"),
+}
+
+
+def test_outbound_scopes_match_the_rest_route_they_mirror() -> None:
+    declared = {t.name: t.outbound_scope for t in REGISTRY.all() if t.outbound_scope is not None}
+    assert declared == {n: scope for n, (scope, _p) in EXPECTED_OUTBOUND_SCOPES.items()}
+    for _name, (scope, path) in EXPECTED_OUTBOUND_SCOPES.items():
+        # The same scope, alone, is what REST needs for the equivalent route.
+        assert scope_matches_request([scope], "POST", path)
+        assert not scope_matches_request(["read"], "POST", path)
+
+
+def test_get_routes_reaching_the_network_are_marked() -> None:
+    """A GET handler that reaches a network / subprocess library through any
+    chain of ``app.*`` functions must carry ``@token_outbound``, or be a
+    reviewed local-infrastructure exception."""
+    stray = {}
+    for (method, path), endpoint in _routes().items():
+        if method != "GET" or is_token_outbound(endpoint) or path in _LOCAL_INFRA_GET_ROUTES:
+            continue
+        hits = sorted({r for r, _d in _references(endpoint) if _matches(r, _NETWORK_LIBS)})
+        if hits:
+            stray[path] = hits
+    assert not stray, f"GET routes reach the network without @token_outbound: {stray}"
+
+
+async def _stub_unflagged_tool() -> Any:
+    # Reaches httpx only two app.* calls down (preflight -> mirror probe).
+    return await preflight_run_all(None)  # type: ignore[arg-type]
+
+
+def test_the_scan_follows_helpers_into_other_modules() -> None:
+    """Negative control: a function reaching the network only through a
+    helper in another module is still caught."""
+    assert any(r.startswith("httpx") for r in _reaches_outbound_helper(_stub_unflagged_tool))
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────
@@ -394,21 +533,71 @@ async def test_read_token_does_not_see_or_call_outbound_mcp_tools(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scopes", [[], ["read", "dns:write"]])
-async def test_unrestricted_or_write_token_keeps_outbound_mcp_tools(
+async def test_unrestricted_token_keeps_outbound_mcp_tools(
     client: AsyncClient,
     db_session: AsyncSession,
     no_real_ping: list[str],
-    scopes: list[str],
 ) -> None:
-    raw = await _token(db_session, scopes)
-    assert "network_ping" in await _listed(client, raw)
+    raw = await _token(db_session, [])
+    listed = await _listed(client, raw)
+    assert "network_ping" in listed
+    assert "find_dns_zone_drift" in listed
     resp = await _mcp(
         client, raw, "tools/call", {"name": "network_ping", "arguments": {"host": "192.0.2.1"}}
     )
     assert "error" not in resp, resp
     assert resp["result"]["isError"] is False
     assert no_real_ping == ["192.0.2.1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scopes",
+    [
+        ["read", "ipam:write"],
+        ["read", "dns:write"],
+        ["read", "ipam:write", "dns:write", "dhcp:write"],
+    ],
+)
+async def test_a_write_scope_does_not_unlock_probes_over_mcp(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    no_real_ping: list[str],
+    scopes: list[str],
+) -> None:
+    """REST refuses every one of these tokens ``POST /tools/ping`` (no write
+    scope covers ``/tools``), so MCP — which they reach only through
+    ``read`` — must too."""
+    raw = await _token(db_session, scopes)
+    assert (
+        await client.post("/api/v1/tools/ping", json={"host": "192.0.2.1"}, headers=_h(raw))
+    ).status_code == 403
+    listed = await _listed(client, raw)
+    assert "network_ping" not in listed
+    assert "lookup_whois_ip" not in listed
+    resp = await _mcp(
+        client, raw, "tools/call", {"name": "network_ping", "arguments": {"host": "192.0.2.1"}}
+    )
+    assert "error" in resp, resp
+    assert no_real_ping == []
+    # Drift follows REST: ``GET /dns/.../drift`` admits dns:write, not ipam:write.
+    assert ("find_dns_zone_drift" in listed) == ("dns:write" in scopes)
+
+
+@pytest.mark.asyncio
+async def test_a_write_only_token_still_cannot_reach_mcp(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """MCP is admitted only by ``read``; a write-only token is refused on
+    both verbs, as on main."""
+    raw = await _token(db_session, ["ipam:write", "dns:write", "dhcp:write"])
+    assert (await client.get("/api/v1/ai/mcp", headers=_h(raw))).status_code == 403
+    r = await client.post(
+        "/api/v1/ai/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        headers=_h(raw),
+    )
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio

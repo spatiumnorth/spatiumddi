@@ -333,7 +333,7 @@ async def _call(db: AsyncSession, user: User, name: str, args: dict | None = Non
         "method": "tools/call",
         "params": {"name": name, "arguments": args or {}},
     }
-    return await mcp_mod._dispatch_one(frame, db, user, outbound_allowed=True)
+    return await mcp_mod._dispatch_one(frame, db, user, token_scopes=[])
 
 
 def _denied(resp: dict) -> bool:

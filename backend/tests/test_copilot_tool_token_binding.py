@@ -211,7 +211,7 @@ async def _mcp_call(db: AsyncSession, user: User, name: str, args: dict | None =
         "method": "tools/call",
         "params": {"name": name, "arguments": args or {}},
     }
-    return await mcp_mod._dispatch_one(frame, db, user, outbound_allowed=True)
+    return await mcp_mod._dispatch_one(frame, db, user, token_scopes=[])
 
 
 def _refused(resp: dict) -> bool:
@@ -276,7 +276,7 @@ async def test_zone_bound_token_is_refused_dns_inventory_tools(db_session: Async
         assert e.group_b.name not in json.dumps(resp), name
 
     listed = await mcp_mod._dispatch_one(
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, db_session, user, outbound_allowed=True
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, db_session, user, token_scopes=[]
     )
     names = {t["name"] for t in listed["result"]["tools"]}
     assert "find_dns_servers" not in names

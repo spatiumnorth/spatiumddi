@@ -1218,6 +1218,7 @@ class FindZoneDriftArgs(BaseModel):
 @register_tool(
     name="find_dns_zone_drift",
     outbound=True,
+    outbound_scope="dns:write",
     honours_token_binding=True,
     permission=("read", "dns_record"),
     description=(
