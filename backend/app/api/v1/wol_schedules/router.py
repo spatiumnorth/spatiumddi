@@ -61,6 +61,7 @@ from app.models.wol_schedule import (
     WolSchedule,
 )
 from app.services import wol
+from app.services.api_token_scopes import read_only_post
 from app.services.wol_scheduler.gating import gate_verdict, load_gate_calendar_events
 from app.services.wol_scheduler.resolver import (
     SKIP_NO_MAC,
@@ -654,6 +655,7 @@ async def run_now(schedule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> 
     response_model=TargetPreviewRead,
     dependencies=[Depends(require_permission("read", PERMISSION))],
 )
+@read_only_post
 async def preview_schedule_targets(
     schedule_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> TargetPreviewRead:
@@ -705,6 +707,7 @@ async def preview_schedule_targets(
     response_model=TargetPreviewRead,
     dependencies=[Depends(require_permission("read", PERMISSION))],
 )
+@read_only_post
 async def preview_selector(
     body: TargetPreviewRequest, db: DB, current_user: CurrentUser
 ) -> TargetPreviewRead:

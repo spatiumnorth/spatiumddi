@@ -26,6 +26,9 @@ from app.services.api_token_scopes import is_read_only_post, scope_matches_reque
 # marker to a route is a reviewed decision, not a drive-by.
 EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
     {
+        "/held",
+        "/api/v1/appliance/acme/preview",
+        "/api/v1/appliance/firewall/preview",
         "/api/v1/av/allocation-preview",
         "/api/v1/dhcp/import/isc/preview",
         "/api/v1/dhcp/import/kea/preview",
@@ -53,16 +56,16 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
         "/api/v1/multicast/groups/bulk-allocate/preview",
         "/api/v1/ot/devices/import/preview",
         "/api/v1/tools/mac-vendor",
+        "/api/v1/wake-scheduler/preview-targets",
+        "/api/v1/wake-scheduler/schedules/{schedule_id}/preview-targets",
     }
 )
 
 # POST routes whose name says query / preview / validate but which are
 # deliberately still writes for the scope gate, with the reason.
 DELIBERATELY_WRITE: dict[str, str] = {
-    "/api/v1/appliance/firewall/preview": "dispatches a render to the supervisor",
-    "/api/v1/appliance/acme/preview": "resolves DNS-01 solvers, reaches cloud DNS APIs",
-    "/api/v1/backup/manifest-preview": "accepts an uploaded archive and reads it server-side",
-    "/api/v1/block-sync/blocks/preview": "asks the integration target (outbound)",
+    "/api/v1/backup/manifest-preview": "reads one file out of an uploaded archive, no write; SuperAdmin-only",
+    "/api/v1/block-sync/blocks/preview": "DB-only, no outbound call; left unmarked behind the ManageUser gate (#3302)",
     "/api/v1/dns/agents/query-log-entries": "agent ingest — writes rows",
     "/api/v1/dhcp/import/windows/preview": "live WinRM pull from a Windows server",
     "/api/v1/dns/import/cloud/preview": "live pull from a cloud DNS provider",
@@ -73,9 +76,9 @@ DELIBERATELY_WRITE: dict[str, str] = {
     "/api/v1/logs/query": "runs Get-WinEvent over WinRM on a Windows server (outbound, stored creds)",
     "/api/v1/logs/dhcp-audit": "reads the audit log over WinRM on a Windows server (outbound)",
     "/api/v1/ipam/import/netbox/preview": "live pull from NetBox (outbound)",
-    "/api/v1/overlays/{overlay_id}/simulate": "not reviewed as side-effect free",
+    "/api/v1/overlays/{overlay_id}/simulate": "pure read-only what-if; left unmarked (#3302 follow-up)",
     "/api/v1/settings/apt/validate": "not reviewed as side-effect free",
-    "/api/v1/system/factory-reset/preview": "destructive-operation workflow step",
+    "/api/v1/system/factory-reset/preview": "read-only dry run, but SuperAdmin-only and a step of a destructive flow",
     "/api/v1/system/support-bundle/preview": "writes an audit row + commits",
     "/api/v1/tools/firewall-logs": "queues a command row for the appliance",
     "/api/v1/tools/dig": "sends DNS traffic",
@@ -88,13 +91,11 @@ DELIBERATELY_WRITE: dict[str, str] = {
     "/api/v1/tools/whois": "outbound query",
     "/api/v1/tools/wol": "sends a magic packet and writes an audit row",
     "/api/v1/upgrades/plan": "writes a planned upgrade run",
-    "/api/v1/wake-scheduler/preview-targets": "not reviewed",
-    "/api/v1/wake-scheduler/schedules/{schedule_id}/preview-targets": "not reviewed",
     "/api/v1/migration/cutover/plans/{plan_id}/items/{item_id}/lease-handover/preview": (
         "cutover workflow step against live servers"
     ),
     "/api/v1/migration/cutover/plans/{plan_id}/items/{item_id}/ttl-preflight/preview": (
-        "cutover workflow step against live servers"
+        "reads the zone from the DB, no outbound call; SuperAdmin-only cutover step (#3302)"
     ),
 }
 

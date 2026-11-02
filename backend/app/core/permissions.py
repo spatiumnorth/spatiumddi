@@ -37,6 +37,7 @@ from app.api.deps import CurrentUser, get_db
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
+from app.services.api_token_scopes import is_read_only_post
 
 logger = structlog.get_logger(__name__)
 
@@ -741,6 +742,36 @@ def require_certificate_store(action: str) -> Callable[..., Awaitable[User]]:
     )
 
 
+def require_type_level(action: str, *resource_types: str) -> Callable[..., Awaitable[User]]:
+    """Route dependency requiring ``action`` on EVERY one of ``resource_types``,
+    checked as the method-derived router gates check it
+    (:func:`type_level_allows`: a resource-scoped API token passes on the
+    types its binding covers, and the handler narrows it).
+
+    For a ``@read_only_post`` preview that must still be write-gated (#3302):
+    the marker makes the router gate ask for ``read``, and an inline check in
+    the handler runs only after the body has been read. Declared as a
+    dependency, :class:`app.api.pre_body_auth.PreBodyAuthRoute` runs it from
+    the headers before the body (#2780)."""
+
+    async def _dep(
+        request: Request,
+        current_user: CurrentUser,
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        for rt in resource_types:
+            if not type_level_allows(current_user, action, rt):
+                await _record_denial(db, current_user, request, action, rt, None)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Permission denied: need '{action}' on '{rt}'",
+                )
+        return current_user
+
+    _dep.spatium_requires = ("exact", [(action, rt) for rt in resource_types])  # type: ignore[attr-defined]
+    return _dep
+
+
 def require_permission_or_scoped(
     action: str,
     resource_type: str,
@@ -815,8 +846,9 @@ MULTI_ROW_DELETE_SUFFIXES: tuple[str, ...] = (
 )
 
 
-def action_for_request(request: Request) -> str:
-    """Return the action a router-level gate requires for ``request``.
+def method_action_for_request(request: Request) -> str:
+    """The action the HTTP method alone implies, ignoring any ``@read_only_post``
+    marker.
 
     The HTTP method decides, except that a multi-row delete (a POST whose path
     ends in one of :data:`MULTI_ROW_DELETE_SUFFIXES`) needs the same ``delete``
@@ -828,6 +860,40 @@ def action_for_request(request: Request) -> str:
     return _METHOD_TO_ACTION.get(method, "write")
 
 
+def action_for_request(request: Request) -> str:
+    """Return the action a router-level gate requires for ``request``.
+
+    :func:`method_action_for_request`, except that a POST whose matched handler
+    carries ``@read_only_post`` (a filter / preview body that changes nothing,
+    #3223) needs ``read``, as the equivalent GET would (#3302). A handler that
+    must still be write-gated (a resize or import preview) says so itself with
+    an inline write check; the marker only stops the router gate demanding
+    ``write`` for a route that reads.
+    """
+    action = method_action_for_request(request)
+    if action == "write" and request.method.upper() == "POST":
+        endpoint = getattr(request.scope.get("route"), "endpoint", None)
+        if is_read_only_post(endpoint):
+            return "read"
+    return action
+
+
+def gate_actions(request: Request) -> tuple[str, ...]:
+    """The actions any one of which satisfies a router-level gate for
+    ``request``: :func:`action_for_request`, plus the method's own action when
+    the two differ.
+
+    The ``@read_only_post`` relaxation is additive: it lets a ``read`` grant
+    through, and keeps admitting the ``write`` grant the route took before
+    (#3302). Write does not imply read in this model, so without the second
+    action a role holding only ``write`` on a type would lose the previews it
+    could always run.
+    """
+    action = action_for_request(request)
+    method_action = method_action_for_request(request)
+    return (action,) if method_action == action else (action, method_action)
+
+
 def require_resource_permission(
     resource_type: str,
     instance_routes: tuple[str, str, frozenset[str], frozenset[str]] | None = None,
@@ -837,8 +903,9 @@ def require_resource_permission(
     """Router-level dependency that enforces permissions by HTTP method.
 
     The mapping is: GET/HEAD/OPTIONS → ``read``, POST/PUT/PATCH → ``write``,
-    DELETE → ``delete``, and a multi-row delete POST → ``delete`` (see
-    :func:`action_for_request`). Attach at the router scope::
+    DELETE → ``delete``, a multi-row delete POST → ``delete``, and a POST
+    marked ``@read_only_post`` → ``read`` (see :func:`action_for_request`).
+    Attach at the router scope::
 
         router = APIRouter(dependencies=[Depends(require_resource_permission("ip_space"))])
 
@@ -858,7 +925,7 @@ def require_resource_permission(
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
         action = action_for_request(request)
-        if user_has_permission(current_user, action, resource_type):
+        if any(user_has_permission(current_user, a, resource_type) for a in gate_actions(request)):
             return current_user
         if (
             instance_routes
@@ -866,7 +933,9 @@ def require_resource_permission(
             and _instance_scoped_admit(
                 request,
                 current_user,
-                action,
+                # Method-derived: a delegate's instance grant keeps the meaning
+                # it had before ``@read_only_post`` relaxed the type-level gate.
+                method_action_for_request(request),
                 {instance_param: instance_routes},
                 prefix or "/ipam",
             )
@@ -899,8 +968,9 @@ def require_any_resource_permission(
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
         action = action_for_request(request)
+        actions = gate_actions(request)
         for rt in resource_types:
-            if user_has_permission(current_user, action, rt):
+            if any(user_has_permission(current_user, a, rt) for a in actions):
                 return current_user
         first = resource_types[0] if resource_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
@@ -1077,22 +1147,28 @@ def require_any_resource_or_scoped(
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
         action = action_for_request(request)
+        actions = gate_actions(request)
         key = request_route_key(request)
         if route_types is not None:
             needed = route_types.get(key, ())
-            if needed and all(type_level_allows(current_user, action, rt) for rt in needed):
+            if needed and all(
+                any(type_level_allows(current_user, a, rt) for a in actions) for rt in needed
+            ):
                 return current_user
         else:
             needed = unscoped_types
             for rt in unscoped_types:
-                if user_has_permission(current_user, action, rt):
+                if any(user_has_permission(current_user, a, rt) for a in actions):
                     return current_user
-        if action != "read" and scoped_routes:
+        # Delegation admits keep the method-derived action: a read-only POST
+        # (a preview) still reaches its per-row gate only for a write delegate.
+        method_action = method_action_for_request(request)
+        if method_action != "read" and scoped_routes:
             for rt, routes in scoped_routes.items():
-                if key in routes and has_any_grant_for(current_user, action, rt):
+                if key in routes and has_any_grant_for(current_user, method_action, rt):
                     return current_user
         if instance_routes and _instance_scoped_admit(
-            request, current_user, action, instance_routes
+            request, current_user, method_action, instance_routes
         ):
             return current_user
         if route_types is not None:
@@ -1153,7 +1229,10 @@ def require_route_types(
         needed = route_types.get(
             mount_route_key(request.method, getattr(route, "path", "") or "", prefix), ()
         )
-        if needed and all(type_level_allows(current_user, action, rt) for rt in needed):
+        actions = gate_actions(request)
+        if needed and all(
+            any(type_level_allows(current_user, a, rt) for a in actions) for rt in needed
+        ):
             return current_user
         first = needed[0] if needed else "*"
         await _record_denial(db, current_user, request, action, first, None)
@@ -1202,6 +1281,8 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
 
 __all__ = [
     "action_for_request",
+    "gate_actions",
+    "method_action_for_request",
     "KNOWN_MANAGE_PERMISSIONS",
     "MULTI_ROW_DELETE_SUFFIXES",
     "caller_can_grant",
@@ -1212,6 +1293,7 @@ __all__ = [
     "require_any_resource_permission",
     "require_permission",
     "require_permission_or_scoped",
+    "require_type_level",
     "mount_route_key",
     "request_route_key",
     "route_key",

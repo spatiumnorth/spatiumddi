@@ -61,6 +61,7 @@ from app.models.acme_client import (
 from app.models.appliance import CERT_SOURCE_LETSENCRYPT, ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import read_only_post
 
 logger = structlog.get_logger(__name__)
 
@@ -409,6 +410,7 @@ async def delete_account(db: DB, user: CurrentUser, request: Request) -> None:
     dependencies=[Depends(require_certificate_store("read"))],
     summary="Preview how each domain's DNS-01 challenge would be solved",
 )
+@read_only_post
 async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainResolution]:
     """For each domain, report whether a SpatiumDDI-managed zone covers it
     (auto-solve, incl. cloud-hosted zones via the agentless drivers) or
