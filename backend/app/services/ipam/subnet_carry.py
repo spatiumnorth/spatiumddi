@@ -56,6 +56,20 @@ UNION_FLAGS: tuple[str, ...] = (
 # subnet / where it lives, and silently picking one is a wrong answer.
 HARD_MERGE_COLUMNS: tuple[str, ...] = ("kind", "customer_id", "site_id")
 
+# Columns a merge takes from the target without any special handling. Sources
+# that disagree on one get a preview warning naming each value and the one
+# kept, so the operator sees what Confirm merge discards (#3326).
+TARGET_WINS_COLUMNS: tuple[str, ...] = (
+    "tags",
+    "custom_fields",
+    "vxlan_id",
+    "domain_name",
+    "dns_servers",
+    "dns_group_ids",
+    "dns_additional_zone_ids",
+    "ipv6_allocation_policy",
+)
+
 # Columns that identify a subnet as mirrored by an integration or imported.
 NOT_CARRIED_PROVENANCE: tuple[str, ...] = (
     *sorted(INTEGRATION_OWNERSHIP_FKS),
@@ -121,6 +135,18 @@ def merge_conflicts_and_warnings(sources: list[Any]) -> tuple[list[tuple[str, st
                 f"Sources disagree on {c}: {', '.join(sorted(vals))}. The merged "
                 f"subnet takes the target's value ({getattr(target, c)!r})."
             )
+    for c in TARGET_WINS_COLUMNS:
+        values = [getattr(s, c) for s in sources]
+        # Empty and unset are the same answer (None vs {} vs []).
+        norm = [v or None for v in values]
+        if all(v == norm[0] for v in norm):
+            continue
+        shown = sorted({repr(v) for v in values})
+        warnings.append(
+            f"Sources disagree on {c}: {', '.join(shown)}. The merged subnet "
+            f"takes the target's value ({getattr(target, c)!r}); the other "
+            "sources' values are not kept."
+        )
     if any(getattr(s, c) for s in sources for c in NOT_CARRIED_PROVENANCE):
         warnings.append(
             "At least one source is owned by an integration or was imported; the "

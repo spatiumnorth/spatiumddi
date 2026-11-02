@@ -327,3 +327,38 @@ async def test_merge_site_disagreement_is_a_conflict(db_session: AsyncSession) -
     assert any(c.type == "metadata_mismatch:kind" for c in preview.conflicts)
     assert any("subnet_role" in w for w in preview.warnings)
     assert any("discovery_interval_minutes" in w for w in preview.warnings)
+
+
+@pytest.mark.asyncio
+async def test_merge_previews_every_setting_the_target_wins_3326(
+    db_session: AsyncSession,
+) -> None:
+    """#3326: tags / custom fields / VXLAN / domain / DNS servers that
+    disagree are named in the preview, with the value the merge keeps."""
+    a, b = await _make_pair(db_session)
+    a.tags, b.tags = {"env": "xp-a", "only-a": "1"}, {"env": "xp-b", "only-b": "1"}
+    a.custom_fields, b.custom_fields = {"xp_note": "a"}, {"xp_note": "b"}
+    a.vxlan_id, b.vxlan_id = 2361, 2362
+    a.domain_name, b.domain_name = "a.example.test", "b.example.test"
+    a.dns_servers, b.dns_servers = ["192.0.2.53"], ["192.0.2.54"]
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert preview.conflicts == []
+    for col in ("tags", "custom_fields", "vxlan_id", "domain_name", "dns_servers"):
+        assert any(f"disagree on {col}:" in w for w in preview.warnings), col
+    vx = next(w for w in preview.warnings if "vxlan_id" in w)
+    assert "2361" in vx and "2362" in vx and "target's value (2361)" in vx
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
+    assert result.merged_subnet.vxlan_id == 2361
+
+
+@pytest.mark.asyncio
+async def test_merge_does_not_warn_when_target_wins_settings_agree_3326(
+    db_session: AsyncSession,
+) -> None:
+    a, b = await _make_pair(db_session)
+    a.tags, b.tags = {"env": "x"}, {"env": "x"}
+    a.custom_fields, b.custom_fields = {}, None
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert not any("disagree on" in w for w in preview.warnings)
