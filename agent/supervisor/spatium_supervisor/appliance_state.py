@@ -658,6 +658,19 @@ _SET_NEXT_BOOT_TRIGGER_FILE = Path(
 _SET_DEFAULT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/slot-set-default-pending"
 )
+# #3284: the Boot once this supervisor last fired: ``<slot> <boot_id>``. The
+# control plane keeps ``desired_next_boot_slot`` on every heartbeat response
+# until the node reports that slot as its ``current_slot``, and the host runner
+# renames the trigger away when it finishes, so trigger presence alone re-ran
+# set-next-boot on every heartbeat before the reboot, and after a trial of the
+# slot fell back it armed the failed slot again. One request is one run; the
+# record goes when a response carries no request (``forget_set_next_boot_fire``).
+_SET_NEXT_BOOT_FIRED_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-set-next-boot-fired"
+)
+# A kernel boot id. Anything else in the record (a power cut can leave NUL
+# bytes, #1747) is read as no boot, so it never reaches a heartbeat.
+_BOOT_ID_FORMAT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # Issue #153 — SNMP config rollout. The trigger file carries the
 # rendered snmpd.conf body so the host runner doesn't need to re-
 # render. The hash sidecar lets the agent skip re-firing after an
@@ -1968,6 +1981,48 @@ def read_slot_versions() -> tuple[str | None, str | None]:
     return slot_a, slot_b
 
 
+def _read_set_next_boot_fired() -> tuple[str | None, str | None]:
+    """(slot, boot id) of the Boot once this supervisor last fired (#3284),
+    or ``(None, None)`` when there is no record or it does not parse."""
+    try:
+        parts = _SET_NEXT_BOOT_FIRED_MARKER.read_text(encoding="utf-8", errors="replace").split()
+    except OSError:
+        return None, None
+    if not parts or parts[0] not in ("slot_a", "slot_b"):
+        return None, None
+    boot = parts[1] if len(parts) > 1 and _BOOT_ID_FORMAT.fullmatch(parts[1]) else None
+    return parts[0], boot
+
+
+def forget_set_next_boot_fire() -> None:
+    """#3284: the control plane holds no Boot once for this node any more
+    (it booted the slot, a reboot spent the request, or none was made), so
+    the next request is a new one and fires."""
+    try:
+        _SET_NEXT_BOOT_FIRED_MARKER.unlink(missing_ok=True)
+    except OSError:
+        # Not ours to remove, or the mount is gone: the record stays and the
+        # next request for the same slot waits for a later forget.
+        pass
+
+
+def read_set_next_boot_ran() -> tuple[str | None, str | None]:
+    """#3284: (slot, boot id) of the Boot once this node has run for the
+    standing request, once the runner has taken its trigger; ``(None,
+    None)`` while the trigger is still there, or when nothing was fired.
+
+    The boot id is the one it ran in. The heartbeat reports both, and the
+    control plane retires the request when it ran in an earlier boot than
+    the heartbeat's: the reboot in between spent it, whether the trial of
+    the slot booted or fell back.
+    """
+    if detect_deployment_kind() != "appliance":
+        return None, None
+    if _SET_NEXT_BOOT_TRIGGER_FILE.exists():
+        return None, None
+    return _read_set_next_boot_fired()
+
+
 def maybe_fire_set_next_boot(
     desired_slot: str | None,
     current_slot: str | None,
@@ -1983,9 +2038,16 @@ def maybe_fire_set_next_boot(
     tick).
 
     Strict appliance-only gate (mirrors ``maybe_fire_reboot``). Empty
-    intent or invalid slot literal → skip. Idempotent via trigger-
-    file presence; the host runner renames the trigger to .done /
-    .failed on completion.
+    intent or invalid slot literal → skip. A trigger fired in this boot is
+    the runner's; the host runner renames it to .done / .failed on
+    completion. One left by an earlier boot is written over (#3283).
+
+    #3284: fires once per request. The response carries the request on
+    every heartbeat until the slot boots, so a run already fired for this
+    slot (recorded in ``_SET_NEXT_BOOT_FIRED_MARKER``, kept across reboots)
+    is not fired again: not on the heartbeats before the reboot, and not
+    after a trial of the slot fell back. The record is forgotten when a
+    response carries no request.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1993,7 +2055,26 @@ def maybe_fire_set_next_boot(
         return False
     if current_slot == desired_slot:
         return False
+    boot_id = read_boot_id()
+    fired_slot, fired_boot = _read_set_next_boot_fired()
     if _SET_NEXT_BOOT_TRIGGER_FILE.exists():
+        # #3283: a trigger fired in this boot is the runner's; it renames it
+        # away when it finishes. One from an earlier boot never will be: a
+        # reboot cut its run, ``PathChanged=`` does not fire for a file that
+        # is already there when the watch starts, and every later request
+        # skipped here, so no Boot once ran on the node again. Write the
+        # request over it: the rename onto the watched path is a change the
+        # watch sees. Without a boot id this boot cannot be told from the one
+        # that wrote it, so the trigger is left alone.
+        if not boot_id or fired_boot == boot_id:
+            return False
+        log.warning(
+            "supervisor.slot_set_next_boot.stale_trigger_replaced",
+            fired_slot=fired_slot,
+            fired_boot_id=fired_boot,
+            desired_slot=desired_slot,
+        )
+    elif fired_slot == desired_slot:
         return False
     try:
         _SET_NEXT_BOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -2004,9 +2085,22 @@ def maybe_fire_set_next_boot(
         # metachars reach the runner.
         tmp.write_text(desired_slot + "\n", encoding="utf-8")
         tmp.replace(_SET_NEXT_BOOT_TRIGGER_FILE)
-        return True
     except OSError:
         return False
+    _record_set_next_boot_fire(desired_slot, boot_id)
+    return True
+
+
+def _record_set_next_boot_fire(slot: str, boot_id: str | None) -> None:
+    """#3284: record the Boot once just fired, after its trigger and never
+    before (a record of a fire that never happened would swallow the
+    request). Renamed into place, so it is whole or absent."""
+    try:
+        tmp = _SET_NEXT_BOOT_FIRED_MARKER.with_suffix(".new")
+        tmp.write_text(f"{slot} {boot_id or ''}\n", encoding="utf-8")
+        tmp.replace(_SET_NEXT_BOOT_FIRED_MARKER)
+    except OSError as exc:
+        log.warning("supervisor.slot_set_next_boot.fire_record_failed", error=str(exc))
 
 
 def maybe_fire_set_default(
@@ -4756,6 +4850,9 @@ def collect() -> dict[str, object]:
         last_upgrade_progress = {}
 
     slot_a_version, slot_b_version = read_slot_versions()
+    next_boot_ran_slot, next_boot_ran_boot_id = (
+        read_set_next_boot_ran() if is_appliance else (None, None)
+    )
     cluster_health = read_cluster_health() if is_appliance else None
     # #402 — fold host disk partitions into the cluster_health dict (stored
     # verbatim by the backend; no schema change). Only on appliance hosts;
@@ -4839,6 +4936,11 @@ def collect() -> dict[str, object]:
         "boot_id": read_boot_id() if is_appliance else None,
         # #3008 — a console F9 cancelled a reboot in this boot.
         "reboot_cancelled_boot_id": read_reboot_cancel() if is_appliance else None,
+        # #3284: the Boot once this node ran for the standing request and the
+        # boot it ran in. Run in an earlier boot than ``boot_id``, it was spent
+        # by the reboot since, and the control plane retires the request.
+        "next_boot_ran_slot": next_boot_ran_slot,
+        "next_boot_ran_boot_id": next_boot_ran_boot_id,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
         # #386 Part C — full upgrade status for the Fleet UI.

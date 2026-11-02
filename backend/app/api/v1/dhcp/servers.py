@@ -43,6 +43,7 @@ from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.agents.spool_status import SpoolStatus
+from app.services.api_token_scopes import token_outbound
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
@@ -1118,6 +1119,7 @@ async def test_fortigate_credentials_endpoint(
 
 
 @router.get("/{server_id}/fortigate-interfaces", response_model=list[FortiGateInterface])
+@token_outbound
 async def fortigate_interfaces(
     server_id: uuid.UUID, db: DB, _user: SuperAdmin
 ) -> list[FortiGateInterface]:

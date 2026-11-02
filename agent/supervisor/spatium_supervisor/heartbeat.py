@@ -1626,6 +1626,10 @@ def heartbeat_once(
                 "supervisor.heartbeat.set_next_boot_trigger_fired",
                 desired_slot=desired_next_boot_slot,
             )
+    else:
+        # #3284: no Boot once on the row (retired, or never made): the next
+        # request is a new one, so forget the run fired for the last.
+        appliance_state.forget_set_next_boot_fire()
     if desired_default_slot:
         if appliance_state.maybe_fire_set_default(
             desired_default_slot,

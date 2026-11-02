@@ -22,6 +22,7 @@ from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
+from app.services.api_token_scopes import token_outbound
 from app.services.appliance.diagnostics import (
     generate_diagnostic_bundle,
     list_log_sources,
@@ -101,6 +102,9 @@ async def post_self_test() -> dict:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Download a diagnostic bundle (zip)",
 )
+# The bundle runs the self-test, whose DNS check resolves
+# ``registry-1.docker.io`` through the host's resolver (#3302).
+@token_outbound
 async def get_bundle(db: DB, user: CurrentUser):
     """Returns a zip with logs, container output, system info, and
     redacted config. Admin permission required because the bundle

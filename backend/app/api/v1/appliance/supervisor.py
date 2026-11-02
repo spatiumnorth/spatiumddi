@@ -127,6 +127,7 @@ from app.services.agents.container_oom import (
     carry_restart_history,
     verdict_needs_write,
 )
+from app.services.api_token_scopes import token_outbound
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
     ensure_ca,
@@ -1664,6 +1665,13 @@ class SupervisorHeartbeatRequest(BaseModel):
     # boot id the cancel was made in. A Fleet request stamped for this boot is
     # retired at once rather than at the give-up. None from an older supervisor.
     reboot_cancelled_boot_id: str | None = Field(default=None, max_length=64)
+    # #3284: the Boot once the supervisor has run for the standing request and
+    # the boot it ran in, reported once the host runner has taken its trigger.
+    # A run in an earlier boot than ``boot_id`` was spent by the reboot since:
+    # the trial of that slot booted (and ``current_slot`` already retires the
+    # request) or fell back. None from an older supervisor.
+    next_boot_ran_slot: Literal["slot_a", "slot_b"] | None = None
+    next_boot_ran_boot_id: str | None = Field(default=None, max_length=64)
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
     # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
@@ -3065,7 +3073,22 @@ async def _supervisor_heartbeat(
     # the requested slot as ``current_slot`` — the operator's intent
     # was "boot into this slot next", and we got there. ``durable_
     # default`` is irrelevant here (next-boot is one-shot by design).
-    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
+    #
+    # #3284: and once the node reports it ran that Boot once in an earlier boot
+    # than this heartbeat's: the one-shot was spent by the reboot in between
+    # and the trial fell back. Kept, the request stayed on the row for good:
+    # the Fleet card's Boot once button stayed disabled, the heartbeat
+    # long-poll stayed off, and a supervisor that fires on every response
+    # armed the slot that had just failed again.
+    if row.desired_next_boot_slot is not None and (
+        row.current_slot == row.desired_next_boot_slot
+        or (
+            body.next_boot_ran_slot == row.desired_next_boot_slot
+            and body.next_boot_ran_boot_id is not None
+            and body.boot_id is not None
+            and body.next_boot_ran_boot_id != body.boot_id
+        )
+    ):
         row.desired_next_boot_slot = None
 
     # Auto-clear desired_default_slot once the supervisor reports the
@@ -8734,6 +8757,7 @@ class ApplianceWorkloadsResponse(BaseModel):
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List restartable Deployments / DaemonSets / StatefulSets on an appliance",
 )
+@token_outbound
 async def k8s_list_workloads(
     appliance_id: uuid.UUID,
     current_user: SuperAdmin,
@@ -9173,6 +9197,7 @@ class K8sPodListResponse(BaseModel):
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List pods on the appliance's local k3s (via the supervisor proxy)",
 )
+@token_outbound
 async def k8s_list_pods(
     appliance_id: uuid.UUID,
     current_user: SuperAdmin,
@@ -9253,6 +9278,7 @@ async def k8s_list_pods(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch recent pod logs from the appliance's local k3s",
 )
+@token_outbound
 async def k8s_get_pod_logs(
     appliance_id: uuid.UUID,
     pod: str,

@@ -697,6 +697,7 @@ async def _parity_for_item(
 
 @register_tool(
     name="find_cutover_parity_check",
+    outbound=True,
     permission="superadmin",
     description=(
         "Run a LIVE parity check for cutover plan items (superadmin only; "
