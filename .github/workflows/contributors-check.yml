@@ -70,6 +70,7 @@ jobs:
               echo
               # Logins in code spans, never a bare @login: the issue is
               # refreshed weekly and must not notify the people it names.
+              # shellcheck disable=SC2016  # the backticks are literal Markdown
               sed -E 's/^- @([A-Za-z0-9-]+)/- `\1`/' report.txt
               echo
               echo "Add a row for each in README.md under \`## Contributors\`, with an Area description of what they contributed. If someone should not be listed, add their login to \`.github/contributors-ignore.txt\`."
