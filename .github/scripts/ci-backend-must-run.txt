@@ -199,3 +199,8 @@ charts/spatiumddi/templates/api.yaml
 k8s/base/api.yaml
 docker-compose.yml
 docker-compose.dev.yml
+
+# test_check_contributors.py runs the weekly README Contributors check's
+# script as a subprocess, so editing it (or its ignore list) must run it.
+.github/scripts/check_contributors.py
+.github/contributors-ignore.txt

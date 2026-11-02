@@ -1,0 +1,4 @@
+# Logins check_contributors.py never reports, one per line (case-insensitive).
+# Bots are already skipped by pattern; list a human here only when they opened
+# a PR and are deliberately not named in the README Contributors table.
+# Blank lines and "#" comments are ignored.

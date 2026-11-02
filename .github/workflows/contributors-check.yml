@@ -1,0 +1,83 @@
+name: Contributors check
+
+# Weekly: does the README Contributors table name everyone who has opened a
+# PR (any state)? If not, open ONE tracking issue (or refresh the open one);
+# if everyone is listed, close it. The table itself stays hand-written.
+# The comparison lives in .github/scripts/check_contributors.py, which exits
+# 2 (not 0) when it could not evaluate anything, so a broken check is red.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: contributors-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: README Contributors vs PR authors
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: List every PR author
+        run: |
+          gh api --paginate "repos/${REPO}/pulls?state=all&per_page=100" \
+            --jq '.[] | {login: .user.login, number: .number}' \
+            | jq -s . > prs.json
+
+      - name: Compare against the README
+        id: check
+        run: |
+          if python3 .github/scripts/check_contributors.py --prs prs.json > report.txt; then
+            echo "missing=0" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              echo "check_contributors.py could not run (exit ${status})" >&2
+              exit "$status"
+            fi
+            echo "missing=1" >> "$GITHUB_OUTPUT"
+          fi
+          cat report.txt
+
+      - name: Open, refresh or close the tracking issue
+        run: |
+          PREFIX="README Contributors: add "
+          existing="$(gh issue list --repo "$REPO" --state open --limit 100 \
+            --json number,title \
+            --jq "[.[] | select(.title | startswith(\"${PREFIX}\"))] | .[0].number // empty")"
+
+          if [ "${{ steps.check.outputs.missing }}" = "1" ]; then
+            count="$(grep -c '^- @' report.txt)"
+            title="${PREFIX}${count} contributor(s)"
+            {
+              echo "These people have opened a pull request but are not in the README Contributors table:"
+              echo
+              cat report.txt
+              echo
+              echo "Add a row for each in README.md under \`## Contributors\`, with an Area description of what they contributed. If someone should not be listed, add their login to \`.github/contributors-ignore.txt\`."
+              echo
+              echo "_Opened by .github/workflows/contributors-check.yml; this issue is refreshed weekly._"
+            } > body.md
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --repo "$REPO" --title "$title" --body-file body.md
+            else
+              gh issue create --repo "$REPO" --title "$title" --body-file body.md \
+                --label "area:ops" --label "theme:ops-tooling" --assignee mzac
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "Everyone who has opened a PR is now listed (or ignored); closing."
+          fi

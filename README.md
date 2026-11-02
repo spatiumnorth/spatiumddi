@@ -1511,8 +1511,10 @@ Thanks to everyone who has opened a pull request against SpatiumDDI.
 
 Opened a PR and not listed? That is an oversight, not a judgement — please
 say so on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)
-and it will be fixed. This list is maintained by hand, so it is added to as
-part of merging each contributor's first PR.
+and it will be fixed. The list is still written by hand, as part of merging
+each contributor's first PR; a weekly check
+(`.github/workflows/contributors-check.yml`) opens an issue when someone who
+has opened a PR is missing.
 
 ---
 

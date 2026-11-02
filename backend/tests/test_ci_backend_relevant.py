@@ -101,6 +101,10 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_release_version_script.py": "scripts/release_version.py",
     "test_changelog_assemble.py": "scripts/changelog_assemble.py",
     "test_format_release_notes.py": "scripts/format_release_notes.py",
+    "test_check_contributors.py": (
+        ".github/scripts/check_contributors.py",
+        ".github/contributors-ignore.txt",
+    ),
     "test_release_tags_script.py": ".github/scripts/release-tags.sh",
     "test_trivy_scan_script.py": ("scripts/trivy-scan.sh", "Makefile"),
     "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",
