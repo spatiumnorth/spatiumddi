@@ -26,6 +26,7 @@ from app.models.network import (
 )
 from app.services.ai.tools.base import register_tool
 from app.services.audit_redact import redact_audit_value
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.oui import is_voip_phone_vendor, lookup_vendor
 
 # ── network devices ───────────────────────────────────────────────────
@@ -564,6 +565,7 @@ class PingHostArgs(BaseModel):
     ),
     args_model=PingHostArgs,
     category="network",
+    module="tools.network",
 )
 async def ping_host(db: AsyncSession, user: User, args: PingHostArgs) -> dict[str, Any]:
     target = _validate_target(args.target)
@@ -574,6 +576,12 @@ async def ping_host(db: AsyncSession, user: User, args: PingHostArgs) -> dict[st
                 "IPv4 / IPv6 address or hostname."
             ),
         }
+
+    # #722 / #3302 — same do-not-probe gate as ``network_ping`` and the
+    # REST ``/tools/ping`` route; this tool spawns ping directly.
+    verdict = await check_probe_target(db, target)
+    if verdict.blocked:
+        return {"target": target, "error": verdict.message(action="Pinging")}
 
     # Pick the right binary for v4/v6. ``ping`` on modern Debian /
     # Alpine resolves both, but explicit ping6 is safer on some
