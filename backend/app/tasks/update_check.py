@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.exc_text import describe_http_exc
 from app.core.versions import canonical_version, includes_release, parse_release
 from app.db import task_connect_args
 from app.models.settings import PlatformSettings
@@ -131,11 +132,12 @@ async def _run_check() -> dict[str, Any]:
                 # ValueError covers JSON-decode issues. Either way we
                 # surface the message so the UI can explain the stale
                 # check.
-                ps.latest_check_error = str(exc)[:500]
+                reason = describe_http_exc(exc)
+                ps.latest_check_error = reason[:500]
                 ps.latest_checked_at = now
                 await db.commit()
                 logger.warning("update_check_network_error", error=str(exc))
-                return {"status": "network_error", "error": str(exc)}
+                return {"status": "network_error", "error": reason}
 
             tag = (data.get("tag_name") or "").strip()
             html_url = data.get("html_url") or None

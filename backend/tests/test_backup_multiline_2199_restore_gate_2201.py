@@ -352,3 +352,117 @@ def test_resolve_dump_format_ignores_format_version() -> None:
     assert resolve({"format_version": 1}, names_plain) == "plain"
     assert resolve({"format_version": 2}, names_custom) == "custom"
     assert resolve({}, {"manifest.json"}) is None
+
+
+# ── #2222: a destination archive's format is readable before restore ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exclude_secrets", "expected_format"), [(True, "plain"), (False, "custom")]
+)
+async def test_destination_archive_preview_reports_the_dump_format(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    stub_pg_dump: None,
+    tmp_path,
+    exclude_secrets: bool,
+    expected_format: str,
+) -> None:
+    headers = await _superadmin(db_session)
+    data = await _build(db_session, exclude_secrets=exclude_secrets)
+    name = "spatiumddi-backup-20260101-000000.zip"
+    (tmp_path / name).write_bytes(data)
+    target = BackupTarget(
+        name="t2222",
+        kind="local_volume",
+        config={"path": str(tmp_path)},
+        passphrase_encrypted=b"x",
+    )
+    db_session.add(target)
+    await db_session.flush()
+
+    resp = await client.get(
+        f"/api/v1/backup/targets/{target.id}/archives/{name}/manifest-preview",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["dump_format"] == expected_format
+    assert body["selective_restore_supported"] is (expected_format == "custom")
+    assert body["restorable"] is True
+
+    missing = await client.get(
+        f"/api/v1/backup/targets/{target.id}/archives/spatiumddi-backup-20260101-000001.zip/manifest-preview",
+        headers=headers,
+    )
+    assert missing.status_code in (404, 502), missing.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["%2E%2E", "notes.txt", "spatiumddi-backup-x.tar"])
+async def test_destination_archive_preview_refuses_a_name_that_is_not_ours(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    """The preview takes its filename through the same ``_archive_name``
+    gate as download / restore / delete, so a traversal or a file the
+    listing never offered is a 422 before the driver is asked for it."""
+    headers = await _superadmin(db_session)
+    (tmp_path / "notes.txt").write_bytes(b"not an archive")
+    target = BackupTarget(
+        name="t2222n",
+        kind="local_volume",
+        config={"path": str(tmp_path)},
+        passphrase_encrypted=b"x",
+    )
+    db_session.add(target)
+    await db_session.flush()
+
+    calls: list[str] = []
+    driver = get_destination("local_volume")
+
+    async def _download(**kwargs: object) -> bytes:
+        calls.append(str(kwargs.get("filename")))
+        return b""
+
+    monkeypatch.setattr(driver, "download", _download)
+    resp = await client.get(
+        f"/api/v1/backup/targets/{target.id}/archives/{name}/manifest-preview",
+        headers=headers,
+    )
+    assert resp.status_code == 422, resp.text
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_destination_archive_preview_is_superadmin_only(
+    client: AsyncClient, db_session: AsyncSession, tmp_path
+) -> None:
+    user = User(
+        username="nosa2222",
+        email="nosa2222@example.com",
+        display_name="nosa2222",
+        hashed_password=hash_password("password123"),
+        auth_source="local",
+        is_superadmin=False,
+    )
+    user.groups = []
+    db_session.add(user)
+    target = BackupTarget(
+        name="t2222p",
+        kind="local_volume",
+        config={"path": str(tmp_path)},
+        passphrase_encrypted=b"x",
+    )
+    db_session.add(target)
+    await db_session.flush()
+    resp = await client.get(
+        f"/api/v1/backup/targets/{target.id}/archives/"
+        "spatiumddi-backup-20260101-000000.zip/manifest-preview",
+        headers={"Authorization": f"Bearer {create_access_token(str(user.id))}"},
+    )
+    assert resp.status_code == 403, resp.text

@@ -37,7 +37,8 @@ import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { exportErrorMessage, isRefused } from "@/lib/refusal";
 
 // E911 dispatchable location (issue #972 Phase 1a).
 //
@@ -212,6 +213,26 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
     onError: (e) => setError(formatApiError(e)),
   });
 
+  // The exports need the same read on `e911_location` the list does, so a
+  // refused list means they would be refused too (#3255).
+  const exportGate = permissionGate(
+    !isRefused(query.error),
+    "Requires read permission on e911_location",
+  );
+  const runExport = async (kind: "csv" | "ios") => {
+    setError("");
+    try {
+      await e911Api.download(kind);
+    } catch (e) {
+      setError(
+        exportErrorMessage(
+          e,
+          kind === "csv" ? "the location CSV" : "the IOS snippets",
+        ),
+      );
+    }
+  };
+
   const items = query.data?.items ?? [];
 
   return (
@@ -259,13 +280,15 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
           <RefreshCw className="h-4 w-4" /> Refresh
         </HeaderButton>
         <HeaderButton
-          onClick={() => void e911Api.download("csv")}
+          onClick={() => void runExport("csv")}
+          {...exportGate}
           title="Every ERL and its bindings — for review, for an auditor, or to map into Cisco Emergency Responder's own bulk load"
         >
           <Download className="h-4 w-4" /> CSV
         </HeaderButton>
         <HeaderButton
-          onClick={() => void e911Api.download("ios")}
+          onClick={() => void runExport("ios")}
+          {...exportGate}
           title="LLDP-MED location stanzas for you to review and apply yourself — SpatiumDDI configures no switches"
         >
           <FileCode className="h-4 w-4" /> IOS snippets

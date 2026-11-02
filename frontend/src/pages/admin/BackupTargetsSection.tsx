@@ -558,6 +558,26 @@ function RestoreFromArchiveModal({
   const [confirm, setConfirm] = useState("");
   const [mode, setMode] = useState<"full" | "selective">("full");
   const [sections, setSections] = useState<string[]>([]);
+  // The archive's dump format, read once for the archive picked (#2222):
+  // a selective restore needs pg_dump's custom format and the API refuses
+  // a plain-SQL archive, so the modal knows before offering it.
+  const previewQ = useQuery({
+    queryKey: ["backup-target-archive-preview", targetId, filename],
+    queryFn: () => backupTargetsApi.previewArchiveManifest(targetId, filename),
+    retry: false,
+    staleTime: Infinity,
+  });
+  const selectiveDisabledReason = previewQ.isLoading
+    ? "Checking the archive's database dump format…"
+    : previewQ.isError
+      ? "The archive's database dump format could not be read, so a selective restore is not offered. Full restore is unaffected."
+      : previewQ.data?.selective_restore_supported
+        ? null
+        : "Selective restore needs a custom-format database dump. This archive's dump is " +
+          (previewQ.data?.dump_format === "plain"
+            ? "plain SQL (an older build, or Exclude secrets diagnostic mode, wrote it)"
+            : "not in a recognised format") +
+          " — use Full restore.";
   const restoreMut = useMutation({
     mutationFn: () =>
       backupTargetsApi.restoreFromArchive(targetId, {
@@ -573,7 +593,7 @@ function RestoreFromArchiveModal({
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
-    (mode !== "selective" || sections.length > 0);
+    (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
   const { dialogProps, titleProps } = useModalDialog(onClose);
 
@@ -628,6 +648,7 @@ function RestoreFromArchiveModal({
             onModeChange={setMode}
             selected={sections}
             onChange={setSections}
+            selectiveDisabledReason={selectiveDisabledReason}
           />
           <Field label="Passphrase" required>
             <input
