@@ -31,7 +31,8 @@ BOOT = "11111111-2222-3333-4444-555555555555"
 
 
 def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "ok",
-         systemctl_sleep: float = 0, cap_s: int = 240, extra_env: dict | None = None):
+         systemctl_sleep: float = 0, cap_s: int = 240, extra_env: dict | None = None,
+         slot_units: str = "", slot_wait_cap_s: int = 900):
     log = tmp_path / "calls.log"
     handoff_sh = tmp_path / "handoff"
     # --undo always returns at once; only --before-reboot takes the body
@@ -51,8 +52,14 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
     sc = bindir / "systemctl"
     issued = tmp_path / "state" / "power-action-issued"
     # records what the issued marker held at the moment systemctl ran
+    # ``systemctl show -p ActiveState --value <unit>`` (#3169's slot-switch
+    # wait) answers from units/<unit> ("inactive" when absent) and is logged
+    # apart, so the call order the other tests assert on is unchanged.
+    (tmp_path / "units").mkdir(exist_ok=True)
     sc.write_text(
-        f'#!/bin/bash\necho "systemctl $*" >> {log}\n'
+        f'#!/bin/bash\nif [ "$1" = show ]; then echo "$5" >> {tmp_path}/show.log; '
+        f'cat {tmp_path}/units/"$5" 2>/dev/null || echo inactive; exit 0; fi\n'
+        f'echo "systemctl $*" >> {log}\n'
         f'cat {issued} > {tmp_path}/issued-at-systemctl 2>/dev/null\n'
         f'sleep {systemctl_sleep}\nexit {systemctl_rc}\n'
     )
@@ -66,7 +73,9 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
            "SPATIUM_POWER_ACTION_LOCK": str(tmp_path / "state"),
            "SPATIUM_POWER_ACTION_ISSUED": str(issued),
            "SPATIUM_BOOT_ID_FILE": str(tmp_path / "boot_id"),
-           "SPATIUM_POWER_ACTION_HANDOFF_CAP_S": str(cap_s)}
+           "SPATIUM_POWER_ACTION_HANDOFF_CAP_S": str(cap_s),
+           "SPATIUM_POWER_ACTION_SLOT_UNITS": slot_units,
+           "SPATIUM_POWER_ACTION_SLOT_WAIT_CAP_S": str(slot_wait_cap_s)}
     proc = subprocess.Popen([str(SCRIPT), action], env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     return proc, log
@@ -133,6 +142,59 @@ def test_a_handoff_past_the_cap_is_stopped_and_the_reboot_goes_on(tmp_path: Path
     assert proc.wait(30) == 0
     assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
     assert "did not finish within 1 s" in proc.stdout.read()
+
+
+SLOT_UNIT = "spatiumddi-slot-set-next-boot.service"
+
+
+def test_a_reboot_waits_for_a_running_slot_switch(tmp_path: Path) -> None:
+    """#3169 — a slot switch copies ~1 GB of image tarballs before it flips
+    GRUB. A reboot that lands mid-copy stops it and the node comes back on the
+    same slot, so the wrapper waits for the switch unit to finish."""
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / SLOT_UNIT).write_text("activating\n")
+    proc, log = _run(tmp_path, "reboot", slot_units=f"spatiumddi-slot-rollback.service {SLOT_UNIT}")
+    _wait_for(lambda: (tmp_path / "show.log").exists()
+              and (tmp_path / "show.log").read_text().count(SLOT_UNIT) >= 2)
+    assert _calls(log) == [], "the reboot went ahead while a slot switch was still running"
+    (units / SLOT_UNIT).write_text("inactive\n")
+    assert proc.wait(30) == 0
+    assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
+    assert "waiting for a slot switch to finish" in proc.stdout.read()
+
+
+def test_a_slot_switch_past_the_cap_does_not_hold_the_reboot(tmp_path: Path) -> None:
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / SLOT_UNIT).write_text("activating\n")
+    proc, log = _run(tmp_path, "reboot", slot_units=SLOT_UNIT, slot_wait_cap_s=2)
+    assert proc.wait(30) == 0
+    assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
+    assert "still running after 2 s" in proc.stdout.read()
+
+
+def test_a_stop_while_waiting_for_a_slot_switch_never_reboots(tmp_path: Path) -> None:
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / SLOT_UNIT).write_text("activating\n")
+    proc, log = _run(tmp_path, "reboot", slot_units=SLOT_UNIT)
+    _wait_for(lambda: (tmp_path / "show.log").exists())
+    started = time.monotonic()
+    proc.terminate()
+    # Non-zero, not exactly 1: #3162 makes a cancel end by the signal it was
+    # stopped with. Either way the caller reads "no reboot".
+    assert proc.wait(20) != 0
+    assert time.monotonic() - started < 10
+    assert "systemctl reboot" not in _calls(log)
+
+
+def test_the_default_slot_units_are_the_three_switch_runners() -> None:
+    text = SCRIPT.read_text()
+    for unit in ("spatiumddi-slot-rollback.service", "spatiumddi-slot-set-default.service",
+                 "spatiumddi-slot-set-next-boot.service"):
+        assert unit in text
+        assert (EXTRA / "etc" / "systemd" / "system" / unit).is_file(), unit
 
 
 def test_an_unknown_action_does_nothing(tmp_path: Path) -> None:

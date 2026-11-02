@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPLease, DHCPScope
 from app.models.ipam import IPAddress, Subnet
+from app.services.ipam.host_name import current_fqdn
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
 
 VendorSource = Literal["ipam", "dhcp_active", "all"]
@@ -209,7 +210,7 @@ async def find_devices(
                     "mac_address": str(r.mac_address),
                     "vendor": vendor,
                     "hostname": r.hostname,
-                    "fqdn": r.fqdn,
+                    "fqdn": current_fqdn(r.hostname, r.fqdn),
                     "subnet_id": str(r.subnet_id) if r.subnet_id else None,
                     "subnet_network": str(sub.network) if sub else None,
                     "subnet_name": sub.name if sub else None,

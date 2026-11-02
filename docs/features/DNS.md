@@ -543,10 +543,10 @@ so there is no private-key custody.
   paste at the parent registrar, plus a per-key table (tag / type / state).
   The DS shown is the set BIND itself would publish as CDS: only keys whose
   `DSState` is rumoured or omnipresent. So a newly signed zone shows **no
-  DS until its DNSKEY has propagated** (on the built-in `default` policy
-  about two hours: DNSKEY TTL + publish-safety + propagation delay), and a
-  KSK being withdrawn at the end of a rollover drops out of the card when
-  BIND withdraws it. The agent re-reads this state every 5 minutes, not
+  DS until its new signatures have propagated**: on the built-in `default`
+  policy about a day, since BIND's own `PublishCDS` time for a new key
+  falls 24 h 5 min after signing (#3154). A KSK being withdrawn at the end
+  of a rollover drops out of the card when BIND withdraws it. The agent re-reads this state every 5 minutes, not
   only after a config change, so both transitions reach the card on their
   own.
 - **Manual rollover.** The card's per-key **Roll** button
