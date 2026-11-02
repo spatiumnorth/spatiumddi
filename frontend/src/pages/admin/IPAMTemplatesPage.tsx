@@ -844,6 +844,8 @@ export function IPAMTemplatesPage() {
                         });
                       }}
                       className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={`Edit template ${t.name}`}
+                      title="Edit template"
                       {...writeGate}
                     >
                       <Pencil className="h-3 w-3" />
@@ -858,6 +860,8 @@ export function IPAMTemplatesPage() {
                           deleteMut.mutate(t.id);
                       }}
                       className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={`Delete template ${t.name}`}
+                      title="Delete template"
                       {...deleteGate}
                     >
                       <Trash2 className="h-3 w-3" />

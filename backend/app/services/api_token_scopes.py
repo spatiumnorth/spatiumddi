@@ -3,7 +3,9 @@
 Five well-known scopes that compose by union:
 
 * ``read`` — restricts the token to safe-method requests only
-  (``GET`` / ``HEAD`` / ``OPTIONS``). Any mutation 401s.
+  (``GET`` / ``HEAD`` / ``OPTIONS``), plus the POST routes that carry
+  the :func:`read_only_post` marker (a filter / preview body, no mutation).
+  Any other mutation is refused.
 * ``ipam:write`` — allows mutations under ``/api/v1/ipam``,
   ``/api/v1/vlans``, ``/api/v1/vrfs``, ``/api/v1/network-devices``.
   Read traffic anywhere is also allowed by ``read`` if combined.
@@ -27,7 +29,8 @@ whose prefix happens to start with the same letters.
 Empty ``scopes`` = no scope restriction (the existing RBAC path
 is the only gate). Non-empty = enforced BEFORE RBAC at the auth
 layer; a request that doesn't match any of the token's scopes
-401s with ``token scope insufficient``. Multiple scopes form a
+is refused 403 with ``token scope insufficient`` (the credential is valid,
+so 401 — which tells a client to re-authenticate — would be wrong, #3223). Multiple scopes form a
 union (any single match passes).
 
 Why a closed vocabulary? Storing free-form strings would let an
@@ -38,6 +41,31 @@ endpoint reject the typo with 422 at issuance time.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+_READ_ONLY_POST_ATTR = "__token_read_only_post__"
+
+
+def read_only_post[F: Callable[..., Any]](fn: F) -> F:
+    """Mark a POST handler as read-only for the coarse token-scope gate.
+
+    A ``read``-scoped token may call a marked route. Use it ONLY for a POST
+    whose body is a filter / preview / dry-run input and which cannot change
+    state: no row written (an audit row for the read excepted), no queued op,
+    no outbound traffic or probe (a WinRM / API pull from a managed server
+    counts as outbound). RBAC on the route is unchanged — this only
+    stops the scope gate reading every POST as a write (#3223). Apply under
+    the ``@router.post(...)`` decorator.
+    """
+    setattr(fn, _READ_ONLY_POST_ATTR, True)
+    return fn
+
+
+def is_read_only_post(endpoint: object) -> bool:
+    return bool(getattr(endpoint, _READ_ONLY_POST_ATTR, False))
+
 
 # Vocabulary — values stored verbatim in ``api_token.scopes``. Any
 # new entry needs a matching branch in ``scope_matches_request``.
@@ -85,9 +113,17 @@ def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
     return any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
-def scope_matches_request(scopes: list[str], method: str, path: str) -> bool:
+def scope_matches_request(
+    scopes: list[str], method: str, path: str, *, read_only_route: bool = False
+) -> bool:
     """Decide whether a token with these ``scopes`` can serve the
     request. Empty ``scopes`` always passes (no restriction).
+
+    ``read_only_route`` is True when the matched handler carries
+    :func:`read_only_post`; ``read`` then covers it like a safe method, for
+    a POST only. The marker is a statement about one POST handler, so it
+    never lets ``read`` reach a PUT / PATCH / DELETE, even if the same
+    function were ever registered for one.
 
     Returns True on first match — scopes union, not intersect.
     """
@@ -95,8 +131,9 @@ def scope_matches_request(scopes: list[str], method: str, path: str) -> bool:
         return True
     method = method.upper()
     is_safe = method in _SAFE_METHODS
+    read_only_post_request = read_only_route and method == "POST"
     for scope in scopes:
-        if scope == "read" and is_safe:
+        if scope == "read" and (is_safe or read_only_post_request):
             return True
         # MCP tools are read-only in Wave 2 — any safe method or a
         # JSON-RPC POST to ``/api/v1/ai/mcp`` is fine under ``read``.
@@ -184,6 +221,8 @@ __all__ = [
     "TOKEN_GRANT_ACTIONS",
     "TOKEN_GRANT_RESOURCE_TYPES",
     "TOKEN_SCOPE_VOCABULARY",
+    "is_read_only_post",
+    "read_only_post",
     "scope_matches_request",
     "validate_resource_grant_shape",
     "validate_scopes",

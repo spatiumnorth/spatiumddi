@@ -27,13 +27,19 @@ vi.mock("@/lib/api", async () => {
 vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({ ready: true, enabled: () => true }),
 }));
-vi.mock("@/hooks/usePermissions", () => ({
-  usePermissions: () => ({
-    can: () => false,
-    isSuperadmin: false,
-    isLoading: false,
-  }),
-}));
+vi.mock("@/hooks/usePermissions", async () => {
+  const actual = await vi.importActual<typeof import("@/hooks/usePermissions")>(
+    "@/hooks/usePermissions",
+  );
+  return {
+    ...actual,
+    usePermissions: () => ({
+      can: () => false,
+      isSuperadmin: false,
+      isLoading: false,
+    }),
+  };
+});
 
 const { E911Page } = await import("@/pages/network/E911Page");
 

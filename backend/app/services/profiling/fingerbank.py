@@ -43,6 +43,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str
+from app.core.exc_text import describe_http_exc
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.settings import PlatformSettings
 
@@ -194,7 +195,7 @@ async def lookup(
                 json=payload,
             )
     except httpx.HTTPError as exc:
-        msg = f"fingerbank request failed: {exc}"
+        msg = f"fingerbank request failed: {describe_http_exc(exc)}"
         fingerprint.fingerbank_last_error = msg[:500]
         fingerprint.fingerbank_last_lookup_at = datetime.now(UTC)
         logger.warning("fingerbank_http_error", mac=str(fingerprint.mac_address), error=str(exc))
