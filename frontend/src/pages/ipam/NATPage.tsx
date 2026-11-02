@@ -381,6 +381,13 @@ export function NATPage() {
     },
   });
 
+  // A refusal belongs to the attempt it answered: closing drops it, so
+  // the next mapping's confirm does not open on someone else's error.
+  function closeDelete() {
+    deleteMut.reset();
+    setConfirmDelete(null);
+  }
+
   function refresh() {
     qc.invalidateQueries({ queryKey: ["nat-mappings"] });
   }
@@ -602,10 +609,7 @@ export function NATPage() {
         />
       )}
       {confirmDelete && (
-        <Modal
-          title="Delete NAT mapping?"
-          onClose={() => setConfirmDelete(null)}
-        >
+        <Modal title="Delete NAT mapping?" onClose={closeDelete}>
           <div className="space-y-3 p-4">
             <p className="text-sm">
               Delete NAT mapping{" "}
@@ -619,7 +623,7 @@ export function NATPage() {
             )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setConfirmDelete(null)}
+                onClick={closeDelete}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
               >
                 Cancel

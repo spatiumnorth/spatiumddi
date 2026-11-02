@@ -9464,6 +9464,8 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   });
   const delAliasMut = useMutation({
     mutationFn: (rid: string) => ipamApi.deleteAlias(address.id, rid),
+    // A new attempt clears the previous refusal; a success leaves none.
+    onMutate: () => setError(null),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
@@ -10436,7 +10438,12 @@ export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
               id: confirmDel.id,
             })
           }
-          onClose={() => setConfirmDel(null)}
+          onClose={() => {
+            // A refusal belongs to the attempt it answered; the next
+            // alias opened must not inherit it (#3346).
+            delAlias.reset();
+            setConfirmDel(null);
+          }}
           isPending={delAlias.isPending}
           error={
             delAlias.isError
@@ -10651,7 +10658,11 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
           </>
         }
         onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
-        onClose={() => setConfirmDel(null)}
+        onClose={() => {
+          // Drop the last refusal so the next set opened starts clean.
+          delSet.reset();
+          setConfirmDel(null);
+        }}
       />
     </div>
   );
