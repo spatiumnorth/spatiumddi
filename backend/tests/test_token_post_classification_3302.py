@@ -13,7 +13,7 @@ exactly one of:
 * ``@read_only_post`` - the body is a filter / preview and nothing changes;
 * ``@token_write("why")`` - it is a write, or is kept write-scoped on purpose.
 
-~440 POSTs predate this, so the unclassified ones are a checked-in baseline
+~390 POSTs predate this, so the unclassified ones are a checked-in baseline
 (``token_unclassified_posts_baseline.txt``, the ``lint_untyped_routes.py``
 pattern): it may shrink, never grow, and a stale entry fails too so the file
 cannot drift from the tree. Annotate a handler to retire its line.
@@ -145,10 +145,37 @@ def test_a_post_is_not_both_read_only_and_write() -> None:
 def test_lookup_shaped_posts_are_never_baselined() -> None:
     """The name heuristic is now only a floor under the baseline: a POST that
     looks like a query / preview must be classified for real."""
-    shaped = sorted(
-        p for p in read_baseline() if any(w in p.rsplit("/", 1)[-1] for w in _LOOKUP_WORDS)
-    )
+    # The whole path, as the #3223 regex this replaces did: ``/x/preview/{id}``
+    # or ``/search/{kind}`` must not slip past on its last segment.
+    shaped = sorted(p for p in read_baseline() if any(w in p for w in _LOOKUP_WORDS))
     assert not shaped, "\n".join(shaped)
+
+
+def _depends_on(dependant: Any, name: str) -> bool:
+    return any(
+        getattr(d.call, "__name__", None) == name or _depends_on(d, name)
+        for d in dependant.dependencies
+    )
+
+
+def test_the_skipped_agent_prefixes_hold_only_agent_routes() -> None:
+    """The guard skips the agent prefixes wholesale, so a user-authenticated
+    POST added under one would never be classified. Each must authenticate
+    the agent JWT, or be the PSK ``/register`` that issues it."""
+    wrong = []
+    for route in _real_app().routes:
+        if not hasattr(route, "effective_route_contexts"):
+            continue
+        for c in route.effective_route_contexts():
+            r = c.original_route
+            if "POST" not in (getattr(r, "methods", None) or ()):
+                continue
+            if not _path_under(c.path_format, AGENT_PREFIXES):
+                continue
+            if c.path_format.endswith("/register") or _depends_on(r.dependant, "_auth_agent"):
+                continue
+            wrong.append(c.path_format)
+    assert not wrong, wrong
 
 
 def test_every_write_reason_is_a_real_one() -> None:
