@@ -23,7 +23,7 @@ from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.permissions import require_permission
+from app.core.permissions import refuse_and_audit, require_permission, user_has_permission
 from app.models.auth import User
 from app.models.dhcp import DHCPMACBlock, DHCPServerGroup
 from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist, Subnet
@@ -478,7 +478,6 @@ async def block_mac(body: BlockBody, db: DB, user: WriteUser, request: Request) 
         # block has already landed. Here it is the whole action, so the
         # helper's silent skips would answer 200 having done nothing; say
         # why instead.
-        from app.core.permissions import user_has_permission
         from app.services.block_sync.reconcile import applicable_targets_for_kind
 
         if not user_has_permission(user, "admin", "manage_block_sync"):
@@ -514,6 +513,39 @@ async def block_mac(body: BlockBody, db: DB, user: WriteUser, request: Request) 
         group_ids = list((await db.execute(select(DHCPServerGroup.id))).scalars().all())
         if not group_ids:
             raise HTTPException(status_code=409, detail="no DHCP server groups to block in")
+
+    # #3302 — the DHCP half writes ``dhcp_mac_block`` rows, which the canonical
+    # ``/dhcp/server-groups/{id}/mac-blocks`` route gates on that resource type.
+    # ``write ip_address`` alone must not reach them. Checked per group (so a
+    # grant scoped to one group's id counts), and every target group must pass:
+    # with ``group_id`` omitted a partial application would leave a MAC blocked
+    # in some groups and not others while the caller believed it was fleet-wide,
+    # so the request is refused whole rather than silently narrowed.
+    denied_groups = [
+        gid
+        for gid in group_ids
+        if not user_has_permission(user, "write", "dhcp_mac_block", str(gid))
+    ]
+    if denied_groups:
+        await refuse_and_audit(
+            db,
+            user,
+            request,
+            action="create",
+            resource_type="dhcp_mac_block",
+            resource_id=body.mac_address,
+            resource_display=body.mac_address,
+            reason="write dhcp_mac_block required",
+            detail=(
+                "Blocking a MAC needs write permission on dhcp_mac_block"
+                + (
+                    "."
+                    if body.group_id is not None
+                    else f" in every DHCP server group ({len(denied_groups)} of "
+                    f"{len(group_ids)} not permitted); pass group_id for one you may block in."
+                )
+            ),
+        )
 
     already = {
         r[0]
@@ -578,7 +610,6 @@ async def _maybe_block_upstream(
     module is on, the caller holds ``manage_block_sync``, and a target is
     armed. Routes through the two-person approval gate like the dedicated
     block-sync surface — returns ``(created, change_request_id)``."""
-    from app.core.permissions import user_has_permission
     from app.services.ai.operations import get_operation
     from app.services.ai.operations_risky import CreateNetworkBlockArgs
     from app.services.approvals.gate import gate_or_execute
