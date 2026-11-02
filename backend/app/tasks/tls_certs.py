@@ -29,6 +29,7 @@ import structlog
 from sqlalchemy import delete, or_, select
 
 from app.celery_app import celery_app
+from app.core.exc_text import describe_exc
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
@@ -125,7 +126,7 @@ async def _probe_due_async() -> dict[str, Any]:
                 scanned += 1
             except Exception as exc:  # noqa: BLE001 — isolate one bad row
                 await db.rollback()
-                errors.append(f"{label}: {exc}")
+                errors.append(f"{label}: {describe_exc(exc)}")
                 logger.warning("tls_cert_probe_row_failed", target=label, error=str(exc))
                 # Advance next_check_at in a fresh tx so a row that
                 # repeatably *raises* (not a network failure, which probe_one
@@ -135,7 +136,10 @@ async def _probe_due_async() -> dict[str, Any]:
                     if fresh is not None:
                         fresh.last_checked_at = now
                         fresh.next_check_at = now + timedelta(hours=interval)
-                        fresh.last_error = str(exc)
+                        # ``describe_exc``: a bare ``TimeoutError`` or a
+                        # pyOpenSSL error carries no text, and an empty
+                        # ``last_error`` reads as "no error" (#3236).
+                        fresh.last_error = describe_exc(exc)
                         fresh.consecutive_failures = (fresh.consecutive_failures or 0) + 1
                         await db.commit()
                 except Exception:  # noqa: BLE001

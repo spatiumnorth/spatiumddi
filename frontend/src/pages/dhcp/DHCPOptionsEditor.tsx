@@ -194,7 +194,17 @@ function CustomOptionRow({
   return (
     <div className="space-y-1">
       <div className="flex items-start gap-2">
-        <div ref={wrapperRef} className="relative w-72 shrink-0">
+        <div
+          ref={wrapperRef}
+          className="relative w-72 shrink-0"
+          // An Esc on a suggestion reached with Tab is the list's too: it
+          // closes the list, never the dialog around it (#3157).
+          onKeyDown={(e) =>
+            closePopupOnEscape(e, open && matches.length > 0, () =>
+              setOpen(false),
+            )
+          }
+        >
           <input
             className={inputCls}
             placeholder="Search code or name…"

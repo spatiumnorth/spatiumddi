@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   nameInZoneError,
   parseTtlInput,
+  reversePointerName,
   summarizeZoneNames,
   zoneKindForName,
 } from "./dnsNames";
@@ -89,5 +90,23 @@ describe("zoneKindForName: a name that merely contains arpa is forward (#3079)",
     ["8.b.d.0.1.0.0.2.ip6.arpa.", "reverse"],
   ])("%s is %s", (name, kind) => {
     expect(zoneKindForName(name)).toBe(kind);
+  });
+});
+
+describe("reversePointerName (#3210)", () => {
+  it("builds the in-addr.arpa owner for IPv4", () => {
+    expect(reversePointerName("192.168.0.22")).toBe(
+      "22.0.168.192.in-addr.arpa",
+    );
+  });
+  it("builds the nibble ip6.arpa owner for IPv6", () => {
+    expect(reversePointerName("2001:db8::1")).toBe(
+      "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
+    );
+  });
+  it("returns null for something that is not an address", () => {
+    expect(reversePointerName("not-an-ip")).toBeNull();
+    expect(reversePointerName("300.1.1.1")).toBeNull();
+    expect(reversePointerName("::ffff:1.2.3.4")).toBeNull();
   });
 });

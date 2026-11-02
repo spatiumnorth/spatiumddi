@@ -47,6 +47,7 @@ from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
 from app.services.dns.cname_conflict import describe_cname_conflict
+from app.services.ipam.orphan_aliases import orphan_record_owners, orphan_record_reason
 
 # Types the trash UI browses, and that ``restore_row`` /
 # ``permanent_delete_from_trash`` accept as an addressable target. Cascade-only
@@ -768,6 +769,21 @@ async def restore_batch(
                     "display": label,
                     "reason": reason,
                     **parent_ref(pzone),
+                }
+            )
+        # #3189 — an IPAM record trashed on its own whose address has since
+        # been marked as orphan: it would name a host that publishes nothing.
+        orphaned = await orphan_record_owners(db, batch_id=batch_id)
+        for rid, (fqdn, rtype, address) in orphaned.items():
+            if rid in record_conflicts or rid in record_parent_conflicts:
+                continue
+            record_parent_conflicts[rid] = orphan_record_reason(address)
+            result.conflicts.append(
+                {
+                    "type": "dns_record",
+                    "id": str(rid),
+                    "display": _record_label(fqdn, rtype),
+                    "reason": orphan_record_reason(address),
                 }
             )
 
