@@ -1483,16 +1483,23 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           {groupScopesError != null ? (
-            <ListReadError error={groupScopesError} what="this group's scopes" />
-          ) : tagFilters.length === 0
-            ? `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
-            : unfilteredCount === undefined
-              ? allScopes.length === 1
-                ? "1 scope matches the tag filter."
-                : `${allScopes.length} scopes match the tag filter.`
-              : unfilteredCount === 1
-                ? `${allScopes.length} of 1 scope matches the tag filter.`
-                : `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`}
+            <ListReadError
+              error={groupScopesError}
+              what="this group's scopes"
+            />
+          ) : tagFilters.length === 0 ? (
+            `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
+          ) : unfilteredCount === undefined ? (
+            allScopes.length === 1 ? (
+              "1 scope matches the tag filter."
+            ) : (
+              `${allScopes.length} scopes match the tag filter.`
+            )
+          ) : unfilteredCount === 1 ? (
+            `${allScopes.length} of 1 scope matches the tag filter.`
+          ) : (
+            `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`
+          )}
         </p>
         <div className="flex items-center gap-2">
           <select
