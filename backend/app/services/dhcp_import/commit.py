@@ -171,6 +171,49 @@ def drop_invalid_pools(scopes: list[ImportedScope]) -> list[str]:
     return warnings
 
 
+def reservation_problem(ip: str, subnet_cidr: str) -> str | None:
+    """Why ``ip`` cannot be a reservation of ``subnet_cidr``, or None (#3335).
+
+    The static form's rule (``static_conflicts``: the address must sit inside
+    the subnet its scope serves) plus the two things the form's typed field
+    already guarantees: it is an address, of the subnet's family. Kea rejects
+    its whole config at load for one out-of-range host, so none is stored.
+    """
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+        net = ipaddress.ip_network(subnet_cidr, strict=False)
+    except ValueError:
+        return "not an IP address"
+    if addr.version != net.version:
+        return "address family does not match the subnet"
+    if addr not in net:
+        return f"outside {net}"
+    return None
+
+
+def drop_invalid_reservations(scopes: list[ImportedScope]) -> list[str]:
+    """Remove every reservation whose address is not in its scope's subnet (#3335).
+
+    Same contract as ``drop_invalid_pools``: runs on the preview and again on
+    the commit (which takes the plan the client sends back), the scope is
+    still imported, and each dropped reservation is named in the warnings.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        kept = []
+        for r in scope.reservations:
+            problem = reservation_problem(r.ip_address, scope.subnet_cidr)
+            if problem is None:
+                kept.append(r)
+            else:
+                warnings.append(
+                    f"{scope.subnet_cidr}: reservation {r.ip_address!r} ({r.mac_address}) "
+                    f"not imported: {problem}"
+                )
+        scope.reservations = kept
+    return warnings
+
+
 def _canonical_cidr(raw: str) -> str:
     return str(ipaddress.ip_network(raw, strict=False))
 
@@ -630,6 +673,7 @@ async def commit_import(
     warnings = list(preview.warnings)
     warnings.extend(drop_unservable_hostnames(preview.scopes))
     warnings.extend(drop_invalid_pools(preview.scopes))
+    warnings.extend(drop_invalid_reservations(preview.scopes))
 
     # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
     # importer keeps an unmapped option as ``opt-NN``), whatever the target

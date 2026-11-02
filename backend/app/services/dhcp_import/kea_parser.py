@@ -248,6 +248,19 @@ def _parse_subnet(
         res = _parse_reservation(r, address_family=address_family)
         if res is not None:
             reservations.append(res)
+            # A reservation holds one address; name what a multi-address /
+            # prefix-delegation one leaves out rather than dropping it (#3336).
+            extra = [str(a) for a in (r.get("ip-addresses") or [])[1:]]
+            if extra:
+                parse_warnings.append(
+                    f"Reservation {res.ip_address} ({res.mac_address}): further address(es) "
+                    f"{', '.join(extra)} not imported — a reservation holds one address."
+                )
+            if r.get("prefixes"):
+                parse_warnings.append(
+                    f"Reservation {res.ip_address} ({res.mac_address}): delegated prefix(es) "
+                    f"{', '.join(str(x) for x in r['prefixes'])} not imported."
+                )
         elif isinstance(r, dict) and not r.get("hw-address"):
             skipped_duid += 1
     if skipped_duid:
@@ -366,7 +379,7 @@ def _dhcp_block(obj: dict[str, Any], wrapper: str, subnet_key: str) -> dict[str,
     (``{"Dhcp4": {...}}``) or bare (``{"subnet4": [...]}``)."""
     if wrapper in obj and isinstance(obj[wrapper], dict):
         return obj[wrapper]
-    if subnet_key in obj:
+    if subnet_key in obj or "shared-networks" in obj:
         return obj
     return None
 
@@ -415,14 +428,35 @@ def parse_kea_config(data: bytes) -> ImportPreview:
                 f"({', '.join(str(block[k]) for k in global_timers)} s) not imported — "
                 "renew/rebind times are derived from each lease and cannot be set."
             )
-        for raw_subnet in block.get(subnet_key) or []:
+        # (subnet, options, lease time) — subnets under a shared network are
+        # flattened into scopes, as the ISC importer does (#3336); the network's
+        # own option-data and valid-lifetime are what its members inherit.
+        members: list[tuple[Any, dict[str, Any], int]] = [
+            (s, global_options, global_lease_time) for s in block.get(subnet_key) or []
+        ]
+        for sn in block.get("shared-networks") or []:
+            if not isinstance(sn, dict):
+                continue
+            sn_subnets = sn.get(subnet_key) or []
+            warnings.append(
+                f"{wrapper}: shared network {str(sn.get('name') or '(unnamed)')!r} flattened — "
+                f"its {len(sn_subnets)} member subnet(s) imported individually; SpatiumDDI has "
+                "no shared-network grouping."
+            )
+            sn_options = {
+                **global_options,
+                **_parse_option_data(sn.get("option-data"), address_family=af),
+            }
+            sn_lease = int(sn.get("valid-lifetime") or global_lease_time)
+            members.extend((s, sn_options, sn_lease) for s in sn_subnets)
+        for raw_subnet, sub_options, sub_lease in members:
             if not isinstance(raw_subnet, dict):
                 continue
             scope = _parse_subnet(
                 raw_subnet,
                 address_family=af,
-                global_options=global_options,
-                global_lease_time=global_lease_time,
+                global_options=sub_options,
+                global_lease_time=sub_lease,
                 global_ddns=global_ddns,
                 warnings=warnings,
             )

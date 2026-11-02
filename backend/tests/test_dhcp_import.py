@@ -12,6 +12,8 @@ Two layers:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -593,8 +595,11 @@ async def test_kea_commit_failed_scope_does_not_poison_the_next_2816(
     # the MACADDR column rejects, so its write RAISES (not a returned
     # failure); the second must still land.
     plan = (await _kea_preview(client, token, str(group.id))).json()
-    good = {**plan["scopes"][0], "subnet_cidr": "10.9.10.0/24"}
-    bad_res = {**plan["scopes"][0]["reservations"][0], "mac_address": "not-a-mac"}
+    # The reservation address must sit in each scope's subnet (#3335).
+    res0 = plan["scopes"][0]["reservations"][0]
+    good_res = {**res0, "ip_address": "10.9.10.5"}
+    good = {**plan["scopes"][0], "subnet_cidr": "10.9.10.0/24", "reservations": [good_res]}
+    bad_res = {**res0, "ip_address": "10.9.9.5", "mac_address": "not-a-mac"}
     bad = {**plan["scopes"][0], "subnet_cidr": "10.9.9.0/24", "reservations": [bad_res]}
     plan["scopes"] = [bad, good]
     resp = await client.post(
@@ -617,8 +622,6 @@ async def test_kea_commit_failed_scope_does_not_poison_the_next_2816(
 
 
 def _kea_pools(subnet: str, *pools: str):
-    import json
-
     body = {
         "subnet4" if ":" not in subnet else "subnet6": [
             {"subnet": subnet, "pools": [{"pool": p} for p in pools]}
@@ -777,8 +780,6 @@ async def test_kea_commit_rechecks_pools_in_the_plan_3037(
 
 
 def test_kea_pool_that_is_not_an_object_is_a_preview_warning_3097() -> None:
-    import json
-
     body = {
         "subnet4": [
             {
@@ -907,3 +908,151 @@ async def test_commit_autocreates_v6_64_subnet_3093(
         )
     ).all()
     assert sorted((str(a), str(b)) for a, b in got) == pools
+
+
+# ── Reservation addresses + shared networks (#3335, #3336) ───────────
+
+
+def _res(ip: str, mac: str, **extra) -> dict:
+    return {"hw-address": mac, "ip-address": ip, **extra}
+
+
+_KEA_3335 = {
+    "Dhcp4": {
+        "subnet4": [
+            {
+                "subnet": "10.236.1.0/24",
+                "reservations": [
+                    _res("10.236.1.10", "aa:bb:cc:00:00:01"),
+                    _res("10.236.9.11", "aa:bb:cc:00:00:02"),
+                ],
+            },
+            {
+                "subnet": "10.236.2.0/24",
+                "reservations": [_res("10.236.2.300", "aa:bb:cc:00:00:03")],
+            },
+        ]
+    }
+}
+
+
+@pytest.mark.asyncio
+async def test_kea_import_drops_bad_reservations_and_names_them_3335(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "10.236.0.0/16")
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/preview",
+        headers=hdr,
+        files={"file": ("k.conf", json.dumps(_KEA_3335).encode(), "application/json")},
+        data={"target_group_id": str(group.id), "ipam_space_id": str(space.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    plan = resp.json()
+    text = " ".join(plan["warnings"])
+    assert "10.236.9.11" in text and "outside 10.236.1.0/24" in text
+    assert "10.236.2.300" in text
+    assert plan["total_reservations"] == 1
+
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers=hdr,
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": plan,
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [s["action_taken"] for s in body["scopes"]] == ["created", "created"]
+    assert body["total_reservations_created"] == 1
+    stored = (await db_session.execute(select(DHCPStaticAssignment.ip_address))).scalars().all()
+    assert [str(i) for i in stored] == ["10.236.1.10"]
+
+    # A client that sends the unfiltered plan straight to commit gets the same.
+    plan["scopes"][0]["reservations"].append(
+        {"ip_address": "10.236.9.11", "mac_address": "aa:bb:cc:00:00:09", "hostname": ""}
+    )
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers=hdr,
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "plan": plan,
+            "conflict_actions": {"10.236.1.0/24": {"action": "overwrite"}},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert any("10.236.9.11" in w for w in resp.json()["warnings"])
+    stored = (await db_session.execute(select(DHCPStaticAssignment.ip_address))).scalars().all()
+    assert all(str(i).startswith("10.236.1.") for i in stored)
+
+
+def test_kea_shared_networks_flattened_3336() -> None:
+    p = parse_kea_config(
+        json.dumps(
+            {
+                "Dhcp4": {
+                    "subnet4": [{"subnet": "10.236.3.0/24"}],
+                    "shared-networks": [
+                        {
+                            "name": "sn1",
+                            "option-data": [{"name": "routers", "data": "10.236.4.1"}],
+                            "subnet4": [{"subnet": "10.236.4.0/24"}],
+                        }
+                    ],
+                }
+            }
+        ).encode()
+    )
+    assert [s.subnet_cidr for s in p.scopes] == ["10.236.3.0/24", "10.236.4.0/24"]
+    assert any("sn1" in w and "flattened" in w for w in p.warnings)
+    assert p.scopes[1].options  # inherited from the shared network
+
+
+def test_kea_only_shared_networks_is_a_config_3336() -> None:
+    p = parse_kea_config(
+        json.dumps(
+            {
+                "Dhcp4": {
+                    "shared-networks": [{"name": "x", "subnet4": [{"subnet": "10.236.5.0/24"}]}]
+                }
+            }
+        ).encode()
+    )
+    assert [s.subnet_cidr for s in p.scopes] == ["10.236.5.0/24"]
+
+
+def test_kea_v6_reservation_extras_named_3336() -> None:
+    p = parse_kea_config(
+        json.dumps(
+            {
+                "Dhcp6": {
+                    "subnet6": [
+                        {
+                            "subnet": "fd36:236::/64",
+                            "reservations": [
+                                {
+                                    "hw-address": "aa:bb:cc:00:00:01",
+                                    "ip-addresses": ["fd36:236::10", "fd36:236::11"],
+                                    "prefixes": ["fd36:236:1::/64"],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ).encode()
+    )
+    w = " ".join(p.scopes[0].parse_warnings)
+    assert "fd36:236::11" in w and "fd36:236:1::/64" in w
