@@ -429,8 +429,14 @@ export function ResizeSubnetModal({
               />
               <RangeRow
                 label="Total usable IPs"
-                before={formatCount(preview.total_ips_before)}
-                after={formatCount(preview.total_ips_after)}
+                before={formatCount(
+                  preview.total_ips_before_exact,
+                  preview.total_ips_before,
+                )}
+                after={formatCount(
+                  preview.total_ips_after_exact,
+                  preview.total_ips_after,
+                )}
               />
               <RangeRow
                 label="Gateway (current)"
@@ -723,8 +729,14 @@ export function ResizeBlockModal({
               />
               <RangeRow
                 label="Total addresses"
-                before={formatCount(preview.total_ips_before)}
-                after={formatCount(preview.total_ips_after)}
+                before={formatCount(
+                  preview.total_ips_before_exact,
+                  preview.total_ips_before,
+                )}
+                after={formatCount(
+                  preview.total_ips_after_exact,
+                  preview.total_ips_after,
+                )}
               />
             </div>
             <div className="pt-2 space-y-0.5">

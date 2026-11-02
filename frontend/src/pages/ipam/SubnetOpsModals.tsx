@@ -133,17 +133,21 @@ function ModalShell({
 // request, renders one row per candidate, with a "Use this" button that
 // calls onPickCidr (the parent wires this into the create-subnet modal).
 
-/** Family + prefix Find Free starts on: the block's own family (#3324). */
-function startingSearch(blockCidr?: string): { family: 4 | 6; prefix: number } {
+/**
+ * Family + prefix Find Free starts on (#3324). An IPv6 block starts on IPv6:
+ * /64, the usual subnet, or one step below a block already /64 or longer,
+ * held to the /126 the server accepts. Anything else (no block, an IPv4
+ * block) keeps the IPv4 /24 the dialog has always opened on.
+ */
+function startingSearch(blockCidr?: string): {
+  family: 4 | 6;
+  prefix: number;
+} {
   const blockPrefix = Number(blockCidr?.split("/")[1]);
-  if (!blockCidr || !Number.isInteger(blockPrefix)) {
-    return { family: 4, prefix: 24 };
-  }
-  if (blockCidr.includes(":")) {
-    // A /64 is the usual subnet; a block longer than /63 searches one step down.
+  if (blockCidr?.includes(":") && Number.isInteger(blockPrefix)) {
     return { family: 6, prefix: Math.min(Math.max(64, blockPrefix + 1), 126) };
   }
-  return { family: 4, prefix: Math.min(Math.max(24, blockPrefix + 1), 30) };
+  return { family: 4, prefix: 24 };
 }
 
 export function FindFreeModal({
@@ -283,8 +287,8 @@ export function FindFreeModal({
           )}
           {data.candidates.length === 0 && !data.summary?.warning && (
             <p className="text-xs text-muted-foreground">
-              No free CIDRs of /{prefixLength} found in{" "}
-              {defaultBlockId ? "this block" : "this space"} (IPv
+              No free CIDRs of /{submitted?.prefix_length ?? prefixLength} found
+              in {defaultBlockId ? "this block" : "this space"} (IPv
               {submitted?.address_family ?? addressFamily}).
             </p>
           )}
@@ -310,7 +314,7 @@ export function FindFreeModal({
                         {c.parent_block_cidr}
                       </td>
                       <td className="px-2 py-1.5 text-xs">
-                        {formatCount(c.free_addresses)}
+                        {formatCount(c.free_addresses_exact, c.free_addresses)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
                         {onPickCidr && (

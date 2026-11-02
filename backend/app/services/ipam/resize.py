@@ -224,7 +224,8 @@ def _total_ips(net: IPNetwork) -> int:
 def _display_total_ips(net: IPNetwork) -> int:
     """The subnet's true size for a preview. ``_total_ips`` clamps IPv6 to
     BIGINT for storage, so two sizes both past 2^63 read as equal and a
-    /64 -> /63 growth as no change (#3322). Never stored."""
+    /64 -> /63 growth as no change (#3322). Never stored; the API saturates
+    its int field and carries this exact figure as a string beside it."""
     if isinstance(net, ipaddress.IPv6Network):
         return net.num_addresses
     return _total_ips(net)

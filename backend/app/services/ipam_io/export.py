@@ -241,6 +241,15 @@ def _sanitize_cell(value: Any) -> Any:
     return value
 
 
+def _xlsx_number(value: Any) -> Any:
+    """An integer past 2^53 goes into XLSX as text. A spreadsheet number is a
+    double, so openpyxl writes 2^64 as ``1.844674407370955E+19`` -- an IPv6
+    /64's size off by 2048 (#3322). Text keeps every digit."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53:
+        return str(value)
+    return value
+
+
 # Public names for the other spreadsheet exporters (the DNS zone records sheet,
 # #2139), so the escape stays one rule rather than a copy per exporter.
 FORMULA_TRIGGERS = _FORMULA_TRIGGERS
@@ -334,7 +343,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
     headers = SUBNET_COLUMNS + cf_keys
     ws.append(headers)
     for row in bundle.subnets:
-        base = [_sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS]
+        base = [_xlsx_number(_sanitize_cell(row.get(k))) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
         ws.append(base + [_sanitize_cell(cf.get(k)) for k in cf_keys])
 
