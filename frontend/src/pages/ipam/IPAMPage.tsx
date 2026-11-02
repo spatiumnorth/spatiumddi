@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
+import { Field } from "@/pages/dhcp/_shared";
 import {
   useQuery,
   useQueries,
@@ -921,26 +922,6 @@ function CustomFieldsSection({
 }
 
 // ─── Modal helpers ────────────────────────────────────────────────────────────
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 // `focus:ring-inset` draws the focus ring inside the element, which prevents
 // the left/right edges of the ring from being clipped by the modal's
