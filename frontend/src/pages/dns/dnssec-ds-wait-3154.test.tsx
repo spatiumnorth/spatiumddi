@@ -31,6 +31,9 @@ vi.mock("@/lib/api", async () => {
         Promise.resolve([{ id: "grp-1", server_drivers: ["bind9"] }]),
       getZoneDnssecInfo: () => Promise.resolve(dnssecInfo),
       listDnssecPolicies: () => Promise.resolve([]),
+      // Edit Zone reads the zone fresh on open (#3269): answer with the row
+      // the dialog was opened on.
+      listZones: () => Promise.resolve([ZONE]),
     },
     domainsApi: { ...actual.domainsApi, list: pending },
     customersApi: { ...actual.customersApi, list: pending },
