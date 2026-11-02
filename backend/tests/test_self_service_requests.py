@@ -231,8 +231,16 @@ async def test_submit_validates_args_against_the_operation_schema(
         headers=_auth(token),
         json={"kind": "subnet", "args": {"prefix_len": "not-a-number"}},
     )
-    assert resp.status_code == 400
-    assert "Invalid request payload" in resp.json()["detail"]
+    # FastAPI's own 422 shape (#3253): each entry names its field under
+    # ``body.args`` and carries the error type, so the form can label it.
+    # Nothing echoes the input back.
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    by_field = {e["loc"][-1]: e for e in detail}
+    assert all(e["loc"][:2] == ["body", "args"] for e in detail)
+    assert by_field["prefix_len"]["type"] == "int_parsing"
+    assert by_field["block_id"]["type"] == "missing"
+    assert "input" not in resp.text and "not-a-number" not in resp.text
 
 
 @pytest.mark.asyncio

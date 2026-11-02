@@ -51,6 +51,7 @@ import {
 } from "@dnd-kit/core";
 import {
   ipamApi,
+  settingsApi,
   dnsApi,
   dhcpApi,
   customFieldsApi,
@@ -8108,15 +8109,37 @@ function DriftRow({
   );
 }
 
-export function EditSubnetModal({
-  subnet,
-  onClose,
-  onDeleted,
-}: {
+type EditSubnetModalProps = {
   subnet: Subnet;
   onClose: (updated?: Subnet) => void;
   onDeleted?: () => void;
-}) {
+};
+
+// Reads the subnet fresh on open (#3269): the row the page holds comes from a
+// cached list that may predate a change made elsewhere, and the form is seeded
+// once from it. Save then sends only what the operator changed.
+export function EditSubnetModal(props: EditSubnetModalProps) {
+  const fresh = useFreshRow(props.subnet, () =>
+    ipamApi.getSubnet(props.subnet.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Subnet"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={() => props.onClose()}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditSubnetModalForm {...props} subnet={fresh.row} />;
+}
+
+function EditSubnetModalForm({
+  subnet,
+  onClose,
+  onDeleted,
+}: EditSubnetModalProps) {
   const qc = useQueryClient();
   // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
   const canDeleteSubnet = usePermissions().can("delete", "subnet");
@@ -8327,7 +8350,7 @@ export function EditSubnetModal({
         autoAddresses !== null && autoAddresses !== hasAutoAddresses
           ? !autoAddresses // True = remove, False = add
           : undefined;
-      return ipamApi.updateSubnet(subnet.id, {
+      const body = {
         name: name || undefined,
         description,
         // Explicit null so the operator can clear the gateway (nullable
@@ -8372,10 +8395,67 @@ export function EditSubnetModal({
         subnet_role: subnetRole,
         customer_id: customerId,
         site_id: siteId,
-        ...(manageAuto !== undefined
-          ? { manage_auto_addresses: manageAuto }
-          : {}),
-      });
+      };
+      // Send only what the operator changed (#3269), so a dialog opened on an
+      // out-of-date subnet cannot write the old values back. Each inheriting
+      // family's own values are compared against the STORED inherit flag, not
+      // the form's: toggling inherit on then sends the explicit nulls that
+      // clear the subnet's own pins (as a full save did), and toggling it off
+      // sends the values shown, so the subnet's settings are stated, not
+      // assumed.
+      const storedDnsInherit = subnet.dns_inherit_settings ?? true;
+      const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
+      const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
+      const was: Record<string, unknown> = {
+        name: subnet.name || undefined,
+        description: subnet.description ?? "",
+        gateway: subnet.gateway || null,
+        vlan_ref_id: subnet.vlan_ref_id ?? null,
+        vxlan_id: subnet.vxlan_id ?? null,
+        status: subnet.status,
+        custom_fields: subnet.custom_fields ?? {},
+        dns_inherit_settings: subnet.dns_inherit_settings ?? true,
+        dns_group_ids: storedDnsInherit ? null : (subnet.dns_group_ids ?? []),
+        dns_zone_id: storedDnsInherit ? null : (subnet.dns_zone_id ?? null),
+        dns_additional_zone_ids: storedDnsInherit
+          ? null
+          : (subnet.dns_additional_zone_ids ?? []),
+        dns_split_horizon: subnet.dns_split_horizon ?? false,
+        dhcp_inherit_settings: subnet.dhcp_inherit_settings ?? true,
+        dhcp_server_group_id: storedDhcpInherit
+          ? null
+          : (subnet.dhcp_server_group_id ?? null),
+        ddns_inherit_settings: subnet.ddns_inherit_settings ?? true,
+        ...(storedDdnsInherit
+          ? {}
+          : {
+              ddns_enabled: subnet.ddns_enabled ?? false,
+              ddns_hostname_policy:
+                subnet.ddns_hostname_policy ?? "client_or_generated",
+              ddns_domain_override: subnet.ddns_domain_override ?? null,
+              ddns_ttl: subnet.ddns_ttl ?? null,
+            }),
+        auto_profile_on_dhcp_lease: subnet.auto_profile_on_dhcp_lease ?? false,
+        auto_profile_preset: subnet.auto_profile_preset ?? "service_and_os",
+        auto_profile_refresh_days: subnet.auto_profile_refresh_days ?? 30,
+        discovery_enabled: subnet.discovery_enabled ?? false,
+        discovery_interval_minutes: subnet.discovery_interval_minutes ?? 360,
+        do_not_probe: subnet.do_not_probe ?? false,
+        do_not_probe_reason: subnet.do_not_probe_reason ?? "",
+        show_free_ranges: subnet.show_free_ranges ?? null,
+        pci_scope: subnet.pci_scope ?? false,
+        hipaa_scope: subnet.hipaa_scope ?? false,
+        internet_facing: subnet.internet_facing ?? false,
+        decom_date: subnet.decom_date || null,
+        subnet_role: subnet.subnet_role ?? null,
+        customer_id: subnet.customer_id ?? null,
+        site_id: subnet.site_id ?? null,
+      };
+      const diff = changedFields(was, body);
+      if (manageAuto !== undefined)
+        Object.assign(diff, { manage_auto_addresses: manageAuto });
+      if (Object.keys(diff).length === 0) return Promise.resolve(subnet);
+      return ipamApi.updateSubnet(subnet.id, diff);
     },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
@@ -13212,6 +13292,21 @@ function EditBlockModalForm({
 
 // ─── Recursive Block Tree Row ─────────────────────────────────────────────────
 
+/** True when the selected subnet or block lies strictly beneath `node`. */
+function subtreeHolds(
+  node: BlockNode,
+  subnetId: string | null,
+  blockId: string | null,
+): boolean {
+  if (!subnetId && !blockId) return false;
+  if (subnetId && node.subnets.some((s) => s.id === subnetId)) return true;
+  return node.children.some(
+    (c) =>
+      (blockId !== null && c.block.id === blockId) ||
+      subtreeHolds(c, subnetId, blockId),
+  );
+}
+
 export function BlockTreeRow({
   node,
   selectedSubnetId,
@@ -13243,9 +13338,29 @@ export function BlockTreeRow({
   // regardless of the operator's saved expand/collapse state.
   forceExpand?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  // Settings → IPAM "Default Expanded Depth" (#3290): a block opens by default
+  // only while its level (depth 0 = level 1) is within that depth. null means
+  // the operator has not toggled this row, so it keeps following the setting
+  // (which may arrive after first paint). The backend default is 2.
+  const { data: treeSettings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const defaultDepth = treeSettings?.subnet_tree_default_expanded_depth ?? 2;
+  const [expanded, setExpanded] = useState<boolean | null>(null);
+  // A block past the default depth still opens when the selected subnet or
+  // block sits beneath it (a deep link, a search hit), or the selection would
+  // be hidden behind a collapsed row. Latched as an operator choice, so the
+  // row stays open when the selection later moves elsewhere.
+  const holdsSelection = subtreeHolds(node, selectedSubnetId, selectedBlockId);
+  useEffect(() => {
+    if (holdsSelection && expanded === null) setExpanded(true);
+  }, [holdsSelection, expanded]);
   const [showAllChildren, setShowAllChildren] = useState(false);
-  const isExpanded = forceExpand || expanded;
+  const isExpanded =
+    forceExpand || (expanded ?? (holdsSelection || depth < defaultDepth));
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
   const {
@@ -13293,7 +13408,7 @@ export function BlockTreeRow({
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  setExpanded((v) => !v);
+                  setExpanded(!isExpanded);
                 }}
                 className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
                 title={isExpanded ? "Collapse" : "Expand"}

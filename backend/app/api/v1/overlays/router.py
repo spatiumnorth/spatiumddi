@@ -484,7 +484,8 @@ async def update_overlay(
     overlay_id: uuid.UUID, body: OverlayUpdate, db: DB, user: CurrentUser
 ) -> OverlayRead:
     row = await _get_overlay(db, overlay_id)
-    if body.customer_id is not None:
+    # Unchanged reference to a trashed customer is kept (#3192).
+    if body.customer_id is not None and body.customer_id != row.customer_id:
         c = await db.get(Customer, body.customer_id)
         if c is None or c.deleted_at is not None:
             raise HTTPException(status_code=422, detail="customer_id not found")

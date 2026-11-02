@@ -440,7 +440,7 @@ async def test_portal_refuses_what_rest_refuses_at_submit(
         await submit(
             "dns_record", {"zone_id": zid, "name": "h1", "record_type": "A", "value": INJECTED_A}
         )
-        == 400
+        == 422
     )
     named = await client.post(
         "/api/v1/requests",
@@ -451,14 +451,18 @@ async def test_portal_refuses_what_rest_refuses_at_submit(
             "justification": "test",
         },
     )
-    # The refusal names the field, as the status and hostname refusals do.
-    assert "value: Value error, A record value contains" in named.json()["detail"]
+    # The refusal names the field, as the status and hostname refusals do —
+    # in FastAPI's 422 shape, so the portal form can label it (#3253).
+    (err,) = named.json()["detail"]
+    assert err["loc"] == ["body", "args", "value"]
+    assert err["type"] == "value_error"
+    assert "A record value contains" in err["msg"]
     assert (
         await submit(
             "ip_address",
             {"subnet_id": str(env.subnet.id), "address": "10.61.5.50", "status": "kubernetes-node"},
         )
-        == 400
+        == 422
     )
     assert (
         await submit(
@@ -470,7 +474,7 @@ async def test_portal_refuses_what_rest_refuses_at_submit(
                 "hostname": "bad host",
             },
         )
-        == 400
+        == 422
     )
     # Negative control: the well-formed equivalents are accepted.
     assert (

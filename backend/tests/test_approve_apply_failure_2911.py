@@ -326,6 +326,38 @@ def test_refusal_text_is_readable_for_every_detail_shape() -> None:
         )
         == "MAC aa:bb:cc:dd:ee:ff is already on 10.0.0.5 in 10.0.0.0/24."
     )
+    pool = _refusal_text(
+        {
+            "warnings": [
+                {
+                    "kind": "dynamic_pool",
+                    "address": "10.199.1.140",
+                    "pool_start": "10.199.1.100",
+                    "pool_end": "10.199.1.150",
+                }
+            ],
+            "requires_confirmation": True,
+        }
+    )
+    assert pool.startswith("The address 10.199.1.140 now falls inside a DHCP dynamic pool")
+    assert "10.199.1.100 to 10.199.1.150" in pool
+    public = _refusal_text(
+        {
+            "warnings": [
+                {
+                    "type": "public_facing_private_ip",
+                    "field": "extra_zone_ids",
+                    "message": "10.0.0.5 is a private address; publishing it would expose it.",
+                    "zone": "z",
+                    "group": "g",
+                }
+            ],
+            "requires_confirmation": True,
+        }
+    )
+    assert public == "10.0.0.5 is a private address; publishing it would expose it."
+    for text in (pool, public):
+        assert "{" not in text and '"' not in text
     assert _refusal_text({"b": 1, "a": None}) == '{"a": null, "b": 1}'
     assert _refusal_text([{"loc": ["x"], "msg": "bad"}]) == '[{"loc": ["x"], "msg": "bad"}]'
 

@@ -139,9 +139,10 @@ async def test_record_statements_do_not_grow_with_the_zone(
     finally:
         event.remove(Engine, "before_cursor_execute", counter)
     assert resp.status_code == 200, resp.text
-    # The twin and CNAME-rule conflict queries (#3187), the load of records outside a restored zone, the
-    # UPDATE, and the batch-type probe: a handful, not one per record.
-    assert len(counter.statements) <= 7, counter.statements
+    # The twin and CNAME-rule conflict queries (#3187), the orphan-record check (#3189), the load of
+    # records outside a restored zone, the UPDATE, and the batch-type probe: a handful, not one per
+    # record.
+    assert len(counter.statements) <= 8, counter.statements
 
 
 @pytest.mark.asyncio
