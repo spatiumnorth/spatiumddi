@@ -71,7 +71,16 @@ export function IPAddressPicker({
   );
 
   return (
-    <div ref={containerRef} className={cn("relative", className)}>
+    <div
+      ref={containerRef}
+      className={cn("relative", className)}
+      // An Esc on a result reached with Tab is the list's too (#3157).
+      onKeyDown={(e) =>
+        closePopupOnEscape(e, open && debouncedQuery.length >= 2, () =>
+          setOpen(false),
+        )
+      }
+    >
       <div className="relative">
         <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         <input

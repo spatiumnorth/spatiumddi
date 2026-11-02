@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Tag, X } from "lucide-react";
 import { tagsApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 
 /**
  * Free-form tag filter chips with key/value autocomplete (issue #104
@@ -130,6 +131,13 @@ export function TagFilterChips({
         className,
       )}
       onClick={() => inputRef.current?.focus()}
+      // An Esc on a suggestion reached with Tab is the list's too (#3157).
+      onKeyDown={(e) => {
+        if (e.target === inputRef.current) return;
+        closePopupOnEscape(e, focused && dropdownItems.length > 0, () =>
+          setFocused(false),
+        );
+      }}
     >
       <Tag className="h-3 w-3 text-muted-foreground" />
       {value.map((chip, idx) => (
@@ -163,6 +171,8 @@ export function TagFilterChips({
             return;
           }
           if (e.key === "Escape") {
+            // An IME composition's Esc belongs to the input method.
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
             // Esc closes the open list and clears the draft; it is this
             // control's Esc, so the dialog around it must not also close
             // (#2720). With nothing open, let it through.
