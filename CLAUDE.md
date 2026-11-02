@@ -2785,7 +2785,7 @@ Every open issue is on the public org project **[SpatiumDDI](https://github.com/
 
 | What | Where | Values |
 |---|---|---|
-| Release scope | milestone | `1.0.0`. Open bugs and QA / Academy findings are in; a feature is in only when a maintainer adds the milestone. The ship criteria are in [#1181](https://github.com/spatiumnorth/spatiumddi/issues/1181) |
+| Release scope | milestone | 1.0.0 ships in drops: `1.0.0-beta.4` (4 Nov), `1.0.0-beta.5` (7 Nov, feature freeze), `1.0.0-rc.1` (10 Nov, code freeze), then `rc.N` until a clean soak. Until rc.1 every new bug and QA / Academy finding, P0 to P3, goes on the open drop with the earliest due date; from rc.1, P0 and P1 go on the current rc and P2 and P3 on `1.0.1`. The plain `1.0.0` milestone holds only the tracking issues. A feature is in only when a maintainer adds a milestone. The ship criteria are in [#1181](https://github.com/spatiumnorth/spatiumddi/issues/1181) |
 | Urgency | project field **Priority** | **P0** data loss, a security hole, wrong DNS / DHCP / IPAM answers, or an install or upgrade that never converges · **P1** fix before the release, or move it out with a reason · **P2** may slip to a patch release · **P3** polish |
 | Where it was found | label | `source:qa` (the ddi-pg proving ground) · `source:academy` (building the Academy course) · `source:community` |
 | State | project field **Status** | Triage → Backlog or Todo → In progress → In review → Done. The project's workflows move most of these |
@@ -2801,7 +2801,7 @@ The QA loop (`spatiumnorth/ddi-pg`) reads two things from issues, and both are e
 **Merging.** PRs are squash-merged, and the squash message is built from the commit messages, so a commit message becomes permanent history. main requires a PR to be up to date and every review thread resolved, the code-quality bot's included, so bring a PR up to date just before merging it; every merge makes the other open PRs stale again. Once the `merge_queue` rule is on `protect-main` ([#2431](https://github.com/spatiumnorth/spatiumddi/issues/2431)), the queue does the updating: `gh pr merge N` enqueues, and the PR is never pushed to again; `docs/DEVELOPMENT.md` §12 has the details. The merged branch is deleted automatically. When a PR that adds a migration merges, any other open PR with a migration must re-point its `down_revision` at the new head, or CI sees two Alembic heads.
 
 ```bash
-gh issue list --milestone 1.0.0                         # release scope
+gh issue list --milestone 1.0.0-beta.4                  # the current drop
 gh project item-list 2 --owner spatiumnorth --limit 500 --format json \
   --jq '.items[] | select(.priority=="P0" and .status!="Done") | "#\(.content.number) \(.status) \(.content.title)"'
 ```
