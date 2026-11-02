@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.core.permissions import require_permission
+from app.services.api_token_scopes import token_outbound
 from app.services.appliance.releases import (
     get_installed_version,
 )
@@ -56,6 +57,7 @@ class ReleasesResponse(BaseModel):
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="List available releases + currently-installed version",
 )
+@token_outbound
 async def list_releases() -> ReleasesResponse:
     rels = await svc_list_releases()
     return ReleasesResponse(

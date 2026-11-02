@@ -37,6 +37,9 @@ class SupportBundlePreviewArgs(BaseModel):
     # the operator should still opt in deliberately rather than discover
     # it is on.
     default_enabled=False,
+    # On an appliance the preview runs the self-test, which resolves
+    # ``registry-1.docker.io`` through the host's resolver (#3302).
+    outbound=True,
 )
 async def get_support_bundle_preview(
     db: AsyncSession, user: User, args: SupportBundlePreviewArgs

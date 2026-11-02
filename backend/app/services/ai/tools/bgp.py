@@ -55,6 +55,7 @@ class AnnouncedPrefixesArgs(BaseModel):
 
 @register_tool(
     name="asn_announced_prefixes",
+    outbound=True,
     permission=("read", "manage_asns"),
     description=(
         "Prefixes currently announced by an AS, sourced from "
@@ -84,6 +85,7 @@ class IxpPresenceArgs(BaseModel):
 
 @register_tool(
     name="asn_ixp_presence",
+    outbound=True,
     permission=("read", "manage_asns"),
     description=(
         "IXP membership rollup for an AS, sourced from PeeringDB. "
@@ -113,6 +115,7 @@ class PeeringProfileArgs(BaseModel):
 
 @register_tool(
     name="asn_peering_profile",
+    outbound=True,
     permission=("read", "manage_asns"),
     description=(
         "PeeringDB network record for an AS — registered org name, "
@@ -147,6 +150,7 @@ class PrefixOriginArgs(BaseModel):
 
 @register_tool(
     name="prefix_origin",
+    outbound=True,
     permission=("read", "manage_asns"),
     description=(
         "For a given IP or CIDR, return the originating AS(es) plus "
@@ -184,6 +188,7 @@ class RoutingHistoryArgs(BaseModel):
 
 @register_tool(
     name="prefix_routing_history",
+    outbound=True,
     permission=("read", "manage_asns"),
     description=(
         "Timeline of origin-AS changes for an IP or prefix, sourced "

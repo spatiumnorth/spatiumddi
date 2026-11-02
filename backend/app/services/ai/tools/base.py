@@ -13,9 +13,11 @@ canonical interface used by both the in-app chat orchestrator
 clients) — keeping a single source of truth for "what can the
 operator copilot do?".
 
-All Wave 2 tools are read-only. Write tools (Phase 3) will gate on
-a ``writes: bool`` flag plus the existing ``requires_confirmation``
-preview / commit pattern.
+A tool that mutates state sets ``writes=True``; the MCP transport
+never dispatches one (nor a ``propose_*`` tool). A tool that makes
+SpatiumDDI send traffic outward sets ``outbound=True``; MCP hides those
+from a scoped API token unless it holds the tool's ``outbound_scope``
+(#3302).
 
 Every tool also carries a mandatory ``permission`` declaration
 (GHSA-4wrc-78rq-vgcg), enforced centrally by :meth:`ToolRegistry.call`
@@ -34,6 +36,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
+from app.services.api_token_scopes import WRITE_SCOPES
 from app.services.nettools.budgets import BUDGETS as _RATE_LIMIT_BUDGETS
 
 # Each tool's executor: takes the user's DB session, the requesting
@@ -172,9 +175,9 @@ class Tool:
     description: str
     args_model: type[BaseModel]
     executor: ToolExecutor
-    # ``writes`` is False for every Wave 2 tool. Phase 3 introduces
-    # write tools that flip this true, gated behind a per-conversation
-    # toggle and the preview / commit pattern.
+    # True for a tool that mutates state. The MCP transport never
+    # dispatches one; the in-app chat gates them behind the
+    # per-conversation toggle and the preview / commit pattern.
     writes: bool = False
     # Free-form category used by the admin "available tools" page to
     # group tools — "ipam", "dns", "dhcp", "network", "ops".
@@ -211,6 +214,25 @@ class Tool:
     # :func:`tool_callable_by`. Leave False unless every row the tool can
     # return is filtered by, or gated on, the token's bound instances.
     honours_token_binding: bool = False
+    # True for a tool that makes SpatiumDDI send traffic outward: a probe
+    # (ping / traceroute / port / TLS / DNS query), a live pull from a
+    # managed server (AXFR, WinRM, a vendor / cloud API, a backup
+    # destination) or an off-prem lookup (RDAP, RIPEstat, PeeringDB, crt.sh,
+    # GitHub). A ``read``-scoped API token never makes SpatiumDDI send
+    # traffic outward (#3302), and a scoped token reaches MCP only through
+    # ``read``, so the MCP transport hides these from every scoped token that
+    # does not hold ``outbound_scope``. Reading SpatiumDDI's own
+    # infrastructure (Postgres, Redis, the local kubeapi / docker socket, the
+    # cluster's own nodes and slot-image mirror) is not outbound.
+    # ``tests/test_token_outbound_3302.py`` fails a tool that reaches a
+    # known network helper without it.
+    outbound: bool = False
+    # The write scope whose REST equivalent of this outbound tool admits a
+    # scoped token (``dns:write`` for ``find_dns_zone_drift``, as for
+    # ``GET /dns/.../drift``). None — a probe or an off-prem lookup, whose
+    # REST route no write scope covers — means only an unrestricted token or
+    # a session may run it over MCP.
+    outbound_scope: str | None = None
 
     def parameters_schema(self) -> dict[str, Any]:
         """JSON Schema for the args. Both OpenAI and MCP consume this
@@ -267,7 +289,7 @@ class ToolRegistry:
         return sorted(self._tools.values(), key=lambda t: t.name)
 
     def read_only(self) -> list[Tool]:
-        """The subset safe to expose to read-only contexts (Wave 2)."""
+        """The tools that do not mutate state (``writes=False``)."""
         return [t for t in self.all() if not t.writes]
 
     def callable_by(self, user: User, tools: list[Tool]) -> list[Tool]:
@@ -393,13 +415,16 @@ def register_tool(
     permission: ToolPermission,
     rate_limit: str | None = None,
     honours_token_binding: bool = False,
+    outbound: bool = False,
+    outbound_scope: str | None = None,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
     """Decorator. Use on each tool's executor function.
 
     ``permission`` is mandatory — see ``ToolPermission``. ``rate_limit``
     names the network-tool budget bucket for a tool that sends traffic off
     the host (see ``Tool.rate_limit``). ``honours_token_binding`` — see
-    :func:`tool_callable_by`.
+    :func:`tool_callable_by`. ``outbound`` / ``outbound_scope`` — see
+    ``Tool.outbound``.
 
     Example::
 
@@ -419,6 +444,11 @@ def register_tool(
             ...
     """
 
+    if outbound_scope is not None and (not outbound or outbound_scope not in WRITE_SCOPES):
+        raise ValueError(
+            f"tool {name!r}: outbound_scope needs outbound=True and one of {sorted(WRITE_SCOPES)}"
+        )
+
     def decorator(fn: ToolExecutor) -> ToolExecutor:
         REGISTRY.register(
             Tool(
@@ -433,6 +463,8 @@ def register_tool(
                 permission=permission,
                 rate_limit=rate_limit,
                 honours_token_binding=honours_token_binding,
+                outbound=outbound,
+                outbound_scope=outbound_scope,
             )
         )
         return fn
