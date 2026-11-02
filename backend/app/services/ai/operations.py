@@ -616,6 +616,7 @@ async def _validate_submit_create_ip_address(
 
     from app.services.ipam.address_create_rules import (  # noqa: PLC0415
         assert_address_unallocated,
+        assert_not_boundary_address,
         assert_static_dhcp_has_mac,
         assert_subnet_takes_addresses,
     )
@@ -625,6 +626,7 @@ async def _validate_submit_create_ip_address(
         return
     assert_subnet_takes_addresses(subnet)
     assert_static_dhcp_has_mac(args.status, args.mac_address)
+    assert_not_boundary_address(subnet, args.address)
     await assert_address_unallocated(db, subnet.id, args.address)
     reason = await _static_dhcp_scope_error(db, subnet, args)
     if reason is not None:

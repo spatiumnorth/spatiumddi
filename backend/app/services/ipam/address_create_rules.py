@@ -7,6 +7,7 @@ instead of two copies. Each function raises a 4xx ``HTTPException``.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from typing import Any
 
@@ -16,6 +17,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
+from app.services.ipam.subnet_boundary import boundary_addresses
 
 
 def assert_subnet_takes_addresses(subnet: Subnet) -> None:
@@ -45,6 +47,25 @@ def holds_address() -> ColumnElement[bool]:
     counters already call free (#2980), unless a DHCP reservation still
     points at it. Shared by the picker and Specific IP so both agree."""
     return or_(IPAddress.status != "available", IPAddress.static_assignment_id.is_not(None))
+
+
+def assert_not_boundary_address(subnet: Subnet, address: str) -> None:
+    """A host cannot sit on an IPv4 subnet's network or broadcast address (409).
+
+    ``total_ips`` leaves both out whether or not the subnet holds rows for them
+    (#2411). A subnet made with ``skip_auto_addresses`` holds none, so without
+    this a host there counts toward Allocated but not toward the total (8 of 6).
+    IPv6 is exempt: its network address is usable and counts in the total.
+    """
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    if isinstance(net, ipaddress.IPv4Network) and address in boundary_addresses(net, subnet.kind):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Address {address} is the network or broadcast address of "
+                f"{subnet.network} and cannot hold a host"
+            ),
+        )
 
 
 async def assert_address_unallocated(db: AsyncSession, subnet_id: uuid.UUID, address: str) -> None:
