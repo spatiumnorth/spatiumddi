@@ -244,7 +244,15 @@ def _vlan_key(vid: int) -> str:
 
 async def _find_customer(db: AsyncSession, name: str) -> Customer | None:
     return (
-        (await db.execute(select(Customer).where(Customer.name == name).limit(1))).scalars().first()
+        (
+            await db.execute(
+                select(Customer)
+                .where(Customer.name == name, Customer.deleted_at.is_(None))
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
     )
 
 

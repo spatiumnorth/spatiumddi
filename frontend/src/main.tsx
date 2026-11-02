@@ -6,12 +6,15 @@ import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 
 import { queryClient } from "@/lib/queryClient";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import App from "./App";
 import "./index.css";
 
-// Apply saved theme before first render to prevent flash
+// Apply saved theme before first render to prevent flash. Storage the
+// browser refuses (site data blocked) reads as nothing saved, so the
+// system theme applies and the console still starts (#3231).
 (function () {
-  const saved = localStorage.getItem("theme") ?? "system";
+  const saved = safeLocalStorage.getItem("theme") ?? "system";
   const resolved =
     saved === "system"
       ? window.matchMedia("(prefers-color-scheme: dark)").matches

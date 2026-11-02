@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exc_text import describe_exc
 from app.models.influxdb import InfluxDBTarget
 from app.services.influxdb import collect
 from app.services.influxdb.client import config_from_row, write_lines
@@ -106,7 +107,7 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
     # leaving this one with no ``last_push_error`` to explain itself, so
     # nothing anywhere would say what went wrong.
     except Exception as exc:  # noqa: BLE001
-        row.last_push_error = str(exc)[:1000] or type(exc).__name__
+        row.last_push_error = describe_exc(exc)[:1000]
         # ``last_push_at`` still advances on failure — otherwise a target
         # that errors fast would be retried on every 30 s beat tick
         # instead of on its own interval.

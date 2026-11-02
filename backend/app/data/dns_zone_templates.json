@@ -29,7 +29,7 @@
           "type": "string",
           "required": false,
           "placeholder": "postmaster@example.com",
-          "hint": "Mailbox that receives aggregate DMARC reports (rua=)."
+          "hint": "Mailbox that receives aggregate DMARC reports (rua=). Leave blank for a monitor-only stub (v=DMARC1; p=none) with no reporting address."
         },
         {
           "key": "dkim_selector",
@@ -60,6 +60,13 @@
           "value": "v=DMARC1; p=quarantine; rua=mailto:{{dmarc_email}}",
           "ttl": 3600,
           "skip_if_empty": ["dmarc_email"]
+        },
+        {
+          "name": "_dmarc",
+          "record_type": "TXT",
+          "value": "v=DMARC1; p=none",
+          "ttl": 3600,
+          "skip_if_set": ["dmarc_email"]
         },
         {
           "name": "{{dkim_selector}}._domainkey",

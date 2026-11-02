@@ -36,6 +36,7 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.tailscale import TailscaleTenant
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.dns.cname_conflict import find_record_insert_conflict
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     SpaceRelease,
     address_taken,
@@ -379,6 +380,7 @@ async def _apply_addresses(
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.tailscale_tenant_id == tenant.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
@@ -389,8 +391,12 @@ async def _apply_addresses(
                 row.tailscale_tenant_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
         # #2790: the tenant's own subnet first, then the longest prefix,

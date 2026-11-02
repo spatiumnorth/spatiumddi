@@ -133,6 +133,7 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import {
   DNS_TTL_MAX,
   fqdnError,
@@ -148,6 +149,7 @@ import {
   zoneTransportOptions,
 } from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
+import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { feedChip, FEED_CHIP_CLS } from "@/lib/blocklist-feed";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
@@ -2690,19 +2692,43 @@ function DnssecCard({
 
 // ── Zone Modal (add / edit) ───────────────────────────────────────────────────
 
-export function ZoneModal({
-  groupId,
-  views,
-  zone,
-  initialName,
-  onClose,
-}: {
+type ZoneModalProps = {
   groupId: string;
   views: DNSView[];
   zone?: DNSZone;
   initialName?: string;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the zone fresh on open (#3269): the row the page holds comes
+// from a cached zone list that may predate a change made elsewhere, and the
+// form is seeded once from it. Save then sends only what the operator changed.
+export function ZoneModal(props: ZoneModalProps) {
+  const fresh = useFreshRow(props.zone, () =>
+    dnsApi
+      .listZones(props.groupId)
+      .then((zones) => zones.find((z) => z.id === props.zone!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Zone"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ZoneModalForm {...props} zone={fresh.row} />;
+}
+
+function ZoneModalForm({
+  groupId,
+  views,
+  zone,
+  initialName,
+  onClose,
+}: ZoneModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
@@ -2949,7 +2975,36 @@ export function ZoneModal({
       }
       payload.masters = masters;
     }
-    mut.mutate(payload);
+    if (!zone) {
+      mut.mutate(payload);
+      return;
+    }
+    // Edit sends only what the operator changed (#3269), so a dialog opened
+    // on an out-of-date zone cannot write the old values back. The name is
+    // locked on edit and never rides an update.
+    const { name: _name, ...fields } = payload;
+    const was: Record<string, unknown> = {
+      zone_type: zone.zone_type,
+      kind: zone.kind,
+      view_id: zone.view_id ?? null,
+      primary_ns: zone.primary_ns ?? "",
+      admin_email: zone.admin_email ?? "",
+      ttl: zone.ttl ?? 3600,
+      color: zone.color ?? null,
+      domain_id: zone.domain_id ?? null,
+      customer_id: zone.customer_id ?? null,
+      forwarders: zone.forwarders ?? [],
+      forward_only: zone.forward_only ?? true,
+      forward_transport: zone.forward_transport ?? "do53",
+      forward_tls_hostname: zone.forward_tls_hostname ?? null,
+      masters: zone.masters ?? [],
+    };
+    const diff = changedFields(was, fields);
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   }
 
   return (
@@ -4067,7 +4122,7 @@ type ZoneSubtab = "records" | "pools" | "certs" | "drift";
 // is split, and each call is its own trash batch — the confirm copy says so.
 const BULK_DELETE_CHUNK = 2000;
 
-function ZoneDetailView({
+export function ZoneDetailView({
   group,
   zone,
   highlightRecordId,
@@ -4168,7 +4223,7 @@ function ZoneDetailView({
       delegationPreview.glue_records_to_create.length > 0);
 
   // "Sync with server" — bi-directional additive sync against the zone's
-  // primary authoritative server (today: Windows DNS). AXFR imports missing
+  // primary authoritative server (any driver that can pull a zone). AXFR imports missing
   // records into our DB, then every DB record not already on the wire is
   // pushed back via RFC 2136. Never deletes. Result shown in <SyncResultModal/>.
   const [syncResult, setSyncResult] = useState<SyncResultPayload | null>(null);
@@ -5473,8 +5528,8 @@ function ZoneDetailView({
                 {bulkPermanent
                   ? "? This cannot be undone."
                   : selectedRecords.size > BULK_DELETE_CHUNK
-                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches in Admin → Trash, each restored separately.`
-                    : " to the trash? They can be restored together from Admin → Trash."}{" "}
+                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
+                    : " to the trash? A superadmin can restore them together from Administration → Trash."}{" "}
                 IPAM-managed records are excluded automatically.
               </p>
               {isSuperadmin && (
@@ -5583,6 +5638,7 @@ function ZoneDetailView({
         <SyncResultModal
           zoneName={zone.name}
           result={syncResult}
+          drivers={group.server_drivers ?? []}
           onClose={() => setSyncResult(null)}
         />
       )}
@@ -5622,13 +5678,15 @@ type SyncResultPayload =
     }
   | { ok: false; error: string };
 
-function SyncResultModal({
+export function SyncResultModal({
   zoneName,
   result,
+  drivers,
   onClose,
 }: {
   zoneName: string;
   result: SyncResultPayload;
+  drivers: string[];
   onClose: () => void;
 }) {
   if (!result.ok) {
@@ -5639,10 +5697,10 @@ function SyncResultModal({
             {result.error}
           </div>
           <p className="text-xs text-muted-foreground">
-            Common causes: zone transfers not allowed from this host (DNS
-            Manager → zone → Properties → Zone Transfers), dynamic updates not
-            permitted, primary server unreachable, or the driver does not
-            support AXFR pull (only Windows DNS does today).
+            Common causes: zone transfers not allowed from this host, dynamic
+            updates not permitted, or the primary server unreachable.
+            {drivers.includes("windows_dns") &&
+              " On Windows DNS, check DNS Manager → zone → Properties → Zone Transfers."}
           </p>
           <div className="flex justify-end pt-1">
             <button
@@ -6488,15 +6546,33 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
  * strings are interpolated verbatim into named.conf, so the client checks
  * nothing it could be wrong about and simply renders the 422.
  */
-function ViewModal({
-  groupId,
-  view,
-  onClose,
-}: {
+type ViewModalProps = {
   groupId: string;
   view: DNSView | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the view fresh on open (#3269), and Save sends only what changed.
+export function ViewModal(props: ViewModalProps) {
+  const fresh = useFreshRow(props.view ?? undefined, () =>
+    dnsApi
+      .listViews(props.groupId)
+      .then((views) => views.find((v) => v.id === props.view!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit View"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ViewModalForm {...props} view={fresh.row ?? null} />;
+}
+
+function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(view?.name ?? "");
   const [description, setDescription] = useState(view?.description ?? "");
@@ -6544,14 +6620,35 @@ function ViewModal({
       );
       return;
     }
-    saveMut.mutate({
+    const body = {
       name: name.trim(),
       description: description.trim(),
       order: Number(order) || 0,
       recursion,
       match_clients: clients,
       match_destinations: lines(matchDestinations),
-    });
+    };
+    if (!view) {
+      saveMut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3269).
+    const diff = changedFields(
+      {
+        name: view.name,
+        description: view.description ?? "",
+        order: view.order ?? 0,
+        recursion: view.recursion ?? true,
+        match_clients: view.match_clients ?? ["any"],
+        match_destinations: view.match_destinations ?? [],
+      },
+      body,
+    );
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    saveMut.mutate(diff);
   }
 
   return (
@@ -7408,45 +7505,51 @@ export function RevealedSecretModal({
   action: "created" | "rotated";
   onClose: () => void;
 }) {
+  // #3222 — the plaintext is shown once; closing before copying it loses it.
+  const secrets = useMemo(() => [secret], [secret]);
+  const guard = useSecretCloseGuard({ onClose, secrets, noun: "secret" });
   return (
-    <Modal title="Copy this secret now" onClose={onClose}>
-      <div className="space-y-3 text-sm">
-        <p className="text-xs text-muted-foreground">
-          This is the only time the plaintext secret for{" "}
-          <code className="font-mono">{name}</code> will be shown. Copy it into
-          your <code>nsupdate</code> client / secondary-server config before
-          closing. SpatiumDDI keeps it encrypted at rest (it has to, to sign DNS
-          updates), but the UI never shows it again — rotate the key to get a
-          new one.
-        </p>
-        <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
-          <div className="mb-1 text-muted-foreground">{algorithm}</div>
-          <div className="break-all">{secret}</div>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            void navigator.clipboard.writeText(secret);
-          }}
-          className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
-        >
-          <Copy className="h-3 w-3" /> Copy secret
-        </button>
-        <p className="text-[11px] text-muted-foreground">
-          Key {action} • The new value will reach BIND9 servers on the next
-          ConfigBundle long-poll (typically within seconds).
-        </p>
-        <div className="flex justify-end pt-1">
+    <>
+      <Modal title="Copy this secret now" onClose={guard.requestClose}>
+        <div className="space-y-3 text-sm" {...guard.copyProps}>
+          <p className="text-xs text-muted-foreground">
+            This is the only time the plaintext secret for{" "}
+            <code className="font-mono">{name}</code> will be shown. Copy it
+            into your <code>nsupdate</code> client / secondary-server config
+            before closing. SpatiumDDI keeps it encrypted at rest (it has to, to
+            sign DNS updates), but the UI never shows it again — rotate the key
+            to get a new one.
+          </p>
+          <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
+            <div className="mb-1 text-muted-foreground">{algorithm}</div>
+            <div className="break-all">{secret}</div>
+          </div>
           <button
             type="button"
-            onClick={onClose}
-            className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            onClick={async () => {
+              if (await copyToClipboard(secret)) guard.markTaken();
+            }}
+            className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
           >
-            I have copied it
+            <Copy className="h-3 w-3" /> Copy secret
           </button>
+          <p className="text-[11px] text-muted-foreground">
+            Key {action} • The new value will reach BIND9 servers on the next
+            ConfigBundle long-poll (typically within seconds).
+          </p>
+          <div className="flex justify-end pt-1">
+            <button
+              type="button"
+              onClick={guard.requestClose}
+              className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              I have copied it
+            </button>
+          </div>
         </div>
-      </div>
-    </Modal>
+      </Modal>
+      {guard.confirm}
+    </>
   );
 }
 
@@ -8873,7 +8976,6 @@ function RecordsTab({
   const [filterModes, setFilterModes] = useState<
     Partial<Record<ColKey, RecordFilterMode>>
   >({});
-  const [openFilterMenu, setOpenFilterMenu] = useState<ColKey | null>(null);
   const [editing, setEditing] = useState<DNSGroupRecord | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSGroupRecord | null>(
     null,
@@ -9034,51 +9136,10 @@ function RecordsTab({
           placeholder="Filter…"
           className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
         />
-        <div className="relative">
-          <button
-            type="button"
-            onClick={() =>
-              setOpenFilterMenu(openFilterMenu === col ? null : col)
-            }
-            className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-            title="Filter mode"
-          >
-            {mode === "begins"
-              ? "^"
-              : mode === "ends"
-                ? "$"
-                : mode === "regex"
-                  ? ".*"
-                  : "⊂"}
-          </button>
-          {openFilterMenu === col && (
-            <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-              {(
-                [
-                  ["contains", "⊂ Contains"],
-                  ["begins", "^ Begins"],
-                  ["ends", "$ Ends"],
-                  ["regex", ".* Regex"],
-                ] as const
-              ).map(([m, label]) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => {
-                    setFilterModes((p) => ({ ...p, [col]: m }));
-                    setOpenFilterMenu(null);
-                  }}
-                  className={cn(
-                    "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                    mode === m && "font-semibold text-primary",
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        <FilterModePicker
+          value={mode}
+          onChange={(m) => setFilterModes((p) => ({ ...p, [col]: m }))}
+        />
       </div>
     );
   }
@@ -10643,6 +10704,8 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       <button
                         className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setEditList(l)}
+                        aria-label={`Edit blocking list ${l.name}`}
+                        title="Edit blocking list"
                         {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Pencil className="h-3 w-3" />
@@ -10650,6 +10713,8 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       <button
                         className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setConfirmDelete(l)}
+                        aria-label={`Delete blocking list ${l.name}`}
+                        title="Delete blocking list"
                         {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Trash2 className="h-3 w-3" />

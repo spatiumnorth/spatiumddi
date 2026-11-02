@@ -180,6 +180,8 @@ spec:
                   name: {{ include "spatiumddi.redisSecretName" . }}
                   key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
           {{- end }}
+          resources:
+            {{- include "spatiumddi.initContainerResources" . | nindent 12 }}
           volumeMounts:
             - name: tmpl
               mountPath: /tmpl

@@ -143,6 +143,42 @@ externalRedis:
   existingSecret: my-redis-secret    # optional; remove for unauth'd redis
 ```
 
+### Exposing DNS and DHCP to clients
+
+The DNS and DHCP agent Services are `ClusterIP` unless a server sets
+`service.type`. A `ClusterIP` Service is reachable from inside the cluster
+only, which is enough for the control plane but not for clients on your LAN.
+
+Do not point a default k3s at `type: LoadBalancer` for port 53. k3s ships
+**servicelb** (klipper-lb), which runs an `svclb-*` pod with `hostPort: 53`
+on every node. The CNI hostPort DNAT then also captures the node's own
+resolver stub at `127.0.0.53:53`, so the node stops resolving: image pulls
+fail with `lookup ghcr.io: Try again`, the `svclb` image itself cannot pull,
+local-path provisioning times out, and the install never converges (#3229).
+UDP 67 for DHCP uses the same hostPort mechanism.
+
+Pick one of these instead:
+
+- **MetalLB** (or a cloud load balancer). Install MetalLB, start k3s with
+  `--disable servicelb` so the two do not both claim the Service, and set
+  `service: { type: LoadBalancer }` with the pool / address annotations shown
+  in `values.yaml`. MetalLB announces a dedicated VIP, so nothing binds :53 on
+  the node.
+- **Another LoadBalancer implementation** with `--disable servicelb` (kube-vip,
+  Cilium LB-IPAM, ...). The same rule applies: whatever implements the
+  Service must not use hostPort 53.
+- **`NodePort`**, for a resolver you reach through a forwarder or an external
+  load balancer. Port 53 is not in the NodePort range, so clients cannot use
+  it directly.
+- **`hostNetwork`** (DHCP only in this chart). It binds the node's own port, so
+  never run it on a node where something else, such as `systemd-resolved`, owns
+  that port. DNS agents do not offer it here for exactly that reason.
+
+On a node where only the resolver stub is the problem, never expose :53 with
+servicelb; if you already did, delete the Service and the `svclb-*` DaemonSet,
+then `iptables -t nat -S CNI-HOSTPORT-DNAT | grep 'dports 53'` should come back
+empty.
+
 ### Running managed DNS agents
 
 ```yaml
@@ -155,11 +191,11 @@ dnsAgents:
     - name: ns1
       role: primary
       group: internal-resolvers
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
     - name: ns2
       role: secondary
       group: internal-resolvers
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
     # PowerDNS (issue #127 — online DNSSEC, ALIAS, LUA, catalog zones).
     # Lives in its own group so PowerDNS-only features can engage; the
     # control plane rejects mixed-driver groups for those features.
@@ -167,7 +203,7 @@ dnsAgents:
       flavor: powerdns
       role: primary
       group: powerdns-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
     # Technitium (third DNS driver — online DNSSEC, catalog zones both
     # ways, and native DoT/DoH/DoQ listeners plus encrypted upstream
     # forwarding with no dnsdist-style sidecar). Own group, same rule.
@@ -175,8 +211,13 @@ dnsAgents:
       flavor: technitium
       role: primary
       group: technitium-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
 ```
+
+The agent Services default to `ClusterIP` (#3229). The `LoadBalancer` lines
+above are opt-in and need a load balancer that does not bind port 53 on the
+node itself; read [Exposing DNS and DHCP to clients](#exposing-dns-and-dhcp-to-clients)
+before copying them onto k3s.
 
 Each server picks its image from `dnsAgents.image` (default,
 configures BIND9) or `dnsAgents.flavors.<flavor>` per-driver
@@ -304,6 +345,10 @@ them:
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job, a regular Job named per revision (`<release>-migrate-r<revision>`), not a Helm hook |
 | `migrate.annotations` | `{}` | Annotations on the Job object (not its pod). For GitOps, see below |
+| `migrate.nodeSelector` / `.tolerations` / `.affinity` | unset (follows `api.*`) | #3207 — placement of the migrate Job's pod. Unset runs it where the api runs: `api.nodeSelector`, `api.tolerations` and `api.affinity.nodeAffinity` (not the api's pod anti-affinity, which would keep the Job off the api's nodes), with `global.controlPlaneNodeSelector` merged into the selector. `{}` / `[]` opt out of the api's values |
+| `initContainers.resources` | requests `10m` / `32Mi`, limit `256Mi` memory | #3208 — resources of every `wait-for-postgres` / `wait-for-migrate` init container |
+| `postgresql.cnpg.enablePDB` | unset (auto) | #3204 — `kind: cnpg`. Unset enables the primary PodDisruptionBudget only when `instances > 1`, so a single instance can be drained; an explicit `true` / `false` wins |
+| `postgresql.affinity.nodeAffinity` | `{}` | #3205 — `kind: cnpg`: rendered into the Cluster's `spec.affinity.nodeAffinity` (prefer a node without hard-pinning it with `nodeSelector`). Standalone: `postgresql.affinity` is the pod's whole affinity |
 | `ingress.*` | disabled |  |
 
 ### Dependencies
@@ -323,10 +368,14 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumnorth/dns-powerdns` | Per-flavor image override (issue #127) |
 | `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumnorth/dns-technitium` | Per-flavor image override |
 | `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
+| `dnsAgents.prefixWithFullname` | `false` | #3209 — name the StatefulSet and Services `<fullname>-dns-<flavor>-<name>` instead of `dns-<flavor>-<name>`. Flipping it on a live install recreates the StatefulSet with new PVCs; see [upgrade note](#agent-object-names-3209) |
+| `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
+| `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
+| `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dhcpAgents.servers` | `[]` |  |
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
@@ -334,12 +383,72 @@ Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 `service.nodePort` (DHCP only; pins the node-facing port of a NodePort
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send
-to UDP/67 only, so use LoadBalancer or `hostNetwork` for those),
-`hostNetwork` (DHCP only), `resources`, and, on DNS servers,
-`nodeSelector` and `tolerations`. DNS agents only *prefer* separate nodes,
+to UDP/67 only, so use LoadBalancer or `hostNetwork` for those; setting it
+without `service.type` implies `NodePort`),
+`hostNetwork` (DHCP only), `resources`, `storageClass` (on an existing install, [read this first](#adopting-storageclass-on-an-existing-install)), `nodeSelector`,
+`tolerations` and `affinity` (#3206: merged with the chart's preferred
+one-agent-per-node anti-affinity; only a `podAntiAffinity` of your own
+replaces it). Agents only *prefer* separate nodes,
 so after a node drain an agent can reschedule next to another one and stay
 there. Pin each server to a node (`nodeSelector: { kubernetes.io/hostname:
 node-a }`) to keep one agent per node behind a shared address.
+
+### Adopting `storageClass` on an existing install
+
+Setting `dnsAgents.storageClass`, `dhcpAgents.storageClass` or a server's
+`storageClass` (#3206) on a release that is already running changes the agent
+StatefulSet's `spec.volumeClaimTemplates[].spec.storageClassName`. Kubernetes
+does not allow that: only `replicas`, `ordinals`, `template`, `updateStrategy`,
+`revisionHistoryLimit`, `persistentVolumeClaimRetentionPolicy` and
+`minReadySeconds` of a StatefulSet can be updated. The upgrade or sync is
+refused with `StatefulSet.apps "<name>" is invalid: spec: Forbidden: updates to
+statefulset spec for fields other than ... are forbidden`. This happens even
+when the class you set is the cluster default. Changing a claim's storage size
+(`servers[].storage.*`) is refused for the same reason.
+
+Delete the StatefulSet object **without** its pod or PVCs, then upgrade or sync
+again; the new StatefulSet adopts the running pod and the existing claims:
+
+```bash
+kubectl delete sts <name> -n <namespace> --cascade=orphan
+helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi --reuse-values ...   # your usual command
+```
+
+With Argo CD, run the same `kubectl delete sts ... --cascade=orphan`, then sync
+the application. `Replace=true` and `ServerSideApply=true` do not help: the
+field is immutable either way.
+
+On a real `helm install` / `helm upgrade` against a cluster, the chart looks up
+the live StatefulSet and stops with a message carrying this exact command
+before sending anything. `helm template` and Argo CD render without cluster
+access, so they cannot detect it; they print a note in `NOTES.txt` instead.
+
+This does not move any data. Existing PVCs keep the class they were created
+with; only claims created afterwards (a new replica, a new server) get the new
+class. Moving an agent's data to another class needs new claims and a copy of the
+data, which this procedure does not do.
+
+### Agent object names (#3209)
+
+The DNS and DHCP agent StatefulSet, Service and headless Service are named
+`dns-<flavor>-<name>` / `dhcp-<flavor>-<name>` by default, without the release
+fullname every other object carries, so two releases in one namespace collide.
+`dnsAgents.prefixWithFullname` / `dhcpAgents.prefixWithFullname` (default
+`false`) name them `<fullname>-dns-<flavor>-<name>` instead (`fullnameOverride`
+applies). A name longer than 52 characters keeps its first 43 and gains a
+hash of the full name (`-1a2b3c4d`), so servers whose names differ only past
+the cut stay distinct. The render fails if two servers would still share a
+name, or if the release name (or `fullnameOverride`) does not start with a
+lowercase letter, which a Service name needs. The default is expected to flip
+in a later release.
+
+Do not flip it on a live install casually. A StatefulSet cannot be renamed:
+Helm deletes the old one and creates a new one with **new PVCs**
+(`<claim>-<new name>-0`) and a new pod name, which is the server's registered
+identity, so the agent registers as a new server (the old row stays until you
+delete it, and the agent's local state starts empty). To keep the data, leave
+it `false`. For a new install, or one you are happy to rebuild, set it `true`
+from the start.
 
 ## Upgrade
 
@@ -348,6 +457,17 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <NEW_CHART_VERSION> \
   --namespace spatiumddi --reuse-values
 ```
+
+**DNS / DHCP agent Service default changed to `ClusterIP` (#3229).** Earlier
+chart versions rendered a `LoadBalancer` Service for an agent server that set
+no `service.type`. An upgrade with `--reuse-values` keeps your values, so a
+server that never set the type now renders `ClusterIP`: Kubernetes changes the
+type in place and **releases the external IP clients use**. Before upgrading,
+list what you have (`kubectl -n spatiumddi get svc -l
+app.kubernetes.io/component=dns-agent`) and add `service: { type:
+LoadBalancer }` to every server that must keep its address, keeping the same
+`loadBalancerIP` or MetalLB annotation. Servers that already set a type are
+unchanged.
 
 The migrate Job is a regular Job named per revision, not a Helm hook. Each
 upgrade creates a new one, and the api, worker and beat pods wait for the

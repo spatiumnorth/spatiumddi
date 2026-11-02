@@ -231,18 +231,35 @@ export function useFocusTrap<T extends HTMLElement>() {
       if (e.target instanceof HTMLElement) lastFocused = e.target;
     };
     node.addEventListener("focusin", onFocusIn);
+    // The same happens when the focused control is DISABLED, not removed: a
+    // submit or confirm that disables itself while its request runs stays in
+    // the DOM, the browser still drops focus on <body>, and a refusal then
+    // leaves the dialog open with focus outside it (#3155). Both cases are
+    // caught here, in the mutation callback (a microtask, before the browser's
+    // own focus fix-up), so the card takes focus right away.
     const observer = new MutationObserver(() => {
       if (!node.isConnected || !trapStack.isTop(token)) return;
       const active = document.activeElement;
-      if (active && active !== document.body && node.contains(active)) return;
-      if (active && active !== document.body) return;
-      if (lastFocused && !lastFocused.isConnected) {
-        lastFocused = null;
-        node.setAttribute("tabindex", "-1");
-        node.focus();
+      const lostToDisabled =
+        lastFocused &&
+        lastFocused.isConnected &&
+        node.contains(lastFocused) &&
+        (lastFocused as HTMLButtonElement).disabled === true &&
+        (!active || active === document.body || active === lastFocused);
+      if (!lostToDisabled) {
+        if (active && active !== document.body) return;
+        if (!lastFocused || lastFocused.isConnected) return;
       }
+      lastFocused = null;
+      node.setAttribute("tabindex", "-1");
+      node.focus();
     });
-    observer.observe(node, { childList: true, subtree: true });
+    observer.observe(node, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["disabled"],
+    });
 
     const focusables = () =>
       Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(

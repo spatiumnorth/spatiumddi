@@ -11,6 +11,8 @@ import {
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { humanTime } from "@/pages/network/_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -738,10 +740,10 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
     null,
   );
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["pcap-captures", "recent"],
     queryFn: () => pcapApi.listCaptures({ page_size: 50 }),
-    refetchInterval: 5000,
+    refetchInterval: pollUnlessRefused(5000),
   });
   const items = data?.items ?? [];
 
@@ -787,7 +789,12 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
     );
   }
   if (isError) {
-    return <p className="text-xs text-destructive">Failed to load captures.</p>;
+    // A refused read is said to be refused, not "Failed to load" (#3149).
+    return (
+      <p className="text-xs">
+        <ListReadError error={error} what="packet captures" />
+      </p>
+    );
   }
   if (items.length === 0) {
     return (

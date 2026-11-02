@@ -19,7 +19,7 @@ and offline-resilience spec.
 | `KEA_LEASE_FILE` | Kea memfile leases path (default `/var/lib/kea/kea-leases4.csv`) |
 | `LONGPOLL_TIMEOUT` | Seconds the control plane holds a long-poll (default `30`) |
 | `HEARTBEAT_INTERVAL` | Seconds between heartbeats (default `30`) |
-| `AGENT_GROUP` | Optional DHCP server group to join |
+| `AGENT_GROUP` | Optional DHCP server group a NEW server row joins at registration. An agent on an appliance joins the group its appliance is assigned instead (#3202) |
 | `AGENT_ROLES` | Comma-separated: `primary,secondary,failover` (default `primary`) |
 | `TLS_CA_PATH` | CA bundle to verify the control plane against (private CA or self-signed). Wins over the skip flag |
 | `TLS_PINNED_CERTS_PATH` | Trust exactly the certificates in this file, with no hostname check (#1281). Read on every connection; fails closed while the file is missing. The appliance chart sets it to the supervisor's pinned certificate. Wins over `TLS_CA_PATH` and the skip flag |

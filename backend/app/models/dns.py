@@ -1105,7 +1105,7 @@ def _initial_zone_serial(context: Any) -> int:
     A primary zone starts at today's ``YYYYMMDD00``, like every later serial.
     At 0 the agents served it at their placeholder 1 (``serial or 1``) until
     its first change. A secondary / stub / forward zone's serial is not ours
-    to number and stays 0 (``_zone_state_in_sync``). Imported here, not at the
+    to number and stays 0 (``zone_state_in_sync``). Imported here, not at the
     top, so the models stay importable without the service layer.
     """
     zone_type = context.get_current_parameters().get("zone_type") or "primary"

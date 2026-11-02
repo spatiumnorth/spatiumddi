@@ -718,3 +718,112 @@ async def test_dns_record_apply_refuses_a_token_bound_to_another_zone(
                 zone_id=str(env.zone.id), name="w", record_type="A", value="10.77.5.60"
             ),
         )
+
+
+# ── #3152: the Copilot approve / reject apply names the real refusal ───────
+
+
+async def _cr_proposal(
+    db: AsyncSession, user_id: uuid.UUID, operation: str, rid: str
+) -> AIOperationProposal:
+    row = AIOperationProposal(
+        session_id=None,
+        user_id=user_id,
+        operation=operation,
+        args={"change_request_id": rid},
+        preview_text="preview",
+        expires_at=operations.expires_at_default(),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_copilot_approve_names_the_missing_subnet_write(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_module(db_session, MODULE)
+    env = await _estate(db_session)
+    rid = await _submit_ip_request(client, db_session, env.subnet_id, "10.77.5.12")
+    appr, _ = await _user(
+        db_session, name="apv", permissions=[*APPROVE, *_ip_writer_reading(env.subnet)]
+    )
+    prop = await _cr_proposal(db_session, appr.id, "approve_change_request", rid)
+
+    with pytest.raises(HTTPException) as ei:
+        await apply_proposal(prop.id, appr, db_session, _fake_request())
+    assert ei.value.status_code == 403
+    detail = str(ei.value.detail)
+    assert "need 'approve' on 'change_request'" not in detail
+    assert "No write permission on subnet" in detail
+    assert (await _cr_state(db_session, rid)).state == "pending"
+    assert await _addresses(db_session, env.subnet_id) == []
+
+
+@pytest.mark.asyncio
+async def test_copilot_approve_self_approval_keeps_its_own_refusal(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_module(db_session, MODULE)
+    env = await _estate(db_session)
+    me, tok = await _user(
+        db_session,
+        name="both",
+        permissions=[
+            *BARE_REQUESTER_PERMS,
+            *APPROVE,
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "write", "resource_type": "subnet"},
+        ],
+    )
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(tok),
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": str(env.subnet_id), "address": "10.77.5.13"},
+            "justification": "need one",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    rid = resp.json()["id"]
+    prop = await _cr_proposal(db_session, me.id, "approve_change_request", rid)
+
+    with pytest.raises(HTTPException) as ei:
+        await apply_proposal(prop.id, me, db_session, _fake_request())
+    assert ei.value.status_code == 403
+    assert "cannot approve your own" in str(ei.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_copilot_reject_self_refusal_keeps_its_own_text(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_module(db_session, MODULE)
+    env = await _estate(db_session)
+    me, tok = await _user(
+        db_session,
+        name="both2",
+        permissions=[
+            *BARE_REQUESTER_PERMS,
+            *APPROVE,
+            {"action": "read", "resource_type": "subnet"},
+        ],
+    )
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(tok),
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": str(env.subnet_id), "address": "10.77.5.14"},
+            "justification": "need one",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    prop = await _cr_proposal(db_session, me.id, "reject_change_request", resp.json()["id"])
+
+    with pytest.raises(HTTPException) as ei:
+        await apply_proposal(prop.id, me, db_session, _fake_request())
+    assert ei.value.status_code == 403
+    assert "cannot reject your own" in str(ei.value.detail)

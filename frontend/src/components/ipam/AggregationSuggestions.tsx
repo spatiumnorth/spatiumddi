@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BellOff, Combine, Lightbulb, RotateCcw, X } from "lucide-react";
 import { ipamApi, type AggregationSuggestion } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useSessionState } from "@/lib/useSessionState";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 
 /**
  * Passive badge button + popover that surfaces contiguous sibling subnets
@@ -27,6 +28,7 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
   const qc = useQueryClient();
   const canEdit = usePermissions().can("write", "ip_block");
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   const [open, setOpen] = useSessionState(
     `ipam-aggregation-popover-${blockId}`,
@@ -64,21 +66,15 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
     onSuccess: invalidate,
   });
 
-  // Close on outside click — but only when open, so we don't churn
-  // listeners on every render.
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (
-        wrapperRef.current &&
-        !wrapperRef.current.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open, setOpen]);
+  // Esc, an outside press and focus leaving close the popover, and Esc
+  // returns focus to the badge (#3159).
+  const closePopover = useCallback(() => setOpen(false), [setOpen]);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePopover,
+    containerRef: wrapperRef,
+    triggerRef,
+  });
 
   const activeCount = useMemo(
     () => data.filter((s) => s.snoozed_until === null).length,
@@ -91,9 +87,12 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
   if (activeCount === 0 && snoozedCount === 0) return null;
 
   return (
-    <div className="relative" ref={wrapperRef}>
+    <div className="relative" ref={wrapperRef} onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         title={
           activeCount > 0

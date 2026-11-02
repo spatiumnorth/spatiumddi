@@ -147,11 +147,16 @@ _ROLE_LABEL_KEYS = {
 # run (~6-11 s), and a pod scheduled in between registered with the previous
 # group. Keep in lock-step with the per-role ``serverGroupName`` keys in
 # ``_build_values`` (a test asserts they agree).
+#
+# #3202: no ``dhcp`` entry. The dhcp-kea template carries no group (the one
+# pod template of every node cannot carry one node's), so there is nothing to
+# wait for, and a Kea agent registers into the group its appliance is assigned
+# whatever its env says. An entry here would hold every dhcp label for the full
+# ``_LABEL_HOLD_MAX_SECONDS``.
 _ROLE_AGENT_GROUP: dict[str, tuple[str, str]] = {
     "dns-bind9": ("dns-bind9", "AGENT_GROUP"),
     "dns-powerdns": ("dns-powerdns", "AGENT_GROUP"),
     "dns-technitium": ("dns-technitium", "AGENT_GROUP"),
-    "dhcp": ("dhcp-kea", "DHCP_AGENT_GROUP"),
 }
 
 # How long the apply waits, after its values write, for helm-controller to roll
@@ -351,14 +356,15 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "enabled": bool(dhcp_key),
             "controlPlaneUrl": control_plane_url,
             "agentKey": dhcp_key,
-            # #555 — NO ``AGENT_GROUP`` fallback here. ``AGENT_GROUP`` is
-            # written only for DNS roles (role_orchestrator writes
-            # ``DHCP_AGENT_GROUP`` for DHCP), so the fallback could only ever
-            # pull in a DNS group name — a node with both dns + dhcp roles but
-            # no dhcp_group_name would silently register its Kea agent into
-            # the DNS group. Absent → empty, which the backend treats as the
-            # default group.
-            "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", ""),
+            # #3202: NO DHCP group here, the node's own (``DHCP_AGENT_GROUP``)
+            # included. Every node of a cluster writes this ONE chart, and the
+            # chart rendered the group into the ONE dhcp-kea pod template, so
+            # a Fleet DHCP group move of one node re-rendered it and replaced
+            # the Kea pod on every node (a hot-standby pair stopped answering
+            # for 15-25 s). The agent needs a group only for the server row
+            # its registration creates, and the control plane places that row
+            # in the group its appliance is assigned. (#555's point stands:
+            # the DNS ``AGENT_GROUP`` never reaches the Kea agent either.)
             "networkMode": env_vars.get("DHCP_NETWORK_MODE", "host"),
         },
         # #566 — BGP Looking Glass collector (GoBGP). Same
@@ -389,6 +395,11 @@ _AGENT_FAMILIES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
 # block on for the nodes holding the role has none of them, so they come from the
 # live chart a holder wrote; the rest of the block is the node's own render.
 _HOLDER_VALUES = ("agentKey", "serverGroupName", "networkMode")
+
+# #3202: values of a block that no writer carries, so none is copied from the
+# live chart either: dhcpKea holds no DHCP group (see ``_build_values``), and a
+# live chart an older build wrote may still hold one.
+_NEVER_KEPT: dict[str, tuple[str, ...]] = {"dhcpKea": ("serverGroupName",)}
 
 
 def _agent_block_on(values: dict[str, object], block: str) -> bool:
@@ -438,7 +449,8 @@ def keep_other_nodes_agents(
             block = dict(own) if isinstance(own, dict) else {}
             block["enabled"] = True
             if isinstance(held, dict):
-                block.update({k: held[k] for k in _HOLDER_VALUES if k in held})
+                never = _NEVER_KEPT.get(b, ())
+                block.update({k: held[k] for k in _HOLDER_VALUES if k in held and k not in never})
             out[b] = block
             kept.append(b)
     return out, kept

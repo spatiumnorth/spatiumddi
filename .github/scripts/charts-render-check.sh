@@ -27,7 +27,8 @@
 #                      that tests the wrong values path renders no
 #                      ``resources:`` block and passes the three gates above.
 #   pod-posture      — every render: each pod template carries a seccomp
-#                      profile, and (where the render opts in) a
+#                      profile, every init container declares resources
+#                      (#3208), and (where the render opts in) a
 #                      PriorityClass (#983). Same failure mode as the line
 #                      above — a workload added without either one runs
 #                      perfectly well, just unprotected and unranked.
@@ -773,6 +774,7 @@ render umbrella-dns-agent-lb "$UMBRELLA" \
     --set dnsAgents.servers[0].dotPort=853 \
     --set dnsAgents.servers[0].dohPort=8443 \
     --set dnsAgents.servers[0].doqPort=853 \
+    --set dnsAgents.servers[0].service.type=LoadBalancer \
     --set dnsAgents.servers[0].service.loadBalancerIP=10.0.0.53 \
     --set dnsAgents.servers[0].service.loadBalancerSourceRanges[0]=192.0.2.0/24 \
     --set dnsAgents.servers[0].service.ipFamilyPolicy=PreferDualStack \
@@ -787,6 +789,79 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
     --expect-annotation metallb.universe.tf/loadBalancerIPs=10.0.0.53 \
     --expect-annotation metallb.universe.tf/address-pool=default \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+# #3229 — a DNS agent server with no service.type must render ClusterIP, and
+# a DHCP agent likewise: a LoadBalancer default is a hostPort-53 svclb pod on
+# k3s that captures the node's own 127.0.0.53 resolver. Explicit
+# LoadBalancer (above) must still work.
+render umbrella-agent-default-svc "$UMBRELLA" \
+    --set dnsAgents.enabled=true \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+echo "── agent Services default to ClusterIP (umbrella, #3229)"
+python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
+    --expect-type ClusterIP "$OUT/umbrella-agent-default-svc.yaml" \
+    || failures=$((failures + 1))
+python3 - "$OUT/umbrella-agent-default-svc.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+rc = 0
+for comp in ("dns-agent", "dhcp-agent"):
+    # The client-facing Service only: the headless peer Service is excluded,
+    # and one must exist so the assertion cannot pass on its absence.
+    svcs = [
+        d for d in docs
+        if d.get("kind") == "Service"
+        and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == comp
+        and d["spec"].get("clusterIP") != "None"
+    ]
+    if not svcs:
+        print(f"FAIL no client-facing {comp} Service rendered (#3229)", file=sys.stderr)
+        rc = 1
+        continue
+    bad = [d["metadata"]["name"] for d in svcs if d["spec"].get("type") != "ClusterIP"]
+    if bad:
+        print(f"FAIL {comp} Service default is not ClusterIP: {bad} (#3229)", file=sys.stderr)
+        rc = 1
+    else:
+        print(f"   {comp} Service defaults to ClusterIP")
+sys.exit(rc)
+PYEOF
+# #3229 under #3209 naming: the same ClusterIP default must hold when agent
+# objects are prefixed with the release fullname.
+render umbrella-agent-default-svc-prefixed "$UMBRELLA" \
+    --set dnsAgents.enabled=true \
+    --set dnsAgents.prefixWithFullname=true \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.prefixWithFullname=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+echo "── agent Services default to ClusterIP (prefixWithFullname, #3229 + #3209)"
+python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
+    --expect-type ClusterIP "$OUT/umbrella-agent-default-svc-prefixed.yaml" \
+    || failures=$((failures + 1))
+# #3229 — a DHCP service.nodePort with no service.type implies NodePort.
+render umbrella-dhcp-nodeport-implied "$UMBRELLA" \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.servers[0].service.nodePort=30067
+echo "── DHCP service.nodePort without type implies NodePort (umbrella, #3229)"
+python3 - "$OUT/umbrella-dhcp-nodeport-implied.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+svcs = [
+    d for d in yaml.safe_load_all(open(sys.argv[1]))
+    if d and d.get("kind") == "Service"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-agent"
+    and d["spec"].get("clusterIP") != "None"
+]
+if not svcs or any(
+    d["spec"].get("type") != "NodePort" or d["spec"]["ports"][0].get("nodePort") != 30067
+    for d in svcs
+):
+    print(f"FAIL DHCP nodePort without type is not NodePort: {[d['spec'].get('type') for d in svcs]} (#3229)", file=sys.stderr)
+    sys.exit(1)
+print("   DHCP nodePort implies NodePort")
+PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
@@ -1017,7 +1092,9 @@ python3 "$ROOT/.github/scripts/chart-webhooks-fail-open.py" "$OUT/metallb-all-on
 # pod-securityContext knob, so no values override can supply a profile.
 # Exempting them by name is strictly better than not rendering the chart,
 # which is how their missing priority class and BestEffort QoS survived #965.
-POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner"
+# The same subchart gives its four ``cp-*`` init containers no resources knob
+# either (#3208), so the init-resources check exempts frr-k8s by name too.
+POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner --allow-no-init-resources frr-k8s"
 # One peer, because the API refuses BGP mode without one: without it this
 # render held no BGPPeer at all, so the CR every BGP appliance carries was
 # never schema-checked.
@@ -1081,6 +1158,159 @@ else
     echo "   FAIL: expected the #1589 readiness guard to refuse a tcpSocket probe on port 8000 (rc=$neg_rc)" >&2
     printf '%s\n' "$neg_out" | tail -5 >&2
     failures=$((failures + 1))
+fi
+
+# #3208 — an init container without resources must fail the pod-posture gate.
+# Grep the message, not just the exit code: a bare non-zero could come from
+# anything.
+echo "── negative control: an init container without resources must fail (#3208)"
+cat > "$OUT/neg-init-resources.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neg-init
+spec:
+  template:
+    spec:
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: wait-for-thing
+          image: busybox
+      containers:
+        - name: main
+          image: busybox
+YAML
+neg_out="$(python3 "$ROOT/.github/scripts/chart-pod-posture.py" "$OUT/neg-init-resources.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "init container wait-for-thing has no resources"; then
+    echo "   ok: resource-less init container refused by the #3208 guard"
+else
+    echo "   FAIL: expected the pod-posture gate to refuse an init container without resources (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #3204-#3209 — the single-instance k8s placement + naming fixes. One render
+# carries every new value so kubeconform checks it (the CNPG Cluster's
+# spec.affinity.nodeAffinity included), then grep assertions on the shapes.
+UMBRELLA_PLACEMENT=(
+    --set postgresql.kind=cnpg --set postgresql.cnpg.instances=1
+    --set-json 'postgresql.affinity={"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"preference":{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["node-a"]}]}}]}}'
+    --set-json 'api.affinity={"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"pool","operator":"In","values":["cp"]}]}]}},"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":{"app.kubernetes.io/component":"api"}},"topologyKey":"kubernetes.io/hostname"}}]}}'
+    --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x
+    --set dnsAgents.prefixWithFullname=true --set dnsAgents.storageClass=slow
+    --set-json 'dnsAgents.servers=[{"name":"ns1","storageClass":"fast","affinity":{"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":50,"preference":{"matchExpressions":[{"key":"zone","operator":"In","values":["a"]}]}}]}}},{"name":"a-very-long-server-name-number-one-xx1"},{"name":"a-very-long-server-name-number-one-xx2"}]'
+    --set dhcpAgents.enabled=true --set dhcpAgents.agentKey.value=x --set dhcpAgents.prefixWithFullname=true
+    --set-json 'dhcpAgents.servers=[{"name":"d1","nodeSelector":{"pool":"edge"},"tolerations":[{"key":"edge","operator":"Exists"}]}]'
+)
+render umbrella-placement "$UMBRELLA" "${UMBRELLA_PLACEMENT[@]}"
+python3 - "$OUT/umbrella-placement.yaml" <<'PY' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+bad = []
+cl = next(d for d in docs if d["kind"] == "Cluster")
+if cl["spec"].get("enablePDB") is not False:
+    bad.append("#3204: one CNPG instance with enablePDB unset must render enablePDB: false")
+if "preferredDuringSchedulingIgnoredDuringExecution" not in (cl["spec"]["affinity"].get("nodeAffinity") or {}):
+    bad.append("#3205: postgresql.affinity.nodeAffinity missing from the Cluster's spec.affinity")
+job = next(d for d in docs if d["kind"] == "Job" and "-migrate-" in d["metadata"]["name"])
+aff = job["spec"]["template"]["spec"].get("affinity") or {}
+if "nodeAffinity" not in aff:
+    bad.append("#3207: the migrate Job did not follow api.affinity.nodeAffinity")
+if "podAntiAffinity" in aff or "podAffinity" in aff:
+    bad.append("#3207: the migrate Job copied the api's pod (anti-)affinity, which keeps it off the api's nodes")
+sts = {d["metadata"]["name"]: d for d in docs if d["kind"] == "StatefulSet"
+       and d["spec"]["template"]["metadata"]["labels"].get("app.kubernetes.io/component") in ("dns-agent", "dhcp-agent")}
+names = sorted(sts)
+if len(names) != 4:
+    bad.append(f"#3209: expected 4 distinct agent StatefulSets, got {names}")
+for n, d in sts.items():
+    if len(n) > 52:
+        bad.append(f"#3209: agent name {n} is {len(n)} > 52 characters")
+    if not n.startswith("umbrella-placement-spatiumddi-"):
+        bad.append(f"#3209: agent name {n} is not prefixed with the release fullname")
+    spec = d["spec"]["template"]["spec"]
+    if d["spec"]["serviceName"] != n + "-headless":
+        bad.append(f"#3209: {n} serviceName {d['spec']['serviceName']}")
+    if "podAntiAffinity" not in spec.get("affinity", {}):
+        bad.append(f"#3206: {n} lost the chart's one-per-node anti-affinity")
+    want = "fast" if n.endswith("-ns1") else ("slow" if "dns" in n else None)
+    for c in d["spec"]["volumeClaimTemplates"]:
+        if c["spec"].get("storageClassName") != want:
+            bad.append(f"#3206: {n} claim {c['metadata']['name']} storageClassName {c['spec'].get('storageClassName')} != {want}")
+    if n.endswith("-ns1") and "nodeAffinity" not in spec["affinity"]:
+        bad.append(f"#3206: {n} lost its own nodeAffinity")
+    if "dhcp" in n and (spec.get("nodeSelector") != {"pool": "edge"} or not spec.get("tolerations")):
+        bad.append(f"#3206: {n} did not carry its nodeSelector / tolerations")
+svcs = [d["metadata"]["name"] for d in docs if d["kind"] == "Service"]
+if len(svcs) != len(set(svcs)):
+    bad.append(f"#3209: duplicate Service names {svcs}")
+for b in bad:
+    print("   FAIL:", b, file=sys.stderr)
+if not bad:
+    print("   ok: #3204-#3209 placement / naming shapes")
+sys.exit(1 if bad else 0)
+PY
+for case in "1:false:unset" "1:true:true" "1:false:false" "3:true:unset" "3:true:true" "3:false:false"; do
+    IFS=: read -r inst want set <<<"$case"
+    args=(--set postgresql.kind=cnpg --set "postgresql.cnpg.instances=$inst")
+    [ "$set" = unset ] || args+=(--set "postgresql.cnpg.enablePDB=$set")
+    got="$(helm template pdb "$UMBRELLA" --kube-version "$K8S_VERSION" "${args[@]}" | sed -n 's/^  enablePDB: //p')"
+    if [ "$got" = "$want" ]; then
+        echo "   ok: #3204 instances=$inst enablePDB=$set renders $got"
+    else
+        echo "   FAIL: #3204 instances=$inst enablePDB=$set rendered '$got', want $want" >&2
+        failures=$((failures + 1))
+    fi
+done
+neg3209() { # label expected-message [helm args...]
+    local label="$1" msg="$2"; shift 2
+    local rel="${REL:-neg}"
+    if out="$(helm template "$rel" "$UMBRELLA" --kube-version "$K8S_VERSION" \
+            --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x "$@" 2>&1)"; then
+        echo "   FAIL: #3209 $label rendered" >&2; failures=$((failures + 1))
+    elif printf '%s' "$out" | grep -q "$msg"; then
+        echo "   ok: #3209 $label refused"
+    else
+        echo "   FAIL: #3209 $label failed for another reason:" >&2
+        printf '%s\n' "$out" | tail -3 >&2; failures=$((failures + 1))
+    fi
+}
+echo "── negative controls: agent object names (#3209)"
+neg3209 "two servers with one name" "server names must be unique" \
+    --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1"}]'
+neg3209 "servers ns1 and ns1-headless (unprefixed)" "server names must be unique" \
+    --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1-headless"}]'
+neg3209 "servers ns1 and ns1-headless (prefixed)" "server names must be unique" \
+    --set dnsAgents.prefixWithFullname=true \
+    --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1-headless"}]'
+neg3209 "DHCP servers a and a-headless" "server names must be unique" \
+    --set dhcpAgents.enabled=true --set dhcpAgents.agentKey.value=x \
+    --set-json 'dhcpAgents.servers=[{"name":"a"},{"name":"a-headless"}]'
+REL=1dev neg3209 "a prefixed name starting with a digit" "must start with a lowercase letter" \
+    --set dnsAgents.prefixWithFullname=true --set-json 'dnsAgents.servers=[{"name":"ns1"}]'
+
+# #3206 follow-up — adopting storageClass on a live StatefulSet is refused by
+# helm via `lookup`, which is empty without a cluster. So here we can only pin
+# the half that must never regress: with no cluster (helm template, Argo CD)
+# setting a class renders, and NOTES carries the static pointer only then.
+echo "── storageClass adoption: renders without a cluster, NOTES pointer (#3206)"
+# NOTES.txt is not a manifest, so `helm template --show-only` cannot select it;
+# a client-side dry-run install needs no cluster and prints it.
+sc_notes() { helm install sc "$UMBRELLA" --dry-run=client "$@" 2>&1 | sed -n '/^NOTES:/,$p'; }
+if ! helm template sc "$UMBRELLA" --kube-version "$K8S_VERSION" --set dnsAgents.enabled=true \
+        --set dnsAgents.agentKey.value=x --set dnsAgents.storageClass=slow --set dhcpAgents.enabled=true \
+        --set dhcpAgents.storageClass=slow >/dev/null 2>/tmp/sc-render.err; then
+    echo "   FAIL: #3206 storageClass set did not render without a cluster:" >&2
+    tail -3 /tmp/sc-render.err >&2; failures=$((failures + 1))
+elif ! sc_out="$(sc_notes --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x --set dnsAgents.storageClass=slow)" \
+        || ! printf '%s' "$sc_out" | grep -q "Adopting storageClass on an existing install"; then
+    echo "   FAIL: #3206 NOTES lacks the storageClass pointer when one is set" >&2; failures=$((failures + 1))
+elif sc_out="$(sc_notes --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x)" \
+        && printf '%s' "$sc_out" | grep -q "Adopting storageClass"; then
+    echo "   FAIL: #3206 NOTES shows the storageClass pointer with none set" >&2; failures=$((failures + 1))
+else
+    echo "   ok: #3206 storageClass renders offline; NOTES pointer only when set"
 fi
 
 # #1550 — no render above sets frontend.controlPlaneVIP, so the

@@ -246,7 +246,8 @@ def _current_slot_from_cmdline() -> str | None:
 
     Mirror of the api-side ``services/appliance/slot.py`` helper; kept
     independent so the agent doesn't pull in the backend package. The
-    PARTLABEL of the booted slot maps to ``slot_a`` or ``slot_b``.
+    PARTLABEL of the booted slot (on a mirrored install, the md array's
+    slot name) maps to ``slot_a`` or ``slot_b``.
 
     Reads ``/run/udev/data/b<major>:<minor>`` files directly instead of
     shelling out to lsblk — lsblk inside a container without
@@ -278,14 +279,21 @@ def _current_slot_from_cmdline() -> str | None:
             continue
         # ``S:`` lines are symlinks udev creates under /dev/disk/. We
         # pull PARTLABEL + UUID from the matching subdirectory prefix.
-        _props, links = _udev_properties(entry)
-        partlabel: str | None = None
+        props, links = _udev_properties(entry)
+        # #3172 — on a mirrored install (#999) the root filesystem is an md
+        # array, which has no PARTLABEL: its by-partlabel links sit on the
+        # member partitions, its by-uuid link on the array. The array is
+        # named after its slot instead (``mdadm --create /dev/md/root_a``),
+        # which udev records as MD_DEVNAME and the ``md/root_a`` link.
+        partlabel: str | None = props.get("MD_DEVNAME") or None
         matches_uuid = False
         for value in links:
             if value.startswith("disk/by-partlabel/"):
                 # Last segment is the PARTLABEL (preserving GPT case
                 # would matter for downstream consumers, but we only
                 # compare case-insensitively to root_a / root_b).
+                partlabel = value.rsplit("/", 1)[-1]
+            elif value.startswith("md/") and partlabel is None:
                 partlabel = value.rsplit("/", 1)[-1]
             elif value.startswith("disk/by-uuid/"):
                 if value.rsplit("/", 1)[-1].lower() == root_uuid:

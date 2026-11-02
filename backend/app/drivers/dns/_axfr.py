@@ -115,7 +115,13 @@ def _hint(exc: BaseException, port: int) -> str:
 
 # Signing artefacts the authoritative server generates and owns. Never
 # modelled as SpatiumDDI records, so they must not surface as drift.
-_DNSSEC_ARTEFACTS = frozenset({"RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY", "CDS", "CDNSKEY"})
+# ``TYPE65534`` is BIND9's private-type signing-state record: an inline-signed
+# zone keeps one at the apex and serves it in every AXFR (verified against
+# BIND 9.20), so without it every signed zone read as drifted (#3198). The
+# agent's ingest skips it for the same reason (``services/dns/ingest.py``).
+_DNSSEC_ARTEFACTS = frozenset(
+    {"RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY", "CDS", "CDNSKEY", "TYPE65534"}
+)
 
 
 async def axfr_zone_records(
@@ -139,7 +145,8 @@ async def axfr_zone_records(
     agent-managed server the served NS set is rendered from the zone's own
     apex NS rows, so dropping it there hides real drift. Out-of-zone glue (an NS target living in a different zone) is
     also skipped, as are DNSSEC signing artefacts (RRSIG / NSEC* / DNSKEY /
-    CDS / CDNSKEY), which the signing server owns and rotates itself.
+    CDS / CDNSKEY / BIND9's private TYPE65534), which the signing server owns
+    and rotates itself.
 
     ``tsig`` signs the transfer (#734). Agent-managed BIND9 and Technitium
     grant ``allow-transfer`` to the group's TSIG key rather than to a source

@@ -1,15 +1,9 @@
-import {
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 
 // Dropdown companion to HeaderButton (#996).
 //
@@ -97,54 +91,14 @@ export function HeaderMenu({
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
-  const close = useCallback((focusTrigger: boolean) => {
-    setOpen(false);
-    if (focusTrigger) triggerRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    // Esc closes the menu wherever focus is. A mouse open leaves focus
-    // on the trigger (or on <body> in Safari, which does not focus a
-    // button on click), and a handler on the panel never sees a key
-    // pressed there (#2047). Capture phase on the document so it runs
-    // before the modal hook's window listener; stopPropagation only
-    // because the menu was open and handled it, so a closed menu never
-    // swallows the Esc a parent dialog is waiting for.
-    //
-    // Two guards. An Esc that ends an IME composition belongs to the
-    // input method, not to us. And the Esc is ours only while focus is
-    // in the menu (trigger or panel) or nowhere (<body>): if a layer
-    // opened over the menu without a pointer press — Cmd+K's palette,
-    // the `?` overlay, a modal from a page shortcut — focus is in that
-    // layer and so is the Esc. The focusout handler on the container
-    // normally closes the menu before that can happen; this is the
-    // backstop, so a missed focusout cannot yank focus back behind the
-    // layer the operator is in.
-    const onDocKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.isComposing) return;
-      const active = document.activeElement;
-      const inMenu =
-        !active ||
-        active === document.body ||
-        (ref.current?.contains(active) ?? false);
-      if (!inMenu) return;
-      e.preventDefault();
-      e.stopPropagation();
-      close(true);
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    document.addEventListener("keydown", onDocKeyDown, true);
-    return () => {
-      document.removeEventListener("mousedown", onDocMouseDown);
-      document.removeEventListener("keydown", onDocKeyDown, true);
-    };
-  }, [open, close]);
+  const dismiss = useCallback(() => setOpen(false), []);
+  // Esc / outside press / focus leaving: the shared popover contract.
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: dismiss,
+    containerRef: ref,
+    triggerRef,
+  });
 
   // Flip to the left edge when the panel would overflow the viewport. A
   // header menu near the right edge is the common case, so `right-0` is
@@ -208,19 +162,7 @@ export function HeaderMenu({
   if (items.length === 0) return null;
 
   return (
-    <div
-      ref={ref}
-      className={cn("relative", className)}
-      // Focus leaving the menu for somewhere else closes it, so an open
-      // menu never sits under whatever took focus (a Tab off a mouse-opened
-      // trigger, or a layer that focused itself). A null relatedTarget is
-      // focus going nowhere — a click on the page, the window losing focus
-      // — which the outside-mousedown handler already decides.
-      onBlur={(e) => {
-        const next = e.relatedTarget as Node | null;
-        if (open && next && !e.currentTarget.contains(next)) setOpen(false);
-      }}
-    >
+    <div ref={ref} className={cn("relative", className)} onBlur={onBlur}>
       <HeaderButton
         ref={triggerRef}
         icon={Icon}

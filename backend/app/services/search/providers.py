@@ -838,7 +838,9 @@ async def search_sites(db: AsyncSession, s: QueryShape, limit: int) -> list[Sear
 
 async def search_circuits(db: AsyncSession, s: QueryShape, limit: int) -> list[SearchResult]:
     cols = (Circuit.name, Circuit.ckt_id, Circuit.notes)
-    stmt = select(Circuit).where(_text_clauses(s.raw, *cols))
+    # Circuit soft-deletes by a bare ``deleted_at`` stamp and is not in the
+    # global filter set in ``app.db``, so the live-only clause is ours (#3191).
+    stmt = select(Circuit).where(Circuit.deleted_at.is_(None), _text_clauses(s.raw, *cols))
     rank = sql_rank(s.raw, *cols)
     rows = (await db.execute(_ranked(stmt, rank, limit, tiebreak=Circuit.name))).all()
 

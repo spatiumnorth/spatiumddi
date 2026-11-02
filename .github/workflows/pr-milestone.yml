@@ -9,8 +9,9 @@ name: PR — Milestone
 #   issue it closes shares one, the PR takes it.
 # - Merged with still none (no closing issue, issues that disagree, or a PR
 #   stacked on another branch, whose "Fixes #N" GitHub does not link): the PR
-#   takes the next release's milestone, the lowest-versioned open one, so the
-#   fallback moves on by itself when a release's milestone is closed.
+#   takes the next drop's milestone, the lowest-versioned open one, a beta or
+#   RC included (1.0.0-beta.4 < 1.0.0-rc.1 < 1.0.0), so the fallback moves on
+#   by itself when a milestone is closed.
 # - A milestone already on the PR is never changed.
 #
 # pull_request_target so fork PRs get a token that can write the milestone.
@@ -82,11 +83,28 @@ jobs:
                 state: "open",
                 per_page: 100,
               });
+              // SemVer 2.0 precedence; reference ordering is backend/app/core/versions.py.
+              // A pre-release sorts before its release; titles that are not versions are ignored.
               const version = (t) => {
-                const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(t);
-                return m ? m.slice(1).map(Number) : null;
+                const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(t);
+                return m ? { core: m.slice(1, 4).map(Number), pre: m[4] ? m[4].split(".") : [] } : null;
               };
-              const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+              const cmpId = (a, b) => {
+                const an = /^\d+$/.test(a);
+                const bn = /^\d+$/.test(b);
+                if (an && bn) return Number(a) - Number(b);
+                if (an !== bn) return an ? -1 : 1; // numeric identifiers sort below alphanumeric
+                return a < b ? -1 : a > b ? 1 : 0;
+              };
+              const cmp = (a, b) => {
+                for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
+                if (!a.pre.length || !b.pre.length) return b.pre.length - a.pre.length; // release > pre-release
+                for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+                  const c = cmpId(a.pre[i], b.pre[i]);
+                  if (c) return c;
+                }
+                return a.pre.length - b.pre.length; // a longer set wins when the rest is equal
+              };
               const releases = open
                 .map((m) => ({ m, v: version(m.title) }))
                 .filter((x) => x.v)

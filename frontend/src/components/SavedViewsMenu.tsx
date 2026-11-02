@@ -9,13 +9,14 @@
 //
 // Gated by the ``ui.saved_views`` feature module: hidden entirely when
 // an operator turns it off.
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bookmark, ChevronDown, Star, Trash2 } from "lucide-react";
 
 import { savedViewsApi, type SavedView } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 
 export function SavedViewsMenu<P extends Record<string, unknown>>({
   page,
@@ -36,6 +37,7 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
   const [name, setName] = useState("");
   const [toDelete, setToDelete] = useState<SavedView | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const appliedDefault = useRef(false);
 
   const viewsQ = useQuery({
@@ -88,15 +90,14 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
     },
   });
 
-  useEffect(() => {
-    if (!open) return;
-    const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node))
-        setOpen(false);
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [open]);
+  // Esc / outside press / focus leaving close the panel (#3159).
+  const closePanel = useCallback(() => setOpen(false), []);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePanel,
+    containerRef: ref,
+    triggerRef,
+  });
 
   // Hidden when the operator disabled the module. Stay optimistic while
   // the module set is still loading so the control doesn't blink in.
@@ -109,9 +110,12 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
   );
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} className="relative" onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
         title="Saved views — store and recall this page's filters"
         className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
@@ -165,7 +169,11 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setToDelete(v)}
+                  onClick={() => {
+                    // Close first, so the confirm dialog owns Esc.
+                    setOpen(false);
+                    setToDelete(v);
+                  }}
                   title="Delete view"
                   className="rounded p-1 text-muted-foreground hover:text-destructive"
                 >

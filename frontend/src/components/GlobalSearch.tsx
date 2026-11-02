@@ -397,6 +397,9 @@ export function GlobalSearch() {
         setOpen((v) => !v);
       }
       if (e.key === "Escape") {
+        // An Esc that ends an IME composition belongs to the input method:
+        // the palette stays open with its query (#3156).
+        if (e.isComposing || e.keyCode === 229) return;
         // Esc in the open palette closes the palette only, not a dialog
         // under it (whose Esc listener sits on window, after this one).
         if (cardRef.current) e.stopPropagation();
@@ -554,6 +557,8 @@ export function GlobalSearch() {
       const row = rows[activeIdx];
       if (row) activate(row);
     } else if (e.key === "Escape") {
+      // A composing Esc cancels the composition only (#3156).
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
       // Stops the native event at the React root, so neither the document
       // handler above nor a dialog's window listener sees it (#1947).
       e.stopPropagation();
