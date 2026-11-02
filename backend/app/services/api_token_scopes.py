@@ -48,6 +48,7 @@ endpoint reject the typo with 422 at issuance time.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -122,7 +123,88 @@ _IPAM_PREFIXES: tuple[str, ...] = (
     "/api/v1/vlans",
     "/api/v1/vrfs",
     "/api/v1/network-devices",
+    # Plainly-IPAM surfaces mounted outside /api/v1/ipam (#3302).
+    "/api/v1/address-sets",
+    "/api/v1/multicast",
+    "/api/v1/av/flows",
+    "/api/v1/av/reserved-ranges",
+    # Custom-field definitions are for ip_space / ip_block / subnet /
+    # ip_address only, so they are IPAM's.
+    "/api/v1/custom-fields",
 )
+# Single routes (method + path) that belong to a write scope without their
+# whole router being covered (#3302). A prefix would widen the scope onto the
+# siblings that share it: ``/nmap`` scan creation is an active probe, and
+# ``/acme/update`` is the acme-dns client's own credential, not an operator.
+# Each entry is ``(scope, method, path regex)``.
+_ROUTE_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
+    ("ipam:write", "POST", re.compile(r"^/api/v1/nmap/scans/[^/]+/stamp-discovered$")),
+    ("dns:write", "POST", re.compile(r"^/api/v1/acme/register$")),
+    ("dns:write", "DELETE", re.compile(r"^/api/v1/acme/accounts/[^/]+$")),
+    # Registered-domain (RDAP / expiry) inventory.
+    ("dns:write", "*", re.compile(r"^/api/v1/domains(/.*)?$")),
+    # Blocks a MAC across DHCP groups; also needs ``write dhcp_mac_block`` RBAC.
+    ("dhcp:write", "POST", re.compile(r"^/api/v1/new-devices/block$")),
+)
+
+# Approve-and-provision routes. A scoped token may enter any of them holding
+# ANY write scope; the handler then checks the scope of the OPERATION's own
+# family (:func:`enforce_operation_token_scope`). The route gate cannot, since
+# the family is in the stored request, not the path.
+_APPLY_TIME_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/api/v1/requests$")),
+    ("POST", re.compile(r"^/api/v1/requests/[^/]+/(approve|reject|cancel)$")),
+    ("POST", re.compile(r"^/api/v1/change-requests/[^/]+/(approve|reject|cancel)$")),
+    ("POST", re.compile(r"^/api/v1/ai/proposals/[^/]+/apply$")),
+)
+
+# Registered operation -> the write scope covering its REST twin. Keyed by
+# name, not by ``Operation.category``: ``allowlist_mac`` is category ``ipam``
+# but its REST route (/new-devices) is in no scope. An operation absent here
+# needs an unrestricted token.
+OPERATION_WRITE_SCOPE: dict[str, str] = {
+    **dict.fromkeys(
+        (
+            "allocate_subnet",
+            "create_ip_address",
+            "create_address_set",
+            "delete_subnet",
+            "delete_block",
+            "delete_space",
+            "commit_netbox_import",
+            "create_multicast_group",
+            "allocate_multicast_groups",
+            "create_multicast_domain",
+            "update_multicast_domain",
+            "delete_multicast_domain",
+        ),
+        "ipam:write",
+    ),
+    **dict.fromkeys(
+        (
+            "create_dns_record",
+            "create_dns_zone",
+            "delete_zone",
+            "sign_zone_dnssec",
+            "unsign_zone_dnssec",
+            "set_zone_update_acl",
+            "commit_dns_import",
+        ),
+        "dns:write",
+    ),
+    **dict.fromkeys(
+        (
+            "create_dhcp_static",
+            "delete_scope",
+            "delete_group",
+            "commit_dhcp_import",
+            "allowlist_ra_router",
+            "block_mac",
+        ),
+        "dhcp:write",
+    ),
+}
+
 # DNS pools are served under ``/api/v1/dns/pools``; nothing is mounted at
 # ``/api/v1/dns-pools``, so it is not listed.
 _DNS_PREFIXES: tuple[str, ...] = ("/api/v1/dns",)
@@ -145,6 +227,49 @@ def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
     ``/api/v1/dns/zones`` but not ``/api/v1/dnsbl`` or ``/api/v1/dns-threat``.
     """
     return any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def _route_rule_matches(scope: str, method: str, path: str) -> bool:
+    return any(s == scope and m in ("*", method) and rx.match(path) for s, m, rx in _ROUTE_RULES)
+
+
+def _apply_time_route(method: str, path: str) -> bool:
+    return any(m == method and rx.match(path) for m, rx in _APPLY_TIME_ROUTES)
+
+
+def enforce_operation_token_scope(request: object, operation_name: str) -> None:
+    """Apply-time scope check for the approve-and-provision routes (#3302).
+
+    The route gate admits a write-scoped token to ``/requests``,
+    ``/change-requests/*/{approve,reject,cancel}`` and
+    ``/ai/proposals/*/apply`` without knowing which domain the stored
+    operation touches. This closes that: a scoped token must hold the write
+    scope of the operation's own family, else 403 naming it. An operation
+    with no family scope (``OPERATION_WRITE_SCOPE``) needs an unrestricted
+    token. No-op for a session or an unrestricted token (``request.state``
+    carries no scopes, or an empty list). RBAC is separate and unchanged.
+    Reject and cancel are held to the same family rule: they change no
+    domain, but they decide a request for that family, and a token that
+    could not have made or applied it has no business ending it.
+    """
+    state = getattr(request, "state", None)
+    scopes: list[str] = list(getattr(state, "api_token_scopes", None) or [])
+    if not scopes:
+        return
+    needed = OPERATION_WRITE_SCOPE.get(operation_name)
+    if needed is not None and needed in scopes:
+        return
+    from fastapi import HTTPException, status  # noqa: PLC0415
+
+    what = (
+        f"the {needed} scope"
+        if needed
+        else "an unrestricted token (no write scope covers this operation)"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Token scope insufficient: operation '{operation_name}' needs {what}",
+    )
 
 
 def scopes_allow_outbound_tool(scopes: list[str], outbound_scope: str | None) -> bool:
@@ -201,6 +326,10 @@ def scope_matches_request(
         # outbound tools from a read-only token — so a JSON-RPC POST to
         # ``/api/v1/ai/mcp`` is fine under ``read``.
         if scope == "read" and _path_under(path, _MCP_PREFIXES):
+            return True
+        if scope in WRITE_SCOPES and _route_rule_matches(scope, method, path):
+            return True
+        if scope in WRITE_SCOPES and _apply_time_route(method, path):
             return True
         if scope == "ipam:write" and _path_under(path, _IPAM_PREFIXES):
             return True
@@ -281,12 +410,14 @@ def validate_resource_grant_shape(grants: list[dict]) -> list[dict]:
 
 
 __all__ = [
+    "OPERATION_WRITE_SCOPE",
     "TOKEN_GRANT_ACTIONS",
     "TOKEN_GRANT_RESOURCE_TYPES",
     "TOKEN_SCOPE_VOCABULARY",
     "is_read_only_post",
     "is_token_outbound",
     "read_only_post",
+    "enforce_operation_token_scope",
     "scope_matches_request",
     "scopes_allow_outbound_tool",
     "token_outbound",

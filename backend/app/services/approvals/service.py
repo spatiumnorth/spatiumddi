@@ -33,6 +33,7 @@ from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.change_request import CHANGE_REQUEST_ORIGINS, ChangeRequest
+from app.services.api_token_scopes import enforce_operation_token_scope
 
 logger = structlog.get_logger(__name__)
 
@@ -697,6 +698,10 @@ async def approve_change_request(
     if op is None:
         raise DecisionError(f"Operation {cr.operation!r} is not registered")
 
+    # 2c. A scoped API token must hold the write scope of the operation's own
+    #     family (#3302); the route gate could only ask for "any write scope".
+    _enforce_token_scope(request, cr.operation)
+
     # 3. Approver holds the approve capability.
     if not _can_approve(approver):
         raise DecisionForbidden(
@@ -999,6 +1004,7 @@ async def reject_change_request(
     cr = await get_change_request(db, cr_id, for_update=True)
     if cr is None:
         raise DecisionNotFound(f"Change request {cr_id} not found")
+    _enforce_token_scope(request, cr.operation)
     if cr.requested_by_user_id is not None and approver.id == cr.requested_by_user_id:
         raise DecisionForbidden("You cannot reject your own request — cancel it instead")
     try:
@@ -1008,6 +1014,16 @@ async def reject_change_request(
     await db.commit()
     await db.refresh(cr)
     return cr
+
+
+def _enforce_token_scope(request: Request | None, operation: str) -> None:
+    """:func:`enforce_operation_token_scope` as a :class:`DecisionForbidden`."""
+    if request is None:
+        return
+    try:
+        enforce_operation_token_scope(request, operation)
+    except HTTPException as exc:
+        raise DecisionForbidden(str(exc.detail)) from exc
 
 
 def _can_approve(user: User) -> bool:

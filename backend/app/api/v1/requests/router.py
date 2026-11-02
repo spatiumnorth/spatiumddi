@@ -56,6 +56,7 @@ from app.models.change_request import ChangeRequest
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSView, DNSZone
 from app.models.ipam import IPBlock, Subnet
+from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
@@ -479,6 +480,9 @@ async def create_request(
     """Submit a request. Provisions nothing — it queues a pending row that a
     *different*, suitably-permissioned approver must accept."""
     _require_submit(current_user)
+    resolved = resolve_operation(body.kind)
+    if resolved is not None:  # an unknown kind is submit_request's 400
+        enforce_operation_token_scope(request, resolved[1].name)  # #3302
     cr = await submit_request(
         db,
         user=current_user,
@@ -565,6 +569,7 @@ async def cancel_request(
     """Withdraw your own pending request (superadmins may cancel any)."""
     _require_read(current_user)
     cr = await _load_visible(db, req_id, current_user, for_update=True)
+    enforce_operation_token_scope(request, cr.operation)  # #3302
     is_requester = (
         cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id
     )

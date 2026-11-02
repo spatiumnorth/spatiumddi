@@ -29,6 +29,7 @@ from app.core.agent_wake import collecting_wakes
 from app.models.ai import AIOperationProposal
 from app.services.ai import operations
 from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
+from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.gate import gate_or_execute
 
 logger = structlog.get_logger(__name__)
@@ -137,6 +138,10 @@ async def apply_proposal(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Operation {row.operation!r} is not registered",
         )
+
+    # A scoped API token must hold the write scope of the operation's family
+    # (#3302): the route gate only asked for "any write scope".
+    enforce_operation_token_scope(request, op.name)
 
     # SECURITY (#400, C2): authoritative RBAC backstop. The propose→apply
     # flow has NO router-level require_*_permission dependency, so without

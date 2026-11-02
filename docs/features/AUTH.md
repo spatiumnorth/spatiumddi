@@ -687,14 +687,25 @@ rejected with `422` rather than silently locking the operator out:
   probe or an off-prem lookup needs an unrestricted token whatever the
   scopes, as its REST route (`/tools/*`, `/bgp/*`, …) does.
 - `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
-  `/vrfs/*`, `/network-devices/*`.
+  `/vrfs/*`, `/network-devices/*`, and also `/address-sets/*`, `/multicast/*`,
+  `/av/flows/*`, `/av/reserved-ranges/*`, `/custom-fields/*` and
+  `POST /nmap/scans/{id}/stamp-discovered`.
 - `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,
   groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
   (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
-  that writes there needs an empty scope set, with RBAC as the gate.
-- `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
+  that writes there needs an empty scope set, with RBAC as the gate. It also
+  covers `/api/v1/domains/*`, `POST /acme/register` and
+  `DELETE /acme/accounts/{id}`.
+- `dhcp:write` — allows mutations under `/api/v1/dhcp/*`, and
+  `POST /api/v1/new-devices/block`.
 - `agent` — allows only the agent push surface
   (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+Approve-and-provision routes (`/requests`, `/change-requests/{id}/approve|reject|cancel`,
+`/ai/proposals/{id}/apply`) admit any write scope, then check the scope of the
+stored operation's own family at apply time (403 naming it otherwise).
+Cutover, Trash restore / purge and other cross-domain routes need an
+unrestricted token.
 
 Prefixes match on a whole path segment, so `/api/v1/dns` covers
 `/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
