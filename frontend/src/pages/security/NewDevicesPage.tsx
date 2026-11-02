@@ -107,7 +107,14 @@ export function NewDevicesPage() {
   // exist while core.dhcp is on. With it off the action survives only as the
   // upstream quarantine (when block-sync is on), and is hidden otherwise.
   const dhcpOn = useModuleOn("core.dhcp");
+  // #3302 — the DHCP half also needs write on dhcp_mac_block; without it the
+  // route answers 403, so the button is disabled with the reason instead.
+  const canWriteMacBlock = perms.can("write", "dhcp_mac_block");
   const canBlock = dhcpOn || blockSyncEnabled;
+  const blockGate =
+    dhcpOn && !canWriteMacBlock
+      ? permissionGate(false, "Requires write permission on DHCP MAC blocks")
+      : writeGate;
 
   const summaryQ = useQuery({
     queryKey: ["new-devices", "summary"],
@@ -396,7 +403,7 @@ export function NewDevicesPage() {
                   setActionError(null);
                   setShowBlock(true);
                 }}
-                {...writeGate}
+                {...blockGate}
               >
                 {dhcpOn ? "Block" : "Quarantine upstream"}
               </HeaderButton>

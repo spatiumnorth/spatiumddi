@@ -91,6 +91,7 @@ import {
   type AddressSetCreate,
   type AddressSetUpdate,
   formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
@@ -1014,7 +1015,7 @@ function ZoneOptions({
 
 // ─── Create Space Modal ───────────────────────────────────────────────────────
 
-function CreateSpaceModal({ onClose }: { onClose: () => void }) {
+export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -1172,6 +1173,12 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             />
           </Field>
         </div>
+      )}
+
+      {mutation.isError && (
+        <p role="alert" className="mt-4 text-sm text-destructive">
+          {formatDialogError(mutation.error, "Failed to create IP space")}
+        </p>
       )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
@@ -7631,6 +7638,11 @@ export function DnsSyncModal({
                 {backfillResult.created.map((c) => c.zone).join(", ")}
               </span>
             </div>
+          )}
+          {commitMut.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              Apply failed. {formatApiError(commitMut.error)}
+            </p>
           )}
           {backfillError && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">

@@ -969,7 +969,9 @@ the 60 s alert tick.
 
 **Operator surface.** `GET /new-devices/{summary,sightings,allowlist}` +
 acknowledge / baseline-import / allowlist / block actions
-(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`). The
+(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`; **Block** additionally needs `write` `dhcp_mac_block` in every
+target DHCP group, and is refused whole (403, audited `denied`) otherwise
+— with `group_id` omitted that means every group). The
 **Tools → New Devices** review queue lists sightings with one-click
 **Acknowledge / Add to allowlist / Block** (block creates a
 `DHCPMACBlock` — arpwatch with teeth). Run a **baseline import** when
@@ -1958,8 +1960,9 @@ advisory locks held through commit:
   re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
   are the safe union (true when any source has it, and the preview
   says so); sources that disagree on kind, customer or site are a
-  conflict; any other disagreeing setting (role, discovery, ...) is a
-  preview warning and the target's value is kept. Service in
+  conflict; any other disagreeing setting (role, discovery, tags, custom
+  fields, VXLAN ID, domain, DNS servers, ...) is a
+  preview warning naming each value and the target's value is kept. Service in
   `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the

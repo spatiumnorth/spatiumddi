@@ -30,6 +30,7 @@ import {
   dhcpApi,
   type PlanNode,
   type PlanValidationConflict,
+  formatDialogError,
 } from "@/lib/api";
 import { newNodeId } from "@/lib/uuid";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -93,6 +94,9 @@ export function SubnetPlannerEditorPage() {
         tree: t,
       }),
     onSuccess: (r) => setConflicts(r.conflicts),
+    // A 422 (e.g. an invalid CIDR) leaves the last answer's conflicts stale;
+    // clear them and let the refusal's own message show instead.
+    onError: () => setConflicts([]),
   });
 
   // Re-validate whenever the tree changes (debounced inline by React's batch).
@@ -228,7 +232,9 @@ export function SubnetPlannerEditorPage() {
             )}
             <button
               type="button"
-              disabled={!dirty || saveMut.isPending || applied}
+              disabled={
+                !dirty || saveMut.isPending || applied || validateMut.isError
+              }
               onClick={() => saveMut.mutate()}
               className="inline-flex items-center gap-1 rounded border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-50"
               {...writeGate}
@@ -267,6 +273,16 @@ export function SubnetPlannerEditorPage() {
             </button>
           </div>
         </div>
+        {validateMut.isError && (
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            This plan can't be validated: {formatDialogError(validateMut.error)}
+          </p>
+        )}
+        {saveMut.isError && (
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            Not saved: {formatDialogError(saveMut.error)}
+          </p>
+        )}
         {applyMut.isError && !showApplyConfirm && (
           <ApplyErrorBanner error={applyMut.error as unknown} />
         )}
