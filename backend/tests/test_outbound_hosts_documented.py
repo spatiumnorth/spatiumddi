@@ -50,6 +50,7 @@ import ast
 import ipaddress
 import pathlib
 import re
+import sys
 
 import pytest
 
@@ -207,6 +208,130 @@ def _public_ips_in_agent_source() -> dict[str, set[str]]:
                     if addr.is_global and not addr.is_multicast:
                         found.setdefault(str(addr), set()).add(str(path.relative_to(_REPO_ROOT)))
     return found
+
+
+# Calls whose argument is a host to resolve or reach (#3307). The URL scan
+# above only sees ``http(s)://`` text, so a bare name handed to a resolver or
+# a socket — the appliance self-test's ``gethostbyname("registry-1.docker.io")``
+# — never reached the page. Matched on the called attribute / function name,
+# not the receiver, because ``dns.resolver.resolve``, ``Resolver().resolve``
+# and ``socket.create_connection`` are spelled many ways.
+_NETWORK_CALLS = frozenset(
+    {
+        "gethostbyname",
+        "gethostbyname_ex",
+        "getaddrinfo",
+        "create_connection",
+        "connect",
+        "open_connection",
+        "resolve",
+        "resolve_address",
+        "query",
+        "getfqdn",
+    }
+)
+
+
+def _call_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _string_assignments(tree: ast.AST) -> dict[str, set[str]]:
+    """Name -> every string literal assigned to it anywhere in the file.
+
+    Deliberately coarse (no scoping): ``target = "registry-1.docker.io"``
+    followed by ``gethostbyname(target)`` is the shape that matters, and a
+    union over the file can only over-report, which a human then sorts into
+    the table or the appendix.
+    """
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        value = None
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            value, targets = node.value, list(node.targets)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            value, targets = node.value, [node.target]
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    out.setdefault(t.id, set()).add(value.value)
+    return out
+
+
+def _literal_hosts(arg: ast.expr, assigned: dict[str, set[str]]) -> list[str]:
+    """String literals an argument stands for: a constant, a name bound to
+    one, or either inside the ``(host, port)`` tuple ``connect`` takes."""
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return [arg.value]
+    if isinstance(arg, ast.Name):
+        return sorted(assigned.get(arg.id, ()))
+    if isinstance(arg, (ast.Tuple, ast.List)):
+        return [h for elt in arg.elts[:1] for h in _literal_hosts(elt, assigned)]
+    return []
+
+
+def _hosts_in_network_calls() -> dict[str, set[str]]:
+    """Map each bare public-FQDN literal handed to a resolve/connect call to its files."""
+    found: dict[str, set[str]] = {}
+    for path in _scanned_files():
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+        assigned = _string_assignments(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _call_name(node) not in _NETWORK_CALLS:
+                continue
+            args = list(node.args[:1]) + [
+                kw.value for kw in node.keywords if kw.arg in ("host", "hostname", "qname")
+            ]
+            for arg in args:
+                for literal in _literal_hosts(arg, assigned):
+                    host = literal.lower().rstrip(".")
+                    if _HOSTNAME_RE.match(host):
+                        found.setdefault(host, set()).add(str(path.relative_to(_REPO_ROOT)))
+    return found
+
+
+def test_every_resolved_or_connected_hostname_is_in_the_privacy_statement() -> None:
+    """The URL scan's blind spot: a bare hostname given to a resolver or socket (#3307)."""
+    privacy = _PRIVACY.read_text(encoding="utf-8").lower()
+    undocumented = {
+        host: sorted(files)
+        for host, files in _hosts_in_network_calls().items()
+        if host not in privacy
+    }
+    assert not undocumented, (
+        "bare hostname literal(s) passed to a resolve / connect call that "
+        "docs/PRIVACY.md does not mention: "
+        + "; ".join(f"{h} ({', '.join(f)})" for h, f in sorted(undocumented.items()))
+        + ". A DNS lookup through the host resolver is still an outbound query: add a "
+        "row to §3 with when it runs, its default and what it sends, or, if it is "
+        "not contacted, list it in the appendix."
+    )
+
+
+def test_network_call_scan_catches_a_bare_hostname(tmp_path, monkeypatch) -> None:
+    """The scan itself works: a stub adds undocumented literals three ways."""
+    stub = tmp_path / "stub.py"
+    stub.write_text(
+        "import socket\n"
+        "def a():\n    return socket.gethostbyname('direct-literal.example.net')\n"
+        "def b():\n    t = 'via-name.example.org'\n    return socket.getaddrinfo(t, 443)\n"
+        "def c():\n    return socket.create_connection(('in-tuple.example.io', 443))\n"
+        "def d(x):\n    return socket.gethostbyname(x), socket.gethostbyname('localhost')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pathlib.Path, "relative_to", lambda self, other: self)
+    monkeypatch.setattr(sys.modules[__name__], "_scanned_files", lambda: [stub])
+    assert set(_hosts_in_network_calls()) == {
+        "direct-literal.example.net",
+        "via-name.example.org",
+        "in-tuple.example.io",
+    }
 
 
 def test_every_agent_package_is_scanned() -> None:

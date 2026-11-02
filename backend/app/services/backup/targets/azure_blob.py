@@ -61,6 +61,7 @@ logger = structlog.get_logger(__name__)
 
 class AzureBlobDestination(BackupDestination):
     kind = "azure_blob"
+    secret_alternatives = (("account_key",), ("connection_string",))
     label = "Azure Blob Storage"
     config_fields = (
         ConfigFieldSpec(

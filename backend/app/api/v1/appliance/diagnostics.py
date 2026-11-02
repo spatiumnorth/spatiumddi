@@ -10,6 +10,7 @@ Mounted at ``/api/v1/appliance/diagnostics``:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC
 
 import structlog
@@ -85,7 +86,8 @@ async def get_log(name: str, lines: int = 500) -> dict[str, str | int]:
     summary="Run the appliance self-test battery",
 )
 async def post_self_test() -> dict:
-    report = run_self_test()
+    # Blocking DNS + kubeapi probes: off the event loop (non-negotiable #2).
+    report = await asyncio.to_thread(run_self_test)
     return self_test_report_to_dict(report)
 
 
