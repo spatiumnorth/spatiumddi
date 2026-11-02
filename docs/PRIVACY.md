@@ -98,11 +98,13 @@ That is the whole list.
 | The RDAP hosts of §3.3 (`data.iana.org`, the RIR hosts, the TLD registries' own servers) | The *Refresh now* button on a Domain or an ASN (#85) | The domain name or ASN being looked up. RDAP is a public registry query, so the registry learns what you asked about. This is the manual twin of the scheduled refresh in §3.3, which is **not** on-demand. |
 | `crt.sh` | TLS certificate → *Certificate Transparency* cross-reference | The hostname being checked. Explicitly on-demand, never run by the scheduled probe, and the matching copilot tool ships disabled. |
 | RBL / DNSBL zones (`zen.spamhaus.org`, `bl.spamcop.net`, …) | Tools → RBL check | A DNS query encoding the IP being checked, to the list operator's resolver. |
+| `registry-1.docker.io` (a name lookup only) | Appliance → Diagnostics → *Run self-test*, and the diagnostics bundle and support bundle, which each run the self-test while generating (#3307). The support bundle runs it on appliances only | A DNS query for the name `registry-1.docker.io`, through the host's own resolver (`gethostbyname`), to check that host DNS works. **No connection is made to Docker Hub** and nothing about the install is in the query; your resolver, and whatever it forwards to, sees that the name was asked for. Never scheduled, never run at startup. |
 | Public resolvers | Tools → DNS propagation check | The name being queried, to each resolver in the chosen set. |
 | Whois / RDAP servers | Tools → whois | The name or IP being looked up. |
 
-Everything in this section is a per-click action with a visible result;
-nothing here runs on a schedule. (The RDAP lookups behind a Domain or ASN
+Everything in this section is a per-click action with a visible result
+(the self-test lookup also runs when you generate a diagnostics or support
+bundle); nothing here runs on a schedule. (The RDAP lookups behind a Domain or ASN
 *do* also run on a schedule, once you have created such a row. They are
 listed in §3.3 for that reason.)
 
@@ -292,9 +294,12 @@ scanned. It looks for IP addresses in the agents only: in the backend
 they are almost all example addresses in tool descriptions, and the
 hardcoded PowerDNS resolvers in §3.5, which this page once missed,
 are IP addresses in agent code, which a hostname scan cannot see.
-Its hostname scan reads hosts out of `http://` and `https://` URLs, so
-a hostname written bare (a resolver name, a `tls://` endpoint) is not
-seen either. The things it cannot see, and which therefore need a
+Its hostname scan reads hosts out of `http://` and `https://` URLs, and
+(since #3307) also a bare hostname literal handed to a resolve or connect
+call (`gethostbyname`, `getaddrinfo`, `create_connection`, `connect`, a
+dnspython `resolve` / `query`), directly or through a variable assigned a
+literal; a hostname written bare anywhere else (a resolver name in a
+config template, a `tls://` endpoint) is not seen. The things it cannot see, and which therefore need a
 human: hostname literals in the appliance's **shell** scripts under
 `appliance/mkosi.extra/usr/local/bin/` — the guard reads Python only, so
 §3.4's rows were written by hand and the next `curl` added to the
@@ -363,7 +368,9 @@ Copilot).
 **In-cluster addresses**, which never leave the node:
 `spatium-control-spatiumddi-api.spatium.svc.cluster.local` — the
 Kubernetes service name an appliance supervisor uses to reach the
-control plane it is already part of.
+control plane it is already part of — and
+`kubernetes.default.svc.cluster.local`, the API-server service name the
+cluster-health check resolves from inside its own pod.
 
 ---
 
