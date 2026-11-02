@@ -43,6 +43,7 @@ from app.services.integration_ownership import (
     owned_addresses_in_space,
     subnet_has_surviving_addresses,
 )
+from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
 from app.services.ipam.utilization import counts_toward_utilization
 
 _BIGINT_MAX = 2**63 - 1
@@ -480,6 +481,7 @@ async def apply_subnets(
             summary.subnets_deleted += 1
 
     used_wrapper_cidrs: set[str] = set()
+    gw_subnets: list[Subnet] = []  # #3347 — subnets whose gateway row was synced
     for cidr, ms in desired.items():
         if cidr in operator_subnets:
             summary.subnets_matched += 1
@@ -512,21 +514,31 @@ async def apply_subnets(
         total = _lan_total_ips(net) if net is not None else 0
         existing = fw_subnets.get(cidr)
         if existing is None:
-            db.add(
-                Subnet(
-                    space_id=space_id,
-                    block_id=parent.id,
-                    network=cidr,
-                    name=ms.name,
-                    description=ms.description,
-                    gateway=ms.gateway,
-                    total_ips=total,
-                    **{owner.fk_attr: target_id},
-                )
+            existing = Subnet(
+                space_id=space_id,
+                block_id=parent.id,
+                network=cidr,
+                name=ms.name,
+                description=ms.description,
+                gateway=ms.gateway,
+                total_ips=total,
+                **{owner.fk_attr: target_id},
             )
+            db.add(existing)
+            await db.flush()
             summary.subnets_created += 1
+            gw_subnets.append(existing)
+            if ms.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, ms.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
         else:
             changed = False
+            gw_subnets.append(existing)
+            if ms.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, ms.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
             if existing.block_id != parent.id:
                 existing.block_id, changed = parent.id, True
             if existing.name != ms.name:
@@ -540,6 +552,8 @@ async def apply_subnets(
             if changed:
                 summary.subnets_updated += 1
     await db.flush()
+    for gw_subnet in gw_subnets:
+        await _recompute_subnet_utilization(db, gw_subnet.id)
 
     # Drop owner-owned wrapper blocks that no longer back a subnet.
     for cidr, wrapper in fw_wrappers.items():
