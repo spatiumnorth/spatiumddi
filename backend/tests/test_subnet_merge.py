@@ -362,3 +362,23 @@ async def test_merge_does_not_warn_when_target_wins_settings_agree_3326(
     await db_session.flush()
     preview = await preview_subnet_merge(db_session, a, [b.id])
     assert not any("disagree on" in w for w in preview.warnings)
+
+
+@pytest.mark.asyncio
+async def test_merge_target_wins_comparison_and_rendering_3326(
+    db_session: AsyncSession,
+) -> None:
+    """DNS group ids in another order are the same answer; DNS servers in
+    another order are not (resolver order); a large custom-fields dict is
+    cut short in the warning rather than dumped whole."""
+    a, b = await _make_pair(db_session)
+    g1, g2 = str(uuid.uuid4()), str(uuid.uuid4())
+    a.dns_group_ids, b.dns_group_ids = [g1, g2], [g2, g1]
+    a.dns_servers, b.dns_servers = ["192.0.2.53", "192.0.2.54"], ["192.0.2.54", "192.0.2.53"]
+    a.custom_fields, b.custom_fields = {"blob": "x" * 5000}, {"blob": "y"}
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert not any("dns_group_ids" in w for w in preview.warnings)
+    assert any("disagree on dns_servers:" in w for w in preview.warnings)
+    cf = next(w for w in preview.warnings if "disagree on custom_fields:" in w)
+    assert "x" * 200 not in cf and len(cf) < 600
