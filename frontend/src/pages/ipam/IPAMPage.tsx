@@ -14322,6 +14322,7 @@ export function BlockDetailView({
           space={space}
           defaultBlockId={block.id}
           defaultBlockLabel={block.network}
+          defaultBlockCidr={block.network}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, parentBlockId) => {
             setFindFreeBlockId(parentBlockId);

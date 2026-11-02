@@ -221,6 +221,15 @@ def _total_ips(net: IPNetwork) -> int:
     return net.num_addresses - 2
 
 
+def _display_total_ips(net: IPNetwork) -> int:
+    """The subnet's true size for a preview. ``_total_ips`` clamps IPv6 to
+    BIGINT for storage, so two sizes both past 2^63 read as equal and a
+    /64 -> /63 growth as no change (#3322). Never stored."""
+    if isinstance(net, ipaddress.IPv6Network):
+        return net.num_addresses
+    return _total_ips(net)
+
+
 def _broadcast_or_none(net: IPNetwork) -> str | None:
     """IPv4 prefixlen ≤ 30 gets a broadcast IP; v4 /31+/32 and IPv6 do not."""
     if isinstance(net, ipaddress.IPv4Network) and net.prefixlen <= 30:
@@ -678,7 +687,7 @@ async def preview_subnet_resize(
             new_network_ip="",
             old_broadcast_ip=_broadcast_or_none(old_net),
             new_broadcast_ip=None,
-            total_ips_before=_total_ips(old_net),
+            total_ips_before=_display_total_ips(old_net),
             total_ips_after=0,
             gateway_current=str(subnet.gateway) if subnet.gateway else None,
             gateway_suggested_new_first_usable=None,
@@ -879,8 +888,8 @@ async def preview_subnet_resize(
         new_network_ip=str(new_net.network_address),
         old_broadcast_ip=_broadcast_or_none(old_net),
         new_broadcast_ip=_broadcast_or_none(new_net),
-        total_ips_before=_total_ips(old_net),
-        total_ips_after=_total_ips(new_net),
+        total_ips_before=_display_total_ips(old_net),
+        total_ips_after=_display_total_ips(new_net),
         gateway_current=str(subnet.gateway) if subnet.gateway else None,
         gateway_suggested_new_first_usable=_first_usable(new_net),
         placeholders_default_named=placeholders_default_named,
@@ -938,7 +947,7 @@ async def preview_block_resize(
             network_address_shifts=False,
             old_network_ip=str(old_net.network_address),
             new_network_ip="",
-            total_ips_before=int(min(old_net.num_addresses, _BIGINT_MAX)),
+            total_ips_before=old_net.num_addresses,
             total_ips_after=0,
             child_blocks_count=0,
             child_subnets_count=0,
@@ -1066,8 +1075,8 @@ async def preview_block_resize(
         network_address_shifts=(str(new_net.network_address) != str(old_net.network_address)),
         old_network_ip=str(old_net.network_address),
         new_network_ip=str(new_net.network_address),
-        total_ips_before=int(min(old_net.num_addresses, _BIGINT_MAX)),
-        total_ips_after=int(min(new_net.num_addresses, _BIGINT_MAX)),
+        total_ips_before=old_net.num_addresses,
+        total_ips_after=new_net.num_addresses,
         child_blocks_count=len(child_blocks),
         child_blocks=child_blocks,
         child_subnets_count=len(child_subnets),

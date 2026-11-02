@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/use-draggable-modal";
 import { summarizeZoneNames } from "@/lib/dnsNames";
 import { cn } from "@/lib/utils";
+import { formatCount } from "@/lib/format-count";
 import {
   formatApiError,
   ipamApi,
@@ -428,8 +429,8 @@ export function ResizeSubnetModal({
               />
               <RangeRow
                 label="Total usable IPs"
-                before={preview.total_ips_before.toLocaleString()}
-                after={preview.total_ips_after.toLocaleString()}
+                before={formatCount(preview.total_ips_before)}
+                after={formatCount(preview.total_ips_after)}
               />
               <RangeRow
                 label="Gateway (current)"
@@ -722,8 +723,8 @@ export function ResizeBlockModal({
               />
               <RangeRow
                 label="Total addresses"
-                before={preview.total_ips_before.toLocaleString()}
-                after={preview.total_ips_after.toLocaleString()}
+                before={formatCount(preview.total_ips_before)}
+                after={formatCount(preview.total_ips_after)}
               />
             </div>
             <div className="pt-2 space-y-0.5">

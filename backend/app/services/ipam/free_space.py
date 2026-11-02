@@ -86,7 +86,9 @@ def _usable_addresses(net: IPNetwork) -> int:
     n = net.num_addresses
     if isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
         n -= 2
-    return min(n, 2**63 - 1)
+    # Not clamped: this is a response figure, never stored in a BIGINT, and a
+    # /64 is 2^64 addresses. Clamping printed the storage cap as the size (#3322).
+    return n
 
 
 def _validate_prefix(prefix_length: int, address_family: int) -> str | None:

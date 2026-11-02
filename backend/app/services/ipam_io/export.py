@@ -69,6 +69,16 @@ class ExportBundle:
     include_addresses: bool = False
 
 
+def _true_total_ips(subnet: Subnet) -> int:
+    """The subnet's real size. ``Subnet.total_ips`` is clamped to BIGINT
+    (2^63 - 1) for IPv6, which exported a /64 as that cap and a /63 as the
+    same number (#3322); an IPv6 row is sized from its CIDR instead."""
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    if net.version == 6:
+        return net.num_addresses
+    return subnet.total_ips
+
+
 def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -157,7 +167,7 @@ async def _collect(
             "vlan_id": s.vlan_id,
             "vxlan_id": s.vxlan_id,
             "status": s.status,
-            "total_ips": s.total_ips,
+            "total_ips": _true_total_ips(s),
             "allocated_ips": s.allocated_ips,
             "utilization_percent": s.utilization_percent,
             "custom_fields": s.custom_fields or {},
