@@ -26,6 +26,7 @@ import {
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { formatCount } from "@/lib/format-count";
 import {
   formatApiError,
   ipamApi,
@@ -132,12 +133,30 @@ function ModalShell({
 // request, renders one row per candidate, with a "Use this" button that
 // calls onPickCidr (the parent wires this into the create-subnet modal).
 
+/**
+ * Family + prefix Find Free starts on (#3324). An IPv6 block starts on IPv6:
+ * /64, the usual subnet, or one step below a block already /64 or longer,
+ * held to the /126 the server accepts. Anything else (no block, an IPv4
+ * block) keeps the IPv4 /24 the dialog has always opened on.
+ */
+function startingSearch(blockCidr?: string): {
+  family: 4 | 6;
+  prefix: number;
+} {
+  const blockPrefix = Number(blockCidr?.split("/")[1]);
+  if (blockCidr?.includes(":") && Number.isInteger(blockPrefix)) {
+    return { family: 6, prefix: Math.min(Math.max(64, blockPrefix + 1), 126) };
+  }
+  return { family: 4, prefix: 24 };
+}
+
 export function FindFreeModal({
   space,
   onClose,
   onPickCidr,
   defaultBlockId,
   defaultBlockLabel,
+  defaultBlockCidr,
 }: {
   space: IPSpace;
   onClose: () => void;
@@ -147,6 +166,8 @@ export function FindFreeModal({
   defaultBlockId?: string;
   /** The scoped block's CIDR (or name), so the dialog says what it searches. */
   defaultBlockLabel?: string;
+  /** The scoped block's CIDR; sets the family and a prefix it can hold (#3324). */
+  defaultBlockCidr?: string;
 }) {
   // Opened from a block the search covers that block only, not the space (#2419).
   const scope = defaultBlockId
@@ -154,8 +175,9 @@ export function FindFreeModal({
       ? `block ${defaultBlockLabel}`
       : "this block"
     : null;
-  const [prefixLength, setPrefixLength] = useState(24);
-  const [addressFamily, setAddressFamily] = useState<4 | 6>(4);
+  const start = startingSearch(defaultBlockCidr);
+  const [prefixLength, setPrefixLength] = useState(start.prefix);
+  const [addressFamily, setAddressFamily] = useState<4 | 6>(start.family);
   const [count, setCount] = useState(5);
   const [submitted, setSubmitted] = useState<FindFreeRequest | null>(null);
 
@@ -265,8 +287,9 @@ export function FindFreeModal({
           )}
           {data.candidates.length === 0 && !data.summary?.warning && (
             <p className="text-xs text-muted-foreground">
-              No free CIDRs of /{prefixLength} found in{" "}
-              {defaultBlockId ? "this block" : "this space"}.
+              No free CIDRs of /{submitted?.prefix_length ?? prefixLength} found
+              in {defaultBlockId ? "this block" : "this space"} (IPv
+              {submitted?.address_family ?? addressFamily}).
             </p>
           )}
           {data.candidates.length > 0 && (
@@ -291,7 +314,7 @@ export function FindFreeModal({
                         {c.parent_block_cidr}
                       </td>
                       <td className="px-2 py-1.5 text-xs">
-                        {c.free_addresses ?? "—"}
+                        {formatCount(c.free_addresses_exact, c.free_addresses)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
                         {onPickCidr && (
