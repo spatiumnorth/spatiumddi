@@ -757,6 +757,8 @@ Zones are displayed and managed in a **tree hierarchy** that mirrors the DNS nam
 
 ### Zone Model
 
+> **Renaming (#3265).** A zone that holds records cannot be renamed: the API answers 409, because each record's name, the name IPAM keeps on its addresses and the PTR values it published are stored under the zone's name and would stay on the old one. Records in the Trash count too, since a restore brings a record back under the name it was deleted with. Create a zone under the new name and move the records, or delete them first and purge them from the Trash. An empty zone renames freely.
+
 ```
 DNSZone
   id, server_group_id, view_id (nullable)

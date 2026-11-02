@@ -51,7 +51,7 @@ from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.audit import AuditLog
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
-from app.models.ipam import IPAddress
+from app.models.ipam import IPAddress, Subnet
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
@@ -2138,6 +2138,7 @@ async def purge_trashed_address_records(
     *,
     host_records_only: bool = False,
     keep_batch_id: uuid.UUID | None = None,
+    keep_record_deletes: bool = False,
 ) -> int:
     """Hard-delete the trashed auto-generated records bound to these addresses
     (spatiumddi#3186).
@@ -2163,6 +2164,15 @@ async def purge_trashed_address_records(
     withdrawn into the address's own batch, which the row's Restore brings
     back (#2604).
 
+    ``keep_record_deletes`` (Mark as Orphan, #3189) also spares a record the
+    operator put in the trash through the record API: one whose batch holds
+    no zone and no subnet. Purging it would delete an operator's Trash row
+    for good, with no audit row; kept, it ages out with the retention sweep,
+    and the Trash refuses its restore while the address is an orphan
+    (:func:`app.services.ipam.orphan_aliases.orphan_record_owners`). A record
+    riding a zone's (or subnet's) batch is still purged: that restore would
+    bring it back for a host that no longer publishes one.
+
     Hand-made records are untouched, as in :func:`retract_address_records`:
     an operator's record is theirs, and keeps its place with
     ``ip_address_id`` null. Returns the row count.
@@ -2182,6 +2192,19 @@ async def purge_trashed_address_records(
             )
         if keep_batch_id is not None:
             stmt = stmt.where(DNSRecord.deletion_batch_id.is_distinct_from(keep_batch_id))
+        if keep_record_deletes:
+            batch_zone = aliased(DNSZone)
+            batch_subnet = aliased(Subnet)
+            stmt = stmt.where(
+                or_(
+                    select(batch_zone.id)
+                    .where(batch_zone.deletion_batch_id == DNSRecord.deletion_batch_id)
+                    .exists(),
+                    select(batch_subnet.id)
+                    .where(batch_subnet.deletion_batch_id == DNSRecord.deletion_batch_id)
+                    .exists(),
+                )
+            )
         res = await db.execute(
             stmt.execution_options(include_deleted=True, synchronize_session=False)
         )
