@@ -35,7 +35,7 @@ from sqlalchemy import ColumnElement, String, and_, any_, func, literal, or_, se
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import host_in_zone_error
+from app.core.dns_names import host_in_zone_error, publishable_host_owner_error
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dns.record_identity import ptr_target_key, zone_target_readings
@@ -1018,6 +1018,20 @@ async def compute_subnet_dns_drift(
         ]
         ip_ptr_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "PTR"]
 
+        # #3268 — the commit (``_sync_dns_record(strict=True)``) refuses the
+        # whole address, before writing anything, when the hostname is no
+        # publishable owner or ``<hostname>.<zone>`` is no host name in its
+        # own zone (an underscore label in the zone's name, #2918). A row
+        # offered for such an address would be refused and offered again
+        # after every Apply, so none is: not the forward record, not the PTR
+        # (whose target is that same ``<hostname>.<zone>``), and not the
+        # extra zones', which the refused re-sync never reaches either.
+        unpublishable = publishable_host_owner_error(ip.hostname) is not None or (
+            ip_zone is not None
+            and host_in_zone_error(ip.hostname, ip_zone.name.rstrip("."), field="h") is not None
+        )
+        primary_unpublishable = ip_zone is not None and unpublishable
+
         # The extra zones this address publishes to (#2107), minus any the name
         # does not fit in, as ``_sync_dns_record`` skips those too. A forward
         # record outside the primary zone and these is judged against the
@@ -1025,7 +1039,8 @@ async def compute_subnet_dns_drift(
         extra_zones = [
             extra_zones_by_id[z]
             for z in forward_zone_ids_in_order(primary_id, ip.extra_zone_ids)
-            if z != primary_id
+            if not unpublishable
+            and z != primary_id
             and z in extra_zones_by_id
             and host_in_zone_error(ip.hostname, extra_zones_by_id[z].name.rstrip("."), field="h")
             is None
@@ -1044,7 +1059,12 @@ async def compute_subnet_dns_drift(
         # PTR below points into it), but takes no A/AAAA from IPAM, so none is
         # expected; a row an earlier release wrote there leaves, with no op,
         # the next time IPAM syncs the address.
-        if ip_zone and ipam_authors_zone(ip_zone) and not is_default_gateway:
+        if (
+            ip_zone
+            and not primary_unpublishable
+            and ipam_authors_zone(ip_zone)
+            and not is_default_gateway
+        ):
             exp_name, exp_value = _expected_a(ip.hostname, str(ip.address), ip_zone.name)
             # #2118 — a name the address's own same-type alias serves in this
             # zone is satisfied, not missing.
@@ -1177,7 +1197,10 @@ async def compute_subnet_dns_drift(
             rz = pick_reverse_zone(subnet, ipaddress.ip_address(str(ip.address)), rev_cands)
         except ValueError:
             continue
-        if rz and ip_zone:
+        if rz and ip_zone and primary_unpublishable:
+            # Nothing the commit could write; see ``primary_unpublishable``.
+            pass
+        elif rz and ip_zone:
             try:
                 exp_label, _ = _expected_ptr(str(ip.address), ip.hostname, rz.name)
                 exp_value = (ip.hostname + "." + ip_zone.name.rstrip(".")).rstrip(".") + "."

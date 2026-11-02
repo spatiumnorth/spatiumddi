@@ -176,14 +176,28 @@ async def _check_optional_fk(db: Any, model: Any, fk_id: uuid.UUID | None, label
         raise HTTPException(status_code=422, detail=f"{label} not found")
 
 
-async def _check_fks(db: Any, body: CircuitCreate | CircuitUpdate) -> None:
+async def _check_customer(
+    db: Any, customer_id: uuid.UUID | None, current: uuid.UUID | None = None
+) -> None:
+    """A NEW or changed customer must be live; keeping the one the circuit
+    already names is fine even once it is in the Trash (#3192)."""
+    if customer_id is None or customer_id == current:
+        return
+    customer = await db.get(Customer, customer_id)
+    if customer is None or customer.deleted_at is not None:
+        raise HTTPException(status_code=422, detail="customer_id not found")
+
+
+async def _check_fks(
+    db: Any, body: CircuitCreate | CircuitUpdate, current_customer_id: uuid.UUID | None = None
+) -> None:
     """Resolve every FK on the body in one place. ``provider_id`` is
     only checked when the operator actually supplied it (Update path
     leaves it None to mean "don't change"); Create's required-ness is
     enforced by the type system."""
     if body.provider_id is not None:
         await _check_provider(db, body.provider_id)
-    await _check_optional_fk(db, Customer, body.customer_id, "customer_id")
+    await _check_customer(db, body.customer_id, current_customer_id)
     from app.models.ipam import Subnet  # noqa: PLC0415
 
     await _check_optional_fk(db, Site, body.a_end_site_id, "a_end_site_id")
@@ -360,7 +374,7 @@ async def update_circuit(
         },
     )
 
-    await _check_fks(db, body)
+    await _check_fks(db, body, row.customer_id)
 
     if "status" in changes and changes["status"] != row.status:
         _stamp_status_transition(row, changes["status"])

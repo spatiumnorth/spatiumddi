@@ -1,6 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 
-import { customersApi, providersApi, sitesApi } from "@/lib/api";
+import {
+  customersApi,
+  providersApi,
+  sitesApi,
+  type CustomerListResponse,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 interface PickerProps {
@@ -15,6 +20,33 @@ interface PickerProps {
 // All three pickers use a 60s staleTime + a shared query key so multiple
 // modals on the same page share one underlying fetch instead of each
 // modal triggering its own list call.
+
+/**
+ * The `<option>` an edit form shows for a stored customer the live list does
+ * not hold (#3192). A customer in the Trash keeps every row that names it
+ * pointing at it, and the update saves while the reference is unchanged, so
+ * the form must keep that id selected rather than fall back to its
+ * placeholder. Nothing is shown until the list has loaded: a list that failed
+ * says nothing about the customer. When the list is truncated (more customers
+ * than one page) the id may simply be on a later page, so it is named as the
+ * current customer, not as one in the Trash.
+ */
+export function MissingCustomerOption({
+  customerId,
+  list,
+}: {
+  customerId: string | null | undefined;
+  list: { isSuccess: boolean; data?: CustomerListResponse };
+}) {
+  if (!customerId || !list.isSuccess || !list.data) return null;
+  const { items, total } = list.data;
+  if (items.some((c) => c.id === customerId)) return null;
+  return (
+    <option value={customerId}>
+      {total > items.length ? "(current customer)" : "(customer in Trash)"}
+    </option>
+  );
+}
 
 export function CustomerPicker({
   value,

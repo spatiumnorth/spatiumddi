@@ -35,6 +35,8 @@ const updateZone = vi.fn(
 const pending = () => new Promise<never>(() => {});
 let groups: unknown[] = [];
 
+let listedZones: unknown[] = [];
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -45,6 +47,7 @@ vi.mock("@/lib/api", async () => {
       // kind must not wait for it.
       classifyZoneName: pending,
       listGroups: () => Promise.resolve(groups),
+      listZones: () => Promise.resolve(listedZones),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (groupId: string, data: Record<string, unknown>) =>
@@ -62,11 +65,12 @@ vi.mock("@/lib/api", async () => {
 
 const { ZoneModal } = await import("./DNSPage");
 
-function open(zone?: DNSZone) {
+function open(zone?: DNSZone, onClose: () => void = () => {}) {
+  listedZones = zone ? [zone] : [];
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
-      <ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={() => {}} />
+      <ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={onClose} />
     </QueryClientProvider>,
   );
 }
@@ -145,28 +149,38 @@ describe("Add Zone's Kind", () => {
   });
 
   it("shows an existing zone's kind as it is stored", async () => {
-    open({
-      id: "zone-1",
-      group_id: "grp-1",
-      view_id: null,
-      name: "88.98.10.in-addr.arpa.",
-      zone_type: "primary",
-      kind: "forward",
-      ttl: 3600,
-      primary_ns: "",
-      admin_email: "",
-      dnssec_enabled: false,
-      color: null,
-      forwarders: [],
-      forward_only: true,
-      masters: [],
-      domain_id: null,
-      customer_id: null,
-    } as unknown as DNSZone);
+    const onClose = vi.fn();
+    open(
+      {
+        id: "zone-1",
+        group_id: "grp-1",
+        view_id: null,
+        name: "88.98.10.in-addr.arpa.",
+        zone_type: "primary",
+        kind: "forward",
+        ttl: 3600,
+        primary_ns: "",
+        admin_email: "",
+        dnssec_enabled: false,
+        color: null,
+        forwarders: [],
+        forward_only: true,
+        masters: [],
+        domain_id: null,
+        customer_id: null,
+      } as unknown as DNSZone,
+      onClose,
+    );
 
+    await screen.findByText("Zone Name (FQDN)");
     expect(control("Kind").value).toBe("forward");
-    await save();
-    expect(updateZone.mock.calls[0][2]).toMatchObject({ kind: "forward" });
+    // An untouched Save sends nothing (#3269): the kind stays as stored. A
+    // kind recomputed from the reverse-looking name would be a change, and
+    // would be sent before the dialog closed.
+    fireEvent.submit(control("Kind").form!);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateZone).not.toHaveBeenCalled();
+    expect(createZone).not.toHaveBeenCalled();
   });
 });
 
@@ -256,19 +270,19 @@ describe("the zone dialog's Primary NS (#2075)", () => {
 
   it("lets a zone stored with a bad value be saved unchanged, and flags it", async () => {
     open(zoneRow("ns1"));
+    await screen.findByText("Zone Name (FQDN)");
     expect(screen.getByText(/Stored before this was checked/)).toBeTruthy();
     fireEvent.change(control("Default TTL (seconds)"), {
       target: { value: "600" },
     });
     await save();
-    expect(updateZone.mock.calls[0][2]).toMatchObject({
-      primary_ns: "ns1",
-      ttl: 600,
-    });
+    // Only the changed field is sent (#3269): the stored value is left as is.
+    expect(updateZone.mock.calls[0][2]).toEqual({ ttl: 600 });
   });
 
   it("refuses changing a stored value to another non-host name", async () => {
     open(zoneRow("ns1"));
+    await screen.findByText("Zone Name (FQDN)");
     fireEvent.change(control("Primary NS"), {
       target: { value: "ns_1.legacy.test." },
     });

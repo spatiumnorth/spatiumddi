@@ -405,3 +405,146 @@ async def test_kea_import_drops_hostname_static_form_refuses(
     by_ip = {str(x.ip_address): x.hostname for x in rows}
     assert by_ip["192.0.2.140"] == ""
     assert by_ip["192.0.2.141"] == "good-host"
+
+
+# ── #3268 — Sync DNS offers only what its Apply can write ────────────
+
+
+async def _preview(client: AsyncClient, env: Env) -> dict[str, Any]:
+    r = await client.get(
+        f"/api/v1/ipam/subnets/{env.subnet.id}/dns-sync/preview", headers=env.headers
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.mark.asyncio
+async def test_sync_preview_offers_nothing_the_commit_refuses(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    env = await _env(db_session, UNDERSCORE_ZONE, net="10.91.3.0/24")
+    db_session.add_all(
+        [
+            IPAddress(
+                subnet_id=env.subnet.id, address="10.91.3.10", status="allocated", hostname="h1"
+            ),
+            IPAddress(
+                subnet_id=env.subnet.id, address="10.91.3.1", status="allocated", hostname="gateway"
+            ),
+        ]
+    )
+    await db_session.commit()
+    data = await _preview(client, env)
+    assert data["missing"] == [], data
+    assert data["mismatched"] == [], data
+
+
+@pytest.mark.asyncio
+async def test_sync_preview_still_offers_rows_in_an_ordinary_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    env = await _env(db_session, "example.test", net="10.91.4.0/24")
+    db_session.add(
+        IPAddress(subnet_id=env.subnet.id, address="10.91.4.10", status="allocated", hostname="h1")
+    )
+    await db_session.commit()
+    data = await _preview(client, env)
+    assert [m["record_type"] for m in data["missing"]] == ["A"], data
+
+
+async def _apply_everything_offered(
+    client: AsyncClient, env: Env, preview: dict[str, Any]
+) -> dict[str, Any]:
+    """Tick every row the preview offers, as the console's Select all does."""
+    body = {
+        "create_for_ip_ids": sorted({m["ip_id"] for m in preview["missing"]}),
+        "update_record_ids": [m["record_id"] for m in preview["mismatched"]],
+        "delete_stale_record_ids": [s["record_id"] for s in preview["stale"]],
+    }
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{env.subnet.id}/dns-sync/commit", json=body, headers=env.headers
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _offered(preview: dict[str, Any]) -> list[tuple[str, str]]:
+    return [
+        (row["record_type"], row["ip_address"])
+        for row in (*preview["missing"], *preview["mismatched"])
+    ]
+
+
+async def _second_zone(db: AsyncSession, env: Env, name: str) -> DNSZone:
+    assert env.zone is not None
+    zone = DNSZone(
+        group_id=env.zone.group_id,
+        name=name + ".",
+        zone_type="primary",
+        kind="forward",
+        primary_ns=f"ns1.{name}.",
+        admin_email=f"admin.{name}.",
+    )
+    db.add(zone)
+    await db.commit()
+    return zone
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_zone", [UNDERSCORE_ZONE, "other.example.test"])
+async def test_sync_after_rebind_offers_only_what_the_commit_writes(
+    client: AsyncClient, db_session: AsyncSession, new_zone: str
+) -> None:
+    """The issue's steps: published under an ordinary zone, the subnet is
+    rebound; every row Sync DNS then offers is written by its commit, and none
+    is offered again. The ordinary zone is the positive control: the gateway's
+    PTR is offered there, and the commit rewrites it."""
+    env = await _env(db_session, "fw.example.test")
+    assert env.zone is not None
+    await _with_reverse_zone(db_session, env.zone)
+    for addr, host in (("10.91.1.10", "h1"), ("10.91.1.1", "gateway")):
+        ip = IPAddress(subnet_id=env.subnet.id, address=addr, status="allocated", hostname=host)
+        db_session.add(ip)
+        await db_session.flush()
+        await _sync_dns_record(db_session, ip, env.subnet, backfill_reverse_zone=False)
+    await db_session.commit()
+    assert _offered(await _preview(client, env)) == []
+
+    target = await _second_zone(db_session, env, new_zone)
+    r = await client.put(
+        f"/api/v1/ipam/subnets/{env.subnet.id}",
+        json={"dns_zone_id": str(target.id)},
+        headers=env.headers,
+    )
+    assert r.status_code == 200, r.text
+
+    first = await _preview(client, env)
+    if new_zone != UNDERSCORE_ZONE:
+        assert ("PTR", "10.91.1.1") in _offered(first), first
+    result = await _apply_everything_offered(client, env, first)
+    assert result["errors"] == [], result
+    assert _offered(await _preview(client, env)) == []
+
+
+@pytest.mark.asyncio
+async def test_sync_offers_no_extra_zone_row_when_the_primary_refuses(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The commit re-syncs an address whole and refuses it when its primary
+    zone cannot take the name, so an extra-zone row for it is refused too."""
+    env = await _env(db_session, UNDERSCORE_ZONE, net="10.91.5.0/24")
+    extra = await _second_zone(db_session, env, "extra.example.test")
+    db_session.add(
+        IPAddress(
+            subnet_id=env.subnet.id,
+            address="10.91.5.10",
+            status="allocated",
+            hostname="h1",
+            extra_zone_ids=[str(extra.id)],
+        )
+    )
+    await db_session.commit()
+    first = await _preview(client, env)
+    result = await _apply_everything_offered(client, env, first)
+    assert result["errors"] == [], result
+    assert _offered(await _preview(client, env)) == []

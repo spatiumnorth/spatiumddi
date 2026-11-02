@@ -346,3 +346,28 @@ async def test_apex_ns_is_dropped_unless_asked(monkeypatch: pytest.MonkeyPatch) 
         ("sub", "ns.sub.example.com."),
     ]
     assert all(r.record_type != "SOA" for r in asked)
+
+
+async def test_bind_private_signing_record_is_never_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3198 — an inline-signed BIND9 zone keeps a private ``TYPE65534``
+    signing-state record at the apex and serves it in every AXFR (seen live on
+    BIND 9.20). Returned, it read as a record extra on the server, so every
+    signed zone's drift report said "drift"."""
+    import dns.query
+    import dns.zone
+
+    served = dns.zone.from_text(
+        "$TTL 300\n@ SOA ns1 hostmaster 1 7200 3600 1209600 300\n"
+        "@ NS ns1.example.net.\n@ 0 TYPE65534 \\# 5 0DC1710001\nwww A 192.0.2.10\n",
+        origin="example.com.",
+        relativize=True,
+    )
+    monkeypatch.setattr(dns.query, "xfr", lambda *_a, **_kw: object())
+    monkeypatch.setattr(dns.zone, "from_xfr", lambda _gen: served)
+
+    out = await axfr_zone_records(
+        host="192.0.2.1", port=53, zone_name="example.com.", include_apex_ns=True
+    )
+    assert sorted(r.record_type for r in out) == ["A", "NS"]

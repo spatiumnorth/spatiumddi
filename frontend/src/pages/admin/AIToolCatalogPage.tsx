@@ -208,9 +208,8 @@ export function AIToolCatalogPage() {
         </div>
         <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
           <Boxes className="h-3.5 w-3.5" />
-          <span>
-            {totalEnabled} of {totalKnown} enabled
-          </span>
+          {/* A failed read is not "0 of 0" (#3148). */}
+          <span>{data ? `${totalEnabled} of ${totalKnown} enabled` : "—"}</span>
           {usingDefaults && (
             <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
               registry defaults

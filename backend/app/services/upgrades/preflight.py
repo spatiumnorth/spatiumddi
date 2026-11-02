@@ -61,6 +61,7 @@ import structlog
 from sqlalchemy import select, text
 
 from app.config import settings
+from app.core.exc_text import describe_http_exc
 from app.core.versions import (
     canonical_version,
     includes_release,
@@ -582,7 +583,7 @@ async def check_mirror_disk_headroom(
         return PreflightResult(
             name="mirror_disk_headroom",
             level="warn",
-            message=f"could not reach mirror Service: {exc}",
+            message=f"could not reach mirror Service: {describe_http_exc(exc)}",
             detail={"url": url, "error": str(exc)},
         )
     if resp.status_code != 200:
