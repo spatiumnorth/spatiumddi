@@ -255,3 +255,31 @@ async def test_approved_portal_request_creates_a_record(
     assert clash is None
     recs = await _a_records(db_session, zone_id)
     assert [(r.name, r.value) for r in recs] == [("app01", "10.98.5.20")]
+
+
+def test_fqdn_without_hostname_takes_the_first_label_3348() -> None:
+    """#3348 — an fqdn alone would store a name #3297 then hides."""
+    args = CreateIPAddressArgs(
+        subnet_id=str(uuid.uuid4()), address="10.0.0.5", fqdn="Web01.prod.example.com"
+    )
+    assert args.hostname == "web01"
+    assert args.fqdn == "web01.prod.example.com"
+
+
+def test_explicit_hostname_is_kept_with_fqdn_3348() -> None:
+    args = CreateIPAddressArgs(
+        subnet_id=str(uuid.uuid4()),
+        address="10.0.0.5",
+        hostname="api",
+        fqdn="web01.prod.example.com",
+    )
+    assert args.hostname == "api"
+
+
+def test_fqdn_with_unusable_first_label_is_refused_3348() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="fqdn"):
+        CreateIPAddressArgs(
+            subnet_id=str(uuid.uuid4()), address="10.0.0.5", fqdn="-bad.example.com"
+        )

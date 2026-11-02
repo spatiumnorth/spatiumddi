@@ -1392,7 +1392,10 @@ async def _commit_address(
         # migration should keep the IP with a cleaned name rather than store a
         # non-conforming one; a valid FQDN passes through unchanged.
         existing.hostname = sanitize_hostname(imported.hostname) or existing.hostname
-        existing.fqdn = imported.fqdn or existing.fqdn
+        # An fqdn only reads as current with a hostname (#3297, #3348): don't
+        # store one a name that sanitised to nothing can't back.
+        if imported.fqdn and existing.hostname:
+            existing.fqdn = imported.fqdn
         if imported.description:
             existing.description = imported.description
         if imported.custom_fields:
@@ -1413,6 +1416,7 @@ async def _commit_address(
             kind="ip_address", key=key, action_taken="overwrote", entity_id=str(existing.id)
         )
 
+    new_hostname = sanitize_hostname(imported.hostname) or None
     managed_by = None
     cf = dict(imported.custom_fields or {})
     if "netbox_managed_by" in cf:
@@ -1422,8 +1426,8 @@ async def _commit_address(
         address=imported.address,
         status=imported.status or "allocated",
         role=imported.role,
-        hostname=sanitize_hostname(imported.hostname) or None,
-        fqdn=imported.fqdn,
+        hostname=new_hostname,
+        fqdn=imported.fqdn if new_hostname else None,
         description=imported.description or "",
         managed_by=managed_by,
         custom_fields=cf,

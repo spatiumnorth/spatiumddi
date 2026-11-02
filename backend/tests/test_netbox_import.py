@@ -591,6 +591,32 @@ async def test_commit_addresses_land_under_subnet(
 
 
 @pytest.mark.asyncio
+async def test_commit_drops_fqdn_when_hostname_sanitises_to_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — a dns_name whose host label folds to nothing stores no fqdn.
+
+    An fqdn only reads as current with a hostname (#3297), so storing one
+    alone would show the address with no name at all.
+    """
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.6/24":
+            ip["dns_name"] = "___.acme.example"
+    _patch_client(monkeypatch, fixture)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.6"))
+    ).scalar_one()
+    assert not addr.hostname
+    assert addr.fqdn is None
+
+
+@pytest.mark.asyncio
 async def test_commit_rerun_is_noop(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

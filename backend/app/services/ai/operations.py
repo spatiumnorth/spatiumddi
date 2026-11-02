@@ -31,7 +31,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +42,7 @@ from app.core.dns_names import (
     primary_ns_error,
     record_value_error,
     validate_fqdn,
+    validate_hostname,
     validate_optional_hostname,
     validate_record_owner,
 )
@@ -415,6 +416,16 @@ class CreateIPAddressArgs(BaseModel):
         if v is None or v.strip() == "":
             return None
         return validate_fqdn(v, field="fqdn", allow_underscore=False)
+
+    @model_validator(mode="after")
+    def _hostname_from_fqdn(self) -> CreateIPAddressArgs:
+        # An address's ``fqdn`` only reads as current with a ``hostname``
+        # (#3297), so an fqdn alone would be stored and then shown as
+        # nothing (#3348). Take the hostname from the fqdn's first label,
+        # as the REST create's hostname is the host label of the name.
+        if self.fqdn and not self.hostname:
+            self.hostname = validate_hostname(self.fqdn.split(".", 1)[0])
+        return self
 
     @field_validator("mac_address")
     @classmethod
