@@ -8050,7 +8050,7 @@ async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
                         }
                         for p in t.parameters
                     ],
-                    "record_count": len(t.records),
+                    "record_count": t.max_record_count,
                 }
                 for t in templates
             ]
@@ -8138,11 +8138,11 @@ async def create_zone_from_template(
         )
 
     # Every provider-refusal gate runs on the whole record set BEFORE the zone
-    # exists or is pushed anywhere, so a refusal is atomic (#3007).
-    record_payloads = materialize(template, body.zone_name, body.params)
-    for r in record_payloads:
-        if r["record_type"] in VALID_RECORD_TYPES:
-            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    # exists or is pushed anywhere, so a refusal is atomic (#3007); the
+    # per-type gate already ran in the loop above. This is the list checked
+    # there, whose owners were written back in the record API's stored form
+    # (#3266) — never re-materialise it from the raw parameters, or the rows
+    # below store the names as typed.
     await _check_driver_refusals(
         [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
     )
