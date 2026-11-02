@@ -121,12 +121,12 @@ from app.services.ipam.hygiene import (
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_placeholders import (
-    GATEWAY_DESCRIPTION,
-    GATEWAY_HOSTNAME,
-    GATEWAY_STATUS,
+    add_gateway_row,
     create_placeholder_rows,
+    find_untouched_gateway_row,
+    gateway_target_problem,
     has_boundary_rows,
-    untouched_gateway_row,
+    holds_placeholder_rows,
 )
 from app.services.ipam.utilization import (
     block_allocated,
@@ -7583,27 +7583,28 @@ async def update_subnet(
     # re-save of a subnet whose stored gateway predates the rule still works.
     old_gateway = str(subnet.gateway) if subnet.gateway else None
     gateway_edit = "gateway" in body.model_fields_set and not _same_ip(body.gateway, old_gateway)
-    holds_boundary_rows = (
-        has_boundary_rows(_parse_network(str(subnet.network)), subnet.kind)
-        and not subnet.kubernetes_semantics
-    )
+    manages_gateway_row = gateway_edit and await holds_placeholder_rows(db, subnet)
     if body.gateway is not None:
         gw_problem = gateway_problem(
             body.gateway,
             _parse_network(str(subnet.network)),
-            reject_reserved=gateway_edit and holds_boundary_rows,
+            reject_reserved=manages_gateway_row,
         )
         if gw_problem:
             raise HTTPException(status_code=422, detail=gw_problem)
     # The default "Gateway" row the old gateway holds, found while the stored
     # gateway is still the old one (the setattr below would autoflush the new).
     old_gateway_row: IPAddress | None = None
-    if gateway_edit and holds_boundary_rows:
-        old_gateway_row = await db.scalar(
-            select(IPAddress)
-            .join(Subnet, Subnet.id == IPAddress.subnet_id)
-            .where(IPAddress.subnet_id == subnet.id, untouched_gateway_row())
-        )
+    if manages_gateway_row:
+        if body.gateway is not None:
+            # A host, a lease or a discovered row already at the new address
+            # is refused, as Resize refuses it (#2413); a reserved row is kept.
+            target_problem = await gateway_target_problem(
+                db, subnet, str(ipaddress.ip_address(body.gateway))
+            )
+            if target_problem:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=target_problem)
+        old_gateway_row = await find_untouched_gateway_row(db, subnet)
 
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:
@@ -7746,31 +7747,19 @@ async def update_subnet(
     # A moved gateway is reserved the way create_subnet reserves a new subnet's
     # gateway, so Next available never offers it to a host (#3317, the third
     # path after Resize #2413 and the import #2979). The old default "Gateway"
-    # row is retired; a renamed / DNS-bearing / owned one is the operator's and
-    # is kept, as is any row already at the new address.
-    if gateway_edit and holds_boundary_rows:
+    # row is retired with its PTR; a renamed / DNS-bearing / owned one is the
+    # operator's and is kept, as is a reserved row already at the new address.
+    if manages_gateway_row:
         if old_gateway_row is not None:
             await _sync_dns_record(db, old_gateway_row, subnet, action="delete")
             await db.delete(old_gateway_row)
             await db.flush()
         if subnet.gateway:
-            new_gw = str(subnet.gateway)
-            holder = await db.scalar(
-                select(IPAddress.id).where(
-                    IPAddress.subnet_id == subnet.id, IPAddress.address == new_gw
-                )
+            gw_row = await add_gateway_row(
+                db, subnet, str(subnet.gateway), created_by_user_id=current_user.id
             )
-            if holder is None:
-                gw_row = IPAddress(
-                    subnet_id=subnet.id,
-                    address=new_gw,
-                    status=GATEWAY_STATUS,
-                    description=GATEWAY_DESCRIPTION,
-                    hostname=GATEWAY_HOSTNAME,
-                    created_by_user_id=current_user.id,
-                )
-                db.add(gw_row)
-                await db.flush()
+            if gw_row is not None:
+                # Same as create_subnet: the placeholder's PTR (spatiumddi#1150).
                 await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
         await db.flush()
         await _update_utilization(db, subnet.id)
