@@ -31,6 +31,7 @@ from sqlalchemy import select
 from app.api.deps import DB
 from app.core.permissions import require_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.host_name import current_fqdn
 
 logger = structlog.get_logger(__name__)
 
@@ -99,7 +100,7 @@ async def ansible_inventory(
             continue
 
         addr = str(ip.address)
-        name = ip.hostname or ip.fqdn or addr
+        name = ip.hostname or addr
         # Inventory hostnames must be unique — fall back to the (unique) IP
         # when a hostname is shared by more than one address.
         if name in seen and seen[name] != ip.id:
@@ -123,7 +124,7 @@ async def ansible_inventory(
             "spatium_role": ip.role,
             "spatium_mac": ip.mac_address,
             "spatium_hostname": ip.hostname,
-            "spatium_fqdn": ip.fqdn,
+            "spatium_fqdn": current_fqdn(ip.hostname, ip.fqdn),
             "spatium_description": ip.description,
             "spatium_subnet": str(subnet.network) if subnet else None,
             "spatium_subnet_name": subnet.name if subnet else None,

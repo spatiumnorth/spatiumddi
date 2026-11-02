@@ -8,7 +8,9 @@ import { Modal } from "@/components/ui/modal";
  * wording, which is right for the paths that really are permanent (group,
  * TSIG key, blocking list). A caller whose delete is a soft delete into Trash
  * (zones, #1880) passes `confirmTitle` / `warning` / `confirmButtonLabel` so
- * the dialog does not claim an irreversible action it is not taking.
+ * the dialog does not claim an irreversible action it is not taking. A caller
+ * whose action is not a delete at all (a TSIG key's Rotate, #3277) passes
+ * `pendingLabel` too, so the button does not read "Deleting…" while it runs.
  */
 export function ConfirmDestroyModal({
   title,
@@ -22,6 +24,7 @@ export function ConfirmDestroyModal({
   confirmTitle = "Confirm Permanent Deletion",
   warning = "This action cannot be undone.",
   confirmButtonLabel = "Delete",
+  pendingLabel = "Deleting…",
 }: {
   title: string;
   description: React.ReactNode;
@@ -37,6 +40,7 @@ export function ConfirmDestroyModal({
   confirmTitle?: string;
   warning?: string;
   confirmButtonLabel?: string;
+  pendingLabel?: string;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
   const [checked, setChecked] = useState(false);
@@ -111,7 +115,7 @@ export function ConfirmDestroyModal({
             disabled={!checked || isPending}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
-            {isPending ? "Deleting…" : confirmButtonLabel}
+            {isPending ? pendingLabel : confirmButtonLabel}
           </button>
         </div>
       </div>

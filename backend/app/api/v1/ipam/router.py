@@ -111,6 +111,7 @@ from app.services.ipam.custom_field_rules import (
     inherited_block_custom_fields,
 )
 from app.services.ipam.gateway_rules import gateway_problem
+from app.services.ipam.host_name import current_fqdn, fqdn_matches
 from app.services.ipam.hygiene import (
     DEFAULT_FREE_RESPONDING_DAYS,
     DEFAULT_SQUAT_DAYS,
@@ -4843,6 +4844,13 @@ class IPAddressResponse(BaseModel):
     @classmethod
     def coerce_inet(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+    @model_validator(mode="after")
+    def _fqdn_only_with_hostname(self) -> "IPAddressResponse":
+        # #3297 — a cleared hostname keeps ``fqdn`` stored (the orphan restore
+        # needs it), so a live row without a name must not report one.
+        self.fqdn = current_fqdn(self.hostname, self.fqdn)
+        return self
 
 
 class IPAddressSearchItem(IPAddressResponse):
@@ -9629,7 +9637,7 @@ def _address_search_conditions(
         alternatives = [
             func.host(IPAddress.address).ilike(pat, escape="\\"),
             IPAddress.hostname.ilike(pat, escape="\\"),
-            IPAddress.fqdn.ilike(pat, escape="\\"),
+            fqdn_matches(IPAddress.fqdn.ilike(pat, escape="\\")),
             IPAddress.description.ilike(pat, escape="\\"),
         ]
         # A MAC in any notation, octet-aligned (#2991); see _mac_colon_form.

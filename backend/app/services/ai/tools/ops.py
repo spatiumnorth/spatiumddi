@@ -474,6 +474,7 @@ def _parse_x509_date(value: str | None) -> datetime | None:
     args_model=TlsCertCheckArgs,
     category="ops",
     default_enabled=False,
+    module="tools.network",
 )
 async def tls_cert_check(
     db: AsyncSession,

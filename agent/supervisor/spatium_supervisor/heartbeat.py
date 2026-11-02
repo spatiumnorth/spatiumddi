@@ -2346,6 +2346,15 @@ def _run_role_lifecycle(
         # conflict, etc).
         if _apply_settled(lifecycle):
             _write_last_apply_hash(state_dir, env_hash)
+        elif not lifecycle.deferred:
+            # #3285 — a failed apply must not leave a MATCHING stamp behind.
+            # The forced path (above) applies while the stamp still names
+            # this key; if that apply fails, every later tick would read
+            # "env unchanged" and report the persisted failure forever.
+            # Dropping the stamp makes the next heartbeat retry, as it does
+            # when no stamp was ever written. A deferred apply (#1750) wrote
+            # nothing and is not a failure: it keeps its semantics.
+            _clear_last_apply_hash(state_dir)
 
     # Phase 10 wave 2 — reconcile node labels every heartbeat
     # regardless of the env-hash skip above. patch_node_labels is
