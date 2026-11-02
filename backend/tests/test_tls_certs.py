@@ -309,6 +309,8 @@ async def test_discovery_from_ip_role(db_session: AsyncSession):
         subnet_id=sn.id,
         address="10.9.1.10",
         role="web",
+        # #3297 — ``fqdn`` names the host only while ``hostname`` is set.
+        hostname="svc",
         fqdn="svc.example.com",
         status="allocated",
     )
