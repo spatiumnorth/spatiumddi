@@ -43,7 +43,7 @@ Both IP blocks and subnets are displayed in a **tree view** in the UI, mirroring
 
 ### Tree Features
 - Expand/collapse nodes
-- Utilization color-coded bars (green < 70%, amber 70–90%, red > 90%)
+- Utilization color-coded bars and dots: amber from Settings' Warning Threshold (default 80%), red from its Critical Threshold (default 95%); the Subnets list and the Dashboard's capacity figures use the same two thresholds
 - Right-click context menu: Create child block, Create subnet, Edit, Delete
 - Drag nodes to reorganize (with validation — child must fit inside parent CIDR)
 - Free space visualization: show unallocated ranges within a block

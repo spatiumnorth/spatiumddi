@@ -362,6 +362,7 @@ export function SplitSubnetModal({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["subnet", subnet.id] });
       onCommitted?.();
       onClose();
@@ -568,6 +569,7 @@ export function MergeSubnetModal({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       onCommitted?.();
       onClose();
     },
