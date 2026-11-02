@@ -653,24 +653,34 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
     block fully carved into full subnets reads 100%; the subnet's own counter
     still leaves them out (#2411). Also updates all ancestor blocks up the tree.
     """
-    block = await db.get(IPBlock, block_id)
-    while block is not None:
-        await _recount_block(db, block)
-        block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
+    await _update_blocks_utilization(db, [block_id])
 
 
 async def _update_blocks_utilization(db: AsyncSession, block_ids: Iterable[uuid.UUID]) -> None:
     """``_update_block_utilization`` for many blocks at once (#2981): every
     block on the union of their chains is recounted exactly once, rather than
     once per block below it. A block's sum reads its descendant SUBNETS, not
-    its child blocks, so the order does not matter."""
-    seen: set[uuid.UUID] = set()
+    its child blocks, so the order does not matter for the result.
+
+    It does matter for locking (#3345): two transactions recounting chains
+    that share an ancestor (a Kea HA pair reports every lease twice, and the
+    lease paths, the router and the hourly recount all write these rows)
+    deadlock if they lock the rows in different orders. So the whole chain
+    is locked up front, in id order, before anything is written."""
+    blocks: dict[uuid.UUID, IPBlock] = {}
     for start in block_ids:
         block = await db.get(IPBlock, start)
-        while block is not None and block.id not in seen:
-            seen.add(block.id)
-            await _recount_block(db, block)
+        while block is not None and block.id not in blocks:
+            blocks[block.id] = block
             block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
+    if not blocks:
+        return
+    order = sorted(blocks)
+    await db.execute(
+        select(IPBlock.id).where(IPBlock.id.in_(order)).order_by(IPBlock.id).with_for_update()
+    )
+    for block_id in order:
+        await _recount_block(db, blocks[block_id])
 
 
 async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
@@ -712,6 +722,12 @@ async def _update_subnets_utilization(db: AsyncSession, subnet_ids: Iterable[uui
     ids = list(dict.fromkeys(subnet_ids))
     if not ids:
         return
+    # Locked in id order before counting, the order every recount takes: two
+    # batches over overlapping subnets cannot deadlock, and the second counts
+    # only after the first commits (#3345).
+    await db.execute(
+        select(Subnet.id).where(Subnet.id.in_(ids)).order_by(Subnet.id).with_for_update()
+    )
     counts: dict[uuid.UUID, int] = {
         sid: int(n)
         for sid, n in (

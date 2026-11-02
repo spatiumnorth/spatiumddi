@@ -244,6 +244,7 @@ async def test_recount_is_one_batch_for_a_100_lease_post(
     async def _wrapped(db: AsyncSession, ids: Any) -> None:
         ids = list(ids)
         calls.append(len(ids))
+        await db.flush()  # the batch's own pending writes are not the recount's
         stmts.clear()
         event.listen(Engine, "before_cursor_execute", _count)
         try:
@@ -256,5 +257,109 @@ async def test_recount_is_one_batch_for_a_100_lease_post(
     r = await _post(client, server, [_ev(i) for i in range(10, 110)])
     assert r.status_code == 200, r.text
     assert calls == [1], "one recount for the whole batch, over one subnet"
-    assert len(stmts) <= 8, f"recount statements must not scale with leases: {len(stmts)}"
+    assert len(stmts) <= 8, "recount statements must not scale with leases:\n" + "\n".join(
+        " ".join(x.split())[:120] for x in stmts
+    )
     assert (await _counts(db_session, subnet, block))[0] == 100
+
+
+@pytest.mark.asyncio
+async def test_renewal_only_batch_skips_the_recount(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A renewal of a row already at ``dhcp`` moves no count, so the hot
+    path does not pay for a recount (or take subnet / block row locks)."""
+    import app.api.v1.dhcp.agents as agents
+
+    server, subnet, block = await _seed(db_session)
+    await db_session.commit()
+    assert (await _post(client, server, [_ev(10), _ev(11)])).status_code == 200
+
+    real = agents.recount_subnets_and_blocks
+    calls: list[list[Any]] = []
+
+    async def _wrapped(db: AsyncSession, ids: Any) -> None:
+        ids = list(ids)
+        calls.append(ids)
+        await real(db, ids)
+
+    monkeypatch.setattr(agents, "recount_subnets_and_blocks", _wrapped)
+    assert (await _post(client, server, [_ev(10), _ev(11)])).status_code == 200
+    assert calls == [[]]
+    assert await _counts(db_session, subnet, block) == (2, 4)
+
+
+@pytest.mark.asyncio
+async def test_block_recount_locks_in_one_order(db_session: AsyncSession) -> None:
+    """Two batches touching the same subnets must update block rows in the
+    same order whatever order they list the subnets in, or concurrent
+    batches (a Kea HA pair) deadlock on the shared ancestor."""
+    from app.services.ipam.utilization import recount_subnets_and_blocks
+
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    root = IPBlock(space_id=space.id, network="10.80.0.0/16", name="root")
+    db_session.add(root)
+    await db_session.flush()
+    kids = []
+    subnets = []
+    for i in range(4):
+        kid = IPBlock(
+            space_id=space.id, parent_block_id=root.id, network=f"10.80.{i}.0/24", name=f"k{i}"
+        )
+        db_session.add(kid)
+        await db_session.flush()
+        sub = Subnet(space_id=space.id, block_id=kid.id, network=f"10.80.{i}.0/25", name=f"s{i}")
+        db_session.add(sub)
+        kids.append(kid)
+        subnets.append(sub)
+    await db_session.commit()
+
+    traces: list[list[tuple[str, list[str]]]] = []
+    for ids in ([s.id for s in subnets], [s.id for s in reversed(subnets)]):
+        # Stale caches, so every recount really writes.
+        for b in [root, *kids]:
+            b.allocated_ips = 999
+        await db_session.commit()
+        trace: list[tuple[str, list[str]]] = []
+
+        def _cap(conn: Any, cur: Any, statement: str, params: Any, *a: Any) -> None:
+            sql = " ".join(statement.split())
+            if sql.upper().endswith("ORDER BY SUBNET.ID FOR UPDATE"):
+                kind = "LOCK subnet"
+            elif sql.upper().endswith("ORDER BY IP_BLOCK.ID FOR UPDATE"):
+                kind = "LOCK ip_block"
+            elif sql.upper().startswith("UPDATE "):
+                kind = "UPDATE " + sql.split()[1]
+            else:
+                return
+            rows = params if isinstance(params, list) else [params]
+            vals: list[str] = []
+            for row in rows:
+                flat = row.values() if isinstance(row, dict) else row
+                for v in flat:
+                    vals.extend(str(x) for x in (v if isinstance(v, list | tuple) else [v]))
+            trace.append((kind, vals))
+
+        event.listen(Engine, "before_cursor_execute", _cap)
+        try:
+            await recount_subnets_and_blocks(db_session, ids)
+            await db_session.flush()
+        finally:
+            event.remove(Engine, "before_cursor_execute", _cap)
+        await db_session.commit()
+        traces.append(trace)
+
+    locks = [[(k, v) for k, v in t if k.startswith("LOCK ")] for t in traces]
+    # Whatever order the caller lists the subnets in, the same rows are
+    # locked, in id order, before any of them is written.
+    assert [k for k, _ in locks[0]] == ["LOCK subnet", "LOCK ip_block"], locks[0]
+    assert [k for k, _ in locks[1]] == ["LOCK subnet", "LOCK ip_block"], locks[1]
+    for lock in locks:
+        assert set(lock[0][1]) == {str(x.id) for x in subnets}
+        assert set(lock[1][1]) == {str(b.id) for b in [root, *kids]}
+    for t in traces:
+        last_lock = max(i for i, (k, _) in enumerate(t) if k.startswith("LOCK "))
+        assert all(k.startswith("LOCK ") for k, _ in t[: last_lock + 1])
+        assert any(k.startswith("UPDATE ") for k, _ in t[last_lock + 1 :])

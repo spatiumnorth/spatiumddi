@@ -130,6 +130,9 @@ async def recount_subnets_and_blocks(db: AsyncSession, subnet_ids: Iterable[uuid
         _update_subnets_utilization,
     )
 
+    # The writers lock subnet rows, then the block chain, each in id order,
+    # so concurrent batches (a Kea HA pair reports every lease twice) cannot
+    # deadlock on them (#3345).
     ids = list(dict.fromkeys(subnet_ids))
     if not ids:
         return

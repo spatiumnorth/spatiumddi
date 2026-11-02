@@ -1663,16 +1663,22 @@ async def agent_lease_events(
                 # so a unique-violation self-heals into the incumbent
                 # row instead of 500-ing on uq_ip_address_subnet_address.
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
-                recount_ids.add(subnet.id)
                 ipam_by_key[(subnet.id, norm_ip(ev.ip_address))] = ipam_row
+                if created:
+                    recount_ids.add(subnet.id)
                 # A fresh insert already carries the right fields; only a
                 # race-lost incumbent we own gets the same update a
                 # pre-existing row would take (never a manual/static row).
-                if not created and (ipam_row.status == "available" or ipam_row.auto_from_lease):
+                elif ipam_row.status == "available" or ipam_row.auto_from_lease:
+                    if ipam_row.status != "dhcp":
+                        recount_ids.add(subnet.id)
                     _apply_lease_fields(ipam_row, ev, lease)
             elif ipam_row.status in ("available",) or ipam_row.auto_from_lease:
+                # Only a status change moves the count: a renewal of a row
+                # already at ``dhcp`` (the common event) costs no recount.
+                if ipam_row.status != "dhcp":
+                    recount_ids.add(subnet.id)
                 _apply_lease_fields(ipam_row, ev, lease)
-                recount_ids.add(subnet.id)
             # else: manual/static — leave it alone
 
             # New-device watch: record the MAC sighting for this lease,
