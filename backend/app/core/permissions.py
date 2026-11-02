@@ -37,6 +37,7 @@ from app.api.deps import CurrentUser, get_db
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
+from app.services.api_token_scopes import is_read_only_post
 
 logger = structlog.get_logger(__name__)
 
@@ -815,8 +816,9 @@ MULTI_ROW_DELETE_SUFFIXES: tuple[str, ...] = (
 )
 
 
-def action_for_request(request: Request) -> str:
-    """Return the action a router-level gate requires for ``request``.
+def method_action_for_request(request: Request) -> str:
+    """The action the HTTP method alone implies, ignoring any ``@read_only_post``
+    marker.
 
     The HTTP method decides, except that a multi-row delete (a POST whose path
     ends in one of :data:`MULTI_ROW_DELETE_SUFFIXES`) needs the same ``delete``
@@ -826,6 +828,24 @@ def action_for_request(request: Request) -> str:
     if method == "POST" and request.url.path.rstrip("/").endswith(MULTI_ROW_DELETE_SUFFIXES):
         return "delete"
     return _METHOD_TO_ACTION.get(method, "write")
+
+
+def action_for_request(request: Request) -> str:
+    """Return the action a router-level gate requires for ``request``.
+
+    :func:`method_action_for_request`, except that a POST whose matched handler
+    carries ``@read_only_post`` (a filter / preview body that changes nothing,
+    #3223) needs ``read``, as the equivalent GET would (#3302). A handler that
+    must still be write-gated (a resize or import preview) says so itself with
+    an inline write check; the marker only stops the router gate demanding
+    ``write`` for a route that reads.
+    """
+    action = method_action_for_request(request)
+    if action == "write" and request.method.upper() == "POST":
+        endpoint = getattr(request.scope.get("route"), "endpoint", None)
+        if is_read_only_post(endpoint):
+            return "read"
+    return action
 
 
 def require_resource_permission(
@@ -866,7 +886,9 @@ def require_resource_permission(
             and _instance_scoped_admit(
                 request,
                 current_user,
-                action,
+                # Method-derived: a delegate's instance grant keeps the meaning
+                # it had before ``@read_only_post`` relaxed the type-level gate.
+                method_action_for_request(request),
                 {instance_param: instance_routes},
                 prefix or "/ipam",
             )
@@ -1087,12 +1109,15 @@ def require_any_resource_or_scoped(
             for rt in unscoped_types:
                 if user_has_permission(current_user, action, rt):
                     return current_user
-        if action != "read" and scoped_routes:
+        # Delegation admits keep the method-derived action: a read-only POST
+        # (a preview) still reaches its per-row gate only for a write delegate.
+        method_action = method_action_for_request(request)
+        if method_action != "read" and scoped_routes:
             for rt, routes in scoped_routes.items():
-                if key in routes and has_any_grant_for(current_user, action, rt):
+                if key in routes and has_any_grant_for(current_user, method_action, rt):
                     return current_user
         if instance_routes and _instance_scoped_admit(
-            request, current_user, action, instance_routes
+            request, current_user, method_action, instance_routes
         ):
             return current_user
         if route_types is not None:
@@ -1202,6 +1227,7 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
 
 __all__ = [
     "action_for_request",
+    "method_action_for_request",
     "KNOWN_MANAGE_PERMISSIONS",
     "MULTI_ROW_DELETE_SUFFIXES",
     "caller_can_grant",

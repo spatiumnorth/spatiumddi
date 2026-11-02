@@ -56,7 +56,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.auth import User
 from app.models.dicom import (
     DICOM_AE_ROLES,
@@ -1133,6 +1133,12 @@ async def import_preview(
     rather than resolved by last-write-wins, because that duplicate is
     the exact collision this registry exists to surface.
     """
+    # ``@read_only_post`` relaxes the router gate to ``read``; an import
+    # preview still needs what the commit needs (#3302).
+    if not user_has_permission(user, "write", "dicom_ae"):
+        raise HTTPException(
+            status_code=403, detail="Permission denied: need 'write' on 'dicom_ae'"
+        )
     plan = await _build_plan(db, user, body)
     return DICOMAEImportPreviewResponse(
         rows=_rows_out(plan),

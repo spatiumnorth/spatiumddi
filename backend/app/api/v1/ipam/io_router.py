@@ -83,6 +83,18 @@ def _refuse_bound_token(user: Any, what: str) -> None:
         )
 
 
+def _require_import_write(current_user: Any) -> None:
+    """The import creates / updates blocks and subnets, so the coarse router
+    gate (which also admits any address_set grant) is not enough. The previews
+    take it too: ``@read_only_post`` only relaxes the router gate (#3302)."""
+    for rtype in ("ip_block", "subnet"):
+        if not user_has_permission(current_user, "write", rtype):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: need 'write' on '{rtype}'",
+            )
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     data = await file.read()
     if len(data) > _MAX_UPLOAD_BYTES:
@@ -105,6 +117,7 @@ async def import_preview(
 ) -> dict:
     """Dry-run an import and return the would-create / would-update / conflict diff."""
     _refuse_bound_token(current_user, "a whole-space import")
+    _require_import_write(current_user)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_import(
@@ -137,14 +150,7 @@ async def import_commit(
 ) -> dict:
     """Commit the import in a single transaction. Writes audit entries per mutation."""
     _refuse_bound_token(current_user, "a whole-space import")
-    # The import creates / updates blocks and subnets, so the coarse router
-    # gate (which also admits any address_set grant) is not enough.
-    for rtype in ("ip_block", "subnet"):
-        if not user_has_permission(current_user, "write", rtype):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Permission denied: need 'write' on '{rtype}'",
-            )
+    _require_import_write(current_user)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     result = await commit_import(
@@ -181,6 +187,7 @@ async def import_preview_json(
     from app.services.ipam_io.parser import ParsedPayload
 
     _refuse_bound_token(current_user, "a whole-space import")
+    _require_import_write(current_user)
     raw = body.get("payload")
     if not isinstance(raw, dict):
         raise HTTPException(status_code=422, detail="Missing 'payload' object")

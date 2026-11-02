@@ -42,6 +42,7 @@ from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
 from app.models.auth import User
+from app.services.api_token_scopes import read_only_post
 from app.services.e911.held import (
     ERROR_CANNOT_PROVIDE,
     ERROR_LOCATION_UNKNOWN,
@@ -183,6 +184,7 @@ async def _answer(
     dependencies=[Depends(require_resource_permission("e911_location"))],
     summary="HELD locationRequest (RFC 5985) — returns PIDF-LO",
 )
+@read_only_post
 async def held_third_party(request: Request, db: DB, user: CurrentUser) -> Response:
     """Third-party HELD: the caller names the device (RFC 6155 identity)."""
     try:

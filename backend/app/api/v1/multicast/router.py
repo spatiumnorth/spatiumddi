@@ -48,7 +48,7 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, IPSpace
 from app.models.multicast import (
     MEMBERSHIP_ROLES,
@@ -1139,11 +1139,17 @@ async def _build_bulk_candidates(
 )
 @read_only_post
 async def bulk_allocate_preview(
-    body: MulticastBulkAllocateRequest, db: DB, _: CurrentUser
+    body: MulticastBulkAllocateRequest, db: DB, user: CurrentUser
 ) -> MulticastBulkAllocatePreviewResponse:
     """Read-only blast radius for a bulk-allocate. Surfaces address
     conflicts so the operator can change ``start_address`` /
     ``count`` before committing."""
+    # ``@read_only_post`` relaxes the router gate to ``read``; an import
+    # preview still needs what the commit needs (#3302).
+    if not user_has_permission(user, "write", "multicast"):
+        raise HTTPException(
+            status_code=403, detail="Permission denied: need 'write' on 'multicast'"
+        )
     await _check_space(db, body.space_id)
     items = await _build_bulk_candidates(db, body)
     conflicts = sum(1 for it in items if it.conflict is not None)

@@ -37,6 +37,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
 from app.api.pagination import (
@@ -424,6 +425,26 @@ async def _dns_records_read(request: Request, current_user: CurrentUser, db: DB)
 
 
 _dns_records_read.spatium_requires = ("exact", [("read", "dns_record")])  # type: ignore[attr-defined]
+
+async def _require_record_write_for_preview(
+    request: Request, db: AsyncSession, current_user: Any
+) -> None:
+    """An import preview is ``@read_only_post``, so the router gate asks only
+    for ``read``; it still needs the ``write`` on ``dns_record`` its commit
+    needs (#3302)."""
+    if not type_level_allows(current_user, "write", "dns_record"):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="write",
+            resource_type="dns_record",
+            resource_id="",
+            resource_display="dns_record:*",
+            reason="permission denied (write on dns_record)",
+            detail="Permission denied: need 'write' on 'dns_record'",
+        )
+
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
 # don't also need a schema edit to be accepted on create/update.
@@ -4072,12 +4093,21 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerOpti
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     if not opts:
-        # Auto-create defaults on first access
-        opts = DNSServerOptions(group_id=group_id)
-        db.add(opts)
-        await db.commit()
-        opts = await _load_options(group_id, db)
-    assert opts is not None
+        # No row yet (a group made before options were created with the group):
+        # answer with the column defaults WITHOUT keeping them. A GET must not
+        # write (a ``read`` token reaches it), and a persisted default row would
+        # move this group's rendered config for every agent (#3302). The row is
+        # flushed inside a savepoint only so the column defaults are filled in,
+        # then rolled back; the PUT creates it when the operator saves.
+        savepoint = await db.begin_nested()
+        try:
+            opts = DNSServerOptions(group_id=group_id)
+            db.add(opts)
+            await db.flush()
+            set_committed_value(opts, "trust_anchors", [])
+            return await _options_response(db, group_id, opts)
+        finally:
+            await savepoint.rollback()
     return await _options_response(db, group_id, opts)
 
 
@@ -10074,6 +10104,7 @@ async def import_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     body: ImportPreviewRequest,
+    request: Request,
     db: DB,
     current_user: CurrentUser,
 ) -> ImportPreviewResponse:
@@ -10081,6 +10112,7 @@ async def import_zone_preview(
 
     Non-mutating: this endpoint never writes to the database.
     """
+    await _require_record_write_for_preview(request, db, current_user)
     zone = await _require_zone(group_id, zone_id, db, current_user)
     zone_name = _resolve_zone_name(body, zone)
 
@@ -10786,6 +10818,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
+    request: Request,
     db: DB,
     current_user: CurrentUser,
     file: UploadFile = File(...),
@@ -10797,6 +10830,7 @@ async def import_zone_spreadsheet_preview(
     ``errors`` with its row number, never a 500. See ``docs/features/DNS.md``
     for the columns and the match rule.
     """
+    await _require_record_write_for_preview(request, db, current_user)
     zone = await _require_zone(group_id, zone_id, db, current_user)
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     return SheetImportPreviewResponse(
