@@ -2646,10 +2646,17 @@ function DnssecCard({
             DS records — paste these at the parent registrar for{" "}
             <code className="font-mono">{zoneName.replace(/\.$/, "")}</code>
           </div>
+          {/* #3154: PowerDNS's sign op returns the DS at once. The BIND9
+              agent reports a key's DS only once BIND would publish it as CDS
+              (DSState rumoured or omnipresent, agent drivers/bind9.py
+              _DS_SUBMITTABLE_STATES): about a day after signing on the
+              default policy. */}
           {dsRecords.length === 0 ? (
             <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
-              Waiting for the agent to report DS records (typically &lt;30 s
-              after signing).
+              No DS records yet. PowerDNS reports them right after it signs the
+              zone. BIND9 offers a new key&apos;s DS only once the signed zone
+              has propagated, about a day after signing under the default
+              policy.
             </div>
           ) : (
             <ul className="space-y-1">
@@ -4408,6 +4415,8 @@ export function ZoneDetailView({
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
     // #2529 — the keyboard path must honour the same grant as the button.
+    // The ? sheet lists the key under ADD_DNS_RECORD.requires, which must
+    // name this same grant (#3167).
     if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
