@@ -17,6 +17,8 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const REASON_LABELS: Record<DHCPMACBlockReason, string> = {
@@ -325,15 +327,34 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
   );
 }
 
-function MacBlockModal({
-  groupId,
-  block,
-  onClose,
-}: {
+type MacBlockModalProps = {
   groupId: string;
   block?: DHCPMACBlock;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the block fresh on open and Save sends only what changed
+// (#3365): the clicked row comes from a list loaded earlier.
+export function MacBlockModal(props: MacBlockModalProps) {
+  const fresh = useFreshRow(props.block, () =>
+    dhcpApi
+      .listMacBlocks(props.groupId)
+      .then((rows) => rows.find((b) => b.id === props.block!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit MAC Block"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <MacBlockModalForm {...props} block={fresh.row} />;
+}
+
+function MacBlockModalForm({ groupId, block, onClose }: MacBlockModalProps) {
   const qc = useQueryClient();
   const editing = !!block;
   const [mac, setMac] = useState(block?.mac_address ?? "");
@@ -354,9 +375,26 @@ function MacBlockModal({
         expires_at: fromLocalInputValue(expiresAt),
       };
       if (!editing) data.mac_address = mac;
-      return editing
-        ? dhcpApi.updateMacBlock(groupId, block!.id, data)
-        : dhcpApi.createMacBlock(groupId, data);
+      if (!editing) return dhcpApi.createMacBlock(groupId, data);
+      const diff = changedFields(
+        {
+          reason: block!.reason,
+          description: block!.description ?? "",
+          enabled: block!.enabled,
+          expires_at: block!.expires_at ?? null,
+        },
+        {
+          ...data,
+          // An untouched expiry keeps its stored instant (the input only
+          // carries minutes), so it is not sent back.
+          expires_at:
+            expiresAt === toLocalInputValue(block!.expires_at)
+              ? (block!.expires_at ?? null)
+              : data.expires_at,
+        },
+      );
+      if (Object.keys(diff).length === 0) return Promise.resolve(block!);
+      return dhcpApi.updateMacBlock(groupId, block!.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-mac-blocks", groupId] });

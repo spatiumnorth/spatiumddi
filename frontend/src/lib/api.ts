@@ -6325,6 +6325,8 @@ export const dnsApi = {
   // Server groups
   listGroups: () =>
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
+  getGroup: (id: string) =>
+    api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
   // Multi-resolver propagation check
   checkPropagation: (body: {
     name: string;
@@ -16482,7 +16484,7 @@ export const natApi = {
     api.get<NATMapping>(`/ipam/nat-mappings/${id}`).then((r) => r.data),
   create: (data: NATMappingWrite) =>
     api.post<NATMapping>("/ipam/nat-mappings", data).then((r) => r.data),
-  update: (id: string, data: NATMappingWrite) =>
+  update: (id: string, data: Partial<NATMappingWrite>) =>
     api.patch<NATMapping>(`/ipam/nat-mappings/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/ipam/nat-mappings/${id}`),
   byIp: (ipId: string) =>

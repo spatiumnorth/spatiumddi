@@ -10666,17 +10666,38 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   );
 }
 
-function AddressSetModal({
-  subnet,
-  existing,
-  onClose,
-  onSaved,
-}: {
+type AddressSetModalProps = {
   subnet: Subnet;
   existing?: AddressSet;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the set fresh on open and Save sends only what changed (#3365):
+// the row the page holds is from a list loaded earlier.
+export function AddressSetModal(props: AddressSetModalProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    addressSetsApi.get(props.existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit address set"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <AddressSetModalForm {...props} existing={fresh.row} />;
+}
+
+function AddressSetModalForm({
+  subnet,
+  existing,
+  onClose,
+  onSaved,
+}: AddressSetModalProps) {
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -10709,7 +10730,7 @@ function AddressSetModal({
     mutationFn: () => {
       const explicit = parseExplicit();
       if (isEdit && existing) {
-        const body: AddressSetUpdate = {
+        const after: AddressSetUpdate = {
           name,
           description,
           customer_id: customerId,
@@ -10719,6 +10740,32 @@ function AddressSetModal({
           end_address: rangeKind === "contiguous" ? endAddress : null,
           explicit_addresses: rangeKind === "explicit" ? explicit : [],
         };
+        const body: AddressSetUpdate = changedFields(
+          {
+            name: existing.name,
+            description: existing.description ?? "",
+            customer_id: existing.customer_id ?? null,
+            site_id: existing.site_id ?? null,
+            range_kind: existing.range_kind,
+            start_address: existing.start_address ?? null,
+            end_address: existing.end_address ?? null,
+            explicit_addresses: existing.explicit_addresses ?? [],
+          },
+          { ...after },
+        );
+        // The range is one unit: when any part of it changed, send all of it.
+        if (
+          "range_kind" in body ||
+          "start_address" in body ||
+          "end_address" in body ||
+          "explicit_addresses" in body
+        ) {
+          body.range_kind = after.range_kind;
+          body.start_address = after.start_address;
+          body.end_address = after.end_address;
+          body.explicit_addresses = after.explicit_addresses;
+        }
+        if (Object.keys(body).length === 0) return Promise.resolve(existing);
         return addressSetsApi.update(existing.id, body);
       }
       const body: AddressSetCreate = {

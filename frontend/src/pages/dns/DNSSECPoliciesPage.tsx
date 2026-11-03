@@ -5,6 +5,8 @@ import { KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
 import { dnsApi, formatApiError, type DNSSECPolicy } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   NEEDS_SUPERADMIN,
@@ -186,13 +188,32 @@ export function DNSSECPoliciesPage() {
   );
 }
 
-function PolicyModal({
-  existing,
-  onClose,
-}: {
+type PolicyModalProps = {
   existing: DNSSECPolicy | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the policy fresh on open and Save sends only what changed (#3365).
+export function PolicyModal(props: PolicyModalProps) {
+  const fresh = useFreshRow(props.existing ?? undefined, () =>
+    dnsApi
+      .listDnssecPolicies()
+      .then((rows) => rows.find((r) => r.id === props.existing!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DNSSEC policy"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PolicyModalForm {...props} existing={fresh.row ?? null} />;
+}
+
+function PolicyModalForm({ existing, onClose }: PolicyModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -218,7 +239,23 @@ function PolicyModal({
         nsec3_salt_length: saltLen,
         nsec3_optout: optout,
       };
-      if (existing) return dnsApi.updateDnssecPolicy(existing.id, body);
+      if (existing) {
+        const diff = changedFields(
+          {
+            description: existing.description ?? "",
+            algorithm: existing.algorithm,
+            ksk_lifetime_days: existing.ksk_lifetime_days,
+            zsk_lifetime_days: existing.zsk_lifetime_days,
+            nsec3: existing.nsec3,
+            nsec3_iterations: existing.nsec3_iterations ?? 0,
+            nsec3_salt_length: existing.nsec3_salt_length,
+            nsec3_optout: existing.nsec3_optout,
+          },
+          { ...body },
+        );
+        if (Object.keys(diff).length === 0) return Promise.resolve(existing);
+        return dnsApi.updateDnssecPolicy(existing.id, diff);
+      }
       return dnsApi.createDnssecPolicy({ ...body, name });
     },
     onSuccess: () => {
