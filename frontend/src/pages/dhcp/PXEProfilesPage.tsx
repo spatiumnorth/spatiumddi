@@ -33,6 +33,8 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
@@ -277,19 +279,55 @@ function ProfileCard({
   );
 }
 
-export function ProfileEditor({
-  mode,
-  groupId,
-  existing,
-  onClose,
-  onSaved,
-}: {
+type ProfileEditorProps = {
   mode: "create" | "edit";
   groupId: string;
   existing?: PXEProfile;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the profile fresh on open and Save sends only what changed
+// (#3365): the row the page holds is from a list loaded earlier, and the
+// rule list is replaced wholesale, so a rule added elsewhere would be deleted.
+export function ProfileEditor(props: ProfileEditorProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    dhcpApi.getPxeProfile(props.existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit PXE profile"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ProfileEditorForm {...props} existing={fresh.row} />;
+}
+
+function sanitizeMatches(matches: PXEArchMatchInput[]) {
+  return matches.map((m) => ({
+    priority: m.priority ?? 100,
+    match_kind: m.match_kind ?? "first_stage",
+    vendor_class_match:
+      m.vendor_class_match && m.vendor_class_match.trim()
+        ? m.vendor_class_match.trim()
+        : null,
+    arch_codes: m.arch_codes && m.arch_codes.length > 0 ? m.arch_codes : null,
+    boot_filename: m.boot_filename.trim(),
+    boot_file_url_v6: m.boot_file_url_v6 ?? null,
+  }));
+}
+
+function ProfileEditorForm({
+  mode,
+  groupId,
+  existing,
+  onClose,
+  onSaved,
+}: ProfileEditorProps) {
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [nextServer, setNextServer] = useState(existing?.next_server ?? "");
@@ -334,18 +372,7 @@ export function ProfileEditor({
 
   const mut = useMutation({
     mutationFn: () => {
-      const sanitized = matches.map((m) => ({
-        priority: m.priority ?? 100,
-        match_kind: m.match_kind ?? "first_stage",
-        vendor_class_match:
-          m.vendor_class_match && m.vendor_class_match.trim()
-            ? m.vendor_class_match.trim()
-            : null,
-        arch_codes:
-          m.arch_codes && m.arch_codes.length > 0 ? m.arch_codes : null,
-        boot_filename: m.boot_filename.trim(),
-        boot_file_url_v6: m.boot_file_url_v6 ?? null,
-      }));
+      const sanitized = sanitizeMatches(matches);
       if (mode === "create") {
         const body: PXEProfileCreate = {
           name,
@@ -356,14 +383,25 @@ export function ProfileEditor({
         };
         return dhcpApi.createPxeProfile(groupId, body);
       }
-      const body: PXEProfileUpdate = {
-        name,
-        description,
-        next_server: nextServer,
-        enabled,
-        matches: sanitized,
-      };
-      return dhcpApi.updatePxeProfile(existing!.id, body);
+      const was = existing!;
+      const body: PXEProfileUpdate = changedFields(
+        {
+          name: was.name,
+          description: was.description ?? "",
+          next_server: was.next_server,
+          enabled: was.enabled,
+          matches: sanitizeMatches(was.matches),
+        },
+        {
+          name,
+          description,
+          next_server: nextServer,
+          enabled,
+          matches: sanitized,
+        },
+      );
+      if (Object.keys(body).length === 0) return Promise.resolve(was);
+      return dhcpApi.updatePxeProfile(was.id, body);
     },
     onSuccess: () => onSaved(),
     onError: (err: unknown) => {

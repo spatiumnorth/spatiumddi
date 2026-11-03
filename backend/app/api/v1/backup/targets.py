@@ -841,9 +841,10 @@ async def download_latest_target_archive(
 
     This is the pull-mode entry point (#989 item 4): an external backup
     tool (Veeam, Bacula, a cron ``curl``) fetches from here with an API
-    token restricted via ``allowed_paths`` to this one route. The token
-    cannot be ``read``-scoped: reading the destination is outbound, which
-    ``@token_outbound`` refuses to ``read`` (#3302).
+    token owned by a superadmin. The token must be unrestricted (no
+    scopes): reading the destination is outbound, which ``@token_outbound``
+    refuses to ``read``, and no write scope covers ``/backup`` (#3302).
+    ``allowed_paths`` cannot narrow it; that column is reserved.
 
     It is conditional. Archive filenames are timestamped and the bytes
     under a given name never change, so the filename *is* a strong

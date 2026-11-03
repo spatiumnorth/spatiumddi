@@ -6325,6 +6325,8 @@ export const dnsApi = {
   // Server groups
   listGroups: () =>
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
+  getGroup: (id: string) =>
+    api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
   // Multi-resolver propagation check
   checkPropagation: (body: {
     name: string;
@@ -10827,22 +10829,22 @@ export const API_TOKEN_SCOPES: {
   {
     value: "read",
     label: "Read-only",
-    hint: "GET / HEAD / OPTIONS and read-only POSTs (previews, log queries). Never makes SpatiumDDI contact another host: probes, live pulls and off-prem lookups are refused.",
+    hint: "GET / HEAD / OPTIONS, read-only POSTs (previews, log queries) and MCP. Mutations are refused, and so is anything that makes SpatiumDDI contact another host: probes, live pulls and off-prem lookups.",
   },
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/* and other IPAM surfaces. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also creates reverse DNS zones and DNS records.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Moving a server between groups repoints its appliance and changes its DoT/DoH/DoQ firewall ports.",
   },
   {
     value: "dhcp:write",
     label: "DHCP write",
-    hint: "Mutate /dhcp/*. Excludes the agent surface.",
+    hint: "Mutate /dhcp/*. Excludes the agent surface. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also mirrors leases and statics into IPAM.",
   },
 ];
 
@@ -16482,7 +16484,7 @@ export const natApi = {
     api.get<NATMapping>(`/ipam/nat-mappings/${id}`).then((r) => r.data),
   create: (data: NATMappingWrite) =>
     api.post<NATMapping>("/ipam/nat-mappings", data).then((r) => r.data),
-  update: (id: string, data: NATMappingWrite) =>
+  update: (id: string, data: Partial<NATMappingWrite>) =>
     api.patch<NATMapping>(`/ipam/nat-mappings/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/ipam/nat-mappings/${id}`),
   byIp: (ipId: string) =>

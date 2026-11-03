@@ -16,6 +16,8 @@ import {
   DeleteConfirmModal,
 } from "./_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { deletePolicyDescription } from "./devicePolicyCopy";
 
 const KEY_BASE = "dhcp-device-policies";
@@ -243,15 +245,38 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
  *  returned on this install — a free-text box would let an operator build a
  *  policy against a class string that never appears, which compiles to an
  *  empty expression and renders nothing at all. */
-export function DevicePolicyModal({
-  groupId,
-  policy,
-  onClose,
-}: {
+type DevicePolicyModalProps = {
   groupId: string;
   policy?: DHCPDevicePolicy;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the policy fresh on open and Save sends only what changed
+// (#3379): the clicked row comes from a list loaded earlier.
+export function DevicePolicyModal(props: DevicePolicyModalProps) {
+  const fresh = useFreshRow(props.policy, () =>
+    dhcpApi
+      .listDevicePolicies(props.groupId)
+      .then((rows) => rows.find((p) => p.id === props.policy!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Device Policy"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <DevicePolicyForm {...props} policy={fresh.row} />;
+}
+
+function DevicePolicyForm({
+  groupId,
+  policy,
+  onClose,
+}: DevicePolicyModalProps) {
   const qc = useQueryClient();
   const isEdit = !!policy;
   const [name, setName] = useState(policy?.name ?? "");
@@ -335,7 +360,7 @@ export function DevicePolicyModal({
       lease = Number(leaseText);
     }
     setLeaseError(null);
-    mut.mutate({
+    const body = {
       name,
       description,
       enabled,
@@ -344,7 +369,30 @@ export function DevicePolicyModal({
       options: parsedOptions,
       match_override: override.trim() ? override : null,
       include_ambiguous: includeAmbiguous,
-    });
+    };
+    if (!policy) {
+      mut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3379).
+    const diff = changedFields(
+      {
+        name: policy.name,
+        description: policy.description ?? "",
+        enabled: policy.enabled,
+        device_classes: policy.device_classes ?? [],
+        lease_time: policy.lease_time ?? null,
+        options: policy.options ?? {},
+        match_override: policy.match_override ?? null,
+        include_ambiguous: policy.include_ambiguous,
+      },
+      body,
+    );
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   };
 
   return (

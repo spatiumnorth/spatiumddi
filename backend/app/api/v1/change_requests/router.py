@@ -52,6 +52,7 @@ from app.services.ai.operations_control import (
     is_controls_protected,
     maybe_gate_control,
 )
+from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.policy import (
     GATEABLE_ACTIONS,
     GATEABLE_RESOURCE_TYPES,
@@ -632,6 +633,7 @@ async def cancel_request(
     # #696 — gate rows only; a portal row is cancelled via /requests.
     if cr is None or cr.origin != "gate":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    enforce_operation_token_scope(request, cr.operation)  # #3302
     is_requester = (
         cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id
     )

@@ -171,6 +171,8 @@ function storingApi() {
       Object.assign(store.zone, d);
       return { ...store.zone };
     },
+    // Edit Group reads the group fresh on open (#3365).
+    getGroup: async () => ({ ...store.group }),
     updateGroup: async (_g: unknown, d: unknown) => {
       store.saved.push(d as Record<string, unknown>);
       Object.assign(store.group, d);
@@ -227,7 +229,9 @@ describe("Edit Group reopened before the refetch resolves (#2830)", () => {
       fireEvent.click(
         await screen.findByRole("button", { name: /Edit Group/ }),
       );
-      return within(topDialog()).getByText("Allow recursion")
+      // The dialog opens once the group has been read fresh (#3365).
+      await waitFor(() => topDialog());
+      return (await within(topDialog()).findByText("Allow recursion"))
         .previousElementSibling as HTMLInputElement;
     }
 
@@ -242,9 +246,12 @@ describe("Edit Group reopened before the refetch resolves (#2830)", () => {
 
     const again = await openEditGroup();
     expect(again.checked).toBe(false);
+    // Untouched: the Save sends nothing (#3365) and closes.
     fireEvent.click(within(topDialog()).getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(store.saved).toHaveLength(2));
-    expect(store.saved[1]).toMatchObject({ is_recursive: false });
+    await waitFor(() =>
+      expect(screen.queryAllByRole("dialog")).toHaveLength(0),
+    );
+    expect(store.saved).toHaveLength(1);
     expect(store.group.is_recursive).toBe(false);
   });
 });
