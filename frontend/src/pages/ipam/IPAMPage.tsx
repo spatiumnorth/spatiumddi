@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
+import { Field } from "@/pages/dhcp/_shared";
 import {
   useQuery,
   useQueries,
@@ -136,6 +137,10 @@ import { useSessionState } from "@/lib/useSessionState";
 import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import {
+  useUtilizationThresholds,
+  utilizationColor,
+} from "@/hooks/useUtilizationThresholds";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -439,13 +444,14 @@ function UsedIps({ allocated, total }: { allocated: number; total: number }) {
   );
 }
 
-function UtilizationBar({
+export function UtilizationBar({
   percent,
   uncountable = false,
 }: {
   percent: number;
   uncountable?: boolean;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (uncountable) {
     return (
       <span
@@ -456,12 +462,7 @@ function UtilizationBar({
       </span>
     );
   }
-  const color =
-    percent >= 95
-      ? "bg-red-500"
-      : percent >= 80
-        ? "bg-amber-400"
-        : "bg-green-500";
+  const color = utilizationColor(percent, thresholds);
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 w-20 rounded-full bg-muted">
@@ -477,13 +478,14 @@ function UtilizationBar({
   );
 }
 
-function UtilizationDot({
+export function UtilizationDot({
   percent,
   uncountable = false,
 }: {
   percent: number;
   uncountable?: boolean;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (uncountable) {
     // Parity with UtilizationBar — a clamped IPv6 subnet computes ≈0%, so a
     // green dot would falsely read "empty". Render a neutral dot instead.
@@ -496,12 +498,7 @@ function UtilizationDot({
       />
     );
   }
-  const color =
-    percent >= 95
-      ? "bg-red-500"
-      : percent >= 80
-        ? "bg-amber-400"
-        : "bg-green-500";
+  const color = utilizationColor(percent, thresholds);
   const tip = `${percent.toFixed(0)}% utilized`;
   return (
     <span
@@ -921,26 +918,6 @@ function CustomFieldsSection({
 }
 
 // ─── Modal helpers ────────────────────────────────────────────────────────────
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 // `focus:ring-inset` draws the focus ring inside the element, which prevents
 // the left/right edges of the ring from being clipped by the modal's
@@ -2884,6 +2861,7 @@ export function CreateSubnetModal({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["spaces"] });
       // Refresh the VLAN detail page's "Subnets using this VLAN" list
       qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
@@ -3729,6 +3707,7 @@ export function AddAddressModal({
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       if (staticError) {
         // Address created, reservation not mirrored — keep the modal open
         // so the operator sees this; the row already exists (don't
@@ -5145,6 +5124,9 @@ export function SubnetDetail({
     onSuccess: () => {
       setInlineEditError(null);
       qc.invalidateQueries({ queryKey: ["addresses"] });
+      // A status edit moves the subnet's and its blocks' counts (#3325).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       // A static assignment's hostname / MAC mirror onto its address, so the
       // statics lists cache the same object (#3076).
       qc.invalidateQueries({ queryKey: ["dhcp-statics"] });
@@ -5665,6 +5647,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
       setActionError(formatApiError(e, "Failed to delete address.")),
@@ -5684,6 +5667,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
       setActionError(formatApiError(e, "Failed to purge address.")),
@@ -5698,6 +5682,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
       setActionError(formatApiError(e, "Failed to restore address.")),
@@ -5792,6 +5777,7 @@ export function SubnetDetail({
               onCommitted={() => {
                 qc.invalidateQueries({ queryKey: ["addresses"] });
                 qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
             <ToolsMenu
@@ -7270,6 +7256,7 @@ export function SubnetDetail({
           onCommitted={() => {
             qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
             qc.invalidateQueries({ queryKey: ["subnets"] });
+            qc.invalidateQueries({ queryKey: ["blocks"] });
           }}
         />
       )}
@@ -7931,6 +7918,7 @@ export function OrphansModal({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       onClose();
     },
   });
@@ -8489,6 +8477,7 @@ function EditSubnetModalForm({
     },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       // Invalidate addresses so network/broadcast changes are reflected immediately
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -9649,6 +9638,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
     },
     onSuccess: ({ staticError }) => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      // A status edit moves the subnet's and its blocks' counts (#3325).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
@@ -11028,6 +11020,7 @@ function BulkEditAddressesModal({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       if (subnetId)
         qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       if (res.skipped.length > 0) {
@@ -11491,6 +11484,7 @@ export function BulkDeleteAddressesModal({
       // Refresh subnet utilization (tree dot + space-table "Used IPs") the way
       // the single-delete path does — bulk-delete was missing this (#509).
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
@@ -13803,6 +13797,7 @@ export function BlockDetailView({
   ancestors,
   allBlocks,
   allSubnets,
+  readError,
   space,
   onSelectSpace,
   onSelectBlock,
@@ -13813,6 +13808,9 @@ export function BlockDetailView({
   ancestors: IPBlock[];
   allBlocks: IPBlock[];
   allSubnets: Subnet[];
+  /** The error of the block or subnet list behind this view, when its read
+   *  was refused or failed: an empty list is then not an empty block (#3337). */
+  readError?: unknown;
   space?: IPSpace;
   onSelectSpace: () => void;
   onSelectBlock: (b: IPBlock) => void;
@@ -14386,6 +14384,7 @@ export function BlockDetailView({
           space={space}
           defaultBlockId={block.id}
           defaultBlockLabel={block.network}
+          defaultBlockCidr={block.network}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, parentBlockId) => {
             setFindFreeBlockId(parentBlockId);
@@ -14413,6 +14412,7 @@ export function BlockDetailView({
                 setShowSplitSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -14429,6 +14429,7 @@ export function BlockDetailView({
                 setShowMergeSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -14585,9 +14586,16 @@ export function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {hasBlockFilter || hasTagFilter || hasRoleFilter
-                    ? "No results match the active filters."
-                    : "This block has no child blocks or subnets yet."}
+                  {readError != null ? (
+                    <ListReadError
+                      error={readError}
+                      what="this block's child blocks and subnets"
+                    />
+                  ) : hasBlockFilter || hasTagFilter || hasRoleFilter ? (
+                    "No results match the active filters."
+                  ) : (
+                    "This block has no child blocks or subnets yet."
+                  )}
                 </p>
               </div>
             );
@@ -14595,6 +14603,16 @@ export function BlockDetailView({
 
           return (
             <div className="overflow-x-auto">
+              {/* Child blocks read, subnets refused: the rows shown are not
+                  the whole block, so say so above them (#3337). */}
+              {readError != null && (
+                <p className="px-4 py-2 text-xs">
+                  <ListReadError
+                    error={readError}
+                    what="all of this block's contents"
+                  />
+                </p>
+              )}
               <table className="w-full min-w-[720px] text-sm">
                 <thead>
                   <tr className="border-b bg-muted/40 text-xs">
@@ -15263,12 +15281,20 @@ export function SpaceTableView({
   const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
-  const { data: blocks, isLoading: blocksLoading } = useQuery({
+  const {
+    data: blocks,
+    isLoading: blocksLoading,
+    error: blocksError,
+  } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
   });
 
-  const { data: subnets, isLoading: subnetsLoading } = useQuery({
+  const {
+    data: subnets,
+    isLoading: subnetsLoading,
+    error: subnetsError,
+  } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
   });
@@ -15624,10 +15650,37 @@ export function SpaceTableView({
           <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>
         ) : isEmpty ? (
           <p className="px-6 py-4 text-sm text-muted-foreground">
-            No blocks or subnets in this space yet.
+            {blocksError != null || subnetsError != null ? (
+              <ListReadError
+                error={blocksError ?? subnetsError}
+                what={
+                  blocksError != null && subnetsError != null
+                    ? "this space's blocks and subnets"
+                    : blocksError != null
+                      ? "this space's blocks"
+                      : "this space's subnets"
+                }
+              />
+            ) : (
+              "No blocks or subnets in this space yet."
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">
+            {/* One of the two reads answered and the other was refused: the
+                rows shown are not the whole space (#3337). */}
+            {(blocksError != null || subnetsError != null) && (
+              <p className="px-6 py-2 text-xs">
+                <ListReadError
+                  error={blocksError ?? subnetsError}
+                  what={
+                    blocksError != null
+                      ? "this space's blocks"
+                      : "this space's subnets"
+                  }
+                />
+              </p>
+            )}
             <table className="w-full min-w-[720px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/40 text-xs">
@@ -16053,6 +16106,7 @@ export function SpaceTableView({
                 setShowSplitSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -16068,6 +16122,7 @@ export function SpaceTableView({
                 setShowMergeSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -16298,13 +16353,17 @@ export function SpaceSection({
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
 
-  const { data: subnets, isLoading } = useQuery({
+  const {
+    data: subnets,
+    isLoading,
+    error: subnetsError,
+  } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
     enabled: expanded || filtering,
   });
 
-  const { data: blocks } = useQuery({
+  const { data: blocks, error: blocksError } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
     enabled: expanded || filtering,
@@ -16409,6 +16468,7 @@ export function SpaceSection({
       }
       if (selectedSubnetId === id) onSelectSubnet(null);
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       setSubnetToDelete(null);
       setSubnetDeleteError(null);
     },
@@ -16606,9 +16666,10 @@ export function SpaceSection({
 
             {/* Block tree (recursive) — filtered + force-expanded when a
                 quick-filter is active, and capped to TREE_GROUP_CAP top-level
-                rows with a reveal (never capped while filtering). */}
+                rows with a reveal (never capped while filtering). A refused
+                subnet read still draws the blocks it can see (#3337). */}
             {blocks &&
-              subnets &&
+              (subnets || subnetsError != null) &&
               (() => {
                 const top = buildBlockTree(treeBlocks, treeSubnets, null);
                 const capped =
@@ -16652,11 +16713,32 @@ export function SpaceSection({
                 );
               })()}
 
-            {!isLoading && !subnets?.length && !blocks?.length && (
-              <p className="py-1 pl-2 text-xs text-muted-foreground">
-                No blocks yet.
+            {/* A refused or failed read says so, not "No blocks yet", and
+                beside the blocks it could read when only subnets were
+                refused (#3337). */}
+            {!isLoading && (blocksError != null || subnetsError != null) && (
+              <p className="py-1 pl-2 text-xs">
+                <ListReadError
+                  error={blocksError ?? subnetsError}
+                  what={
+                    blocksError != null && subnetsError != null
+                      ? "this space's blocks and subnets"
+                      : blocksError != null
+                        ? "this space's blocks"
+                        : "this space's subnets"
+                  }
+                />
               </p>
             )}
+            {!isLoading &&
+              !subnets?.length &&
+              !blocks?.length &&
+              blocksError == null &&
+              subnetsError == null && (
+                <p className="py-1 pl-2 text-xs text-muted-foreground">
+                  No blocks yet.
+                </p>
+              )}
           </div>
         </DndContext>
       )}
@@ -17417,13 +17499,13 @@ export function IPAMPage() {
   const activeSpaceId =
     selectedBlock?.space_id ?? selectedSubnet?.space_id ?? selectedSpace?.id;
 
-  const { data: detailBlocks } = useQuery({
+  const { data: detailBlocks, error: detailBlocksError } = useQuery({
     queryKey: ["blocks", activeSpaceId],
     queryFn: () => ipamApi.listBlocks(activeSpaceId!),
     enabled: !!activeSpaceId,
   });
 
-  const { data: detailSubnets } = useQuery({
+  const { data: detailSubnets, error: detailSubnetsError } = useQuery({
     queryKey: ["subnets", activeSpaceId],
     queryFn: () => ipamApi.listSubnets({ space_id: activeSpaceId }),
     enabled: !!activeSpaceId,
@@ -17731,6 +17813,7 @@ export function IPAMPage() {
             ancestors={selectedBlockAncestors}
             allBlocks={detailBlocks ?? []}
             allSubnets={detailSubnets ?? []}
+            readError={detailSubnetsError ?? detailBlocksError}
             onSelectSpace={() => {
               const sp = spaces?.find(
                 (s: IPSpace) => s.id === selectedBlock.space_id,

@@ -2,6 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { ipamApi, type Subnet } from "@/lib/api";
 import { StatusTag } from "@/components/ui/status-tag";
 import { zebraBodyCls } from "@/lib/utils";
+import {
+  useUtilizationThresholds,
+  utilizationColor,
+} from "@/hooks/useUtilizationThresholds";
 
 export function SubnetsPage() {
   const { data: subnets, isLoading } = useQuery({
@@ -63,12 +67,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function UtilizationBar({ percent }: { percent: number }) {
-  const color =
-    percent >= 95
-      ? "bg-red-500"
-      : percent >= 80
-        ? "bg-amber-400"
-        : "bg-green-500";
+  const color = utilizationColor(percent, useUtilizationThresholds());
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 w-24 rounded-full bg-muted">

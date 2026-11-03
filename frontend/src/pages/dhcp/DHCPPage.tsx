@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -157,7 +158,11 @@ function GroupSidebar({
     "spatium.dhcp.expandedGroups",
     new Set(),
   );
-  const { data: groups = [], isLoading } = useQuery({
+  const {
+    data: groups = [],
+    isLoading,
+    error: groupsError,
+  } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
   });
@@ -216,7 +221,13 @@ function GroupSidebar({
         {isLoading && (
           <p className="px-4 py-2 text-xs text-muted-foreground">Loading…</p>
         )}
-        {groups.length === 0 && !isLoading && (
+        {/* A refused or failed read says so, not an empty estate (#3337). */}
+        {groups.length === 0 && !isLoading && groupsError != null && (
+          <p className="px-4 pt-6 text-center text-xs">
+            <ListReadError error={groupsError} what="DHCP server groups" />
+          </p>
+        )}
+        {groups.length === 0 && !isLoading && groupsError == null && (
           <div className="px-4 pt-6 text-center">
             <Wifi className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
             <p className="text-xs text-muted-foreground mb-3">
@@ -1395,7 +1406,7 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
   // Scopes live on the DHCP server group, not on individual servers — every
   // peer in the group renders the same set. Both the group detail view and
   // the (legacy) Windows-server detail view feed in the same group id.
-  const { data: groupScopes = [] } = useQuery({
+  const { data: groupScopes = [], error: groupScopesError } = useQuery({
     queryKey: ["dhcp-scopes-group", groupId, tagFilters],
     queryFn: () =>
       groupId
@@ -1471,15 +1482,24 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
       />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {tagFilters.length === 0
-            ? `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
-            : unfilteredCount === undefined
-              ? allScopes.length === 1
-                ? "1 scope matches the tag filter."
-                : `${allScopes.length} scopes match the tag filter.`
-              : unfilteredCount === 1
-                ? `${allScopes.length} of 1 scope matches the tag filter.`
-                : `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`}
+          {groupScopesError != null ? (
+            <ListReadError
+              error={groupScopesError}
+              what="this group's scopes"
+            />
+          ) : tagFilters.length === 0 ? (
+            `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
+          ) : unfilteredCount === undefined ? (
+            allScopes.length === 1 ? (
+              "1 scope matches the tag filter."
+            ) : (
+              `${allScopes.length} scopes match the tag filter.`
+            )
+          ) : unfilteredCount === 1 ? (
+            `${allScopes.length} of 1 scope matches the tag filter.`
+          ) : (
+            `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`
+          )}
         </p>
         <div className="flex items-center gap-2">
           <select
@@ -1516,9 +1536,16 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
       <div className="rounded-lg border">
         {allScopes.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            {tagFilters.length > 0 && unfilteredCount !== 0
-              ? "No scopes match the current tag filter."
-              : "No scopes on this server."}
+            {groupScopesError != null ? (
+              <ListReadError
+                error={groupScopesError}
+                what="this group's scopes"
+              />
+            ) : tagFilters.length > 0 && unfilteredCount !== 0 ? (
+              "No scopes match the current tag filter."
+            ) : (
+              "No scopes on this server."
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -1765,7 +1792,7 @@ export function ServerPoolsOrStaticsTab({
 }) {
   // Scopes belong to the group — pull them once and walk into each scope
   // for its pool / static rows. Empty when the group has no scopes yet.
-  const { data: groupScopes = [] } = useQuery({
+  const { data: groupScopes = [], error: groupScopesError } = useQuery({
     queryKey: ["dhcp-scopes-group", groupId],
     queryFn: () =>
       groupId ? dhcpApi.listScopesByGroup(groupId) : Promise.resolve([]),
@@ -1812,6 +1839,17 @@ export function ServerPoolsOrStaticsTab({
   }> = nestedQueries.flatMap((q, i) =>
     (q.data ?? []).map((item) => ({ scope: allScopes[i]!, item })),
   );
+  // A refused or failed read of the scopes, or of any scope's pools /
+  // statics, is not an empty list (#3337): a role that reads ``dhcp_scope``
+  // but not ``dhcp_pool`` / ``dhcp_static`` is refused the next read.
+  const rowsError =
+    groupScopesError ?? nestedQueries.find((q) => q.error != null)?.error;
+  const rowsWhat =
+    groupScopesError != null
+      ? "this group's scopes"
+      : kind === "pools"
+        ? "this group's pools"
+        : "this group's static assignments";
 
   type PoolRow = { scope: DHCPScope; item: DHCPPool };
   type StaticRow = { scope: DHCPScope; item: DHCPStaticAssignment };
@@ -1882,6 +1920,8 @@ export function ServerPoolsOrStaticsTab({
       // Delete detaches the linked IPAM row + triggers DNS sync server-side,
       // so refresh the same IPAM/DNS keys the create/edit modal invalidates.
       qc.invalidateQueries({ queryKey: ["addresses", row.scope.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({
         queryKey: ["subnet-dns-sync", row.scope.subnet_id],
       });
@@ -1924,11 +1964,15 @@ export function ServerPoolsOrStaticsTab({
       <div className="rounded-lg border">
         {rows.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            {kind === "pools"
-              ? "No pools yet."
-              : allScopes.length === 0
-                ? "No DHCP scopes in this group yet — create a scope first, then add reservations here."
-                : "No static assignments yet."}
+            {rowsError != null ? (
+              <ListReadError error={rowsError} what={rowsWhat} />
+            ) : kind === "pools" ? (
+              "No pools yet."
+            ) : allScopes.length === 0 ? (
+              "No DHCP scopes in this group yet — create a scope first, then add reservations here."
+            ) : (
+              "No static assignments yet."
+            )}
           </p>
         ) : kind === "pools" ? (
           <div className="overflow-x-auto">
