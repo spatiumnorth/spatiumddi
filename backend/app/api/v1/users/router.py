@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
@@ -16,7 +16,7 @@ from app.core.permissions import refuse_and_audit
 from app.core.security import hash_password
 from app.core.session_rotation import revoke_live_sessions
 from app.models.audit import AuditLog
-from app.models.auth import User, UserSession
+from app.models.auth import APIToken, User, UserSession
 from app.models.auth_provider import AuthProvider
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
@@ -491,6 +491,19 @@ async def update_user(
             is_active=body.is_active,
             sessions_revoked=(await revoke_live_sessions(db, UserSession.user_id == user.id)),
         )
+        if not body.is_active:
+            # #3432 — disabling also revokes the account's API tokens. A
+            # bearer token authenticates as its owner, so one left live would
+            # outlast the containment the disable is for and work again on
+            # re-enable. Re-enabling does not bring them back: the owner or
+            # an admin mints new ones.
+            changes["api_tokens_revoked"] = (
+                await db.execute(
+                    update(APIToken)
+                    .where(APIToken.user_id == user.id, APIToken.is_active.is_(True))
+                    .values(is_active=False)
+                )
+            ).rowcount
         user.is_active = body.is_active
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin

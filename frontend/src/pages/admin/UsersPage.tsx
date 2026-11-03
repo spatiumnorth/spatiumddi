@@ -317,6 +317,12 @@ function EditUserModal({
             />
             Active
           </label>
+          <p
+            className={`text-xs ${isActive ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400"}`}
+          >
+            Disabling this account ends its sessions and revokes its API tokens.
+            Re-enabling it does not bring the tokens back; mint new ones.
+          </p>
         </div>
         {user.auth_source !== "local" && <ProviderLink user={user} />}
         {promoting && (

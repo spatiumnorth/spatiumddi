@@ -12,14 +12,16 @@ account; a re-enabled account must start with no sessions.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import generate_api_token
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import APIToken, User
 from tests.test_fix_m3_m4_auth_session import _bearer, _ensure_settings, _session, _user
 
 
@@ -68,7 +70,11 @@ async def test_disabling_ends_the_sessions_and_re_enabling_brings_none_back(
     )
 
     disable, enable = await _audits(db_session, target)
-    assert disable.new_value == {"is_active": False, "sessions_revoked": 1}, disable.new_value
+    assert disable.new_value == {
+        "is_active": False,
+        "sessions_revoked": 1,
+        "api_tokens_revoked": 0,
+    }, disable.new_value
     assert enable.new_value == {"is_active": True, "sessions_revoked": 0}, enable.new_value
 
 
@@ -134,3 +140,51 @@ async def test_an_edit_that_keeps_the_account_active_ends_no_session(
     assert (
         await client.get("/api/v1/auth/me", headers=_bearer(target, session))
     ).status_code == 200
+
+
+async def _token(db: AsyncSession, owner: User, *, active: bool = True) -> APIToken:
+    raw, prefix, token_hash = generate_api_token()
+    tok = APIToken(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        token_hash=token_hash,
+        prefix=raw[:10],
+        scope="user",
+        scopes=[],
+        user_id=owner.id,
+        created_by_user_id=owner.id,
+        is_active=active,
+    )
+    db.add(tok)
+    await db.flush()
+    tok._raw = raw  # type: ignore[attr-defined]
+    return tok
+
+
+async def test_disabling_revokes_api_tokens_and_re_enabling_does_not_restore_them(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3432 — a bearer token authenticates as its owner, so a disable must end it."""
+    await _ensure_settings(db_session)
+    admin = await _user(db_session, is_superadmin=True)
+    target = await _user(db_session)
+    other = await _user(db_session)
+    tok = await _token(db_session, target)
+    other_tok = await _token(db_session, other)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {tok._raw}"}  # type: ignore[attr-defined]
+    assert (await client.get("/api/v1/auth/me", headers=headers)).status_code == 200
+
+    await _set_active(client, admin, target, False)
+    await db_session.refresh(tok)
+    await db_session.refresh(other_tok)
+    assert tok.is_active is False, "disabling the account left its API token live"
+    assert other_tok.is_active is True, "another user's token was revoked"
+
+    await _set_active(client, admin, target, True)
+    await db_session.refresh(tok)
+    assert tok.is_active is False, "re-enabling the account brought the token back"
+    assert (await client.get("/api/v1/auth/me", headers=headers)).status_code == 401
+
+    disable, enable = await _audits(db_session, target)
+    assert disable.new_value["api_tokens_revoked"] == 1, disable.new_value
+    assert "api_tokens_revoked" not in enable.new_value, enable.new_value
