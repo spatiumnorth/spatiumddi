@@ -569,13 +569,27 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
               d.weight !== m.weight ||
               scopeChanged
             ) {
-              await dnsApi.updatePoolMember(id, {
-                address: d.address,
-                enabled: d.enabled,
-                weight: d.weight,
-                serving_cidrs: dCidrs,
-                site_id: d.siteId,
-              });
+              // Only the member fields the operator changed (#3379), so an
+              // edit to one field cannot undo another made elsewhere.
+              await dnsApi.updatePoolMember(
+                id,
+                changedFields(
+                  {
+                    address: m.address,
+                    enabled: m.enabled,
+                    weight: m.weight,
+                    serving_cidrs: m.serving_cidrs ?? [],
+                    site_id: m.site_id ?? null,
+                  },
+                  {
+                    address: d.address,
+                    enabled: d.enabled,
+                    weight: d.weight,
+                    serving_cidrs: dCidrs,
+                    site_id: d.siteId ?? null,
+                  },
+                ),
+              );
             }
           }
         }

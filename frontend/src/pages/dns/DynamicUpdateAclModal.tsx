@@ -142,8 +142,14 @@ function DynamicUpdateAclForm({
           JSON.stringify(stored.entries.map(wireEntry));
       // Nothing changed against the fresh read: send nothing (#3379).
       if (unchanged) return null;
+      // The flag goes only when it changed: the server reads an absent flag as
+      // "leave as is", so editing the entries cannot undo a toggle made
+      // elsewhere since this dialog opened. The entries are a whole-set
+      // replace, so they always go.
       return dnsApi.replaceZoneUpdateAcl(groupId, zoneId, {
-        dynamic_update_enabled: enabled,
+        ...(enabled !== stored.dynamic_update_enabled
+          ? { dynamic_update_enabled: enabled }
+          : {}),
         entries,
       });
     },

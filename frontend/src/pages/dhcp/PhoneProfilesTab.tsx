@@ -337,11 +337,15 @@ function PhoneProfileEditorForm({
             enabled: profile.enabled,
             vendor: profile.vendor ?? null,
             vendor_class_match: profile.vendor_class_match ?? null,
-            option_set: (profile.option_set ?? []).map((o) => ({
-              code: o.code,
-              name: o.name ?? null,
-              value: o.value,
-            })),
+            // Filtered the way the body is, so a stored blank-valued row
+            // does not read as a change on an untouched Save.
+            option_set: (profile.option_set ?? [])
+              .filter((o) => o.value.trim())
+              .map((o) => ({
+                code: o.code,
+                name: o.name ?? null,
+                value: o.value,
+              })),
           },
           fields,
         );

@@ -577,3 +577,238 @@ describe("Edit DHCP device policy (#3379)", () => {
     expect(screen.queryByDisplayValue("IoT")).toBeNull();
   });
 });
+
+describe("#3379 validation: what each set-replacing Save sends", () => {
+  const member = (id: string, address: string) => ({
+    id,
+    pool_id: "p-1",
+    address,
+    weight: 1,
+    enabled: true,
+    serving_cidrs: [],
+    site_id: null,
+    last_check_state: "unknown",
+  });
+  const pool = {
+    id: "p-1",
+    name: "web",
+    description: "d",
+    record_name: "www",
+    record_type: "A",
+    ttl: 30,
+    enabled: true,
+    hc_type: "tcp",
+    hc_target_port: 80,
+    hc_path: "/",
+    hc_method: "GET",
+    hc_verify_tls: false,
+    hc_expected_status_codes: [200],
+    hc_interval_seconds: 30,
+    hc_timeout_seconds: 5,
+    hc_unhealthy_threshold: 2,
+    hc_healthy_threshold: 2,
+    members: [member("m-1", "10.0.0.1"), member("m-2", "10.0.0.2")],
+  } as unknown as DNSPool;
+
+  it("pool: a member removed in the dialog is deleted, and an edited member sends only the changed field", async () => {
+    const updatePool = vi.fn(() => Promise.resolve(pool));
+    const deletePoolMember = vi.fn(() => Promise.resolve());
+    const updatePoolMember = vi.fn(() => Promise.resolve());
+    const addPoolMember = vi.fn(() => Promise.resolve());
+    answers.dnsApi = {
+      getPool: () => Promise.resolve(pool),
+      updatePool,
+      deletePoolMember,
+      updatePoolMember,
+      addPoolMember,
+    };
+    answers.sitesApi = { list: () => Promise.resolve({ items: [] }) };
+    open(
+      <PoolModal
+        group={{ id: "g-1" } as DNSServerGroup}
+        zone={{ id: "z-1" } as DNSZone}
+        pool={pool}
+        onClose={() => {}}
+      />,
+    );
+    await screen.findByDisplayValue("10.0.0.2");
+    // Disable m-2, then remove m-1 (removing first would shift the rows).
+    const second = screen
+      .getByDisplayValue("10.0.0.2")
+      .parentElement!.querySelector("input[type=checkbox]") as HTMLInputElement;
+    fireEvent.click(second);
+    fireEvent.click(screen.getAllByTitle("Remove")[0]);
+    save();
+    await waitFor(() => expect(updatePoolMember).toHaveBeenCalled());
+    expect(deletePoolMember).toHaveBeenCalledTimes(1);
+    expect(deletePoolMember).toHaveBeenCalledWith("m-1");
+    // Only `enabled`: re-sending address / weight / scope would undo a
+    // change made to them elsewhere since the dialog opened.
+    expect(updatePoolMember).toHaveBeenCalledWith("m-2", { enabled: false });
+    expect(updatePool).not.toHaveBeenCalled();
+    expect(addPoolMember).not.toHaveBeenCalled();
+  });
+
+  const entry = (id: string, cidr: string) => ({
+    id,
+    seq: 0,
+    action: "grant",
+    match_kind: "ip",
+    ip_cidr: cidr,
+    tsig_key_id: null,
+    tsig_key_name: null,
+    name_scope: null,
+    name_pattern: null,
+    record_types: null,
+  });
+  const acl = (entries: unknown[], enabled: boolean) =>
+    ({
+      zone_id: "z-1",
+      dynamic_update_enabled: enabled,
+      driver_names: ["bind9"],
+      caps: {
+        supports_ip_acl: true,
+        supports_tsig_acl: true,
+        supports_name_scoping: false,
+        supports_per_type: false,
+        coarse_enum_only: true,
+        supported: true,
+      },
+      entries,
+      warnings: [],
+    }) as unknown as ZoneUpdateAcl;
+  const twoEntries = [
+    entry("e-1", "10.0.0.0/24"),
+    entry("e-2", "192.168.1.0/24"),
+  ];
+
+  function openAcl(
+    replaceZoneUpdateAcl: Answer,
+    onClose: () => void = () => {},
+  ) {
+    answers.dnsApi = {
+      getZoneUpdateAcl: () => Promise.resolve(acl(twoEntries, true)),
+      replaceZoneUpdateAcl,
+      listTSIGKeys: () => Promise.resolve([]),
+    };
+    open(
+      <DynamicUpdateAclModal
+        groupId="g-1"
+        zoneId="z-1"
+        zoneName="example.com."
+        onClose={onClose}
+      />,
+    );
+  }
+
+  it("ACL: an entries-only edit leaves the enabled flag out of the replace", async () => {
+    const replaceZoneUpdateAcl = vi.fn(() =>
+      Promise.resolve(acl([entry("e-2", "192.168.1.0/24")], true)),
+    );
+    openAcl(replaceZoneUpdateAcl);
+    await screen.findByDisplayValue("10.0.0.0/24");
+    fireEvent.click(screen.getAllByTitle("Remove")[0]);
+    save(/^Save ACL/);
+    await waitFor(() => expect(replaceZoneUpdateAcl).toHaveBeenCalled());
+    const [, , body] = replaceZoneUpdateAcl.mock.calls[0] as unknown as [
+      string,
+      string,
+      Record<string, unknown> & { entries: { ip_cidr: string }[] },
+    ];
+    // Absent means "leave as is" server-side, so a toggle made elsewhere
+    // since the dialog opened survives this save.
+    expect(body).not.toHaveProperty("dynamic_update_enabled");
+    expect(body.entries.map((e) => e.ip_cidr)).toEqual(["192.168.1.0/24"]);
+  });
+
+  it("ACL: after a save the dialog compares against what was saved", async () => {
+    const replaceZoneUpdateAcl = vi.fn(() =>
+      Promise.resolve(acl(twoEntries, false)),
+    );
+    const onClose = vi.fn();
+    openAcl(replaceZoneUpdateAcl, onClose);
+    await screen.findByDisplayValue("10.0.0.0/24");
+    fireEvent.click(screen.getByRole("checkbox"));
+    save(/^Save ACL/);
+    await waitFor(() => expect(replaceZoneUpdateAcl).toHaveBeenCalledTimes(1));
+    expect(onClose).not.toHaveBeenCalled();
+    // Nothing changed since that save: the second Save sends nothing,
+    // although the form still differs from the read it opened with.
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: /^Save ACL/ }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    );
+    save(/^Save ACL/);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(replaceZoneUpdateAcl).toHaveBeenCalledTimes(1);
+  });
+
+  it("phone profile: a stored blank-valued option does not make an untouched Save send", async () => {
+    const profile = {
+      id: "pp-1",
+      group_id: "g-1",
+      name: "Cisco",
+      description: "d",
+      enabled: false,
+      vendor: null,
+      vendor_class_match: "Cisco",
+      option_set: [
+        { code: 150, name: "tftp-server", value: "10.0.0.5" },
+        { code: 66, name: "tftp-server-name", value: "" },
+      ],
+      scope_ids: [],
+    } as unknown as PhoneProfile;
+    const update = vi.fn(() => Promise.resolve(profile));
+    const onClose = vi.fn();
+    answers.dhcpApi = {
+      listPhoneProfiles: () => Promise.resolve([profile]),
+      listVoipVendors: () => Promise.resolve([]),
+      listScopesByGroup: () => Promise.resolve([]),
+      updatePhoneProfile: update,
+      setPhoneProfileScopes: vi.fn(),
+    };
+    answers.ipamApi = { listSubnets: () => Promise.resolve([]) };
+    open(
+      <PhoneProfileEditorModal
+        groupId="g-1"
+        profile={profile}
+        onClose={onClose}
+      />,
+    );
+    await screen.findByDisplayValue("d");
+    save();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("DNS server: an untouched cloud-driver edit sends no credentials", async () => {
+    const server = {
+      id: "s-2",
+      group_id: "g-1",
+      name: "r53",
+      driver: "route53",
+      host: "route53",
+      port: 443,
+      api_port: null,
+      roles: [],
+      notes: "cloud",
+      is_enabled: true,
+      is_primary: true,
+      has_credentials: true,
+    } as unknown as DNSServer;
+    const updateServer = vi.fn(() => Promise.resolve(server));
+    const onClose = vi.fn();
+    answers.dnsApi = {
+      listServers: () => Promise.resolve([server]),
+      listGroups: () => Promise.resolve([]),
+      updateServer,
+    };
+    open(<ServerModal groupId="g-1" server={server} onClose={onClose} />);
+    await screen.findByDisplayValue("cloud");
+    save();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateServer).not.toHaveBeenCalled();
+  });
+});
