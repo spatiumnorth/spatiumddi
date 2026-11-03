@@ -36,12 +36,12 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.services.support_bundle as support_bundle
-import app.services.support_bundle.scrub as scrub_mod
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
+from app.services import support_bundle
 from app.services.appliance import diagnostics as diag_svc
 from app.services.support_bundle import collect, generate
+from app.services.support_bundle import scrub as scrub_mod
 from app.services.support_bundle.scrub import Scrubber, redact_secrets
 
 # Long enough for a free loop to answer many times over, short enough
