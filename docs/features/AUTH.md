@@ -1063,3 +1063,20 @@ rather than swallowing the failure. Permission-related rejections
 - **Group mapping target must exist.** `AuthGroupMapping` rows reject
   `internal_group_id` values that don't resolve to an existing
   `Group`. `backend/app/api/v1/auth_providers/router.py`.
+
+---
+
+## Group-based RBAC and API token scoping — reference summary
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Providers, backup-server failover and token scoping
+
+multi-protocol auth.
+
+- LDAP, OIDC, SAML, RADIUS, TACACS+
+- Backup-server failover for every protocol
+- Delegate IP ranges and zones by role
+- API tokens with auto-expiry
+- **Scoped API tokens** — `scopes` JSONB column on `api_token` lists the resource_types the token is allowed to touch (vs. inheriting all of the user's permissions). Permission-name granularity (`subnet:read`, `subnet:admin`, `*` for full inheritance). Authorization enforces scope intersection — token can do at most what the scope set allows AND what the user has permission for.
+- **Resource-scoped API tokens** (#374) — a `resource_grants` list binds a token to specific instances (`{action, resource_type, resource_id}`, resource_type ∈ `subnet` / `dns_zone`) so a leaked CI / Terraform secret can only touch the one subnet or zone it was minted for. The binding only ever *narrows* the owner: the effective permission is the intersection of the owner's RBAC and the token grants, validated at create time to be a subset of what the issuer holds (you can't mint a token more powerful than yourself). Enforced per-row at the IP-create/edit/delete + DNS-record CRUD handlers.

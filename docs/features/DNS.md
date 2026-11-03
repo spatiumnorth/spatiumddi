@@ -3243,3 +3243,37 @@ No new MCP tool (non-negotiable #13 — one field on an existing read), and
 none for the refresh, which is an off-prem call. Not a feature module
 (#14) — it extends the existing zone resource rather than adding a
 top-level family.
+
+---
+
+## 23. Reference summaries — drift report coverage, PowerDNS-only records, pools
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Record-level drift report
+
+per zone, AXFR the live zone from every server in the group and diff it against the database: *extra on server* (someone edited the host by hand), *missing on server* (a change never landed), *in sync*. Strictly read-only — it never applies anything, and the Sync path stays the way you push. A changed value shows as a missing+extra pair, because the diff key includes the value. Split-horizon zones carry a caveat banner: a transfer is addressed by zone *name*, so the server answers from whichever view matches the control plane's source address. **Driver coverage: every driver except PowerDNS**, which implements no record pull at all. Windows Path B, the cloud drivers and agentless Technitium (`technitium_api`) pull over an API; agent-managed BIND9 and Technitium use a TSIG-signed AXFR, because their agents grant transfer to the group's key rather than to an address ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)) — a group with no TSIG key reports that rather than a bare refusal
+
+### PowerDNS-only record types
+
+synthesised at query time by `pdns_server`, so they have no BIND9 equivalent:
+  - **ALIAS** — an apex CNAME-equivalent. Lets `example.com` itself point at a cloud load balancer's hostname, which a real CNAME can't do at the apex without breaking the SOA / NS rrset
+  - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. Authoring is gated on the usual DNS write permission — scope that permission accordingly, and treat it as more privileged than authoring an A record
+
+### DNS pools (GSLB-lite)
+
+health-checked DNS round-robin.
+
+- One DNS name returns one record per healthy + enabled member; members flip in / out of the rrset as state changes
+- **Health checks**:
+  - `tcp` — open-connection probe
+  - `http` / `https` — status-code match with optional TLS verification
+  - `icmp` — echo-request via `iputils-ping`
+  - `none` — always healthy (for pools that just want manual-enable + multi-RR semantics)
+- Per-pool interval (default 30 s), timeout, and consecutive-failure / consecutive-success thresholds so single flapping checks don't churn records
+- **Operator UX**:
+  - Top-level `/dns/pools` page — every pool across every zone with live health summary
+  - Per-zone Pools tab on the zone detail page
+  - Manual enable / disable per member, like a load-balancer pool
+- **Driver-agnostic** — members render as regular A/AAAA records via the normal record pipeline, so BIND9 + Windows DNS serve them unchanged
+- **Tradeoff (UI-warned)** — TTL races. DNS is cached client-side; a member dropping out doesn't take effect until TTL expires. This is not a real L4/L7 load balancer. Default TTL is 30 s with an inline pointer to the LB-mapping roadmap item.
