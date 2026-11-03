@@ -40,6 +40,7 @@ from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -209,6 +210,7 @@ async def purge_lease(
     subnet_id: uuid.UUID | None | Any = _UNSET,
     now: datetime | None = None,
     spare_if_peer_holds: bool = True,
+    touched_subnets: set[uuid.UUID] | None = None,
 ) -> bool:
     """Tear one lease + its ``auto_from_lease`` IPAM mirror down.
 
@@ -233,7 +235,12 @@ async def purge_lease(
     go, and relying on the order of deletes and autoflush to get there
     would be an accident rather than a rule.
 
-    Returns whether an IPAM mirror row was removed. Does not commit/flush.
+    Removing a mirror changes its subnet's (and blocks') utilization (#3345).
+    A batch caller passes ``touched_subnets`` and recounts once itself with
+    ``recount_subnets_and_blocks``; with none, the single teardown recounts
+    its own subnet before returning.
+
+    Returns whether an IPAM mirror row was removed. Does not commit.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -275,15 +282,24 @@ async def purge_lease(
             await purge_trashed_address_records(db, [mirror.id])  # #3186
             await db.delete(mirror)
             mirror_removed = True
+            if touched_subnets is not None:
+                touched_subnets.add(sid)
 
     # Stamp history before the row goes away. ``removed`` signals
     # "operator/server purged the lease" vs ``expired`` (time-based sweep).
     record_lease_history(db, lease, lease_state="removed", expired_at=now)
     await db.delete(lease)
+    if mirror_removed and touched_subnets is None and sid is not None:
+        await recount_subnets_and_blocks(db, [sid])
     return mirror_removed
 
 
-async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tuple[int, int]:
+async def delete_leases_for_scope(
+    db: AsyncSession,
+    scope_id: uuid.UUID,
+    *,
+    touched_subnets: set[uuid.UUID] | None = None,
+) -> tuple[int, int]:
     """Purge every dynamic lease that belongs to ``scope_id``.
 
     Enumerates strictly by ``DHCPLease.scope_id`` (all states). A scope is
@@ -294,6 +310,13 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     ``scope_id`` still points at it; the post-delete race (a poll that nulled
     ``scope_id``) is handled by the pull-leases zero-wire floor guard.
 
+    The freed mirrors move their subnets' counters (#3345). A caller tearing
+    several scopes down in one transaction passes ``touched_subnets`` and
+    recounts once itself, last, with ``recount_subnets_and_blocks``: a recount
+    per scope would lock one scope's subnet and block chain before the next
+    scope's subnet, out of the one order every recount takes (#3354). With
+    none, this recounts what it freed before returning.
+
     Returns ``(leases_removed, mirrors_removed)`` for audit / preview.
     """
     leases = list(
@@ -302,12 +325,17 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     now = datetime.now(UTC)
     leases_removed = 0
     mirrors_removed = 0
+    touched: set[uuid.UUID] = set() if touched_subnets is None else touched_subnets
     for lease in leases:
         # Every copy of every lease in the scope is going, so no copy's peer
         # outlives it — see ``purge_lease(spare_if_peer_holds=...)``.
-        if await purge_lease(db, lease, now=now, spare_if_peer_holds=False):
+        if await purge_lease(
+            db, lease, now=now, spare_if_peer_holds=False, touched_subnets=touched
+        ):
             mirrors_removed += 1
         leases_removed += 1
+    if touched_subnets is None:
+        await recount_subnets_and_blocks(db, touched)  # #3345
     return leases_removed, mirrors_removed
 
 
@@ -364,6 +392,7 @@ async def delete_leases_for_server(
     subnet_cache = await _load_subnet_cache(db)
     leases_removed = 0
     mirrors_removed = 0
+    touched: set[uuid.UUID] = set()
     capped = False
     while leases_removed < max_leases:
         batch = list(
@@ -385,7 +414,7 @@ async def delete_leases_for_server(
                 capped = True
                 break
             sid = await _resolve_lease_subnet_id(db, lease, subnet_cache)
-            if await purge_lease(db, lease, subnet_id=sid, now=now):
+            if await purge_lease(db, lease, subnet_id=sid, now=now, touched_subnets=touched):
                 mirrors_removed += 1
             leases_removed += 1
         await db.flush()
@@ -395,6 +424,7 @@ async def delete_leases_for_server(
             break
     else:
         capped = True
+    await recount_subnets_and_blocks(db, touched)  # #3345
     if capped:
         remaining = (
             await db.execute(
@@ -430,7 +460,8 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
     skipped, and so is anything seen within ``ORPHAN_MIRROR_GRACE`` so a mirror
     mid-flight with its lease write is never raced.
 
-    Returns the number of mirror rows freed. Does not commit.
+    Returns the number of mirror rows freed. Does not commit; recounts the
+    touched subnets and their blocks in the same transaction (#3345).
     """
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
 
@@ -466,6 +497,8 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
                     error=str(exc),
                 )
         await db.delete(row)
+    # #3345 — the freed mirrors no longer count toward their subnets.
+    await recount_subnets_and_blocks(db, {row.subnet_id for row in rows})
     return len(rows)
 
 

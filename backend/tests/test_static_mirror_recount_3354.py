@@ -88,14 +88,16 @@ async def test_scope_statics_removal_recounts(db_session: AsyncSession) -> None:
 
 @pytest.mark.asyncio
 async def test_trash_purge_release_recounts(db_session: AsyncSession) -> None:
-    from app.tasks.trash_purge import _release_ipam_mirrors
+    from app.tasks.trash_purge import _sweep
 
     _scope, subnet, block, st = await _setup(db_session)
     st.deleted_at = datetime.now(UTC) - timedelta(days=400)
-    await db_session.flush()
-
-    assert await _release_ipam_mirrors(db_session, datetime.now(UTC) - timedelta(days=30)) == 1
     await db_session.commit()
+
+    # The whole sweep: the release collects the subnets and the recount runs
+    # last, just before the sweep's own commit.
+    result = await _sweep()
+    assert result["ipam_mirrors_released"] == 1
 
     assert await _counts(db_session, subnet, block) == (0, 0)
 
@@ -182,7 +184,11 @@ async def test_scope_batch_teardown_recounts_every_scope_subnet(
     await db_session.commit()
 
     batch = SimpleNamespace(rows=[SimpleNamespace(obj=scope_a), SimpleNamespace(obj=scope_b)])
-    await _purge_leases_for_scope_batch(db_session, batch)
+    touched: set[uuid.UUID] = set()
+    await _purge_leases_for_scope_batch(db_session, batch, touched)
+    assert touched == {subnet_a.id, subnet_b.id}
+    # What every caller does last, before its commit.
+    await recount_subnets_and_blocks(db_session, touched)
     await db_session.commit()
 
     assert await _counts(db_session, subnet_a, block_a) == (0, 0)

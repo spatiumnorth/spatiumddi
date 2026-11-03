@@ -53,6 +53,18 @@ logger = structlog.get_logger(__name__)
 _AUDIT_CHAIN_LOCK_KEY = 0x4144495441554449  # ASCII "ADITAUDI" — close enough
 
 
+async def lock_audit_chain(db: AsyncSession) -> None:
+    """Take the audit-chain lock now rather than at the next audit flush.
+
+    For a transaction about to take row locks that auditing transactions
+    take after this lock (#3345): taking it first keeps one order, audit
+    lock then rows, so the transaction can never hold such a row while it
+    waits for this lock. Transaction-scoped and re-entrant: the later audit
+    flush simply takes it again.
+    """
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY})
+
+
 def canonical_json(row: AuditLog) -> str:
     """Deterministic JSON over the columns that participate in the
     hash. ``seq``, ``row_hash``, ``prev_hash`` are NEVER in the

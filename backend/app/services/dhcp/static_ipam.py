@@ -693,6 +693,10 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
     hold it, the operator's columns are snapshotted onto it first, so the
     restore stays lossless.
 
+    Ends by recounting the freed rows' subnets and their blocks (#3354), which
+    holds the audit-chain lock and those rows until commit: the caller commits
+    before taking any other subnet or block lock.
+
     Returns the number of mirror rows freed.
     """
     # Two indexed queries rather than one correlated NOT EXISTS. The obvious
