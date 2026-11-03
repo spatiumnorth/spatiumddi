@@ -142,16 +142,16 @@ network modeling, auth/RBAC, the audit log, and platform settings. The
 service containers never hold authoritative state of their own; they
 render from what the control plane assembles.
 
-### Redis 7 — broker, cache, and wake bus
+### Redis 8 — broker, cache, and wake bus
 
 Three jobs: the Celery broker/result backend, a general cache /
 sessions store, and the **agent-wake pub/sub bus** (see §4). Treat both
 Postgres and Redis as internal-only — never expose them to the host or
 network.
 
-> The non-negotiable stack pins **Redis 7**; the shipped Compose file
-> currently runs a newer `redis:*-alpine` tag. Either way the app
-> connects via `settings.redis_url` (and `sentinel://` URLs in HA).
+> Compose, the Helm chart and the appliance all run **Redis 8**
+> (`redis:8.x-alpine`, pinned once in `versions.json`). The app connects
+> via `settings.redis_url` (and `sentinel://` URLs in HA).
 
 ---
 

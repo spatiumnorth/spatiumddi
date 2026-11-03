@@ -114,7 +114,7 @@ _Click any image to open the full-size version._
 - **One platform, three surfaces.** IPAM tree, DNS zones, DHCP scopes — one UI, one REST API, one source of truth. Hostname changes in IPAM propagate to DNS; reservations propagate to DHCP. No more three-tab reconciliation.
 - **Bring your own servers — or ours.** Use the bundled engines, or point SpatiumDDI at your existing Windows DCs and DHCP servers via WinRM. Agentless in both directions — nothing installed on the Windows side.
 - **Built for delegation.** Group-based RBAC with LDAP, OIDC, SAML, RADIUS and TACACS+ (with backup-server failover). Hand a subnet or a zone to a department without handing over root.
-- **API-first.** Every UI action is a REST call. Terraform, Ansible and ad-hoc scripts all speak the same surface. If you can click it, you can automate it.
+- **API-first.** Every UI action is a REST call. Ansible and ad-hoc scripts speak the same surface, and so will the planned Terraform provider. If you can click it, you can automate it.
 
 The tables below are the summary. The operational detail per subsystem — what's stored, how it behaves, where the seams are — lives in the specs listed under [Documentation](#documentation).
 
@@ -282,13 +282,13 @@ The software makes no outbound connection you did not configure, with one except
   <img src="docs/assets/architecture.svg" alt="SpatiumDDI architecture" width="900"/>
 </p>
 
-**Control plane** — FastAPI + PostgreSQL 16 + Redis 7 + Celery. Single source of truth for everything (IPAM tree, DNS records, DHCP scopes, auth, audit log). Exposes a REST API; the web UI and any Terraform / Ansible / CLI / MCP integration all speak the same API. Runs single-node by default; on the OS appliance it can **scale to a 3/5/7-node HA cluster** — replicated PostgreSQL (CloudNativePG), Redis Sentinel, k3s embedded-etcd quorum, and a MetalLB control-plane VIP. The **Operator Copilot** (multi-vendor LLM + hundreds of tools in the registry + MCP HTTP endpoint) is grounded in this same live data.
+**Control plane** — FastAPI + PostgreSQL 16 + Redis 8 + Celery. Single source of truth for everything (IPAM tree, DNS records, DHCP scopes, auth, audit log). Exposes a REST API; the web UI and any Ansible / CLI / MCP integration all speak the same API. Runs single-node by default; on the OS appliance it can **scale to a 3/5/7-node HA cluster** — replicated PostgreSQL (CloudNativePG), Redis Sentinel, k3s embedded-etcd quorum, and a MetalLB control-plane VIP. The **Operator Copilot** (multi-vendor LLM + hundreds of tools in the registry + MCP HTTP endpoint) is grounded in this same live data.
 
 **Data plane — four independent shapes (mix freely):**
 
 - **Agented, on-prem** (BIND9 *or* PowerDNS *or* Technitium, plus Kea) — one container per service. Each bakes in a sidecar agent (`spatium-dns-agent` / `spatium-dhcp-agent`) that (1) bootstraps with a PSK or pairing code → rotating JWT, (2) long-polls `/config` with an ETag (woken over a Redis pub/sub channel), (3) caches the last-known-good bundle on disk so the service keeps serving if the control plane is unreachable — and **reverts to it, quarantines the bad etag and reports that upward** when a bundle renders config the daemon rejects, because a reverted agent otherwise keeps serving and keeps heartbeating while the zone or scope you saved is live nowhere, (4) drains record / config ops over loopback (nsupdate + TSIG for BIND9; REST API for PowerDNS / Technitium; REST Control Agent for Kea). Structural changes reload the daemon; record changes do not. The DNS engine is mutually exclusive per server group.
 
-- **Agentless, on-prem** (Windows DNS, Windows DHCP, Technitium) — no software on the managed host. The control plane speaks directly: RFC 2136 over UDP/TCP 53 (DNS record writes + AXFR), WinRM + PowerShell over 5985/5986 (DNS zone CRUD, DHCP lease / scope reads), and for `technitium_api` the server's own HTTP API with a permanent bearer token. Credentials are Fernet-encrypted on the server row.
+- **Agentless, on-prem** (Windows DNS, Windows DHCP, Technitium) — no software on the managed host. The control plane speaks directly: RFC 2136 over UDP/TCP 53 (DNS record writes + AXFR), WinRM + PowerShell over 5985/5986 (DNS zone CRUD; DHCP scope, reservation and exclusion writes plus lease reads), and for `technitium_api` the server's own HTTP API with a permanent bearer token. Credentials are Fernet-encrypted on the server row.
 
 - **Agentless, cloud DNS** (Cloudflare, Route 53, Azure DNS, Google Cloud DNS, plus DigitalOcean / Hetzner / Linode / Vultr) — first-class drivers that call the provider's REST API / SDK directly, with import-existing-zones. No agent, no daemon.
 
@@ -298,7 +298,7 @@ On the **OS appliance**, a host-side **`spatium-supervisor`** (Ed25519 identity,
 
 The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / PowerDNS / Technitium / Kea / PowerShell / cloud-SDK specifics.
 
-**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · cloud provider SDKs · Docker · Kubernetes + Helm · k3s (appliance)
+**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 8 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · cloud provider SDKs · Docker · Kubernetes + Helm · k3s (appliance)
 
 ---
 
@@ -834,7 +834,7 @@ make openapi VERSION=<tag>     # reproduces the identical bytes locally
 
 Two things the published document guarantees, both because a generated client fails *quietly* rather than loudly: nullable properties are the plain schema with the property absent from `required` — not OpenAPI 3.1's `null` union, whose unmodellable arm makes strict generators drop the **whole property** with a warning — and timestamps are RFC 3339 with exactly three fractional digits, since the six Python emits (and the none it emits on a whole second) are what most generated decoders reject. See [`docs/API.md`](docs/API.md) §2.
 
-Every UI action is a REST call, so anything you do in the UI you can do via `curl`, Terraform, or your own client. Log in to the UI first to obtain a bearer token, then use `Authorization: Bearer <token>`.
+Every UI action is a REST call, so anything you do in the UI you can do via `curl` or your own client. Log in to the UI first to obtain a bearer token, then use `Authorization: Bearer <token>`.
 
 ### Reset the admin password
 
