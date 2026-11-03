@@ -5546,15 +5546,21 @@ export function ZoneDetailView({
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem
-                              disabled={!canWriteRecords}
                               onSelect={() => setEditRecord(r)}
+                              {...permissionGate(
+                                canWriteRecords,
+                                NEEDS_DNS_WRITE,
+                              )}
                             >
                               Edit…
                             </ContextMenuItem>
                             <ContextMenuItem
                               destructive
-                              disabled={!canDeleteRecords}
                               onSelect={() => setConfirmDeleteRecord(r)}
+                              {...permissionGate(
+                                canDeleteRecords,
+                                NEEDS_DNS_DELETE,
+                              )}
                             >
                               Delete…
                             </ContextMenuItem>
