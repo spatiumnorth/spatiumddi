@@ -80,7 +80,11 @@ async def test_disabling_ends_the_sessions_and_re_enabling_brings_none_back(
         "sessions_revoked": 1,
         "api_tokens_revoked": 0,
     }, disable.new_value
-    assert enable.new_value == {"is_active": True, "sessions_revoked": 0}, enable.new_value
+    assert enable.new_value == {
+        "is_active": True,
+        "sessions_revoked": 0,
+        "api_tokens_revoked": 0,
+    }, enable.new_value
 
 
 async def test_an_account_disabled_before_brings_back_no_session_when_re_enabled(
@@ -192,7 +196,31 @@ async def test_disabling_revokes_api_tokens_and_re_enabling_does_not_restore_the
 
     disable, enable = await _audits(db_session, target)
     assert disable.new_value["api_tokens_revoked"] == 1, disable.new_value
-    assert "api_tokens_revoked" not in enable.new_value, enable.new_value
+    assert enable.new_value["api_tokens_revoked"] == 0, enable.new_value
+
+
+async def test_an_account_disabled_before_brings_back_no_token_when_re_enabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3432 — an account disabled with its tokens left live (before this fix,
+    or in the database) must not get them back when it is re-enabled."""
+    await _ensure_settings(db_session)
+    admin = await _user(db_session, is_superadmin=True)
+    target = await _user(db_session)
+    tok = await _token(db_session, target)
+    target.is_active = False
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {tok._raw}"}  # type: ignore[attr-defined]
+
+    await _set_active(client, admin, target, True)
+    resp = await client.get("/api/v1/auth/me", headers=headers)
+    assert (
+        resp.status_code == 401
+    ), f"re-enabling the account revived a token it held while disabled: {resp.status_code}"
+    await db_session.refresh(tok)
+    assert tok.is_active is False
+    (enable,) = await _audits(db_session, target)
+    assert enable.new_value["api_tokens_revoked"] == 1, enable.new_value
 
 
 async def test_each_revoked_token_gets_its_own_audit_row(

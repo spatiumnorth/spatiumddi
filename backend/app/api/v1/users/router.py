@@ -491,50 +491,54 @@ async def update_user(
             is_active=body.is_active,
             sessions_revoked=(await revoke_live_sessions(db, UserSession.user_id == user.id)),
         )
-        if not body.is_active:
-            # #3432 — disabling also revokes the account's API tokens. A
-            # bearer token authenticates as its owner, so one left live would
-            # outlast the containment the disable is for and work again on
-            # re-enable. Re-enabling does not bring them back: the owner or
-            # an admin mints new ones.
-            #
-            # The account row is locked first: ``create_token`` re-reads the
-            # owner's ``is_active`` under a share lock, so a mint racing this
-            # disable either commits before the SELECT below (and is revoked
-            # by it) or waits for this commit and is refused.
-            await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-            live = (
-                await db.execute(
-                    select(APIToken.id, APIToken.name).where(
-                        APIToken.user_id == user.id, APIToken.is_active.is_(True)
-                    )
+        # #3432 — and revokes the account's API tokens. A bearer token
+        # authenticates as its owner, so one left live would outlast the
+        # containment the disable is for and work again on re-enable. As for
+        # sessions, a re-enable revokes too, so a token an account held when
+        # it was disabled before this change does not come back with it;
+        # none can be in honest use while the account is disabled. The owner
+        # or an admin mints new ones.
+        #
+        # The account row is locked first: ``create_token`` re-reads the
+        # owner's ``is_active`` under a share lock, so a mint racing a disable
+        # either commits before the SELECT below (and is revoked by it) or
+        # waits for this commit and is refused.
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        live = (
+            await db.execute(
+                select(APIToken.id, APIToken.name).where(
+                    APIToken.user_id == user.id, APIToken.is_active.is_(True)
                 )
-            ).all()
-            if live:
-                await db.execute(
-                    update(APIToken)
-                    .where(APIToken.id.in_([tid for tid, _ in live]))
-                    .values(is_active=False)
+            )
+        ).all()
+        if live:
+            await db.execute(
+                update(APIToken)
+                .where(APIToken.id.in_([tid for tid, _ in live]))
+                .values(is_active=False)
+            )
+        # One row per token as well, shaped like the token's own revoke
+        # (PATCH ``is_active: false``), so a token's history says why it
+        # went inactive.
+        for tid, name in live:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    user_display_name=current_user.display_name,
+                    auth_source=current_user.auth_source,
+                    action="update",
+                    resource_type="api_token",
+                    resource_id=str(tid),
+                    resource_display=name,
+                    result="success",
+                    changed_fields=["is_active"],
+                    new_value={
+                        "is_active": False,
+                        "reason": "owner_enabled" if body.is_active else "owner_disabled",
+                    },
                 )
-            # One row per token as well, shaped like the token's own revoke
-            # (PATCH ``is_active: false``), so a token's history says why it
-            # went inactive.
-            for tid, name in live:
-                db.add(
-                    AuditLog(
-                        user_id=current_user.id,
-                        user_display_name=current_user.display_name,
-                        auth_source=current_user.auth_source,
-                        action="update",
-                        resource_type="api_token",
-                        resource_id=str(tid),
-                        resource_display=name,
-                        result="success",
-                        changed_fields=["is_active"],
-                        new_value={"is_active": False, "reason": "owner_disabled"},
-                    )
-                )
-            changes["api_tokens_revoked"] = len(live)
+            )
+        changes["api_tokens_revoked"] = len(live)
         user.is_active = body.is_active
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin

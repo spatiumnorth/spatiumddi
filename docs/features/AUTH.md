@@ -1021,7 +1021,8 @@ rather than swallowing the failure. Permission-related rejections
   revokes the account's API tokens (#3432; `api_tokens_revoked` on the
   user's audit row, and one `api_token` audit row per token). A token
   minted while the disable is saving is refused (403). Re-enabling does
-  not bring them back: mint new ones.
+  not bring them back, and revokes any token still live (one an account
+  disabled before this change kept): mint new ones.
   `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
 - **Open streams re-check their caller.** A streaming response (cluster
   health, pod logs, nmap progress, AI chat) re-runs the same session,
