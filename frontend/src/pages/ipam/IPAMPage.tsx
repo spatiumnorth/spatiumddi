@@ -2023,21 +2023,19 @@ export function DdnsSettingsSection({
   // tab changes), read with parseTtlInput: "1h" is refused, not sent as 1.
   const ttlParsed = parseTtlInput(ttlText);
   const ttlError = typeof ttlParsed === "string" ? ttlParsed : null;
-  // Preview: synthesise what ``dhcp-<tail>`` would look like for the
+  // Preview: synthesise what ``dhcp-<address>`` would look like for the
   // first host IP in this subnet. Mirrors the Python implementation in
-  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — keep in
-  // sync when policy generators change.
+  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — the whole
+  // address, hyphenated (#3364) — keep in sync when policy generators change.
   const preview = (() => {
     if (!subnetNetwork) return null;
     const match = subnetNetwork.match(/^([\d.]+)\/(\d+)$/);
     if (!match) return null;
     const octets = match[1].split(".").map((s) => parseInt(s, 10));
     if (octets.length !== 4 || octets.some((n) => isNaN(n))) return null;
-    const prefix = parseInt(match[2], 10);
-    if (prefix < 16) return null;
     // First usable: network + 1 for /30 and shorter, + 1 for /31 / /32
     octets[3] = (octets[3] + 1) & 0xff;
-    return `dhcp-${octets[2]}-${octets[3]}`;
+    return `dhcp-${octets.join("-")}`;
   })();
 
   // While inheriting, the controls show what the subnet resolves to (the

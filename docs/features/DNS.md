@@ -923,8 +923,9 @@ The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle l
 | `disabled` | Never publish, even if `ddns_enabled`. (Useful for temporarily parking DDNS without losing your config.) |
 
 **Generated hostnames:**
-- IPv4 — `dhcp-<third-octet>-<fourth-octet>`. So `10.1.20.5` → `dhcp-20-5`.
-- IPv6 — `dhcp-<low-32-bits-hex>`. Rare path; the format is ugly but unique.
+- IPv4 — `dhcp-<a>-<b>-<c>-<d>`, the whole address. So `10.1.20.5` → `dhcp-10-1-20-5`. Two subnets that share a zone can both hold a `.20.5`, so a shorter form would give them one name.
+- IPv6 — `dhcp-<32 hex digits>`, the whole address, 37 characters. Rare path; the format is ugly but unique.
+- Records published before this (`dhcp-20-5`, `dhcp-<8 hex>`) are left alone and move to the new name when the lease next renews. Both forms stay reserved for the address they encode, so a client cannot name itself one. The old IPv4 form is shared by every address ending in the same two octets (`dhcp-20-5` is the old name of `10.1.20.5` and of `10.2.20.5`), so for those addresses it is free only while no record holds it: a lease still published as `dhcp-20-5` keeps it from the other until it renews.
 
 **Static assignment override:** if the lease IP matches a `DHCPStaticAssignment` that has a hostname set, that hostname always wins — regardless of policy, including `always_generate`. Rationale: a static hostname is an explicit admin choice.
 
