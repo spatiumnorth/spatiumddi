@@ -116,6 +116,10 @@ class ApiTokenResponse(BaseModel):
     # superadmin sees across users; None elsewhere or for an ownerless token.
     owner_username: str | None = None
     owner_display_name: str | None = None
+    # False when the owner account is disabled: auth refuses every call with
+    # the token (403) whatever its own is_active says (#3431). Filled by the
+    # list endpoint; None elsewhere or for an ownerless token.
+    owner_is_active: bool | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
     is_active: bool
@@ -265,17 +269,18 @@ async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenRespons
     """List tokens owned by the caller. Superadmin sees everyone's, each
     row naming its owner."""
     stmt = (
-        select(APIToken, User.username, User.display_name)
+        select(APIToken, User.username, User.display_name, User.is_active)
         .outerjoin(User, User.id == APIToken.user_id)
         .order_by(APIToken.created_at.desc())
     )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
     out: list[ApiTokenResponse] = []
-    for token, username, display_name in (await db.execute(stmt)).all():
+    for token, username, display_name, owner_active in (await db.execute(stmt)).all():
         row = ApiTokenResponse.model_validate(token)
         row.owner_username = username
         row.owner_display_name = display_name or None
+        row.owner_is_active = owner_active
         out.append(row)
     return out
 
@@ -505,6 +510,21 @@ async def update_token(
                 "authenticate. Create a new token instead."
             ),
         )
+    # A disabled owner's tokens are refused at auth (403) whatever is_active
+    # says, so re-enabling would report success and change nothing (#3431).
+    if reenables and token.user_id is not None:
+        owner_active = (
+            await db.execute(select(User.is_active).where(User.id == token.user_id))
+        ).scalar_one_or_none()
+        if owner_active is False:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The owner account is disabled, so re-enabling this API token "
+                    "would not let it authenticate. Re-enable the owner first, "
+                    "then create a new token."
+                ),
+            )
     stepup_method: str | None = None
     if reenables or widens:
         stepup_method = await require_operator_stepup(
