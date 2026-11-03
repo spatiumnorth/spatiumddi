@@ -7,6 +7,7 @@ import {
 
 import {
   api,
+  applianceDiagnosticsApi,
   conformityApi,
   dnsApi,
   e911Api,
@@ -138,6 +139,10 @@ describe("blob downloads decode a refusal (#3255)", () => {
     ["DNS import template", () => dnsApi.zoneImportTemplate("g", "z")],
     ["DNS export all zones", () => dnsApi.exportAllZones("g")],
     ["support bundle", () => supportBundleApi.download(true)],
+    [
+      "appliance diagnostic bundle",
+      () => applianceDiagnosticsApi.downloadBundle(),
+    ],
   ])("%s", async (_, call: () => Promise<unknown>) => {
     const err = await call().then(
       () => {

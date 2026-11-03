@@ -14497,9 +14497,25 @@ export const applianceDiagnosticsApi = {
     api
       .post<ApplianceSelfTestReport>("/appliance/diagnostics/self-test")
       .then((r) => r.data),
-  // Bundle download uses a direct URL — the browser handles the
-  // attachment + filename via Content-Disposition.
-  bundleUrl: () => "/api/v1/appliance/diagnostics/bundle",
+  // The API authenticates by the Authorization bearer only, so a plain
+  // <a href> navigation 401s (#3394). Fetch through the client as a blob,
+  // decode a refusal, and take the filename from Content-Disposition.
+  downloadBundle: async (): Promise<{ blob: Blob; filename: string }> => {
+    const res = await api
+      .get("/appliance/diagnostics/bundle", { responseType: "blob" })
+      .catch(rethrowBlobError);
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    return {
+      blob: new Blob([res.data as BlobPart]),
+      filename: match ? match[1] : `appliance-diagnostic-bundle-${ts}.zip`,
+    };
+  },
 };
 
 /**
