@@ -326,6 +326,7 @@ export function ProxmoxPage() {
                                 ? "Discovery — see which guests aren't reporting IPs"
                                 : "Sync at least once to populate discovery"
                             }
+                            aria-label="Discovery"
                           >
                             <Search className="h-3.5 w-3.5" />
                           </button>
