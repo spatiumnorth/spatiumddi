@@ -515,6 +515,24 @@ def _parse_network(network: str) -> ipaddress.IPv4Network | ipaddress.IPv6Networ
 _BIGINT_MAX = 2**63 - 1
 
 
+def _int64_count(n: int) -> int:
+    """Saturate an address count at int64 for an ``int`` response field.
+
+    The published schema types these as ``integer``, which a generated client
+    (Swift ``Int``, Go ``int64``) decodes as 64-bit: a /64's 2^64 would fail
+    to decode the whole response. The true figure rides in the sibling
+    ``*_exact`` string field instead (#3322).
+    """
+    return min(n, _BIGINT_MAX)
+
+
+_COUNT_DESC = (
+    "Address count, saturating at 2^63-1 so it always fits int64. "
+    "An IPv6 /64 or wider reads the cap here; see the *_exact field."
+)
+_EXACT_DESC = "The exact address count as a decimal string (IPv6 sizes exceed int64)."
+
+
 def _total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
     """Usable host count (excludes network/broadcast for IPv4 prefixlen < 31).
 
@@ -7949,8 +7967,10 @@ class SubnetResizePreviewResponse(BaseModel):
     new_network_ip: str
     old_broadcast_ip: str | None
     new_broadcast_ip: str | None
-    total_ips_before: int
-    total_ips_after: int
+    total_ips_before: int = Field(description=_COUNT_DESC)
+    total_ips_after: int = Field(description=_COUNT_DESC)
+    total_ips_before_exact: str = Field(description=_EXACT_DESC)
+    total_ips_after_exact: str = Field(description=_EXACT_DESC)
     gateway_current: str | None
     gateway_suggested_new_first_usable: str | None
     placeholders_default_named: list[_ResizePlaceholderRow]
@@ -7999,8 +8019,10 @@ class BlockResizePreviewResponse(BaseModel):
     network_address_shifts: bool
     old_network_ip: str
     new_network_ip: str
-    total_ips_before: int
-    total_ips_after: int
+    total_ips_before: int = Field(description=_COUNT_DESC)
+    total_ips_after: int = Field(description=_COUNT_DESC)
+    total_ips_before_exact: str = Field(description=_EXACT_DESC)
+    total_ips_after_exact: str = Field(description=_EXACT_DESC)
     child_blocks_count: int
     child_blocks: list[_BlockResizeChildRow]
     child_subnets_count: int
@@ -8053,8 +8075,10 @@ async def resize_subnet_preview(
         new_network_ip=preview.new_network_ip,
         old_broadcast_ip=preview.old_broadcast_ip,
         new_broadcast_ip=preview.new_broadcast_ip,
-        total_ips_before=preview.total_ips_before,
-        total_ips_after=preview.total_ips_after,
+        total_ips_before=_int64_count(preview.total_ips_before),
+        total_ips_after=_int64_count(preview.total_ips_after),
+        total_ips_before_exact=str(preview.total_ips_before),
+        total_ips_after_exact=str(preview.total_ips_after),
         gateway_current=preview.gateway_current,
         gateway_suggested_new_first_usable=preview.gateway_suggested_new_first_usable,
         placeholders_default_named=[
@@ -8164,8 +8188,10 @@ async def resize_block_preview(
         network_address_shifts=preview.network_address_shifts,
         old_network_ip=preview.old_network_ip,
         new_network_ip=preview.new_network_ip,
-        total_ips_before=preview.total_ips_before,
-        total_ips_after=preview.total_ips_after,
+        total_ips_before=_int64_count(preview.total_ips_before),
+        total_ips_after=_int64_count(preview.total_ips_after),
+        total_ips_before_exact=str(preview.total_ips_before),
+        total_ips_after_exact=str(preview.total_ips_after),
         child_blocks_count=preview.child_blocks_count,
         child_blocks=[_BlockResizeChildRow(**c) for c in preview.child_blocks],
         child_subnets_count=preview.child_subnets_count,
@@ -8431,7 +8457,8 @@ class FindFreeCandidate(BaseModel):
     cidr: str
     parent_block_id: uuid.UUID
     parent_block_cidr: str
-    free_addresses: int | None = None
+    free_addresses: int | None = Field(default=None, description=_COUNT_DESC)
+    free_addresses_exact: str | None = Field(default=None, description=_EXACT_DESC)
 
 
 class FindFreeResponse(BaseModel):
@@ -8489,7 +8516,12 @@ async def find_free_space_in_space(
                 cidr=c.cidr,
                 parent_block_id=c.parent_block_id,
                 parent_block_cidr=c.parent_block_cidr,
-                free_addresses=c.free_addresses,
+                free_addresses=(
+                    _int64_count(c.free_addresses) if c.free_addresses is not None else None
+                ),
+                free_addresses_exact=(
+                    str(c.free_addresses) if c.free_addresses is not None else None
+                ),
             )
             for c in result.candidates
         ],
