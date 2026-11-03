@@ -36,6 +36,7 @@ import {
   type NmapScanRead,
   type Subnet,
   formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
@@ -723,6 +724,12 @@ export function ReputationSection({ address }: { address: string }) {
           Check now
         </button>
       </div>
+
+      {check.isError && (
+        <p role="alert" className="mb-1 text-[11px] text-destructive">
+          {formatDialogError(check.error, "Blocklist check failed")}
+        </p>
+      )}
 
       {q.error || !canReadDnsbl ? (
         <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">

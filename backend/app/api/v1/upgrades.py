@@ -45,6 +45,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import add_trigger_audit
 from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
+from app.services.api_token_scopes import token_write
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
     SlotImageTarget,
@@ -312,6 +313,7 @@ def _row_to_schema(run: Any) -> UpgradeRunOut:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Plan a rolling upgrade — preflight + node enumeration",
 )
+@token_write("Writes a planned upgrade run row and runs preflight against the fleet")
 async def post_plan(
     body: PlanRequest,
     request: Request,

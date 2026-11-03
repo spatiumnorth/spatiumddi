@@ -14,9 +14,10 @@ Permissions: every endpoint is gated on ``e911_location`` at the router
 level (GET→read, POST/PATCH→write, DELETE→delete; superadmin always
 passes). The intended shape for a third-party caller — a PBX, Cisco
 Emergency Responder, RedSky, an ops script — is an existing API token
-(#74) scoped to ``allowed_paths=["/api/v1/e911"]`` with that one read
-permission: read-only, revocable, audited, and no new credential
-mechanism.
+(#74) with the ``read`` scope, owned by an account holding only
+``e911_location: read``: read-only, revocable, audited, and no new
+credential mechanism. (Token ``allowed_paths`` is a reserved column that
+nothing enforces, so the account's permission is what limits it.)
 
 **Every ``/location`` answer writes an ``e911_resolution_log`` row.** It
 is a lookup of which desk a named person sits at; the trail is not
