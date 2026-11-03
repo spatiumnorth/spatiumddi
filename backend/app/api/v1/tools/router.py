@@ -72,7 +72,7 @@ from app.models.audit import AuditLog
 from app.models.bgp_looking_glass import LookingGlassCollector
 from app.models.settings import PlatformSettings
 from app.services import wol
-from app.services.api_token_scopes import read_only_post
+from app.services.api_token_scopes import read_only_post, token_write
 from app.services.appliance import agent_cmd
 from app.services.nettools import (
     inspect_tls_cert,
@@ -390,6 +390,7 @@ async def _guard_probe(
 
 
 @router.post("/ping", response_model=CommandResult, dependencies=[_RequirePerm])
+@token_write("Sends ICMP probe traffic to the target (outbound)")
 async def ping(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
@@ -411,6 +412,7 @@ async def ping(
 
 
 @router.post("/traceroute", response_model=CommandResult, dependencies=[_RequirePerm])
+@token_write("Sends probe traffic to the target (outbound)")
 async def traceroute(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
@@ -432,6 +434,7 @@ async def traceroute(
 
 
 @router.post("/mtr", response_model=CommandResult, dependencies=[_RequirePerm])
+@token_write("Sends probe traffic to the target (outbound)")
 async def mtr(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
@@ -448,6 +451,7 @@ async def mtr(
 
 
 @router.post("/dig", response_model=CommandResult, dependencies=[_RequirePerm])
+@token_write("Sends DNS traffic to the target (outbound probe)")
 async def dig(
     body: DigRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
@@ -471,6 +475,7 @@ async def dig(
 
 
 @router.post("/whois", response_model=CommandResult, dependencies=[_RequirePerm])
+@token_write("Sends a WHOIS query to an external server (outbound)")
 async def whois(body: WhoisRequest, _rl=RateLimitOffprem) -> CommandResult:
     try:
         return await run_whois(body.query)
@@ -482,6 +487,7 @@ async def whois(body: WhoisRequest, _rl=RateLimitOffprem) -> CommandResult:
 
 
 @router.post("/port-test", response_model=PortTestResult, dependencies=[_RequirePerm])
+@token_write("Opens TCP connections to the target (outbound probe)")
 async def port_test(
     body: PortTestRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> PortTestResult:
@@ -500,6 +506,7 @@ async def port_test(
 
 
 @router.post("/tls-cert", response_model=TlsCertResult, dependencies=[_RequirePerm])
+@token_write("Opens a TLS connection to the target (outbound)")
 async def tls_cert(
     body: TlsCertRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> TlsCertResult:
@@ -521,6 +528,9 @@ async def tls_cert(
 
 
 @router.post("/firewall-logs", response_model=FirewallLogsResult, dependencies=[_RequirePerm])
+@token_write(
+    "Dispatches a command to an appliance supervisor to tail its nftables log (queues a command row)"
+)
 async def firewall_logs(
     body: FirewallLogsRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> FirewallLogsResult:
@@ -555,6 +565,7 @@ async def firewall_logs(
 
 
 @router.post("/dns-propagation", response_model=PropagationCheckResult, dependencies=[_RequirePerm])
+@token_write("Sends DNS queries to public resolvers (outbound)")
 async def dns_propagation(body: PropagationRequest, _rl=RateLimitOffprem) -> PropagationCheckResult:
     """Query a record across several public resolvers in parallel.
 
@@ -649,6 +660,7 @@ class WolToolRequest(BaseModel):
 
 
 @router.post("/wol", response_model=wol.WolResult, dependencies=[_RequirePerm])
+@token_write("Sends a Wake-on-LAN magic packet and writes an audit row")
 async def wol_wake(
     body: WolToolRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> wol.WolResult:

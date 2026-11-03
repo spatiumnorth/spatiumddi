@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str
@@ -58,7 +58,8 @@ from app.services.integration_ownership import (
     subnet_has_surviving_addresses,
     unowned_subnets_at,
 )
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.router_naming import pick_unique_router_name
 from app.services.unifi.client import (
     UnifiClient,
@@ -252,25 +253,6 @@ def _find_enclosing_operator_block(
             best = b
             best_prefix = bnet.prefixlen
     return best
-
-
-async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
-    allocated = (
-        await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == subnet_id)
-            .where(counts_toward_utilization())
-        )
-        or 0
-    )
-    subnet = await db.get(Subnet, subnet_id)
-    if subnet is None:
-        return
-    subnet.allocated_ips = allocated
-    subnet.utilization_percent = (
-        round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
-    )
 
 
 # ── Desired state computation ────────────────────────────────────────
@@ -606,6 +588,7 @@ async def _apply_blocks_and_subnets(
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
+    gw_subnets: list[Subnet] = []  # #3347 — subnets whose gateway row was synced
 
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
@@ -666,23 +649,33 @@ async def _apply_blocks_and_subnets(
 
         existing = current_subnets.get(net_str)
         if existing is None:
-            db.add(
-                Subnet(
-                    space_id=controller.ipam_space_id,
-                    block_id=parent_block.id,
-                    network=d.network,
-                    name=d.name,
-                    description=d.description,
-                    gateway=d.gateway,
-                    unifi_controller_id=controller.id,
-                    total_ips=expected_total,
-                    vlan_ref_id=vlan_ref_id,
-                    vlan_id=d.vlan_tag,
-                )
+            existing = Subnet(
+                space_id=controller.ipam_space_id,
+                block_id=parent_block.id,
+                network=d.network,
+                name=d.name,
+                description=d.description,
+                gateway=d.gateway,
+                unifi_controller_id=controller.id,
+                total_ips=expected_total,
+                vlan_ref_id=vlan_ref_id,
+                vlan_id=d.vlan_tag,
             )
+            db.add(existing)
+            await db.flush()
             summary.subnets_created += 1
+            gw_subnets.append(existing)
+            if d.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, d.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
         else:
             changed = False
+            gw_subnets.append(existing)
+            if d.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, d.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
             if existing.block_id != parent_block.id:
                 existing.block_id = parent_block.id
                 changed = True
@@ -713,6 +706,7 @@ async def _apply_blocks_and_subnets(
                 summary.subnets_updated += 1
 
     await db.flush()
+    await recount_subnets_and_blocks(db, [s.id for s in gw_subnets])
 
     for net_str, wrapper in controller_owned_wrappers.items():
         if net_str in used_wrapper_cidrs:
@@ -956,9 +950,7 @@ async def _apply_addresses(
             summary.addresses_created += 1
 
     if dirty_subnets:
-        await db.flush()
-        for subnet_id in dirty_subnets:
-            await _recompute_subnet_utilization(db, subnet_id)
+        await recount_subnets_and_blocks(db, dirty_subnets)
 
 
 # ── Discovery payload ───────────────────────────────────────────────

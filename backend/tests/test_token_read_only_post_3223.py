@@ -10,7 +10,6 @@ expired token stays 401.
 
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -61,89 +60,17 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
     }
 )
 
-# POST routes whose name says query / preview / validate but which are
-# deliberately still writes for the scope gate, with the reason.
-DELIBERATELY_WRITE: dict[str, str] = {
-    "/api/v1/backup/manifest-preview": "reads one file out of an uploaded archive, no write; SuperAdmin-only",
-    "/api/v1/block-sync/blocks/preview": "DB-only, no outbound call; left unmarked behind the ManageUser gate (#3302)",
-    "/api/v1/dns/agents/query-log-entries": "agent ingest — writes rows",
-    "/api/v1/dhcp/import/windows/preview": "live WinRM pull from a Windows server",
-    "/api/v1/dns/import/cloud/preview": "live pull from a cloud DNS provider",
-    "/api/v1/dns/import/powerdns/preview": "live pull from a PowerDNS API",
-    "/api/v1/dns/import/technitium/preview": "live pull from a Technitium API",
-    "/api/v1/dns/import/windows-dns/preview": "live WinRM pull from a Windows server",
-    "/api/v1/dns/tools/propagation-check": "sends queries to public resolvers",
-    "/api/v1/logs/query": "runs Get-WinEvent over WinRM on a Windows server (outbound, stored creds)",
-    "/api/v1/logs/dhcp-audit": "reads the audit log over WinRM on a Windows server (outbound)",
-    "/api/v1/ipam/import/netbox/preview": "live pull from NetBox (outbound)",
-    "/api/v1/overlays/{overlay_id}/simulate": "pure read-only what-if; left unmarked (#3302 follow-up)",
-    "/api/v1/settings/apt/validate": "not reviewed as side-effect free",
-    "/api/v1/system/factory-reset/preview": "read-only dry run, but SuperAdmin-only and a step of a destructive flow",
-    "/api/v1/system/support-bundle/preview": "writes an audit row + commits",
-    "/api/v1/tools/firewall-logs": "queues a command row for the appliance",
-    "/api/v1/tools/dig": "sends DNS traffic",
-    "/api/v1/tools/dns-propagation": "sends DNS traffic to public resolvers",
-    "/api/v1/tools/mtr": "sends probe traffic",
-    "/api/v1/tools/ping": "sends probe traffic",
-    "/api/v1/tools/port-test": "sends probe traffic",
-    "/api/v1/tools/tls-cert": "opens a connection to the target",
-    "/api/v1/tools/traceroute": "sends probe traffic",
-    "/api/v1/tools/whois": "outbound query",
-    "/api/v1/tools/wol": "sends a magic packet and writes an audit row",
-    "/api/v1/upgrades/plan": "writes a planned upgrade run",
-    "/api/v1/migration/cutover/plans/{plan_id}/items/{item_id}/lease-handover/preview": (
-        "cutover workflow step against live servers"
-    ),
-    "/api/v1/migration/cutover/plans/{plan_id}/items/{item_id}/ttl-preflight/preview": (
-        "reads the zone from the DB, no outbound call; SuperAdmin-only cutover step (#3302)"
-    ),
-}
-
-_QUERYISH = re.compile(
-    r"(preview|query|dns-queries|dhcp-audit|dhcp-activity|analytics|search|validate"
-    r"|find-free|plan-allocation|allocation-preview|simulate)"
-)
-
 
 def _post_routes() -> dict[str, object]:
     from app.main import app  # noqa: PLC0415
+    from tests.test_token_post_classification_3302 import post_routes  # noqa: PLC0415
 
-    found: dict[str, object] = {}
-
-    def rec(routes, prefix: str = "") -> None:  # type: ignore[no-untyped-def]
-        for r in routes:
-            if hasattr(r, "original_router"):
-                rec(r.original_router.routes, prefix + r.include_context.prefix)
-            elif hasattr(r, "endpoint") and "POST" in getattr(r, "methods", ()):
-                found[re.sub(r":\w+}", "}", prefix + r.path)] = r.endpoint
-
-    rec(app.routes)
-    return found
+    return post_routes(app)
 
 
 def test_the_marked_routes_are_exactly_the_reviewed_set() -> None:
     marked = {p for p, ep in _post_routes().items() if is_read_only_post(ep)}
     assert marked == set(EXPECTED_READ_ONLY_POSTS)
-
-
-def test_query_shaped_post_routes_are_marked_or_justified() -> None:
-    """Heuristic guard (it keys on the route path, so a read-only POST with an
-    unusual name will not be caught): a POST whose path looks like a query /
-    preview / validation must either carry ``@read_only_post`` or be listed
-    in ``DELIBERATELY_WRITE`` with a reason."""
-    missing = []
-    for path, ep in sorted(_post_routes().items()):
-        if not path.startswith("/api/v1/") or not _QUERYISH.search(path):
-            continue
-        if is_read_only_post(ep):
-            continue
-        if path in DELIBERATELY_WRITE:
-            continue
-        missing.append(path)
-    assert not missing, (
-        "POST route(s) look read-only but are neither @read_only_post nor in "
-        "DELIBERATELY_WRITE:\n" + "\n".join(missing)
-    )
 
 
 def test_read_scope_covers_a_marked_route_but_not_other_posts() -> None:

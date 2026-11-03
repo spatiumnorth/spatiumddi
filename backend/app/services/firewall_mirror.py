@@ -43,7 +43,8 @@ from app.services.integration_ownership import (
     owned_addresses_in_space,
     subnet_has_surviving_addresses,
 )
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 _BIGINT_MAX = 2**63 - 1
 
@@ -385,25 +386,6 @@ def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
     return best
 
 
-async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
-    allocated = (
-        await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == subnet_id)
-            .where(counts_toward_utilization())
-        )
-        or 0
-    )
-    subnet = await db.get(Subnet, subnet_id)
-    if subnet is None:
-        return
-    subnet.allocated_ips = allocated
-    subnet.utilization_percent = (
-        round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
-    )
-
-
 def _find_enclosing_operator_block(blocks: list[IPBlock], cidr: str) -> IPBlock | None:
     """The tightest unowned (operator) block that contains ``cidr`` — used as the
     subnet's parent so we don't create a redundant wrapper."""
@@ -480,6 +462,7 @@ async def apply_subnets(
             summary.subnets_deleted += 1
 
     used_wrapper_cidrs: set[str] = set()
+    gw_subnets: list[Subnet] = []  # #3347 — subnets whose gateway row was synced
     for cidr, ms in desired.items():
         if cidr in operator_subnets:
             summary.subnets_matched += 1
@@ -512,21 +495,31 @@ async def apply_subnets(
         total = _lan_total_ips(net) if net is not None else 0
         existing = fw_subnets.get(cidr)
         if existing is None:
-            db.add(
-                Subnet(
-                    space_id=space_id,
-                    block_id=parent.id,
-                    network=cidr,
-                    name=ms.name,
-                    description=ms.description,
-                    gateway=ms.gateway,
-                    total_ips=total,
-                    **{owner.fk_attr: target_id},
-                )
+            existing = Subnet(
+                space_id=space_id,
+                block_id=parent.id,
+                network=cidr,
+                name=ms.name,
+                description=ms.description,
+                gateway=ms.gateway,
+                total_ips=total,
+                **{owner.fk_attr: target_id},
             )
+            db.add(existing)
+            await db.flush()
             summary.subnets_created += 1
+            gw_subnets.append(existing)
+            if ms.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, ms.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
         else:
             changed = False
+            gw_subnets.append(existing)
+            if ms.gateway:
+                gw_problem = await sync_mirror_gateway_row(db, existing, ms.gateway)
+                if gw_problem:
+                    summary.warnings.append(gw_problem)
             if existing.block_id != parent.id:
                 existing.block_id, changed = parent.id, True
             if existing.name != ms.name:
@@ -540,6 +533,7 @@ async def apply_subnets(
             if changed:
                 summary.subnets_updated += 1
     await db.flush()
+    await recount_subnets_and_blocks(db, [s.id for s in gw_subnets])
 
     # Drop owner-owned wrapper blocks that no longer back a subnet.
     for cidr, wrapper in fw_wrappers.items():
@@ -593,12 +587,33 @@ async def apply_addresses(
     for row in gone:
         await db.delete(row)
 
+    # Rows at a desired address that this target does not own: the subnet's
+    # reserved gateway row (#3347), an operator's row, another integration's.
+    # Inserting beside one would violate ``uq_ip_address_subnet_address`` and
+    # fail the whole sync, so that address is skipped with a warning.
+    space_subnet_ids = [s.id for s in subnets]
+    new_addrs = [a for a in desired if a not in current]
+    foreign_at: set[tuple[Any, str]] = set()
+    if space_subnet_ids and new_addrs:
+        held = await db.execute(
+            select(IPAddress.subnet_id, IPAddress.address).where(
+                IPAddress.subnet_id.in_(space_subnet_ids), IPAddress.address.in_(new_addrs)
+            )
+        )
+        foreign_at = {(sid, str(a)) for sid, a in held.all()}
+
     for addr, ma in desired.items():
         subnet = _find_subnet_for_ip(subnets, addr)
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
         row = current.get(addr)
+        if row is None and (subnet.id, addr) in foreign_at:
+            summary.warnings.append(
+                f"address {addr} is already held by another row in subnet "
+                f"{subnet.network}; not mirroring it"
+            )
+            continue
         if row is None:
             db.add(
                 IPAddress(
@@ -629,9 +644,7 @@ async def apply_addresses(
                 summary.addresses_updated += 1
 
     if dirty:
-        await db.flush()
-        for sid in dirty:
-            await _recompute_subnet_utilization(db, sid)
+        await recount_subnets_and_blocks(db, dirty)
 
 
 __all__ = [
