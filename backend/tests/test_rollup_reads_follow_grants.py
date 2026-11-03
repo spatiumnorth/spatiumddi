@@ -134,11 +134,24 @@ async def test_network_summary_only_fills_panels_the_caller_can_read(
     body = resp.json()
     assert body["asn_drift_count"] == 0
     assert body["asn_drift"] == []
+    # ...and says so, so the zero is not read as an all-clear (#3449).
+    assert body["withheld"] == {
+        "asn": True,
+        "circuit": False,
+        "service": True,
+        "overlay": True,
+    }
 
     viewer = await _headers(db_session, role="Viewer")
     resp = await client.get("/api/v1/dashboards/network/summary", headers=viewer)
     assert resp.status_code == 200, resp.text
     assert asn.number in [row["number"] for row in resp.json()["asn_drift"]]
+    assert resp.json()["withheld"] == {
+        "asn": False,
+        "circuit": False,
+        "service": False,
+        "overlay": False,
+    }
 
 
 # ── Integrations dashboard ─────────────────────────────────────────────────

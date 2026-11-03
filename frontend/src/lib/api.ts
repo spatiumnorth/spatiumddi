@@ -11299,8 +11299,18 @@ export interface NetworkDashboardOverlayImpactRow {
   site_count: number;
   note: string;
 }
+export interface NetworkDashboardWithheld {
+  asn: boolean;
+  circuit: boolean;
+  service: boolean;
+  overlay: boolean;
+}
 export interface NetworkDashboardSummary {
   generated_at: string;
+  /** Panels the server emptied because the caller may not read them: their
+   *  zeros are "not visible to you", never an all-clear (#3449). Optional
+   *  for an older server. */
+  withheld?: Partial<NetworkDashboardWithheld>;
   asn_drift_count: number;
   rpki_expiring_count: number;
   rpki_expired_count: number;

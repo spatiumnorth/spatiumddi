@@ -4850,48 +4850,88 @@ function NetworkPanel() {
     );
   }
 
+  const w = data.withheld ?? {};
+  const NV = "not visible to your role";
+
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
       <div className="grid gap-3 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
         <NetworkKpi
           label="ASN drift"
-          value={data.asn_drift_count}
-          tone={data.asn_drift_count > 0 ? "warn" : "good"}
+          value={w.asn ? "—" : data.asn_drift_count}
+          tone={w.asn ? "default" : data.asn_drift_count > 0 ? "warn" : "good"}
+          hint={w.asn ? NV : undefined}
           to="/network/asns"
         />
-        <RpkiExpiringKpi data={data} />
+        {w.asn ? (
+          <NetworkKpi
+            label="RPKI expiring"
+            value="—"
+            tone="default"
+            to="/network/asns"
+            hint={NV}
+          />
+        ) : (
+          <RpkiExpiringKpi data={data} />
+        )}
         <NetworkKpi
           label="RPKI expired"
-          value={data.rpki_expired_count}
-          tone={data.rpki_expired_count > 0 ? "bad" : "good"}
+          value={w.asn ? "—" : data.rpki_expired_count}
+          tone={
+            w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
+          }
+          hint={w.asn ? NV : undefined}
           to="/network/asns"
         />
         <NetworkKpi
           label="Circuit alerts"
           value={
-            data.circuit_term_expiring_count + data.circuit_status_changed_count
+            w.circuit
+              ? "—"
+              : data.circuit_term_expiring_count +
+                data.circuit_status_changed_count
           }
           tone={
-            data.circuit_term_expiring_count +
-              data.circuit_status_changed_count >
-            0
-              ? "warn"
-              : "good"
+            w.circuit
+              ? "default"
+              : data.circuit_term_expiring_count +
+                    data.circuit_status_changed_count >
+                  0
+                ? "warn"
+                : "good"
           }
           to="/network/circuits"
-          hint={`${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`}
+          hint={
+            w.circuit
+              ? NV
+              : `${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`
+          }
         />
         <NetworkKpi
           label="Orphan services"
-          value={data.service_orphan_count}
-          tone={data.service_orphan_count > 0 ? "bad" : "good"}
+          value={w.service ? "—" : data.service_orphan_count}
+          tone={
+            w.service
+              ? "default"
+              : data.service_orphan_count > 0
+                ? "bad"
+                : "good"
+          }
+          hint={w.service ? NV : undefined}
           to="/network/services"
         />
         <NetworkKpi
           label="Overlays impacted"
-          value={data.overlay_impacted_count}
-          tone={data.overlay_impacted_count > 0 ? "warn" : "good"}
+          value={w.overlay ? "—" : data.overlay_impacted_count}
+          tone={
+            w.overlay
+              ? "default"
+              : data.overlay_impacted_count > 0
+                ? "warn"
+                : "good"
+          }
+          hint={w.overlay ? NV : undefined}
           to="/network/overlays"
         />
       </div>
@@ -4899,6 +4939,8 @@ function NetworkPanel() {
       <div className="grid gap-5 lg:grid-cols-2">
         <DashboardListCard
           title="ASN holder drift"
+          withheld={w.asn}
+          withheldHint="Not visible to your role."
           emptyHint="No ASNs in drift state right now."
         >
           {data.asn_drift.map((row) => (
@@ -4923,6 +4965,8 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="RPKI ROAs expiring soon"
+          withheld={w.asn}
+          withheldHint="Not visible to your role."
           emptyHint="No ROAs are expiring in the next 30 days."
         >
           {data.rpki_expiring.map((row) => (
@@ -4948,6 +4992,8 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="Circuit alerts"
+          withheld={w.circuit}
+          withheldHint="Not visible to your role."
           emptyHint="No circuits past term or in suspended/decom status."
         >
           {data.circuit_alerts.map((row) => (
@@ -4980,7 +5026,13 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="Orphan services + overlay impact"
-          emptyHint="Service catalog clean and no overlays touching down circuits."
+          withheld={w.service && w.overlay}
+          emptyHint={
+            w.service || w.overlay
+              ? "Nothing to show in the part of this card your role can read."
+              : "Service catalog clean and no overlays touching down circuits."
+          }
+          withheldHint="Not visible to your role."
         >
           {data.orphan_services.map((row) => (
             <Link
@@ -5728,10 +5780,14 @@ function DashboardListCard({
   title,
   emptyHint,
   withheld = false,
+  withheldHint,
   children,
 }: {
   title: string;
   emptyHint: string;
+  /** Replaces the default withheld sentence where there is no count above
+   *  the card to lean on (#3449). */
+  withheldHint?: string;
   /** The server stripped this list for the caller (#400): say so in place of
    *  the all-clear sentence (#3235). */
   withheld?: boolean;
@@ -5752,7 +5808,8 @@ function DashboardListCard({
       {childArray.length === 0 ? (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
           {withheld
-            ? "The detail is not shown to your role. The count above is the whole headline."
+            ? (withheldHint ??
+              "The detail is not shown to your role. The count above is the whole headline.")
             : emptyHint}
         </div>
       ) : (
