@@ -94,7 +94,8 @@ afterEach(() => {
 
 const STAMP = "2026-11-03T00:00:00Z";
 
-function signInAs(grants: [string, string][] | "superadmin") {
+type Grant = [string, string] | [string, string, string];
+function signInAs(grants: Grant[] | "superadmin") {
   answers.authApi = {
     myPermissions: () =>
       Promise.resolve(
@@ -102,10 +103,10 @@ function signInAs(grants: [string, string][] | "superadmin") {
           ? { is_superadmin: true, grants: [] }
           : {
               is_superadmin: false,
-              grants: grants.map(([action, resource_type]) => ({
+              grants: grants.map(([action, resource_type, resource_id]) => ({
                 action,
                 resource_type,
-                resource_id: null,
+                resource_id: resource_id ?? null,
               })),
             },
       ),
@@ -165,7 +166,10 @@ const treeitem = (name: string) =>
 const headings = () =>
   Array.from(document.querySelectorAll("h2")).map((h) => h.textContent);
 
-async function openTree() {
+async function openTree(
+  onSelectSubnet: (s: Subnet | null) => void = () => {},
+  onSelectBlock: (b: IPBlock) => void = () => {},
+) {
   answers.ipamApi = {
     listSubnets: () => Promise.resolve([subnet]),
     listBlocks: () => Promise.resolve([block]),
@@ -178,8 +182,8 @@ async function openTree() {
       selectedBlockId={null}
       isSpaceSelected={false}
       onSelectSpace={() => {}}
-      onSelectSubnet={() => {}}
-      onSelectBlock={() => {}}
+      onSelectSubnet={onSelectSubnet}
+      onSelectBlock={onSelectBlock}
     />,
   );
   await waitFor(() => expect(treeitem("10.142.1.0/24")).toBeTruthy());
@@ -253,11 +257,15 @@ describe("the tree's right-click menus (#3392)", () => {
   });
 
   it("makes the rows undraggable for a Viewer, draggable for an editor", async () => {
+    const blockRow = () =>
+      treeitem("10.142.0.0/16").firstElementChild as HTMLElement;
     signInAs(VIEWER);
     await openTree();
-    expect(treeitem("10.142.1.0/24").getAttribute("aria-disabled")).toBe(
-      "true",
+    // Not draggable: nothing announces it as a drag source.
+    expect(treeitem("10.142.1.0/24").hasAttribute("aria-roledescription")).toBe(
+      false,
     );
+    expect(blockRow().hasAttribute("aria-roledescription")).toBe(false);
     cleanup();
 
     signInAs([
@@ -266,9 +274,76 @@ describe("the tree's right-click menus (#3392)", () => {
       ["write", "ip_block"],
     ]);
     await openTree();
-    expect(treeitem("10.142.1.0/24").getAttribute("aria-disabled")).toBe(
-      "false",
+    expect(treeitem("10.142.1.0/24").getAttribute("aria-roledescription")).toBe(
+      "draggable",
     );
+    expect(blockRow().getAttribute("aria-roledescription")).toBe("draggable");
+  });
+
+  it("leaves a Viewer's rows enabled and selectable: only the drag is gone", async () => {
+    signInAs(VIEWER);
+    const pickSubnet = vi.fn();
+    const pickBlock = vi.fn();
+    await openTree(pickSubnet, pickBlock);
+    const row = treeitem("10.142.1.0/24");
+    const blockRow = treeitem("10.142.0.0/16").firstElementChild as HTMLElement;
+    // A row the Viewer may open must not read as unavailable (dnd-kit sets
+    // aria-disabled="true" on a disabled draggable; a screen reader then
+    // announces the row dimmed, and Playwright refuses to click inside it).
+    expect(row.getAttribute("aria-disabled")).not.toBe("true");
+    expect(blockRow.getAttribute("aria-disabled")).not.toBe("true");
+    expect(
+      document.querySelector('[aria-disabled="true"][role="treeitem"]'),
+    ).toBeNull();
+    fireEvent.click(row);
+    expect(pickSubnet).toHaveBeenCalledWith(subnet);
+    fireEvent.click(blockRow.querySelector("button:not([aria-label])")!);
+    expect(pickBlock).toHaveBeenCalled();
+  });
+
+  it("shows the reason on a disabled item and ignores Enter on it", async () => {
+    signInAs(VIEWER);
+    await openTree();
+    await menuItems(treeitem("10.142.0.0/16").firstElementChild as HTMLElement);
+    const newSubnet = item("New subnet…");
+    expect(newSubnet.getAttribute("title")).toBe(
+      "Requires write permission on subnets",
+    );
+    // The reason is only seen on hover if the item takes pointer events.
+    expect(newSubnet.className).not.toMatch(/pointer-events-none/);
+    newSubnet.focus();
+    fireEvent.keyDown(newSubnet, { key: "Enter" });
+    fireEvent.keyDown(newSubnet, { key: " " });
+    await settle();
+    expect(headings()).not.toContain("New Subnet");
+  });
+
+  it("enables Edit Space for a grant scoped to that space", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "ip_space", "sp-1"],
+    ]);
+    await openTree();
+    const m = await menuItems(
+      document.querySelector("[title='Collapse']")!
+        .parentElement as HTMLElement,
+    );
+    expect(m["Edit Space…"]).toBe(false);
+    expect(m["New Block…"]).toBe(true);
+  });
+
+  it("enables a block's Edit for a grant scoped to that block, not its Delete", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "ip_block", "blk-1"],
+    ]);
+    await openTree();
+    const m = await menuItems(
+      treeitem("10.142.0.0/16").firstElementChild as HTMLElement,
+    );
+    expect(m["Edit…"]).toBe(false);
+    expect(m["Delete…"]).toBe(true);
+    expect(m["New child block…"]).toBe(true);
   });
 
   it("offers a superadmin every item enabled", async () => {
@@ -325,6 +400,25 @@ describe("an orphan address's right-click (#3392)", () => {
     fireEvent.click(item("Delete Forever…"));
     await settle();
     expect(headings()).not.toContain("Permanently Delete");
+  });
+
+  it("disables the purge, inline and right-click, without delete; keeps Restore", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+    ]);
+    const row = await openOrphan();
+    const purge = row.querySelector(
+      'button[aria-label="Permanently delete 10.142.1.10"]',
+    ) as HTMLButtonElement;
+    expect(purge).toBeTruthy();
+    expect(purge.disabled).toBe(true);
+    fireEvent.click(purge);
+    await settle();
+    expect(headings()).not.toContain("Permanently Delete");
+    const m = await menuItems(row);
+    expect(m["Restore"]).toBe(false);
+    expect(m["Delete Forever…"]).toBe(true);
   });
 
   it("keeps both for a superadmin", async () => {

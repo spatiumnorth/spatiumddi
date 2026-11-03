@@ -50,6 +50,7 @@ import {
   useDraggable,
   useDroppable,
   type DragEndEvent,
+  type DraggableAttributes,
 } from "@dnd-kit/core";
 import {
   ipamApi,
@@ -7041,8 +7042,15 @@ export function SubnetDetail({
                                           onClick={() =>
                                             setConfirmPurgeAddr(addr)
                                           }
-                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                                           title="Permanently delete"
+                                          aria-label={`Permanently delete ${addr.address}`}
+                                          // #3392 — the purge is a DELETE: as
+                                          // the right-click Delete Forever….
+                                          {...permissionGate(
+                                            canDeleteIpam,
+                                            NEEDS_ADDRESS_DELETE,
+                                          )}
                                         >
                                           <Trash2 className="h-3.5 w-3.5" />
                                         </button>
@@ -11717,6 +11725,24 @@ export function BulkDeleteAddressesModal({
  *  text is the chip's own `title`. */
 export const TREE_CHIP_CLS = "block min-w-0 max-w-[6rem] shrink truncate";
 
+/** dnd-kit's attributes for a tree row, minus what announces it as draggable
+ *  when the operator may not move it (#3392). With `disabled` dnd-kit still
+ *  sets `aria-disabled="true"`, which on a row that selects when clicked tells
+ *  a screen reader (and Playwright's enabled check) that the row itself is
+ *  unavailable; a read-only user's whole tree would read as disabled. */
+function treeDragAttributes(
+  attrs: DraggableAttributes,
+  draggable: boolean,
+): React.HTMLAttributes<HTMLElement> {
+  if (draggable) return attrs;
+  return {
+    ...attrs,
+    "aria-disabled": undefined,
+    "aria-roledescription": undefined,
+    "aria-describedby": undefined,
+  };
+}
+
 export function SubnetRow({
   subnet,
   isSelected,
@@ -11749,7 +11775,7 @@ export function SubnetRow({
       <ContextMenuTrigger asChild>
         <div
           ref={setNodeRef}
-          {...attributes}
+          {...treeDragAttributes(attributes, canEditSubnet)}
           {...listeners}
           onClick={onSelect}
           role="treeitem"
@@ -13778,7 +13804,7 @@ export function BlockTreeRow({
         <ContextMenuTrigger asChild>
           <div
             ref={setRefs}
-            {...dragAttrs}
+            {...treeDragAttributes(dragAttrs, canEditBlock)}
             {...dragListeners}
             className={cn(
               "group flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-muted/30 cursor-pointer",
@@ -16511,8 +16537,9 @@ export function SpaceSection({
   const [dndError, setDndError] = useState<string | null>(null);
   const qc = useQueryClient();
   // #3392 — the right-click New / Edit items ask what the header's twins ask.
+  // Edit Space names the space: a grant scoped to it may edit it (#3039).
   const perms = usePermissions();
-  const canWriteSpaces = perms.can("write", "ip_space");
+  const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
   const sensors = useSensors(
@@ -16825,7 +16852,7 @@ export function SpaceSection({
           </ContextMenuItem>
           <ContextMenuItem
             onSelect={() => setShowEditSpace(true)}
-            {...permissionGate(canWriteSpaces, NEEDS_SPACE_WRITE)}
+            {...permissionGate(canEditSpace, NEEDS_SPACE_WRITE)}
           >
             Edit Space…
           </ContextMenuItem>
