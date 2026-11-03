@@ -242,6 +242,95 @@ describe("#3369 panels follow the refreshed list", () => {
     });
     await screen.findByText("10.0.0.0/8 (parentblk)");
   });
+
+  it("the block breadcrumb follows a block moved into another space", async () => {
+    const base = {
+      description: "",
+      custom_fields: {},
+      tags: {},
+      parent_block_id: null,
+    };
+    const child = {
+      ...base,
+      id: "b1",
+      space_id: "sp1",
+      network: "10.237.0.0/16",
+      name: "blk",
+    };
+    const parent2 = {
+      ...base,
+      id: "b2",
+      space_id: "sp2",
+      network: "10.0.0.0/8",
+      name: "parentblk",
+    };
+    const moved = { ...child, space_id: "sp2", parent_block_id: "b2" };
+    let done = false;
+    answers.ipamApi = {
+      listSpaces: ok([
+        { id: "sp1", name: "spaceOne", custom_fields: {} },
+        { id: "sp2", name: "spaceTwo", custom_fields: {} },
+      ]),
+      listBlocks: (id: unknown) => {
+        const sp1 = done ? [] : [child];
+        const sp2 = done ? [parent2, moved] : [parent2];
+        return Promise.resolve(
+          id === "sp1" ? sp1 : id === "sp2" ? sp2 : [...sp1, ...sp2],
+        );
+      },
+      listSubnets: ok([]),
+      getBlock: () => Promise.resolve(done ? moved : child),
+      blockFreeSpace: ok([]),
+      moveBlockPreview: ok({
+        block_id: "b1",
+        block_network: child.network,
+        source_space_id: "sp1",
+        target_space_id: "sp2",
+        target_parent_id: "b2",
+        descendant_blocks_count: 0,
+        descendant_subnets_count: 0,
+        descendant_ip_addresses_total: 0,
+        reparent_chain_block_ids: [],
+        integration_blockers: [],
+        warnings: [],
+      }),
+      moveBlockCommit: () => {
+        done = true;
+        return Promise.resolve({
+          block: moved,
+          source_space_id: "sp1",
+          target_space_id: "sp2",
+          target_parent_id: "b2",
+          blocks_moved: 1,
+          subnets_moved: 0,
+          addresses_in_moved_subtree: 0,
+          reparented_block_ids: [],
+        });
+      },
+    };
+    mount(<IPAMPage />, undefined, "/ipam?block=b1");
+    await screen.findAllByText(/10\.237\.0\.0\/16/);
+    fireEvent.click(await screen.findByText("Tools"));
+    fireEvent.click(await screen.findByText("Move…"));
+    const dialog = await screen.findByRole("dialog");
+    const selects = () => within(dialog).getAllByRole("combobox");
+    fireEvent.change(selects()[0], { target: { value: "sp2" } });
+    await within(dialog).findByText(/parentblk/);
+    fireEvent.change(selects()[1], { target: { value: "b2" } });
+    fireEvent.click(within(dialog).getByText("Preview move"));
+    fireEvent.change(
+      await within(dialog).findByPlaceholderText(child.network),
+      {
+        target: { value: child.network },
+      },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Move" }));
+    // No reselect: the breadcrumb names the new space and the new parent.
+    const crumb = await screen.findByText("10.0.0.0/8 (parentblk)");
+    const trail = crumb.closest("div.flex-wrap")?.textContent;
+    expect(trail).toMatch(/spaceTwo/);
+    expect(trail).not.toMatch(/spaceOne/);
+  });
 });
 
 describe("#3366 / #3369 a Save writes its answer into the cached copies", () => {

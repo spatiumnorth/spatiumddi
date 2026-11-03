@@ -14250,6 +14250,10 @@ export function BlockDetailView({
           onCommitted={(result) => {
             setBlock(result.block);
             setShowMoveBlock(false);
+            // The block left this space: the page's selection (and with it
+            // the active space, the tree highlight and the breadcrumb) is
+            // the click-time copy, so hand it the moved block (#3369).
+            onSelectBlock(result.block);
           }}
         />
       )}
