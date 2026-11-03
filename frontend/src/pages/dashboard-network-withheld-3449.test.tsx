@@ -44,7 +44,10 @@ vi.mock("@/hooks/useFeatureModules", () => ({
 
 const { DashboardPage } = await import("@/pages/DashboardPage");
 
-const summary = (withheld: Record<string, boolean>) => ({
+const summary = (
+  withheld: Record<string, boolean>,
+  extra: Record<string, unknown> = {},
+) => ({
   generated_at: "2026-11-03T00:00:00Z",
   withheld,
   asn_drift_count: 0,
@@ -61,6 +64,7 @@ const summary = (withheld: Record<string, boolean>) => ({
   circuit_alerts: [],
   orphan_services: [],
   overlay_impact: [],
+  ...extra,
 });
 
 beforeEach(() => {
@@ -115,6 +119,41 @@ describe("withheld Network panels (#3449)", () => {
     }
     expect(text).not.toContain("No ASNs in drift state");
     expect(text).not.toContain("No ROAs are expiring");
+  });
+
+  it("the combined card names the withheld half when the other has rows", async () => {
+    // The reported role: services readable, overlays not. A list of orphan
+    // services must not read as "and no overlay impact".
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(
+        summary(
+          { overlay: true },
+          {
+            service_orphan_count: 1,
+            orphan_services: [
+              {
+                service_id: "s1",
+                service_name: "svc-one",
+                resource_kind: "vrf",
+                resource_id: "r1",
+              },
+            ],
+          },
+        ),
+      );
+    const text = await show();
+    expect(text).toContain("svc-one");
+    expect(text).toContain("Overlay impact is not visible to your role.");
+    expect(text).not.toContain("no overlays touching down circuits");
+  });
+
+  it("the combined card's empty readable half says only what it knows", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(summary({ service: true }));
+    const text = await show();
+    expect(text).toContain("No overlays touching down circuits.");
+    expect(text).toContain("Orphan services are not visible to your role.");
+    expect(text).not.toContain("Service catalog clean");
   });
 
   it("nothing withheld keeps the all-clear wording", async () => {

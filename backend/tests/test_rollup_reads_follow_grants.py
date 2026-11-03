@@ -154,6 +154,29 @@ async def test_network_summary_only_fills_panels_the_caller_can_read(
     }
 
 
+async def test_network_summary_flags_what_the_three_editor_roles_cannot_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The role mix #3449 was found with: services readable (IPAM Editor's
+    ``network_service`` grant admits the summary), ASNs / circuits / overlays
+    not. Each emptied panel is flagged, the readable one is not."""
+    perms = [
+        p for role in ("IPAM Editor", "DNS Editor", "DHCP Editor") for p in _BUILTIN_ROLES[role][1]
+    ]
+    headers = await _headers(db_session, permissions=perms)
+    resp = await client.get("/api/v1/dashboards/network/summary", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["withheld"] == {
+        "asn": True,
+        "circuit": True,
+        "service": False,
+        "overlay": True,
+    }
+    assert body["circuit_term_expiring_count"] == 0
+    assert body["circuit_alerts"] == []
+
+
 # ── Integrations dashboard ─────────────────────────────────────────────────
 
 

@@ -4827,17 +4827,21 @@ export function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
-  const { data, isLoading, isError } = useQuery<NetworkDashboardSummary>({
-    queryKey: ["dashboards", "network"],
-    queryFn: () => dashboardsApi.networkSummary(),
-    refetchInterval: 60_000,
-  });
+  const { data, isLoading, isError, error } = useQuery<NetworkDashboardSummary>(
+    {
+      queryKey: ["dashboards", "network"],
+      queryFn: () => dashboardsApi.networkSummary(),
+      // A refusal ends the poll (#3149).
+      refetchInterval: pollUnlessRefused(60_000),
+    },
+  );
 
+  // A refusal says so; any other failure says the read failed, never that
+  // the role may lack access (#3149).
   if (isError) {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
-        Network signals are unavailable. Your role may not include read access
-        to ASNs, circuits, services or overlays.
+        <ListReadError error={error} what="network signals" />
       </div>
     );
   }
@@ -5027,12 +5031,24 @@ function NetworkPanel() {
         <DashboardListCard
           title="Orphan services + overlay impact"
           withheld={w.service && w.overlay}
-          emptyHint={
-            w.service || w.overlay
-              ? "Nothing to show in the part of this card your role can read."
-              : "Service catalog clean and no overlays touching down circuits."
-          }
           withheldHint="Not visible to your role."
+          // With one half withheld, the card names that half whether or not
+          // the other half has rows: a list of orphan services alone must not
+          // read as "and no overlay impact" (#3449).
+          emptyHint={
+            w.service
+              ? "No overlays touching down circuits."
+              : w.overlay
+                ? "Service catalog clean."
+                : "Service catalog clean and no overlays touching down circuits."
+          }
+          note={
+            w.service && !w.overlay
+              ? "Orphan services are not visible to your role."
+              : w.overlay && !w.service
+                ? "Overlay impact is not visible to your role."
+                : undefined
+          }
         >
           {data.orphan_services.map((row) => (
             <Link
@@ -5781,10 +5797,14 @@ function DashboardListCard({
   emptyHint,
   withheld = false,
   withheldHint,
+  note,
   children,
 }: {
   title: string;
   emptyHint: string;
+  /** A line under the list or the empty sentence, shown either way: for a
+   *  card part of which the server withheld (#3449). */
+  note?: string;
   /** Replaces the default withheld sentence where there is no count above
    *  the card to lean on (#3449). */
   withheldHint?: string;
@@ -5818,6 +5838,11 @@ function DashboardListCard({
             <li key={i}>{child}</li>
           ))}
         </ul>
+      )}
+      {note && (
+        <p className="border-t px-4 py-2 text-center text-[11px] text-muted-foreground">
+          {note}
+        </p>
       )}
     </div>
   );

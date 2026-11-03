@@ -1,2 +1,2 @@
 ### Fixed
-- The Dashboard Network tab no longer shows "0" or an all-clear for panels your role may not read: the API now reports which panels it withheld (`withheld` on `/dashboards/network/summary`), and the tab shows "not visible to your role" for them instead.
+- The Dashboard Network tab no longer shows "0" or an all-clear for panels your role may not read: the API now reports which panels it withheld (`withheld` on `/dashboards/network/summary`), and the tab shows "not visible to your role" for them instead. On the combined orphan-services and overlay card, the half your role may not read is named even when the other half has rows. A refused summary now says so and stops asking every 60 s.
