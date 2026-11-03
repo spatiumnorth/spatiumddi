@@ -3690,6 +3690,14 @@ export function DHCPPage() {
     if (selection?.type !== "server") return null;
     return freshServer ?? selection.server;
   }, [selection, freshServer]);
+  // #3369 — the selection holds the group as it was when clicked; draw the
+  // panel from the refreshed list so a saved edit shows at once.
+  const liveGroup = useMemo(() => {
+    if (!selection || !selection.group) return null;
+    return (
+      allGroups?.find((g) => g.id === selection.group!.id) ?? selection.group
+    );
+  }, [selection, allGroups]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -3712,9 +3720,9 @@ export function DHCPPage() {
         )}
         {selection?.type === "group" && (
           <GroupDetailView
-            group={selection.group}
-            onEdit={() => setEditGroup(selection.group)}
-            onDelete={() => setDelGroup(selection.group)}
+            group={liveGroup ?? selection.group}
+            onEdit={() => setEditGroup(liveGroup ?? selection.group)}
+            onDelete={() => setDelGroup(liveGroup ?? selection.group)}
             onAddServer={() => setAddServerFor(selection.group.id)}
             // Issue #181: open the read-only modal instead of
             // navigating to the full standalone server view. Mirrors
@@ -3727,7 +3735,7 @@ export function DHCPPage() {
         {selection?.type === "server" && effectiveServer && (
           <ServerDetailView
             server={effectiveServer}
-            group={selection.group}
+            group={liveGroup}
             onEdit={() => setEditServer(effectiveServer)}
             onDelete={() => setDelServer(effectiveServer)}
             onSelectGroup={(g) => setSelection({ type: "group", group: g })}

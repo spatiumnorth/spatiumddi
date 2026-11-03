@@ -13921,6 +13921,15 @@ export function BlockDetailView({
     setBlock(initialBlock);
   }, [initialBlock.id]);
 
+  // #3369 — the page's selection is a click-time snapshot; once the blocks
+  // list is read again after a Save (the tree's Edit…, another panel), show
+  // the stored row. react-query keeps an unchanged row's reference, so this
+  // runs only when the row actually changed.
+  const listedBlock = allBlocks.find((b) => b.id === initialBlock.id);
+  useEffect(() => {
+    if (listedBlock) setBlock(listedBlock);
+  }, [listedBlock]);
+
   const { data: subnetCfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "subnet"],
     queryFn: () => customFieldsApi.list("subnet"),
