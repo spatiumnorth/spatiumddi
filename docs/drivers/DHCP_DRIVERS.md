@@ -253,7 +253,7 @@ Located at [`app/drivers/dhcp/windows.py`](https://github.com/spatiumnorth/spati
 | `apply_exclusion` / `remove_exclusion` | ✅ | `Add-DhcpServerv4ExclusionRange` / `Remove-DhcpServerv4ExclusionRange`. |
 | `get_failover_relationships` | ✅ | `Get-DhcpServerv4Failover` — read-only (#1110). `ok` false means the read failed, not "no relationships". |
 | `probe_scopes` | ✅ | Live presence / state / range of given scopes + the server's relationships, in one round trip — what the write-through plans from (#1110). |
-| Failover relationship management | ❌ | `Add-/Set-/Remove-DhcpServerv4Failover` and `Add-DhcpServerv4FailoverScope` are #1110 Phase 2. |
+| Failover relationship management | ✅ | Create / change / delete relationships, add / remove their scopes and replicate (`Add-/Set-/Remove-DhcpServerv4Failover`, `Add-/Remove-DhcpServerv4FailoverScope`, `Invoke-DhcpServerv4FailoverReplication`; #1110 Phase 2, see Managing relationships below). |
 | `render_config` | ❌ | Raises `NotImplementedError`. Windows DHCP is cmdlet-driven, not config-file-driven. |
 | `apply_config` / `reload` / `restart` / `validate_config` | ❌ | Raise `NotImplementedError`. |
 

@@ -10817,12 +10817,7 @@ export const logsApi = {
  * = enforced at the auth layer BEFORE RBAC. Multiple scopes
  * union; ``read`` covers safe-method requests across the surface.
  */
-export type ApiTokenScope =
-  | "read"
-  | "ipam:write"
-  | "dns:write"
-  | "dhcp:write"
-  | "agent";
+export type ApiTokenScope = "read" | "ipam:write" | "dns:write" | "dhcp:write";
 
 export const API_TOKEN_SCOPES: {
   value: ApiTokenScope;
@@ -10849,11 +10844,6 @@ export const API_TOKEN_SCOPES: {
     label: "DHCP write",
     hint: "Mutate /dhcp/*. Excludes the agent surface.",
   },
-  {
-    value: "agent",
-    label: "Agent",
-    hint: "Bootstrap + push for /dns/agents/* and /dhcp/agents/*.",
-  },
 ];
 
 /** Per-token resource binding (#374). resource_type ∈ {subnet, dns_zone}. */
@@ -10869,7 +10859,9 @@ export interface ApiToken {
   description: string;
   prefix: string;
   scope: string;
-  scopes: ApiTokenScope[];
+  /** What the row stores. Usually an ``ApiTokenScope``, but a token minted
+   *  before #3302 may still carry the retired ``agent`` (matches nothing). */
+  scopes: string[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
   /** Set by the list endpoint (#2443). */

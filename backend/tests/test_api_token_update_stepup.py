@@ -286,7 +286,7 @@ async def test_rename_and_revoke_need_no_step_up(
 
 def test_scopes_widen() -> None:
     assert scopes_widen(["read"], []) is True
-    assert scopes_widen(["read"], ["agent"]) is True
+    assert scopes_widen(["read"], ["dns:write"]) is True
     assert scopes_widen(None, ["read"]) is False
     assert scopes_widen([], []) is False
-    assert scopes_widen(["read", "agent"], ["agent"]) is False
+    assert scopes_widen(["read", "dns:write"], ["dns:write"]) is False

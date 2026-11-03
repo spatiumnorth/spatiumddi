@@ -591,6 +591,86 @@ async def test_commit_addresses_land_under_subnet(
 
 
 @pytest.mark.asyncio
+async def test_commit_drops_fqdn_when_hostname_sanitises_to_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — a dns_name whose host label folds to nothing stores no fqdn.
+
+    An fqdn only reads as current with a hostname (#3297), so storing one
+    alone would show the address with no name at all.
+    """
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.6/24":
+            ip["dns_name"] = "___.acme.example"
+    _patch_client(monkeypatch, fixture)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.6"))
+    ).scalar_one()
+    assert not addr.hostname
+    assert addr.fqdn is None
+
+
+@pytest.mark.asyncio
+async def test_overwrite_keeps_the_name_when_hostname_sanitises_to_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — an overwrite whose host label folds to nothing keeps the row's
+    hostname AND its fqdn, rather than pairing the old hostname with an fqdn
+    that names some other host."""
+    _patch_client(monkeypatch, _FIXTURE)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+    await _preview_then_commit(db_session, actor)
+
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.5/24":
+            ip["dns_name"] = "___.other.example"
+    _patch_client(monkeypatch, fixture)
+    await _preview_then_commit(
+        db_session,
+        actor,
+        conflict_actions={"ip_address:10.10.20.0/24:10.10.20.5": "overwrite"},
+    )
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.5"))
+    ).scalar_one()
+    await db_session.refresh(addr)
+    assert addr.hostname == "host5"
+    assert addr.fqdn == "host5.acme.example"
+
+
+@pytest.mark.asyncio
+async def test_commit_fqdn_is_the_folded_name_3348(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3348 — the stored fqdn starts with the stored (folded) hostname, so the
+    row never shows a name that is not the one it holds."""
+    fixture = json.loads(json.dumps(_FIXTURE))
+    for ip in fixture["/api/ipam/ip-addresses/"]:
+        if ip["address"] == "10.10.20.6/24":
+            ip["dns_name"] = "Web_01.Acme.Example."
+    _patch_client(monkeypatch, fixture)
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.10.20.6"))
+    ).scalar_one()
+    assert addr.hostname == "web-01"
+    assert addr.fqdn == "web-01.acme.example"
+
+
+@pytest.mark.asyncio
 async def test_commit_rerun_is_noop(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -698,8 +698,13 @@ rejected with `422` rather than silently locking the operator out:
   `DELETE /acme/accounts/{id}`.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`, and
   `POST /api/v1/new-devices/block`.
-- `agent` — allows only the agent push surface
-  (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+There is no scope for the agent push surface (`/api/v1/dns/agents/*`,
+`/api/v1/dhcp/agents/*`): those routes authenticate with the agent's own JWT
+or pre-shared key and never accept an API token. An `agent` scope used to be
+offered and reached nothing; it is retired, and create / update refuse it
+with a 422. A token that already stores `agent` is still refused everywhere
+(a non-empty scope list that matches nothing is not "unrestricted").
 
 Approve-and-provision routes (`/requests`, `/change-requests/{id}/approve|reject|cancel`,
 `/ai/proposals/{id}/apply`) admit any write scope, then check the scope of the
