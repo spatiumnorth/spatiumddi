@@ -116,6 +116,10 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import {
+  useUtilizationThresholds,
+  utilizationBand,
+} from "@/hooks/useUtilizationThresholds";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
 import { activityTone } from "@/lib/activity-tone";
@@ -1526,6 +1530,9 @@ export function DashboardPage() {
   const reportSubnets = subnets?.filter((s) =>
     includeInUtilization(s, settings),
   );
+  // Settings' Warning / Critical Thresholds (#3327) band the capacity
+  // figures below, as they do the IPAM tree's bars and dots.
+  const utilThresholds = useUtilizationThresholds();
 
   // DNS
   //
@@ -1758,9 +1765,12 @@ export function DashboardPage() {
     .sort((a, b) => b.utilization_percent - a.utilization_percent);
   const topSubnets = sortedSubnets.slice(0, 6);
   const ipamTopSubnets = sortedSubnets.slice(0, 20);
-  const critical = reporting.filter((s) => s.utilization_percent >= 95).length;
+  const critical = reporting.filter(
+    (s) =>
+      utilizationBand(s.utilization_percent, utilThresholds) === "critical",
+  ).length;
   const warning = reporting.filter(
-    (s) => s.utilization_percent >= 80 && s.utilization_percent < 95,
+    (s) => utilizationBand(s.utilization_percent, utilThresholds) === "warn",
   ).length;
 
   const allServers = [
@@ -1868,10 +1878,10 @@ export function DashboardPage() {
   const healthDetail =
     [
       critical > 0
-        ? `${critical} subnet${critical === 1 ? "" : "s"} ≥95% full`
+        ? `${critical} subnet${critical === 1 ? "" : "s"} ≥${utilThresholds.critical}% full`
         : null,
       warning > 0
-        ? `${warning} subnet${warning === 1 ? "" : "s"} ≥80% full`
+        ? `${warning} subnet${warning === 1 ? "" : "s"} ≥${utilThresholds.warn}% full`
         : null,
       unhealthyServers > 0
         ? `${unhealthyServers} server${unhealthyServers === 1 ? "" : "s"} unreachable`
@@ -2092,10 +2102,11 @@ export function DashboardPage() {
                         : "text-amber-600 dark:text-amber-400"
                     }
                   >
-                    {critical} at ≥95% · {warning} at ≥80%
+                    {critical} at ≥{utilThresholds.critical}% · {warning} at ≥
+                    {utilThresholds.warn}%
                   </span>
                 ) : (
-                  "no subnet above 80%"
+                  `no subnet above ${utilThresholds.warn}%`
                 )
               }
               icon={Network}
@@ -2181,9 +2192,9 @@ export function DashboardPage() {
               tone={
                 subnetsWhy
                   ? "default"
-                  : overallUtil >= 95
+                  : overallUtil >= utilThresholds.critical
                     ? "bad"
-                    : overallUtil >= 80
+                    : overallUtil >= utilThresholds.warn
                       ? "warn"
                       : "default"
               }
@@ -2285,9 +2296,9 @@ export function DashboardPage() {
                 value={`${overallUtil.toFixed(1)}%`}
                 label="utilization"
                 tone={
-                  overallUtil >= 95
+                  overallUtil >= utilThresholds.critical
                     ? "bad"
-                    : overallUtil >= 80
+                    : overallUtil >= utilThresholds.warn
                       ? "warn"
                       : undefined
                 }
@@ -2457,9 +2468,9 @@ export function DashboardPage() {
               tone={
                 subnetsWhy
                   ? "default"
-                  : overallUtil >= 95
+                  : overallUtil >= utilThresholds.critical
                     ? "bad"
-                    : overallUtil >= 80
+                    : overallUtil >= utilThresholds.warn
                       ? "warn"
                       : "good"
               }

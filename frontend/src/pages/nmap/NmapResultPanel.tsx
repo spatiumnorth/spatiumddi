@@ -170,6 +170,7 @@ function StampDiscoveredModal({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
   });
   const result = stamp.data;
