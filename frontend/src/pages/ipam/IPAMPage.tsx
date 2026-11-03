@@ -10865,7 +10865,11 @@ export function BulkEditAddressesModal({
   // Re-read on open: Edit Block / Edit Subnet can have moved the primary zone
   // since the last read, and Apply sends what the picker shows (#3368, as
   // #3078 for Allocate IP).
-  const { data: effectiveDns, isFetching: effectiveFetching } = useQuery({
+  const {
+    data: effectiveDns,
+    isFetching: effectiveFetching,
+    isRefetchError: effectiveRefetchFailed,
+  } = useQuery({
     queryKey: ["effective-dns-subnet", subnetId ?? "none"],
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId as string),
     enabled: !!subnetId,
@@ -10896,12 +10900,19 @@ export function BulkEditAddressesModal({
       : allGroupZones;
 
   // The pick is not final while the subnet's DNS is re-read over a cached
-  // copy, or its zones are on their way: Apply waits (#3368).
+  // copy, or its zones are on their way: Apply and the picker wait (#3368).
+  // Both settle on error or offline (isFetching / isLoading go false), so
+  // this never blocks for good; a failed re-read keeps the cached answer
+  // and says so below.
   const zonesPending =
     editDnsZone &&
     dnsOn &&
     ((effectiveFetching && effectiveDns !== undefined) ||
       !zoneQueries.every((q: { isLoading: boolean }) => !q.isLoading));
+  // The section is hidden when the fresh answer leaves no zone to pick; a
+  // tick made over the cached copy must not then send a zone the dialog no
+  // longer shows.
+  const dnsZoneEditing = editDnsZone && availableZones.length > 0;
   // Re-pick the primary when the fresh answer changes it, until the operator
   // has chosen.
   useEffect(() => {
@@ -10992,7 +11003,7 @@ export function BulkEditAddressesModal({
         }
         if (Object.keys(cfObj).length > 0) changes.custom_fields = cfObj;
       }
-      if (editDnsZone) changes.dns_zone_id = dnsZoneId; // "" clears the zone
+      if (dnsZoneEditing) changes.dns_zone_id = dnsZoneId; // "" clears the zone
       return ipamApi.bulkEditAddresses({ ip_ids: ipIds, changes });
     },
     onSuccess: (res) => {
@@ -11034,7 +11045,7 @@ export function BulkEditAddressesModal({
     editDescription ||
     hasTagChanges ||
     hasCfChanges ||
-    editDnsZone ||
+    dnsZoneEditing ||
     editRole ||
     editReservedUntil;
 
@@ -11167,6 +11178,9 @@ export function BulkEditAddressesModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
+                  // Not choosable until the re-read answers: a pick made
+                  // from the cached list could name a zone it drops (#3368).
+                  disabled={zonesPending}
                   onChange={(e) => {
                     setDnsZoneId(e.target.value);
                     setDnsZoneTouched(true);
@@ -11179,6 +11193,17 @@ export function BulkEditAddressesModal({
                     noneOption="None (remove DNS records)"
                   />
                 </select>
+                {zonesPending && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Re-reading the subnet&rsquo;s DNS zones&hellip;
+                  </p>
+                )}
+                {effectiveRefetchFailed && !zonesPending && (
+                  <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                    Could not re-read the subnet&rsquo;s DNS settings; these
+                    zones are from an earlier read and may be out of date.
+                  </p>
+                )}
                 <p className="text-[11px] text-muted-foreground">
                   Moves every selected IP's forward record to this zone (and
                   deletes the old record if present). Picking &ldquo;None&rdquo;

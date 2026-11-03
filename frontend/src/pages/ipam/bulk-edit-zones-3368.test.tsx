@@ -125,4 +125,116 @@ describe("Bulk edit DNS Zone (#3368)", () => {
       changes: { dns_zone_id: "zb" },
     });
   });
+
+  function mount(cached: unknown) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    qc.setQueryData(["effective-dns-subnet", "s1"], cached);
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <BulkEditAddressesModal
+            ipIds={["i1", "i2"]}
+            subnetId="s1"
+            onClose={() => {}}
+            onDone={() => {}}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+  const cachedA = {
+    dns_group_ids: ["g1"],
+    dns_zone_id: "za",
+    dns_additional_zone_ids: [],
+  };
+  function common() {
+    answer("dnsApi", "listZones", () =>
+      Promise.resolve([zone("za", "a.example."), zone("zb", "b.example.")]),
+    );
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    answer("ipamApi", "listAddresses", () => Promise.resolve([]));
+    const bulkEdit = vi.fn(() =>
+      Promise.resolve({ updated_count: 2, skipped: [] }),
+    );
+    answer("ipamApi", "bulkEditAddresses", bulkEdit);
+    return bulkEdit;
+  }
+
+  it("holds Apply and the picker while the re-read is in flight", async () => {
+    common();
+    let release: (v: unknown) => void = () => {};
+    answer(
+      "ipamApi",
+      "getEffectiveSubnetDns",
+      () => new Promise((r) => (release = r)),
+    );
+    mount(cachedA);
+    fireEvent.click(await screen.findByLabelText("DNS Zone"));
+    const apply = screen.getByRole("button", { name: "Apply to all" });
+    await waitFor(() =>
+      expect(screen.getByText(/Re-reading the subnet/)).toBeTruthy(),
+    );
+    expect((apply as HTMLButtonElement).disabled).toBe(true);
+    const select = [...document.querySelectorAll("select")].find((el) =>
+      [...el.options].some((o) => o.value === "za"),
+    ) as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+    release({ ...cachedA, dns_zone_id: "zb" });
+    await waitFor(() =>
+      expect((apply as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(screen.queryByText(/Re-reading the subnet/)).toBeNull();
+  });
+
+  it("a failed re-read keeps the earlier answer, says so, and does not block Apply", async () => {
+    const bulkEdit = common();
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.reject(new Error("offline")),
+    );
+    mount(cachedA);
+    fireEvent.click(await screen.findByLabelText("DNS Zone"));
+    await waitFor(() =>
+      expect(screen.getByText(/Could not re-read the subnet/)).toBeTruthy(),
+    );
+    const apply = screen.getByRole("button", { name: "Apply to all" });
+    expect((apply as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(apply);
+    await waitFor(() => expect(bulkEdit).toHaveBeenCalled());
+    expect((bulkEdit.mock.calls[0] as unknown[])[0]).toMatchObject({
+      changes: { dns_zone_id: "za" },
+    });
+  });
+
+  it("sends no zone when the fresh answer leaves none to pick", async () => {
+    const bulkEdit = common();
+    let release: (v: unknown) => void = () => {};
+    answer(
+      "ipamApi",
+      "getEffectiveSubnetDns",
+      () => new Promise((r) => (release = r)),
+    );
+    mount(cachedA);
+    fireEvent.click(await screen.findByLabelText("DNS Zone"));
+    fireEvent.click(screen.getByLabelText("Description"));
+    release({
+      dns_group_ids: [],
+      dns_zone_id: null,
+      dns_additional_zone_ids: [],
+    });
+    await waitFor(() => expect(screen.queryByLabelText("DNS Zone")).toBeNull());
+    const apply = screen.getByRole("button", { name: "Apply to all" });
+    await waitFor(() =>
+      expect((apply as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(apply);
+    await waitFor(() => expect(bulkEdit).toHaveBeenCalled());
+    const changes = (
+      (bulkEdit.mock.calls[0] as unknown[])[0] as {
+        changes: Record<string, unknown>;
+      }
+    ).changes;
+    expect(changes).not.toHaveProperty("dns_zone_id");
+  });
 });
