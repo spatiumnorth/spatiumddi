@@ -17,7 +17,14 @@ from collections.abc import Iterable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope
+from app.models.dhcp import (
+    DHCPClientClass,
+    DHCPPhoneProfile,
+    DHCPPool,
+    DHCPPXEArchMatch,
+    DHCPPXEProfile,
+    DHCPScope,
+)
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 
 # Classes Kea defines itself. ``HA_*`` / ``VENDOR_CLASS_*`` are Kea's
@@ -52,6 +59,10 @@ def reserved_name_reason(name: str) -> str | None:
     if _GENERATED_RE.match(name):
         return f"'{name}' is a name generated for a PXE / phone profile"
     return None
+
+
+def is_generated(name: str) -> bool:
+    return bool(_GENERATED_RE.match(name))
 
 
 def is_builtin_or_generated(name: str) -> bool:
@@ -164,3 +175,93 @@ def dangling_changed(server_id: str, dangling: list[tuple[str, str]]) -> bool:
     else:
         _last_reported.pop(server_id, None)
     return True
+
+
+def pxe_class_name(profile_id: uuid.UUID, match_id: uuid.UUID) -> str:
+    """The Kea class the bundle generates for a PXE boot rule."""
+    return f"pxe-{str(profile_id)[:8]}-{str(match_id)[:8]}"
+
+
+async def pxe_profile_rendered(
+    db: AsyncSession,
+    profile: DHCPPXEProfile,
+    *,
+    enabled: bool | None = None,
+    exclude_scope_id: uuid.UUID | None = None,
+) -> bool:
+    """Whether the bundle defines the profile's classes: it is enabled AND an
+    active scope of its group binds it (``_assemble_pxe_classes``).
+    ``enabled`` / ``exclude_scope_id`` ask the question for a pending change."""
+    if not (profile.enabled if enabled is None else enabled):
+        return False
+    q = select(DHCPScope.id).where(
+        DHCPScope.group_id == profile.group_id,
+        DHCPScope.pxe_profile_id == profile.id,
+        DHCPScope.is_active.is_(True),
+    )
+    if exclude_scope_id is not None:
+        q = q.where(DHCPScope.id != exclude_scope_id)
+    return (await db.execute(q.limit(1))).first() is not None
+
+
+async def pxe_rule_pool_refs(
+    db: AsyncSession, profile: DHCPPXEProfile
+) -> list[tuple[str, list[tuple[str, str, str]]]]:
+    """``(class name, pools)`` for each of the profile's rules a pool names."""
+    out = []
+    for m in await _profile_rules(db, profile):
+        name = pxe_class_name(profile.id, m.id)
+        pools = await pools_restricted_to(db, profile.group_id, name)
+        if pools:
+            out.append((name, pools))
+    return out
+
+
+async def _profile_rules(db: AsyncSession, profile: DHCPPXEProfile) -> list[DHCPPXEArchMatch]:
+    return list(
+        (
+            await db.execute(
+                select(DHCPPXEArchMatch).where(DHCPPXEArchMatch.profile_id == profile.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def generated_class_problem(db: AsyncSession, group_id: uuid.UUID, name: str) -> str | None:
+    """Why a generated ``pxe-…`` / ``voip-…`` name cannot be a pool's class in
+    this group (#3388), else None. The shape alone proves nothing: a typo, or
+    the name of a deleted rule, is shaped right and Kea never gets the class.
+    A PXE class must also be rendered (profile enabled and bound to an active
+    scope), or the pool would match no client."""
+    if name.startswith("voip-"):
+        phones = (
+            (
+                await db.execute(
+                    select(DHCPPhoneProfile).where(DHCPPhoneProfile.group_id == group_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if any(f"voip-{str(p.id)[:8]}" == name for p in phones):
+            return None
+        return f"no phone profile in this server group generates class '{name}'"
+    profiles = (
+        (await db.execute(select(DHCPPXEProfile).where(DHCPPXEProfile.group_id == group_id)))
+        .unique()
+        .scalars()
+        .all()
+    )
+    for prof in profiles:
+        for m in await _profile_rules(db, prof):
+            if pxe_class_name(prof.id, m.id) != name:
+                continue
+            if await pxe_profile_rendered(db, prof):
+                return None
+            return (
+                f"PXE profile '{prof.name}' generates class '{name}' only while it is "
+                "enabled and bound to an active scope of this server group"
+            )
+    return f"no PXE boot rule in this server group generates class '{name}'"

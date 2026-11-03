@@ -48,7 +48,12 @@ from app.models.dhcp import (
     DHCPPXEProfile,
     DHCPServerGroup,
 )
-from app.services.dhcp.class_refs import describe_pools, pools_restricted_to
+from app.services.dhcp.class_refs import (
+    describe_pools,
+    pools_restricted_to,
+    pxe_profile_rendered,
+    pxe_rule_pool_refs,
+)
 from app.services.dhcp.option_validation import check_vendor_class_match
 
 router = APIRouter(
@@ -343,6 +348,51 @@ async def _refuse_if_pool_bound(
             raise HTTPException(status_code=409, detail=detail)
 
 
+async def refuse_if_classes_stop_rendering(
+    db: AsyncSession,
+    p: DHCPPXEProfile,
+    verb: str,
+    *,
+    enabled: bool | None = None,
+    exclude_scope_id: uuid.UUID | None = None,
+) -> None:
+    """409 when a change would stop the bundle defining this profile's classes
+    (disabled, or unbound from its last active scope) while a pool's
+    ``class_restriction`` names one (#3388). Only the transition is refused: a
+    profile already unrendered is not blocked from being tidied up."""
+    if not await pxe_profile_rendered(db, p):
+        return
+    if await pxe_profile_rendered(db, p, enabled=enabled, exclude_scope_id=exclude_scope_id):
+        return
+    for name, pools in await pxe_rule_pool_refs(db, p):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {verb}: PXE profile '{p.name}' generates class '{name}', which is "
+                f"still referenced by {len(pools)} pool(s) ({describe_pools(pools)}). Kea "
+                "accepts a reference to an undefined class and the pool would silently "
+                "match no client. Clear or change those references first."
+            ),
+        )
+
+
+def _reject_duplicate_selectors(rows: list[ArchMatchInput]) -> None:
+    """422 on two rules selecting the same clients (#3388): the second's
+    generated class could never be told apart from the first's."""
+    seen: set[Any] = set()
+    for r in rows:
+        sel = _selector(_input_key(r))
+        if sel in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Two boot rules in this profile select the same clients "
+                    "(same kind, vendor class and architecture codes)"
+                ),
+            )
+        seen.add(sel)
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
@@ -384,6 +434,7 @@ async def create_profile(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A PXE profile with that name exists")
 
+    _reject_duplicate_selectors(body.matches)
     # Construct the profile with its matches in one shot so SQLAlchemy
     # never lazy-loads ``matches`` on the just-added row (which would
     # try a sync DB read inside the async session and trip
@@ -480,6 +531,13 @@ async def update_profile(
     payload.pop("matches", None)
     if "tags" in payload:
         payload["tags"] = dict(payload["tags"] or {})
+
+    if payload.get("enabled") is False:
+        await refuse_if_classes_stop_rendering(
+            db, prof, f"disable PXE profile '{prof.name}'", enabled=False
+        )
+    if matches_input is not None:
+        _reject_duplicate_selectors(matches_input)
 
     before = snapshot(prof, payload)
     for k, v in payload.items():

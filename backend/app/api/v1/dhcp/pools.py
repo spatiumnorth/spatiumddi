@@ -20,7 +20,12 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
-from app.services.dhcp.class_refs import is_builtin_or_generated, known_class_names
+from app.services.dhcp.class_refs import (
+    generated_class_problem,
+    is_builtin_or_generated,
+    is_generated,
+    known_class_names,
+)
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
@@ -220,6 +225,15 @@ async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | No
         )
     ).scalar_one_or_none()
     family = scope.address_family or "ipv4"
+    if cc is None and is_generated(name):
+        # #3388 — shaped like a generated class is not the same as being one.
+        problem = await generated_class_problem(db, scope.group_id, name)
+        if problem:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Client class '{name}' is not defined: {problem}, so the pool "
+                "would match no client.",
+            )
     if (
         cc is None
         and not is_builtin_or_generated(name)

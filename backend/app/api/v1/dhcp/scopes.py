@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser, ensure_superadmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
+from app.api.v1.dhcp.pxe_profiles import refuse_if_classes_stop_rendering
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, snapshot
@@ -981,7 +982,18 @@ async def update_scope(
     # The audit's before-image, taken ahead of the detach below (which writes
     # the row directly) so a detach is named as a ``pxe_profile_id`` change.
     before = snapshot(scope, [*changes, "pxe_profile_id"])
-    if changes.pop("clear_pxe_profile", False):
+    _clear_pxe = bool(changes.pop("clear_pxe_profile", False))
+    if scope.pxe_profile_id is not None and (
+        _clear_pxe or changes.get("pxe_profile_id") not in (None, scope.pxe_profile_id)
+    ):
+        # #3388 — unbinding the last scope of an enabled profile drops its
+        # classes from the bundle; a pool naming one would match no client.
+        _old = await db.get(DHCPPXEProfile, scope.pxe_profile_id)
+        if _old is not None:
+            await refuse_if_classes_stop_rendering(
+                db, _old, "unbind this PXE profile from the scope", exclude_scope_id=scope.id
+            )
+    if _clear_pxe:
         scope.pxe_profile_id = None
     if changes.get("pxe_profile_id") is not None:
         # #2650 — profiles are group-scoped; binding one from another group
