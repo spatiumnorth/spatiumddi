@@ -26,6 +26,7 @@ from .commit import (
     commit_import,
     detect_conflicts,
     drop_invalid_pools,
+    drop_invalid_reservations,
     drop_unservable_hostnames,
 )
 from .isc_dhcp_parser import IscImportError, parse_isc_config
@@ -49,6 +50,7 @@ __all__ = [
     "commit_import",
     "detect_conflicts",
     "drop_invalid_pools",
+    "drop_invalid_reservations",
     "drop_unservable_hostnames",
     "parse_isc_config",
     "parse_kea_config",

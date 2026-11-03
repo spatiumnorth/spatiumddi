@@ -69,6 +69,16 @@ class ExportBundle:
     include_addresses: bool = False
 
 
+def _true_total_ips(subnet: Subnet) -> int:
+    """The subnet's real size. ``Subnet.total_ips`` is clamped to BIGINT
+    (2^63 - 1) for IPv6, which exported a /64 as that cap and a /63 as the
+    same number (#3322); an IPv6 row is sized from its CIDR instead."""
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    if net.version == 6:
+        return net.num_addresses
+    return subnet.total_ips
+
+
 def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -157,7 +167,7 @@ async def _collect(
             "vlan_id": s.vlan_id,
             "vxlan_id": s.vxlan_id,
             "status": s.status,
-            "total_ips": s.total_ips,
+            "total_ips": _true_total_ips(s),
             "allocated_ips": s.allocated_ips,
             "utilization_percent": s.utilization_percent,
             "custom_fields": s.custom_fields or {},
@@ -228,6 +238,15 @@ def _sanitize_cell(value: Any) -> Any:
     """
     if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
         return "'" + value
+    return value
+
+
+def _xlsx_number(value: Any) -> Any:
+    """An integer past 2^53 goes into XLSX as text. A spreadsheet number is a
+    double, so openpyxl writes 2^64 as ``1.844674407370955E+19`` -- an IPv6
+    /64's size off by 2048 (#3322). Text keeps every digit."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53:
+        return str(value)
     return value
 
 
@@ -324,7 +343,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
     headers = SUBNET_COLUMNS + cf_keys
     ws.append(headers)
     for row in bundle.subnets:
-        base = [_sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS]
+        base = [_xlsx_number(_sanitize_cell(row.get(k))) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
         ws.append(base + [_sanitize_cell(cf.get(k)) for k in cf_keys])
 

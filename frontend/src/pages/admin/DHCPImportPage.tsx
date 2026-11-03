@@ -65,7 +65,7 @@ const TABS: TabDef[] = [
     label: "Kea",
     short: "kea-dhcp4.conf / kea-dhcp6.conf",
     description:
-      "Upload a Kea JSON config from a non-managed daemon. The importer strips Kea's comment extensions, walks every Dhcp4 subnet4 / Dhcp6 subnet6 and maps pools, reservations, option-data, and client-classes into the canonical shape. HA / host-cache / lease-cmds hook config is not carried across — set HA up at the SpatiumDDI server-group level post-import.",
+      "Upload a Kea JSON config from a non-managed daemon. The importer strips Kea's comment extensions, walks every Dhcp4 subnet4 / Dhcp6 subnet6 (including those under shared-networks, which are flattened) and maps pools, reservations, option-data, and client-classes into the canonical shape. HA / host-cache / lease-cmds hook config is not carried across — set HA up at the SpatiumDDI server-group level post-import.",
   },
   {
     id: "windows_dhcp",
