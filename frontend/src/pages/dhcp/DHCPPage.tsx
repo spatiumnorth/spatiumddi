@@ -2461,8 +2461,16 @@ export function OptionTemplatesTab({ groupId }: { groupId: string }) {
           title="Delete Option Template"
           description={`Delete template "${del.name}"? Scopes that already had it applied keep their options.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>

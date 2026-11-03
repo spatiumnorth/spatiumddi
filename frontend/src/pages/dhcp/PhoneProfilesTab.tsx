@@ -4,6 +4,7 @@ import { Pencil, Phone, Plus, Sparkles, Trash2 } from "lucide-react";
 
 import {
   dhcpApi,
+  formatApiError,
   ipamApi,
   type PhoneOption,
   type PhoneProfile,
@@ -219,8 +220,16 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
           title="Delete Phone Profile"
           description={`Delete profile "${del.name}"? Any client matching its vendor-class fence will stop receiving its option set on the next bundle push.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
