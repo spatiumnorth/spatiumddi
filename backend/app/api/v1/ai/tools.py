@@ -11,14 +11,16 @@ Two surfaces:
   platform-level allowlist with an explicit list, or send ``null``
   to revert to per-tool registry defaults. Per-provider
   ``AIProvider.enabled_tools`` narrows further; both layers
-  compose.
+  compose. A list naming a tool the catalog cannot keep (an unknown
+  name, or a tool that writes) is refused with a 422 that names it,
+  and nothing is saved (#3415).
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import DB, SuperAdmin
@@ -95,6 +97,27 @@ async def list_tools(current_user: SuperAdmin, db: DB) -> ToolCatalogResponse:
     )
 
 
+def _refusal(names: list[str]) -> str | None:
+    """Why the catalog cannot enable some of ``names``, naming each one, or
+    None when it can keep them all. An unknown name is most likely a typo or
+    a tool a newer release renamed; a ``writes=True`` tool is never offered
+    to the model (``effective_tool_names``), and a Copilot write is a
+    ``propose_*`` tool instead."""
+    by_name = {t.name: t for t in REGISTRY.all()}
+    why = {
+        name: (
+            "no tool by that name"
+            if name not in by_name
+            else "it writes directly, and the Copilot never offers such a tool"
+        )
+        for name in sorted(set(names))
+        if name not in by_name or by_name[name].writes
+    }
+    if not why:
+        return None
+    return "Cannot enable " + "; ".join(f"{name}: {w}" for name, w in why.items()) + "."
+
+
 @router.put("/tools/catalog", response_model=ToolCatalogResponse)
 async def update_tool_catalog(
     body: ToolCatalogUpdate,
@@ -115,10 +138,13 @@ async def update_tool_catalog(
     if body.enabled is None:
         settings_row.ai_tools_enabled = None
     else:
-        # Strip unknown names so a typo doesn't permanently shadow
-        # a renamed tool. Same forward-compat we apply when reading.
-        registered = {t.name for t in REGISTRY.all() if not t.writes}
-        settings_row.ai_tools_enabled = sorted(set(body.enabled) & registered)
+        # A name the save cannot keep is refused, never dropped in silence
+        # (#3415): the Tool Catalog page shows this detail, so the operator
+        # learns why a toggle did not hold.
+        refusal = _refusal(body.enabled)
+        if refusal is not None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=refusal)
+        settings_row.ai_tools_enabled = sorted(set(body.enabled))
     after_override = (
         list(settings_row.ai_tools_enabled) if settings_row.ai_tools_enabled is not None else None
     )
