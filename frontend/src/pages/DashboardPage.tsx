@@ -5391,7 +5391,7 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
  * "no data" and "no threats" look identical on a dashboard unless you
  * say which one you mean, and only one of them is reassuring.
  */
-function DNSThreatCard() {
+export function DNSThreatCard() {
   // Gate the QUERY on the module, not just the render (#942). Hiding
   // the card on a 404 still fired the request — and with a 60 s
   // refetch, that is a console error every minute forever on every
@@ -5403,18 +5403,35 @@ function DNSThreatCard() {
   // the hook's own docstring.
   const { enabled, ready } = useFeatureModules();
   const moduleEnabled = ready && enabled("security.dns_threat");
+  // The route needs read on servers (#3450): a user without it was refused
+  // every 60 s, each a 403 and a denied audit row. ``can`` is false while
+  // the grants load, so the query waits for them as well.
+  const { can, isLoading: permsLoading } = usePermissions();
+  const mayRead = can("read", "server");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
     queryFn: () => dnsThreatApi.summary({ hours: 24 }),
     refetchInterval: 60_000,
     retry: false,
-    enabled: moduleEnabled,
+    enabled: moduleEnabled && mayRead,
   });
 
   const moduleOff =
     (error as { response?: { status?: number } } | null)?.response?.status ===
     404;
-  if (!moduleEnabled || moduleOff || isLoading) return null;
+  if (!moduleEnabled || permsLoading) return null;
+  if (!mayRead) {
+    return (
+      <div className="rounded-lg border bg-card p-4">
+        <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Not shown: the DNS tunneling rollup needs read on DNS servers, which
+          your role does not have.
+        </p>
+      </div>
+    );
+  }
+  if (moduleOff || isLoading) return null;
   if (!data) return null;
 
   const tone: Tone = !data.has_data
