@@ -17208,6 +17208,13 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
   const [showBulkDelete, setShowBulkDelete] = useState(false);
   const perms = usePermissions();
   const canDeleteIpam = canDeleteInIpam(perms.can);
+  // ``POST /addresses/bulk-edit`` lets through write on subnets at the type
+  // level or, for an address-set delegate (#103), a write grant on any
+  // address set; its handler then skips each address the caller cannot
+  // write. Anyone else is refused at the gate (#3423).
+  const canBulkEdit =
+    perms.can("write", "subnet") ||
+    perms.hasAnyGrantFor("write", "address_set");
 
   const params = {
     q: applied.q || undefined,
@@ -17507,6 +17514,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
               disabled={selected.size === 0}
               onClick={() => setShowBulkEdit(true)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              {...permissionGate(canBulkEdit, NEEDS_ADDRESS_WRITE)}
             >
               <Pencil className="h-3.5 w-3.5" />
               Bulk edit{" "}
