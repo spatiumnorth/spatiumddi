@@ -367,7 +367,7 @@ Deployment's `replicas`.
 
 **Measured on the appliance,** RSS in MiB across every shape:
 
-| Pod | Chart default, request / limit | Measured on the appliance |
+| Pod | Chart default when measured (before #3110), request / limit | Measured on the appliance |
 |---|---|---|
 | api (one uvicorn process) | 256Mi / 512Mi | 380 to 710 at p50, up to 854 at p95, 1276 in one sample |
 | worker | 256Mi / 1Gi, four processes | worker and beat together: 600 to 1017 at p50, up to 1106 at p95, with two worker processes |
