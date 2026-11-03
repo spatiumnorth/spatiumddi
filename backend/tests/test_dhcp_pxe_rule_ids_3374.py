@@ -147,3 +147,54 @@ async def test_removing_a_rule_a_pool_names_is_refused(
         f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h, json=_body(prof, _with_ids(prof)[:1])
     )
     assert resp.status_code == 200, resp.text
+
+
+async def test_duplicated_id_and_invalid_edited_rule_are_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, _srv, prof, _rule, _cls = await _setup(client, db_session)
+    rows = _with_ids(prof)
+    rows[1]["id"] = rows[0]["id"]
+    resp = await client.put(
+        f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h, json=_body(prof, rows)
+    )
+    assert resp.status_code == 422, resp.text
+
+    # An identified edit is still validated like any other rule.
+    rows = _with_ids(prof)
+    rows[0]["vendor_class_match"] = "PXE'Client"
+    resp = await client.put(
+        f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h, json=_body(prof, rows)
+    )
+    assert resp.status_code == 422, resp.text
+    rows = _with_ids(prof)
+    rows[0]["arch_codes"] = [300]
+    resp = await client.put(
+        f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h, json=_body(prof, rows)
+    )
+    assert resp.status_code == 422, resp.text
+    still = await client.get(f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h)
+    assert still.json()["matches"] == prof["matches"]
+
+
+async def test_deleting_a_profile_whose_rule_a_pool_names_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, _srv, prof, _rule, cls = await _setup(client, db_session)
+    resp = await client.delete(f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h)
+    assert resp.status_code == 409, resp.text
+    assert cls in resp.json()["detail"]
+    assert "10.0.20.10-10.0.20.50" in resp.json()["detail"]
+    still = await client.get(f"/api/v1/dhcp/pxe-profiles/{prof['id']}", headers=h)
+    assert still.status_code == 200
+    assert len(still.json()["matches"]) == 2
+
+    # Once no pool names its classes, the profile deletes as before.
+    other = await client.post(
+        f"/api/v1/dhcp/server-groups/{prof['group_id']}/pxe-profiles",
+        headers=h,
+        json={"name": "spare", "next_server": "10.0.0.6", "matches": [_m(10, 7, "x.efi")]},
+    )
+    assert other.status_code == 201, other.text
+    resp = await client.delete(f"/api/v1/dhcp/pxe-profiles/{other.json()['id']}", headers=h)
+    assert resp.status_code == 204, resp.text

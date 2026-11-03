@@ -321,19 +321,22 @@ def _replace_matches(
 
 
 async def _refuse_if_pool_bound(
-    db: AsyncSession, p: DHCPPXEProfile, removed: list[DHCPPXEArchMatch]
+    db: AsyncSession, p: DHCPPXEProfile, removed: list[DHCPPXEArchMatch], verb: str
 ) -> None:
-    """409 when a deleted rule's generated class is still named by a pool's
-    ``class_restriction`` (#3374) — Kea would accept the pool and never match
-    it. Same refusal shape as deleting a client class (#2285)."""
+    """409 when a rule about to go has a generated class a pool's
+    ``class_restriction`` still names (#3374) — Kea would accept the pool and
+    never match it. Covers a Save that drops a rule and deleting the whole
+    profile. Same refusal shape as deleting a client class (#2285)."""
     for m in removed:
         name = f"pxe-{str(p.id)[:8]}-{str(m.id)[:8]}"
         pools = await pools_restricted_to(db, p.group_id, name)
         if pools:
             detail = (
-                f"Cannot remove boot rule '{m.boot_filename}': its generated class "
-                f"{name} is the class restriction of pool(s) "
-                f"{describe_pools(pools)}. Change those pools first."
+                f"Cannot {verb}: boot rule '{m.boot_filename}' generates class "
+                f"'{name}', which is still referenced by {len(pools)} pool(s) "
+                f"({describe_pools(pools)}). Kea accepts a reference to an undefined "
+                "class and the pool would silently match no client. Clear or change "
+                "those references first."
             )
             # Drop the in-session edits so a refused Save leaves nothing staged.
             await db.rollback()
@@ -485,7 +488,7 @@ async def update_profile(
     matches_changed = False
     if matches_input is not None:
         matches_changed, removed = _replace_matches(prof, matches_input)
-        await _refuse_if_pool_bound(db, prof, removed)
+        await _refuse_if_pool_bound(db, prof, removed, "remove that boot rule")
 
     write_audit(
         db,
@@ -509,9 +512,16 @@ async def update_profile(
 
 @router.delete("/pxe-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_profile(profile_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
-    prof = await db.get(DHCPPXEProfile, profile_id)
+    res = await db.execute(
+        select(DHCPPXEProfile)
+        .where(DHCPPXEProfile.id == profile_id)
+        .options(selectinload(DHCPPXEProfile.matches))
+    )
+    prof = res.scalar_one_or_none()
     if prof is None:
         raise HTTPException(status_code=404, detail="PXE profile not found")
+    # The rules go with the profile (cascade), and so do their classes.
+    await _refuse_if_pool_bound(db, prof, list(prof.matches), f"delete PXE profile '{prof.name}'")
     write_audit(
         db,
         user=user,
