@@ -35,11 +35,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
 from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
     boundary_rows,
     create_placeholder_rows,
+    find_untouched_gateway_row,
+    gateway_target_problem,
     has_boundary_rows,
+    holds_placeholder_rows,
     subnet_kind_for,
 )
 from app.services.ipam_io.parser import ParsedPayload
@@ -208,6 +213,29 @@ def _subnet_gateway(
     return str(gw_addr), None
 
 
+def _gateway_moves(existing: Subnet, gateway: str | None) -> bool:
+    """``overwrite`` changes ``existing``'s stored gateway (a blank cell keeps it)."""
+    if not gateway:
+        return False
+    if existing.gateway is None:
+        return True
+    return ipaddress.ip_address(str(existing.gateway)) != ipaddress.ip_address(gateway)
+
+
+async def _overwrite_gateway_problem(
+    db: AsyncSession, existing: Subnet, canonical: str, gateway: str | None
+) -> str | None:
+    """Why ``overwrite`` cannot move ``existing``'s gateway onto ``gateway``, as
+    Edit Subnet refuses it (#3317): a host, a lease or a discovered row already
+    holds the address. Shared by preview and commit (#495)."""
+    if gateway is None or not _gateway_moves(existing, gateway):
+        return None
+    if not await holds_placeholder_rows(db, existing):
+        return None
+    problem = await gateway_target_problem(db, existing, gateway)
+    return f"{canonical}: {problem}" if problem else None
+
+
 # ── Preview ────────────────────────────────────────────────────────────────────
 
 
@@ -344,6 +372,18 @@ async def preview_import(
         }
         diff_details = {"old": old_snapshot, "new": {**row, "network": canonical}}
         if strategy == "overwrite":
+            gw_target_error = await _overwrite_gateway_problem(db, existing, canonical, _gw)
+            if gw_target_error is not None:
+                preview.errors.append(
+                    DiffRow(
+                        kind="subnet",
+                        action="error",
+                        network=canonical,
+                        reason=gw_target_error,
+                        details=row,
+                    )
+                )
+                continue
             preview.updates.append(
                 DiffRow(
                     kind="subnet",
@@ -418,8 +458,11 @@ async def commit_import(
     # Subnets created and the blocks they sit in, recounted once at the end
     # in batches (#2981), not per row.
     created_subnet_ids: list[uuid.UUID] = []
+    # Existing subnets whose gateway row ``overwrite`` moved (#3317).
+    recount_subnet_ids: list[uuid.UUID] = []
     touched_blocks: set[uuid.UUID] = set()
     from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _sync_dns_record,
         _update_blocks_utilization,
         _update_subnets_utilization,
     )
@@ -483,6 +526,18 @@ async def commit_import(
                 result_obj.skipped += 1
                 continue
             if strategy == "overwrite":
+                gw_target_error = await _overwrite_gateway_problem(db, existing, canonical, gateway)
+                if gw_target_error is not None:
+                    result_obj.errors.append(gw_target_error)
+                    continue
+                # A moved gateway takes New Subnet's reserved row and the old
+                # untouched placeholder goes, as on Edit Subnet (#3317).
+                moves_gateway_row = _gateway_moves(
+                    existing, gateway
+                ) and await holds_placeholder_rows(db, existing)
+                old_gateway_row = (
+                    await find_untouched_gateway_row(db, existing) if moves_gateway_row else None
+                )
                 old = {
                     "name": existing.name,
                     "description": existing.description,
@@ -496,8 +551,16 @@ async def commit_import(
                     existing.vlan_id = vlan_id
                 if vxlan_id is not None:
                     existing.vxlan_id = vxlan_id
+                if old_gateway_row is not None:
+                    await _sync_dns_record(db, old_gateway_row, existing, action="delete")
+                    await db.delete(old_gateway_row)
+                    await db.flush()
                 if gateway:
                     existing.gateway = gateway
+                if moves_gateway_row and gateway:
+                    await add_gateway_row(db, existing, gateway, created_by_user_id=current_user.id)
+                    recount_subnet_ids.append(existing.id)
+                    touched_blocks.add(existing.block_id)
                 if custom_fields:
                     merged = dict(existing.custom_fields or {})
                     merged.update(custom_fields)
@@ -639,7 +702,7 @@ async def commit_import(
     # The counters follow the rows just made (#2412 / #2981): one grouped
     # recount of the new subnets, then every block on their chains once.
     await db.flush()
-    await _update_subnets_utilization(db, created_subnet_ids)
+    await _update_subnets_utilization(db, created_subnet_ids + recount_subnet_ids)
     await db.flush()
     await _update_blocks_utilization(db, touched_blocks)
 
@@ -935,6 +998,12 @@ async def preview_address_import(
         row_hostname = fields.get("hostname") or ""
         existing_ip = existing.get(canonical)
         if existing_ip is None:
+            boundary = _boundary_host_refusal(subnet, canonical, fields)
+            if boundary is not None:
+                preview.errors.append(
+                    DiffRow(kind="address", action="error", network=canonical, reason=boundary)
+                )
+                continue
             create_details: dict[str, Any] = {"fields": fields}
             create_details.update(await _dhcp_flag(canonical, fields, None))
             preview.creates.append(
@@ -990,6 +1059,15 @@ async def preview_address_import(
                 )
             )
     return preview
+
+
+def _boundary_host_refusal(subnet: Any, canonical: str, fields: dict[str, Any]) -> str | None:
+    """A new imported host on an IPv4 network / broadcast address is refused,
+    as the REST create refuses it (#3321). The ``network`` / ``broadcast``
+    placeholder rows themselves are what belongs there, so they import."""
+    if (fields.get("status") or "allocated") in ("network", "broadcast"):
+        return None
+    return boundary_address_refusal(subnet, canonical)
 
 
 def _count_dns_sync(result_obj: Any, canonical: str, ip: Any, published: bool) -> None:
@@ -1201,6 +1279,10 @@ async def commit_address_import(
             )
 
         # New row
+        boundary = _boundary_host_refusal(subnet, canonical, fields)
+        if boundary is not None:
+            result_obj.errors.append(boundary)
+            continue
         ip_status = fields.get("status") or "allocated"
         new_ip = IPAddress(
             subnet_id=subnet.id,

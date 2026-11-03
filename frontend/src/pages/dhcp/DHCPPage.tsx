@@ -1882,6 +1882,8 @@ export function ServerPoolsOrStaticsTab({
       // Delete detaches the linked IPAM row + triggers DNS sync server-side,
       // so refresh the same IPAM/DNS keys the create/edit modal invalidates.
       qc.invalidateQueries({ queryKey: ["addresses", row.scope.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({
         queryKey: ["subnet-dns-sync", row.scope.subnet_id],
       });
