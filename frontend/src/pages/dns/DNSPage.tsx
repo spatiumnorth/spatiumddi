@@ -1156,7 +1156,28 @@ function patchCachedRow(
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
-export function GroupModal({
+// Edit reads the group fresh on open and Save sends only what changed (#3365).
+export function GroupModal(props: {
+  group?: DNSServerGroup;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow(props.group, () =>
+    dnsApi.getGroup(props.group!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server Group"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <GroupModalForm group={fresh.row} onClose={props.onClose} />;
+}
+
+function GroupModalForm({
   group,
   onClose,
 }: {
@@ -1239,7 +1260,7 @@ export function GroupModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError("");
-          mut.mutate({
+          const body = {
             name,
             description,
             group_type: groupType,
@@ -1248,7 +1269,32 @@ export function GroupModal({
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
             auto_reverse_zones_at_provider: autoReverseAtProvider,
-          });
+          };
+          if (!group) {
+            mut.mutate(body);
+            return;
+          }
+          // Edit sends only what the operator changed (#3365).
+          const diff = changedFields(
+            {
+              name: group.name,
+              description: group.description ?? "",
+              group_type: group.group_type ?? "internal",
+              is_recursive: group.is_recursive ?? true,
+              catalog_zones_enabled: group.catalog_zones_enabled ?? false,
+              catalog_zone_name:
+                group.catalog_zone_name ?? "catalog.spatium.invalid.",
+              is_public_facing: group.is_public_facing ?? false,
+              auto_reverse_zones_at_provider:
+                group.auto_reverse_zones_at_provider ?? false,
+            },
+            body,
+          );
+          if (Object.keys(diff).length === 0) {
+            onClose();
+            return;
+          }
+          mut.mutate(diff);
         }}
         className="space-y-3"
       >
@@ -1440,15 +1486,34 @@ export function GroupModal({
 
 // ── Server Modal (add / edit) ─────────────────────────────────────────────────
 
-export function ServerModal({
-  groupId,
-  server,
-  onClose,
-}: {
+type ServerModalProps = {
   groupId: string;
   server?: DNSServer;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the server fresh on open and Save sends only what changed
+// (#3379): the clicked row comes from a list loaded earlier.
+export function ServerModal(props: ServerModalProps) {
+  const fresh = useFreshRow(props.server, () =>
+    dnsApi
+      .listServers(props.groupId)
+      .then((rows) => rows.find((s) => s.id === props.server!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerModalForm {...props} server={fresh.row} />;
+}
+
+function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const editing = !!server;
@@ -1714,6 +1779,48 @@ export function ServerModal({
       }
     }
 
+    if (server) {
+      // Edit sends only what the operator changed (#3379); credentials,
+      // api_key, group move and primary flag are already conditional above.
+      const baseKeys = [
+        "name",
+        "driver",
+        "host",
+        "port",
+        "api_port",
+        "roles",
+        "notes",
+        "is_enabled",
+      ];
+      const base = Object.fromEntries(
+        baseKeys.filter((k) => k in payload).map((k) => [k, payload[k]]),
+      );
+      const rest = Object.fromEntries(
+        Object.entries(payload).filter(([k]) => !baseKeys.includes(k)),
+      );
+      const out = {
+        ...changedFields(
+          {
+            name: server.name,
+            driver: server.driver,
+            host: server.host,
+            port: server.port,
+            api_port: server.api_port ?? null,
+            roles: server.roles ?? [],
+            notes: server.notes ?? "",
+            is_enabled: server.is_enabled,
+          },
+          base,
+        ),
+        ...rest,
+      };
+      if (Object.keys(out).length === 0) {
+        onClose();
+        return;
+      }
+      mut.mutate(out);
+      return;
+    }
     mut.mutate(payload);
   }
 
@@ -7328,17 +7435,39 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   );
 }
 
-function TSIGKeyModal({
-  groupId,
-  existing,
-  onClose,
-  onCreated,
-}: {
+type TSIGKeyModalProps = {
   groupId: string;
   existing?: DNSTSIGKey;
   onClose: () => void;
   onCreated?: (s: { name: string; algorithm: string; secret: string }) => void;
-}) {
+};
+
+// Edit reads the key fresh on open and Save sends only what changed (#3379).
+export function TSIGKeyModal(props: TSIGKeyModalProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    dnsApi
+      .listTSIGKeys(props.groupId)
+      .then((rows) => rows.find((k) => k.id === props.existing!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit TSIG Key"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <TSIGKeyModalForm {...props} existing={fresh.row} />;
+}
+
+function TSIGKeyModalForm({
+  groupId,
+  existing,
+  onClose,
+  onCreated,
+}: TSIGKeyModalProps) {
   const qc = useQueryClient();
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
@@ -7359,12 +7488,17 @@ function TSIGKeyModal({
   const saveMut = useMutation({
     mutationFn: () => {
       if (isEdit && existing) {
-        return dnsApi.updateTSIGKey(groupId, existing.id, {
-          name,
-          algorithm,
-          purpose: purpose || null,
-          notes,
-        });
+        const diff = changedFields(
+          {
+            name: existing.name,
+            algorithm: existing.algorithm,
+            purpose: existing.purpose || null,
+            notes: existing.notes ?? "",
+          },
+          { name, algorithm, purpose: purpose || null, notes },
+        );
+        if (Object.keys(diff).length === 0) return Promise.resolve(existing);
+        return dnsApi.updateTSIGKey(groupId, existing.id, diff);
       }
       return dnsApi.createTSIGKey(groupId, {
         name,
@@ -10799,7 +10933,28 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   );
 }
 
-function BlocklistModal({
+// Edit reads the list fresh on open and Save sends only what changed (#3365).
+export function BlocklistModal(props: {
+  list?: DNSBlockList;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow(props.list, () =>
+    dnsBlocklistApi.get(props.list!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Blocking List"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <BlocklistModalForm list={fresh.row} onClose={props.onClose} />;
+}
+
+function BlocklistModalForm({
   list,
   onClose,
 }: {
@@ -10844,24 +10999,48 @@ function BlocklistModal({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          mut.mutate(
-            blocklistPayload(
-              {
-                name,
-                description,
-                category,
-                sourceType,
-                feedUrl,
-                feedFormat,
-                blockMode,
-                sinkholeIp,
-                updateHours,
-                feedWildcard,
-                enabled,
-              },
-              !!list,
-            ),
+          const body = blocklistPayload(
+            {
+              name,
+              description,
+              category,
+              sourceType,
+              feedUrl,
+              feedFormat,
+              blockMode,
+              sinkholeIp,
+              updateHours,
+              feedWildcard,
+              enabled,
+            },
+            !!list,
           );
+          if (!list) {
+            mut.mutate(body);
+            return;
+          }
+          // Edit sends only what the operator changed (#3365).
+          const diff = changedFields(
+            {
+              name: list.name,
+              description: list.description ?? "",
+              category: list.category ?? "custom",
+              source_type: list.source_type ?? "manual",
+              feed_url: list.feed_url ?? null,
+              feed_format: list.feed_format ?? "hosts",
+              block_mode: list.block_mode ?? "nxdomain",
+              sinkhole_ip: list.sinkhole_ip ?? null,
+              update_interval_hours: list.update_interval_hours ?? 24,
+              feed_entries_are_wildcard: list.feed_entries_are_wildcard ?? true,
+              enabled: list.enabled ?? true,
+            },
+            body,
+          );
+          if (Object.keys(diff).length === 0) {
+            onClose();
+            return;
+          }
+          mut.mutate(diff);
         }}
       >
         <Field label="Name">

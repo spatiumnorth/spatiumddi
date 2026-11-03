@@ -697,11 +697,14 @@ curl -sS -f -o backup.zip -D headers.txt \
 grep -i '^etag:' headers.txt | cut -d' ' -f2- > etag.txt
 ```
 
-Three things make this a least-privilege pull rather than a full API key:
+Three things to know about this pull:
 
-* **Mint the token with `allowed_paths`** restricted to that one route. A token
-  so restricted gets 403 on `GET /backup/targets` — it can fetch the archive and
-  nothing else.
+* **The token must be unrestricted** (no scopes), and its owner a superadmin,
+  which the route requires. A `read` token is refused: reading the destination
+  is outbound, which `read` never does, and no write scope covers `/backup`.
+  There is no way to limit a token to this one route (`allowed_paths` is
+  reserved and enforced nowhere), so keep the credential in the backup tool's
+  secret store and revoke it when the job is retired.
 * **The response is conditional.** Archive filenames carry a UTC timestamp and
   the bytes under a name are never rewritten, so the filename is a legitimate
   strong `ETag`. A poller that already has the newest archive gets a `304` and

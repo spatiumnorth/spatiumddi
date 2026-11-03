@@ -12,6 +12,8 @@ import {
   formatDialogError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -33,15 +35,36 @@ function pickPort(start: number | null, end: number | null): string {
 // Modal
 // ─────────────────────────────────────────────────────────────────────
 
-function NATMappingModal({
-  initial,
-  onClose,
-  onSaved,
-}: {
+type NATMappingModalProps = {
   initial: NATMapping | null;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the mapping fresh on open and Save sends only what changed
+// (#3365).
+export function NATMappingModal(props: NATMappingModalProps) {
+  const fresh = useFreshRow(props.initial ?? undefined, () =>
+    natApi.get(props.initial!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit NAT mapping"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <NATMappingModalForm {...props} initial={fresh.row ?? null} />;
+}
+
+function NATMappingModalForm({
+  initial,
+  onClose,
+  onSaved,
+}: NATMappingModalProps) {
   const editing = initial != null;
   const [name, setName] = useState(initial?.name ?? "");
   const [kind, setKind] = useState<NATKind>(initial?.kind ?? "1to1");
@@ -80,7 +103,7 @@ function NATMappingModal({
   });
 
   const saveMut = useMutation({
-    mutationFn: (body: NATMappingWrite) =>
+    mutationFn: (body: Partial<NATMappingWrite>) =>
       editing && initial
         ? natApi.update(initial.id, body)
         : natApi.create(body),
@@ -122,7 +145,34 @@ function NATMappingModal({
       device_label: deviceLabel.trim() || null,
       description: description.trim() || null,
     };
-    saveMut.mutate(body);
+    if (!initial) {
+      saveMut.mutate(body);
+      return;
+    }
+    const diff: Partial<NATMappingWrite> = changedFields(
+      {
+        name: initial.name,
+        kind: initial.kind,
+        internal_ip: initial.internal_ip ?? null,
+        internal_subnet_id: initial.internal_subnet_id ?? null,
+        internal_port_start: initial.internal_port_start ?? null,
+        internal_port_end: initial.internal_port_end ?? null,
+        external_ip: initial.external_ip ?? null,
+        external_port_start: initial.external_port_start ?? null,
+        external_port_end: initial.external_port_end ?? null,
+        protocol: initial.protocol,
+        device_label: initial.device_label ?? null,
+        description: initial.description ?? null,
+      },
+      { ...body },
+    );
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    // A change of kind reshapes which address / port fields apply, so the
+    // mapping is validated whole: send all of it then.
+    saveMut.mutate("kind" in diff ? body : diff);
   }
 
   const showInternalIp = kind === "1to1" || kind === "pat";

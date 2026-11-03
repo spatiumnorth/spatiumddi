@@ -17,6 +17,22 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+const STORED_POLICY = {
+  id: "p1",
+  group_id: "g1",
+  name: "phones",
+  description: "",
+  enabled: true,
+  class_name: "spatium-dp-phones",
+  device_classes: [],
+  options: {},
+  lease_time: 86400,
+  match_override: null,
+  include_ambiguous: false,
+  priority: 0,
+  created_at: "",
+  modified_at: "",
+};
 const createDevicePolicy = vi.fn(() => Promise.resolve({}));
 const updateDevicePolicy = vi.fn(() => Promise.resolve({}));
 
@@ -29,6 +45,8 @@ vi.mock("@/lib/api", () => ({
       (createDevicePolicy as (...x: unknown[]) => unknown)(...a),
     updateDevicePolicy: (...a: unknown[]) =>
       (updateDevicePolicy as (...x: unknown[]) => unknown)(...a),
+    // The edit dialog reads the policy fresh on open (#3379).
+    listDevicePolicies: () => Promise.resolve([STORED_POLICY]),
   },
 }));
 
@@ -97,33 +115,25 @@ describe("DevicePolicyModal", () => {
     expect(calls[0][1].lease_time).toBe(600);
   });
 
-  it("saves an existing lease unchanged on edit", async () => {
-    open({
-      id: "p1",
-      group_id: "g1",
-      name: "phones",
-      description: "",
-      enabled: true,
-      class_name: "spatium-dp-phones",
-      device_classes: [],
-      options: {},
-      lease_time: 86400,
-      match_override: null,
-      include_ambiguous: false,
-      priority: 0,
-      created_at: "",
-      modified_at: "",
-    });
+  it("keeps an existing lease on edit without sending it", async () => {
+    open(STORED_POLICY);
     expect(
-      (screen.getByLabelText("Lease time (seconds)") as HTMLInputElement).value,
+      (
+        (await screen.findByLabelText(
+          "Lease time (seconds)",
+        )) as HTMLInputElement
+      ).value,
     ).toBe("86400");
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "phones2" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
     await waitFor(() => expect(updateDevicePolicy).toHaveBeenCalledTimes(1));
-    const calls = updateDevicePolicy.mock.calls as unknown as [
-      string,
-      { lease_time: number | null },
-    ][];
-    expect(calls[0][1].lease_time).toBe(86400);
+    // Only the changed field goes (#3379): the untouched lease is not
+    // re-sent, so it cannot overwrite a newer one.
+    expect(updateDevicePolicy).toHaveBeenCalledWith("p1", {
+      name: "phones2",
+    });
   });
 
   it("sends null for a genuinely blank lease", async () => {

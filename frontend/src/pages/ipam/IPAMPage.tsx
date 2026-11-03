@@ -7,6 +7,7 @@ import {
   useQueries,
   useMutation,
   useQueryClient,
+  type QueryClient,
 } from "@tanstack/react-query";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import {
@@ -8369,7 +8370,9 @@ function EditSubnetModalForm({
           ? !autoAddresses // True = remove, False = add
           : undefined;
       const body = {
-        name: name || undefined,
+        // ``""`` when cleared: ``|| undefined`` was dropped by JSON.stringify,
+        // so the clear answered 200 and the old name stayed (#3370).
+        name,
         description,
         // Explicit null so the operator can clear the gateway (nullable
         // column); ``|| undefined`` was silently dropped (#502).
@@ -8425,7 +8428,7 @@ function EditSubnetModalForm({
       const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
       const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
       const was: Record<string, unknown> = {
-        name: subnet.name || undefined,
+        name: subnet.name ?? "",
         description: subnet.description ?? "",
         gateway: subnet.gateway || null,
         vlan_ref_id: subnet.vlan_ref_id ?? null,
@@ -9419,10 +9422,13 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   });
 
   // Fetch effective DNS for the subnet this IP belongs to
+  // Re-read on open: an Edit Block / Edit Subnet may have moved the zones
+  // since the last read (#3368, as #3078).
   const { data: effectiveDns } = useQuery({
     queryKey: ["effective-dns-subnet", address.subnet_id],
     queryFn: () => ipamApi.getEffectiveSubnetDns(address.subnet_id),
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // Aliases live in the DNS zone but are owned by this IP (auto-deleted on purge).
@@ -10660,17 +10666,38 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   );
 }
 
-function AddressSetModal({
-  subnet,
-  existing,
-  onClose,
-  onSaved,
-}: {
+type AddressSetModalProps = {
   subnet: Subnet;
   existing?: AddressSet;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the set fresh on open and Save sends only what changed (#3365):
+// the row the page holds is from a list loaded earlier.
+export function AddressSetModal(props: AddressSetModalProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    addressSetsApi.get(props.existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit address set"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <AddressSetModalForm {...props} existing={fresh.row} />;
+}
+
+function AddressSetModalForm({
+  subnet,
+  existing,
+  onClose,
+  onSaved,
+}: AddressSetModalProps) {
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -10703,7 +10730,7 @@ function AddressSetModal({
     mutationFn: () => {
       const explicit = parseExplicit();
       if (isEdit && existing) {
-        const body: AddressSetUpdate = {
+        const after: AddressSetUpdate = {
           name,
           description,
           customer_id: customerId,
@@ -10713,6 +10740,32 @@ function AddressSetModal({
           end_address: rangeKind === "contiguous" ? endAddress : null,
           explicit_addresses: rangeKind === "explicit" ? explicit : [],
         };
+        const body: AddressSetUpdate = changedFields(
+          {
+            name: existing.name,
+            description: existing.description ?? "",
+            customer_id: existing.customer_id ?? null,
+            site_id: existing.site_id ?? null,
+            range_kind: existing.range_kind,
+            start_address: existing.start_address ?? null,
+            end_address: existing.end_address ?? null,
+            explicit_addresses: existing.explicit_addresses ?? [],
+          },
+          { ...after },
+        );
+        // The range is one unit: when any part of it changed, send all of it.
+        if (
+          "range_kind" in body ||
+          "start_address" in body ||
+          "end_address" in body ||
+          "explicit_addresses" in body
+        ) {
+          body.range_kind = after.range_kind;
+          body.start_address = after.start_address;
+          body.end_address = after.end_address;
+          body.explicit_addresses = after.explicit_addresses;
+        }
+        if (Object.keys(body).length === 0) return Promise.resolve(existing);
         return addressSetsApi.update(existing.id, body);
       }
       const body: AddressSetCreate = {
@@ -10847,7 +10900,7 @@ function AddressSetModal({
 
 // ─── Bulk Edit / Bulk Delete modals ──────────────────────────────────────────
 
-function BulkEditAddressesModal({
+export function BulkEditAddressesModal({
   ipIds,
   subnetId,
   onClose,
@@ -10880,6 +10933,7 @@ function BulkEditAddressesModal({
   const [editCustomFields, setEditCustomFields] = useState(false);
   const [editDnsZone, setEditDnsZone] = useState(false);
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   const [editRole, setEditRole] = useState(false);
   const [role, setRole] = useState<string>("");
   const [editReservedUntil, setEditReservedUntil] = useState(false);
@@ -10894,11 +10948,19 @@ function BulkEditAddressesModal({
   // Same shape the single-address modal uses: load the effective DNS config
   // for the subnet, then restrict the picker to explicit primary + additional
   // zones. Falling back to all group zones only when nothing is pinned.
-  const { data: effectiveDns } = useQuery({
+  // Re-read on open: Edit Block / Edit Subnet can have moved the primary zone
+  // since the last read, and Apply sends what the picker shows (#3368, as
+  // #3078 for Allocate IP).
+  const {
+    data: effectiveDns,
+    isFetching: effectiveFetching,
+    isRefetchError: effectiveRefetchFailed,
+  } = useQuery({
     queryKey: ["effective-dns-subnet", subnetId ?? "none"],
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId as string),
     enabled: !!subnetId,
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   // #2135 — no zone reads while core.dns is off, so no zone picker either.
   const dnsOn = useModuleOn("core.dns");
@@ -10923,16 +10985,36 @@ function BulkEditAddressesModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // The pick is not final while the subnet's DNS is re-read over a cached
+  // copy, or its zones are on their way: Apply and the picker wait (#3368).
+  // Both settle on error or offline (isFetching / isLoading go false), so
+  // this never blocks for good; a failed re-read keeps the cached answer
+  // and says so below.
+  const zonesPending =
+    editDnsZone &&
+    dnsOn &&
+    ((effectiveFetching && effectiveDns !== undefined) ||
+      !zoneQueries.every((q: { isLoading: boolean }) => !q.isLoading));
+  // The section is hidden when the fresh answer leaves no zone to pick; a
+  // tick made over the cached copy must not then send a zone the dialog no
+  // longer shows.
+  const dnsZoneEditing = editDnsZone && availableZones.length > 0;
+  // Re-pick the primary when the fresh answer changes it, until the operator
+  // has chosen.
   useEffect(() => {
-    if (editDnsZone && !dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z: DNSZone) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [editDnsZone, availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!editDnsZone || dnsZoneTouched || availableZones.length === 0) return;
+    const primary = effectiveDns?.dns_zone_id;
+    const target =
+      primary && availableZones.some((z: DNSZone) => z.id === primary)
+        ? primary
+        : availableZones[0].id;
+    if (target !== dnsZoneId) setDnsZoneId(target);
+  }, [
+    editDnsZone,
+    dnsZoneTouched,
+    availableZones.length,
+    effectiveDns?.dns_zone_id,
+  ]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Needed for "replace all tags" mode: we need the union of existing keys
   // across the selected IPs so we can null them out server-side.
@@ -11007,7 +11089,7 @@ function BulkEditAddressesModal({
         }
         if (Object.keys(cfObj).length > 0) changes.custom_fields = cfObj;
       }
-      if (editDnsZone) changes.dns_zone_id = dnsZoneId; // "" clears the zone
+      if (dnsZoneEditing) changes.dns_zone_id = dnsZoneId; // "" clears the zone
       return ipamApi.bulkEditAddresses({ ip_ids: ipIds, changes });
     },
     onSuccess: (res) => {
@@ -11049,7 +11131,7 @@ function BulkEditAddressesModal({
     editDescription ||
     hasTagChanges ||
     hasCfChanges ||
-    editDnsZone ||
+    dnsZoneEditing ||
     editRole ||
     editReservedUntil;
 
@@ -11182,7 +11264,13 @@ function BulkEditAddressesModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  // Not choosable until the re-read answers: a pick made
+                  // from the cached list could name a zone it drops (#3368).
+                  disabled={zonesPending}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}
@@ -11191,6 +11279,17 @@ function BulkEditAddressesModal({
                     noneOption="None (remove DNS records)"
                   />
                 </select>
+                {zonesPending && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Re-reading the subnet&rsquo;s DNS zones&hellip;
+                  </p>
+                )}
+                {effectiveRefetchFailed && !zonesPending && (
+                  <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                    Could not re-read the subnet&rsquo;s DNS settings; these
+                    zones are from an earlier read and may be out of date.
+                  </p>
+                )}
                 <p className="text-[11px] text-muted-foreground">
                   Moves every selected IP's forward record to this zone (and
                   deletes the old record if present). Picking &ldquo;None&rdquo;
@@ -11435,7 +11534,12 @@ function BulkEditAddressesModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!hasChanges || mutation.isPending}
+            disabled={!hasChanges || zonesPending || mutation.isPending}
+            title={
+              zonesPending
+                ? "Waiting for the subnet's DNS zones to load"
+                : undefined
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Applying…" : "Apply to all"}
@@ -12215,6 +12319,16 @@ type EditSpaceModalProps = {
 
 // Reads the space fresh on open (#3075): the panel holds the space as it was
 // when clicked, and the form is seeded once from it.
+/** Every effective-DNS read a space / block / subnet save can change. */
+function invalidateEffectiveDns(qc: QueryClient) {
+  for (const k of [
+    "effective-dns-subnet",
+    "effective-dns-block",
+    "effective-dns-space",
+  ])
+    qc.invalidateQueries({ queryKey: [k] });
+}
+
 export function EditSpaceModal(props: EditSpaceModalProps) {
   const fresh = useFreshRow<IPSpace>(props.space, () =>
     ipamApi.getSpace(props.space.id),
@@ -12333,6 +12447,8 @@ function EditSpaceModalForm({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
+      // A space's DNS settings reach every block and subnet below it (#3368).
+      invalidateEffectiveDns(qc);
       onClose();
     },
     // #516 — surface save failures (403/409/etc.) instead of leaving the
@@ -13175,7 +13291,8 @@ function EditBlockModalForm({
   const mutation = useMutation({
     mutationFn: async () => {
       const now = {
-        name: name || undefined,
+        // ``""`` when cleared, as for a subnet (#3370).
+        name,
         description,
         custom_fields: customFields,
         dns_inherit_settings: dnsInherit,
@@ -13196,7 +13313,7 @@ function EditBlockModalForm({
       // inherited DNS / DHCP fields go out as null, so they are compared as
       // null whatever the stored row holds under an inheriting block.
       const was = {
-        name: block.name || undefined,
+        name: block.name ?? "",
         description: block.description ?? "",
         custom_fields: block.custom_fields ?? {},
         dns_inherit_settings: block.dns_inherit_settings ?? true,
@@ -13232,6 +13349,8 @@ function EditBlockModalForm({
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
+      // A block's DNS settings reach its subnets' effective DNS (#3368).
+      invalidateEffectiveDns(qc);
       onClose(updated);
     },
     onError: (err: unknown) => {
