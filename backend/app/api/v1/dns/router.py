@@ -9,6 +9,7 @@ import json
 import re
 import uuid
 import zipfile
+import zlib
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
@@ -6925,6 +6926,45 @@ def _acl_version(enabled: bool, entries: list[UpdateAclEntryOut]) -> str:
     return hashlib.sha256(json.dumps(canon, separators=(",", ":")).encode()).hexdigest()[:32]
 
 
+# Advisory-lock namespace for a zone's dynamic-update ACL replace (#3381).
+_LOCK_NS_ZONE_UPDATE_ACL = 0x3381_0AC1
+
+
+async def _lock_acl_and_check_version(db: DB, zone: DNSZone, expected_version: str | None) -> None:
+    """Serialise ACL replaces on one zone, then refuse a stale one (#3381).
+
+    Every ACL writer (the REST PUT and the MCP apply) calls this before
+    touching the rows, so the version compare and the write are one step
+    against any other writer. A per-zone advisory lock, not ``FOR UPDATE``
+    on the zone row: only ACL writers take it, and they take it before
+    anything else, so it cannot close a cycle. A zone-row lock would — a
+    record or zone edit holds the audit-chain lock and then updates the
+    zone row, while this request would hold the row and then want the
+    audit lock at commit. ``expected_version=None`` replaces
+    unconditionally (still serialised).
+    """
+    key = zlib.crc32(str(zone.id).encode("utf-8"))
+    if key >= 2**31:
+        key -= 2**32
+    await db.execute(select(func.pg_advisory_xact_lock(_LOCK_NS_ZONE_UPDATE_ACL, key)))
+    if expected_version is None:
+        return
+    await db.refresh(zone, ["dynamic_update_enabled"])
+    current = _acl_version(zone.dynamic_update_enabled, await _load_acl_out(db, zone.id))
+    if current != expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACL_VERSION_CONFLICT",
+                "message": (
+                    "Someone changed this ACL since you opened it. "
+                    "Reload to see the current entries."
+                ),
+                "current_version": current,
+            },
+        )
+
+
 async def _group_driver_names(db: DB, group_id: uuid.UUID) -> list[str]:
     """Distinct driver names among a group's servers.
 
@@ -6983,7 +7023,9 @@ async def _load_acl_out(db: DB, zone_id: uuid.UUID) -> list[UpdateAclEntryOut]:
             select(DNSZoneUpdateAcl, DNSTSIGKey.name)
             .outerjoin(DNSTSIGKey, DNSZoneUpdateAcl.tsig_key_id == DNSTSIGKey.id)
             .where(DNSZoneUpdateAcl.zone_id == zone_id)
-            .order_by(DNSZoneUpdateAcl.seq)
+            # ``id`` breaks a ``seq`` tie (the index is not unique), so two
+            # reads of an unchanged ACL list it, and version it, alike (#3381).
+            .order_by(DNSZoneUpdateAcl.seq, DNSZoneUpdateAcl.id)
         )
     ).all()
     return [
@@ -7222,24 +7264,7 @@ async def replace_zone_update_acl(
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
-    if body.expected_version is not None:
-        # Serialise concurrent replaces on the zone row so the compare and
-        # the write are one step, then refuse if the ACL moved (#3381).
-        await db.execute(select(DNSZone.id).where(DNSZone.id == zone.id).with_for_update())
-        await db.refresh(zone)
-        current = _acl_version(zone.dynamic_update_enabled, await _load_acl_out(db, zone.id))
-        if current != body.expected_version:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "ACL_VERSION_CONFLICT",
-                    "message": (
-                        "Someone changed this ACL since you opened it. "
-                        "Reload to see the current entries."
-                    ),
-                    "current_version": current,
-                },
-            )
+    await _lock_acl_and_check_version(db, zone, body.expected_version)
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
     db.add(

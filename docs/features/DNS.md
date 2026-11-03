@@ -2420,8 +2420,10 @@ entry is UDP-spoofable → recommend TSIG).
   Send the `version` you read as `expected_version`: if the stored ACL has
   changed since, the call answers 409 (`ACL_VERSION_CONFLICT`) and changes
   nothing. `expected_version` is optional — omit it and the replace is
-  unconditional, as before. The response carries the new `version`. The MCP
-  `propose_set_zone_update_acl` has no token and replaces unconditionally.
+  unconditional, as before. The response carries the new `version`. Every
+  ACL replace is serialised per zone, so the check and the write are one
+  step. The MCP `propose_set_zone_update_acl` pins the version current when
+  it is proposed, and Apply refuses if the ACL has changed since.
 
 All three gate behind the default-on `dns.dynamic_update_acl` feature
 module. MCP: `find_zone_update_acls` (read, default-on) +

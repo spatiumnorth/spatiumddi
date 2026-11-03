@@ -73,6 +73,13 @@ function mount() {
   );
 }
 
+// Replace the single entry's CIDR, so the save has a change to send.
+async function setCidr(cidr: string) {
+  const input = screen.getByDisplayValue(/^10\.\d+\.\d+\.\d+\/32$/);
+  await userEvent.clear(input);
+  await userEvent.type(input, cidr);
+}
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -81,16 +88,19 @@ afterEach(() => {
 describe("ACL version check (#3381)", () => {
   it("sends the token it read, then the new one on a second save", async () => {
     getAcl.mockResolvedValue(acl("v1", "10.0.0.1/32"));
-    replaceAcl.mockResolvedValueOnce(acl("v2", "10.0.0.1/32"));
-    replaceAcl.mockResolvedValueOnce(acl("v3", "10.0.0.1/32"));
+    replaceAcl.mockResolvedValueOnce(acl("v2", "10.0.0.2/32"));
+    replaceAcl.mockResolvedValueOnce(acl("v3", "10.0.0.3/32"));
     mount();
     const save = await screen.findByRole("button", { name: "Save ACL" });
+    // An unchanged save sends nothing (#3379), so each save edits the entry.
+    await setCidr("10.0.0.2/32");
     await userEvent.click(save);
     await waitFor(() => expect(replaceAcl).toHaveBeenCalledTimes(1));
     expect(replaceAcl.mock.calls[0][2].expected_version).toBe("v1");
     await waitFor(() =>
       expect((save as HTMLButtonElement).disabled).toBe(false),
     );
+    await setCidr("10.0.0.3/32");
     await userEvent.click(save);
     await waitFor(() => expect(replaceAcl).toHaveBeenCalledTimes(2));
     expect(replaceAcl.mock.calls[1][2].expected_version).toBe("v2");
@@ -106,9 +116,9 @@ describe("ACL version check (#3381)", () => {
       },
     });
     mount();
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Save ACL" }),
-    );
+    const save = await screen.findByRole("button", { name: "Save ACL" });
+    await setCidr("10.0.0.2/32");
+    await userEvent.click(save);
     expect(
       await screen.findByText(/Someone changed this ACL since you opened it/),
     ).toBeTruthy();

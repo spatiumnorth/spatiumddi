@@ -736,3 +736,60 @@ async def test_replace_update_acl_version_check(
     r5 = await client.put(url, headers=headers, json={"entries": []})
     assert r5.status_code == 200
     assert r5.json()["entries"] == []
+
+
+async def test_copilot_proposal_pins_acl_version(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3381 — a Copilot proposal applies only over the ACL it previewed.
+
+    propose -> Apply can be minutes apart; an ACL changed in between must not
+    be silently replaced by the proposal's copy.
+    """
+    from app.services.ai.operations_writes import (
+        SetZoneUpdateAclArgs,
+        _apply_set_zone_update_acl,
+        _preview_set_zone_update_acl,
+    )
+
+    user, headers = await _superadmin(db_session)
+    group, zone, _key = await _bind9_group_zone_key(db_session)
+    await db_session.commit()
+    group_id, zone_id, user_id = group.id, zone.id, user.id
+    url = f"/api/v1/dns/groups/{group_id}/zones/{zone_id}/update-acl"
+    v0 = (await client.get(url, headers=headers)).json()["version"]
+
+    def _args() -> SetZoneUpdateAclArgs:
+        return SetZoneUpdateAclArgs(
+            group_id=group_id,
+            zone_id=zone_id,
+            entries=[{"match_kind": "ip", "ip_cidr": "10.9.9.9"}],
+        )
+
+    # Preview pins the current version into the (persisted) args.
+    stale = _args()
+    assert (await _preview_set_zone_update_acl(db_session, user, stale)).ok
+    assert stale.expected_version == v0
+
+    # Someone edits the ACL before Apply.
+    r = await client.put(
+        url,
+        headers=headers,
+        json={"entries": [{"match_kind": "ip", "ip_cidr": "10.0.0.7"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    with pytest.raises(ValueError, match="changed since this was proposed"):
+        await _apply_set_zone_update_acl(db_session, user, stale)
+    await db_session.rollback()
+    after = (await client.get(url, headers=headers)).json()
+    assert [e["ip_cidr"] for e in after["entries"]] == ["10.0.0.7/32"]
+    user = await db_session.get(User, user_id)
+    assert user is not None
+
+    # A fresh proposal over the current ACL applies.
+    fresh = _args()
+    assert (await _preview_set_zone_update_acl(db_session, user, fresh)).ok
+    await _apply_set_zone_update_acl(db_session, user, fresh)
+    after = (await client.get(url, headers=headers)).json()
+    assert [e["ip_cidr"] for e in after["entries"]] == ["10.9.9.9/32"]
