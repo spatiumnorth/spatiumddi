@@ -72,6 +72,12 @@ export function PXEProfilesPage() {
       setDeleting(null);
     },
   });
+  // A refusal is shown in the dialog (#3396), so closing it forgets the
+  // refusal: the next profile's dialog starts clean.
+  function closeDelete() {
+    deleteMut.reset();
+    setDeleting(null);
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -155,16 +161,27 @@ export function PXEProfilesPage() {
         />
       )}
       {deleting && (
-        <Modal title="Delete PXE profile" onClose={() => setDeleting(null)}>
+        <Modal title="Delete PXE profile" onClose={closeDelete}>
           <div className="space-y-4 text-sm">
             <p>
               Permanently delete <strong>{deleting.name}</strong>? Any scope
               currently bound to this profile will detach automatically (FK SET
               NULL).
             </p>
+            {/* #3396: the server's reason when it refuses the delete (a pool
+                whose class restriction names one of the profile's rule
+                classes answers 409, #3374); the dialog stays open. */}
+            {deleteMut.isError && (
+              <div
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              >
+                {formatApiError(deleteMut.error, "Delete failed.")}
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setDeleting(null)}
+                onClick={closeDelete}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
               >
                 Cancel
