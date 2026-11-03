@@ -2244,3 +2244,190 @@ speak for themselves.
 - **DNS zone link must resolve.** Setting `dns_zone_id` on a subnet
   requires the zone to exist *in the subnet's configured view* —
   linking a zone from a different view returns `404`.
+
+---
+
+## 17. Network entities and discovery — reference summaries
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation. Each entry is the short operational description: what is stored, how it behaves, where the seams are._
+
+### Hierarchical IP management
+
+spaces, blocks, subnets, addresses in a visual tree.
+
+- IPv4 + full IPv6 auto-allocation (EUI-64 / random /128 / sequential)
+- Per-IP role: host / loopback / anycast / vip / vrrp / secondary / gateway
+- Reservation TTL with auto-expiry
+- Per-IP MAC observation history
+- **Bulk allocate** a contiguous range with a name template
+  (`dhcp-{n}` / `host-{oct3}-{oct4}` / `web-{n:03d}`) — preview
+  → commit, capped at 1024 IPs, skips dynamic DHCP pools, detects
+  FQDN collisions, optionally creates A + PTR records
+- **IP table polish** — sticky column headers, shift-click range
+  select, "Seen" recency dot per row (alive / stale / cold /
+  never), subtle gap markers between non-contiguous IPs so a
+  deleted hole doesn't go unnoticed
+
+### Subnet planner + planning tools
+
+design CIDR hierarchies before applying them.
+
+- `/ipam/plans` — draggable multi-level CIDR design surface (root + nested children, arbitrary depth)
+- Saved as `SubnetPlan` rows, validated live as the operator edits, applied in a single transaction
+- Per-node DNS-group / DHCP-group / gateway bindings (null = inherit, explicit = set + flip inherit off)
+- CIDR calculator at `/tools/cidr` — pure client-side IPv4 + IPv6 breakdown
+- Address planner — packs `{count, prefix_len}` requests into free space using largest-prefix-first ordering
+- Aggregation suggestion banner — surfaces clean-merge opportunities (10.0.0.0/24 + 10.0.1.0/24 → /23)
+- Free-space treemap toggleable from the Allocation map header — surfaces fragmentation hidden in the 1-D band
+
+### NAT mapping cross-reference
+
+operator-curated rules with FK links to IPAM.
+
+- 1:1 / PAT / hide-NAT supported
+- Per-IP modal lists every mapping that touches the address
+- Per-subnet "NAT" tab uses Postgres CIDR containment to find every mapping crossing into the subnet's range
+
+### Multicast group registry
+
+IPv4 + IPv6 multicast groups as first-class entities.
+
+- RFC 5771 IANA registry seeded as platform-provided rows (e.g. `224.0.0.1` All-Hosts, `224.0.0.5` OSPF, …)
+- Operator catalog of business-defined groups (per-IPSpace) with description, owner, scope (link-local / admin-local / org-local / global)
+- **PIM rendezvous-point domains** — `pim_rp_domain` table tracking RP routers + group ranges they serve
+- **IPAM tree integration** — creating a group in an IPSpace auto-creates the enclosing `224.0.0.0/4` (v4) or `ff00::/8` (v6) IPBlock when none exists; a startup hook backfills blocks for pre-existing groups so the upgrade is seamless
+- **Tree rendering** — multicast IPBlocks render with a violet 📡 Radio icon in both the tree row and BlockDetailView identity row; inside a multicast block, a "Multicast Groups" panel surfaces the streams whose addresses fall within the block's CIDR (queries `multicast_group` directly — no mirror IPAddress rows)
+- **Click-through** opens the multicast page pre-scoped to the IPSpace via `?space=<uuid>`
+- **Bulk-allocate** from RFC 2365 admin-scoped ranges with name templating
+- Per-IP collision conformity check — flags addresses that overlap a known multicast registration before allocation
+
+### ASN management
+
+first-class autonomous-system entity.
+
+- Data model: `asn` table with BigInteger `number` (full 32-bit range), auto-derived `kind` (public / private per RFC 6996 + RFC 7300), auto-derived `registry` (RIR — arin / ripe / apnic / lacnic / afrinic) from a hand-curated IANA delegation snapshot
+- **RDAP holder refresh** — per-RIR routing via IANA bootstrap; per-row Refresh button + scheduled hourly task (`asn_whois_interval_hours`, default 24 h)
+- **RPKI ROA pull** — Cloudflare or RIPE NCC source (operator-tunable via `rpki_roa_source`); cached for 5 min in-memory so a sweep of 50 ASNs makes one HTTP call; per-row Refresh RPKI button
+- **Holder-drift diff viewer** — `previous_holder` persisted on every refresh so the WHOIS tab can render a side-by-side without consulting the audit log
+- **Alert rules** — `asn_holder_drift`, `asn_whois_unreachable`, `rpki_roa_expiring`, `rpki_roa_expired`
+- **BGP Footprint tab** — what the *rest of the internet* sees for this AS, alongside what you've recorded. RIPEstat supplies announced prefixes, prefix-overview and routing history; PeeringDB supplies the peering profile and IXP presence. Read-only, REST + MCP, with an in-process TTL cache (RIPEstat 6 h, PeeringDB 24 h) so an open tab doesn't hammer either service
+- Detail page tabs: WHOIS · RPKI ROAs · **BGP Footprint** · BGP Monitoring · Learned Routes (only when the Looking Glass module is on) · BGP Peering · Communities · IP Spaces / Blocks · Alert History
+
+### BGP peering + communities
+
+operator-curated relationship graph + community catalog.
+
+- **Peerings** — `bgp_peering` table with `peer | customer | provider | sibling`; both endpoints FK ON DELETE CASCADE; unique on `(local, peer, relationship_type)`. Form lets the operator pick either side as "local"; modal normalises to canonical shape on submit
+- **`Router.local_asn_id` FK** — stamps which AS a router originates routes from
+- **Communities catalog** — 7 RFC 1997 / 7611 / 7999 well-knowns seeded as platform rows (no-export, no-advertise, no-export-subconfed, local-as, graceful-shutdown, blackhole, accept-own); per-AS catalog with `kind` validation (`standard` / `regular` `ASN:N` / `large` `ASN:N:M`)
+- "Use on this AS" button per standard row pre-fills the form with the well-known value
+
+### VRFs as first-class entities
+
+replaces the freeform `vrf_name` / `route_distinguisher` / `route_targets` text fields on IPSpace.
+
+- Data model: `vrf` table with name, description, optional `asn_id` FK, RD (with format validation), split import / export RT lists, tags, custom_fields
+- `ip_space.vrf_id` + `ip_block.vrf_id` FKs ON DELETE SET NULL
+- **Cross-cutting RD / RT validator** — each `ASN:N` entry whose ASN portion does not match `vrf.asn.number` produces a non-blocking warning; `vrf_strict_rd_validation` toggle escalates to 422
+- `IPBlock.vrf_warning` flags when a block's pinned VRF differs from its parent space's VRF (intentional in hub-and-spoke designs but worth a heads-up)
+- **VRF picker** on the New / Edit IPSpace and Create / Edit IPBlock modals (replaces the freeform text inputs)
+- Migration backfills existing freeform values into VRF rows so nothing is lost
+
+### Domain registration tracking
+
+distinct from DNSZone (records SpatiumDDI serves vs. registry-side metadata).
+
+- Data model: `domain` table tracking registrar / registrant / expiry / DNSSEC status / nameservers
+- **RDAP refresh** — TLD → RDAP-base lookup driven by the IANA bootstrap registry (`data.iana.org/rdap/dns.json`), cached 6 h; routes `.com` → `rdap.verisign.com/com/v1/`, etc.
+- **Nameserver drift** — operator-pinned expected list vs. registry-advertised list, with a side-by-side diff panel
+- **Alert rules** — `domain_expiring` (severity escalation around `threshold_days`), `domain_nameserver_drift`, `domain_registrar_changed`, `domain_dnssec_status_changed`
+- Per-row expiry countdown badges (green > 90 d / amber 30–90 d / red < 30 d / dark-red expired)
+- **Explicit `dns_zone.domain_id` linkage** with sub-zone suffix-match fallback — `test.example.com` shows up under `example.com`'s linked-zones tab; `example.com.au` correctly does NOT
+
+### Customer / Site / Provider
+
+three first-class logical ownership rows that cross-cut IPAM / DNS / DHCP / Network.
+
+- **`Customer`** — soft-deletable; account number / contact info / status (active / inactive / decommissioning) / tags
+- **`Site`** — hierarchical via `parent_site_id`; unique-per-parent `code` (NULLS NOT DISTINCT for top-level deduping); kinds (datacenter / branch / pop / colo / cloud_region / customer_premise) + free-form region label
+- **`Provider`** — kinds (transit / peering / carrier / cloud / registrar / sdwan_vendor) + optional `default_asn_id` FK
+- **Cross-reference FKs** added on subnet / ip_block / ip_space / vrf / dns_zone / asn / network_device / domain / circuit / network_service / overlay_network — every column is `ON DELETE SET NULL` so re-tagging is safe and operators never lose data
+- Shared `CustomerPicker` / `SitePicker` / `ProviderPicker` (with optional kind filter) + matching Chip components plug into every IPAM / DNS / circuit / overlay create + edit modal
+
+### WAN circuits
+
+carrier-supplied logical pipe distinct from the equipment that lights it up.
+
+- Data model: `circuit` table with `provider_id` (RESTRICT), optional `customer_id` (SET NULL), 4 endpoint refs (a/z-end site + subnet, all SET NULL), `transport_class` enum (mpls / internet_broadband / fiber_direct / wavelength / lte / satellite / direct_connect_aws / express_route_azure / interconnect_gcp), asymmetric `bandwidth_mbps_down` / `bandwidth_mbps_up`, `term_start_date` / `term_end_date`, `monthly_cost` + 3-letter ISO 4217 currency
+- **Soft-deletable** — `status='decom'` is the operator-visible end-of-life flag; row stays restorable for "what carrier did Site-X use in 2024?" audits
+- List page at `/network/circuits` with bulk-action table + tabbed editor modal (General / Endpoints / Term + cost / Notes) + colour-coded term-end badge
+- **Alert rules** — `circuit_term_expiring` (severity escalates around `threshold_days`), `circuit_status_changed` (only fires on `suspended` / `decom` transitions; auto-resolves after 7 d)
+
+### Service catalog
+
+bundles network resources into a customer-deliverable.
+
+- `NetworkService` is one row per thing the operator delivers; polymorphic `NetworkServiceResource` join row binds to VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site / OverlayNetwork
+- **Kinds in v1**: `mpls_l3vpn` (with hard at-most-one-VRF rule + soft warnings for missing VRF, fewer than 2 edge sites, edge subnet's enclosing block in a different VRF) and `custom`. `sdwan` lit up alongside the SD-WAN overlay roadmap. Future kinds reserved in the column: `mpls_l2vpn` / `vpls` / `evpn` / `dia` / `hosted_dns` / `hosted_dhcp`
+- **Kind-aware `/summary` endpoint** — L3VPN view returns canonical VRF + edge sites + edge circuits + edge subnets + warnings
+- **Reverse lookup** — `GET /by-resource/{kind}/{id}` returns every service referencing a given resource
+- **Alert rules** — `service_term_expiring` (mirrors circuit shape), `service_resource_orphaned` (sweep over join rows whose target was deleted; auto-resolves on detach)
+- List page at `/network/services` (bulk-action table) + tabbed editor modal (General / Resources / Term + cost / Notes / Summary)
+
+### SD-WAN overlays
+
+vendor-neutral source of truth for overlay topology and routing-policy intent.
+
+- Vendor config push (vManage / Meraki Dashboard / FortiManager / Versa Director) and real-time path telemetry are **explicitly out of scope** — those stay NCM / observability concerns
+- Data model: `overlay_network` (six kinds: sdwan / ipsec_mesh / wireguard_mesh / dmvpn / vxlan_evpn / gre_mesh), `overlay_site` (m2m binding sites with role hub / spoke / transit / gateway, edge device, loopback subnet, ordered `preferred_circuits` jsonb — first wins, fall through on outage), `routing_policy` (priority + match-kind + match-value + action + action-target + enabled), `application_category` (curated SaaS catalog seeded with 33 well-known apps — Office365 / Teams / Zoom / Slack / Salesforce / GitHub / AWS / Azure / GCP / SIP voice / OpenAI / Anthropic / …)
+- **`/topology` endpoint** — nodes (sites + roles + device + loopback + preferred-circuits) + edges (site pairs whose `preferred_circuits` lists overlap; `shared_circuits` is the intersection so the UI can colour by transport class) + policies
+- **`/simulate` endpoint** — pure read-only what-if; body specifies `down_circuits`, response shows per-site fallback resolution + per-policy effective-target with `impacted` flag and human-readable note
+- List page at `/network/overlays` + detail page with five tabs: Overview / Topology (SVG circular layout with role-coloured nodes + transport-coloured edges) / Sites / Policies (priority-ordered with per-kind editors) / Simulate
+
+### SNMP discovery
+
+v1 / v2c / v3 polling via standard MIBs.
+
+- MIBs walked: IF-MIB, IP-MIB, Q-BRIDGE-MIB, LLDP-MIB
+- Surfaces interfaces, ARP, FDB, LLDP neighbours
+- Per-IP switch-port + VLAN visibility in IPAM
+- Neighbours tab on each device
+
+### Nmap scanner
+
+on-demand scans from the browser.
+
+- Per-IP "Scan with Nmap" launcher · per-subnet "Scan with nmap"
+  in the IPAM Tools dropdown (pre-fills CIDR target +
+  `subnet_sweep` preset) · standalone `/tools/nmap` page for
+  ad-hoc targets
+- Presets: quick, service+version, **service+OS**, OS,
+  default-scripts, **subnet_sweep** (-sn ping sweep capped at
+  /16 worth of hosts), UDP top-100, aggressive, custom
+- Live SSE output streams while the scan runs; results render
+  single-host or multi-host (CIDR) summaries
+- **Stamp alive hosts → IPAM** action on a CIDR scan claims
+  responding IPs as `discovered` rows with `last_seen_at` set;
+  `Copy alive IPs` for clipboard handoff
+- History page with bulk-delete (cancels in-flight scans + drops
+  terminal ones) and a 3-tab right panel (Live / History / Last
+  result) that auto-switches as a scan completes
+
+### Device profiling
+
+answer "what kind of device is on every IP" without
+
+asking. Two layers feeding one consolidated panel in the IP detail modal.
+- **Passive — DHCP fingerprinting.** scapy `AsyncSniffer` thread on the DHCP
+  agent reads option-55 / option-60 / option-77 / client-id from every
+  DISCOVER + REQUEST, batches per-MAC, ships to the control plane
+- **Enrichment — fingerbank.** Optional API key in Settings → IPAM →
+  Device Profiling turns raw signatures into Type / Class / Manufacturer
+  (`HP iLO`, `Aruba AP`, `Cisco IP Phone 8841`, `iOS device`, …); 7-day
+  cache; works offline-degraded
+- **Active — auto-nmap on new DHCP lease.** Per-subnet opt-in toggle picks a
+  preset; refresh-window dedupe (default 30 days) means churning Wi-Fi
+  leases don't fan out; per-subnet 4-scan concurrency cap
+- **"Re-profile now"** button on the IP detail modal for ad-hoc rescan
+- Default-off everywhere — IDS-aware (nmap is loud; passive collection
+  needs `cap_add: NET_RAW`)
