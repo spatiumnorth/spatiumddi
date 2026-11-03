@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>DNS record change — end-to-end propagation</title>
-  <desc>A record mutation is validated and written in the service layer, enqueued as RecordOp rows, returned to the caller, released to agents holding a config long-poll, applied over loopback nsupdate on BIND9, and acknowledged on the next heartbeat.</desc>
+  <desc>A record mutation is validated and written in the service layer, enqueued as RecordOp rows, returned to the caller, released to agents holding a config long-poll, applied over loopback nsupdate on BIND9 or the local API on PowerDNS and Technitium, and acknowledged on the next heartbeat.</desc>
   <defs>
     <linearGradient id="dnsp-cp" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#8b5cf6"/>
@@ -86,8 +86,8 @@
   <!-- 6. Agent applies -->
   <g>
     <rect x="180" y="560" width="560" height="68" rx="8" fill="url(#dnsp-agent)"/>
-    <text x="460" y="586" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agent executes via loopback</text>
-    <text x="460" y="608" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 → nsupdate ‹signed with the local TSIG key›</text>
+    <text x="460" y="586" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agent applies the op locally</text>
+    <text x="460" y="608" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 → loopback nsupdate (TSIG-signed) · PowerDNS / Technitium → their local API</text>
   </g>
   <path d="M 460 628 V 656" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
 

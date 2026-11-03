@@ -56,7 +56,7 @@
   <path d="M 610 148 H 658" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
   <path d="M 792 148 H 804" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
   <path d="M 610 200 H 658" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
-  <text x="853" y="118" text-anchor="middle" font-size="11" fill="#475569">only if enabled</text>
+  <text x="900" y="118" text-anchor="end" font-size="11" fill="#475569">if enabled · POST /auth/login/mfa</text>
 
   <!-- Browser to login and back -->
   <path d="M 200 146 H 338" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>

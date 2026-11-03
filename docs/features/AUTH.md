@@ -27,8 +27,20 @@ SpatiumDDI's auth stack has three layers:
    for the grammar.
 
 <p align="center">
-  <img src="../assets/diagrams/auth-login-flow.svg" alt="Login flow — three authentication paths, one identity sync" width="900"/>
+  <img src="../assets/diagrams/auth-login-flow.svg" alt="Login flow — password logins on /auth/login, SSO on its own authorize and callback routes, one identity sync for external users" width="900"/>
 </p>
+
+Password logins all go to `POST /auth/login`. A username that matches a
+local account is checked against the local password hash first; if that
+account has TOTP enabled, the response carries `mfa_required` and a
+short-lived `mfa_token` instead of an access token, and the login finishes
+at `POST /auth/login/mfa`. Only a username that is not a local account
+falls through to the enabled LDAP / RADIUS / TACACS+ providers. OIDC and
+SAML never touch `/auth/login`: the browser starts at
+`GET /auth/{provider_id}/authorize`, is redirected to the identity
+provider, and returns to `/auth/{provider_id}/callback`. Only external
+users pass through `sync_external_user()`; a local login never changes
+group membership.
 
 ## Local auth
 

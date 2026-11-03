@@ -110,10 +110,10 @@
     <text x="650" y="588" text-anchor="middle" font-size="10" fill="#bbf7d0">replica + etcd</text>
 
     <text x="460" y="628" text-anchor="middle" font-size="11" fill="#475569">
-      HAProxy in front: primary on :5432  ·  replica on :5433
+      HAProxy in front: read/write on :5000  ·  read-only on :5001
     </text>
     <text x="460" y="646" text-anchor="middle" font-size="10" fill="#64748b" font-style="italic">
-      restore lands on :5432 (the primary)
+      a restore writes through :5000 (the primary)
     </text>
   </g>
 </svg>

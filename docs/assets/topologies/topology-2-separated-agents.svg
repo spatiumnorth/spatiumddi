@@ -103,6 +103,6 @@
         stroke-dasharray="6 4" marker-end="url(#t2-arrow)"/>
   <line x1="790" y1="412" x2="640" y2="310" stroke="#fb923c" stroke-width="2"
         stroke-dasharray="6 4" marker-end="url(#t2-arrow)"/>
-  <text x="248" y="340" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dns/agents/config (ETag)</text>
+  <text x="345" y="340" text-anchor="end" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dns/agents/config (ETag)</text>
   <text x="690" y="336" font-size="10" fill="#ea580c" font-style="italic">long-poll /api/v1/dhcp/agents/config (ETag)</text>
 </svg>

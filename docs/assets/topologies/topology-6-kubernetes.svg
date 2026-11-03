@@ -52,7 +52,7 @@
     <text x="410" y="106" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">worker ×2 (fixed replicas)</text>
     <rect x="320" y="118" width="180" height="36" rx="6" fill="url(#t6-pod)"/>
     <text x="410" y="141" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">Celery</text>
-    <text x="410" y="170" text-anchor="middle" font-size="10" fill="#64748b">NET_RAW for passive DHCP fingerprint</text>
+    <text x="410" y="170" text-anchor="middle" font-size="10" fill="#64748b">NET_RAW for nmap SYN / OS scans</text>
   </g>
 
   <g>

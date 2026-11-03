@@ -883,7 +883,7 @@ Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Wind
 
 ## 4b. Kea Lease Cache (#637)
 
-Kea 3.0 (shipped from Alpine 3.23) enables **lease caching** by default —
+Kea 3.0 (shipped from Alpine since 3.23) enables **lease caching** by default —
 `cache-threshold: 0.25`. When a client re-requests a lease that still has more
 than 75% of its lifetime remaining, Kea hands back the *same* lease with an
 **unchanged expiry** and skips the lease-database write entirely.
@@ -1340,8 +1340,12 @@ DHCPLease (not persisted long-term — cached in Redis, written to DB for histor
 
 ### Lease Sync Strategy
 
-- **Real-time (preferred)**: Kea `lease_cmds` hook + webhook to SpatiumDDI on lease events
-- **Polling fallback**: Celery task pulls lease dump every N minutes via DHCP driver API
+- **Kea (agent)**: the agent tails Kea's lease CSV and posts each lease change
+  to `POST /api/v1/dhcp/agents/lease-events` in batches, spooling them on disk
+  while the control plane is unreachable
+- **Agentless (Windows DHCP, FortiGate)**: the `auto_pull_dhcp_leases` Celery
+  task pulls leases through the driver API on the interval set in
+  `dhcp_pull_leases_interval_seconds` (see §15)
 - Leases are used to update `IPAddress.status`, `IPAddress.last_seen`, and trigger DDNS
 
 ### Lease History (forensic trail)
@@ -1379,7 +1383,11 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
 ### Agent Behavior
 
 **When control plane is reachable:**
-1. Agent polls SpatiumDDI API for config changes every N seconds (configurable, default 30s)
+1. Agent long-polls `GET /api/v1/dhcp/agents/config` with its last ETag; the
+   control plane holds the request (up to `LONGPOLL_TIMEOUT`, default 30 s)
+   and answers as soon as the bundle changes, woken by a Redis pub/sub
+   message published after the change commits. A heartbeat goes out
+   separately every `HEARTBEAT_INTERVAL` (default 30 s)
 2. On config change: agent validates new config, writes to local cache, applies to DHCP daemon
 3. Agent reports lease events back to SpatiumDDI API in real time
 4. Agent writes a "last successful sync" timestamp to local disk
@@ -1626,11 +1634,13 @@ Full reference: [Migration](MIGRATION.md). Parser internals:
 ## 10. Environment Variables for DHCP
 
 ```bash
-DHCP_SYNC_INTERVAL_SECONDS=30       # How often agents poll for config
-DHCP_LEASE_SYNC_INTERVAL_MINUTES=5  # Fallback polling for leases
-DHCP_CONFIG_CACHE_PATH=/var/cache/spatiumddi/dhcp-config.json
-DHCP_AGENT_RECONNECT_INTERVAL=60    # Seconds between reconnect attempts
-DHCP_AGENT_MAX_CACHE_AGE_HOURS=72   # Alert if cache older than this
+# DHCP agent (read by agent/dhcp/spatium_dhcp_agent/config.py)
+SPATIUM_API_URL=https://spatium.example.com  # control plane URL
+SPATIUM_AGENT_KEY=...                # bootstrap PSK, exchanged for a JWT
+CACHE_DIR=/var/lib/spatium-dhcp-agent # token, config cache, spool
+LONGPOLL_TIMEOUT=30                 # seconds the control plane holds /config
+HEARTBEAT_INTERVAL=30               # seconds between heartbeats
+AGENT_SPOOL_MAX_BYTES=268435456     # on-disk spool cap during an outage (#1077)
 ```
 
 ---
@@ -1783,7 +1793,7 @@ HA is configured on the server group, not a separate page. Edit the group under 
 
 ---
 
-## 15. Windows DHCP — Path A (read-only)
+## 15. Windows DHCP (agentless, WinRM)
 
 SpatiumDDI supports Windows Server DHCP as an **agentless** backend, driven over WinRM. It polls each Windows server for its leases and scopes and reflects them into IPAM, and writes scope / pool / reservation edits through to the server per object (it does not push config bundles — Windows has no whole-config entry point). A group with more than one Windows member is covered in §15.8.
 
