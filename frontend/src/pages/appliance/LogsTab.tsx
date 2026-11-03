@@ -239,6 +239,19 @@ function LogViewerCard() {
 // ── Diagnostic bundle card ──────────────────────────────────────────
 
 function DiagnosticBundleCard() {
+  const download = useMutation({
+    mutationFn: applianceDiagnosticsApi.downloadBundle,
+    onSuccess: ({ blob, filename }) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    },
+  });
   return (
     <section className="rounded-lg border bg-card p-4 shadow-sm">
       <div className="flex items-start justify-between gap-3">
@@ -256,14 +269,21 @@ function DiagnosticBundleCard() {
             review the bundle before sharing it.
           </p>
         </div>
-        <a
-          href={applianceDiagnosticsApi.bundleUrl()}
-          className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+        <button
+          type="button"
+          onClick={() => download.mutate()}
+          disabled={download.isPending}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-60"
         >
           <Download className="h-3.5 w-3.5" />
-          Download bundle
-        </a>
+          {download.isPending ? "Building bundle…" : "Download bundle"}
+        </button>
       </div>
+      {download.isError && (
+        <p role="alert" className="mt-2 text-xs text-destructive">
+          {formatApiError(download.error, "Download failed")}
+        </p>
+      )}
     </section>
   );
 }
