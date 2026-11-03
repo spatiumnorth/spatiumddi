@@ -56,14 +56,14 @@ afterEach(() => {
   for (const name of Object.keys(answers)) delete answers[name];
 });
 
-function signInAs(grants: [string, string][]) {
+function signInAs(grants: [string, string, string?][]) {
   const myPermissions = vi.fn(() =>
     Promise.resolve({
       is_superadmin: false,
-      grants: grants.map(([action, resource_type]) => ({
+      grants: grants.map(([action, resource_type, resource_id]) => ({
         action,
         resource_type,
-        resource_id: null,
+        resource_id: resource_id ?? null,
       })),
     }),
   );
@@ -127,7 +127,7 @@ describe("Wake-on-LAN gate", () => {
     await opened();
     expect(wakeButton().disabled).toBe(true);
     expect(wakeButton().title).toBe(
-      "Requires read on network tools and write on this subnet",
+      "Requires read on network tools and write on subnets",
     );
   });
 
@@ -144,5 +144,17 @@ describe("Wake-on-LAN gate", () => {
     ]);
     await opened();
     expect(wakeButton().disabled).toBe(false);
+  });
+
+  it("is disabled for a write grant scoped to this subnet only", async () => {
+    // The route's IPAM gate checks write on subnets type-wide; a grant scoped
+    // to the address's own subnet is refused there (403), so Wake must not
+    // be offered on it.
+    signInAs([
+      ["read", "use_network_tools"],
+      ["write", "subnet", "s1"],
+    ]);
+    await opened();
+    expect(wakeButton().disabled).toBe(true);
   });
 });
