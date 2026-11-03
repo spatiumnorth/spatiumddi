@@ -67,9 +67,7 @@ MANIFEST = {
         "dhcp-driver": {"from": "Data plane", "to": "Integration mirrors"},
         "integration": {"from": "Integration mirrors"},
     },
-    "identifier_diagrams": {
-        "docs/assets/diagrams/model.svg": ["backend/app/models/dns.py"]
-    },
+    "identifier_diagrams": {"docs/assets/diagrams/model.svg": ["backend/app/models/dns.py"]},
     "identifier_ignore": {},
     "path_roots": ["backend", "agent", "docs"],
 }
@@ -121,9 +119,7 @@ def build(root: pathlib.Path, **override: object) -> pathlib.Path:
             }
         ),
     )
-    compose = "services:\n" + "".join(
-        f"  {s}:\n    image: x\n" for s in [*SERVICES, "migrate"]
-    )
+    compose = "services:\n" + "".join(f"  {s}:\n    image: x\n" for s in [*SERVICES, "migrate"])
     _write(root, "docker-compose.yml", compose + "volumes:\n  data:\n")
     for chart in ("spatiumddi", "spatiumddi-appliance"):
         (root / "charts" / chart / "templates").mkdir(parents=True, exist_ok=True)
@@ -169,18 +165,14 @@ def _kinds(findings: list) -> list[str]:
     return sorted(f.kind for f in findings)
 
 
-def test_clean_tree_has_no_findings(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_clean_tree_has_no_findings(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     assert lint.run(build(tmp_path)) == []
 
 
 # --- version ---------------------------------------------------------------
 
 
-def test_stale_version_in_svg_and_page(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_stale_version_in_svg_and_page(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     build(tmp_path)
     _write(
         tmp_path,
@@ -242,9 +234,7 @@ def test_a_label_naming_a_component_missing_from_versions_json_is_an_error(
 # --- inventory -------------------------------------------------------------
 
 
-def test_unlisted_workloads_are_findings(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_unlisted_workloads_are_findings(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     build(tmp_path)
     _write(
         tmp_path,
@@ -272,17 +262,13 @@ def test_allowlist_exempts_and_a_dead_entry_is_a_finding(
     build(tmp_path)
     # compose:migrate is allowlisted and absent from the diagram: no finding.
     assert lint.run(tmp_path) == []
-    build(
-        tmp_path, inventory_allowlist={"compose:migrate": "x", "compose:ghost": "gone"}
-    )
+    build(tmp_path, inventory_allowlist={"compose:migrate": "x", "compose:ghost": "gone"})
     findings = lint.run(tmp_path)
     assert [f.file for f in findings] == ["scripts/docs_drift_manifest.json"]
     assert "compose:ghost" in findings[0].message
 
 
-def test_an_allowlist_entry_needs_a_reason(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_an_allowlist_entry_needs_a_reason(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     build(tmp_path, inventory_allowlist={"compose:migrate": " "})
     with pytest.raises(lint.CheckError):
         lint.run(tmp_path)
@@ -344,9 +330,7 @@ def test_an_empty_inventory_is_an_error_not_a_pass(
 # --- identifier ------------------------------------------------------------
 
 
-def test_identifier_missing_from_models(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_identifier_missing_from_models(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     build(tmp_path)
     _write(
         tmp_path,
@@ -375,9 +359,7 @@ def test_identifier_ignore_and_unmapped_diagrams(
     assert [f for f in lint.run(tmp_path) if f.kind == "identifier"] == []
 
 
-def test_acronym_plurals_are_prose(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_acronym_plurals_are_prose(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     build(tmp_path)
     _write(
         tmp_path,
@@ -448,9 +430,7 @@ def test_identifier_mapped_module_must_exist(
 ) -> None:
     build(
         tmp_path,
-        identifier_diagrams={
-            "docs/assets/diagrams/model.svg": ["backend/app/models/gone.py"]
-        },
+        identifier_diagrams={"docs/assets/diagrams/model.svg": ["backend/app/models/gone.py"]},
     )
     with pytest.raises(lint.CheckError):
         lint.run(tmp_path)
@@ -459,9 +439,7 @@ def test_identifier_mapped_module_must_exist(
 # --- path ------------------------------------------------------------------
 
 
-def test_paths_named_in_diagrams_must_exist(
-    lint: types.ModuleType, tmp_path: pathlib.Path
-) -> None:
+def test_paths_named_in_diagrams_must_exist(lint: types.ModuleType, tmp_path: pathlib.Path) -> None:
     build(tmp_path)
     _write(
         tmp_path,
@@ -479,10 +457,7 @@ def test_paths_named_in_diagrams_must_exist(
     )
     found = sorted(f.message for f in lint.run(tmp_path) if f.kind == "path")
     assert len(found) == 2
-    assert (
-        "backend/app/models/gone.py" in found[0]
-        or "backend/app/models/gone.py" in found[1]
-    )
+    assert "backend/app/models/gone.py" in found[0] or "backend/app/models/gone.py" in found[1]
     assert any("missing-file.yml" in m for m in found)
 
 
@@ -515,11 +490,7 @@ def test_exit_codes_and_markdown(
     )
     assert lint.main(["--root", str(tmp_path), "--markdown"]) == 1
     body = capsys.readouterr().out
-    assert (
-        body.startswith(lint.MARKER)
-        and "### version (1)" in body
-        and "docs/guide.md" in body
-    )
+    assert body.startswith(lint.MARKER) and "### version (1)" in body and "docs/guide.md" in body
 
     (tmp_path / "scripts/docs_drift_manifest.json").unlink()
     assert lint.main(["--root", str(tmp_path)]) == 2
