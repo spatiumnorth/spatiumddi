@@ -709,11 +709,15 @@ function AttentionAgentsPanel({
 function OpenAlertsPanel({
   events,
   failed = false,
+  error,
   truncated = false,
 }: {
   events: AlertEvent[];
   /** The fetch failed. Distinct from "no open alerts" — see below. */
   failed?: boolean;
+  /** The fetch's error, so a refusal reads as one rather than as an outage
+   *  (#3456): the IPAM / DNS / DHCP Editor roles hold no `read alert`. */
+  error?: unknown;
   /** The response came back at the fetch cap, so the count is a floor. */
   truncated?: boolean;
 }) {
@@ -726,6 +730,14 @@ function OpenAlertsPanel({
   // A failed fetch renders as unknown, never as an all-clear. React Query
   // hands back the `[]` default on error, which would otherwise paint the
   // exact green "No open alerts" this panel exists to disprove.
+  if (failed && isRefused(error)) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+        <span className="font-medium">Open alerts</span>
+        <ListReadError error={error} what="alert events" />
+      </div>
+    );
+  }
   if (failed) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400">
@@ -1711,7 +1723,11 @@ export function DashboardPage() {
   // practice. When the response comes back exactly full the total is
   // rendered as "N+" rather than as a number we know is wrong.
   const OPEN_ALERT_FETCH_LIMIT = 1000;
-  const { data: openAlerts = [], isError: openAlertsFailed } = useQuery({
+  const {
+    data: openAlerts = [],
+    isError: openAlertsFailed,
+    error: openAlertsError,
+  } = useQuery({
     queryKey: ["alert-events", { open: true }],
     queryFn: () =>
       alertsApi.listEvents({
@@ -2251,6 +2267,7 @@ export function DashboardPage() {
             <OpenAlertsPanel
               events={openAlerts}
               failed={openAlertsFailed}
+              error={openAlertsError}
               truncated={openAlertsTruncated}
             />
           </WidgetErrorBoundary>
@@ -3236,7 +3253,7 @@ function ServerRow({
  * either would render as a red exhaustion bar for behaving correctly.
  */
 function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
     refetchInterval: pollUnlessRefused(60_000),
@@ -3246,7 +3263,15 @@ function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
 
   // A failed fetch must not render as "no pools configured" — that is the
   // same false-calm this panel exists to prevent, and an error boundary
-  // does not catch a rejected query.
+  // does not catch a rejected query. A refusal is neither: the role may
+  // not read pools, so say that rather than "could not load" (#3456).
+  if (isError && isRefused(error)) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs">
+        <ListReadError error={error} what="DHCP pool occupancy" />
+      </div>
+    );
+  }
   if (isError) {
     return (
       <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
@@ -5516,7 +5541,7 @@ function DNSThreatCard() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
     queryFn: () => dnsThreatApi.summary({ hours: 24 }),
-    refetchInterval: pollUnlessRefused(60_000),
+    refetchInterval: 60_000,
     retry: false,
     enabled: moduleEnabled,
   });

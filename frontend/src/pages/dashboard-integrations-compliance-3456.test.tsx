@@ -143,3 +143,29 @@ describe("refused Compliance reads (#3456)", () => {
     expect(text).not.toContain("No compliance-change events");
   });
 });
+
+describe("refused Overview and DHCP reads (#3456)", () => {
+  it("Overview open alerts say refused, not 'could not load'", async () => {
+    calls["alertsApi.listEvents"] = denied;
+    const text = await show("overview");
+    expect(text).toContain("You don't have permission to see alert events");
+    expect(text).not.toContain("Could not load alerts");
+    expect(text).not.toContain("No open alerts");
+  });
+
+  it("Overview open alerts that fail otherwise stay unknown", async () => {
+    calls["alertsApi.listEvents"] = () =>
+      Promise.reject({ response: { status: 500, data: {} } });
+    const text = await show("overview");
+    expect(text).toContain("Could not load alerts");
+  });
+
+  it("DHCP pool pressure says refused, not 'could not load'", async () => {
+    calls["dhcpApi.fleetPoolOccupancy"] = denied;
+    const text = await show("dhcp");
+    expect(text).toContain(
+      "You don't have permission to see DHCP pool occupancy",
+    );
+    expect(text).not.toContain("Could not load pool occupancy");
+  });
+});

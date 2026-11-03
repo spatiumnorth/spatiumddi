@@ -49,6 +49,7 @@ const REFUSED = new Set([
   "dashboardsApi.integrationsSummary",
   "dashboardsApi.networkSummary",
   "dashboardsApi.securitySummary",
+  "dhcpApi.fleetPoolOccupancy",
   "alertsApi.listEvents",
   "alertsApi.listRules",
   "conformityApi.summary",
@@ -201,6 +202,16 @@ describe("refused reads are not polled (#3149)", () => {
     expect(document.body.textContent).toContain(
       "You don't have permission to see security signals",
     );
+  });
+
+  it("Dashboard Overview open alerts and DHCP pool pressure (#3456)", async () => {
+    await held(<DashboardPage />, 130_000);
+    expectAskedOnce(["alertsApi.listEvents"]);
+    cleanup();
+    calls.clear();
+    localStorage.setItem("dashboard-tab", "dhcp");
+    await held(<DashboardPage />, 130_000);
+    expectAskedOnce(["dhcpApi.fleetPoolOccupancy"]);
   });
 
   it("Dashboard Conformity tab", async () => {
