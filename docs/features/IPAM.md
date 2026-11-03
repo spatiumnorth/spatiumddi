@@ -43,7 +43,7 @@ Both IP blocks and subnets are displayed in a **tree view** in the UI, mirroring
 
 ### Tree Features
 - Expand/collapse nodes
-- Utilization color-coded bars (green < 70%, amber 70–90%, red > 90%)
+- Utilization color-coded bars and dots: amber from Settings' Warning Threshold (default 80%), red from its Critical Threshold (default 95%); the Subnets list and the Dashboard's capacity figures use the same two thresholds
 - Right-click context menu: Create child block, Create subnet, Edit, Delete
 - Drag nodes to reorganize (with validation — child must fit inside parent CIDR)
 - Free space visualization: show unallocated ranges within a block
@@ -1053,7 +1053,7 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 
 ## 9. Utilization Tracking
 
-- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
+- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). A host is refused (409) on those two addresses even when the subnet was made with skip auto addresses and holds no rows for them (#3321); the Copilot / request-portal create and the address import refuse it too. Rows recorded from the wire (DHCP lease mirrors, discovery, integrations) are not refused, and a host stored there before #3321 stays, so such a subnet can still read over its total. Bulk allocate takes over an `available` row in its range as Next available does, and refuses (422) a range covering such an edge address (#3319). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
 - `IPBlock.utilization_percent` is the share of the block's **whole CIDR** in use (#2982). `total_ips` is the CIDR size (clamped to 2^63 - 1 for huge IPv6 blocks). `allocated_ips` rolls up every descendant subnet's `allocated_ips` **plus that subnet's non-usable addresses** — network and broadcast for IPv4 below /31, the network address for IPv6 below /127, nothing for /31, /32, /127 and /128 — each counted once even when a row already sits on it. So a /30 block holding one full /30 subnet reads 4 / 4, 100%, while the subnet itself reads 2 / 2. A block is clamped to its CIDR size and never reads over 100%. Both counters are rewritten on every write under the block and by the hourly `recount_ipam_utilization` sweep.
 - Alerts are configured in the notification system when utilization exceeds thresholds (default: warn at 80%, critical at 95%)
 
@@ -1141,7 +1141,7 @@ The same column customization applies to IP address lists, DHCP scope lists, and
 ### Gateway Auto-Assignment
 
 When creating a subnet, the **first usable IP** (network address + 1) is automatically designated as the gateway (`status = reserved`, `description = "Gateway"`). This can be:
-- Changed to any other IP in the subnet
+- Changed to any other IP in the subnet. Editing the gateway (Edit Subnet, or the subnet import's `overwrite`) follows New Subnet's rules: the network and broadcast address are refused with a 422, the new address gets its own reserved `Gateway` row (so Next available never offers it) and its PTR, and the old default `Gateway` row is retired with its PTR — a renamed or otherwise operator-owned row is kept. An address that already holds a `reserved` row (the router recorded as a reservation) keeps that row; any other row there (a host, a DHCP lease, a discovered address) refuses the move with a 409 naming it, as Resize does. A subnet made without placeholder rows (`skip_auto_addresses`, /31, multicast) gets no gateway row, as on New Subnet (#3317, #3318)
 - Deleted if no gateway is needed (e.g., transit link)
 - Overridden during import
 

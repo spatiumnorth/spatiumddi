@@ -379,6 +379,7 @@ export function BulkAllocateModal({
       setServerError(null);
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       onCommitted?.();

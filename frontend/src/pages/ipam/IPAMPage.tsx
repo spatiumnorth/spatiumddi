@@ -137,6 +137,10 @@ import { useSessionState } from "@/lib/useSessionState";
 import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import {
+  useUtilizationThresholds,
+  utilizationColor,
+} from "@/hooks/useUtilizationThresholds";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -440,13 +444,14 @@ function UsedIps({ allocated, total }: { allocated: number; total: number }) {
   );
 }
 
-function UtilizationBar({
+export function UtilizationBar({
   percent,
   uncountable = false,
 }: {
   percent: number;
   uncountable?: boolean;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (uncountable) {
     return (
       <span
@@ -457,12 +462,7 @@ function UtilizationBar({
       </span>
     );
   }
-  const color =
-    percent >= 95
-      ? "bg-red-500"
-      : percent >= 80
-        ? "bg-amber-400"
-        : "bg-green-500";
+  const color = utilizationColor(percent, thresholds);
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 w-20 rounded-full bg-muted">
@@ -478,13 +478,14 @@ function UtilizationBar({
   );
 }
 
-function UtilizationDot({
+export function UtilizationDot({
   percent,
   uncountable = false,
 }: {
   percent: number;
   uncountable?: boolean;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (uncountable) {
     // Parity with UtilizationBar — a clamped IPv6 subnet computes ≈0%, so a
     // green dot would falsely read "empty". Render a neutral dot instead.
@@ -497,12 +498,7 @@ function UtilizationDot({
       />
     );
   }
-  const color =
-    percent >= 95
-      ? "bg-red-500"
-      : percent >= 80
-        ? "bg-amber-400"
-        : "bg-green-500";
+  const color = utilizationColor(percent, thresholds);
   const tip = `${percent.toFixed(0)}% utilized`;
   return (
     <span
@@ -2865,6 +2861,7 @@ export function CreateSubnetModal({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["spaces"] });
       // Refresh the VLAN detail page's "Subnets using this VLAN" list
       qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
@@ -3710,6 +3707,7 @@ export function AddAddressModal({
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       if (staticError) {
         // Address created, reservation not mirrored — keep the modal open
         // so the operator sees this; the row already exists (don't
@@ -5122,6 +5120,9 @@ export function SubnetDetail({
     onSuccess: () => {
       setInlineEditError(null);
       qc.invalidateQueries({ queryKey: ["addresses"] });
+      // A status edit moves the subnet's and its blocks' counts (#3325).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       // A static assignment's hostname / MAC mirror onto its address, so the
       // statics lists cache the same object (#3076).
       qc.invalidateQueries({ queryKey: ["dhcp-statics"] });
@@ -5642,6 +5643,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
       setActionError(formatApiError(e, "Failed to delete address.")),
@@ -5661,6 +5663,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
       setActionError(formatApiError(e, "Failed to purge address.")),
@@ -5675,6 +5678,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
       setActionError(formatApiError(e, "Failed to restore address.")),
@@ -5769,6 +5773,7 @@ export function SubnetDetail({
               onCommitted={() => {
                 qc.invalidateQueries({ queryKey: ["addresses"] });
                 qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
             <ToolsMenu
@@ -7247,6 +7252,7 @@ export function SubnetDetail({
           onCommitted={() => {
             qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
             qc.invalidateQueries({ queryKey: ["subnets"] });
+            qc.invalidateQueries({ queryKey: ["blocks"] });
           }}
         />
       )}
@@ -7908,6 +7914,7 @@ export function OrphansModal({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       onClose();
     },
   });
@@ -8466,6 +8473,7 @@ function EditSubnetModalForm({
     },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       // Invalidate addresses so network/broadcast changes are reflected immediately
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -9621,6 +9629,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
     },
     onSuccess: ({ staticError }) => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      // A status edit moves the subnet's and its blocks' counts (#3325).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
@@ -10972,6 +10983,7 @@ function BulkEditAddressesModal({
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       if (subnetId)
         qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       if (res.skipped.length > 0) {
@@ -11431,6 +11443,7 @@ export function BulkDeleteAddressesModal({
       // Refresh subnet utilization (tree dot + space-table "Used IPs") the way
       // the single-delete path does — bulk-delete was missing this (#509).
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
@@ -14315,6 +14328,7 @@ export function BlockDetailView({
           space={space}
           defaultBlockId={block.id}
           defaultBlockLabel={block.network}
+          defaultBlockCidr={block.network}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, parentBlockId) => {
             setFindFreeBlockId(parentBlockId);
@@ -14342,6 +14356,7 @@ export function BlockDetailView({
                 setShowSplitSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -14358,6 +14373,7 @@ export function BlockDetailView({
                 setShowMergeSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -15982,6 +15998,7 @@ export function SpaceTableView({
                 setShowSplitSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -15997,6 +16014,7 @@ export function SpaceTableView({
                 setShowMergeSubnet(false);
                 setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
               }}
             />
           ) : null;
@@ -16338,6 +16356,7 @@ export function SpaceSection({
       }
       if (selectedSubnetId === id) onSelectSubnet(null);
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       setSubnetToDelete(null);
       setSubnetDeleteError(null);
     },

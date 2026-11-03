@@ -7,6 +7,7 @@ instead of two copies. Each function raises a 4xx ``HTTPException``.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from typing import Any
 
@@ -16,6 +17,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
+from app.services.ipam.subnet_boundary import boundary_addresses
 
 
 def assert_subnet_takes_addresses(subnet: Subnet) -> None:
@@ -45,6 +47,38 @@ def holds_address() -> ColumnElement[bool]:
     counters already call free (#2980), unless a DHCP reservation still
     points at it. Shared by the picker and Specific IP so both agree."""
     return or_(IPAddress.status != "available", IPAddress.static_assignment_id.is_not(None))
+
+
+def boundary_address_refusal(subnet: Subnet, address: str) -> str | None:
+    """Why a host cannot sit on ``address``, or ``None`` when it can.
+
+    ``total_ips`` leaves an IPv4 subnet's network and broadcast addresses out
+    whether or not the subnet holds rows for them (#2411). A subnet made with
+    ``skip_auto_addresses`` holds none, so without this a host there counts
+    toward Allocated but not toward the total (8 of 6, #3321). IPv6 is exempt:
+    its network address is usable and counts in the total. So are /31 and /32
+    (RFC 3021: every address is a host) and multicast subnets, which have no
+    boundary addresses. Only a hand-made host is refused: observed data (a DHCP
+    lease mirror, discovery, an integration) records what is on the wire.
+    """
+    try:
+        net = ipaddress.ip_network(str(subnet.network), strict=False)
+        canonical = str(ipaddress.ip_address(address))
+    except ValueError:
+        return None  # the caller's own address / subnet checks answer this
+    if isinstance(net, ipaddress.IPv4Network) and canonical in boundary_addresses(net, subnet.kind):
+        return (
+            f"Address {canonical} is the network or broadcast address of "
+            f"{subnet.network} and cannot hold a host"
+        )
+    return None
+
+
+def assert_not_boundary_address(subnet: Subnet, address: str) -> None:
+    """``boundary_address_refusal`` as a 409."""
+    reason = boundary_address_refusal(subnet, address)
+    if reason is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=reason)
 
 
 async def assert_address_unallocated(db: AsyncSession, subnet_id: uuid.UUID, address: str) -> None:

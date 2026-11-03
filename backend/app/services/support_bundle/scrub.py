@@ -426,20 +426,59 @@ def render_env_file(text: str, clean: Callable[[str], str]) -> str:
     return "\n".join(out)
 
 
-def redact_secrets(text: str) -> tuple[str, list[str]]:
+# ── A whole log, in pieces ──────────────────────────────────────────────
+#
+# One regex pass over a whole host log is one C call that holds the GIL
+# until it returns, so a log of tens of MB held the API's event loop for
+# seconds even from a worker thread (#3310): about 85 ms per MB for the
+# slowest pass (the keyword-credential pattern). A caller that scrubs a
+# whole log asks for ``in_pieces``: the text is cut at line ends into
+# pieces of about this many characters, and every pass runs over one
+# piece at a time, a few ms each.
+_PIECE_CHARS = 64 * 1024
+
+
+def _line_pieces(text: str) -> list[str]:
+    """``text`` cut at line ends into pieces of about :data:`_PIECE_CHARS`.
+
+    Scrubbed one by one, the pieces come out exactly as the whole text
+    does: every pattern but the private-key ones matches within one line,
+    and a text that holds a private-key marker is not cut at all (one
+    piece), since a key, and the fragment pass after it, span lines.
+    """
+    if len(text) <= _PIECE_CHARS or "PRIVATE KEY" in text:
+        return [text]
+    pieces: list[str] = []
+    start = 0
+    while start < len(text):
+        cut = text.find("\n", start + _PIECE_CHARS)
+        if cut == -1:
+            pieces.append(text[start:])
+            break
+        pieces.append(text[start : cut + 1])
+        start = cut + 1
+    return pieces
+
+
+def redact_secrets(text: str, *, in_pieces: bool = False) -> tuple[str, list[str]]:
     """Strip secret-shaped substrings. Returns (clean_text, kinds_hit).
 
     Runs in **every** mode. The unscrubbed bundle exists so an operator
     can read their own hostnames and addresses; it is not a reason to
     hand out the key that decrypts their database.
+
+    ``in_pieces`` runs each pattern over one piece of ``text`` at a time
+    (:func:`_line_pieces`), for a whole log; the result is the same.
     """
-    hits: list[str] = []
-    out = text
-    for kind, pattern, replacement in _SECRET_VALUE_PATTERNS:
-        out, n = pattern.subn(replacement, out)
-        if n:
-            hits.append(kind)
-    out, n = _redact_pem_fragments(out)
+    pieces = _line_pieces(text) if in_pieces else [text]
+    matched = [False] * len(_SECRET_VALUE_PATTERNS)
+    for p, piece in enumerate(pieces):
+        for i, (_kind, pattern, replacement) in enumerate(_SECRET_VALUE_PATTERNS):
+            piece, n = pattern.subn(replacement, piece)
+            matched[i] = matched[i] or n > 0
+        pieces[p] = piece
+    hits = [kind for (kind, _, _), hit in zip(_SECRET_VALUE_PATTERNS, matched, strict=True) if hit]
+    out, n = _redact_pem_fragments("".join(pieces))
     if n and "pem" not in hits:
         hits.append("pem")
     return out, hits
@@ -1015,27 +1054,34 @@ class Scrubber:
         return self._users[key]
 
     # ── Text sweep ──────────────────────────────────────────────────
-    def text(self, value: str) -> str:
+    def text(self, value: str, *, in_pieces: bool = False) -> str:
         """Scrub a blob of freeform text (a log file, a traceback).
 
         Order matters. MACs first, because a colon-separated MAC is a
         near-miss for the IPv6 pattern. Then v6, then v4, then hostnames
         — by which point anything address-shaped is already a synthetic
         value and the hostname regex will not re-match it.
+
+        ``in_pieces`` scrubs a whole log one piece at a time
+        (:func:`_line_pieces`), so that no pass holds the GIL for long; the
+        text, the report and the mapping come out the same.
         """
         if not value:
             return value
-        cleaned, kinds = redact_secrets(value)
+        cleaned, kinds = redact_secrets(value, in_pieces=in_pieces)
         for kind in kinds:
             self.report.secrets_redacted[kind] = self.report.secrets_redacted.get(kind, 0) + 1
         if not self.enabled:
             return cleaned
+        pieces = _line_pieces(cleaned) if in_pieces else [cleaned]
+        return "".join(self._pseudonymise(piece) for piece in pieces)
 
-        cleaned = _MAC_RE.sub(lambda m: self.mac(m.group(0)), cleaned)
-        cleaned = _IPV6_CANDIDATE_RE.sub(self._maybe_ipv6, cleaned)
-        cleaned = _IPV4_RE.sub(lambda m: self._sub_cidr(m.group(0), self.ipv4), cleaned)
-        cleaned = _HOSTNAME_RE.sub(lambda m: self.hostname(m.group(0)), cleaned)
-        return cleaned
+    def _pseudonymise(self, text: str) -> str:
+        """The address and name passes of :meth:`text`, in its order."""
+        text = _MAC_RE.sub(lambda m: self.mac(m.group(0)), text)
+        text = _IPV6_CANDIDATE_RE.sub(self._maybe_ipv6, text)
+        text = _IPV4_RE.sub(lambda m: self._sub_cidr(m.group(0), self.ipv4), text)
+        return _HOSTNAME_RE.sub(lambda m: self.hostname(m.group(0)), text)
 
     def _maybe_ipv6(self, match: re.Match[str]) -> str:
         """Map a hex-and-colon run, but only if it really is an address.
@@ -1109,7 +1155,8 @@ def safety_net(name: str, content: str, report: ScrubReport) -> str:
     a bug, and hiding that would let the bug persist behind a net that
     might not catch the next variant.
     """
-    cleaned, kinds = redact_secrets(content)
+    # In pieces: a host log's section is up to CAP_LOG_BYTES (#3310).
+    cleaned, kinds = redact_secrets(content, in_pieces=True)
     if kinds:
         report.safety_net_hits.append(f"{name}: {', '.join(sorted(set(kinds)))}")
         for kind in kinds:
