@@ -42,13 +42,13 @@
 
 ---
 
-> ⚠️ **Beta software.** SpatiumDDI is under active development. Core IPAM / DNS / DHCP / appliance surfaces have stabilised since the `2026.04.16-1` alpha cut, but expect occasional schema changes between releases and roadmap features that are still in flight. Suitable for labs, homelabs, and pilots in front of non-critical client populations; production deploys in front of business-critical DHCP should pin to a tested release and snapshot Postgres before upgrading. Early adopter feedback is very welcome — open an issue or start a discussion on GitHub.
+> ⚠️ **Beta software.** SpatiumDDI is under active development. Core IPAM / DNS / DHCP / appliance surfaces have stabilised since the `2026.04.16-1` alpha cut, but expect occasional schema changes between releases and roadmap features that are still in flight. Ready for evaluation, pilots and staged rollouts today; 1.0.0 is due November 2026. For production use in front of business-critical DNS or DHCP, pin to a tested release, snapshot Postgres before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for the rollout. Early adopter feedback is very welcome — open an issue or start a discussion on GitHub.
 
 ---
 
 ## Contents
 
-- [Why I built this](#why-i-built-this) — the story
+- [Why SpatiumDDI exists](#why-spatiumddi-exists) — the case for an open DDI platform
 - [About SpatiumNorth](#about-spatiumnorth) — the company behind it
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
 - [Privacy: your data stays yours](#privacy-your-data-stays-yours) — no telemetry, no analytics, no phone-home
@@ -70,13 +70,13 @@
 
 ---
 
-## Why I built this
+## Why SpatiumDDI exists
 
-I'm a network engineer. I've spent years working with enterprise DDI platforms, and while they're solid pieces of software, the licensing puts them out of reach for smaller teams, homelabs, and folks who just want to learn how this stuff fits together.
+I'm a network engineer, and I spent years running enterprise DDI. The platforms work. What doesn't work is paying for them by the IP, by the appliance and by the feature, then finding that every zone, scope and subnet you own is now locked inside a vendor's data model and a renewal cycle you don't control. Meanwhile the open-source world had every piece — BIND9, PowerDNS, Technitium, Kea — and no single control plane that ran them as one system, with the authentication, delegation and audit trail an organisation actually requires. That gap is why SpatiumDDI exists.
 
-The open source world has excellent standalone tools — NetBox for IPAM, BIND9 / PowerDNS / Technitium for DNS, Kea for DHCP — but nothing that pulls them into a single control plane the way the commercial platforms do. So I started building one on nights and weekends.
+SpatiumDDI is that control plane. It doesn't just render config for DNS and DHCP servers somebody else operates — it deploys and runs BIND9, PowerDNS, Technitium and Kea itself, and it manages Windows DNS and DHCP agentlessly over WinRM, with importers for existing BIND, Windows, PowerDNS, Technitium, Kea, ISC and NetBox estates and a guided Windows cutover rather than a forklift. Group-based RBAC over LDAP, OIDC, SAML, RADIUS or TACACS+; an append-only, tamper-evident audit log; a highly available control plane; an OS appliance with atomic A/B upgrades or a Helm chart; a REST API behind every click; and no telemetry of any kind, so it runs air-gapped. All of it is Apache 2.0 — every feature, on every install, with no licence to count against.
 
-If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
+Open source is the model, not a concession. SpatiumNorth sells support, deployment and migration from the people who write the code, and MSPs partner to run it for their clients — that is what pays for the platform, not a per-object meter. If your team is evaluating a replacement for commercial DDI, start with the [feature tour](#whats-in-the-box) below and the [documentation](https://www.spatiumddi.com). If you're a homelab or a student learning how DNS, DHCP and IPAM fit together, you're just as welcome: it's the same software.
 
 ## About SpatiumNorth
 
@@ -84,15 +84,15 @@ SpatiumDDI is built by [SpatiumNorth](https://www.spatiumnorth.com), a Montréal
 
 ## Support the project
 
-SpatiumDDI started on nights and weekends and homelab hardware, and the software is free and stays free. If it's saving your team work and you want to chip in, there are two ways, depending on who you are.
+The software is free and stays free. If it's saving your team work and you want to back it, there are two ways, depending on who you are.
+
+**Organizations** — if your team runs SpatiumDDI in production, the way to back the project is the support your operators will want anyway: that's what [SpatiumNorth](https://www.spatiumnorth.com) sells — support, deployment and migration from the people who wrote the code. See [pricing](https://www.spatiumnorth.com/spatiumddi/pricing) or [contact us](https://www.spatiumnorth.com/contact). Want to sponsor a specific feature or just say hi? Still happy to talk — [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 **Individuals** — small tips help cover the boring stuff (a domain, a homelab SSD, the occasional cloud VM I spin up to test a deploy topology I don't have locally). No tier system, no perks list, no obligation — just a "thanks, here's a coffee" button if the project saved you an afternoon. Every contribution is genuinely appreciated.
 
 <p align="left">
   <a href="https://buymeacoffee.com/mzac"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buy-me-a-coffee&logoColor=000000" alt="Buy me a coffee" /></a>
 </p>
-
-**Organizations** — if your team runs SpatiumDDI in production, the way to back the project is the support your operators will want anyway: that's what [SpatiumNorth](https://www.spatiumnorth.com) sells — support, deployment and migration from the people who wrote the code. See [pricing](https://www.spatiumnorth.com/spatiumddi/pricing) or [contact us](https://www.spatiumnorth.com/contact). Want to sponsor a specific feature or just say hi? Still happy to talk — [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 ## Why SpatiumDDI
 
