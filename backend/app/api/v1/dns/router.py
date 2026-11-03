@@ -35,7 +35,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -275,6 +275,7 @@ from app.services.dns_io import (
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
+from app.services.ipam.zone_binding import prune_group_ids
 from app.services.soft_delete import (
     SoftDeleteBatch,
     add_to_batch,
@@ -2382,33 +2383,12 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
     # IPAM names DNS groups in ``dns_group_ids``, a JSONB id list with no
     # foreign key, so nothing removes the id when the group goes: every space,
     # block and subnet that named it kept counting it as an inherited group
-    # and effective-dns kept returning it (#3433). Prune it here, Trash rows
-    # included (a raw UPDATE is not soft-delete filtered), so a restore brings
-    # back no reference to a group that no longer exists. Compared as text in
-    # lower case, the form the group's id has in every entry the API wrote.
-    for table in _IPAM_DNS_GROUP_TABLES:
-        await db.execute(
-            text(f"""
-                UPDATE {table} SET dns_group_ids = COALESCE((
-                    SELECT jsonb_agg(e ORDER BY o) FROM jsonb_array_elements(dns_group_ids)
-                        WITH ORDINALITY AS t(e, o)
-                    WHERE lower(e #>> '{{}}') <> :gid
-                ), '[]'::jsonb)
-                WHERE jsonb_typeof(dns_group_ids) = 'array'
-                  AND EXISTS (
-                    SELECT 1 FROM jsonb_array_elements(dns_group_ids) x
-                    WHERE lower(x #>> '{{}}') = :gid
-                  )
-                """),
-            {"gid": str(group.id)},
-        )
+    # and effective-dns kept returning it (#3433). Pruned here, Trash rows
+    # included, in any spelling the readers resolve.
+    await prune_group_ids(db, [group.id])
     collect_wake(dns_group_channel(group.id))
     await db.delete(group)
     await db.commit()
-
-
-# The IPAM tables whose ``dns_group_ids`` can name a DNS server group (#3433).
-_IPAM_DNS_GROUP_TABLES = ("ip_space", "ip_block", "subnet")
 
 
 # ── DNS Server endpoints ────────────────────────────────────────────────────

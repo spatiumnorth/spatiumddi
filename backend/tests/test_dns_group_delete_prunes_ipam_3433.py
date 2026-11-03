@@ -189,3 +189,166 @@ async def test_plan_naming_a_deleted_group_is_a_conflict(
     assert body["ok"] is False
     assert [(c["node_id"], c["kind"]) for c in body["conflicts"]] == [("b", "invalid_binding")]
     assert dead in body["conflicts"][0]["message"]
+
+
+def _spellings(u: uuid.UUID) -> list[str]:
+    """Spellings an older build stored as given and the readers resolve."""
+    return ["{" + str(u).upper() + "}", u.hex, f"urn:uuid:{u}", str(u).upper()]
+
+
+async def test_group_delete_prunes_every_spelling(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Before #2923 an id was stored as given; ``uuid.UUID`` resolves all of
+    these, so the delete must remove them all and keep the live group's."""
+    db = db_session
+    h = await _headers(db)
+    gone, keep = await _groups(db, "gone", "keep")
+    kept = ["{" + str(keep.id) + "}", keep.id.hex]
+    space = IPSpace(
+        name=f"sp3433-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_group_ids=[kept[0], *_spellings(gone.id), kept[1]],
+    )
+    db.add(space)
+    await db.flush()
+    await db.commit()
+
+    r = await client.delete(f"/api/v1/dns/groups/{gone.id}", headers=h)
+    assert r.status_code == 204, r.text
+    assert await _ids(db, "ip_space", space.id) == kept
+
+
+async def test_update_keeps_a_dead_group_the_row_already_has(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A row carrying a dead id (a selective IPAM restore) still takes an
+    unrelated edit from a dialog that re-sends its groups; a NEW dead id is
+    still refused."""
+    db = db_session
+    h = await _headers(db)
+    dead, new_dead = str(uuid.uuid4()), str(uuid.uuid4())
+    space = IPSpace(name=f"r3433-{uuid.uuid4().hex[:6]}", description="", dns_group_ids=[dead])
+    db.add(space)
+    await db.flush()
+    block = IPBlock(space_id=space.id, network="10.96.0.0/16", name="b", dns_group_ids=[dead])
+    db.add(block)
+    await db.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.96.1.0/24",
+        name="n",
+        dns_group_ids=[dead],
+    )
+    db.add(subnet)
+    await db.flush()
+    await db.commit()
+    paths = {
+        "spaces": space.id,
+        "blocks": block.id,
+        "subnets": subnet.id,
+    }
+    db.expire_all()
+    for kind, row_id in paths.items():
+        r = await client.put(
+            f"/api/v1/ipam/{kind}/{row_id}",
+            headers=h,
+            json={"description": "edited", "dns_group_ids": [dead]},
+        )
+        assert r.status_code == 200, (kind, r.text)
+        r = await client.put(
+            f"/api/v1/ipam/{kind}/{row_id}",
+            headers=h,
+            json={"dns_group_ids": [dead, new_dead]},
+        )
+        assert r.status_code == 422, (kind, r.text)
+        assert new_dead in r.text and dead not in r.text
+
+
+async def test_dns_factory_reset_clears_group_ids(db_session: AsyncSession) -> None:
+    """A DNS-only factory reset wipes every group and keeps IPAM, so every
+    ``dns_group_ids`` entry would name nothing."""
+    from tests.test_factory_reset_fk_cascade import _wipe  # noqa: PLC0415
+
+    db = db_session
+    (grp,) = await _groups(db, "reset")
+    space = IPSpace(
+        name=f"f3433-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_group_ids=[str(grp.id), "{" + str(grp.id).upper() + "}"],
+    )
+    db.add(space)
+    await db.flush()
+    trashed = IPSpace(
+        name=f"ft3433-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_group_ids=[str(grp.id)],
+        deleted_at=datetime.now(UTC),
+    )
+    db.add(trashed)
+    await db.flush()
+    await db.commit()
+    space_id, trashed_id = space.id, trashed.id
+
+    await _wipe("dns")
+    db.expire_all()
+    assert await _ids(db, "ip_space", space_id) == []
+    assert await _ids(db, "ip_space", trashed_id) == []
+
+
+async def test_migration_keeps_live_ids_in_any_spelling(db_session: AsyncSession) -> None:
+    """``b3d7e19a5c40`` drops dead ids and keeps a live one however it was
+    spelled; comparing lower-cased text would clear the braced, unhyphenated
+    and ``urn:uuid:`` spellings of a LIVE group."""
+    import importlib.util  # noqa: PLC0415
+    import pathlib  # noqa: PLC0415
+
+    from alembic.migration import MigrationContext  # noqa: PLC0415
+    from alembic.operations import Operations  # noqa: PLC0415
+
+    path = next(
+        (pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions").glob(
+            "b3d7e19a5c40_*.py"
+        )
+    )
+    spec = importlib.util.spec_from_file_location("b3d7e19a5c40", path)
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    db = db_session
+    (live,) = await _groups(db, "live")
+    dead = uuid.uuid4()
+    live_spellings = [str(live.id), *_spellings(live.id)]
+    space = IPSpace(
+        name=f"m3433-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_group_ids=[*_spellings(dead), live_spellings[1], str(dead), *live_spellings[2:]],
+    )
+    db.add(space)
+    await db.flush()
+    untouched = IPSpace(
+        name=f"mu3433-{uuid.uuid4().hex[:6]}", description="", dns_group_ids=live_spellings
+    )
+    trashed = IPSpace(
+        name=f"mt3433-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_group_ids=[str(dead), str(live.id)],
+        deleted_at=datetime.now(UTC),
+    )
+    db.add_all([untouched, trashed])
+    await db.flush()
+    await db.commit()
+
+    def _up(sync_conn: object) -> None:
+        with Operations.context(MigrationContext.configure(connection=sync_conn)):
+            mig.upgrade()
+
+    conn = await db.connection()
+    await conn.run_sync(_up)
+    await db.commit()
+
+    assert await _ids(db, "ip_space", space.id) == [live_spellings[1], *live_spellings[2:]]
+    assert await _ids(db, "ip_space", untouched.id) == live_spellings
+    assert await _ids(db, "ip_space", trashed.id) == [str(live.id)]
