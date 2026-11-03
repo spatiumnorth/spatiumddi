@@ -401,7 +401,9 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 
 - **Scopes** (`scopes: [...]`) — a coarse, closed vocabulary defined in
   [`backend/app/services/api_token_scopes.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/api_token_scopes.py):
-  `read`, `ipam:write`, `dns:write`, `dhcp:write`, `agent`. An empty
+  `read`, `ipam:write`, `dns:write`, `dhcp:write`. (An `agent` scope was
+  retired in #3302: the agent routes take the agent's own JWT or PSK, never an
+  API token. Create and update refuse it with 422.) An empty
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
   scopes returns `403 "Token scope insufficient for this request"` (the

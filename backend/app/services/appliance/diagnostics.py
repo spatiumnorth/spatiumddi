@@ -323,8 +323,10 @@ def _check_role_present(name_substring: str, label: str) -> CheckResult:
 def _clean(text: str) -> str:
     """Strip secret-shaped substrings (Fernet blobs, JWTs, PEM keys, URL
     credentials, …) — the support bundle's hard-exclude pass, shared so
-    the two bundles cannot drift apart again."""
-    return redact_secrets(text)[0]
+    the two bundles cannot drift apart again. In pieces: a host log goes
+    into the bundle whole, and one pass over a large one holds the GIL for
+    seconds (#3310)."""
+    return redact_secrets(text, in_pieces=True)[0]
 
 
 def _put(zf: zipfile.ZipFile, name: str, content: str) -> None:

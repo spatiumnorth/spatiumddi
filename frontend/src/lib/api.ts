@@ -1154,8 +1154,11 @@ export interface SubnetResizePreviewResponse {
   new_network_ip: string;
   old_broadcast_ip: string | null;
   new_broadcast_ip: string | null;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3322). */
   total_ips_before: number;
   total_ips_after: number;
+  total_ips_before_exact?: string;
+  total_ips_after_exact?: string;
   gateway_current: string | null;
   gateway_suggested_new_first_usable: string | null;
   placeholders_default_named: SubnetResizePlaceholder[];
@@ -1204,8 +1207,11 @@ export interface BlockResizePreviewResponse {
   network_address_shifts: boolean;
   old_network_ip: string;
   new_network_ip: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3322). */
   total_ips_before: number;
   total_ips_after: number;
+  total_ips_before_exact?: string;
+  total_ips_after_exact?: string;
   child_blocks_count: number;
   child_blocks: BlockResizeChildRow[];
   child_subnets_count: number;
@@ -1308,7 +1314,9 @@ export interface FindFreeCandidate {
   cidr: string;
   parent_block_id: string;
   parent_block_cidr: string;
+  /** Saturates at 2^63 - 1; use `free_addresses_exact` for display (#3322). */
   free_addresses?: number | null;
+  free_addresses_exact?: string | null;
 }
 
 export interface FindFreeResponse {
@@ -10809,12 +10817,7 @@ export const logsApi = {
  * = enforced at the auth layer BEFORE RBAC. Multiple scopes
  * union; ``read`` covers safe-method requests across the surface.
  */
-export type ApiTokenScope =
-  | "read"
-  | "ipam:write"
-  | "dns:write"
-  | "dhcp:write"
-  | "agent";
+export type ApiTokenScope = "read" | "ipam:write" | "dns:write" | "dhcp:write";
 
 export const API_TOKEN_SCOPES: {
   value: ApiTokenScope;
@@ -10841,11 +10844,6 @@ export const API_TOKEN_SCOPES: {
     label: "DHCP write",
     hint: "Mutate /dhcp/*. Excludes the agent surface.",
   },
-  {
-    value: "agent",
-    label: "Agent",
-    hint: "Bootstrap + push for /dns/agents/* and /dhcp/agents/*.",
-  },
 ];
 
 /** Per-token resource binding (#374). resource_type ∈ {subnet, dns_zone}. */
@@ -10861,7 +10859,9 @@ export interface ApiToken {
   description: string;
   prefix: string;
   scope: string;
-  scopes: ApiTokenScope[];
+  /** What the row stores. Usually an ``ApiTokenScope``, but a token minted
+   *  before #3302 may still carry the retired ``agent`` (matches nothing). */
+  scopes: string[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
   /** Set by the list endpoint (#2443). */

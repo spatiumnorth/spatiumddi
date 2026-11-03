@@ -238,3 +238,25 @@ def test_enumerate_hosts_tiny_subnets(cidr: str) -> None:
     # sweep just no-ops (empty list, not None).
     hosts = enumerate_hosts(cidr)
     assert hosts is not None
+
+
+async def test_reconcile_recounts_subnet_and_block_on_insert(db_session: AsyncSession) -> None:
+    """#3320: a ``discovered`` insert counts toward utilization, so the
+    subnet's and its block's cached figures follow it in the same pass
+    rather than at the hourly recount."""
+    subnet = await _make_subnet(db_session, "198.51.100.0/28")
+    subnet.total_ips = 14
+    await db_session.flush()
+    assert subnet.allocated_ips == 0
+
+    sweep = SweepResult(ping_alive={"198.51.100.5", "198.51.100.6"}, arp={})
+    counts = await reconcile_subnet(db_session, subnet, sweep)
+    assert counts["created"] == 2
+
+    await db_session.refresh(subnet)
+    assert subnet.allocated_ips == 2
+    assert subnet.utilization_percent == pytest.approx(14.29)
+    block = await db_session.get(IPBlock, subnet.block_id)
+    await db_session.refresh(block)
+    # A block counts its subnets' network + broadcast too (#2982).
+    assert block.allocated_ips == 4

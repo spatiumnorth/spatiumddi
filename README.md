@@ -1300,8 +1300,8 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 Turn it on per group under **DNS → Server Groups → Options → Encrypted
 transports**, after linking a TLS certificate (upload one, or issue it
 from Let's Encrypt under **Appliance → Fleet → Web UI Certificate**;
-a Docker or Kubernetes control plane has no certificate page, so there
-it goes through `POST /api/v1/appliance/tls/upload` or
+on a Docker or Kubernetes control plane the same store is **Fleet → TLS
+certificates**, or `POST /api/v1/appliance/tls/upload` /
 `POST /api/v1/appliance/acme/issue`). Both
 listeners are additive — plain DNS on `:53` keeps working.
 
