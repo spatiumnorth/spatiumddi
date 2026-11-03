@@ -319,7 +319,7 @@ APIToken
 
 - **User tokens** are the only kind the build issues: a token acts as its owning user and cannot exceed that user's rights. A token with no owner (a "global" token) is refused with 401 "Global-scope API tokens are not yet supported"; use a dedicated service user for automation, CI/CD and Terraform instead
 - Tokens are displayed once on creation (sha256 hash stored)
-- Instead of typing API paths, the create dialog offers five fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write`, `dhcp:write` and `agent`. A token may also be bound to specific subnets or DNS zones (`resource_grants`; the create dialog binds one)
+- Instead of typing API paths, the create dialog offers four fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write` and `dhcp:write`. There is no scope for the agent routes, which never accept an API token. A token may also be bound to specific subnets or DNS zones (`resource_grants`; the create dialog binds one)
 
 ### 2.6 Syslog / Log Forwarding
 

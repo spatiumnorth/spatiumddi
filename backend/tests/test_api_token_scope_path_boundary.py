@@ -57,7 +57,6 @@ def test_dns_write_covers_its_own_surface(path: str) -> None:
 
 def test_dns_write_still_excludes_the_agent_surface() -> None:
     assert scope_matches_request(["dns:write"], "POST", "/api/v1/dns/agents/register") is False
-    assert scope_matches_request(["agent"], "POST", "/api/v1/dns/agents/register") is True
     assert scope_matches_request(["dhcp:write"], "POST", "/api/v1/dhcp/agents/x") is False
 
 
@@ -69,7 +68,6 @@ def test_dns_write_still_excludes_the_agent_surface() -> None:
         ("ipam:write", "/api/v1/vrfs/abc", "/api/v1/vrfsx"),
         ("ipam:write", "/api/v1/network-devices/abc", "/api/v1/network-devices2"),
         ("dhcp:write", "/api/v1/dhcp/scopes", "/api/v1/dhcpx/scopes"),
-        ("agent", "/api/v1/dns/agents/heartbeat", "/api/v1/dns/agentsx"),
     ],
 )
 def test_every_prefix_respects_the_segment_boundary(scope: str, inside: str, outside: str) -> None:
@@ -123,7 +121,7 @@ def _mounted_paths() -> set[str]:
 def test_write_scopes_grant_only_their_own_top_level_segments() -> None:
     """For every mounted route, a write scope matches if and only if the
     route's first segment under ``/api/v1`` is one the scope names (agent
-    paths excepted, which need ``agent``)."""
+    paths excepted, which no scope covers)."""
     paths = _mounted_paths()
     assert any(p.startswith("/api/v1/dnsbl/") for p in paths)
     assert any(p.startswith("/api/v1/dns-threat/") for p in paths)

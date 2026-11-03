@@ -458,7 +458,9 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
     for name in names:
         try:
             raw = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
-            out[name] = cap(scrub.text(raw), CAP_LOG_BYTES)
+            # In pieces: the whole file is scrubbed before its tail is kept, and
+            # one pass over a large log holds the GIL for seconds (#3310).
+            out[name] = cap(scrub.text(raw, in_pieces=True), CAP_LOG_BYTES)
         except OSError as exc:
             out[f"{name}.error"] = f"{type(exc).__name__}: {exc}"
     if not out:
@@ -508,7 +510,7 @@ def _collect_installer_logs(scrub: Scrubber) -> dict[str, str]:
         except OSError as exc:
             out[f"install/{path.name}.error"] = f"{type(exc).__name__}: {exc}"
             continue
-        out[f"install/{path.name}"] = cap(scrub.text(raw), CAP_LOG_BYTES)
+        out[f"install/{path.name}"] = cap(scrub.text(raw, in_pieces=True), CAP_LOG_BYTES)
     return out
 
 
