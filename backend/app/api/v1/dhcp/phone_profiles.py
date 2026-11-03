@@ -408,7 +408,7 @@ async def replace_scope_attachments(
         resource_id=str(prof.id),
         resource_display=prof.name,
         changed_fields=["scope_attachments"],
-        new_value={"scope_count": len(body.scope_ids)},
+        new_value={"scope_count": len(set(body.scope_ids))},
     )
     collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()

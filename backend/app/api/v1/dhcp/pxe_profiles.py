@@ -215,6 +215,12 @@ def _input_key(r: ArchMatchInput) -> tuple[Any, ...]:
     )
 
 
+def _selector(key: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The part of a match key that says WHICH clients the rule selects
+    (kind, vendor class, arch codes) — priority and boot files aside."""
+    return key[1:4]
+
+
 def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
     """Reconcile the stored matches with the input; return True when anything
     differed (#3367).
@@ -222,8 +228,13 @@ def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
     Rows whose content is already stored are kept as they are, ids included.
     The Kea class name embeds the match id, so re-creating an identical row
     renamed its class, shifted the bundle ETag and pushed a config to every
-    agent for a Save that changed nothing. Leftover rows are updated in place
-    pairwise; only a real surplus is deleted or created.
+    agent for a Save that changed nothing. A leftover input row is updated in
+    place only onto a stored row that selects the same clients (same kind,
+    vendor class and arch codes), so an edited priority or boot file keeps its
+    class name — and a pool whose ``class_restriction`` names that class keeps
+    meaning the same clients. Any other leftover is deleted and created anew:
+    reusing an id across selectors would silently move such a pool onto a
+    different set of clients.
     """
     existing = sorted(p.matches, key=lambda x: (x.priority, str(x.id)))
     unmatched_rows: list[ArchMatchInput] = []
@@ -239,14 +250,14 @@ def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
     if not unmatched_rows and not free:
         return False
     for r in unmatched_rows:
-        if free:
-            m = free.pop(0)
-            m.priority = r.priority
-            m.match_kind = r.match_kind
-            m.vendor_class_match = r.vendor_class_match
-            m.arch_codes = r.arch_codes
-            m.boot_filename = r.boot_filename
-            m.boot_file_url_v6 = r.boot_file_url_v6
+        sel = _selector(_input_key(r))
+        for m in free:
+            if _selector(_row_key(m)) == sel:
+                free.remove(m)
+                m.priority = r.priority
+                m.boot_filename = r.boot_filename
+                m.boot_file_url_v6 = r.boot_file_url_v6
+                break
         else:
             p.matches.append(
                 DHCPPXEArchMatch(
