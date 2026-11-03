@@ -338,3 +338,159 @@ describe("Edit NAT mapping (#3365)", () => {
     expect(update).toHaveBeenCalledWith("n-1", { description: "new" });
   });
 });
+
+describe("edge cases (#3365 validation)", () => {
+  it("an untouched Edit Server Group Save sends nothing and closes", async () => {
+    const group = {
+      id: "g-1",
+      name: "grp",
+      description: "d",
+      group_type: "internal",
+      is_recursive: false,
+      catalog_zones_enabled: false,
+      catalog_zone_name: "catalog.spatium.invalid.",
+      is_public_facing: false,
+      auto_reverse_zones_at_provider: false,
+    } as unknown as DNSServerGroup;
+    const updateGroup = vi.fn(() => Promise.resolve(group));
+    const onClose = vi.fn();
+    answers.dnsApi = { getGroup: () => Promise.resolve(group), updateGroup };
+    open(<GroupModal group={group} onClose={onClose} />);
+    await screen.findByDisplayValue("d");
+    save();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateGroup).not.toHaveBeenCalled();
+  });
+
+  it("a MAC block deleted elsewhere says so instead of showing a form", async () => {
+    const block = {
+      id: "m-1",
+      group_id: "g-1",
+      mac_address: "aa:bb:cc:dd:ee:ff",
+      reason: "other",
+      description: "d",
+      enabled: true,
+      expires_at: null,
+    } as unknown as DHCPMACBlock;
+    const createMacBlock = vi.fn();
+    const updateMacBlock = vi.fn();
+    answers.dhcpApi = {
+      listMacBlocks: () => Promise.resolve([]),
+      createMacBlock,
+      updateMacBlock,
+    };
+    open(<MacBlockModal groupId="g-1" block={block} onClose={() => {}} />);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/not found/);
+    expect(screen.queryByRole("button", { name: /^Save/ })).toBeNull();
+    expect(createMacBlock).not.toHaveBeenCalled();
+    expect(updateMacBlock).not.toHaveBeenCalled();
+  });
+
+  it("a PXE profile whose read fails shows the error, not the stale form", async () => {
+    const updatePxeProfile = vi.fn();
+    answers.dhcpApi = {
+      getPxeProfile: () => Promise.reject(new Error("PXE profile not found")),
+      updatePxeProfile,
+    };
+    open(
+      <ProfileEditor
+        mode="edit"
+        groupId="g-1"
+        existing={
+          {
+            id: "p-1",
+            name: "prof",
+            description: "d",
+            next_server: "10.0.0.1",
+            enabled: true,
+            matches: [],
+          } as unknown as PXEProfile
+        }
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    expect((await screen.findByRole("alert")).textContent).toMatch(/not found/);
+    expect(screen.queryByDisplayValue("d")).toBeNull();
+    expect(updatePxeProfile).not.toHaveBeenCalled();
+  });
+
+  it("an address-set range edit sends the whole range", async () => {
+    const set = {
+      id: "s-1",
+      name: "set",
+      description: "d",
+      subnet_id: "sn-1",
+      customer_id: null,
+      site_id: null,
+      range_kind: "contiguous",
+      start_address: "10.0.0.10",
+      end_address: "10.0.0.79",
+      explicit_addresses: [],
+    } as unknown as AddressSet;
+    const update = vi.fn(() => Promise.resolve(set));
+    answers.addressSetsApi = { get: () => Promise.resolve(set), update };
+    open(
+      <AddressSetModal
+        subnet={{ id: "sn-1", network: "10.0.0.0/24" } as never}
+        existing={set}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    const end = await screen.findByDisplayValue("10.0.0.79");
+    fireEvent.change(end, { target: { value: "10.0.0.89" } });
+    save();
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(update).toHaveBeenCalledWith("s-1", {
+      range_kind: "contiguous",
+      start_address: "10.0.0.10",
+      end_address: "10.0.0.89",
+      explicit_addresses: [],
+    });
+  });
+
+  it("a NAT kind change sends the whole mapping", async () => {
+    const mapping = {
+      id: "n-1",
+      name: "nat",
+      kind: "1to1",
+      internal_ip: "10.0.0.5",
+      internal_subnet_id: null,
+      internal_port_start: null,
+      internal_port_end: null,
+      external_ip: "203.0.113.9",
+      external_port_start: null,
+      external_port_end: null,
+      protocol: "any",
+      device_label: null,
+      description: "d",
+    } as unknown as NATMapping;
+    const update = vi.fn(() => Promise.resolve(mapping));
+    answers.natApi = { get: () => Promise.resolve(mapping), update };
+    open(
+      <NATMappingModal
+        initial={mapping}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    await screen.findByDisplayValue("d");
+    fireEvent.change(screen.getAllByRole("combobox")[0], {
+      target: { value: "pat" },
+    });
+    save();
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(update).toHaveBeenCalledWith(
+      "n-1",
+      expect.objectContaining({
+        name: "nat",
+        kind: "pat",
+        internal_ip: "10.0.0.5",
+        external_ip: "203.0.113.9",
+        protocol: "any",
+        description: "d",
+      }),
+    );
+  });
+});
