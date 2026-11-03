@@ -287,6 +287,7 @@ function AsnRow({
                 ? "Private ASN — no public WHOIS"
                 : "Refresh WHOIS"
             }
+            aria-label="Refresh WHOIS"
             className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
             {...writeGate}
           >

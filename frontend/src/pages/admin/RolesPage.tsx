@@ -476,11 +476,7 @@ export function RolesPage() {
                             ? "Built-in roles cannot be deleted"
                             : "Delete"
                         }
-                        aria-label={
-                          role.is_builtin
-                            ? "Built-in roles cannot be deleted"
-                            : "Delete"
-                        }
+                        aria-label="Delete"
                         {...adminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />

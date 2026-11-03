@@ -17,10 +17,17 @@
  * capitalised element with children of its own, a fragment, a `{…}`
  * expression) is treated as content that may carry a name.
  *
+ * An icon chosen in an expression (`{busy ? <Loader2 /> : <X />}`,
+ * `{ok && <Check />}`) counts as an icon too. Any other capitalised
+ * component that takes a permission-gate spread is scanned as well (a local
+ * `IconBtn` wrapper, say): the gate's `title` lands on whatever the wrapper
+ * renders it as, so beside one only `aria-label`, `aria-labelledby` or a
+ * `label` prop (the wrapper's own name for the action) counts (#3395).
+ *
  * Known misses, accepted to keep this a cheap static check rather than a
  * render of every page:
- *   - an icon chosen in an expression (`{busy ? <Loader2 /> : <X />}`) or
- *     wrapped in a lowercase element (`<span><X /></span>`) is not seen;
+ *   - an icon wrapped in a lowercase element (`<span><X /></span>`) is not
+ *     seen;
  *   - a button with a spread (`{...props}`) is assumed named, since the
  *     spread may carry `aria-label`. The one exception is a permission
  *     gate (`{...permissionGate(...)}`, `{...dhcpGate(...)}`, `{...writeGate}`):
@@ -42,6 +49,8 @@ import ts from "typescript";
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NAMING = new Set(["aria-label", "aria-labelledby", "title"]);
 const DURABLE = new Set(["aria-label", "aria-labelledby"]);
+// A wrapper component's own action-name prop, which it renders as the name.
+const WRAPPER_DURABLE = new Set(["aria-label", "aria-labelledby", "label"]);
 const BUTTONS = new Set(["button", "Button", "HeaderButton"]);
 // A spread of a permission gate gives a title only while denied (#3160):
 // `permissionGate(...)`, `dhcpGate(...)`, `writeGate`. Matched as a whole
@@ -75,18 +84,39 @@ function unnamedIconButtons(fileName: string, code: string): number[] {
     ts.ScriptKind.TSX,
   );
   const found: number[] = [];
+  // `{busy ? <Loader2 /> : <X />}` / `{ok && <Check />}`: an expression
+  // whose every rendered branch is an icon.
+  const iconOnly = (e: ts.Expression): boolean => {
+    if (ts.isParenthesizedExpression(e)) return iconOnly(e.expression);
+    if (ts.isConditionalExpression(e))
+      return iconOnly(e.whenTrue) && iconOnly(e.whenFalse);
+    if (
+      ts.isBinaryExpression(e) &&
+      e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+    )
+      return iconOnly(e.right);
+    if (ts.isJsxSelfClosingElement(e)) {
+      const tag = e.tagName.getText();
+      return /^[A-Z]/.test(tag) || tag === "svg";
+    }
+    if (ts.isJsxElement(e)) return e.openingElement.tagName.getText() === "svg";
+    return false;
+  };
   const visit = (n: ts.Node) => {
-    if (ts.isJsxElement(n) && BUTTONS.has(n.openingElement.tagName.getText())) {
-      const props = n.openingElement.attributes.properties;
-      // A permission gate overwrites `title` with the refusal reason while
-      // denied, so beside one only a real aria-label / aria-labelledby is a
-      // name that survives (#3395).
-      const gated = props.some(
-        (a) =>
-          ts.isJsxSpreadAttribute(a) &&
-          GATE_SPREAD.test(a.expression.getText()),
-      );
-      const naming = gated ? DURABLE : NAMING;
+    const tag = ts.isJsxElement(n) ? n.openingElement.tagName.getText() : "";
+    const props = ts.isJsxElement(n)
+      ? n.openingElement.attributes.properties
+      : undefined;
+    // A permission gate overwrites `title` with the refusal reason while
+    // denied, so beside one only a real aria-label / aria-labelledby is a
+    // name that survives (#3395).
+    const gated = !!props?.some(
+      (a) =>
+        ts.isJsxSpreadAttribute(a) && GATE_SPREAD.test(a.expression.getText()),
+    );
+    const wrapper = !BUTTONS.has(tag) && /^[A-Z]/.test(tag) && gated;
+    if (ts.isJsxElement(n) && props && (BUTTONS.has(tag) || wrapper)) {
+      const naming = wrapper ? WRAPPER_DURABLE : gated ? DURABLE : NAMING;
       const named = props.some(
         (a) =>
           (ts.isJsxSpreadAttribute(a) &&
@@ -99,7 +129,8 @@ function unnamedIconButtons(fileName: string, code: string): number[] {
         if (ts.isJsxText(c)) {
           if (c.text.trim()) content = true;
         } else if (ts.isJsxExpression(c)) {
-          if (c.expression) content = true;
+          if (c.expression && iconOnly(c.expression)) icon = true;
+          else if (c.expression) content = true;
         } else if (ts.isJsxSelfClosingElement(c)) {
           const tag = c.tagName.getText();
           if (/^[A-Z]/.test(tag) || tag === "svg") icon = true;
@@ -167,6 +198,15 @@ describe("icon-only buttons", () => {
       "a title plus a gate spread (the gate replaces the title)",
       "<button title='Edit' {...superadminGate}><Pencil /></button>",
     ],
+    [
+      "an icon chosen in an expression, title plus gate",
+      "<button title='Disable' {...adminGate}>{on ? <PowerOff /> : <Check />}</button>",
+    ],
+    [
+      "a wrapper component given a title and a gate",
+      "<IconBtn title='Edit' onClick={f} {...writeGate}><Pencil /></IconBtn>",
+    ],
+    ["an icon behind &&", "<button>{busy && <Loader2 />}</button>"],
     ["aria-hidden but no name", "<button aria-hidden='true'><X /></button>"],
   ])("flags an unnamed button holding %s", (_, jsx) => {
     expect(unnamedIconButtons("f.tsx", `const a = (${jsx});`)).toEqual([1]);
@@ -195,6 +235,18 @@ describe("icon-only buttons", () => {
       "<button aria-label='Edit x' {...permissionGate(ok, why)}><Pencil /></button>",
     ],
     ["a component with text", "<button><Kbd>Esc</Kbd></button>"],
+    [
+      "a wrapper's label prop beside a gate",
+      "<IconBtn label='Edit' onClick={f} {...writeGate}><Pencil /></IconBtn>",
+    ],
+    [
+      "a wrapper with visible text beside a gate",
+      "<ActionButton title='Restart' {...gate}>Restart</ActionButton>",
+    ],
+    [
+      "a title on an ungated button whose icon is chosen in an expression",
+      "<button title='Sync'>{busy ? <Loader2 /> : <RefreshCw />}</button>",
+    ],
   ])("passes a button named by %s", (_, jsx) => {
     expect(unnamedIconButtons("f.tsx", `const a = (${jsx});`)).toEqual([]);
   });

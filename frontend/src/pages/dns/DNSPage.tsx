@@ -9485,11 +9485,7 @@ function RecordsTab({
                               ? "Auto-managed — edit the source IP/lease"
                               : "Edit"
                           }
-                          aria-label={
-                            rec.auto_generated
-                              ? "Auto-managed — edit the source IP/lease"
-                              : "Edit"
-                          }
+                          aria-label="Edit"
                           {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
                         >
                           <Pencil className="h-3.5 w-3.5" />
@@ -9503,11 +9499,7 @@ function RecordsTab({
                               ? "Auto-managed — delete the source IP/lease"
                               : "Delete"
                           }
-                          aria-label={
-                            rec.auto_generated
-                              ? "Auto-managed — delete the source IP/lease"
-                              : "Delete"
-                          }
+                          aria-label="Delete"
                           {...permissionGate(
                             canDeleteRecords,
                             NEEDS_DNS_DELETE,
@@ -10876,11 +10868,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                               ? "Refresh in progress…"
                               : "Refresh from feed"
                           }
-                          aria-label={
-                            refreshing.has(l.id)
-                              ? "Refresh in progress…"
-                              : "Refresh from feed"
-                          }
+                          aria-label="Refresh from feed"
                           disabled={refreshing.has(l.id)}
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
                           onClick={() => refreshMut.mutate(l.id)}
@@ -11533,11 +11521,7 @@ export function BlocklistDetail({
                             ? "Remove entry"
                             : "Remove (will return on next feed refresh)"
                         }
-                        aria-label={
-                          e.source === "manual"
-                            ? "Remove entry"
-                            : "Remove (will return on next feed refresh)"
-                        }
+                        aria-label="Remove entry"
                         {...permissionGate(
                           can("delete", "dns_blocklist"),
                           NEEDS_BLOCKLIST_DELETE,

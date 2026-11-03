@@ -123,9 +123,9 @@ function gated(name: string | RegExp): HTMLElement {
 
 const byName = (n: string | RegExp) => gated(n);
 
-/** A gated icon button is named by its tooltip, so while it is denied the
- *  reason is its name. Every button carrying that reason is disabled; an
- *  enabled icon button is found by its own title instead. */
+/** A gated icon button carries the reason as its tooltip while it is
+ *  denied (its name stays the action, #3395). Every button carrying that
+ *  reason is disabled; an enabled icon button is found by its own title. */
 function expectIconsDenied(reason: string, count: number) {
   const found = screen.getAllByTitle(reason) as HTMLButtonElement[];
   expect(found.length).toBe(count);

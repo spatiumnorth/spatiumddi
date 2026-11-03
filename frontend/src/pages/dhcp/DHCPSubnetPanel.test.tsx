@@ -158,8 +158,8 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
       "Requires write permission on DHCP scopes",
     );
     expect(button(/Add Pool/).disabled).toBe(true);
-    // The icon buttons are named by their tooltip, which is the reason
-    // while it is denied: edit + delete scope, edit + delete pool.
+    // The icon buttons carry the reason as their tooltip while denied (and
+    // keep their action as the name, #3395): edit + delete scope and pool.
     const denied = screen
       .getAllByTitle(
         /^Requires (write|delete) permission on DHCP (scopes|pools)$/,

@@ -106,10 +106,12 @@ async function permissionsLoaded() {
   await act(async () => {});
 }
 
-/** A refused icon-only button keeps its action name (#3395) but is disabled. */
+/** A refused icon-only button keeps its action name (#3395) but is
+ *  disabled. At least one must be found, so a button that vanished, or one
+ *  named by its refusal again, fails here instead of passing vacuously. */
 function expectRefused(name: string | RegExp) {
-  for (const b of screen.queryAllByRole("button", { name }))
-    expect((b as HTMLButtonElement).disabled).toBe(true);
+  const found = screen.getAllByRole("button", { name });
+  for (const b of found) expect((b as HTMLButtonElement).disabled).toBe(true);
 }
 
 /** A refused icon-only button is named by its action (aria-label, #3395) and
@@ -265,8 +267,8 @@ describe("#1338 the DNS page", () => {
     await openDns("zones");
     expectDenied(GROUP_WRITES, SUPERADMIN);
     expectDenied(["Add Zone", /From Template/], ZONE_WRITE);
-    // The tree's "New server group" is an icon button: while denied it is
-    // named by its tooltip, the reason (as #1175's icon buttons are).
+    // The tree's "New server group" is an icon button: while denied it keeps
+    // its action as its name and is disabled (#3395).
     expectRefused("New server group");
     for (const tab of TAB_CREATES.slice(1)) {
       cleanup();
@@ -475,7 +477,7 @@ describe("#1339 the DHCP page", () => {
       ["Edit Group", "Delete Group", "Add Server", /^Pause\b/],
       SUPERADMIN,
     );
-    // The icon buttons are named by their tooltip, the reason, while denied.
+    // The icon buttons keep their action name while denied, disabled (#3395).
     for (const name of ["New group", "Edit server", "Delete server"]) {
       expectRefused(name);
     }
@@ -594,7 +596,7 @@ describe("#1340 the Network and integration pages", () => {
         0,
       );
     }
-    // VLANs' "New Router" is an icon button: named by its reason while denied.
+    // VLANs' "New Router" is an icon button: named by its action, disabled.
     cleanup();
     await openPage("/network/vlans", "vlans/VLANsPage", "VLANsPage");
     await screen.findByTitle(/^Refresh routers/);
@@ -619,11 +621,17 @@ describe("#1340 the Network and integration pages", () => {
     );
     const row = (await screen.findByText("viewer-customer")).closest("tr")!;
     await permissionsLoaded();
-    // Icon buttons, named by their tooltip: the reason while denied.
+    // Icon buttons: named by their action, the reason as the tooltip.
     const rowButtons = Array.from(row.querySelectorAll("button"));
-    expect(rowButtons.map((b) => [b.title, b.disabled])).toEqual([
-      ["Requires write permission on customers", true],
-      ["Requires delete permission on customers", true],
+    expect(
+      rowButtons.map((b) => [
+        b.getAttribute("aria-label"),
+        b.title,
+        b.disabled,
+      ]),
+    ).toEqual([
+      ["Edit", "Requires write permission on customers", true],
+      ["Delete", "Requires delete permission on customers", true],
     ]);
   });
 

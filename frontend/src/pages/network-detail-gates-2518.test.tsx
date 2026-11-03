@@ -107,10 +107,12 @@ function expectDenied(el: HTMLElement, reason: string) {
 function expectOffered(el: HTMLElement) {
   expect((el as HTMLButtonElement).disabled).toBe(false);
 }
-/** A refused icon-only button keeps its action name (#3395) but is disabled. */
+/** A refused icon-only button keeps its action name (#3395) but is
+ *  disabled. At least one must be found, so a button that vanished, or one
+ *  named by its refusal again, fails here instead of passing vacuously. */
 function expectRefused(name: string | RegExp) {
-  for (const b of screen.queryAllByRole("button", { name }))
-    expect((b as HTMLButtonElement).disabled).toBe(true);
+  const found = screen.getAllByRole("button", { name });
+  for (const b of found) expect((b as HTMLButtonElement).disabled).toBe(true);
 }
 
 /** A refused icon-only button is named by its action (aria-label, #3395) and
@@ -129,9 +131,9 @@ function gated(name: string | RegExp): HTMLElement {
 
 const byName = (n: string | RegExp) => gated(n);
 
-/** A gated icon button is named by its tooltip, so while it is denied the
- *  reason is its name. Every button carrying that reason is disabled; an
- *  enabled icon button is found by its own title instead. */
+/** A gated icon button carries the reason as its tooltip while it is
+ *  denied (its name stays the action, #3395). Every button carrying that
+ *  reason is disabled; an enabled icon button is found by its own title. */
 function expectIconsDenied(reason: string, count: number) {
   const found = screen.getAllByTitle(reason) as HTMLButtonElement[];
   expect(found.length).toBe(count);

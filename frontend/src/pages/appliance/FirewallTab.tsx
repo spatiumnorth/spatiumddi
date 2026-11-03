@@ -778,11 +778,7 @@ function PoliciesSection() {
                             ? "Built-in policies can't be deleted (disable instead)"
                             : "Delete"
                         }
-                        aria-label={
-                          p.is_builtin
-                            ? "Built-in policies can't be deleted (disable instead)"
-                            : "Delete"
-                        }
+                        aria-label="Delete"
                         className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
                         {...applianceGate}
                       >

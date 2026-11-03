@@ -264,6 +264,7 @@ export function ConformityPage() {
                         <button
                           type="button"
                           title={p.enabled ? "Disable" : "Enable"}
+                          aria-label={p.enabled ? "Disable" : "Enable"}
                           onClick={() => togglePolicyMut.mutate(p)}
                           className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           {...adminGate}
