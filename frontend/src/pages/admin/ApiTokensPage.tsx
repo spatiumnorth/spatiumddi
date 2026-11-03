@@ -1049,7 +1049,7 @@ export function ApiTokensPage() {
   );
 }
 
-function ScopeChips({ scopes }: { scopes: ApiTokenScope[] | undefined }) {
+function ScopeChips({ scopes }: { scopes: string[] | undefined }) {
   // Empty list = no restriction; render an explicit "full access"
   // hint rather than blank so operators can tell the difference
   // between "scopes weren't loaded" and "no scope restriction".
@@ -1071,7 +1071,12 @@ function ScopeChips({ scopes }: { scopes: ApiTokenScope[] | undefined }) {
           <span
             key={s}
             className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary"
-            title={meta?.hint ?? s}
+            title={
+              meta?.hint ??
+              // A stored value no longer offered (the retired `agent`, #3302)
+              // matches no route; it does not make the token unrestricted.
+              `${s}: not a current scope; matches nothing`
+            }
           >
             {s}
           </span>

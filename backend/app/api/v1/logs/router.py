@@ -38,7 +38,7 @@ from app.drivers.dns import AGENTLESS_DRIVERS as DNS_AGENTLESS
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
-from app.services.api_token_scopes import read_only_post
+from app.services.api_token_scopes import read_only_post, token_write
 from app.services.feature_modules import get_enabled_modules, require_module
 from app.services.logs.agent_logs import (
     InvalidLogFilter,
@@ -299,6 +299,7 @@ async def _resolve_server(db: DB, server_kind: str, server_id: uuid.UUID) -> tup
 
 
 @router.post("/query", response_model=LogQueryResponse, dependencies=[_WINRM_READ])
+@token_write("Runs Get-WinEvent over WinRM on a Windows server with stored credentials (outbound)")
 async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     """Run a filtered ``Get-WinEvent`` against the named server and return
     matching rows.
@@ -362,6 +363,9 @@ async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     "/dhcp-audit",
     response_model=DhcpAuditResponse,
     dependencies=[_WINRM_READ, Depends(require_module("core.dhcp"))],
+)
+@token_write(
+    "Reads the DHCP audit log over WinRM on a Windows server with stored credentials (outbound)"
 )
 async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
     """Read + parse a Windows DHCP server's audit log for the given day.

@@ -1103,8 +1103,8 @@ running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The
 conformity evaluator follows the same rules.
 
-Rule types described on this page. The build has 73 (`RULE_TYPES` in
-`backend/app/services/alerts.py`) and 41 of them have a row below.
+Rule types described on this page. Most of the build's `RULE_TYPES` (in
+`backend/app/services/alerts.py`) have a row below.
 `GET /api/v1/alerts/rule-types` lists every type whose feature module is
 enabled, with its parameters, and some are documented on their own feature page
 instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in

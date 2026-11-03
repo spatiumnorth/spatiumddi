@@ -51,6 +51,7 @@ from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import CreateNetworkBlockArgs
+from app.services.api_token_scopes import token_write
 from app.services.approvals.gate import gate_or_execute
 from app.services.block_sync.reconcile import (
     applicable_targets_for_kind,
@@ -366,6 +367,9 @@ async def list_blocks(db: DB, _: ManageUser) -> list[BlockOut]:
 
 
 @router.post("/blocks/preview", response_model=list[TargetDiffOut])
+@token_write(
+    "DB-only dry run of a block-sync add, no push and no write; kept write-scoped behind ManageUser as the preview half of the block-sync write flow"
+)
 async def preview_block(body: BlockCreate, db: DB, _: ManageUser) -> list[TargetDiffOut]:
     """Show which armed targets a new block would land on, and the exact
     add — WITHOUT persisting or pushing anything (NN#5)."""

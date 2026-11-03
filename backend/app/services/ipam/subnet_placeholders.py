@@ -19,7 +19,7 @@ from __future__ import annotations
 import ipaddress
 import uuid
 
-from sqlalchemy import ColumnElement, and_, exists, false, func, or_, text
+from sqlalchemy import ColumnElement, and_, exists, false, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
@@ -158,3 +158,167 @@ async def create_placeholder_rows(
     subnet.gateway = gw_addr
     created.append(gw_addr)
     return created, gw_row
+
+
+# ── Moving a stored gateway (#3317) ─────────────────────────────────────────
+#
+# Edit Subnet and the subnet import's ``overwrite`` change an existing
+# subnet's gateway. Both follow New Subnet: the gateway gets the reserved row
+# ``create_placeholder_rows`` would have given it, so Next available never
+# offers it, and the old untouched placeholder goes. The caller retracts the
+# old row's DNS before deleting it and publishes the new row's, as it would
+# for any address it writes.
+
+
+async def holds_placeholder_rows(db: AsyncSession, subnet: Subnet) -> bool:
+    """True when ``subnet`` carries New Subnet's placeholder rows, so its
+    gateway takes a row too. False for a subnet New Subnet gives none (a /31,
+    a multicast range, a Kubernetes pod / service CIDR) and for one created
+    with ``skip_auto_addresses`` or stripped by ``manage_auto_addresses``,
+    which has no ``network`` row: New Subnet reserves no gateway row there
+    either, and accepts a gateway on the network / broadcast address."""
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    if subnet.kubernetes_semantics or not has_boundary_rows(net, subnet.kind):
+        return False
+    return bool(
+        await db.scalar(
+            select(
+                exists().where(
+                    IPAddress.subnet_id == subnet.id,
+                    IPAddress.status == "network",
+                )
+            )
+        )
+    )
+
+
+async def find_untouched_gateway_row(db: AsyncSession, subnet: Subnet) -> IPAddress | None:
+    """The placeholder row on the subnet's *stored* gateway, or None when the
+    operator has made it theirs (``untouched_gateway_row``). Read it before the
+    gateway column changes: the test compares the row with ``subnet.gateway``."""
+    return await db.scalar(
+        select(IPAddress)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
+        .where(IPAddress.subnet_id == subnet.id, untouched_gateway_row())
+    )
+
+
+async def gateway_target_problem(db: AsyncSession, subnet: Subnet, gateway: str) -> str | None:
+    """Why the gateway cannot move onto ``gateway``, an address other than the
+    stored one, or None. The address is free, or holds a ``reserved`` row (an
+    infrastructure reservation such as the router's own, kept as it is). Any
+    other row is a host, a DHCP lease, a discovered or orphaned address: the
+    gateway would point at it, and when the row went the address would be
+    offered as free. Resize refuses the same (#2413)."""
+    row = await db.scalar(
+        select(IPAddress).where(IPAddress.subnet_id == subnet.id, IPAddress.address == gateway)
+    )
+    if row is None or row.status == GATEWAY_STATUS:
+        return None
+    holder = f'"{row.hostname}" ({row.status})' if row.hostname else f"a {row.status} row"
+    return (
+        f"Gateway {gateway} is already held by {holder} in subnet {subnet.network}: "
+        "free that address, or mark it reserved, first"
+    )
+
+
+async def add_gateway_row(
+    db: AsyncSession,
+    subnet: Subnet,
+    gateway: str,
+    *,
+    created_by_user_id: uuid.UUID | None,
+) -> IPAddress | None:
+    """Add the reserved gateway row at ``gateway`` (as ``create_placeholder_rows``
+    does) unless a row already holds it, and flush. Returns the new row, or None
+    when the address was already held (``gateway_target_problem`` let it through
+    as a reservation of the operator's)."""
+    held = await db.scalar(
+        select(IPAddress.id).where(IPAddress.subnet_id == subnet.id, IPAddress.address == gateway)
+    )
+    if held is not None:
+        return None
+    row = IPAddress(
+        subnet_id=subnet.id,
+        address=gateway,
+        status=GATEWAY_STATUS,
+        description=GATEWAY_DESCRIPTION,
+        hostname=GATEWAY_HOSTNAME,
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+# ── Integration mirrors (#3347) ─────────────────────────────────────────────
+
+
+async def sync_mirror_gateway_row(
+    db: AsyncSession, subnet: Subnet, new_gateway: str | None
+) -> str | None:
+    """Keep the reserved gateway row of an integration-mirrored subnet in step
+    with the gateway the integration reports, so Next available never offers it.
+
+    Call it *before* the caller assigns ``subnet.gateway = new_gateway`` (the
+    untouched-row test reads the stored gateway), and once for a subnet created
+    this sync, after a flush. It creates the row when the gateway has none,
+    moves an untouched one when the gateway changed, and removes an untouched
+    one when the gateway went away. It may add or delete a row, so the caller
+    recounts every subnet it passes here (once, after the loop).
+
+    A subnet New Subnet gives no gateway row (Kubernetes semantics, /31, /127,
+    multicast) gets none, and nor does a gateway that is the network or
+    broadcast address or outside the subnet. An address held by another
+    (non-reserved) row is never overwritten: when the gateway moves onto it,
+    the problem text is returned for the reconciler's own warning list and the
+    gateway row is not created.
+
+    An operator who deletes the placeholder gets it back on the next sync (the
+    integration's gateway is authoritative, as for the Docker / OPNsense
+    gateway rows); one who edits it makes it theirs, and it is then neither
+    moved nor removed."""
+    if subnet.kubernetes_semantics:
+        return None
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    if not has_boundary_rows(net, subnet.kind):
+        return None
+
+    target: str | None = None
+    if new_gateway:
+        try:
+            gw = ipaddress.ip_address(new_gateway)
+        except ValueError:
+            gw = None
+        if (
+            gw is not None
+            and gw.version == net.version
+            and gw in net
+            and gw != net.network_address
+            and not (isinstance(net, ipaddress.IPv4Network) and gw == net.broadcast_address)
+        ):
+            target = str(gw)
+
+    old = await find_untouched_gateway_row(db, subnet)
+    if old is not None and target is not None and str(old.address) == target:
+        return None
+
+    # A gateway that did not move and whose address a row already holds (the
+    # operator's edit of the placeholder, or a row that was there first) is
+    # left as it stands, silently: nothing changed, and a warning on every
+    # sync would only be noise. Only a gateway moving onto a held address is
+    # reported, once, when it moves.
+    stored = str(subnet.gateway) if subnet.gateway is not None else None
+    problem: str | None = None
+    if target is not None and target != stored:
+        problem = await gateway_target_problem(db, subnet, target)
+    if old is not None:
+        # Same retraction every other row removal does (a PTR it published).
+        from app.services.dns.record_ops import retract_address_dns  # noqa: PLC0415
+
+        await retract_address_dns(db, [old.id])
+        await db.delete(old)
+        await db.flush()
+    if target is not None and problem is None:
+        await add_gateway_row(db, subnet, target, created_by_user_id=None)
+    return problem
