@@ -172,6 +172,10 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
       <span class="idx-card-title">Vertical Network Awareness</span>
       <span class="idx-card-desc">AV-over-IP, BACnet/IP, industrial OT and DICOM registries, plus the do-not-probe flag</span>
     </a>
+    <a class="idx-card" href="features/COPILOT.html">
+      <span class="idx-card-title">Operator Copilot</span>
+      <span class="idx-card-desc">Provider failover, tool registry, MCP endpoint, chat surface and token caps</span>
+    </a>
     <a class="idx-card" href="features/E911.html">
       <span class="idx-card-title">E911 Dispatchable Location</span>
       <span class="idx-card-desc">A Location Information Server: ERLs, port and subnet bindings, HELD and DHCP delivery</span>

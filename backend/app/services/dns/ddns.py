@@ -21,13 +21,16 @@ Design:
 * **Policy for dynamic leases:**
     ``client_provided``       — only publish if the lease has a hostname.
     ``client_or_generated``   — use client hostname if present, else
-                                generate ``dhcp-<hyphenated-last-octets>``.
+                                generate ``dhcp-<hyphenated-address>``.
     ``always_generate``       — always synthesise, ignore client hostname.
     ``disabled``               — never publish.
-* **Generated hostnames** use the last two octets for IPv4 (compact,
-  readable — ``dhcp-20-5`` for ``10.1.20.5``). For IPv6 we use the low
-  32 bits hex-encoded (``dhcp-0-abcd1234``) — it's ugly but unique,
-  and v6 DDNS is a rare path.
+* **Generated hostnames** encode the whole address (#3364): ``dhcp-10-1-20-5``
+  for ``10.1.20.5``, and all 128 bits as 32 hex digits for IPv6 (37
+  characters, inside the 63 a label allows). Two subnets sharing a zone
+  can hold ``10.1.20.5`` and ``10.2.20.5``, which the old last-two-octets
+  form (``dhcp-20-5``) and low-32-bits IPv6 form (``dhcp-<8 hex>``) gave
+  one name. Records already published under those legacy forms are left
+  alone and move to the new name when the lease next renews.
 * **Idempotent.** If the IPAM row already has the same hostname and its
   published record carries that name, no DNS op is queued.
 
@@ -191,18 +194,26 @@ def _sanitise(raw: str | None) -> str:
 
 
 def _generate_hostname(ip_str: str) -> str:
-    """Synthesise ``dhcp-<hyphenated-tail>`` for an IP with no client name."""
+    """Synthesise ``dhcp-<whole address>`` for an IP with no client name (#3364)."""
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
         return "dhcp-unknown"
     if isinstance(addr, ipaddress.IPv4Address):
-        parts = str(addr).split(".")
-        tail = "-".join(parts[-2:])  # ``20-5`` for 10.1.20.5
-        return f"dhcp-{tail}"
-    # IPv6: last 32 bits, no separators. Rare path.
-    low = int(addr) & 0xFFFFFFFF
-    return f"dhcp-{low:08x}"
+        return "dhcp-" + str(addr).replace(".", "-")  # ``10-1-20-5``
+    return f"dhcp-{int(addr):032x}"
+
+
+def _legacy_generated_hostname(ip_str: str) -> str | None:
+    """The pre-#3364 generated name (last two octets / low 32 bits), which
+    published records may still carry until their lease renews."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv4Address):
+        return "dhcp-" + "-".join(str(addr).split(".")[-2:])
+    return f"dhcp-{int(addr) & 0xFFFFFFFF:08x}"
 
 
 async def _static_hostname_for(db: AsyncSession, subnet: Subnet, ip_str: str) -> str | None:
@@ -348,9 +359,16 @@ async def _name_holder(
 
 
 # #3362 — a generated name belongs to the address it encodes. A client that
-# names itself ``dhcp-2-51`` from 10.1.2.50 would otherwise take the name
-# 10.1.2.51 falls back to, leaving that address unpublished.
-_GENERATED_NAME_RE = re.compile(r"^dhcp-(?:\d{1,3}-\d{1,3}|[0-9a-f]{8}|unknown)$")
+# names itself ``dhcp-10-1-2-51`` from 10.1.2.50 would otherwise take the name
+# 10.1.2.51 falls back to, leaving that address unpublished. #3364: both the
+# whole-address form and the legacy last-two-octets / low-32-bits form are
+# reserved, since records published under the legacy form still exist. Only
+# the exact shapes ``_generate_hostname`` / ``_legacy_generated_hostname`` can
+# emit match: decimal octets 0-255 without leading zeros, lower-case hex.
+_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+_GENERATED_NAME_RE = re.compile(
+    rf"dhcp-(?:{_OCTET}(?:-{_OCTET}){{3}}|{_OCTET}-{_OCTET}|[0-9a-f]{{32}}|[0-9a-f]{{8}}|unknown)"
+)
 
 # #3362 — the visible signal (warning + audit row) for a name clash. It fires
 # once per ``(subnet, ip, requested name)`` and at most once per address per
@@ -411,7 +429,14 @@ async def _name_or_generated(
         primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids
     )
     fallback = _generate_hostname(str(ipam_row.address))
-    reserved = hostname != fallback and _GENERATED_NAME_RE.match(hostname) is not None
+    # An address's own legacy name is not reserved against it, but the legacy
+    # IPv4 form is shared by every ``x.y.c.d`` with the same last two octets,
+    # so whether it is free is decided by ``_name_holder`` - by whoever holds
+    # the record - not here. Compared case-folded: a static assignment's name
+    # is the operator's spelling, not sanitised to lower case.
+    own_names = {fallback, _legacy_generated_hostname(str(ipam_row.address))}
+    folded = hostname.lower()
+    reserved = folded not in own_names and _GENERATED_NAME_RE.fullmatch(folded) is not None
     holder = None if reserved else await _name_holder(db, ipam_row, zone_ids, hostname)
     if not reserved and holder is None:
         return hostname
