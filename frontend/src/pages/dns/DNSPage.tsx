@@ -1156,7 +1156,28 @@ function patchCachedRow(
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
-export function GroupModal({
+// Edit reads the group fresh on open and Save sends only what changed (#3365).
+export function GroupModal(props: {
+  group?: DNSServerGroup;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow(props.group, () =>
+    dnsApi.getGroup(props.group!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server Group"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <GroupModalForm group={fresh.row} onClose={props.onClose} />;
+}
+
+function GroupModalForm({
   group,
   onClose,
 }: {
@@ -1239,7 +1260,7 @@ export function GroupModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError("");
-          mut.mutate({
+          const body = {
             name,
             description,
             group_type: groupType,
@@ -1248,7 +1269,32 @@ export function GroupModal({
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
             auto_reverse_zones_at_provider: autoReverseAtProvider,
-          });
+          };
+          if (!group) {
+            mut.mutate(body);
+            return;
+          }
+          // Edit sends only what the operator changed (#3365).
+          const diff = changedFields(
+            {
+              name: group.name,
+              description: group.description ?? "",
+              group_type: group.group_type ?? "internal",
+              is_recursive: group.is_recursive ?? true,
+              catalog_zones_enabled: group.catalog_zones_enabled ?? false,
+              catalog_zone_name:
+                group.catalog_zone_name ?? "catalog.spatium.invalid.",
+              is_public_facing: group.is_public_facing ?? false,
+              auto_reverse_zones_at_provider:
+                group.auto_reverse_zones_at_provider ?? false,
+            },
+            body,
+          );
+          if (Object.keys(diff).length === 0) {
+            onClose();
+            return;
+          }
+          mut.mutate(diff);
         }}
         className="space-y-3"
       >
@@ -10799,7 +10845,28 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   );
 }
 
-function BlocklistModal({
+// Edit reads the list fresh on open and Save sends only what changed (#3365).
+export function BlocklistModal(props: {
+  list?: DNSBlockList;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow(props.list, () =>
+    dnsBlocklistApi.get(props.list!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Blocking List"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <BlocklistModalForm list={fresh.row} onClose={props.onClose} />;
+}
+
+function BlocklistModalForm({
   list,
   onClose,
 }: {
@@ -10844,24 +10911,48 @@ function BlocklistModal({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          mut.mutate(
-            blocklistPayload(
-              {
-                name,
-                description,
-                category,
-                sourceType,
-                feedUrl,
-                feedFormat,
-                blockMode,
-                sinkholeIp,
-                updateHours,
-                feedWildcard,
-                enabled,
-              },
-              !!list,
-            ),
+          const body = blocklistPayload(
+            {
+              name,
+              description,
+              category,
+              sourceType,
+              feedUrl,
+              feedFormat,
+              blockMode,
+              sinkholeIp,
+              updateHours,
+              feedWildcard,
+              enabled,
+            },
+            !!list,
           );
+          if (!list) {
+            mut.mutate(body);
+            return;
+          }
+          // Edit sends only what the operator changed (#3365).
+          const diff = changedFields(
+            {
+              name: list.name,
+              description: list.description ?? "",
+              category: list.category ?? "custom",
+              source_type: list.source_type ?? "manual",
+              feed_url: list.feed_url ?? null,
+              feed_format: list.feed_format ?? "hosts",
+              block_mode: list.block_mode ?? "nxdomain",
+              sinkhole_ip: list.sinkhole_ip ?? null,
+              update_interval_hours: list.update_interval_hours ?? 24,
+              feed_entries_are_wildcard: list.feed_entries_are_wildcard ?? true,
+              enabled: list.enabled ?? true,
+            },
+            body,
+          );
+          if (Object.keys(diff).length === 0) {
+            onClose();
+            return;
+          }
+          mut.mutate(diff);
         }}
       >
         <Field label="Name">
