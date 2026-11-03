@@ -58,10 +58,15 @@ MANIFEST = {
     "version_labels": {
         "redis": r"\bRedis\s+v?((?:[4-9]|\d{2,})(?:\.\d+)*)",
         "bind": r"\bBIND(?:\s?9)?\s+(9\.\d+(?:\.\d+)*)",
+        "alpine": r"\b[Aa]lpine[\s:]+(\d+\.\d+(?:\.\d+)*)",
     },
     "needles": {"compose:postgres": ["postgresql"], "agent:dns": ["spatium dns agent"]},
-    "inventory_groups": {"integration": ["integrations"]},
     "inventory_allowlist": {"compose:migrate": "one-shot job"},
+    "inventory_regions": {
+        "dns-driver": {"from": "Data plane", "to": "Integration mirrors"},
+        "dhcp-driver": {"from": "Data plane", "to": "Integration mirrors"},
+        "integration": {"from": "Integration mirrors"},
+    },
     "identifier_diagrams": {
         "docs/assets/diagrams/model.svg": ["backend/app/models/dns.py"]
     },
@@ -77,14 +82,14 @@ ARCH_TEXT = [
     "Worker",
     "Beat",
     "Frontend",
+    "spatium-dns-agent",
+    "Looking Glass",
+    "Data plane",
     "dns-bind9",
     "BIND9 9.20",
     "dhcp-kea",
-    "Kea",
-    "spatium-dns-agent",
-    "Looking Glass",
-    "integrations",
-    "BIND 9 driver",
+    "Integration mirrors",
+    "Docker",
 ]
 
 
@@ -111,6 +116,7 @@ def build(root: pathlib.Path, **override: object) -> pathlib.Path:
                 "components": {
                     "redis": {"version": "8.10.2-alpine"},
                     "bind": {"version": "9.20.29-r0"},
+                    "alpine": {"version": "3.24"},
                 }
             }
         ),
@@ -189,6 +195,24 @@ def test_stale_version_in_svg_and_page(
     assert any("docs/guide.md" in m and "redis 8.10.2-alpine" in m for m in msgs)
 
 
+def test_a_list_and_a_dockerfile_from_are_not_history(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """ "and" joins a list of what ships and ``FROM`` is a Dockerfile instruction;
+    the first draft read both as history and skipped the version after them."""
+    build(tmp_path)
+    _write(
+        tmp_path,
+        "docs/guide.md",
+        "Ships BIND9 9.20 and Redis 7.\n```\nFROM alpine:3.23 AS runtime\n```\n",
+    )
+    msgs = sorted(f.line() for f in lint.run(tmp_path) if f.kind == "version")
+    assert msgs == [
+        "docs/guide.md: version: line 1: 'Redis 7' but versions.json pins redis 8.10.2-alpine",
+        "docs/guide.md: version: line 3: 'alpine:3.23' but versions.json pins alpine 3.24",
+    ]
+
+
 def test_version_granularity_and_history_are_not_findings(
     lint: types.ModuleType, tmp_path: pathlib.Path
 ) -> None:
@@ -199,6 +223,9 @@ def test_version_granularity_and_history_are_not_findings(
         "Redis 8.10 is fine. BIND 9.20 is fine.\n"
         "Needs BIND 9.18+ for catalog zones.\n"
         "Since Redis 7 the wake bus exists.\n"
+        "Upgraded from Redis 6 to Redis 7 last year.\n"
+        "Behaviour differs between Redis 6 and Redis 7.\n"
+        "Kea 3.0 (shipped from Alpine 3.23) caches leases.\n"
         "CNPG 1 / Redis 1 replicas.\n",
     )
     assert [f for f in lint.run(tmp_path) if f.kind == "version"] == []
@@ -222,7 +249,7 @@ def test_unlisted_workloads_are_findings(
     _write(
         tmp_path,
         "docs/assets/architecture.svg",
-        _svg(["PostgreSQL 16", "Redis 8", "API"]),
+        _svg(["PostgreSQL 16", "Redis 8", "API", "Data plane", "Integration mirrors"]),
     )
     keys = " ".join(f.message for f in lint.run(tmp_path) if f.kind == "inventory")
     for expected in (
@@ -261,19 +288,46 @@ def test_an_allowlist_entry_needs_a_reason(
         lint.run(tmp_path)
 
 
-def test_integration_group_label_covers_members(
+def test_a_driver_must_be_drawn_in_its_own_region(
     lint: types.ModuleType, tmp_path: pathlib.Path
 ) -> None:
+    """The FortiGate DHCP driver is not the Fortinet FortiGate integration card."""
     build(tmp_path)
-    # 'docker' is not named, but 'integrations' is and the group maps to it.
-    assert lint.run(tmp_path) == []
+    _write(tmp_path, "backend/app/drivers/dhcp/fortigate.py", "")
     _write(
         tmp_path,
         "docs/assets/architecture.svg",
-        _svg([t for t in ARCH_TEXT if t != "integrations"]),
+        _svg([*ARCH_TEXT, "Fortinet FortiGate", "integrations · docker"]),
     )
-    msgs = " ".join(f.message for f in lint.run(tmp_path))
-    assert "integration:docker" in msgs
+    msgs = [f.message for f in lint.run(tmp_path) if f.kind == "inventory"]
+    assert len(msgs) == 1
+    assert "dhcp-driver:fortigate" in msgs[0] and "'Data plane' section" in msgs[0]
+
+    texts = list(ARCH_TEXT)
+    texts.insert(texts.index("Integration mirrors"), "FortiGate DHCP")
+    _write(tmp_path, "docs/assets/architecture.svg", _svg(texts))
+    assert lint.run(tmp_path) == []
+
+    # An integration named only by the Worker's generic 'integrations' line, above
+    # the mirrors lane, is not drawn: any new integration would otherwise pass.
+    texts.remove("Docker")
+    texts.insert(0, "integrations · docker")
+    _write(tmp_path, "docs/assets/architecture.svg", _svg(texts))
+    msgs = [f.message for f in lint.run(tmp_path) if f.kind == "inventory"]
+    assert len(msgs) == 1 and "integration:docker" in msgs[0]
+
+
+def test_a_region_heading_that_moved_cannot_run(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    build(tmp_path)
+    _write(
+        tmp_path,
+        "docs/assets/architecture.svg",
+        _svg([t for t in ARCH_TEXT if t != "Integration mirrors"]),
+    )
+    with pytest.raises(lint.CheckError):
+        lint.run(tmp_path)
 
 
 def test_an_empty_inventory_is_an_error_not_a_pass(
@@ -319,6 +373,15 @@ def test_identifier_ignore_and_unmapped_diagrams(
     _write(tmp_path, "docs/assets/diagrams/model.svg", _svg(["serial_strategy"]))
     _write(tmp_path, "docs/assets/diagrams/other.svg", _svg(["no_such_thing"]))
     assert [f for f in lint.run(tmp_path) if f.kind == "identifier"] == []
+
+
+def test_a_dead_identifier_ignore_is_a_finding(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    build(tmp_path, identifier_ignore={"gone_name": "was a JSON key"})
+    found = [f for f in lint.run(tmp_path) if f.kind == "identifier"]
+    assert [f.file for f in found] == ["scripts/docs_drift_manifest.json"]
+    assert "gone_name" in found[0].message
 
 
 def test_identifier_mapped_module_must_exist(

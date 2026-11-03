@@ -21,7 +21,10 @@ Four checks, one finding per line as ``file: kind: message``:
     Every shipped workload -- compose service, chart Deployment / StatefulSet /
     DaemonSet, agent package, DNS / DHCP driver module, integration module --
     must be named in ``docs/assets/architecture.svg``, or sit in the manifest's
-    ``inventory_allowlist`` with a reason.
+    ``inventory_allowlist`` with a reason. ``inventory_regions`` confines a kind
+    to one section of the diagram, so a driver has to be drawn in the data plane:
+    the FortiGate *DHCP driver* is not satisfied by the Fortinet FortiGate
+    *integration* card two sections further down.
 
 ``identifier``
     Code-style identifiers a mapped diagram shows (snake_case, CamelCase, or
@@ -65,7 +68,7 @@ _MANIFEST_KEYS = {
     "version_exclude",
     "needles",
     "inventory_allowlist",
-    "inventory_groups",
+    "inventory_regions",
     "identifier_diagrams",
     "identifier_ignore",
     "path_roots",
@@ -164,12 +167,16 @@ def _numeric(version: str) -> list[int]:
     return [int(x) for x in m.group(0).split(".")] if m else []
 
 
-# "since Technitium 15.0", "between X 2.4 and 2.6": a claim about the past or a minimum,
-# not about what ships now.
+# "since Technitium 15.0", "shipped from Alpine 3.23": a claim about the past or a
+# minimum, not about what ships now. A bare "and" / "to" is NOT one -- "PostgreSQL 16
+# and Redis 7" is a list of what ships -- so those count only as the second half of a
+# "between X and Y" / "from X to Y" range opened just before.
 _HISTORICAL = re.compile(
-    r"(?:since|before|until|prior to|older than|as on|between|from|and|to|[<>≤≥])[\s*_`]*$",
+    r"\b(?:since|before|until|prior to|older than|as on|between|from)[\s*_`]*$|[<>≤≥][\s*_`]*$",
     re.I,
 )
+_DOCKERFILE_FROM = re.compile(r"\bFROM\s+$")  # case-sensitive: the instruction
+_RANGE_TAIL = re.compile(r"\b(?:between|from)\b.{0,40}\b(?:and|to)[\s*_`]*$", re.I)
 
 
 def check_versions(root: pathlib.Path, manifest: dict) -> list[Finding]:
@@ -200,7 +207,12 @@ def check_versions(root: pathlib.Path, manifest: dict) -> list[Finding]:
     def scan(file: str, line: int, text: str) -> None:
         for key, rx, shipped, raw in rules:
             for m in rx.finditer(text):
-                if _HISTORICAL.search(text[max(0, m.start() - 16) : m.start()]):
+                pre = text[max(0, m.start() - 16) : m.start()]
+                if _DOCKERFILE_FROM.search(pre):
+                    pass  # `FROM alpine:3.23` is what an image builds on, not history
+                elif _HISTORICAL.search(pre) or _RANGE_TAIL.search(
+                    text[max(0, m.start() - 64) : m.start()]
+                ):
                     continue
                 label = _numeric(m.group(1))
                 scanned_hit = label and shipped[: len(label)] == label
@@ -310,28 +322,61 @@ def _norm(text: str) -> str:
     return " " + re.sub(r"[^a-z0-9]+", " ", text.lower()).strip() + " "
 
 
+def _region(texts: list[str], kind: str, spec: dict, diagram: str) -> str:
+    """The diagram text from the first element naming ``spec["from"]`` up to (not
+    including) the next one naming ``spec["to"]``. A heading that has moved is a
+    check that cannot run, not a pass."""
+    start_at, end_at = _norm(spec.get("from", "")), spec.get("to")
+    start = next((i for i, t in enumerate(texts) if start_at in _norm(t)), None)
+    if not spec.get("from") or start is None:
+        raise CheckError(
+            f"inventory_regions[{kind!r}]: no text in {diagram} names {spec.get('from')!r}"
+        )
+    end = len(texts)
+    if end_at:
+        end = next(
+            (
+                i
+                for i in range(start + 1, len(texts))
+                if _norm(end_at) in _norm(texts[i])
+            ),
+            -1,
+        )
+        if end < 0:
+            raise CheckError(
+                f"inventory_regions[{kind!r}]: no text in {diagram} after "
+                f"{spec['from']!r} names {end_at!r}"
+            )
+    return _norm(" ".join(texts[start:end]))
+
+
 def check_inventory(root: pathlib.Path, manifest: dict) -> list[Finding]:
     diagram = manifest["architecture_diagram"]
-    haystack = _norm(" ".join(t for _, t, _ in svg_texts(_read(root / diagram))))
+    texts = [t for _, t, _ in svg_texts(_read(root / diagram))]
+    haystack = _norm(" ".join(texts))
     items = inventory(root)
     if len(items) < 10:
         raise CheckError(f"inventory found only {len(items)} items; a source has moved")
     needles = manifest.get("needles", {})
     allow = manifest.get("inventory_allowlist", {})
-    groups = manifest.get("inventory_groups", {})
+    regions = {
+        kind: (spec, _region(texts, kind, spec, diagram))
+        for kind, spec in manifest.get("inventory_regions", {}).items()
+    }
     findings: list[Finding] = []
     for key, default in items.items():
         if key in allow:
             continue
         terms = needles.get(key) or [default]
-        group_terms = groups.get(key.split(":")[0], [])
-        if any(_norm(t) in haystack for t in [*terms, *group_terms]):
+        spec, hay = regions.get(key.split(":")[0], (None, haystack))
+        if any(_norm(t) in hay for t in terms):
             continue
+        where = f" in the {spec['from']!r} section" if spec else ""
         findings.append(
             Finding(
                 diagram,
                 "inventory",
-                f"{key} is shipped but not named in the diagram "
+                f"{key} is shipped but not named in the diagram{where} "
                 f"(looked for {', '.join(repr(t) for t in terms)})",
             )
         )
@@ -398,6 +443,7 @@ def code_identifiers(text: str) -> set[str]:
 
 def check_identifiers(root: pathlib.Path, manifest: dict) -> list[Finding]:
     ignore = set(manifest.get("identifier_ignore", {}))
+    used_ignores: set[str] = set()
     findings: list[Finding] = []
     mapped = manifest.get("identifier_diagrams", {})
     for diagram, modules in sorted(mapped.items()):
@@ -421,6 +467,8 @@ def check_identifiers(root: pathlib.Path, manifest: dict) -> list[Finding]:
         seen: set[str] = set()
         for line, text, _ in svg_texts(_read(svg)):
             for tok in sorted(code_identifiers(text)):
+                if tok in ignore:
+                    used_ignores.add(tok)
                 if tok in seen or tok in ignore:
                     continue
                 seen.add(tok)
@@ -434,6 +482,16 @@ def check_identifiers(root: pathlib.Path, manifest: dict) -> list[Finding]:
                         f"{', '.join(modules)}",
                     )
                 )
+    # Like a dead inventory allowlist entry: an ignore no mapped diagram uses would
+    # silently exempt the name the day a diagram starts showing it for real.
+    for tok in sorted(ignore - used_ignores):
+        findings.append(
+            Finding(
+                MANIFEST_NAME,
+                "identifier",
+                f"identifier_ignore entry {tok!r} matches nothing in a mapped diagram",
+            )
+        )
     return findings
 
 

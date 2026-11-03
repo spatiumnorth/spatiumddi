@@ -58,12 +58,16 @@ jobs:
       - name: Open, refresh or close the tracking issue
         run: |
           TITLE="Docs drift"
+          MARKER="<!-- docs-drift -->"
           # Search by title, not a page of open issues: the repo has far more
           # than one page open, so a --limit scan would miss it and duplicate.
+          # The search is a substring match, so confirm the exact title AND the
+          # marker the script writes as the body's first line: a human-filed
+          # issue that happens to be called "Docs drift" is not ours to close.
           existing="$(gh issue list --repo "$REPO" --state open --limit 20 \
             --search "\"${TITLE}\" in:title" \
-            --json number,title \
-            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+            --json number,title,body \
+            --jq "[.[] | select(.title == \"${TITLE}\" and (.body | startswith(\"${MARKER}\")))] | .[0].number // empty")"
 
           if [ "${{ steps.check.outputs.status }}" = "drift" ]; then
             {

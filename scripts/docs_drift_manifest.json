@@ -9,9 +9,11 @@
     "",
     "needles overrides the name a diagram is searched for (matched on whole words, case and",
     "punctuation ignored). Use it for naming variance only: the frontend container IS nginx.",
-    "inventory_groups lets one generic label stand for a whole class when the diagram draws the",
-    "class as one line (the Worker box says 'integrations').",
-    "version_labels omits Kea on purpose: the docs compare Kea 2.4 / 2.6 / 3.0 behaviour throughout, so a bare 'Kea 2.6' is history far more often than a stale claim. Redis requires a major of 4+ so 'Redis 1' (a replica count) is not read as a version."
+    "inventory_regions confines a kind to one section of the diagram, from the first text naming",
+    "'from' up to the next naming 'to'. Drivers must be drawn in the data plane and integrations in",
+    "the mirrors lane: a bare product name anywhere is not enough (the FortiGate DHCP driver is not",
+    "the Fortinet FortiGate integration card). A heading that moves makes the check exit 2.",
+    "version_labels omits Kea on purpose: the docs compare Kea 2.4 / 2.6 / 3.0 behaviour throughout, so a bare 'Kea 2.6' is history far more often than a stale claim. Redis requires a major of 4+ so 'Redis 1' (a replica count) is not read as a version. Alpine also matches the image-tag form ('FROM alpine:3.24'), which the docs quote in code blocks; versions.json pins one Alpine for every agent image (#1037 moved them all to 3.24), so there is no per-image pin to choose between."
   ],
   "architecture_diagram": "docs/assets/architecture.svg",
   "version_labels": {
@@ -23,9 +25,9 @@
     "nginx": "\\bnginx\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
     "haproxy": "\\bHAProxy\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
     "technitium": "\\bTechnitium\\s+(?:DNS\\s+)?v?(\\d+\\.\\d+(?:\\.\\d+)*)",
-    "k3s": "\\bk3s\\s+v(\\d+\\.\\d+(?:\\.\\d+)*)",
+    "k3s": "\\bk3s\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
     "metallb": "\\bMetalLB\\s+v?(\\d+\\.\\d+(?:\\.\\d+)*)",
-    "alpine": "\\bAlpine\\s+(\\d+\\.\\d+(?:\\.\\d+)*)"
+    "alpine": "\\b[Aa]lpine[\\s:]+(\\d+\\.\\d+(?:\\.\\d+)*)"
   },
   "version_exclude": [
     "docs/SHIPPED.md"
@@ -88,11 +90,6 @@
       "pan os"
     ]
   },
-  "inventory_groups": {
-    "integration": [
-      "integrations"
-    ]
-  },
   "inventory_allowlist": {
     "compose:migrate": "one-shot alembic job that exits; not a runtime component",
     "compose:dhcp-kea-2": "second HA peer of dhcp-kea, same image; the diagram draws the one container",
@@ -101,6 +98,19 @@
     "workload:node-exporter": "appliance observability exporter, not part of the DDI architecture",
     "workload:slot-image-mirror": "serves A/B slot images to peers; an upgrade helper, not a service tier",
     "workload:redis-sentinel": "the HA form of the redis workload; the diagram draws it as 'Redis Sentinel' under multi-node HA"
+  },
+  "inventory_regions": {
+    "dns-driver": {
+      "from": "Data plane",
+      "to": "Integration mirrors"
+    },
+    "dhcp-driver": {
+      "from": "Data plane",
+      "to": "Integration mirrors"
+    },
+    "integration": {
+      "from": "Integration mirrors"
+    }
   },
   "identifier_diagrams": {
     "docs/assets/diagrams/data-model-dns.svg": [
@@ -133,9 +143,9 @@
   "identifier_ignore": {
     "PowerDNS": "a product name, not a model identifier",
     "ACKs": "the English verb",
-    "action": "key inside the Role.permissions JSONB, not a column",
     "resource_type": "key inside the Role.permissions JSONB, not a column",
-    "resource_id": "key inside the Role.permissions JSONB, not a column"
+    "resource_id": "key inside the Role.permissions JSONB, not a column",
+    "op_id": "the config-bundle / ack key carrying DNSRecordOp.id to the agent (services/dns/agent_config.py), not a column"
   },
   "path_roots": [
     "backend",
