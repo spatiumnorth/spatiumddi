@@ -520,3 +520,146 @@ def test_generated_names_fit_a_label_and_v6_is_not_truncated() -> None:
     a = _generate_hostname("2001:db8:1::5")
     b = _generate_hostname("2001:db8:2::5")
     assert a != b and len(a) <= 63
+
+
+# --- #3364 validation: the legacy form, held vs free; the rename at renewal ---
+
+
+async def _subnet_in_same_zone(db: AsyncSession, subnet: Subnet, zone_id: Any, net: str) -> Subnet:
+    block = IPBlock(space_id=subnet.space_id, network=net.rsplit(".", 2)[0] + ".0.0/16", name="b2")
+    db.add(block)
+    await db.flush()
+    sn = Subnet(
+        space_id=subnet.space_id,
+        block_id=block.id,
+        network=net,
+        name="sn2",
+        dns_zone_id=str(zone_id),
+        dns_group_ids=subnet.dns_group_ids,
+        dns_inherit_settings=False,
+        ddns_enabled=True,
+        ddns_inherit_settings=False,
+        ddns_hostname_policy="client_or_generated",
+    )
+    db.add(sn)
+    await db.flush()
+    return sn
+
+
+def _publish_as_before_3364(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``_generate_hostname`` the pre-#3364 generator, so a record is
+    published under the legacy name the way an upgraded install has it."""
+    from app.services.dns import ddns
+
+    monkeypatch.setattr(ddns, "_generate_hostname", ddns._legacy_generated_hostname)
+
+
+@pytest.mark.asyncio
+async def test_a_held_legacy_name_is_not_taken_by_another_address_sharing_its_tail(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``dhcp-53-5`` is the legacy name of both 10.93.53.5 and 10.94.53.5. While
+    10.93.53.5's pre-#3364 record holds it, a client on 10.94.53.5 asking for
+    it gets its own whole-address name: who holds the record decides, not the
+    shape."""
+    from app.services.dns.ddns import apply_ddns_for_lease
+
+    _server, subnet, zone, _ip = await _setup(db_session, 53)
+    zone_id = zone.id
+    subnet2 = await _subnet_in_same_zone(db_session, subnet, zone_id, "10.94.53.0/24")
+    row1 = IPAddress(subnet_id=subnet.id, address="10.93.53.5", status="dhcp", auto_from_lease=True)
+    row2 = IPAddress(
+        subnet_id=subnet2.id, address="10.94.53.5", status="dhcp", auto_from_lease=True
+    )
+    db_session.add_all([row1, row2])
+    await db_session.commit()
+
+    with monkeypatch.context() as m:
+        _publish_as_before_3364(m)
+        await apply_ddns_for_lease(db_session, subnet=subnet, ipam_row=row1, client_hostname=None)
+        await db_session.commit()
+    assert [r.value for r in await _a_records(db_session, zone_id, "dhcp-53-5")] == ["10.93.53.5"]
+
+    row2 = await _row(db_session, subnet2.id, "10.94.53.5")
+    subnet2 = await db_session.get(Subnet, subnet2.id)
+    await apply_ddns_for_lease(
+        db_session, subnet=subnet2, ipam_row=row2, client_hostname="dhcp-53-5"
+    )
+    await db_session.commit()
+
+    assert [r.value for r in await _a_records(db_session, zone_id, "dhcp-53-5")] == ["10.93.53.5"]
+    assert [r.value for r in await _a_records(db_session, zone_id, "dhcp-10-94-53-5")] == [
+        "10.94.53.5"
+    ]
+    assert (await _row(db_session, subnet2.id, "10.94.53.5")).hostname == "dhcp-10-94-53-5"
+
+
+@pytest.mark.parametrize("policy", ["client_or_generated", "always_generate"])
+@pytest.mark.asyncio
+async def test_a_pre_3364_record_moves_on_renewal_with_its_ptr_and_then_holds_still(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    """A lease published under ``dhcp-54-50`` before the upgrade renews with no
+    client name: the A and PTR move to ``dhcp-10-93-54-50``, the old ones are
+    retracted, and neither a further renewal nor the auto-sync backstop
+    queues anything afterwards."""
+    from app.tasks.ipam_dns_sync import _reapply_ddns_for_active_leases
+    from tests.test_ddns_lease_rename_1618 import _op_count
+
+    server, subnet, zone, ip = await _setup(db_session, 54)
+    zone_id = zone.id
+    subnet.ddns_hostname_policy = policy
+    await db_session.commit()
+
+    with monkeypatch.context() as m:
+        _publish_as_before_3364(m)
+        await _post(client, db_session, server, _lease(ip, ""))
+    row = await _row(db_session, subnet.id, ip)
+    assert row.hostname == "dhcp-54-50"
+    assert await _records(db_session, row) == {
+        "A": [("dhcp-54-50", ip)],
+        "PTR": [("50", f"dhcp-54-50.{zone.name}")],
+    }
+
+    await _post(client, db_session, server, _lease(ip, ""))
+
+    row = await _row(db_session, subnet.id, ip)
+    assert row.hostname == "dhcp-10-93-54-50"
+    assert await _records(db_session, row) == {
+        "A": [("dhcp-10-93-54-50", ip)],
+        "PTR": [("50", f"dhcp-10-93-54-50.{zone.name}")],
+    }
+    assert await _a_records(db_session, zone_id, "dhcp-54-50") == []
+
+    before = await _op_count(db_session)
+    await _post(client, db_session, server, _lease(ip, ""))
+    db_session.expunge_all()
+    sn = await db_session.get(Subnet, subnet.id)
+    fired, errors = await _reapply_ddns_for_active_leases(db_session, sn)
+    await db_session.commit()
+    assert (fired, errors) == (0, [])
+    assert await _op_count(db_session) == before
+
+
+@pytest.mark.parametrize("name", ["dhcp-backup", "dhcp-300-1", "dhcp-010-93-55-51", "dhcp-1-2-3"])
+@pytest.mark.asyncio
+async def test_names_that_only_look_generated_are_the_clients_to_take(
+    client: AsyncClient, db_session: AsyncSession, name: str
+) -> None:
+    """Only the exact shapes the generator emits are reserved: a name no
+    address generates is an ordinary client name."""
+    server, subnet, zone, ip = await _setup(db_session, 55)
+    await _post(client, db_session, server, _lease(ip, name))
+    assert (await _row(db_session, subnet.id, ip)).hostname == name
+    assert [r.value for r in await _a_records(db_session, zone.id, name)] == [ip]
+
+
+def test_v6_generated_name_is_the_same_however_the_address_is_written() -> None:
+    from app.services.dns.ddns import _generate_hostname
+
+    full = "2001:0db8:0000:0000:0000:0000:0000:0005"
+    assert _generate_hostname(full) == _generate_hostname("2001:db8::5")
+    assert _generate_hostname("2001:DB8::5") == "dhcp-20010db8000000000000000000000005"

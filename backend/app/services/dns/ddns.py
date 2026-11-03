@@ -362,9 +362,12 @@ async def _name_holder(
 # names itself ``dhcp-10-1-2-51`` from 10.1.2.50 would otherwise take the name
 # 10.1.2.51 falls back to, leaving that address unpublished. #3364: both the
 # whole-address form and the legacy last-two-octets / low-32-bits form are
-# reserved, since records published under the legacy form still exist.
+# reserved, since records published under the legacy form still exist. Only
+# the exact shapes ``_generate_hostname`` / ``_legacy_generated_hostname`` can
+# emit match: decimal octets 0-255 without leading zeros, lower-case hex.
+_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
 _GENERATED_NAME_RE = re.compile(
-    r"^dhcp-(?:\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}|\d{1,3}-\d{1,3}|[0-9a-f]{32}|[0-9a-f]{8}|unknown)$"
+    rf"dhcp-(?:{_OCTET}(?:-{_OCTET}){{3}}|{_OCTET}-{_OCTET}|[0-9a-f]{{32}}|[0-9a-f]{{8}}|unknown)"
 )
 
 # #3362 — the visible signal (warning + audit row) for a name clash. It fires
@@ -426,8 +429,14 @@ async def _name_or_generated(
         primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids
     )
     fallback = _generate_hostname(str(ipam_row.address))
+    # An address's own legacy name is not reserved against it, but the legacy
+    # IPv4 form is shared by every ``x.y.c.d`` with the same last two octets,
+    # so whether it is free is decided by ``_name_holder`` - by whoever holds
+    # the record - not here. Compared case-folded: a static assignment's name
+    # is the operator's spelling, not sanitised to lower case.
     own_names = {fallback, _legacy_generated_hostname(str(ipam_row.address))}
-    reserved = hostname not in own_names and _GENERATED_NAME_RE.match(hostname) is not None
+    folded = hostname.lower()
+    reserved = folded not in own_names and _GENERATED_NAME_RE.fullmatch(folded) is not None
     holder = None if reserved else await _name_holder(db, ipam_row, zone_ids, hostname)
     if not reserved and holder is None:
         return hostname
