@@ -631,9 +631,11 @@ def markdown(findings: list[Finding]) -> str:
         lines.append("")
     lines += [
         "---",
-        "A finding is fixed in the diagram, or -- when the thing legitimately does not belong "
-        "in it -- allowlisted with a reason in `scripts/docs_drift_manifest.json`. "
-        "This issue auto-closes when a weekly run comes back clean.",
+        (
+            "A finding is fixed in the diagram, or -- when the thing legitimately does not belong "
+            "in it -- allowlisted with a reason in `scripts/docs_drift_manifest.json`. "
+            "This issue auto-closes when a weekly run comes back clean."
+        ),
     ]
     return "\n".join(lines) + "\n"
 
