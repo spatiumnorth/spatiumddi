@@ -12,7 +12,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
 const summary = vi.fn();
-let grants: { action: string; resource_type: string }[] = [];
+let grants: {
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+}[] = [];
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -23,7 +27,7 @@ vi.mock("@/lib/api", async () => {
       myPermissions: () =>
         Promise.resolve({
           is_superadmin: false,
-          grants: grants.map((g) => ({ ...g, resource_id: null })),
+          grants: grants.map((g) => ({ resource_id: null, ...g })),
         }),
     },
     dnsThreatApi: {
@@ -66,9 +70,7 @@ describe("DNSThreatCard permission gate (#3450)", () => {
     ];
     await show();
     expect(summary).not.toHaveBeenCalled();
-    expect(
-      screen.getByText(/needs read on DNS servers|read on DNS servers/),
-    ).toBeTruthy();
+    expect(screen.getByText(/needs read on servers/)).toBeTruthy();
   });
 
   it("asks the summary with read on servers", async () => {
@@ -83,6 +85,51 @@ describe("DNSThreatCard permission gate (#3450)", () => {
     });
     await show();
     expect(summary).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText(/read on DNS servers/)).toBeNull();
+    expect(screen.queryByText(/read on servers/)).toBeNull();
+  });
+
+  it("does not ask with a read grant scoped to one server", async () => {
+    // The route checks read on the whole type; a scoped grant is refused.
+    grants = [{ action: "read", resource_type: "server", resource_id: "abc" }];
+    await show();
+    expect(summary).not.toHaveBeenCalled();
+    expect(screen.getByText(/needs read on servers/)).toBeTruthy();
+  });
+
+  it("asks the summary with a wildcard grant", async () => {
+    grants = [{ action: "*", resource_type: "*" }];
+    summary.mockResolvedValue({
+      has_data: false,
+      suspicious_clients: 0,
+      clients_seen: 0,
+      worst_client_ip: null,
+      worst_client_score: null,
+      worst_client_parent: null,
+    });
+    await show();
+    expect(summary).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops asking once the summary is refused", async () => {
+    // The grant list is cached, so a read revoked mid-session still passes
+    // ``can``: the poll itself must stop on the first 403.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      grants = [{ action: "read", resource_type: "server" }];
+      summary.mockRejectedValue(
+        Object.assign(new Error("Forbidden"), {
+          isAxiosError: true,
+          response: { status: 403, data: { detail: "Permission denied" } },
+        }),
+      );
+      await show();
+      expect(summary).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+      expect(summary).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

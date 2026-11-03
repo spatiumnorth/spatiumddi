@@ -5411,7 +5411,10 @@ export function DNSThreatCard() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
     queryFn: () => dnsThreatApi.summary({ hours: 24 }),
-    refetchInterval: 60_000,
+    // A grant revoked while the tab is open (or a time-bound grant that
+    // lapsed) still leaves a stale ``can`` for up to the permission cache's
+    // lifetime; stop on the first refusal rather than ask every minute.
+    refetchInterval: pollUnlessRefused(60_000),
     retry: false,
     enabled: moduleEnabled && mayRead,
   });
@@ -5425,8 +5428,8 @@ export function DNSThreatCard() {
       <div className="rounded-lg border bg-card p-4">
         <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Not shown: the DNS tunneling rollup needs read on DNS servers, which
-          your role does not have.
+          Not shown: the DNS tunneling rollup needs read on servers (the server
+          logs permission), which your role does not have.
         </p>
       </div>
     );
