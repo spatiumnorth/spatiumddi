@@ -255,3 +255,153 @@ async def test_approved_portal_request_creates_a_record(
     assert clash is None
     recs = await _a_records(db_session, zone_id)
     assert [(r.name, r.value) for r in recs] == [("app01", "10.98.5.20")]
+
+
+async def _ip(db: AsyncSession, sid: str, address: str) -> IPAddress | None:
+    return (
+        await db.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == uuid.UUID(sid), IPAddress.address == address
+            )
+        )
+    ).scalar_one_or_none()
+
+
+@pytest.mark.asyncio
+async def test_fqdn_without_hostname_publishes_that_name_3348(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3348 — an fqdn alone becomes the hostname that publishes exactly it.
+
+    The hostname is the part before the subnet's zone (which can be more than
+    one label), so the record, the stored fqdn and the given fqdn agree, whatever
+    case or trailing dot the fqdn arrived with.
+    """
+    admin = await _user(db_session, "admin")
+    sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
+    zone_id = zone.id
+    zone_name = zone.name.rstrip(".")
+    op = get_operation("create_ip_address")
+    assert op is not None
+    args = CreateIPAddressArgs(
+        subnet_id=sid, address="10.98.5.30", fqdn=f"Web01.Prod.{zone_name.upper()}."
+    )
+
+    preview = await op.preview(db_session, admin, args)
+    assert preview.ok, preview.detail
+    assert f"A web01.prod.{zone_name}" in preview.preview_text
+
+    await op.apply(db_session, admin, args)
+    recs = await _a_records(db_session, zone_id)
+    assert [(r.name, r.value) for r in recs] == [("web01.prod", "10.98.5.30")]
+    ip = await _ip(db_session, sid, "10.98.5.30")
+    assert ip is not None
+    assert ip.hostname == "web01.prod"
+    assert ip.fqdn == f"web01.prod.{zone_name}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hostname", "fqdn", "reason"),
+    [
+        (None, "web01.elsewhere.example", "is not a name in"),
+        ("api", "web01.{zone}", "name different hosts"),
+    ],
+)
+async def test_fqdn_that_would_publish_another_name_is_refused_3348(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    hostname: str | None,
+    fqdn: str,
+    reason: str,
+) -> None:
+    """#3348 — an fqdn the address would not publish is refused, not swapped."""
+    admin = await _user(db_session, "admin")
+    sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
+    zone_id = zone.id
+    op = get_operation("create_ip_address")
+    assert op is not None
+    args = CreateIPAddressArgs(
+        subnet_id=sid,
+        address="10.98.5.31",
+        hostname=hostname,
+        fqdn=fqdn.format(zone=zone.name.rstrip(".")),
+    )
+
+    preview = await op.preview(db_session, admin, args)
+    assert not preview.ok
+    assert reason in preview.detail
+    with pytest.raises(ValueError, match=reason):
+        await op.apply(db_session, admin, args)
+    assert await _ip(db_session, sid, "10.98.5.31") is None
+    assert await _a_records(db_session, zone_id) == []
+
+
+@pytest.mark.asyncio
+async def test_portal_request_with_fqdn_only_publishes_it_3348(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3348 — submit → approve → apply for an fqdn-only request: the name the
+    requester gave is the one published and shown, and one outside the zone is
+    refused at submit rather than queued."""
+    admin = await _user(db_session, "admin")
+    sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
+    zone_id = zone.id
+    zone_name = zone.name.rstrip(".")
+    db_session.add(FeatureModule(id="governance.requests", enabled=True))
+    await db_session.flush()
+    feature_modules.invalidate_cache()
+
+    from app.models.auth import Group, Role
+
+    requester = await _user(db_session, "req", superadmin=False)
+    role = Role(
+        name=f"r-{uuid.uuid4().hex[:6]}",
+        permissions=[
+            {"action": "write", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "subnet"},
+        ],
+    )
+    grp = Group(name=f"g-{uuid.uuid4().hex[:6]}")
+    grp.roles = [role]
+    db_session.add_all([role, grp])
+    requester.groups = [grp]
+    await db_session.flush()
+    req_hdr = {"Authorization": f"Bearer {create_access_token(str(requester.id))}"}
+    approver = await _user(db_session, "appr")
+    appr_hdr = {"Authorization": f"Bearer {create_access_token(str(approver.id))}"}
+
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=req_hdr,
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": sid, "address": "10.98.5.40", "fqdn": "db01.other.example"},
+            "justification": "Outside the zone.",
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "is not a name in" in resp.text
+
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=req_hdr,
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": sid, "address": "10.98.5.40", "fqdn": f"db01.{zone_name}"},
+            "justification": "Database host.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    rid = resp.json()["id"]
+    resp = await client.post(
+        f"/api/v1/requests/{rid}/approve", headers=appr_hdr, json={"decision_note": "ok"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "executed", resp.json()
+    recs = await _a_records(db_session, zone_id)
+    assert [(r.name, r.value) for r in recs] == [("db01", "10.98.5.40")]
+    ip = await _ip(db_session, sid, "10.98.5.40")
+    assert ip is not None
+    assert (ip.hostname, ip.fqdn) == ("db01", f"db01.{zone_name}")
