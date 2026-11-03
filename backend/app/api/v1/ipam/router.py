@@ -139,6 +139,7 @@ from app.services.ipam.utilization import (
 )
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.ipam.zone_binding import (
+    assert_zones_exist,
     check_group_uuid_list,
     check_zone_uuid,
     check_zone_uuid_list,
@@ -5117,6 +5118,7 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     await _assert_dns_groups_exist(db, body.dns_group_ids)
     # Pre-check the unique-name constraint so we can return a clean 409
     # instead of letting the DB raise an IntegrityError (→ 500).
@@ -5191,6 +5193,7 @@ async def update_space(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     await _assert_dns_groups_exist(db, body.dns_group_ids, already=space.dns_group_ids)
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
@@ -5496,6 +5499,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     await _assert_dns_groups_exist(db, body.dns_group_ids)
 
     # Verify parent block exists and belongs to the same space
@@ -5672,6 +5676,7 @@ async def update_block(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     await _assert_dns_groups_exist(db, body.dns_group_ids, already=block.dns_group_ids)
 
     # Required custom fields (#2478): checked only when the request sends
@@ -6516,6 +6521,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -7659,6 +7665,7 @@ async def update_subnet(
         subnet,
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     # Per-row: a grant scoped to this subnet suffices (#2438); an unscoped one
     # still does. A scoped holder may not point the subnet at another resource
     # (block, customer, site, VLAN, DHCP / DNS servers) nor at a DNS zone it
@@ -10136,6 +10143,7 @@ async def create_address(
     await _enforce_zone_token_scope(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.extra_zone_ids or [])])
 
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
@@ -10547,6 +10555,13 @@ async def update_address(
                 *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
             ],
             already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
+        )
+        await assert_zones_exist(
+            db,
+            [
+                body.dns_zone_id if "dns_zone_id" in touched else None,
+                *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
+            ],
         )
     # "Touched" means CHANGED, not merely present: the Edit dialog sends its
     # hostname, MAC and zone on every Save, so presence alone re-ran every
@@ -11673,6 +11688,7 @@ async def bulk_allocate_preview(
     # The preview reports name collisions in the zone the body names, so it
     # is held to the same zone rule as the commit.
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
+    await assert_zones_exist(db, [body.dns_zone_id])
 
     # Address-set write delegation (#103): the same per-address test the
     # commit applies. A caller who can write nothing on this subnet is refused
@@ -11760,6 +11776,7 @@ async def bulk_allocate_commit(
     _enforce_subnet_token_scope(current_user, subnet_id)
     # GHSA-875w — a zone named in the body must be one the token may write.
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
+    await assert_zones_exist(db, [body.dns_zone_id])
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -12047,6 +12064,7 @@ async def allocate_next_ip(
     await _enforce_zone_token_scope(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.extra_zone_ids or [])])
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     # ``dns_zone_id: ""`` is the dialog's "None (no DNS record)" (#2466): the
     # address is allocated with no forward zone, no A and no PTR. Absent / null
