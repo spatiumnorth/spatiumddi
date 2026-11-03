@@ -122,7 +122,14 @@ from app.services.ipam.hygiene import (
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_boundary import boundary_addresses
-from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
+from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
+    create_placeholder_rows,
+    find_untouched_gateway_row,
+    gateway_target_problem,
+    has_boundary_rows,
+    holds_placeholder_rows,
+)
 from app.services.ipam.utilization import (
     block_allocated,
     block_subnet_contribution_sql,
@@ -7521,6 +7528,16 @@ async def get_effective_subnet_dhcp(
     )
 
 
+def _same_ip(a: str | None, b: str | None) -> bool:
+    """Two optional IP strings name the same address (spelling-insensitive)."""
+    if a is None or b is None:
+        return a is b
+    try:
+        return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+    except ValueError:
+        return a == b
+
+
 @router.put("/subnets/{subnet_id}", response_model=SubnetResponse)
 async def update_subnet(
     subnet_id: uuid.UUID, body: SubnetUpdate, current_user: CurrentUser, db: DB
@@ -7580,11 +7597,34 @@ async def update_subnet(
                 detail=f"Subnet {subnet.network} is not contained within block {target.network}",
             )
 
-    # Validate new gateway is within the subnet (same rule as create, #2984).
+    # Validate new gateway: the same rule as create, #2984 — inside the subnet,
+    # and (when the subnet holds network / broadcast rows) not on either of
+    # them (#3318). A gateway the edit leaves as it was is not re-judged, so a
+    # re-save of a subnet whose stored gateway predates the rule still works.
+    old_gateway = str(subnet.gateway) if subnet.gateway else None
+    gateway_edit = "gateway" in body.model_fields_set and not _same_ip(body.gateway, old_gateway)
+    manages_gateway_row = gateway_edit and await holds_placeholder_rows(db, subnet)
     if body.gateway is not None:
-        gw_problem = gateway_problem(body.gateway, _parse_network(str(subnet.network)))
+        gw_problem = gateway_problem(
+            body.gateway,
+            _parse_network(str(subnet.network)),
+            reject_reserved=manages_gateway_row,
+        )
         if gw_problem:
             raise HTTPException(status_code=422, detail=gw_problem)
+    # The default "Gateway" row the old gateway holds, found while the stored
+    # gateway is still the old one (the setattr below would autoflush the new).
+    old_gateway_row: IPAddress | None = None
+    if manages_gateway_row:
+        if body.gateway is not None:
+            # A host, a lease or a discovered row already at the new address
+            # is refused, as Resize refuses it (#2413); a reserved row is kept.
+            target_problem = await gateway_target_problem(
+                db, subnet, str(ipaddress.ip_address(body.gateway))
+            )
+            if target_problem:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=target_problem)
+        old_gateway_row = await find_untouched_gateway_row(db, subnet)
 
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:
@@ -7723,6 +7763,26 @@ async def update_subnet(
             _val = getattr(body, _field)
             setattr(subnet, _field, _val)
             changes_for_audit[_field] = str(_val) if isinstance(_val, uuid.UUID) else _val
+
+    # A moved gateway is reserved the way create_subnet reserves a new subnet's
+    # gateway, so Next available never offers it to a host (#3317, the third
+    # path after Resize #2413 and the import #2979). The old default "Gateway"
+    # row is retired with its PTR; a renamed / DNS-bearing / owned one is the
+    # operator's and is kept, as is a reserved row already at the new address.
+    if manages_gateway_row:
+        if old_gateway_row is not None:
+            await _sync_dns_record(db, old_gateway_row, subnet, action="delete")
+            await db.delete(old_gateway_row)
+            await db.flush()
+        if subnet.gateway:
+            gw_row = await add_gateway_row(
+                db, subnet, str(subnet.gateway), created_by_user_id=current_user.id
+            )
+            if gw_row is not None:
+                # Same as create_subnet: the placeholder's PTR (spatiumddi#1150).
+                await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
+        await db.flush()
+        await _update_utilization(db, subnet.id)
 
     # Handle add/remove of auto-created network/broadcast/gateway records.
     # Kubernetes-semantics subnets (pod / service CIDRs) are routed
