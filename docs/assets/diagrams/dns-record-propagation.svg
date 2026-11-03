@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>DNS record change — end-to-end propagation</title>
-  <desc>A record mutation is validated and written in the service layer, enqueued as RecordOp rows, returned to the caller, released to agents holding a config long-poll, applied over loopback nsupdate on BIND9, and acknowledged on the next heartbeat.</desc>
+  <desc>A record mutation is validated and written in the service layer, enqueued as RecordOp rows, returned to the caller, released to agents holding a config long-poll, applied over loopback nsupdate on BIND9 or the local API on PowerDNS and Technitium, and acknowledged on the next heartbeat.</desc>
   <defs>
     <linearGradient id="dnsp-cp" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#8b5cf6"/>
@@ -61,9 +61,9 @@
   <g>
     <rect x="180" y="246" width="560" height="104" rx="8" fill="url(#dnsp-store)"/>
     <text x="460" y="272" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Enqueue RecordOp rows</text>
-    <text x="204" y="296" font-size="11" fill="#a7f3d0">{ id, server_id, zone_name, op: create | update | delete,</text>
-    <text x="204" y="314" font-size="11" fill="#a7f3d0">  record: {…}, serial_strategy: bump, created_at,</text>
-    <text x="204" y="332" font-size="11" fill="#a7f3d0">  state: pending }</text>
+    <text x="204" y="296" font-size="11" fill="#a7f3d0">one per agent-based server in the group:  { id, server_id, zone_name,</text>
+    <text x="204" y="314" font-size="11" fill="#a7f3d0">  op: create | update | delete, record: {whole RRset}, target_serial,</text>
+    <text x="204" y="332" font-size="11" fill="#a7f3d0">  attempts, next_attempt_at, superseded_by, state: pending }</text>
   </g>
   <path d="M 460 350 V 378" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
 
@@ -78,16 +78,16 @@
   <!-- 5. Long-poll released -->
   <g>
     <rect x="180" y="464" width="560" height="68" rx="8" fill="url(#dnsp-accent)"/>
-    <text x="460" y="490" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agents holding a long-poll on /config are released</text>
-    <text x="460" y="512" text-anchor="middle" font-size="11" fill="#cffafe">or the next long-poll picks it up within ≤ 30 s — idempotent by op_id</text>
+    <text x="460" y="490" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Redis wake (post-commit) releases agents' /config long-poll</text>
+    <text x="460" y="512" text-anchor="middle" font-size="11" fill="#cffafe">fallback tick 12 s · ETag compare is authoritative · state: in_flight once shipped</text>
   </g>
   <path d="M 460 532 V 560" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
 
   <!-- 6. Agent applies -->
   <g>
     <rect x="180" y="560" width="560" height="68" rx="8" fill="url(#dnsp-agent)"/>
-    <text x="460" y="586" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agent executes via loopback</text>
-    <text x="460" y="608" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 → nsupdate ‹signed with the local TSIG key›</text>
+    <text x="460" y="586" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agent applies the op locally</text>
+    <text x="460" y="608" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 → loopback nsupdate (TSIG-signed) · PowerDNS / Technitium → their local API</text>
   </g>
   <path d="M 460 628 V 656" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
 
@@ -108,7 +108,7 @@
   <g>
     <rect x="460" y="736" width="280" height="76" rx="8" fill="url(#dnsp-danger)"/>
     <text x="600" y="758" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">state = failed → alert</text>
-    <text x="600" y="777" text-anchor="middle" font-size="11" fill="#fee2e2">after N retries</text>
-    <text x="600" y="794" text-anchor="middle" font-size="11" fill="#fee2e2">(default 5, expo-backoff)</text>
+    <text x="600" y="777" text-anchor="middle" font-size="11" fill="#fee2e2">after the last attempt</text>
+    <text x="600" y="794" text-anchor="middle" font-size="11" fill="#fee2e2">(8 attempts, 30 s → 15 min backoff)</text>
   </g>
 </svg>
