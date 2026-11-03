@@ -948,7 +948,7 @@ const SECTIONS: SectionDef[] = [
     title: "Audit Event Forwarding",
     group: "Security",
     description:
-      "Multi-target forwarding for AuditLog events. Add syslog (UDP/TCP/TLS with RFC 5424 JSON, CEF, LEEF, RFC 3164, or raw JSON-lines) or HTTP webhook targets; each filters independently and a dead collector never blocks the audit write.",
+      "Multi-target forwarding for AuditLog events. Add syslog (UDP/TCP/TLS with RFC 5424 JSON, CEF, LEEF, RFC 3164, or raw JSON-lines), HTTP webhook, or email (SMTP) targets; each filters independently and a dead collector never blocks the audit write.",
     keywords: [
       "syslog",
       "siem",

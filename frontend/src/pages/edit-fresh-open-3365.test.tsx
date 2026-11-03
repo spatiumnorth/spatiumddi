@@ -237,6 +237,60 @@ describe("Edit PXE profile (#3365)", () => {
   });
 });
 
+describe("Edit PXE profile sends rule ids (#3374)", () => {
+  const rule = {
+    id: "r-10",
+    priority: 10,
+    match_kind: "first_stage",
+    vendor_class_match: "PXEClient",
+    arch_codes: [0],
+    boot_filename: "a",
+    boot_file_url_v6: null,
+  };
+  const prof = {
+    id: "p-1",
+    group_id: "g-1",
+    name: "prof",
+    description: "d",
+    next_server: "10.0.0.1",
+    enabled: true,
+    matches: [rule],
+  } as unknown as PXEProfile;
+
+  it("names the existing rule, and a rule added in the dialog carries no id", async () => {
+    const updatePxeProfile = vi.fn(() => Promise.resolve(prof));
+    answers.dhcpApi = {
+      getPxeProfile: () => Promise.resolve(prof),
+      updatePxeProfile,
+    };
+    open(
+      <ProfileEditor
+        mode="edit"
+        groupId="g-1"
+        existing={prof}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    await screen.findByDisplayValue("d");
+    fireEvent.change(screen.getByDisplayValue("a"), { target: { value: "b" } });
+    fireEvent.click(screen.getByText(/Add match/i));
+    const added = screen.getAllByLabelText(/Boot filename/i).at(-1)!;
+    fireEvent.change(added, { target: { value: "new.efi" } });
+    save();
+    await waitFor(() => expect(updatePxeProfile).toHaveBeenCalled());
+    const calls = updatePxeProfile.mock.calls as unknown as [
+      string,
+      { matches: { id?: string; boot_filename: string }[] },
+    ][];
+    const sent = calls[0][1].matches;
+    expect(sent.map((m) => [m.boot_filename, m.id])).toEqual([
+      ["b", "r-10"],
+      ["new.efi", undefined],
+    ]);
+  });
+});
+
 describe("Edit address set (#3365)", () => {
   const stale = {
     id: "s-1",

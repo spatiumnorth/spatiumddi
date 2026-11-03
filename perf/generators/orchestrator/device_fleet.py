@@ -12,9 +12,14 @@ A/PTR resolves, single-clock).
 Per-device FSM (§3.2):
 
     OFFLINE -> DISCOVERING -(DORA)-> ONLINE -> RENEWING -ACK-> ONLINE
-                                       |  (T1 fails) -> REBINDING -ACK-> ONLINE
-                                       |  departure -> DEPARTING -> LEFT
+          ^         | (retries exhausted)       |  (T1 fails) -> REBINDING -ACK-> ONLINE
+          +---------+                           |  (rebind times out) -> LEFT (lapsed)
+                                                |  departure (ONLINE / RENEWING /
+                                                |    REBINDING) -> LEFT
     LEFT -> (re-arrival) -> DISCOVERING ...
+
+``DState.DEPARTING`` is declared but never assigned: a departure goes straight
+to LEFT.
 
 HARD FSM CONTRACTS (the report turns these into named correctness FAILs):
   * T1 = 900s: RENEWING re-REQUESTs the CURRENT lease/IP (NOT a fresh DISCOVER); a

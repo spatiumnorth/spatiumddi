@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import ipaddress
+import json
 import re
 import uuid
 import zipfile
+import zlib
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
@@ -6880,16 +6883,86 @@ class ZoneUpdateAclReplace(BaseModel):
     # call so the UI can toggle + set the ACL atomically. None = leave as-is.
     dynamic_update_enabled: bool | None = None
     entries: list[UpdateAclEntryIn] = Field(default_factory=list)
+    # Optimistic-concurrency token (#3381): the ``version`` the caller read
+    # from GET / a previous PUT. A mismatch against the stored ACL answers
+    # 409 and changes nothing. Omitted = replace unconditionally.
+    expected_version: str | None = None
 
 
 class ZoneUpdateAclResponse(BaseModel):
     zone_id: uuid.UUID
+    # Opaque hash of the stored ACL state (flag + ordered entries).
+    version: str = ""
     dynamic_update_enabled: bool
     driver_names: list[str]
     caps: DynamicUpdateCapsOut
     entries: list[UpdateAclEntryOut]
     # Non-fatal warnings from the driver (e.g. "IP entries are UDP-spoofable").
     warnings: list[str] = Field(default_factory=list)
+
+
+def _acl_version(enabled: bool, entries: list[UpdateAclEntryOut]) -> str:
+    """Version token for a zone's dynamic-update ACL (#3381).
+
+    A hash of the canonical state — the enable flag plus the ordered entries,
+    excluding row ids (a replace re-creates every row, so ids would change
+    the token on a no-op save). Derived, so it needs no column.
+    """
+    canon = [
+        bool(enabled),
+        [
+            [
+                e.action,
+                e.match_kind,
+                e.ip_cidr,
+                str(e.tsig_key_id) if e.tsig_key_id else None,
+                e.name_scope,
+                e.name_pattern,
+                sorted(e.record_types) if e.record_types else None,
+            ]
+            for e in entries
+        ],
+    ]
+    return hashlib.sha256(json.dumps(canon, separators=(",", ":")).encode()).hexdigest()[:32]
+
+
+# Advisory-lock namespace for a zone's dynamic-update ACL replace (#3381).
+_LOCK_NS_ZONE_UPDATE_ACL = 0x3381_0AC1
+
+
+async def _lock_acl_and_check_version(db: DB, zone: DNSZone, expected_version: str | None) -> None:
+    """Serialise ACL replaces on one zone, then refuse a stale one (#3381).
+
+    Every ACL writer (the REST PUT and the MCP apply) calls this before
+    touching the rows, so the version compare and the write are one step
+    against any other writer. A per-zone advisory lock, not ``FOR UPDATE``
+    on the zone row: only ACL writers take it, and they take it before
+    anything else, so it cannot close a cycle. A zone-row lock would — a
+    record or zone edit holds the audit-chain lock and then updates the
+    zone row, while this request would hold the row and then want the
+    audit lock at commit. ``expected_version=None`` replaces
+    unconditionally (still serialised).
+    """
+    key = zlib.crc32(str(zone.id).encode("utf-8"))
+    if key >= 2**31:
+        key -= 2**32
+    await db.execute(select(func.pg_advisory_xact_lock(_LOCK_NS_ZONE_UPDATE_ACL, key)))
+    if expected_version is None:
+        return
+    await db.refresh(zone, ["dynamic_update_enabled"])
+    current = _acl_version(zone.dynamic_update_enabled, await _load_acl_out(db, zone.id))
+    if current != expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACL_VERSION_CONFLICT",
+                "message": (
+                    "Someone changed this ACL since you opened it. "
+                    "Reload to see the current entries."
+                ),
+                "current_version": current,
+            },
+        )
 
 
 async def _group_driver_names(db: DB, group_id: uuid.UUID) -> list[str]:
@@ -6950,7 +7023,9 @@ async def _load_acl_out(db: DB, zone_id: uuid.UUID) -> list[UpdateAclEntryOut]:
             select(DNSZoneUpdateAcl, DNSTSIGKey.name)
             .outerjoin(DNSTSIGKey, DNSZoneUpdateAcl.tsig_key_id == DNSTSIGKey.id)
             .where(DNSZoneUpdateAcl.zone_id == zone_id)
-            .order_by(DNSZoneUpdateAcl.seq)
+            # ``id`` breaks a ``seq`` tie (the index is not unique), so two
+            # reads of an unchanged ACL list it, and version it, alike (#3381).
+            .order_by(DNSZoneUpdateAcl.seq, DNSZoneUpdateAcl.id)
         )
     ).all()
     return [
@@ -7029,6 +7104,7 @@ async def get_zone_update_acl(
                 )
     return ZoneUpdateAclResponse(
         zone_id=zone.id,
+        version=_acl_version(zone.dynamic_update_enabled, entries),
         dynamic_update_enabled=zone.dynamic_update_enabled,
         driver_names=driver_names,
         caps=_caps_out(caps),
@@ -7188,6 +7264,7 @@ async def replace_zone_update_acl(
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
+    await _lock_acl_and_check_version(db, zone, body.expected_version)
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
     db.add(
@@ -7218,12 +7295,14 @@ async def replace_zone_update_acl(
     )
 
     caps = _effective_dynamic_update_caps(driver_names)
+    new_entries = await _load_acl_out(db, zone.id)
     return ZoneUpdateAclResponse(
         zone_id=zone.id,
+        version=_acl_version(zone.dynamic_update_enabled, new_entries),
         dynamic_update_enabled=zone.dynamic_update_enabled,
         driver_names=driver_names,
         caps=_caps_out(caps),
-        entries=await _load_acl_out(db, zone.id),
+        entries=new_entries,
         warnings=sorted(set(warnings + win_warnings)),
     )
 

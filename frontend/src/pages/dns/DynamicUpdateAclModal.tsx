@@ -90,8 +90,8 @@ function DynamicUpdateAclForm({
   const nextKey = () => (rowKey.current += 1);
 
   const [enabled, setEnabled] = useState(acl.dynamic_update_enabled);
-  const [rows, setRows] = useState<Row[]>(() =>
-    acl.entries.map((e) => ({
+  const seedRows = (from: ZoneUpdateAcl): Row[] =>
+    from.entries.map((e) => ({
       _key: nextKey(),
       match_kind: e.match_kind,
       action: e.action,
@@ -100,11 +100,13 @@ function DynamicUpdateAclForm({
       name_scope: e.name_scope,
       name_pattern: e.name_pattern,
       record_types: e.record_types,
-    })),
-  );
+    }));
+  const [rows, setRows] = useState<Row[]>(() => seedRows(acl));
   // What the server holds as far as this dialog knows: the fresh read, then
-  // the last saved response (the dialog stays open after a save).
+  // the last saved response (the dialog stays open after a save). Its
+  // ``version`` goes back with the save, so a stale one answers 409 (#3381).
   const [stored, setStored] = useState(acl);
+  const [conflict, setConflict] = useState(false);
 
   const keysQuery = useQuery({
     queryKey: ["dns-tsig-keys", groupId],
@@ -147,11 +149,17 @@ function DynamicUpdateAclForm({
       // elsewhere since this dialog opened. The entries are a whole-set
       // replace, so they always go.
       return dnsApi.replaceZoneUpdateAcl(groupId, zoneId, {
+        expected_version: stored.version,
         ...(enabled !== stored.dynamic_update_enabled
           ? { dynamic_update_enabled: enabled }
           : {}),
         entries,
       });
+    },
+    onMutate: () => setConflict(false),
+    onError: (err) => {
+      if ((err as { response?: { status?: number } })?.response?.status === 409)
+        setConflict(true);
     },
     onSuccess: (data) => {
       if (!data) {
@@ -165,7 +173,23 @@ function DynamicUpdateAclForm({
     },
   });
 
-  const savedWarnings = saveMut.data?.warnings ?? acl.warnings ?? [];
+  // Reload after a 409: re-read the ACL and re-seed the editor from it.
+  const reload = async () => {
+    let fresh: ZoneUpdateAcl;
+    try {
+      fresh = await dnsApi.getZoneUpdateAcl(groupId, zoneId);
+    } catch {
+      return; // the conflict banner stays; Reload can be pressed again
+    }
+    saveMut.reset();
+    setConflict(false);
+    setStored(fresh);
+    setEnabled(fresh.dynamic_update_enabled);
+    setRows(seedRows(fresh));
+    qc.setQueryData(["dns-zone-update-acl", groupId, zoneId], fresh);
+  };
+
+  const savedWarnings = saveMut.data?.warnings ?? stored.warnings ?? [];
 
   const addRow = () =>
     setRows((rs) => [
@@ -406,7 +430,23 @@ function DynamicUpdateAclForm({
               </div>
             )}
 
-            {saveMut.error && (
+            {conflict && (
+              <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                <span>
+                  Someone changed this ACL since you opened it. Reload to see
+                  the current entries; your edits here will be discarded.
+                </span>
+                <button
+                  type="button"
+                  className="shrink-0 rounded-md border px-2 py-1"
+                  onClick={reload}
+                >
+                  Reload
+                </button>
+              </div>
+            )}
+
+            {saveMut.error && !conflict && (
               <p className="text-xs text-destructive">
                 {formatApiError(saveMut.error, "Could not save the ACL")}
               </p>

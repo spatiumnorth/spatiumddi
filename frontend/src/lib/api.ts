@@ -6184,6 +6184,8 @@ export interface UpdateAclEntryInput {
 
 export interface ZoneUpdateAcl {
   zone_id: string;
+  // Version token of the stored ACL (#3381); send it back as expected_version.
+  version: string;
   dynamic_update_enabled: boolean;
   driver_names: string[];
   caps: DynamicUpdateCaps;
@@ -6194,6 +6196,8 @@ export interface ZoneUpdateAcl {
 export interface ZoneUpdateAclReplace {
   dynamic_update_enabled?: boolean | null;
   entries: UpdateAclEntryInput[];
+  // The `version` last read; a stale one answers 409 (#3381). Omitted = unconditional.
+  expected_version?: string | null;
 }
 
 // Generic server-side pagination envelope (#455). Matches the backend
@@ -9068,6 +9072,8 @@ export interface PXEArchMatch {
 }
 
 export interface PXEArchMatchInput {
+  /** Existing rule's id (#3374); omit for a new rule. */
+  id?: string;
   priority?: number;
   match_kind?: PXEMatchKind;
   vendor_class_match?: string | null;
@@ -14497,9 +14503,26 @@ export const applianceDiagnosticsApi = {
     api
       .post<ApplianceSelfTestReport>("/appliance/diagnostics/self-test")
       .then((r) => r.data),
-  // Bundle download uses a direct URL — the browser handles the
-  // attachment + filename via Content-Disposition.
-  bundleUrl: () => "/api/v1/appliance/diagnostics/bundle",
+  // The API authenticates by the Authorization bearer only, so a plain
+  // <a href> navigation 401s (#3394). Fetch through the client as a blob,
+  // decode a refusal, and take the filename from Content-Disposition (the
+  // fallback matches the server's own `spatium-diagnostic-<UTC stamp>.zip`).
+  downloadBundle: async (): Promise<{ blob: Blob; filename: string }> => {
+    const res = await api
+      .get("/appliance/diagnostics/bundle", { responseType: "blob" })
+      .catch(rethrowBlobError);
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    return {
+      blob: new Blob([res.data as BlobPart]),
+      filename: match ? match[1] : `spatium-diagnostic-${ts}.zip`,
+    };
+  },
 };
 
 /**

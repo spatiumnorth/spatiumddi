@@ -66,6 +66,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
     activate: vi.fn(),
     remove: vi.fn(),
     upload: vi.fn(),
+    importSignedCert: vi.fn(),
   },
   applianceAcmeApi: {
     listOrders: vi.fn().mockResolvedValue([]),
@@ -225,5 +226,56 @@ describe("CertificatesTab on an appliance, as a store-only caller (#3067)", () =
     expect(screen.getAllByText("Delete")[0].closest("button")!.disabled).toBe(
       true,
     );
+  });
+});
+
+describe("CertificatesTab View CSR dialog (#3393)", () => {
+  const pending = {
+    ...certs[1],
+    id: "3",
+    name: "pending-csr",
+    pending: true,
+    csr_pem:
+      "-----BEGIN CERTIFICATE REQUEST-----\nabc\n-----END CERTIFICATE REQUEST-----",
+  };
+
+  async function openCsr() {
+    const { applianceTlsApi } = await import("@/lib/api");
+    vi.mocked(applianceTlsApi.list).mockResolvedValue([pending] as never);
+    renderTab(false);
+    await screen.findByText("pending-csr");
+    fireEvent.click(screen.getByText("View CSR"));
+    return screen.findByText("Have the signed cert? Paste it now");
+  }
+
+  afterEach(async () => {
+    const { applianceTlsApi } = await import("@/lib/api");
+    vi.mocked(applianceTlsApi.list).mockResolvedValue(certs as never);
+  });
+
+  it("a read-only caller can read the CSR but not open the paste form", async () => {
+    grants.current = new Set(["read:certificate_store"]);
+    const label = await openCsr();
+    const paste = label.closest("button")!;
+    expect(paste.disabled).toBe(true);
+    expect(paste.title).toMatch(/certificate_store/);
+    fireEvent.click(paste);
+    expect(screen.queryByText(/Paste signed certificate/)).toBeNull();
+    // The read half stays usable.
+    expect(screen.getByText("Copy").closest("button")!.disabled).toBe(false);
+    expect(
+      screen.getByText("Download pending-csr.csr").closest("button")!.disabled,
+    ).toBe(false);
+    const { applianceTlsApi } = await import("@/lib/api");
+    expect(applianceTlsApi.importSignedCert).not.toHaveBeenCalled();
+  });
+
+  it("a certificate-store writer still reaches the paste form", async () => {
+    grants.current = new Set(["write:certificate_store"]);
+    const label = await openCsr();
+    const paste = label.closest("button")!;
+    expect(paste.disabled).toBe(false);
+    fireEvent.click(paste);
+    await screen.findByText(/Paste signed certificate/);
   });
 });
