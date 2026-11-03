@@ -41,7 +41,7 @@ def certificate_store_location(appliance_mode: bool) -> str:
         return WEB_UI_CERTIFICATE_PAGE
     return (
         f"the API ({CERTIFICATE_API}, or {ACME_ISSUE_API} for Let's Encrypt; "
-        "a Docker or Kubernetes control plane has no certificate page)"
+        "on a Docker or Kubernetes control plane it is Fleet → TLS certificates)"
     )
 
 

@@ -27,7 +27,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.models.dhcp import DHCPServer
-from app.services.api_token_scopes import read_only_post
+from app.services.api_token_scopes import read_only_post, token_write
 from app.services.dhcp.option_validation import canonical_domain_options
 from app.services.dhcp_import import (
     CommitResult,
@@ -37,6 +37,7 @@ from app.services.dhcp_import import (
     commit_import,
     detect_conflicts,
     drop_invalid_pools,
+    drop_invalid_reservations,
     drop_unservable_hostnames,
     parse_isc_config,
     parse_kea_config,
@@ -375,11 +376,15 @@ async def _attach_conflicts(
         target_group_id=target_group_id,
         ipam_space_id=ipam_space_id,
     )
+    # #3335 — a reservation outside its subnet is never stored; say so here.
+    # First, so a dropped reservation is not also named for its hostname.
+    preview.warnings.extend(drop_invalid_reservations(preview.scopes))
     # #2919 — the preview shows what the commit will store.
     preview.warnings.extend(drop_unservable_hostnames(preview.scopes))
     # #3037 — Kea / ISC drop a bad pool at parse; this covers Windows too.
     preview.warnings.extend(drop_invalid_pools(preview.scopes))
     preview.total_pools = sum(len(s.pools) for s in preview.scopes)
+    preview.total_reservations = sum(len(s.reservations) for s in preview.scopes)
 
 
 # ── Kea endpoints ────────────────────────────────────────────────────
@@ -491,6 +496,7 @@ async def windows_servers(_: SuperAdmin, db: DB) -> list[WindowsDHCPServerOption
 
 
 @router.post("/windows/preview", response_model=PreviewOut)
+@token_write("Live WinRM pull from a Windows DHCP server with stored credentials (outbound)")
 async def windows_preview(
     current_user: SuperAdmin, db: DB, body: WindowsDHCPPreviewIn = Body(...)
 ) -> PreviewOut:

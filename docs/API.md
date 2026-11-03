@@ -401,7 +401,9 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 
 - **Scopes** (`scopes: [...]`) — a coarse, closed vocabulary defined in
   [`backend/app/services/api_token_scopes.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/api_token_scopes.py):
-  `read`, `ipam:write`, `dns:write`, `dhcp:write`, `agent`. An empty
+  `read`, `ipam:write`, `dns:write`, `dhcp:write`. (An `agent` scope was
+  retired in #3302: the agent routes take the agent's own JWT or PSK, never an
+  API token. Create and update refuse it with 422.) An empty
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
   scopes returns `403 "Token scope insufficient for this request"` (the
@@ -435,6 +437,27 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 
 A token can never exceed its owner's RBAC: the scope / grant check is
 an *additional* gate, applied on top of the owning user's permissions.
+
+**Declaring a new POST route.** The token-scope gate reads every POST as a
+write unless the handler says otherwise, so each POST outside the agent
+surfaces (`/api/v1/dns/agents`, `/api/v1/dhcp/agents`) must state which it is,
+directly under its `@router.post(...)` decorator:
+
+- `@read_only_post` when the body is only a filter, preview or dry run: no row
+  written (an audit row for the read excepted), no queued op, nothing sent
+  outward. A `read` token may then call it.
+- `@token_write("reason")` for everything else, with a real reason: it mutates
+  state, queues an op, sends traffic outward (a probe, a live pull from a
+  managed server), or is a read deliberately kept write-scoped. "Not reviewed"
+  is refused when the module imports. This changes no behaviour; it records the
+  decision.
+
+Both live in `app/services/api_token_scopes.py`.
+`tests/test_token_post_classification_3302.py` fails CI for a new POST with
+neither. The ~390 older unclassified routes sit in
+`backend/token_unclassified_posts_baseline.txt`, which may only shrink:
+annotate a handler, then re-record with
+`python tests/test_token_post_classification_3302.py --baseline`.
 
 See [`features/AUTH.md`](features/AUTH.md) for the full auth provider,
 MFA, and session model.
