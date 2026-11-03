@@ -493,6 +493,29 @@ def target_block_write_refusal(current_user: User, block: IPBlock) -> str:
     return f"Permission denied: need 'write' on target block {block.id}"
 
 
+async def _resize_parent_refusal(
+    db: AsyncSession, current_user: User, parent_block_id: uuid.UUID | None
+) -> str | None:
+    """A resize is grow-only, so it always takes address space from the
+    parent block; that is the parent owner's to allocate (#3439). Returns the
+    refusal words when ``current_user`` may not write the parent, else None.
+    A top-level block has no parent block (the space bounds it)."""
+    if parent_block_id is None:
+        return None
+    parent = await db.get(IPBlock, parent_block_id)
+    if parent is None or user_has_permission(current_user, "write", "ip_block", parent.id):
+        return None
+    return target_block_write_refusal(current_user, parent)
+
+
+async def _require_resize_parent_write(
+    db: AsyncSession, current_user: User, parent_block_id: uuid.UUID | None
+) -> None:
+    refusal = await _resize_parent_refusal(db, current_user, parent_block_id)
+    if refusal is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
+
+
 router.include_router(io_router)
 
 # NAT mappings — operator-curated metadata cross-referenced from IPAM
@@ -8095,7 +8118,7 @@ async def resize_subnet_preview(
     db: DB,
 ) -> SubnetResizePreviewResponse:
     _require_type_write(current_user, "subnet")
-    from app.services.ipam.resize import preview_subnet_resize
+    from app.services.ipam.resize import ResizeConflict, preview_subnet_resize
 
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
@@ -8107,6 +8130,9 @@ async def resize_subnet_preview(
         body.new_cidr,
         move_gateway_to_first_usable=body.move_gateway_to_first_usable,
     )
+    refusal = await _resize_parent_refusal(db, current_user, subnet.block_id)
+    if refusal is not None:
+        preview.conflicts.insert(0, ResizeConflict(type="permission", detail=refusal))
     return SubnetResizePreviewResponse(
         old_cidr=preview.old_cidr,
         new_cidr=preview.new_cidr,
@@ -8152,6 +8178,7 @@ async def resize_subnet_commit(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    await _require_resize_parent_write(db, current_user, subnet.block_id)
 
     old_snapshot = {
         "network": str(subnet.network),
@@ -8216,12 +8243,15 @@ async def resize_block_preview(
     db: DB,
 ) -> BlockResizePreviewResponse:
     _require_type_write(current_user, "ip_block")
-    from app.services.ipam.resize import preview_block_resize
+    from app.services.ipam.resize import ResizeConflict, preview_block_resize
 
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
     preview = await preview_block_resize(db, block, body.new_cidr)
+    refusal = await _resize_parent_refusal(db, current_user, block.parent_block_id)
+    if refusal is not None:
+        preview.conflicts.insert(0, ResizeConflict(type="permission", detail=refusal))
     return BlockResizePreviewResponse(
         old_cidr=preview.old_cidr,
         new_cidr=preview.new_cidr,
@@ -8255,6 +8285,8 @@ async def resize_block_commit(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+
+    await _require_resize_parent_write(db, current_user, block.parent_block_id)
 
     old_snapshot = {"network": str(block.network)}
 
