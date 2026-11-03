@@ -256,6 +256,7 @@ export function CertificatesTab() {
       {csrViewing && (
         <ViewCsrModal
           cert={csrViewing}
+          pasteGate={writeGate}
           onClose={() => setCsrViewing(null)}
           onPasteCertNow={() => {
             const target = csrViewing;
@@ -867,10 +868,14 @@ function GenerateCsrModal({
 
 function ViewCsrModal({
   cert,
+  pasteGate,
   onClose,
   onPasteCertNow,
 }: {
   cert: ApplianceCertificate;
+  // #3393 — the same gate as the row's "Paste signed cert": the dialog
+  // itself is a read, the form it opens is a write.
+  pasteGate: { disabled?: boolean; title?: string };
   onClose: () => void;
   onPasteCertNow: () => void;
 }) {
@@ -936,7 +941,8 @@ function ViewCsrModal({
           <button
             type="button"
             onClick={onPasteCertNow}
-            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            {...pasteGate}
+            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Upload className="h-3 w-3" />
             Have the signed cert? Paste it now

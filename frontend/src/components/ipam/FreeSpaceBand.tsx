@@ -35,11 +35,15 @@ export function FreeSpaceBand({
   directSubnets,
   childBlocks,
   onSelectFree,
+  createDisabledReason,
 }: {
   block: IPBlock;
   directSubnets: Subnet[];
   childBlocks: IPBlock[];
   onSelectFree: (range: FreeCidrRange) => void;
+  /** Set when the caller may not create a subnet (#3391): a free segment is
+   *  then disabled and this is its tooltip. */
+  createDisabledReason?: string;
 }) {
   const {
     data: freeRanges = [],
@@ -151,7 +155,11 @@ export function FreeSpaceBand({
                 if (fr) onSelectFree(fr);
               }
             }}
-            title={seg.label}
+            title={
+              seg.kind === "free" && createDisabledReason
+                ? createDisabledReason
+                : seg.label
+            }
             style={{
               left: `${seg.start * 100}%`,
               width: `${Math.max(seg.width * 100, 0.25)}%`,
@@ -166,7 +174,7 @@ export function FreeSpaceBand({
                 "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.5)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.6)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.500/.6)_0_4px,transparent_4px_8px)] dark:hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
             )}
             aria-label={seg.label}
-            disabled={seg.kind !== "free"}
+            disabled={seg.kind !== "free" || !!createDisabledReason}
           >
             {(seg.kind === "block" || seg.kind === "subnet") && (
               <span
