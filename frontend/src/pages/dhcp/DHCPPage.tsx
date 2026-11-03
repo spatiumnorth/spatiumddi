@@ -3691,13 +3691,31 @@ export function DHCPPage() {
     return freshServer ?? selection.server;
   }, [selection, freshServer]);
   // #3369 — the selection holds the group as it was when clicked; draw the
-  // panel from the refreshed list so a saved edit shows at once.
+  // panel from the refreshed list so a saved edit shows at once. On a
+  // server's page the group is the one the server is in NOW, so moving it
+  // with Edit DHCP Server moves the page's "Group:" line with it.
   const liveGroup = useMemo(() => {
-    if (!selection || !selection.group) return null;
+    if (!selection) return null;
+    if (selection.type === "server" && effectiveServer) {
+      const gid = effectiveServer.server_group_id;
+      if (!gid) return null;
+      return (
+        allGroups?.find((g) => g.id === gid) ??
+        (selection.group?.id === gid ? selection.group : null)
+      );
+    }
+    if (!selection.group) return null;
     return (
       allGroups?.find((g) => g.id === selection.group!.id) ?? selection.group
     );
-  }, [selection, allGroups]);
+  }, [selection, allGroups, effectiveServer]);
+  // The read-only server inspector opened from a group's server list is a
+  // click-time snapshot too: its Pause / Resume refreshes the server lists,
+  // so draw it from the refreshed list or the button never flips.
+  const liveModalServer = useMemo(() => {
+    if (!modalServer) return null;
+    return allServers?.find((s) => s.id === modalServer.id) ?? modalServer;
+  }, [modalServer, allServers]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -3795,9 +3813,9 @@ export function DHCPPage() {
           }
         />
       )}
-      {modalServer && (
+      {liveModalServer && (
         <ServerDetailModal
-          server={modalServer}
+          server={liveModalServer}
           onClose={() => setModalServer(null)}
         />
       )}

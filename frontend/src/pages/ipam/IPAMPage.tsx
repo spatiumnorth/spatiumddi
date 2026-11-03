@@ -17480,6 +17480,17 @@ export function IPAMPage() {
     }
   }, [detailSubnets, selectedSubnet]);
 
+  // The block selection follows the refetched list as well (#3369): the
+  // breadcrumb's ancestors are computed from it, so a block moved or edited
+  // from the tree kept its old parent chain until clicked again.
+  useEffect(() => {
+    if (!selectedBlock || !detailBlocks) return;
+    const fresh = detailBlocks.find((b) => b.id === selectedBlock.id);
+    if (fresh && JSON.stringify(fresh) !== JSON.stringify(selectedBlock)) {
+      setSelectedBlock(fresh);
+    }
+  }, [detailBlocks, selectedBlock]);
+
   // The space panel's snapshot follows the refetched list too (#3075), as the
   // subnet's does (#509): an Edit IP Space Save refreshed the list and left
   // the panel header on the old values.

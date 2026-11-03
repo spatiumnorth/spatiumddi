@@ -15,6 +15,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -66,18 +67,18 @@ vi.mock("@/hooks/useFeatureModules", () => ({
 }));
 
 const { DHCPPage } = await import("@/pages/dhcp/DHCPPage");
-const { BlockDetailView } = await import("@/pages/ipam/IPAMPage");
+const { BlockDetailView, IPAMPage } = await import("@/pages/ipam/IPAMPage");
 const { CreateServerModal } = await import("@/pages/dhcp/CreateServerModal");
 const { CreateServerGroupModal } =
   await import("@/pages/dhcp/CreateServerGroupModal");
 
-function mount(el: React.ReactElement, client?: QueryClient) {
+function mount(el: React.ReactElement, client?: QueryClient, url = "/") {
   const c =
     client ??
     new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrap = (e: React.ReactElement) => (
     <QueryClientProvider client={c}>
-      <MemoryRouter>{e}</MemoryRouter>
+      <MemoryRouter initialEntries={[url]}>{e}</MemoryRouter>
     </QueryClientProvider>
   );
   const r = render(wrap(el));
@@ -167,6 +168,80 @@ describe("#3369 panels follow the refreshed list", () => {
     await screen.findByText(/xp p2/);
     expect(screen.queryByText(/xp p1/)).toBeNull();
   });
+
+  it("the server page's group follows a move made with Edit DHCP Server", async () => {
+    const g2 = { ...grp("other"), id: "g2", name: "grp2" };
+    answers.dhcpApi = {
+      listGroups: ok([grp("xp g1"), g2]),
+      listServers: ok([srv("xp d1")]),
+      getServer: ok(srv("xp d1")),
+    };
+    const { c } = mount(<DHCPPage />, undefined, "/dhcp?server=s1");
+    await screen.findByText("Group: grp1");
+    act(() => {
+      c.setQueryData(["dhcp-server", "s1"], {
+        ...srv("xp d1"),
+        server_group_id: "g2",
+      });
+    });
+    await screen.findByText("Group: grp2");
+  });
+
+  it("the server inspector follows the refreshed list after Pause", async () => {
+    answers.dhcpApi = {
+      listGroups: ok([grp("xp g1")]),
+      listServers: ok([srv("xp d1")]),
+    };
+    const { c } = mount(<DHCPPage />, undefined, "/dhcp?group=g1");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View details of kea1" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByRole("button", { name: /Pause/ });
+    act(() => {
+      c.setQueryData(
+        ["dhcp-servers", "all"],
+        [{ ...srv("xp d1"), maintenance_mode: true }],
+      );
+    });
+    await within(dialog).findByRole("button", { name: /Resume/ });
+  });
+
+  it("the block breadcrumb follows a block moved under another", async () => {
+    const parent = {
+      id: "b0",
+      space_id: "sp1",
+      network: "10.0.0.0/8",
+      name: "parentblk",
+      description: "",
+      parent_block_id: null,
+      custom_fields: {},
+      tags: {},
+    };
+    const child = {
+      ...parent,
+      id: "b1",
+      network: "10.237.0.0/16",
+      name: "blk",
+    };
+    answers.ipamApi = {
+      listSpaces: ok([{ id: "sp1", name: "space1", custom_fields: {} }]),
+      listBlocks: ok([parent, child]),
+      listSubnets: ok([]),
+      getBlock: ok(child),
+      blockFreeSpace: ok([]),
+    };
+    const { c } = mount(<IPAMPage />, undefined, "/ipam?block=b1");
+    await screen.findAllByText(/10\.237\.0\.0\/16/);
+    expect(screen.queryByText("10.0.0.0/8 (parentblk)")).toBeNull();
+    act(() => {
+      c.setQueryData(
+        ["blocks", "sp1"],
+        [parent, { ...child, parent_block_id: "b0" }],
+      );
+    });
+    await screen.findByText("10.0.0.0/8 (parentblk)");
+  });
 });
 
 describe("#3366 / #3369 a Save writes its answer into the cached copies", () => {
@@ -180,6 +255,7 @@ describe("#3366 / #3369 a Save writes its answer into the cached copies", () => 
     });
     client.setQueryData(["dhcp-server", "s1"], srv("xp d1"));
     client.setQueryData(["dhcp-servers", "all"], [srv("xp d1")]);
+    client.setQueryData(["dhcp-servers", "g1"], [srv("xp d1")]);
     mount(
       <CreateServerModal server={srv("xp d1") as never} onClose={() => {}} />,
       client,
@@ -194,6 +270,13 @@ describe("#3366 / #3369 a Save writes its answer into the cached copies", () => 
     expect(
       (
         client.getQueryData(["dhcp-servers", "all"]) as {
+          description: string;
+        }[]
+      )[0].description,
+    ).toBe("xp d2");
+    expect(
+      (
+        client.getQueryData(["dhcp-servers", "g1"]) as {
           description: string;
         }[]
       )[0].description,
