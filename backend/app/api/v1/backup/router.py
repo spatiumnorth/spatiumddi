@@ -36,6 +36,7 @@ from app.config import settings
 from app.core.content_disposition import content_disposition
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
+from app.services.api_token_scopes import token_write
 from app.services.backup import (
     BackupArchiveError,
     BackupCryptoError,
@@ -516,6 +517,9 @@ async def restore_backup(
 
 
 @router.post("/manifest-preview")
+@token_write(
+    "Parses manifest.json from an uploaded platform backup, no write and no outbound call; kept write-scoped because it takes a whole archive and is a step of the SuperAdmin-only restore flow"
+)
 async def preview_archive_manifest(
     current_user: SuperAdmin,
     archive: UploadFile = File(...),

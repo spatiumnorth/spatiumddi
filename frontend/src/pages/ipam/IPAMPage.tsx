@@ -4168,7 +4168,11 @@ export function AddAddressModal({
           values={shownCustomFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         {pendingWarnings && (
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
@@ -8366,7 +8370,9 @@ function EditSubnetModalForm({
           ? !autoAddresses // True = remove, False = add
           : undefined;
       const body = {
-        name: name || undefined,
+        // ``""`` when cleared: ``|| undefined`` was dropped by JSON.stringify,
+        // so the clear answered 200 and the old name stayed (#3370).
+        name,
         description,
         // Explicit null so the operator can clear the gateway (nullable
         // column); ``|| undefined`` was silently dropped (#502).
@@ -8422,7 +8428,7 @@ function EditSubnetModalForm({
       const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
       const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
       const was: Record<string, unknown> = {
-        name: subnet.name || undefined,
+        name: subnet.name ?? "",
         description: subnet.description ?? "",
         gateway: subnet.gateway || null,
         vlan_ref_id: subnet.vlan_ref_id ?? null,
@@ -9453,9 +9459,14 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   });
   const delAliasMut = useMutation({
     mutationFn: (rid: string) => ipamApi.deleteAlias(address.id, rid),
+    // A new attempt clears the previous refusal; a success leaves none.
+    onMutate: () => setError(null),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
+    },
+    onError: (e: unknown) => {
+      setError(formatDialogError(e, "Failed to delete alias"));
     },
   });
 
@@ -10017,7 +10028,11 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         {pendingWarnings && (
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
@@ -10317,7 +10332,7 @@ function NatMappingsForIpModal({
   );
 }
 
-function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
+export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
   const qc = useQueryClient();
   const { data: aliases = [], isLoading } = useQuery({
     queryKey: ["subnet-aliases", subnetId],
@@ -10421,8 +10436,18 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
               id: confirmDel.id,
             })
           }
-          onClose={() => setConfirmDel(null)}
+          onClose={() => {
+            // A refusal belongs to the attempt it answered; the next
+            // alias opened must not inherit it (#3346).
+            delAlias.reset();
+            setConfirmDel(null);
+          }}
           isPending={delAlias.isPending}
+          error={
+            delAlias.isError
+              ? formatDialogError(delAlias.error, "Failed to delete alias")
+              : undefined
+          }
         />
       )}
     </div>
@@ -10449,7 +10474,7 @@ function addressSetRangeLabel(s: AddressSet): string {
   return "—";
 }
 
-function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
+export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   const qc = useQueryClient();
   const perms = usePermissions();
   const { data: sets = [], isLoading } = useQuery({
@@ -10614,14 +10639,28 @@ function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
         confirmLabel="Delete"
         loading={delSet.isPending}
         message={
-          confirmDel
-            ? `Delete address set "${confirmDel.name}"? Any permissions ` +
-              `granted on this set will no longer match. The IP addresses ` +
-              `themselves are not removed.`
-            : ""
+          <>
+            {confirmDel
+              ? `Delete address set "${confirmDel.name}"? Any permissions ` +
+                `granted on this set will no longer match. The IP addresses ` +
+                `themselves are not removed.`
+              : ""}
+            {delSet.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatDialogError(
+                  delSet.error,
+                  "Failed to delete address set",
+                )}
+              </p>
+            )}
+          </>
         }
         onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
-        onClose={() => setConfirmDel(null)}
+        onClose={() => {
+          // Drop the last refusal so the next set opened starts clean.
+          delSet.reset();
+          setConfirmDel(null);
+        }}
       />
     </div>
   );
@@ -11431,7 +11470,11 @@ export function BulkEditAddressesModal({
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -11577,7 +11620,11 @@ export function BulkDeleteAddressesModal({
         <p className="text-[11px] text-muted-foreground">
           System rows (network, broadcast) are always skipped.
         </p>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -11731,6 +11778,7 @@ function ConfirmDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   title: string;
   message: string;
@@ -11738,11 +11786,17 @@ function ConfirmDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending?: boolean;
+  error?: string;
 }) {
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
         <p className="break-words text-sm text-muted-foreground">{message}</p>
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -13190,7 +13244,8 @@ function EditBlockModalForm({
   const mutation = useMutation({
     mutationFn: async () => {
       const now = {
-        name: name || undefined,
+        // ``""`` when cleared, as for a subnet (#3370).
+        name,
         description,
         custom_fields: customFields,
         dns_inherit_settings: dnsInherit,
@@ -13211,7 +13266,7 @@ function EditBlockModalForm({
       // inherited DNS / DHCP fields go out as null, so they are compared as
       // null whatever the stored row holds under an inheriting block.
       const was = {
-        name: block.name || undefined,
+        name: block.name ?? "",
         description: block.description ?? "",
         custom_fields: block.custom_fields ?? {},
         dns_inherit_settings: block.dns_inherit_settings ?? true,

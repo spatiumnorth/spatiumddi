@@ -26,6 +26,7 @@ from app.api.deps import DB, SuperAdmin
 from app.config import settings
 from app.core.demo_mode import forbid_in_demo_mode
 from app.models.backup import BackupTarget
+from app.services.api_token_scopes import token_write
 from app.services.factory_reset import (
     FACTORY_SECTIONS,
     FACTORY_SECTIONS_BY_KEY,
@@ -121,6 +122,9 @@ async def list_sections(current_user: SuperAdmin) -> FactorySectionCatalog:
 
 
 @router.post("/preview", response_model=PreviewResponse)
+@token_write(
+    "Read-only dry run of a factory reset, but SuperAdmin-only and a step of a destructive flow"
+)
 async def preview(body: PreviewRequest, db: DB, current_user: SuperAdmin) -> PreviewResponse:
     """Read-only dry-run. Returns the row counts that would be
     deleted plus diagnostic flags (backup warning, cooldown).

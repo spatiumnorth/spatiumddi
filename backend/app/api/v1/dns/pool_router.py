@@ -31,6 +31,7 @@ from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
+from app.services.api_token_scopes import token_write
 from app.services.dns import technitium_api_scope
 from app.services.dns.pool_apply import apply_pool_state, withdraw_member_records
 from app.services.dns.pool_health_staleness import (
@@ -545,6 +546,7 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
 
 
 @router.post("/pools/{pool_id}/check-now", response_model=PoolResponse)
+@token_write("Writes the pool's next_check_at to queue a health check, and an audit row")
 async def check_pool_now(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> PoolResponse:
     """Force ``next_check_at`` to ``now`` so the next dispatcher tick fires.
 
