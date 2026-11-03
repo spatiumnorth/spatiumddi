@@ -389,10 +389,15 @@ async def replace_scope_attachments(
 
     await _validate_scope_ids(db, prof.group_id, body.scope_ids)
 
+    # #3367 — an untouched Save re-sends the same list. Nothing to rewrite,
+    # audit or wake agents for.
+    if set(await _scope_ids_for(db, profile_id)) == set(body.scope_ids):
+        return await _to_response(db, prof)
+
     await db.execute(
         delete(DHCPPhoneProfileScope).where(DHCPPhoneProfileScope.profile_id == profile_id)
     )
-    for sid in body.scope_ids:
+    for sid in dict.fromkeys(body.scope_ids):
         db.add(DHCPPhoneProfileScope(profile_id=profile_id, scope_id=sid))
 
     write_audit(

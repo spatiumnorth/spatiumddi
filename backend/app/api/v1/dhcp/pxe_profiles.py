@@ -175,21 +175,92 @@ def _to_response(p: DHCPPXEProfile) -> PXEProfileResponse:
     )
 
 
-def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> None:
-    """Drop existing matches and re-create from input. Cascade delete
-    on the relationship handles the orphan rows."""
-    p.matches.clear()
+def _match_key(
+    priority: int,
+    match_kind: str,
+    vendor_class_match: str | None,
+    arch_codes: list[int] | None,
+    boot_filename: str,
+    boot_file_url_v6: str | None,
+) -> tuple[Any, ...]:
+    return (
+        priority,
+        match_kind,
+        vendor_class_match,
+        None if arch_codes is None else tuple(arch_codes),
+        boot_filename,
+        boot_file_url_v6,
+    )
+
+
+def _row_key(m: DHCPPXEArchMatch) -> tuple[Any, ...]:
+    return _match_key(
+        m.priority,
+        m.match_kind,
+        m.vendor_class_match,
+        m.arch_codes,
+        m.boot_filename,
+        m.boot_file_url_v6,
+    )
+
+
+def _input_key(r: ArchMatchInput) -> tuple[Any, ...]:
+    return _match_key(
+        r.priority,
+        r.match_kind,
+        r.vendor_class_match,
+        r.arch_codes,
+        r.boot_filename,
+        r.boot_file_url_v6,
+    )
+
+
+def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
+    """Reconcile the stored matches with the input; return True when anything
+    differed (#3367).
+
+    Rows whose content is already stored are kept as they are, ids included.
+    The Kea class name embeds the match id, so re-creating an identical row
+    renamed its class, shifted the bundle ETag and pushed a config to every
+    agent for a Save that changed nothing. Leftover rows are updated in place
+    pairwise; only a real surplus is deleted or created.
+    """
+    existing = sorted(p.matches, key=lambda x: (x.priority, str(x.id)))
+    unmatched_rows: list[ArchMatchInput] = []
+    free: list[DHCPPXEArchMatch] = list(existing)
     for r in rows:
-        p.matches.append(
-            DHCPPXEArchMatch(
-                priority=r.priority,
-                match_kind=r.match_kind,
-                vendor_class_match=r.vendor_class_match,
-                arch_codes=r.arch_codes,
-                boot_filename=r.boot_filename,
-                boot_file_url_v6=r.boot_file_url_v6,
+        k = _input_key(r)
+        for m in free:
+            if _row_key(m) == k:
+                free.remove(m)
+                break
+        else:
+            unmatched_rows.append(r)
+    if not unmatched_rows and not free:
+        return False
+    for r in unmatched_rows:
+        if free:
+            m = free.pop(0)
+            m.priority = r.priority
+            m.match_kind = r.match_kind
+            m.vendor_class_match = r.vendor_class_match
+            m.arch_codes = r.arch_codes
+            m.boot_filename = r.boot_filename
+            m.boot_file_url_v6 = r.boot_file_url_v6
+        else:
+            p.matches.append(
+                DHCPPXEArchMatch(
+                    priority=r.priority,
+                    match_kind=r.match_kind,
+                    vendor_class_match=r.vendor_class_match,
+                    arch_codes=r.arch_codes,
+                    boot_filename=r.boot_filename,
+                    boot_file_url_v6=r.boot_file_url_v6,
+                )
             )
-        )
+    for m in free:
+        p.matches.remove(m)
+    return True
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
@@ -334,8 +405,9 @@ async def update_profile(
     for k, v in payload.items():
         setattr(prof, k, v)
 
+    matches_changed = False
     if matches_input is not None:
-        _replace_matches(prof, matches_input)
+        matches_changed = _replace_matches(prof, matches_input)
 
     write_audit(
         db,
@@ -344,8 +416,7 @@ async def update_profile(
         resource_type="dhcp_pxe_profile",
         resource_id=str(prof.id),
         resource_display=prof.name,
-        changed_fields=changed_keys(before, payload)
-        + (["matches"] if matches_input is not None else []),
+        changed_fields=changed_keys(before, payload) + (["matches"] if matches_changed else []),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     collect_wake(dhcp_group_channel(prof.group_id))
