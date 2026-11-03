@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="660" viewBox="0 0 920 660"
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="720" viewBox="0 0 920 720"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <defs>
@@ -29,85 +29,90 @@
     </marker>
   </defs>
 
+  <!-- Not-supported banner -->
+  <rect x="60" y="10" width="800" height="40" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text x="460" y="27" text-anchor="middle" font-size="13" font-weight="700" fill="#92400e">Patroni is not supported in 1.0 (#1236)</text>
+  <text x="460" y="43" text-anchor="middle" font-size="11" fill="#92400e">The Compose Patroni overlay does not work. Supported HA: CloudNativePG on Kubernetes, or the OS appliance (Topology 7).</text>
+
   <!-- Operators -->
-  <rect x="354" y="20" width="212" height="42" rx="21" fill="#1e293b"/>
-  <text x="460" y="46" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">operators / API consumers</text>
+  <rect x="354" y="80" width="212" height="42" rx="21" fill="#1e293b"/>
+  <text x="460" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">operators / API consumers</text>
 
   <!-- LB -->
-  <rect x="320" y="92" width="280" height="50" rx="8" fill="url(#t4-lb)"/>
-  <text x="460" y="116" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">nginx / haproxy</text>
-  <text x="460" y="132" text-anchor="middle" font-size="10" fill="#dbeafe">TLS termination · sticky LB for SSE</text>
-  <line x1="460" y1="62" x2="460" y2="92" stroke="#475569" stroke-width="2"
+  <rect x="320" y="152" width="280" height="50" rx="8" fill="url(#t4-lb)"/>
+  <text x="460" y="176" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">nginx / haproxy</text>
+  <text x="460" y="192" text-anchor="middle" font-size="10" fill="#dbeafe">TLS termination · sticky LB for SSE</text>
+  <line x1="460" y1="122" x2="460" y2="152" stroke="#475569" stroke-width="2"
         marker-end="url(#t4-arrow)"/>
 
   <!-- API hosts -->
   <g>
-    <rect x="100" y="180" width="240" height="100" rx="10"
+    <rect x="100" y="240" width="240" height="100" rx="10"
           fill="url(#t4-host)" stroke="#94a3b8" stroke-width="2"/>
-    <text x="220" y="206" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">vm-api-01</text>
-    <rect x="120" y="218" width="90" height="48" rx="6" fill="url(#t4-cp)"/>
-    <text x="165" y="248" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">api · frontend</text>
-    <rect x="220" y="218" width="100" height="48" rx="6" fill="url(#t4-cp)"/>
-    <text x="270" y="248" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">worker</text>
+    <text x="220" y="266" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">vm-api-01</text>
+    <rect x="120" y="278" width="90" height="48" rx="6" fill="url(#t4-cp)"/>
+    <text x="165" y="308" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">api · frontend</text>
+    <rect x="220" y="278" width="100" height="48" rx="6" fill="url(#t4-cp)"/>
+    <text x="270" y="308" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">worker</text>
   </g>
   <g>
-    <rect x="580" y="180" width="240" height="100" rx="10"
+    <rect x="580" y="240" width="240" height="100" rx="10"
           fill="url(#t4-host)" stroke="#94a3b8" stroke-width="2"/>
-    <text x="700" y="206" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">vm-api-02</text>
-    <rect x="600" y="218" width="90" height="48" rx="6" fill="url(#t4-cp)"/>
-    <text x="645" y="248" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">api · frontend</text>
-    <rect x="700" y="218" width="100" height="48" rx="6" fill="url(#t4-cp)"/>
-    <text x="750" y="248" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">worker</text>
+    <text x="700" y="266" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">vm-api-02</text>
+    <rect x="600" y="278" width="90" height="48" rx="6" fill="url(#t4-cp)"/>
+    <text x="645" y="308" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">api · frontend</text>
+    <rect x="700" y="278" width="100" height="48" rx="6" fill="url(#t4-cp)"/>
+    <text x="750" y="308" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">worker</text>
   </g>
 
   <!-- Beat singleton -->
-  <rect x="354" y="200" width="212" height="60" rx="8" fill="url(#t4-cp)"/>
-  <text x="460" y="226" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">vm-beat (single)</text>
-  <text x="460" y="246" text-anchor="middle" font-size="10" fill="#ddd6fe">celery beat — not horizontally scalable</text>
+  <rect x="354" y="260" width="212" height="60" rx="8" fill="url(#t4-cp)"/>
+  <text x="460" y="286" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">vm-beat (single)</text>
+  <text x="460" y="306" text-anchor="middle" font-size="10" fill="#ddd6fe">celery beat — not horizontally scalable</text>
 
-  <line x1="340" y1="142" x2="220" y2="180" stroke="#475569" stroke-width="2"
+  <line x1="340" y1="202" x2="220" y2="240" stroke="#475569" stroke-width="2"
         marker-end="url(#t4-arrow)"/>
-  <line x1="580" y1="142" x2="700" y2="180" stroke="#475569" stroke-width="2"
+  <line x1="580" y1="202" x2="700" y2="240" stroke="#475569" stroke-width="2"
         marker-end="url(#t4-arrow)"/>
 
   <!-- Redis Sentinel cluster -->
   <g>
-    <rect x="60" y="320" width="800" height="100" rx="12"
+    <rect x="60" y="380" width="800" height="100" rx="12"
           fill="url(#t4-host)" stroke="#94a3b8" stroke-width="2"/>
-    <text x="80" y="346" font-size="13" font-weight="600" fill="#0f172a">Redis Sentinel — 3 nodes</text>
-    <rect x="180" y="358" width="180" height="48" rx="6" fill="url(#t4-cache)"/>
-    <text x="270" y="380" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-redis-01</text>
-    <text x="270" y="396" text-anchor="middle" font-size="10" fill="#cffafe">master</text>
-    <rect x="370" y="358" width="180" height="48" rx="6" fill="url(#t4-cache)"/>
-    <text x="460" y="380" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-redis-02</text>
-    <text x="460" y="396" text-anchor="middle" font-size="10" fill="#cffafe">replica + sentinel</text>
-    <rect x="560" y="358" width="180" height="48" rx="6" fill="url(#t4-cache)"/>
-    <text x="650" y="380" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-redis-03</text>
-    <text x="650" y="396" text-anchor="middle" font-size="10" fill="#cffafe">replica + sentinel</text>
+    <text x="80" y="406" font-size="13" font-weight="600" fill="#0f172a">Redis Sentinel — 3 nodes</text>
+    <rect x="180" y="418" width="180" height="48" rx="6" fill="url(#t4-cache)"/>
+    <text x="270" y="440" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-redis-01</text>
+    <text x="270" y="456" text-anchor="middle" font-size="10" fill="#cffafe">master + sentinel</text>
+    <rect x="370" y="418" width="180" height="48" rx="6" fill="url(#t4-cache)"/>
+    <text x="460" y="440" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-redis-02</text>
+    <text x="460" y="456" text-anchor="middle" font-size="10" fill="#cffafe">replica + sentinel</text>
+    <rect x="560" y="418" width="180" height="48" rx="6" fill="url(#t4-cache)"/>
+    <text x="650" y="440" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-redis-03</text>
+    <text x="650" y="456" text-anchor="middle" font-size="10" fill="#cffafe">replica + sentinel</text>
   </g>
 
   <!-- Patroni cluster -->
   <g>
-    <rect x="60" y="450" width="800" height="160" rx="12"
+    <rect x="60" y="510" width="800" height="160" rx="12"
           fill="url(#t4-host)" stroke="#94a3b8" stroke-width="2"/>
-    <text x="80" y="476" font-size="13" font-weight="600" fill="#0f172a">Patroni cluster — 3 nodes (CloudNativePG on K8s)</text>
+    <text x="80" y="536" font-size="13" font-weight="600" fill="#0f172a">PostgreSQL HA design — Patroni, 3 nodes (CloudNativePG is the supported path)</text>
 
-    <rect x="180" y="488" width="180" height="56" rx="6" fill="url(#t4-store)"/>
-    <text x="270" y="510" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-pg-01</text>
-    <text x="270" y="528" text-anchor="middle" font-size="10" fill="#bbf7d0">primary</text>
+    <rect x="180" y="548" width="180" height="56" rx="6" fill="url(#t4-store)"/>
+    <text x="270" y="570" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-pg-01</text>
+    <text x="270" y="588" text-anchor="middle" font-size="10" fill="#bbf7d0">primary + etcd</text>
 
-    <rect x="370" y="488" width="180" height="56" rx="6" fill="url(#t4-store)"/>
-    <text x="460" y="510" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-pg-02</text>
-    <text x="460" y="528" text-anchor="middle" font-size="10" fill="#bbf7d0">replica + etcd</text>
+    <rect x="370" y="548" width="180" height="56" rx="6" fill="url(#t4-store)"/>
+    <text x="460" y="570" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-pg-02</text>
+    <text x="460" y="588" text-anchor="middle" font-size="10" fill="#bbf7d0">replica + etcd</text>
 
-    <rect x="560" y="488" width="180" height="56" rx="6" fill="url(#t4-store)"/>
-    <text x="650" y="510" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-pg-03</text>
-    <text x="650" y="528" text-anchor="middle" font-size="10" fill="#bbf7d0">replica + etcd</text>
+    <rect x="560" y="548" width="180" height="56" rx="6" fill="url(#t4-store)"/>
+    <text x="650" y="570" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">vm-pg-03</text>
+    <text x="650" y="588" text-anchor="middle" font-size="10" fill="#bbf7d0">replica + etcd</text>
 
-    <text x="460" y="568" text-anchor="middle" font-size="11" fill="#475569">
+    <text x="460" y="628" text-anchor="middle" font-size="11" fill="#475569">
       HAProxy in front: primary on :5432  ·  replica on :5433
     </text>
-    <text x="460" y="586" text-anchor="middle" font-size="10" fill="#64748b" font-style="italic">
+    <text x="460" y="646" text-anchor="middle" font-size="10" fill="#64748b" font-style="italic">
       restore lands on :5432 (the primary)
     </text>
   </g>

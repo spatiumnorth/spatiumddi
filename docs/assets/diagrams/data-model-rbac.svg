@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>Auth and RBAC — the permission chain</title>
-  <desc>User links to Group through the user_group association table and Group links to Role through group_role; a Role carries its permissions as a JSONB list of action, resource_type and optional resource_id.</desc>
+  <desc>User links to Group through the user_group association table and Group links to Role through group_role; a Role carries its permissions as a JSONB list of action, resource_type and optional resource_id. A time_bound_grant adds expiring permissions to a Group on top of its roles.</desc>
   <defs>
     <linearGradient id="dmr-user" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#8b5cf6"/>
@@ -92,6 +92,16 @@
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{ action, resource_type, resource_id? }</text>
   <text x="438" y="382" font-size="11" fill="#475569">wildcard * is accepted for action and resource_type</text>
   <text x="438" y="400" font-size="11" fill="#475569">resource_id scopes a permission to a single resource</text>
+
+  <!-- time_bound_grant (additive) -->
+  <rect x="40" y="300" width="300" height="84" rx="12"
+        fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="60" y="328" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">time_bound_grant</text>
+  <text x="60" y="350" font-size="11" fill="#475569">adds an action / resource_type / resource_id</text>
+  <text x="60" y="366" font-size="11" fill="#475569">permission to a group until expires_at</text>
+  <path d="M 190 300 V 266 H 460 V 238" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4" fill="none"
+        marker-end="url(#dmr-arrow)"/>
 
   <!-- Legend -->
   <path d="M 40 438 H 62" stroke="#64748b" stroke-width="2" fill="none"

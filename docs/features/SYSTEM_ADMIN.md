@@ -81,44 +81,21 @@ superadmin-gated.
 
 ## 1. System Health Dashboard
 
-The main **Health Overview** page gives a single-pane-of-glass view of the entire platform.
-
-### Component Health Grid
-
-Each managed component shows a status card:
+The dashboard's **Platform Health** card reports whether the platform's own moving parts are up. It is fed by `GET /health/platform` and shows five cells, each a status dot (green ok, amber warn, red error) and a one-line detail:
 
 <p align="center">
-  <img src="../assets/diagrams/system-health-grid.svg" alt="System health — component status grid" width="900"/>
+  <img src="../assets/diagrams/system-health-grid.svg" alt="Platform Health strip — API, PostgreSQL, Redis, Workers and Beat" width="900"/>
 </p>
 
-### Per-Component Detail
+| Cell | What it checks | Detail shown |
+|---|---|---|
+| API | The request was served | `responding` |
+| PostgreSQL | A `SELECT 1` round trip | `SELECT 1 in N ms` |
+| Redis | A `PING` round trip | `ping in N ms` |
+| Workers | A Celery `inspect` ping | `N alive`, or `no workers responding` / `inspect timed out` |
+| Beat | The beat heartbeat key a worker refreshes each tick | `last tick Ns ago`, `(stalled)`, or clock skew |
 
-Clicking any component opens a detail panel:
-
-**Database:**
-- Primary/replica status
-- Replication lag (ms)
-- Active connections / max connections
-- Longest running query
-- WAL archive status
-- Last backup timestamp
-
-**DHCP/DNS Servers:**
-- Online/offline status per server
-- Last successful sync timestamp
-- Config version: IPAM DB version vs. pushed version
-- Query rate (DNS), lease count (DHCP)
-- Agent connectivity status
-
-**Celery Workers:**
-- Worker list with hostname, status, active tasks
-- Queue depths per queue
-- Failed task count in last hour
-
-**Redis:**
-- Sentinel / Cluster topology
-- Memory usage
-- Hit/miss ratio
+The card's headline reads `all good` when the rollup status is ok and `degraded` otherwise. Hovering a Workers cell lists the worker names for a signed-in user. A failing check reports a generic detail (`postgres error`, `redis error`) rather than the exception text. Replication lag, WAL archive state, queue depths and per-server DNS / DHCP status are not part of this card; DNS and DHCP server state is on their own pages and in the alert rules.
 
 ### Service Start / Stop / Restart (issue #890)
 

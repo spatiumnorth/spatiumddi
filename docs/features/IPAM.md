@@ -1126,7 +1126,7 @@ The left-side IPAM menu expands into a unified tree view. There are no separate 
   <img src="../assets/diagrams/ipam-tree-ui.svg" alt="Combined IPAM tree navigator" width="900"/>
 </p>
 
-Clicking a subnet opens its IP address list panel on the right. The IP address list is **collapsible** — useful for large subnets (e.g., WiFi /16) where listing every IP is slow. A toggle "Show IP list" defaults based on subnet size (auto-collapse if > 1000 IPs).
+Clicking a subnet opens its IP address list panel on the right. Unallocated ranges inside the subnet appear there as gap rows; for large subnets (larger than a /16) free ranges are hidden by default behind a "Hide free ranges" toggle.
 
 ### Subnet Column Customization
 
