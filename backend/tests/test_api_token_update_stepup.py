@@ -327,3 +327,24 @@ async def test_list_reports_owner_is_active(client: AsyncClient, db_session: Asy
     await db_session.commit()
     rows = {t["id"]: t for t in (await client.get("/api/v1/api-tokens", headers=headers)).json()}
     assert rows[str(tok.id)]["owner_is_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_single_token_responses_report_the_owner(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """GET and PATCH fill the owner fields the list does: None there would
+    read as "owner state unknown" to a client (#3431)."""
+    owner, _ = await _user(db_session, superadmin=False)
+    _admin, headers = await _user(db_session, superadmin=True)
+    tok = await _token(db_session, owner, active=True)
+    owner.is_active = False
+    await db_session.commit()
+    r = await client.get(f"/api/v1/api-tokens/{tok.id}", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["owner_is_active"] is False
+    assert r.json()["owner_username"] == owner.username
+    r = await client.patch(f"/api/v1/api-tokens/{tok.id}", headers=headers, json={"name": "n2"})
+    assert r.status_code == 200, r.text
+    assert r.json()["owner_is_active"] is False
+    assert r.json()["owner_username"] == owner.username
