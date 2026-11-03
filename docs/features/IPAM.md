@@ -43,7 +43,7 @@ Both IP blocks and subnets are displayed in a **tree view** in the UI, mirroring
 
 ### Tree Features
 - Expand/collapse nodes
-- Utilization color-coded bars (green < 70%, amber 70–90%, red > 90%)
+- Utilization color-coded bars and dots: amber from Settings' Warning Threshold (default 80%), red from its Critical Threshold (default 95%); the Subnets list and the Dashboard's capacity figures use the same two thresholds
 - Right-click context menu: Create child block, Create subnet, Edit, Delete
 - Drag nodes to reorganize (with validation — child must fit inside parent CIDR)
 - Free space visualization: show unallocated ranges within a block
@@ -1141,7 +1141,7 @@ The same column customization applies to IP address lists, DHCP scope lists, and
 ### Gateway Auto-Assignment
 
 When creating a subnet, the **first usable IP** (network address + 1) is automatically designated as the gateway (`status = reserved`, `description = "Gateway"`). This can be:
-- Changed to any other IP in the subnet
+- Changed to any other IP in the subnet. Editing the gateway (Edit Subnet, or the subnet import's `overwrite`) follows New Subnet's rules: the network and broadcast address are refused with a 422, the new address gets its own reserved `Gateway` row (so Next available never offers it) and its PTR, and the old default `Gateway` row is retired with its PTR — a renamed or otherwise operator-owned row is kept. An address that already holds a `reserved` row (the router recorded as a reservation) keeps that row; any other row there (a host, a DHCP lease, a discovered address) refuses the move with a 409 naming it, as Resize does. A subnet made without placeholder rows (`skip_auto_addresses`, /31, multicast) gets no gateway row, as on New Subnet (#3317, #3318)
 - Deleted if no gateway is needed (e.g., transit link)
 - Overridden during import
 

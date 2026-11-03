@@ -226,3 +226,32 @@ async def test_status_change_clears_reserved_until(db_session: AsyncSession) -> 
             assert resp.json()["reserved_until"] is None
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_sweep_recounts_subnet_and_block_utilization(db_session: AsyncSession) -> None:
+    """#3320: freeing a reservation lowers the subnet's and block's counters
+    in the same pass, not at the hourly recount."""
+    from app.api.v1.ipam.router import _update_blocks_utilization, _update_subnets_utilization
+
+    subnet = await _seed_subnet(db_session)
+    subnet_id, block_id = subnet.id, subnet.block_id
+    expired = datetime.now(UTC) - timedelta(minutes=10)
+    for host, until in (("10.60.1.20", expired), ("10.60.1.21", None)):
+        db_session.add(
+            IPAddress(subnet_id=subnet_id, address=host, status="reserved", reserved_until=until)
+        )
+    await db_session.flush()
+    await _update_subnets_utilization(db_session, [subnet_id])
+    await _update_blocks_utilization(db_session, [block_id])
+    await db_session.commit()
+    block_before = (await db_session.get(IPBlock, block_id)).allocated_ips
+    assert (await db_session.get(Subnet, subnet_id)).allocated_ips == 2
+
+    assert (await _sweep())["released"] == 1
+
+    db_session.expire_all()
+    sub = await db_session.get(Subnet, subnet_id)
+    blk = await db_session.get(IPBlock, block_id)
+    assert sub.allocated_ips == 1
+    assert blk.allocated_ips == block_before - 1

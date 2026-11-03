@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { ResponsiveContainer, Tooltip, Treemap } from "recharts";
@@ -54,7 +55,7 @@ export function FreeSpaceTreemap({
   directSubnets: Subnet[];
   childBlocks: IPBlock[];
 }) {
-  const { data: freeRanges = [] } = useQuery<FreeCidrRange[]>({
+  const { data: freeRanges = [], error } = useQuery<FreeCidrRange[]>({
     queryKey: [
       "block-free-space",
       block.id,
@@ -96,6 +97,14 @@ export function FreeSpaceTreemap({
     }
     return out.filter((c) => c.size > 0);
   }, [childBlocks, directSubnets, freeRanges]);
+
+  if (error != null) {
+    return (
+      <p className="flex h-32 items-center justify-center text-xs">
+        <ListReadError error={error} what="this block's allocation map" />
+      </p>
+    );
+  }
 
   if (cells.length === 0) {
     return (

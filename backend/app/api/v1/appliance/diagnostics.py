@@ -110,7 +110,10 @@ async def get_bundle(db: DB, user: CurrentUser):
     redacted config. Admin permission required because the bundle
     surfaces internal log content + env keys (values redacted but
     keys are visible)."""
-    blob = generate_diagnostic_bundle()
+    # Blocking self-test probes, a kube API read per pod and every host
+    # log file: off the event loop, like the self-test route above
+    # (non-negotiable #2, #3310).
+    blob = await asyncio.to_thread(generate_diagnostic_bundle)
     db.add(
         AuditLog(
             user_id=user.id,
