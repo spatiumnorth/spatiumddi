@@ -10827,22 +10827,22 @@ export const API_TOKEN_SCOPES: {
   {
     value: "read",
     label: "Read-only",
-    hint: "GET / HEAD / OPTIONS and read-only POSTs (previews, log queries). Never makes SpatiumDDI contact another host: probes, live pulls and off-prem lookups are refused.",
+    hint: "GET / HEAD / OPTIONS, read-only POSTs (previews, log queries) and MCP. Mutations are refused, and so is anything that makes SpatiumDDI contact another host: probes, live pulls and off-prem lookups.",
   },
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/* and other IPAM surfaces. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also creates reverse DNS zones and DNS records.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Moving a server between groups repoints its appliance and changes its DoT/DoH/DoQ firewall ports.",
   },
   {
     value: "dhcp:write",
     label: "DHCP write",
-    hint: "Mutate /dhcp/*. Excludes the agent surface.",
+    hint: "Mutate /dhcp/*. Excludes the agent surface. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also mirrors leases and statics into IPAM.",
   },
 ];
 
