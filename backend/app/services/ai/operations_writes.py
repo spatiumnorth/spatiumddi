@@ -1198,6 +1198,13 @@ class SetZoneUpdateAclArgs(BaseModel):
         default_factory=list,
         description="Full ordered ACL to set (replaces the existing one). Empty clears it.",
     )
+    expected_version: str | None = Field(
+        default=None,
+        description=(
+            "Leave unset. The proposal pins the ACL version current when it is "
+            "proposed, and Apply refuses if the ACL has changed since."
+        ),
+    )
 
 
 def _build_acl_replace(args: SetZoneUpdateAclArgs) -> Any:
@@ -1217,7 +1224,11 @@ def _build_acl_replace(args: SetZoneUpdateAclArgs) -> Any:
         entries = [UpdateAclEntryIn(**e.model_dump()) for e in args.entries]
     except ValidationError as exc:
         raise ValueError(f"invalid ACL entry: {exc}") from exc
-    return ZoneUpdateAclReplace(dynamic_update_enabled=args.dynamic_update_enabled, entries=entries)
+    return ZoneUpdateAclReplace(
+        dynamic_update_enabled=args.dynamic_update_enabled,
+        entries=entries,
+        expected_version=args.expected_version,
+    )
 
 
 async def _preview_set_zone_update_acl(
@@ -1259,6 +1270,21 @@ async def _preview_set_zone_update_acl(
         except ValueError as exc:
             return PreviewResult(ok=False, detail=f"{name}: {exc}")
 
+    # #3381 — pin the ACL this proposal was previewed against. The args are
+    # persisted after the preview, so Apply replaces only that ACL and refuses
+    # (as the REST PUT answers 409) if anyone changed it in between.
+    current = dns_router._acl_version(  # noqa: SLF001
+        zone.dynamic_update_enabled,
+        await dns_router._load_acl_out(db, zone.id),  # noqa: SLF001
+    )
+    if args.expected_version is None:
+        args.expected_version = current
+    elif args.expected_version != current:
+        return PreviewResult(
+            ok=False,
+            detail="The zone's dynamic-update ACL has changed since this was read.",
+        )
+
     flag = ""
     if args.dynamic_update_enabled is not None:
         flag = f", dynamic updates {'ON' if args.dynamic_update_enabled else 'OFF'}"
@@ -1290,11 +1316,22 @@ async def _apply_set_zone_update_acl(
     try:
         zone = await dns_router._require_zone(args.group_id, args.zone_id, db)  # noqa: SLF001
         dns_router._reject_if_synthesised_zone(zone, "edit")  # noqa: SLF001
+        # #3381 — serialised with every other ACL writer, and refused if the
+        # ACL moved since the proposal was previewed (its pinned version).
+        await dns_router._lock_acl_and_check_version(  # noqa: SLF001
+            db, zone, body.expected_version
+        )
         _driver_names, warnings = await dns_router._replace_update_acl_rows(  # noqa: SLF001
             db, args.group_id, zone, body
         )
     except HTTPException as exc:
-        raise ValueError(str(exc.detail)) from exc
+        detail = exc.detail
+        if isinstance(detail, dict) and detail.get("code") == "ACL_VERSION_CONFLICT":
+            raise ValueError(
+                "The zone's dynamic-update ACL has changed since this was proposed. "
+                "Propose it again against the current ACL."
+            ) from exc
+        raise ValueError(str(detail)) from exc
     write_audit(
         db,
         user=user,

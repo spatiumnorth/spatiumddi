@@ -37,22 +37,22 @@
   <g>
     <rect x="180" y="20" width="560" height="220" rx="14"
           fill="url(#t5-cloud)" stroke="#3b82f6" stroke-width="2"/>
-    <text x="200" y="48" font-size="14" font-weight="600" fill="#1e3a8a">☁  Cloud region (eu-west-1 / east-us / etc.)</text>
+    <text x="200" y="48" font-size="14" font-weight="600" fill="#1e3a8a">Cloud region (eu-west-1 / east-us / etc.)</text>
 
     <rect x="220" y="68" width="480" height="80" rx="10"
           fill="url(#t5-host)" stroke="#94a3b8" stroke-width="1.5"/>
     <text x="240" y="92" font-size="12" font-weight="600" fill="#0f172a">Spatium control plane</text>
-    <text x="240" y="108" font-size="10" fill="#475569">HA api + Patroni + Redis Sentinel (Topology 4 stack)</text>
+    <text x="240" y="108" font-size="10" fill="#475569">HA api · managed Postgres (RDS / Cloud SQL / Azure DB) · managed Redis</text>
     <rect x="240" y="115" width="80" height="22" rx="4" fill="url(#t5-cp)"/>
     <text x="280" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">api ×N</text>
     <rect x="328" y="115" width="80" height="22" rx="4" fill="url(#t5-cp)"/>
     <text x="368" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">worker</text>
     <rect x="416" y="115" width="80" height="22" rx="4" fill="#34d399"/>
-    <text x="456" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">postgres HA</text>
+    <text x="456" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">mgd PG</text>
     <rect x="504" y="115" width="76" height="22" rx="4" fill="#22d3ee"/>
-    <text x="542" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">redis HA</text>
+    <text x="542" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">mgd Redis</text>
     <rect x="588" y="115" width="86" height="22" rx="4" fill="#94a3b8"/>
-    <text x="631" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">backup S3</text>
+    <text x="631" y="131" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">backup</text>
 
     <rect x="280" y="172" width="360" height="44" rx="8" fill="url(#t5-lb)"/>
     <text x="460" y="195" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">Cloud LB — TLS</text>
@@ -72,7 +72,7 @@
   <g>
     <rect x="60" y="298" width="800" height="280" rx="14"
           fill="url(#t5-corp)" stroke="#d97706" stroke-width="2"/>
-    <text x="80" y="328" font-size="14" font-weight="600" fill="#92400e">🏢  Branch / on-prem corp network</text>
+    <text x="80" y="328" font-size="14" font-weight="600" fill="#92400e">Branch / on-prem corp network</text>
 
     <g>
       <rect x="100" y="354" width="200" height="120" rx="10"
@@ -83,12 +83,19 @@
       <text x="200" y="450" text-anchor="middle" font-size="10" fill="#475569">serves LAN clients :53</text>
     </g>
     <g>
-      <rect x="335" y="354" width="240" height="120" rx="10"
+      <rect x="335" y="354" width="112" height="120" rx="10"
             fill="url(#t5-host)" stroke="#94a3b8" stroke-width="1.5"/>
-      <text x="455" y="380" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">vm-dhcp-east (Kea HA)</text>
-      <rect x="355" y="394" width="200" height="36" rx="6" fill="url(#t5-agent)"/>
-      <text x="455" y="416" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">kea + dhcp-agent</text>
-      <text x="455" y="450" text-anchor="middle" font-size="10" fill="#475569">serves LAN clients :67</text>
+      <text x="391" y="380" text-anchor="middle" font-size="11" font-weight="600" fill="#0f172a">vm-dhcp-east-1</text>
+      <rect x="345" y="394" width="92" height="36" rx="6" fill="url(#t5-agent)"/>
+      <text x="391" y="416" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">kea + agent</text>
+      <text x="391" y="450" text-anchor="middle" font-size="10" fill="#475569">:67 · HA peer</text>
+      <rect x="463" y="354" width="112" height="120" rx="10"
+            fill="url(#t5-host)" stroke="#94a3b8" stroke-width="1.5"/>
+      <text x="519" y="380" text-anchor="middle" font-size="11" font-weight="600" fill="#0f172a">vm-dhcp-east-2</text>
+      <rect x="473" y="394" width="92" height="36" rx="6" fill="url(#t5-agent)"/>
+      <text x="519" y="416" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">kea + agent</text>
+      <text x="519" y="450" text-anchor="middle" font-size="10" fill="#475569">:67 · HA peer</text>
+      <path d="M 447 414 H 463" stroke="#ea580c" stroke-width="2.5"/>
     </g>
     <g>
       <rect x="610" y="354" width="200" height="120" rx="10"

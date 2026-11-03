@@ -48,11 +48,20 @@ infrastructure rather than application surface:
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |
 | `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
 
-`/api/v1` is the only API version. When the surface changes shape in a
-non-additive way a `/api/v2` prefix would be introduced alongside it;
-today there is exactly one version. New routers are inserted into
-`router.py` in **alphabetical order** so the generated docs list
-sections A → Z.
+`/api/v1` is the only API version, and from 1.0.0 it is stable. Within
+1.x it only grows: a release may add routes, optional parameters and
+response fields, but it does not remove any of them or change what an
+existing one means. Anything that is going away is marked deprecated,
+in the changelog's `Deprecated` section and as `deprecated` in the
+OpenAPI schema, at least one minor release before it can be removed,
+and the removal itself waits for the next major release. A surface
+that has to change shape in a non-additive way gets a `/api/v2` prefix,
+introduced alongside `/api/v1`. The one exception is a security fix,
+which may tighten what a route allows without notice; its changelog
+entry says so.
+
+New routers are inserted into `router.py` in **alphabetical order** so
+the generated docs list sections A → Z.
 
 ---
 
