@@ -5017,7 +5017,9 @@ export function ZoneDetailView({
                 : "border-transparent text-muted-foreground hover:text-foreground")
             }
           >
-            Records ({recordsTotal.toLocaleString()})
+            {/* No count until the records have loaded (#3385). */}
+            Records
+            {recordsPage !== undefined && ` (${recordsTotal.toLocaleString()})`}
           </button>
           <button
             type="button"
@@ -5176,12 +5178,15 @@ export function ZoneDetailView({
                 setRecordPage(1);
               }}
             />
-            <span className="text-xs text-muted-foreground">
-              {recordsTotal.toLocaleString()}{" "}
-              {recordsTotal === 1 ? "record" : "records"}
-              {hasRecFilter && " · page filtered"}
-              {isFetching && " · loading…"}
-            </span>
+            {/* A refused, failed or unanswered read has no count (#3385). */}
+            {recordsPage !== undefined && (
+              <span className="text-xs text-muted-foreground">
+                {recordsTotal.toLocaleString()}{" "}
+                {recordsTotal === 1 ? "record" : "records"}
+                {hasRecFilter && " · page filtered"}
+                {isFetching && " · loading…"}
+              </span>
+            )}
             <div className="ml-auto">
               <Pager
                 page={recordPage}
@@ -6068,7 +6073,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
     // Beat-scheduled dns-health-sweep task updates server rows.
     refetchInterval: 30_000,
   });
-  const { data: zones = [] } = useQuery({
+  // The serials line counts the group's zones, so it waits for that read: a
+  // refused or failed one draws no "no zones" (#3385).
+  const { data: zones } = useQuery({
     queryKey: ["dns-zones", group.id],
     queryFn: () => dnsApi.listZones(group.id),
   });
@@ -6137,7 +6144,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   </span>
                 ) : null,
             )}
-            <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
+            {zones !== undefined && (
+              <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
+            )}
           </div>
         </div>
       )}
@@ -9325,11 +9334,14 @@ function RecordsTab({
               setGroupRecordPage(1);
             }}
           />
-          <p className="text-xs text-muted-foreground">
-            {filtered.length.toLocaleString()} of{" "}
-            {recordsTotal.toLocaleString()}{" "}
-            {recordsTotal === 1 ? "record" : "records"}
-          </p>
+          {/* A refused, failed or unanswered read has no count (#3385). */}
+          {groupRecordsPage !== undefined && (
+            <p className="text-xs text-muted-foreground">
+              {filtered.length.toLocaleString()} of{" "}
+              {recordsTotal.toLocaleString()}{" "}
+              {recordsTotal === 1 ? "record" : "records"}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Pager
@@ -9624,7 +9636,7 @@ function ZonesTab({
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   const {
-    data: zones = [],
+    data: zonesData,
     isFetching,
     error: zonesError,
   } = useQuery({
@@ -9635,6 +9647,7 @@ function ZonesTab({
         tagFilters.length > 0 ? { tag: tagFilters } : undefined,
       ),
   });
+  const zones = zonesData ?? [];
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", group.id],
@@ -9886,10 +9899,16 @@ function ZonesTab({
     <div>
       <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-          {hasZoneFilter
-            ? `${filteredZones.length} / ${zones.length}`
-            : zones.length}{" "}
-          zone{zones.length !== 1 ? "s" : ""}
+          {/* The count is the length of the list below it, so a read that was
+              refused, failed or has not answered yet draws none (#3385). */}
+          {zonesData !== undefined && (
+            <>
+              {hasZoneFilter
+                ? `${filteredZones.length} / ${zones.length}`
+                : zones.length}{" "}
+              zone{zones.length !== 1 ? "s" : ""}
+            </>
+          )}
           {selected.size > 0 && (
             <span className="ml-2 text-primary normal-case tracking-normal">
               {selected.size} selected
@@ -10368,7 +10387,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
 
   const {
-    data: lists = [],
+    data: listsData,
     isFetching,
     error: listError,
   } = useQuery({
@@ -10380,6 +10399,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     // every pending row's last_synced_at has advanced past its baseline.
     refetchInterval: refreshing.size > 0 ? 3000 : false,
   });
+  const lists = listsData ?? [];
 
   // Clear the per-row pending flag as soon as the row's last_synced_at
   // advances past the value it had when the refresh was kicked off.
@@ -10604,7 +10624,12 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-          {lists.length} blocking list{lists.length !== 1 ? "s" : ""}
+          {/* A refused, failed or unanswered read has no count (#3385). */}
+          {listsData !== undefined && (
+            <>
+              {lists.length} blocking list{lists.length !== 1 ? "s" : ""}
+            </>
+          )}
         </span>
         <div className="flex items-center gap-2">
           <button
