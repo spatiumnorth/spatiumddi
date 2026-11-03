@@ -94,14 +94,19 @@ describe("diagnostic bundle download (#3394)", () => {
   it("is a button, fetched through the client, saved under the server's filename", async () => {
     setAdapter(
       respond({
-        "content-disposition": 'attachment; filename="diag-20261103.zip"',
+        // the shape app.core.content_disposition sends: both forms
+        "content-disposition":
+          'attachment; filename="spatium-diagnostic-20261103-101500.zip"; ' +
+          "filename*=UTF-8''spatium-diagnostic-20261103-101500.zip",
       }),
     );
     renderTab();
     const btn = await screen.findByRole("button", { name: /Download bundle/ });
     expect(document.querySelector('a[href*="/api/v1"]')).toBeNull();
     fireEvent.click(btn);
-    await vi.waitFor(() => expect(saved).toEqual(["diag-20261103.zip"]));
+    await vi.waitFor(() =>
+      expect(saved).toEqual(["spatium-diagnostic-20261103-101500.zip"]),
+    );
     expect(calls).toContain("get /appliance/diagnostics/bundle");
   });
 
@@ -110,7 +115,7 @@ describe("diagnostic bundle download (#3394)", () => {
     renderTab();
     fireEvent.click(await screen.findByRole("button", { name: /Download/ }));
     await vi.waitFor(() => expect(saved).toHaveLength(1));
-    expect(saved[0]).toMatch(/^appliance-diagnostic-bundle-\d{8}-\d{6}\.zip$/);
+    expect(saved[0]).toMatch(/^spatium-diagnostic-\d{8}-\d{6}\.zip$/);
   });
 
   it("shows a busy state while the bundle builds", async () => {

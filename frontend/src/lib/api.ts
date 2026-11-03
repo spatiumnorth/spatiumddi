@@ -14499,7 +14499,8 @@ export const applianceDiagnosticsApi = {
       .then((r) => r.data),
   // The API authenticates by the Authorization bearer only, so a plain
   // <a href> navigation 401s (#3394). Fetch through the client as a blob,
-  // decode a refusal, and take the filename from Content-Disposition.
+  // decode a refusal, and take the filename from Content-Disposition (the
+  // fallback matches the server's own `spatium-diagnostic-<UTC stamp>.zip`).
   downloadBundle: async (): Promise<{ blob: Blob; filename: string }> => {
     const res = await api
       .get("/appliance/diagnostics/bundle", { responseType: "blob" })
@@ -14513,7 +14514,7 @@ export const applianceDiagnosticsApi = {
       .replace("T", "-");
     return {
       blob: new Blob([res.data as BlobPart]),
-      filename: match ? match[1] : `appliance-diagnostic-bundle-${ts}.zip`,
+      filename: match ? match[1] : `spatium-diagnostic-${ts}.zip`,
     };
   },
 };
