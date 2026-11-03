@@ -2023,21 +2023,19 @@ export function DdnsSettingsSection({
   // tab changes), read with parseTtlInput: "1h" is refused, not sent as 1.
   const ttlParsed = parseTtlInput(ttlText);
   const ttlError = typeof ttlParsed === "string" ? ttlParsed : null;
-  // Preview: synthesise what ``dhcp-<tail>`` would look like for the
+  // Preview: synthesise what ``dhcp-<address>`` would look like for the
   // first host IP in this subnet. Mirrors the Python implementation in
-  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — keep in
-  // sync when policy generators change.
+  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — the whole
+  // address, hyphenated (#3364) — keep in sync when policy generators change.
   const preview = (() => {
     if (!subnetNetwork) return null;
     const match = subnetNetwork.match(/^([\d.]+)\/(\d+)$/);
     if (!match) return null;
     const octets = match[1].split(".").map((s) => parseInt(s, 10));
     if (octets.length !== 4 || octets.some((n) => isNaN(n))) return null;
-    const prefix = parseInt(match[2], 10);
-    if (prefix < 16) return null;
     // First usable: network + 1 for /30 and shorter, + 1 for /31 / /32
     octets[3] = (octets[3] + 1) & 0xff;
-    return `dhcp-${octets[2]}-${octets[3]}`;
+    return `dhcp-${octets.join("-")}`;
   })();
 
   // While inheriting, the controls show what the subnet resolves to (the
@@ -4558,6 +4556,11 @@ const NEEDS_ADDRESS_DELETE =
   "Requires delete permission on subnets, and write on this subnet or on an address set in it";
 const NEEDS_DNS_SYNC =
   "Requires read permission on subnets and IP addresses, and write permission on subnets";
+// A block's and a space's Sync DNS ask the same of their own type (#3334).
+const NEEDS_BLOCK_DNS_SYNC =
+  "Requires read permission on IP blocks and IP addresses, and write permission on IP blocks";
+const NEEDS_SPACE_DNS_SYNC =
+  "Requires read permission on IP spaces and IP addresses, and write permission on IP spaces";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
@@ -7519,7 +7522,9 @@ export function DnsSyncModal({
         const r = await backfillFn(scope.id);
         setBackfillResult(r);
       } catch (e) {
-        setBackfillError((e as Error).message || "Backfill failed");
+        // #3334: the server's reason, not axios's "Request failed with
+        // status code N"; the error's own message only when there is none.
+        setBackfillError(formatApiError(e, "Backfill failed"));
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
@@ -13987,6 +13992,14 @@ export function BlockDetailView({
   const canWriteBlocks = perms.can("write", "ip_block");
   const canEditBlock = perms.can("write", "ip_block", block.id);
   const canWriteSubnets = perms.can("write", "subnet");
+  // #3334: Sync DNS, gated as #2571 gates the subnet's. The drift preview
+  // reads the block and its addresses, and Apply's reverse-zone backfill and
+  // commit are write on IP blocks, all at the type level (a grant scoped to
+  // this one block reaches none of them).
+  const canDnsSync =
+    perms.can("read", "ip_block") &&
+    perms.can("read", "ip_address") &&
+    canWriteBlocks;
 
   const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
     string | null
@@ -14208,6 +14221,7 @@ export function BlockDetailView({
                     icon={Globe2}
                     onClick={() => setShowDnsSync(true)}
                     title="Reconcile IPAM-managed DNS records across every subnet under this block"
+                    {...permissionGate(canDnsSync, NEEDS_BLOCK_DNS_SYNC)}
                   >
                     Sync DNS
                   </HeaderButton>
@@ -15400,6 +15414,12 @@ export function SpaceTableView({
   const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
+  // #3334: Sync DNS, as on a block: read on IP spaces and IP addresses for
+  // the preview, write on IP spaces for Apply, all at the type level.
+  const canDnsSync =
+    perms.can("read", "ip_space") &&
+    perms.can("read", "ip_address") &&
+    canWriteSpaces;
   const {
     data: blocks,
     isLoading: blocksLoading,
@@ -15711,6 +15731,7 @@ export function SpaceTableView({
                 icon={Globe2}
                 onClick={() => setShowDnsSync(true)}
                 title="Reconcile IPAM-managed DNS records across every subnet in this space"
+                {...permissionGate(canDnsSync, NEEDS_SPACE_DNS_SYNC)}
               >
                 Sync DNS
               </HeaderButton>

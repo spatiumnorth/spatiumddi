@@ -9,7 +9,7 @@ scraping the live zone (§4.5). MACs come from a locally-administered OUI
 Note: the *leased IP* is assigned by Kea at runtime and is NOT predictable here — so
 the computable forward/PTR query set targets (a) per-device client-hostnames (when
 the subnet uses ``client_or_generated``) and (b) PTRs across the known pool ranges.
-The IP-derived ``dhcp-<3rd>-<4th>`` names (``always_generate``) are queried by the
+The IP-derived ``dhcp-<a>-<b>-<c>-<d>`` names (``always_generate``) are queried by the
 orchestrator's own per-device streams at runtime, which know the actual lease.
 """
 
@@ -55,9 +55,9 @@ def forward_fqdn(hostname: str, zone: str) -> str:
 
 
 def generated_forward_name(ip: str) -> str:
-    """The ``always_generate`` forward label for a leased IPv4 (ddns.py:162: dhcp-<3rd>-<4th>)."""
-    octets = ip.split(".")
-    return f"dhcp-{octets[2]}-{octets[3]}"
+    """The ``always_generate`` forward label for a leased IPv4: the whole address,
+    ``dhcp-<a>-<b>-<c>-<d>`` (ddns.py ``_generate_hostname``, #3364)."""
+    return "dhcp-" + ip.replace(".", "-")
 
 
 def ptr_qname(ip: str) -> str:

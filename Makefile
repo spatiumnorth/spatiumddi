@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -82,6 +82,7 @@ help:
 	@echo "  make docs-down   Stop the local documentation site"
 	@echo "  make docs-verify Check every docs SVG diagram for overflow / clipping"
 	@echo "  make versions-check     Assert every pin matches versions.json (part of make ci)"
+	@echo "  make docs-drift         Weekly docs-vs-code drift check (not part of make ci)"
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
 	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
 	@echo "  make image-upgrade-check   Refuse a shipped image that never upgrades its packages"
@@ -457,6 +458,16 @@ versions-check:
 
 versions-upstream:
 	@python3 scripts/lint_versions.py --check-upstream
+
+# Docs drift (#3414). Do the docs diagrams and pages still match the code:
+# version labels vs versions.json, shipped workloads vs architecture.svg,
+# identifiers vs backend/app/models, and file paths named in diagrams.
+# Deterministic, offline, stdlib-only. Deliberately NOT part of `make ci` or PR
+# CI: the weekly docs-drift-scheduled workflow runs it and files the findings,
+# because a stale diagram is a chore to fix, not a reason to block an unrelated PR.
+# Exit 1 = findings, 2 = the check could not run.
+docs-drift:
+	@python3 scripts/lint_docs_drift.py
 
 # Workflow shell-status guard (#1036). GitHub Actions runs every `run:` block
 # under `bash -e`, which `set -uo pipefail` does NOT clear — so `cmd; rc=$$?`

@@ -36,23 +36,23 @@
   <!-- K8s cluster outline -->
   <rect x="20" y="20" width="880" height="560" rx="14"
         fill="url(#t6-k8s)" stroke="#3b82f6" stroke-width="2"/>
-  <text x="40" y="50" font-size="15" font-weight="600" fill="#1e3a8a">⎈  Kubernetes cluster — 3+ nodes (separate node pools optional)</text>
+  <text x="40" y="50" font-size="15" font-weight="600" fill="#1e3a8a">Kubernetes cluster — 3+ nodes (separate node pools optional)</text>
 
   <!-- Web tier -->
   <g>
     <rect x="60" y="80" width="220" height="100" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
-    <text x="170" y="106" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">api Pod ×3</text>
+    <text x="170" y="106" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">api Pods ×N (HPA, min 2)</text>
     <rect x="80" y="118" width="180" height="36" rx="6" fill="url(#t6-pod)"/>
     <text x="170" y="141" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">Service (cluster-internal)</text>
-    <text x="170" y="170" text-anchor="middle" font-size="10" fill="#64748b">Stateless · ready for HPA</text>
+    <text x="170" y="170" text-anchor="middle" font-size="10" fill="#64748b">Stateless · HPA-scaled</text>
   </g>
 
   <g>
     <rect x="300" y="80" width="220" height="100" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
-    <text x="410" y="106" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">worker ×N (HPA-scaled)</text>
+    <text x="410" y="106" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">worker ×2 (fixed replicas)</text>
     <rect x="320" y="118" width="180" height="36" rx="6" fill="url(#t6-pod)"/>
     <text x="410" y="141" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">Celery</text>
-    <text x="410" y="170" text-anchor="middle" font-size="10" fill="#64748b">NET_RAW for passive DHCP fingerprint</text>
+    <text x="410" y="170" text-anchor="middle" font-size="10" fill="#64748b">NET_RAW for nmap SYN / OS scans</text>
   </g>
 
   <g>
@@ -67,7 +67,7 @@
     <rect x="720" y="80" width="160" height="100" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
     <text x="800" y="106" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">migrate Job</text>
     <rect x="740" y="118" width="120" height="36" rx="6" fill="#64748b"/>
-    <text x="800" y="141" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">pre-upgrade hook</text>
+    <text x="800" y="141" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">Job (init-gated)</text>
     <text x="800" y="170" text-anchor="middle" font-size="10" fill="#64748b">alembic upgrade head</text>
   </g>
 
@@ -86,7 +86,7 @@
 
   <g>
     <rect x="460" y="220" width="380" height="120" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
-    <text x="650" y="246" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">Bitnami Redis HA — sentinel</text>
+    <text x="650" y="246" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">Redis + Sentinel — in-chart StatefulSet</text>
     <rect x="480" y="260" width="100" height="58" rx="6" fill="url(#t6-cache)"/>
     <text x="530" y="282" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">master</text>
     <rect x="590" y="260" width="100" height="58" rx="6" fill="url(#t6-cache)"/>
