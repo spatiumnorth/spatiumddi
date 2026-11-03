@@ -42,6 +42,8 @@ lazy-import the router function at call time to dodge it.
 from __future__ import annotations
 
 import ipaddress
+import re
+import time
 from typing import Any
 
 import structlog
@@ -284,12 +286,21 @@ async def _name_holder(
     """The record at ``hostname`` in one of ``zone_ids`` this address does not
     own, or None (#3362).
 
-    A record is this address's own when it is generated and carries its
-    ``ip_address_id`` (the host record, its aliases): a renewal keeps its
-    name. An operator A / AAAA with the same value is the #1867 twin the sync
-    adopts, so it is not a holder either. Anything else at the name - an
-    operator A / AAAA / CNAME of another value, or a record generated for
-    another address (a static host, another lease) - holds it.
+    RFC 4703 lets a client take a name only when nothing exists at it, so any
+    record type holds the name: an A / AAAA / CNAME, and equally an operator's
+    MX- or TXT-only name or an NS delegation, which an A written beside it
+    would turn into an address answer the operator never published. Views do
+    not matter: the generated record is unviewed and renders in every view,
+    so a view-scoped record at the name is a holder too. Soft-deleted records
+    are excluded by the session filter; a restored one is caught at the next
+    renewal, which moves the lease off the name.
+
+    Not holders: the address's own generated records (the host record, its
+    aliases), so a renewal keeps its name; and the #1867 twin, an operator
+    A / AAAA in no view with this address's value, which the sync adopts. When
+    the operator has written such a twin, the name is theirs for this address,
+    so their other non-address records at it (a TXT, an MX) do not hold it
+    either; another address at the name still does.
     """
     from app.models.dns import DNSRecord  # noqa: PLC0415 — lazy, avoid cycle
 
@@ -298,31 +309,79 @@ async def _name_holder(
     rows = (
         (
             await db.execute(
-                select(DNSRecord).where(
+                select(DNSRecord)
+                .where(
                     DNSRecord.zone_id.in_(zone_ids),
                     func.lower(DNSRecord.name) == hostname.lower(),
-                    DNSRecord.record_type.in_(["A", "AAAA", "CNAME"]),
                 )
+                .order_by(DNSRecord.created_at, DNSRecord.id)
             )
         )
         .scalars()
         .all()
     )
     own = str(ipam_row.address)
+    family_type = "AAAA" if ":" in own else "A"
+
+    def _is_twin(rec: Any) -> bool:
+        return (
+            not rec.auto_generated
+            and rec.view_id is None
+            and (rec.record_type or "").upper() == family_type
+            and (rec.value or "").strip() == own
+        )
+
+    twin_present = any(_is_twin(rec) for rec in rows)
     for rec in rows:
         if rec.auto_generated and rec.ip_address_id == ipam_row.id:
             continue
-        if not rec.auto_generated and rec.record_type != "CNAME" and rec.value == own:
+        if _is_twin(rec):
+            continue
+        if (
+            twin_present
+            and not rec.auto_generated
+            and (rec.record_type or "").upper() not in ("A", "AAAA", "CNAME")
+        ):
             continue
         return rec
     return None
 
 
-# #3362 — ``(subnet, ip, requested name)`` triples whose clash was already
-# raised (warning + audit row) in this process. Every renewal re-runs the
-# check, so the visible signal fires once per triple and the rest log at debug.
+# #3362 — a generated name belongs to the address it encodes. A client that
+# names itself ``dhcp-2-51`` from 10.1.2.50 would otherwise take the name
+# 10.1.2.51 falls back to, leaving that address unpublished.
+_GENERATED_NAME_RE = re.compile(r"^dhcp-(?:\d{1,3}-\d{1,3}|[0-9a-f]{8}|unknown)$")
+
+# #3362 — the visible signal (warning + audit row) for a name clash. It fires
+# once per ``(subnet, ip, requested name)`` and at most once per address per
+# ``_NAME_CONFLICT_AUDIT_INTERVAL`` seconds, so neither renewals nor a client
+# cycling through held names floods the audit log; the rest log at debug. Both
+# maps are bounded and per process.
 _name_conflict_raised: dict[tuple[str, str, str], None] = {}
+_name_conflict_audited_at: dict[tuple[str, str], float] = {}
 _NAME_CONFLICT_RAISED_MAX = 4096
+_NAME_CONFLICT_AUDIT_INTERVAL = 300.0
+
+
+def _bound(d: dict[Any, Any]) -> None:
+    while len(d) > _NAME_CONFLICT_RAISED_MAX:
+        d.pop(next(iter(d)))
+
+
+def _name_conflict_is_loud(subnet: Subnet, ipam_row: IPAddress, hostname: str) -> bool:
+    key = (str(subnet.id), str(ipam_row.address), hostname)
+    addr_key = key[:2]
+    now = time.monotonic()
+    first = key not in _name_conflict_raised
+    last = _name_conflict_audited_at.get(addr_key)
+    loud = first and (last is None or now - last >= _NAME_CONFLICT_AUDIT_INTERVAL)
+    _name_conflict_raised[key] = None
+    _bound(_name_conflict_raised)
+    if loud:
+        _name_conflict_audited_at.pop(addr_key, None)
+        _name_conflict_audited_at[addr_key] = now
+        _bound(_name_conflict_audited_at)
+    return loud
 
 
 async def _name_or_generated(
@@ -338,9 +397,10 @@ async def _name_or_generated(
 
     Returns ``hostname`` when it is free (or already this address's own),
     else the generated ``dhcp-<ip>`` name, and ``None`` when that is held too
-    (nothing is published). The zones checked are the ones the sync would
-    write the forward record into: the DDNS override zone or the subnet's,
-    plus the address's extra zones.
+    (nothing is published). Another address's generated name is never free.
+    The zones checked are the ones the sync would write the forward record
+    into: the DDNS override zone or the subnet's, plus the address's extra
+    zones.
     """
     from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415
     from app.services.dns.sync_check import forward_zone_ids_in_order  # noqa: PLC0415
@@ -350,32 +410,40 @@ async def _name_or_generated(
     zone_ids = forward_zone_ids_in_order(
         primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids
     )
-    holder = await _name_holder(db, ipam_row, zone_ids, hostname)
-    if holder is None:
+    fallback = _generate_hostname(str(ipam_row.address))
+    reserved = hostname != fallback and _GENERATED_NAME_RE.match(hostname) is not None
+    holder = None if reserved else await _name_holder(db, ipam_row, zone_ids, hostname)
+    if not reserved and holder is None:
         return hostname
 
-    fallback = _generate_hostname(str(ipam_row.address))
-    key = (str(subnet.id), str(ipam_row.address), hostname)
-    first = key not in _name_conflict_raised
-    _name_conflict_raised[key] = None
-    while len(_name_conflict_raised) > _NAME_CONFLICT_RAISED_MAX:
-        _name_conflict_raised.pop(next(iter(_name_conflict_raised)))
-    (logger.warning if first else logger.debug)(
-        "ddns_name_conflict",
-        subnet_id=str(subnet.id),
-        ip=str(ipam_row.address),
-        mac=str(ipam_row.mac_address) if ipam_row.mac_address else None,
-        requested_name=hostname,
-        client_hostname=client_hostname,
-        published_name=fallback,
-        holder_record_id=str(holder.id),
-        holder_type=holder.record_type,
-        holder_value=holder.value,
-        holder_auto_generated=holder.auto_generated,
-    )
-    if first:
+    published: str | None = fallback
+    if fallback == hostname or await _name_holder(db, ipam_row, zone_ids, fallback) is not None:
+        published = None
+
+    loud = _name_conflict_is_loud(subnet, ipam_row, hostname)
+    detail: dict[str, Any] = {
+        "subnet_id": str(subnet.id),
+        "ip": str(ipam_row.address),
+        "mac": str(ipam_row.mac_address) if ipam_row.mac_address else None,
+        "requested_name": hostname,
+        "client_hostname": client_hostname,
+        "published_name": published,
+        "reason": "reserved_generated_name" if reserved else "held",
+        "holder_record_id": str(holder.id) if holder is not None else None,
+        "holder_type": holder.record_type if holder is not None else None,
+        "holder_value": holder.value if holder is not None else None,
+        "holder_auto_generated": holder.auto_generated if holder is not None else None,
+    }
+    (logger.warning if loud else logger.debug)("ddns_name_conflict", **detail)
+    if loud:
         from app.models.audit import AuditLog  # noqa: PLC0415
 
+        held_by = (
+            f"held by {holder.record_type} {holder.value}"
+            if holder is not None
+            else "reserved for the address it encodes"
+        )
+        outcome = f"published {published!r} instead" if published else "published nothing"
         db.add(
             AuditLog(
                 user_display_name="system",
@@ -385,17 +453,11 @@ async def _name_or_generated(
                 resource_id=str(ipam_row.id),
                 resource_display=str(ipam_row.address),
                 result="denied",
-                error_detail=(
-                    f"DHCP client asked DDNS for {hostname!r}, held by "
-                    f"{holder.record_type} {holder.value}; published {fallback!r} instead"
-                ),
+                error_detail=(f"DHCP client asked DDNS for {hostname!r}, {held_by}; {outcome}"),
+                new_value=detail,
             )
         )
-    if fallback == hostname:
-        return None
-    if await _name_holder(db, ipam_row, zone_ids, fallback) is not None:
-        return None
-    return fallback
+    return published
 
 
 async def apply_ddns_for_lease(
@@ -438,11 +500,22 @@ async def apply_ddns_for_lease(
         return False
 
     # #3362 — a name another record holds is not the client's to publish.
-    hostname = await _name_or_generated(
+    published_name = await _name_or_generated(
         db, subnet, ipam_row, hostname, eff, client_hostname=client_hostname
     )
-    if hostname is None:
+    if published_name is None:
+        # Nothing may be published: the row must not keep the client's name
+        # either, or Sync DNS and the auto-sync backstop (which publish a
+        # row's hostname as it stands) would write it beside the holder. The
+        # lease keeps what the client asked for; whatever an earlier name
+        # published for this address is retracted.
+        if (ipam_row.hostname or "").strip() or ipam_row.dns_record_id is not None:
+            from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+            ipam_row.hostname = ""
+            await _sync_dns_record(db, ipam_row, subnet, action="create")
         return False
+    hostname = published_name
 
     # Idempotency: if the hostname is unchanged and the auto-generated
     # record already published for this IP carries it, skip the sync.
