@@ -14211,6 +14211,11 @@ export function BlockDetailView({
   const selectedBlockKeys = [...selected].filter((k) => k.startsWith("block:"));
   const hasBlocksSelected = selectedBlockKeys.length > 0;
   const selectedCount = selected.size;
+  // #3384: the selection's Bulk Edit, Split… and Merge…, gated as the subnet
+  // view gates its own Split… and Merge… (#1155). Each asks write on subnets
+  // at the type level: the bulk edit and the split and merge commits at the
+  // router gate, and every handler, the previews included, itself.
+  const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
   const toggleOne = (key: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -14259,17 +14264,24 @@ export function BlockDetailView({
                   <HeaderButton
                     icon={Pencil}
                     onClick={() => setShowBulkEdit(true)}
+                    {...subnetWriteGate}
                   >
                     Bulk Edit ({selectedSubnetIds.length})
                   </HeaderButton>
                 )}
                 {!hasBlocksSelected && selectedSubnetIds.length === 1 && (
-                  <HeaderButton onClick={() => setShowSplitSubnet(true)}>
+                  <HeaderButton
+                    onClick={() => setShowSplitSubnet(true)}
+                    {...subnetWriteGate}
+                  >
                     Split…
                   </HeaderButton>
                 )}
                 {!hasBlocksSelected && selectedSubnetIds.length >= 2 && (
-                  <HeaderButton onClick={() => setShowMergeSubnet(true)}>
+                  <HeaderButton
+                    onClick={() => setShowMergeSubnet(true)}
+                    {...subnetWriteGate}
+                  >
                     Merge…
                   </HeaderButton>
                 )}
@@ -15686,6 +15698,9 @@ export function SpaceTableView({
   const selectedSubnetIds = [...selected]
     .filter((k) => k.startsWith("subnet:"))
     .map((k) => k.slice("subnet:".length));
+  // #3384: Bulk Edit, Split… and Merge… ask write on subnets at the type
+  // level, as on a block's selection.
+  const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -15772,6 +15787,7 @@ export function SpaceTableView({
                     icon={Pencil}
                     onClick={() => setBulkOpen(true)}
                     title="Bulk-edit applies to subnets only"
+                    {...subnetWriteGate}
                   >
                     Bulk Edit ({selectedCount})
                   </HeaderButton>
@@ -15780,6 +15796,7 @@ export function SpaceTableView({
                   <HeaderButton
                     onClick={() => setShowSplitSubnet(true)}
                     title="Split this subnet into 2^k aligned children"
+                    {...subnetWriteGate}
                   >
                     Split…
                   </HeaderButton>
@@ -15788,6 +15805,7 @@ export function SpaceTableView({
                   <HeaderButton
                     onClick={() => setShowMergeSubnet(true)}
                     title="Merge contiguous sibling subnets"
+                    {...subnetWriteGate}
                   >
                     Merge…
                   </HeaderButton>
@@ -16432,7 +16450,9 @@ function BulkEditSubnetsModal({
       qc.invalidateQueries({ queryKey: ["blocks"] });
       onDone();
     },
-    onError: (e: Error) => setError(e.message),
+    // #3384: the server's reason, not axios's "Request failed with status
+    // code N". The checks above throw plain errors, said word for word.
+    onError: (e: Error) => setError(formatApiError(e, "Bulk edit failed")),
   });
 
   return (
