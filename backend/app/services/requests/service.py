@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.models.change_request import ChangeRequest
-from app.services.ai.operations import unreadable_target_detail
+from app.services.ai.operations import previewing_for_requester, unreadable_target_detail
 from app.services.approvals.service import create_change_request
 from app.services.requests.catalog import resolve_operation
 
@@ -124,7 +124,10 @@ async def submit_request(
     # what approving will do, and the request is implicitly scoped to what the
     # requester can already see — a preview that reads a subnet the requester
     # has no visibility of fails here rather than leaking it into the queue.
-    preview = await op.preview(db, user, parsed)
+    # A per-resource gate the APPLIER must pass (write on the target block,
+    # #3425) is not judged here: the approver's re-preview judges it.
+    with previewing_for_requester():
+        preview = await op.preview(db, user, parsed)
     if not preview.ok:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

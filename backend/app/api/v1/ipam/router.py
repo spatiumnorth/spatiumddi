@@ -477,11 +477,20 @@ def require_target_block_write(current_user: User, block: IPBlock) -> None:
     if not user_has_permission(current_user, "write", "ip_block", block.id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                f"Permission denied: need 'write' on target block "
-                f"{block.network} ({block.name}, {block.id})"
-            ),
+            detail=target_block_write_refusal(current_user, block),
         )
+
+
+def target_block_write_refusal(current_user: User, block: IPBlock) -> str:
+    """The 403 words for :func:`require_target_block_write`. The block's CIDR
+    and name only for a caller who may read it; otherwise just the id the
+    caller sent, so the refusal is no way to learn what a block holds."""
+    if user_has_permission(current_user, "read", "ip_block", block.id):
+        return (
+            f"Permission denied: need 'write' on target block "
+            f"{block.network} ({block.name}, {block.id})"
+        )
+    return f"Permission denied: need 'write' on target block {block.id}"
 
 
 router.include_router(io_router)
@@ -6724,6 +6733,9 @@ async def allocate_subnet(
     block = locked.scalar_one_or_none()
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+    # Before the answers below, which name the block's CIDR and what is free
+    # in it (#3425); create_subnet re-checks.
+    require_target_block_write(current_user, block)
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
     family_max = 32 if block_net.version == 4 else 128

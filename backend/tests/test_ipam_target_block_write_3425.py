@@ -64,7 +64,8 @@ async def test_create_subnet_needs_write_on_target_block(
         headers=h,
     )
     assert r.status_code == 403, r.text
-    assert str(b.id) in r.json()["detail"] and "10.1.0.0/16" in r.json()["detail"]
+    # Names the block by the id sent; the caller cannot read B, so not its CIDR.
+    assert str(b.id) in r.json()["detail"] and "10.1.0.0/16" not in r.json()["detail"]
 
     r = await client.post(
         "/api/v1/ipam/subnets",
@@ -182,4 +183,155 @@ def test_require_target_block_write_helper() -> None:
     require_target_block_write(user([{"action": "*", "resource_type": "*"}]), block)
     with pytest.raises(HTTPException) as exc:
         require_target_block_write(user([_grant("write", "ip_block", other)]), block)
-    assert exc.value.status_code == 403 and "10.9.0.0/16" in exc.value.detail
+    # The caller cannot read the block: the refusal names only the id it sent.
+    assert exc.value.status_code == 403 and str(block.id) in exc.value.detail
+    assert "10.9.0.0/16" not in exc.value.detail and "(Z," not in exc.value.detail
+    with pytest.raises(HTTPException) as exc:
+        require_target_block_write(user([_grant("read", "ip_block", block.id)]), block)
+    assert "10.9.0.0/16" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_allocate_refuses_before_describing_the_block(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # The free-space answers name the block's CIDR and what is free in it, so
+    # the target check comes first, and its words keep an unreadable block's
+    # CIDR and name to themselves.
+    _, a, b = await _world(db_session)
+    h = await _holder(db_session, [_grant("write", "subnet"), _grant("write", "ip_block", a.id)])
+    await db_session.commit()
+    for prefix_len in (8, 24):  # an invalid size, then a valid one
+        r = await client.post(
+            f"/api/v1/ipam/blocks/{b.id}/allocate-subnet",
+            json={"prefix_len": prefix_len},
+            headers=h,
+        )
+        assert r.status_code == 403, r.text
+        assert str(b.id) in r.json()["detail"]
+        assert "10.1.0.0/16" not in r.json()["detail"]
+
+
+# ── Copilot + request portal (allocate_subnet operation) ───────────────────
+
+
+async def _op_user(db: AsyncSession, permissions: list[dict]) -> tuple[User, str]:
+    user = User(
+        username=f"op-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@t.io",
+        display_name="op",
+        hashed_password=hash_password("password123"),
+    )
+    role = Role(name=f"role-{uuid.uuid4().hex[:8]}", permissions=permissions)
+    group = Group(name=f"grp-{uuid.uuid4().hex[:8]}")
+    group.roles = [role]
+    user.groups = [group]
+    db.add_all([role, group, user])
+    await db.flush()
+    return user, create_access_token(str(user.id))
+
+
+@pytest.mark.asyncio
+async def test_allocate_preview_reports_the_target_block_refusal(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.operations import (
+        AllocateSubnetArgs,
+        get_operation,
+        previewing_for_requester,
+    )
+
+    _, a, b = await _world(db_session)
+    op = get_operation("allocate_subnet")
+    assert op is not None
+    args = AllocateSubnetArgs(block_id=str(b.id), prefix_len=24)
+
+    # Will apply, may read B, may not write it: refused, by name, as the
+    # caller's own refusal (an approve leaves the request pending).
+    reader, _ = await _op_user(
+        db_session,
+        [_grant("write", "subnet"), _grant("read", "ip_block"), _grant("write", "ip_block", a.id)],
+    )
+    pv = await op.preview(db_session, reader, args)
+    assert not pv.ok and pv.forbidden_detail is not None
+    assert "10.1.0.0/16" in pv.detail and "write" in pv.detail
+
+    # May not read B either: answered like an unknown id.
+    blind, _ = await _op_user(db_session, [_grant("write", "subnet")])
+    pv = await op.preview(db_session, blind, args)
+    assert not pv.ok and pv.forbidden_detail is not None
+    assert "10.1.0.0/16" not in pv.detail and "not found" in pv.detail
+
+    # A portal requester is not judged on it: the approver is.
+    with previewing_for_requester():
+        pv = await op.preview(db_session, reader, args)
+    assert pv.ok, pv.detail
+
+    # May write B: ready.
+    writer, _ = await _op_user(
+        db_session, [_grant("write", "subnet"), _grant("write", "ip_block", b.id)]
+    )
+    assert (await op.preview(db_session, writer, args)).ok
+
+
+@pytest.mark.asyncio
+async def test_portal_subnet_request_needs_target_block_write_on_the_approver(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    from sqlalchemy import select
+
+    from app.models.feature_module import FeatureModule
+    from app.services import feature_modules
+
+    db_session.add(FeatureModule(id="governance.requests", enabled=True))
+    await db_session.flush()
+    feature_modules.invalidate_cache()
+    _, _, b = await _world(db_session)
+    requester = [
+        _grant("write", "provisioning_request"),
+        _grant("read", "provisioning_request"),
+        _grant("read", "ip_block"),
+    ]
+    # A requester who writes subnets but not B still asks through the portal.
+    _, req_token = await _op_user(db_session, [*requester, _grant("write", "subnet")])
+    approver = [
+        _grant("approve", "change_request"),
+        _grant("read", "change_request"),
+        _grant("write", "subnet"),
+        _grant("read", "subnet"),
+        _grant("read", "ip_block"),
+    ]
+    _, weak_token = await _op_user(db_session, approver)
+    _, ok_token = await _op_user(db_session, [*approver, _grant("write", "ip_block", b.id)])
+    await db_session.commit()
+
+    r = await client.post(
+        "/api/v1/requests",
+        headers={"Authorization": f"Bearer {req_token}"},
+        json={"kind": "subnet", "args": {"block_id": str(b.id), "prefix_len": 24}},
+    )
+    assert r.status_code == 201, r.text
+    req_id = r.json()["id"]
+
+    # An approver who may not write B is refused; the request waits for one
+    # who may, rather than failing.
+    r = await client.post(
+        f"/api/v1/requests/{req_id}/approve",
+        headers={"Authorization": f"Bearer {weak_token}"},
+        json={},
+    )
+    assert r.status_code == 403, r.text
+    assert "10.1.0.0/16" in r.json()["detail"]
+    row = await client.get(
+        f"/api/v1/requests/{req_id}", headers={"Authorization": f"Bearer {weak_token}"}
+    )
+    assert row.json()["state"] == "pending", row.text
+    assert not (await db_session.execute(select(Subnet))).scalars().all()
+
+    r = await client.post(
+        f"/api/v1/requests/{req_id}/approve",
+        headers={"Authorization": f"Bearer {ok_token}"},
+        json={},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "executed"
