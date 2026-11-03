@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DHCPServerGroup } from "@/lib/api";
+import { AxiosError, type InternalAxiosRequestConfig } from "axios";
 
 const updateGroup = vi.fn();
 let stored: unknown;
@@ -63,5 +64,70 @@ describe.each([
       new RegExp(`${label.replace(/ \(ms\)/, "")} must be`),
     );
     expect(updateGroup).not.toHaveBeenCalled();
+  });
+});
+
+const renderGroup = (g: DHCPServerGroup) => {
+  stored = g;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <CreateServerGroupModal group={g} onClose={() => {}} />
+    </QueryClientProvider>,
+  );
+};
+
+describe("hidden HA timers (standalone) (#3371)", () => {
+  it("a stored Max Unacked Clients of 0 is not rewritten to 5 by an unrelated save", async () => {
+    updateGroup.mockResolvedValue({});
+    renderGroup({
+      ...group,
+      mode: "standalone",
+      max_unacked_clients: 0,
+    } as unknown as DHCPServerGroup);
+    const name = (await screen.findByText("Name", { selector: "label" }))
+      .nextElementSibling as HTMLInputElement;
+    fireEvent.change(name, { target: { value: "renamed" } });
+    fireEvent.submit(name.form!);
+    await vi.waitFor(() => expect(updateGroup).toHaveBeenCalled());
+    expect(updateGroup.mock.calls[0][1]).toEqual({ name: "renamed" });
+  });
+});
+
+describe("save errors (#3371)", () => {
+  const cfg = { headers: {} } as InternalAxiosRequestConfig;
+  const submitWith = async (err: unknown) => {
+    updateGroup.mockRejectedValue(err);
+    renderGroup(group);
+    const name = (await screen.findByText("Name", { selector: "label" }))
+      .nextElementSibling as HTMLInputElement;
+    fireEvent.change(name, { target: { value: "renamed" } });
+    fireEvent.submit(name.form!);
+  };
+
+  it("a network failure reads as the dialog's own message, not axios's", async () => {
+    await submitWith(
+      new AxiosError("Network Error", "ERR_NETWORK", cfg, {}, undefined),
+    );
+    await screen.findByText("Failed to save group");
+    expect(screen.queryByText("Network Error")).toBeNull();
+  });
+
+  it("a server detail is still shown", async () => {
+    await submitWith(
+      new AxiosError(
+        "Request failed",
+        "ERR_BAD_REQUEST",
+        cfg,
+        {},
+        {
+          status: 409,
+          statusText: "Conflict",
+          headers: {},
+          config: cfg,
+          data: { detail: "A group named renamed already exists" },
+        },
+      ),
+    );
+    await screen.findByText("A group named renamed already exists");
   });
 });

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isAxiosError } from "axios";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -120,8 +121,11 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
         min: number,
         dflt: number,
       ) => {
-        if (!isHA) return parseInt(raw, 10) || dflt;
         const n = raw.trim() === "" ? NaN : parseInt(raw, 10);
+        // Hidden (standalone): send back what the row holds. ``|| dflt`` would
+        // turn a stored 0 (a valid Max Unacked Clients, #2480) into 5 on any
+        // unrelated save.
+        if (!isHA) return Number.isNaN(n) ? dflt : n;
         if (Number.isNaN(n) || n < min) {
           throw new Error(`${label} must be a number of at least ${min}.`);
         }
@@ -183,10 +187,12 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
       onClose();
     },
     // A client-side refusal is a plain Error carrying its own reason; errMsg
-    // only reads API details and would answer "Failed to save group".
+    // only reads API details and would answer "Failed to save group". Any
+    // axios error (a 4xx detail, or a network failure with no response,
+    // whose message is just "Network Error") still goes through errMsg.
     onError: (e) =>
       setError(
-        e instanceof Error && !("response" in e)
+        e instanceof Error && !isAxiosError(e)
           ? e.message
           : errMsg(e, "Failed to save group"),
       ),
