@@ -1632,3 +1632,100 @@ cannot abort the transaction and take every later section with it.
 
 **MCP:** `get_support_bundle_preview` (default **off** — a broad read of
 logs and configuration). It returns the preview, never the archive.
+
+---
+
+## 10. Factory reset
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Per-section wipe back to defaults
+
+per-section "wipe back to defaults" surface for superadmins.
+
+- 12 sections mapped from the operator's mental model: IPAM · DNS · DHCP · Network modeling · Integrations · AI/Copilot · Compliance · Tools · Observability logs · Auth+RBAC · Settings+branding · Everything. Per-section confirm phrase (`DESTROY-IPAM` / `DESTROY-DNS` / … / `FACTORY-RESET-ALL`) typed exactly to commit
+- Three dispatch kinds: `truncate` (9 sections — straight `TRUNCATE … RESTART IDENTITY CASCADE`), `auth_rbac` (partial wipe preserving the calling user, every other superadmin, and built-in roles), `settings_reset` (DELETE platform_settings; recreated with model defaults). Tables intentionally untouchable: `alembic_version`, `oui_vendor`, `backup_target`, `feature_module`, `event_outbox`, `internal_error`, `audit_forward_target` — the schema head, OUI cache, recovery path, module toggles, and audit-forward shipping channels survive every reset
+- Hard guardrails server-side: superadmin gate · fresh bcrypt password re-check (NOT bearer-token check) · exact-match per-section confirm phrase · refuses 409 when any backup target is mid-run · Redis lock against concurrent resets · 6-hour cooldown · audit anchor written via fresh AsyncSessionLocal post-truncate so the trail of evidence survives an `audit_log` wipe · `system.factory_reset` typed event fans through the existing webhook outbox
+- **Pre-flight backup as warn-only with override** — if no enabled backup target exists, `POST /system/factory-reset/execute` returns 412 unless the operator passes `acknowledge_no_backup=true`. The Backup admin tab surfaces the warning + checkbox up front
+- UI lives as a third tab on the Backup admin page (after Manual + Destinations) — backup snapshots state, factory reset wipes it, two ends of the same lifecycle. Per-section cards in a 2-col grid + red-bordered "Reset everything" card. Modal gates the password field on a green-border phrase match
+
+---
+
+## 11. Reference summaries — audit chain, conformity, trash, backup
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Audit log + tamper-evident hash chain
+
+append-only, SHA-256 chained, machine-verifiable.
+
+- Every mutation across IPAM / DNS / DHCP / Network / auth / ownership / integrations writes an `AuditLog` row before the response is returned. Filterable in the UI by user / action / resource type / time range; full row diff (`old_value` / `new_value` / `changed_fields` JSONB) so an audit shows you exactly what changed
+- **Hash chain** — each row carries `seq` (monotonically-increasing position), `prev_hash` (the previous row's hash), and `row_hash = sha256(prev_hash || canonical_json(row))`. A `before_flush` SQLAlchemy listener takes a Postgres transaction-scoped advisory lock so concurrent transactions can't interleave their "fetch previous hash, hash my row, write it" sequence — you can't fork the chain by racing
+- **Verifier** — `verify_chain` walks the table in `seq` order, recomputes the hash for each row, and returns the first break with `reason=row_hash_mismatch` (someone edited the row's content) or `reason=prev_hash_mismatch` (someone deleted or inserted a row mid-stream). One verification pass shows the offending row + the position in the chain
+- **Conformity hookup** — the `audit_log_immutable` conformity check kind runs the verifier on its scheduled tick and emits a `pass` / `fail` result, so the auditor's PDF export carries a positive-presence signal that nothing has been tampered with since the last evaluation
+- **Backfill migration** — `d92f4a18c763_audit_chain_hash` populates `seq`, `prev_hash`, and `row_hash` for every existing row in chronological order on upgrade, so the chain is unbroken from day one
+
+### Conformity evaluations
+
+proactive: prove steady state and produce the auditor PDF.
+
+- Declarative `ConformityPolicy` rows pin a `check_kind` against a target set (subnet / IP address / DNS zone / DHCP scope / platform). Beat-driven engine ticks every 60 s and runs every enabled policy on its `eval_interval_hours` cadence (default 24 h). On-demand re-eval via `POST /conformity/policies/{id}/evaluate`
+- 16 check kinds:
+  - `has_field` — non-empty value on a named target column (e.g. PCI subnet must have `customer_id`)
+  - `in_separate_vrf` — subnet's effective VRF holds only classification-matched siblings (no PCI ↔ non-PCI mixing)
+  - `no_open_ports` — latest nmap scan within N days didn't expose forbidden ports (`warn` when no recent scan; never silent-pass)
+  - `alert_rule_covers` — at least one enabled alert rule of the named type covers this scope (positive coverage signal — confirms the reactive #105 channel is wired)
+  - `last_seen_within` — IP / subnet recency check (catches rows that should be decommissioned)
+  - `audit_log_immutable` — platform-level positive-presence signal for the auditor checkbox
+  - `voice_segment_not_internet_facing` — a voice / VoIP-classified subnet must not also carry the `internet_facing` flag
+  - `no_multicast_collision` — no two multicast group registrations in an IPSpace claim the same address
+  - `no_lanwide_control_plane_ports` — no appliance exposes k3s control-plane ports (etcd / kubelet / apiserver) to the LAN
+  - `av_flow_outside_reserved_range` — an AV-over-IP flow sits outside every multicast range declared for its protocol (not applicable when no range is declared — absence of policy isn't a violation)
+  - `av_flow_no_ptp_domain` — advisory; an AV flow with no PTP clock domain recorded (PTP misconfig is the top AoIP failure mode)
+  - `bbmd_one_per_subnet` — a BACnet-bearing subnet has exactly one BBMD; fails on 0 (devices unreachable across routers) and on >1 (duplicated broadcasts)
+  - `bacnet_duplicate_device_instance` — no two BACnet devices share an internetwork-unique device instance number
+  - `bacnet_vendor_id_unknown` — advisory; BACnet devices reporting vendor id 0 or none (usually a cloned or misconfigured controller)
+  - `ot_device_crosses_purdue_boundary` — an OT device's Purdue level differs from the level its subnet is zoned for
+  - `ot_zone_missing_purdue_level` — advisory; a subnet carrying OT devices but declaring no OT zone
+  - `fragile_subnet_probed` — works *backwards* from the OT / DICOM / `bmc`-role registries: a subnet holding devices known to be probe-fragile that nobody marked do-not-probe
+  - `dicom_ae_default_title` — no DICOM AE is still on a vendor default title (`AE_TITLE`, `DICOM_SCP`, …)
+  - `dicom_ae_title_convention` — AE Titles match an operator-supplied regex, so the estate's naming scheme is enforceable
+  - `dicom_ae_outside_hipaa_scope` — AEs sit in subnets actually flagged `hipaa_scope`
+  - `dicom_ae_no_tls` — AEs are recorded as TLS-enabled
+- 19 disabled seed policies covering PCI-DSS / HIPAA / SOC2 + the vertical registries: PCI dedicated VRF, PCI owner_assigned, PCI no admin ports, PCI alert coverage, PCI no stale IPs, HIPAA dedicated VRF, internet-facing alert coverage, voice-not-internet-facing, multicast-collision-free, audit log immutable, no LAN-wide control-plane ports, AV flows in declared range, AV flows record PTP domain, one BBMD per subnet, unique BACnet device instances, plausible BACnet vendor ids, OT devices match subnet Purdue level, OT subnets declare a zone, fragile subnets marked do-not-probe
+- `pass→fail` transitions emit `AlertEvent` rows against the policy's wired alert rule when set, so conformity drift surfaces in the existing alerts dashboard
+- Append-only `ConformityResult` history indexed twice (by policy and by resource) so both natural drilldowns hit an index — answers "every result for this policy" + "every policy that touched this resource" in O(log n)
+- Auditor-facing **PDF export** via `reportlab` — per-framework summary table, per-policy section with pass / warn / fail counts, enumerated failing rows with diagnostic JSON pretty-printed beneath, trailer with a SHA-256 hash over `(result_id, status)` tuples so the auditor can verify post-generation tampering. `GET /conformity/export.pdf` with optional `?framework=` filter
+- New `conformity` permission resource type plus two new built-in roles: **Auditor** (read-only) suitable for an external auditor account, **Compliance Editor** (admin) for the team that authors and tunes policies
+- Frontend `/admin/conformity` page with per-framework summary cards, policies table (toggle / re-eval / edit / delete inline), filterable results panel with diagnostic JSON drill-in. Platform Insights gains a Conformity card with deep-link
+
+### Soft-delete + 30-day Trash
+
+accidental deletes are recoverable; the `Delete` button moves rows to a holding area, not the void.
+
+- Scope: `IPSpace`, `IPBlock`, `Subnet`, `DNSZone`, `DNSRecord`, `DHCPScope` rows inherit a `SoftDeleteMixin` (`deleted_at`, `deleted_by_user_id`, `deletion_batch_id`). IP addresses are intentionally NOT soft-deletable — they cascade-delete with their parent subnet, and the parent subnet is the recoverable unit
+- **Global ORM filter** — a `do_orm_execute` event listener injects `Model.deleted_at IS NULL` into every SELECT touching one of these models, so the rest of the codebase doesn't need to remember. Callers that need to see the trash opt in via `execution_options(include_deleted=True)`
+- **Cascade-aware restore** — when you delete a subnet its DHCP scopes are stamped under the same `deletion_batch_id`; one click on Restore brings the whole batch back atomically, with a pre-flight conflict check (rejects 409 when a live row would clash on a uniqueness key)
+- Admin page at `/admin/trash` lists soft-deleted rows newest-first with type / since / substring filters and "Restore" / "Delete permanently" per row. Sidebar entry under Admin
+- **Nightly purge** — `trash_purge` Celery beat task hard-deletes rows older than `PlatformSettings.soft_delete_purge_days` (default 30; set 0 to disable forever). The retention window is operator-tunable in Settings → Security
+- Endpoints: `GET /admin/trash` · `POST /admin/trash/{type}/{id}/restore` · `DELETE /admin/trash/{type}/{id}` (hard-delete a soft-deleted row before the purge sweep)
+
+### Backup + restore
+
+full-system snapshot with passphrase-wrapped secrets and 10 destination kinds.
+
+- **Format** — single `.zip` archive carrying `manifest.json` (app version, schema head, hostname, dump format), `database.dump` (custom-format `pg_dump`), `secrets.enc` (PBKDF2-HMAC-SHA256 + AES-256-GCM envelope wrapping the install's `SECRET_KEY`), and `README.txt`. The operator passphrase NEVER lands on disk or in the API logs
+- **Ten destination kinds** — `local_volume` (filesystem path mounted as a docker / k8s volume), `s3` (AWS + S3-compatible: MinIO, Wasabi, Backblaze B2, Cloudflare R2 — via `endpoint_url`), `scp` (SFTP with password OR PEM private key, three host-key check modes), `azure_blob` (shared-key OR connection-string), `smb` (NTLM with optional domain + SMB3 encryption), `ftp` (plain ftp / ftps_explicit / ftps_implicit + passive/active + verify_tls toggle), `gcs` (service-account JSON key), `webdav` (Nextcloud / ownCloud / mod_dav / IIS WebDAV via PUT/GET/PROPFIND/DELETE — no SDK dep), `nfs` (an NFSv4 or v3 export, spoken in userspace — no kernel mount, so it works on the appliance too), `https_put` (PUT or POST to an HTTPS receiver — Artifactory / Nexus generic repositories, a presigned URL — with none / bearer / basic / header auth; write-only, so no listing, restore-from-destination or drill). Same `BackupDestination` ABC + module registry; the kind picker reflects on `GET /backup/targets/kinds` so adding a new driver requires no frontend changes
+- **Scheduled cron + retention** — 5-field UTC cron with friendly presets (hourly / 6h / 12h / daily 02:00 / 04:00 / weekly Sun 03:00 / monthly 1st 03:00) + custom; retention as `keep_last_n` OR `keep_for_days`; per-target last-run state surfaced inline; 60s beat sweep with `last_run_status='in_progress'` per-target mutex
+- **Selective restore** — operators tick which sections to restore (IPAM only / DNS only / etc.) on both upload-restore and restore-from-destination flows. 17-section catalog mapping all 110 schema tables; volatile sections (DHCP leases, DNS query log, DHCP activity log, nmap scan history, metric samples) skipped by default. TRUNCATE … RESTART IDENTITY CASCADE + `pg_restore --data-only --table=…` in one transaction, with the closure's foreign keys set aside and checked on the way back, so it needs no superuser (#1693); `platform_internal` (alembic_version + oui_vendor) always rides along
+- **Cross-install secret rewrap** — restoring onto an install with a different `SECRET_KEY` rewraps every Fernet-encrypted column (22 columns across 16 tables + the `backup_target.config` JSONB blob). Same-install restores short-circuit. Closes the manual `SECRET_KEY` copy step that Phase 1 needed
+- **Alembic upgrade-on-restore + drift recovery** — restore detects schema-version skew and runs `alembic upgrade head` automatically when the source is on an older head. Drift-recovery branch handles the case where the dump's alembic_version row is stale relative to the dump's own schema (operator stamped head later, then restored an older backup): canonical "table already exists" error pattern is detected and recovered via `alembic stamp head`
+- **Exclude-secrets diagnostic mode** — checkbox on the build form switches to plain-format dump and post-processes the SQL text in memory to scrub every Fernet-encrypted column + `__enc__:`-prefixed JSONB field. Live database is never touched. For sharing snapshots with support / consultants without leaking integration credentials
+- **Restore from any archive at any destination** — pick destination → expand drawer → click Restore icon. Driver fetches the bytes via `download(filename)`; standard restore path takes over. Plus `GET /backup/targets/{id}/archives/{filename}/download` for proxy-download (operator pulls a remote archive without ever holding the destination's credentials) and `…/archives/latest/download` for one-shot "give me the newest" automation
+- **Audit + observability** — every backup creates / fails / restore-performed lands an audit row; `system.backup_completed` / `system.backup_failed` / `system.restore_performed` typed events fire via the existing webhook event-outbox + HMAC-signed POST + retry pipeline
+- **Restore drills** — scheduled proof that the archives are actually restorable, which is the failure nobody discovers until recovery day. A drill downloads a target's newest archive, replays it into a throwaway scratch database, runs a fixed assertion set (archive readable and a supported format version · the stored passphrase opens `secrets.enc` · the dump replays · the alembic head is one this build knows · core tables are populated · the audit chain verifies), then drops the scratch database. **The live database is never written to** — the scratch name is generated from a fixed prefix plus random hex, never from operator input, and is checked against the live database name before anything runs. Deliberately not built on the operator restore path, which takes a pre-restore safety dump and disposes the live engine's pool: correct for a deliberate restore, wrong for an unattended background check
+  - Cadence is **separate from the backup schedule**, because replaying a full dump costs far more than taking a backup — weekly drills against nightly backups is the expected shape
+  - Bounded and self-cleaning: a size ceiling (`SPATIUM_DRILL_MAX_DB_BYTES`, 20 GiB default) so a verification job can never fill the production volume, a stale-mutex escape so a killed worker can't stop a target drilling forever, and a reaper that drops orphaned scratch databases with no backend attached
+  - `restore_drill_failed` alert fires only on a verdict *about the archive* — never on "the drill couldn't run at all", which would train operators to ignore the rule. A target with drills switched off reports as **unverified**, not healthy
+  - Restore Drills tab on the Backup admin page, `GET/POST /backup/drills` (list · get · run-now · readiness), 2 Copilot tools
+- Endpoints: `POST /backup/create-and-download` · `POST /backup/restore` · `POST /backup/targets` (CRUD + run-now + test) · `POST /backup/targets/{id}/archives/restore` · `GET /backup/targets/{id}/archives/{filename}/download` · `GET /backup/targets/{id}/archives/latest/download` · `GET /backup/drills`. UI lives at **Administration → Backup**

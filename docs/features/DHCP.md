@@ -2422,3 +2422,25 @@ REST (gated by the module): `GET /dhcp/ra/groups/{id}/ra-config`
 /dhcp/ra/groups/{id}/ra-allowlist`. Operator-Copilot tools:
 `find_ra_subnets`, `find_observed_ra_routers`, `count_rogue_ra_routers`
 (reads, default on) + `propose_allowlist_ra_router` (write proposal).
+
+---
+
+## 20. DHCP server management — reference summary
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Kea servers, scope authoring and PXE profiles
+
+Kea container + agent with lease tracking.
+
+- Group-centric HA (hot-standby + load-balancing) with live state reporting
+- Self-healing peer-IP drift
+- Supervised daemons for crash-loop-safe restarts
+- **Scope authoring**:
+  - 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row (search by code or name, description shown inline)
+  - Named option templates (group-scoped, e.g. "VoIP phones", "PXE BIOS clients") — apply to a scope in one click; apply is a stamp not a binding, so later template edits don't propagate
+- **PXE / iPXE provisioning profiles** — netboot a mixed-architecture estate without hand-writing Kea client classes
+  - A profile is group-scoped and reusable; a scope selects one via `pxe_profile_id`. It carries the `next_server` (TFTP / HTTP boot host) and N **architecture matches**
+  - Each match pairs a vendor-class + DHCP arch-code filter with the boot file that architecture should pull — `undionly.kpxe` for BIOS, `ipxe.efi` for UEFI x64, the arm64 or ia32 equivalents, or a chained iPXE config URL
+  - **iPXE chainloading** is the case that makes this worth modelling: the classic two-stage boot needs a class guarded on `dhcp.user-class` matching the iPXE signature, so the second request (from iPXE itself) is answered with a script URL instead of the binary it already loaded — otherwise the client loops
+  - Profiles can be **disabled** rather than deleted; a disabled profile renders no classes at all, so an operator can A/B-test boot files and roll back by flipping one switch
