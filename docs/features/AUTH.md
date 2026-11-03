@@ -687,17 +687,76 @@ rejected with `422` rather than silently locking the operator out:
   probe or an off-prem lookup needs an unrestricted token whatever the
   scopes, as its REST route (`/tools/*`, `/bgp/*`, …) does.
 - `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
-  `/vrfs/*`, `/network-devices/*`.
+  `/vrfs/*`, `/network-devices/*`, and also `/address-sets/*`, `/multicast/*`,
+  `/av/flows/*`, `/av/reserved-ranges/*`, `/custom-fields/*` and
+  `POST /nmap/scans/{id}/stamp-discovered`.
 - `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,
   groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
   (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
-  that writes there needs an empty scope set, with RBAC as the gate.
-- `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
-- `agent` — allows only the agent push surface
-  (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+  that writes there needs an empty scope set, with RBAC as the gate. It also
+  covers `/api/v1/domains/*` (except the off-prem `refresh-whois` lookup), `POST /acme/register` and
+  `DELETE /acme/accounts/{id}`.
+- `dhcp:write` — allows mutations under `/api/v1/dhcp/*`, and
+  `POST /api/v1/new-devices/block`.
+
+There is no scope for the agent push surface (`/api/v1/dns/agents/*`,
+`/api/v1/dhcp/agents/*`): those routes authenticate with the agent's own JWT
+or pre-shared key and never accept an API token. An `agent` scope used to be
+offered and reached nothing; it is retired, and create / update refuse it
+with a 422. A token that already stores `agent` is still refused everywhere
+(a non-empty scope list that matches nothing is not "unrestricted").
+
+Approve-and-provision routes (`/requests`, `/change-requests/{id}/approve|reject|cancel`,
+`/ai/proposals/{id}/apply`) admit any write scope, then check the scope of the
+stored operation's own family at apply time (403 naming it otherwise).
+Cutover, Trash restore / purge and other cross-domain routes need an
+unrestricted token.
 
 Prefixes match on a whole path segment, so `/api/v1/dns` covers
 `/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
+
+**What a scope does and does not grant.**
+
+- A write scope admits every method under its own prefixes, reads included,
+  and nothing outside them: a token with only `ipam:write` can list subnets but
+  is refused a `GET /dns/groups`. Combine it with `read` for a token that reads
+  everywhere and writes in one domain.
+- A write-only token cannot use MCP. The Operator Copilot endpoint
+  (`POST /api/v1/ai/mcp`) is admitted by `read` alone, so a scoped token needs
+  `read` as well. MCP never dispatches a write or `propose_*` tool, whatever the
+  token holds.
+- **Writes outside the scopes above need an unrestricted token** (an empty scope
+  set, RBAC as the only gate). The write scopes cover IPAM, DNS and DHCP; they
+  do not cover the other mutating routes, which number in the hundreds:
+  integrations, ownership (customers, sites, services), settings, alerts, users
+  and groups, backup, appliance and fleet, and the rest. The notable families
+  that stay unrestricted-only even though they touch IPAM, DNS or DHCP data:
+  every `/migration/cutover/*` route; Trash restore and purge
+  (`/admin/trash/{type}/{id}/restore` and the purge `DELETE`); change-request
+  policies (`/change-requests/policies*`); discarding an AI proposal
+  (`POST /ai/proposals/{id}/discard`); `POST /domains/{id}/refresh-whois`;
+  every `/nmap/*` write except `stamp-discovered`; every `/new-devices/*` write
+  except `block`; `/av/*` outside `flows` and `reserved-ranges`; and any
+  proposal or change request whose operation has no write-scope family.
+  (`POST /acme/update` and the agent push routes under `/dns/agents/*` and
+  `/dhcp/agents/*` are not API-token routes at all: they take the acme-dns
+  credential and the agent's own JWT or pre-shared key.)
+- **A scope is one domain's route prefix, not one domain's data.** The handlers
+  behind a prefix do what the operation needs, in other domains:
+  - `ipam:write` creates reverse DNS zones for a new subnet and publishes DNS
+    records for an address (queued record ops reach the zone's servers).
+  - `dhcp:write` mirrors static assignments and leases into IPAM, creating and
+    removing address rows.
+  - `dns:write` can move a DNS server between groups, which repoints the
+    appliance's DNS group assignment and so changes which encrypted-DNS
+    (DoT / DoH / DoQ) ports the appliance firewall opens.
+
+  Grant a scope to a token as you would grant those effects.
+- **`allowed_paths` is reserved and not enforced.** The `APIToken.allowed_paths`
+  column cannot be set through the API and nothing reads it, so it restricts
+  nothing. To limit a token use the scopes above, `resource_grants`, and the
+  owning account's RBAC. None of these can limit a token to a single route; the
+  narrowest token is one owned by an account holding only that permission.
 
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still
@@ -707,7 +766,7 @@ the create dialog.
 
 Scope enforcement runs **before** RBAC: a non-empty scope set narrows the
 token, and the owning user's RBAC still applies on top, so a `read`-scoped
-token owned by an IPAM Editor can list subnets but cannot create one. A scope refusal is a `403`; it is also what a `read` token gets on a POST that writes, while POST routes that only read (the DNS query and DHCP activity logs, previews) accept it. A
+token owned by an IPAM Editor can list subnets but cannot create one. A scope refusal is a `403` (a revoked, expired or unknown token is the `401`). A `read` token gets the same `403` on any mutation, on any POST not marked read-only, and on any request (a GET included) that makes SpatiumDDI contact another host, while the POST routes that only read (the DNS query and DHCP activity logs, previews and dry runs) accept it, as does the MCP endpoint. A
 per-token resource-instance binding (`resource_grants`, #374) can narrow
 further to specific `{action, resource_type, resource_id}` grants, validated
 at create time to be a subset of what the issuing user holds.
@@ -881,8 +940,8 @@ so clients can detect "refresh me" vs "reconfigure me".
 - **Global-scope / service-account tokens** — the `APIToken.scope`
   column supports `global`, but validation rejects them today pending
   a proper service-account user model. Token-only `allowed_paths` and
-  per-token permission overrides exist on the model but aren't
-  exposed on create yet.
+  per-token permission overrides exist on the model but are reserved:
+  nothing sets or enforces them.
 
 ## Rules & constraints
 

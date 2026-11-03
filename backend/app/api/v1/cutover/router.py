@@ -52,6 +52,7 @@ from app.models.cutover import (
 )
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
+from app.services.api_token_scopes import token_write
 from app.services.cutover import checklist as checklist_svc
 from app.services.cutover import leases as leases_svc
 from app.services.cutover import parity as parity_svc
@@ -824,6 +825,9 @@ async def run_shadow(
 
 
 @router.post("/plans/{plan_id}/items/{item_id}/ttl-preflight/preview")
+@token_write(
+    "Reads the zone from the DB, no write and no outbound call; kept write-scoped as the preview half of the SuperAdmin-only cutover TTL step"
+)
 async def preview_ttl(
     plan_id: uuid.UUID, item_id: uuid.UUID, body: TTLPreflightIn, db: DB, _user: SuperAdmin
 ) -> dict[str, Any]:
@@ -918,6 +922,9 @@ async def restore_ttl(
 
 
 @router.post("/plans/{plan_id}/items/{item_id}/lease-handover/preview")
+@token_write(
+    "Pulls the live lease table from the source Windows DHCP server over WinRM (outbound); a SuperAdmin cutover step"
+)
 async def preview_leases(
     plan_id: uuid.UUID, item_id: uuid.UUID, db: DB, _user: SuperAdmin
 ) -> dict[str, Any]:
