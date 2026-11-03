@@ -10837,17 +10837,17 @@ export const API_TOKEN_SCOPES: {
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/* and other IPAM surfaces. Grants no reads: add Read-only. A write-only token cannot use MCP. Also creates reverse DNS zones and DNS records.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/* and other IPAM surfaces. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also creates reverse DNS zones and DNS records.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*. Grants no reads: add Read-only. A write-only token cannot use MCP. Can move appliance DNS assignments and change firewall ports.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Moving a server between groups repoints its appliance and changes its DoT/DoH/DoQ firewall ports.",
   },
   {
     value: "dhcp:write",
     label: "DHCP write",
-    hint: "Mutate /dhcp/*. Excludes the agent surface. Grants no reads: add Read-only. A write-only token cannot use MCP. Also mirrors leases and statics into IPAM.",
+    hint: "Mutate /dhcp/*. Excludes the agent surface. No reads outside these paths: add Read-only. A write-only token cannot use MCP. Also mirrors leases and statics into IPAM.",
   },
   {
     value: "agent",

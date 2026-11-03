@@ -712,10 +712,10 @@ Prefixes match on a whole path segment, so `/api/v1/dns` covers
 
 **What a scope does and does not grant.**
 
-- A write scope grants mutations under its own prefixes and nothing else. It
-  grants no reads outside them: a token with only `ipam:write` is refused a
-  `GET /dns/zones`. Combine it with `read` for a token that reads everywhere
-  and writes in one domain.
+- A write scope admits every method under its own prefixes, reads included,
+  and nothing outside them: a token with only `ipam:write` can list subnets but
+  is refused a `GET /dns/zones`. Combine it with `read` for a token that reads
+  everywhere and writes in one domain.
 - A write-only token cannot use MCP. The Operator Copilot endpoint
   (`POST /api/v1/ai/mcp`) is admitted by `read` alone, so a scoped token needs
   `read` as well. MCP never dispatches a write or `propose_*` tool, whatever the
@@ -733,8 +733,9 @@ Prefixes match on a whole path segment, so `/api/v1/dns` covers
   every `/nmap/*` write except `stamp-discovered`; every `/new-devices/*` write
   except `block`; `/av/*` outside `flows` and `reserved-ranges`; and any
   proposal or change request whose operation has no write-scope family.
-  (`POST /acme/update` is not an API-token route at all: it takes the acme-dns
-  credential.)
+  (`POST /acme/update` and the agent push routes under `/dns/agents/*` and
+  `/dhcp/agents/*` are not API-token routes at all: they take the acme-dns
+  credential and the agent's own JWT or pre-shared key.)
 - **A scope is one domain's route prefix, not one domain's data.** The handlers
   behind a prefix do what the operation needs, in other domains:
   - `ipam:write` creates reverse DNS zones for a new subnet and publishes DNS
@@ -760,7 +761,7 @@ the create dialog.
 
 Scope enforcement runs **before** RBAC: a non-empty scope set narrows the
 token, and the owning user's RBAC still applies on top, so a `read`-scoped
-token owned by an IPAM Editor can list subnets but cannot create one. A scope refusal is a `403` (a revoked, expired or unknown token is the `401`). A `read` token gets the same `403` on any mutation and on a POST that writes or sends traffic outward, while the POST routes that only read (the DNS query and DHCP activity logs, previews and dry runs) accept it, as does the MCP endpoint. A
+token owned by an IPAM Editor can list subnets but cannot create one. A scope refusal is a `403` (a revoked, expired or unknown token is the `401`). A `read` token gets the same `403` on any mutation, on any POST not marked read-only, and on any request (a GET included) that makes SpatiumDDI contact another host, while the POST routes that only read (the DNS query and DHCP activity logs, previews and dry runs) accept it, as does the MCP endpoint. A
 per-token resource-instance binding (`resource_grants`, #374) can narrow
 further to specific `{action, resource_type, resource_id}` grants, validated
 at create time to be a subset of what the issuing user holds.

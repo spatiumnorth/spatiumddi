@@ -1,7 +1,8 @@
 /**
  * The token dialog's scope hints state what the gate enforces (#3302): the
  * read-only hint no longer claims "no mutations anywhere" of a scope that also
- * admits read-only POSTs and MCP, and every write scope says it grants no reads.
+ * admits read-only POSTs and MCP, and every write scope says it grants no reads
+ * outside its own paths.
  */
 import { describe, expect, it } from "vitest";
 
@@ -19,9 +20,11 @@ describe("API_TOKEN_SCOPES hints", () => {
   });
 
   it.each(["ipam:write", "dns:write", "dhcp:write"])(
-    "%s says it grants no reads and cannot use MCP alone",
+    "%s says it grants no reads outside its paths and cannot use MCP alone",
     (scope) => {
-      expect(hint(scope)).toMatch(/Grants no reads: add Read-only/);
+      expect(hint(scope)).toMatch(
+        /No reads outside these paths: add Read-only/,
+      );
       expect(hint(scope)).toMatch(/cannot use MCP/);
     },
   );
