@@ -401,7 +401,9 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 
 - **Scopes** (`scopes: [...]`) — a coarse, closed vocabulary defined in
   [`backend/app/services/api_token_scopes.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/services/api_token_scopes.py):
-  `read`, `ipam:write`, `dns:write`, `dhcp:write`, `agent`. An empty
+  `read`, `ipam:write`, `dns:write`, `dhcp:write`. (An `agent` scope was
+  retired in #3302: the agent routes take the agent's own JWT or PSK, never an
+  API token. Create and update refuse it with 422.) An empty
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
   scopes returns `403 "Token scope insufficient for this request"` (the
@@ -410,14 +412,15 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   Path prefixes match on a whole segment: `dns:write` covers
   `/api/v1/dns/...` but not `/api/v1/dnsbl/...` or `/api/v1/dns-threat/...`.
   `read` permits only safe methods (`GET` / `HEAD` / `OPTIONS`) — plus
-  a JSON-RPC `POST` to the read-only MCP endpoint, plus the POST routes
+  a JSON-RPC `POST` to the MCP endpoint (`/api/v1/ai/mcp`, which dispatches no write tool), plus the POST routes
   that only read (a filter or preview body, no mutation, no outbound probe):
   those carry the `@read_only_post` marker from `api_token_scopes.py`
   (the DNS query log, its analytics and the DHCP activity log under
   `/logs/`, `/tools/mac-vendor`, and the side-effect-free previews /
   validations). The Windows Event Log and DHCP audit pulls (`/logs/query`,
   `/logs/dhcp-audit`) are not marked: they run PowerShell on the Windows
-  server over WinRM, so they need a write scope. The set is pinned by
+  server over WinRM, and no write scope covers `/logs`, so they need an
+  unrestricted token. The set is pinned by
   `tests/test_token_read_only_post_3223.py`.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
   specific `subnet` or `dns_zone` instance with an
@@ -435,6 +438,27 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
 
 A token can never exceed its owner's RBAC: the scope / grant check is
 an *additional* gate, applied on top of the owning user's permissions.
+
+**Declaring a new POST route.** The token-scope gate reads every POST as a
+write unless the handler says otherwise, so each POST outside the agent
+surfaces (`/api/v1/dns/agents`, `/api/v1/dhcp/agents`) must state which it is,
+directly under its `@router.post(...)` decorator:
+
+- `@read_only_post` when the body is only a filter, preview or dry run: no row
+  written (an audit row for the read excepted), no queued op, nothing sent
+  outward. A `read` token may then call it.
+- `@token_write("reason")` for everything else, with a real reason: it mutates
+  state, queues an op, sends traffic outward (a probe, a live pull from a
+  managed server), or is a read deliberately kept write-scoped. "Not reviewed"
+  is refused when the module imports. This changes no behaviour; it records the
+  decision.
+
+Both live in `app/services/api_token_scopes.py`.
+`tests/test_token_post_classification_3302.py` fails CI for a new POST with
+neither. The ~390 older unclassified routes sit in
+`backend/token_unclassified_posts_baseline.txt`, which may only shrink:
+annotate a handler, then re-record with
+`python tests/test_token_post_classification_3302.py --baseline`.
 
 See [`features/AUTH.md`](features/AUTH.md) for the full auth provider,
 MFA, and session model.

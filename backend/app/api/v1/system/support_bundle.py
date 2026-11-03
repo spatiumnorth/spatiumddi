@@ -39,6 +39,7 @@ from app.core.content_disposition import content_disposition
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
+from app.services.api_token_scopes import token_write
 from app.services.support_bundle import generate
 
 logger = structlog.get_logger(__name__)
@@ -111,6 +112,9 @@ def _audit(user: Any, scrubbed: bool, action: str) -> AuditLog:
 
 
 @router.post("/preview", response_model=BundlePreviewOut)
+@token_write(
+    "Builds the full diagnostics bundle to preview it, reads platform-wide data and writes an audit row; SuperAdmin-only"
+)
 async def preview_support_bundle(
     body: BundleRequest, db: DB, current_user: SuperAdmin
 ) -> BundlePreviewOut:
