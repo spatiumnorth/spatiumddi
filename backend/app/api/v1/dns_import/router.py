@@ -26,7 +26,7 @@ from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
-from app.services.api_token_scopes import read_only_post
+from app.services.api_token_scopes import read_only_post, token_write
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns_import import (
@@ -617,6 +617,7 @@ async def windows_dns_servers(
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live WinRM pull from a Windows DNS server with stored credentials (outbound)")
 async def windows_dns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -774,6 +775,7 @@ async def powerdns_test_connection(
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live pull from a PowerDNS API (outbound)")
 async def powerdns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -908,6 +910,7 @@ async def technitium_test_connection(
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live pull from a Technitium API (outbound)")
 async def technitium_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -1043,6 +1046,7 @@ async def cloud_dns_servers(
 
 
 @router.post("/cloud/preview", response_model=PreviewOut)
+@token_write("Live pull from a cloud DNS provider API with stored credentials (outbound)")
 async def cloud_dns_preview(
     current_user: SuperAdmin,
     db: DB,
