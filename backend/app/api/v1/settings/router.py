@@ -58,6 +58,7 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services import feature_modules as fm_svc
+from app.services.api_token_scopes import token_write
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
     mask_proxy_url,
@@ -3161,6 +3162,9 @@ class AptValidateResponse(BaseModel):
 
 
 @router.post("/apt/validate", response_model=AptValidateResponse)
+@token_write(
+    "Structural check of a candidate APT config, no save; kept write-scoped because it needs write on settings and may create the settings singleton row on first read"
+)
 async def validate_apt_config(
     body: AptValidateRequest,
     current_user: CurrentUser,

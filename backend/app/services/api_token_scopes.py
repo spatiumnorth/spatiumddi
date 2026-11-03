@@ -65,6 +65,7 @@ from typing import Any
 
 _READ_ONLY_POST_ATTR = "__token_read_only_post__"
 _OUTBOUND_ATTR = "__token_outbound__"
+_WRITE_ATTR = "__token_write__"
 
 
 def read_only_post[F: Callable[..., Any]](fn: F) -> F:
@@ -106,6 +107,41 @@ def token_outbound[F: Callable[..., Any]](fn: F) -> F:
 
 def is_token_outbound(endpoint: object) -> bool:
     return bool(getattr(endpoint, _OUTBOUND_ATTR, False))
+
+
+# Reasons that say nothing. A reason is the review record for "this POST is
+# not read-only"; "not reviewed" is the absence of one (#3302).
+_EMPTY_REASON = re.compile(r"\b(not reviewed|unreviewed|todo|tbd|fixme|unknown)\b", re.I)
+
+
+def token_write[F: Callable[..., Any]](reason: str) -> Callable[[F], F]:
+    """Declare a POST handler a write for the coarse token-scope gate, and say why.
+
+    The counterpart of :func:`read_only_post`: every POST under a non-agent
+    prefix carries one of the two, so "a ``read`` token is refused" is a
+    recorded decision rather than the default nobody looked at (#3302,
+    ``tests/test_token_post_classification_3302.py``). Changes no behaviour -
+    an unmarked POST is already a write; this is metadata for the guard.
+
+    ``reason`` states what makes it a write or why it is deliberately kept
+    write-scoped: it mutates state, queues an op, sends traffic outward, or is
+    a read left behind a stronger gate on purpose. It must be a real sentence;
+    "not reviewed" and the like are refused at import. Apply under the
+    ``@router.post(...)`` decorator.
+    """
+    if len(reason.strip()) < 15 or _EMPTY_REASON.search(reason):
+        raise ValueError(f"token_write needs a real reason, got {reason!r}")
+
+    def deco(fn: F) -> F:
+        setattr(fn, _WRITE_ATTR, reason.strip())
+        return fn
+
+    return deco
+
+
+def token_write_reason(endpoint: object) -> str | None:
+    reason = getattr(endpoint, _WRITE_ATTR, None)
+    return reason if isinstance(reason, str) else None
 
 
 # Vocabulary — values stored verbatim in ``api_token.scopes``. Any
@@ -451,6 +487,8 @@ __all__ = [
     "scope_matches_request",
     "scopes_allow_outbound_tool",
     "token_outbound",
+    "token_write",
+    "token_write_reason",
     "validate_resource_grant_shape",
     "validate_scopes",
 ]

@@ -48,6 +48,7 @@ from app.models.overlay import (
     RoutingPolicy,
 )
 from app.models.ownership import Customer, Site
+from app.services.api_token_scopes import token_write
 from app.services.tags import apply_tag_filter
 
 # Single router; sub-paths live as separate decorated handlers below.
@@ -1020,6 +1021,9 @@ async def get_topology(overlay_id: uuid.UUID, db: DB, _: CurrentUser) -> Topolog
 
 
 @router.post("/{overlay_id:uuid}/simulate", response_model=SimulateResponse)
+@token_write(
+    "Pure DB what-if, never writes; kept write-scoped for now, a candidate for @read_only_post (RBAC is only CurrentUser)"
+)
 async def simulate(
     overlay_id: uuid.UUID,
     body: SimulateRequest,
