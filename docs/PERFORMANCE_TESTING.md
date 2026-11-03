@@ -782,7 +782,7 @@ so they align with appliance 60s metric buckets.
 Ground-truth names that exist in our zones:
 
 - **DDNS forward names** — `_generate_hostname(ip_str)` (`ddns.py:162`): for IPv4,
-  **`dhcp-<3rd>-<4th>`** (e.g. `10.1.20.5` → `dhcp-20-5`) under `always_generate`,
+  **`dhcp-<a>-<b>-<c>-<d>`** (e.g. `10.1.20.5` → `dhcp-10-1-20-5`) under `always_generate`,
   or the sanitised client hostname under `client_or_generated`. Either way an `A`
   (and `AAAA` for v6) in the subnet's forward zone, with a matching `PTR` in the
   reverse zone (`router.py:1308-1344`).
