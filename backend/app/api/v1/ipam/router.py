@@ -40,6 +40,7 @@ from app.core.permissions import (
     effective_grants,
     is_effective_superadmin,
     require_any_resource_or_scoped,
+    scoped_grant_refusal,
     token_scope_allows,
     token_scoped_resource_ids,
     type_level_allows,
@@ -1315,7 +1316,7 @@ def _assert_scoped_item_bindings(
         if _binding_value(value) != _binding_value(getattr(row, field, None)):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Permission denied: changing '{field}' needs 'write' on '{rtype}'",
+                detail=scoped_grant_refusal(field, rtype),
             )
 
 
@@ -7569,7 +7570,7 @@ async def update_subnet(
             if _binding_value(getattr(body, field)) != _binding_value(getattr(subnet, field)):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Permission denied: changing '{field}' needs 'write' on 'subnet'",
+                    detail=scoped_grant_refusal(field, "subnet"),
                 )
         await _assert_scoped_zones(
             db,
