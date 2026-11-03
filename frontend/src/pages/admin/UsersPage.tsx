@@ -755,6 +755,7 @@ export function UsersPage() {
                         onClick={() => setEditUser(user)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        aria-label="Edit"
                         {...superadminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -766,6 +767,7 @@ export function UsersPage() {
                           onClick={() => setResetUser(user)}
                           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Reset password"
+                          aria-label="Reset password"
                           {...superadminGate}
                         >
                           <KeyRound className="h-3.5 w-3.5" />
@@ -776,6 +778,7 @@ export function UsersPage() {
                         onClick={() => setDeleteUser(user)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        aria-label="Delete"
                         {...superadminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />

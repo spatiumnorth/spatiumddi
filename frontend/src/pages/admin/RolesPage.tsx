@@ -462,6 +462,7 @@ export function RolesPage() {
                         onClick={() => setCloneRole(role)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Clone"
+                        aria-label="Clone"
                         {...adminGate}
                       >
                         <Copy className="h-3.5 w-3.5" />
@@ -471,6 +472,11 @@ export function RolesPage() {
                         disabled={role.is_builtin}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
                         title={
+                          role.is_builtin
+                            ? "Built-in roles cannot be deleted"
+                            : "Delete"
+                        }
+                        aria-label={
                           role.is_builtin
                             ? "Built-in roles cannot be deleted"
                             : "Delete"

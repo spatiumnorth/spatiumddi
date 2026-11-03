@@ -5495,6 +5495,7 @@ export function ZoneDetailView({
                                   className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                                   onClick={() => setEditRecord(r)}
                                   title="Edit record"
+                                  aria-label="Edit record"
                                   {...permissionGate(
                                     canWriteRecords,
                                     NEEDS_DNS_WRITE,
@@ -5506,6 +5507,7 @@ export function ZoneDetailView({
                                   className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                                   onClick={() => setConfirmDeleteRecord(r)}
                                   title="Delete record"
+                                  aria-label="Delete record"
                                   {...permissionGate(
                                     canDeleteRecords,
                                     NEEDS_DNS_DELETE,
@@ -6295,6 +6297,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   setEditServer(s);
                 }}
                 title="Edit server"
+                aria-label="Edit server"
                 {...serverGate}
               >
                 <Pencil className="h-3.5 w-3.5" />
@@ -6306,6 +6309,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   setConfirmDeleteServer(s);
                 }}
                 title="Delete server"
+                aria-label="Delete server"
                 {...serverGate}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -6527,6 +6531,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                       title="Edit view"
+                      aria-label="Edit view"
                       onClick={() => {
                         setError("");
                         setEditing(v);
@@ -6541,6 +6546,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                       title="Delete view"
+                      aria-label="Delete view"
                       onClick={() => {
                         setError("");
                         setConfirmDelete(v);
@@ -7157,6 +7163,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
                   setConfirmDelete(acl);
                 }}
                 title="Delete ACL"
+                aria-label="Delete ACL"
                 {...permissionGate(
                   can("delete", "dns_group"),
                   NEEDS_GROUP_DELETE,
@@ -7352,6 +7359,7 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                       onClick={() => setEditKey(k)}
                       className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted/50 disabled:opacity-40"
                       title="Edit metadata"
+                      aria-label="Edit metadata"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Pencil className="h-3 w-3" />
@@ -7363,6 +7371,7 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                       }}
                       className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                       title="Delete key"
+                      aria-label="Delete key"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Trash2 className="h-3 w-3" />
@@ -9476,6 +9485,11 @@ function RecordsTab({
                               ? "Auto-managed — edit the source IP/lease"
                               : "Edit"
                           }
+                          aria-label={
+                            rec.auto_generated
+                              ? "Auto-managed — edit the source IP/lease"
+                              : "Edit"
+                          }
                           {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
                         >
                           <Pencil className="h-3.5 w-3.5" />
@@ -9485,6 +9499,11 @@ function RecordsTab({
                           disabled={rec.auto_generated}
                           className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
                           title={
+                            rec.auto_generated
+                              ? "Auto-managed — delete the source IP/lease"
+                              : "Delete"
+                          }
+                          aria-label={
                             rec.auto_generated
                               ? "Auto-managed — delete the source IP/lease"
                               : "Delete"
@@ -10842,6 +10861,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       {views.length > 0 && (
                         <button
                           title="Scope to specific views"
+                          aria-label="Scope to specific views"
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => setScopeList(l)}
                           {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
@@ -10852,6 +10872,11 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       {l.source_type === "url" && l.feed_url && (
                         <button
                           title={
+                            refreshing.has(l.id)
+                              ? "Refresh in progress…"
+                              : "Refresh from feed"
+                          }
+                          aria-label={
                             refreshing.has(l.id)
                               ? "Refresh in progress…"
                               : "Refresh from feed"
@@ -11491,6 +11516,7 @@ export function BlocklistDetail({
                             setEditEntryWildcard(e.is_wildcard);
                           }}
                           title="Edit domain"
+                          aria-label="Edit domain"
                           {...permissionGate(
                             can("write", "dns_blocklist"),
                             NEEDS_BLOCKLIST_WRITE,
@@ -11503,6 +11529,11 @@ export function BlocklistDetail({
                         className="text-muted-foreground hover:text-destructive"
                         onClick={() => deleteEntry.mutate(e.id)}
                         title={
+                          e.source === "manual"
+                            ? "Remove entry"
+                            : "Remove (will return on next feed refresh)"
+                        }
+                        aria-label={
                           e.source === "manual"
                             ? "Remove entry"
                             : "Remove (will return on next feed refresh)"
@@ -11616,6 +11647,7 @@ export function BlocklistDetail({
                           setEditExcReason(ex.reason ?? "");
                         }}
                         title="Edit exception"
+                        aria-label="Edit exception"
                         {...permissionGate(
                           can("write", "dns_blocklist"),
                           NEEDS_BLOCKLIST_WRITE,
@@ -11627,6 +11659,7 @@ export function BlocklistDetail({
                         className="text-muted-foreground hover:text-destructive"
                         onClick={() => deleteException.mutate(ex.id)}
                         title="Remove exception"
+                        aria-label="Remove exception"
                         {...permissionGate(
                           can("delete", "dns_blocklist"),
                           NEEDS_BLOCKLIST_DELETE,
@@ -12678,6 +12711,7 @@ export function DNSPage() {
               className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={() => setShowCreateGroup(true)}
               title="New server group"
+              aria-label="New server group"
               {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Plus className="h-3.5 w-3.5" />

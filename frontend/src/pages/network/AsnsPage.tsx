@@ -299,6 +299,7 @@ function AsnRow({
           <button
             onClick={onEdit}
             title="Edit ASN"
+            aria-label="Edit ASN"
             className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             {...writeGate}
           >

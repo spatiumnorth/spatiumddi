@@ -277,6 +277,7 @@ export function ConformityPage() {
                         <button
                           type="button"
                           title="Re-evaluate now"
+                          aria-label="Re-evaluate now"
                           onClick={() => evaluateMut.mutate(p.id)}
                           className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={evaluateMut.isPending}
@@ -287,6 +288,7 @@ export function ConformityPage() {
                         <button
                           type="button"
                           title="Edit"
+                          aria-label="Edit"
                           onClick={() => setEditing(p)}
                           className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           {...adminGate}
@@ -297,6 +299,7 @@ export function ConformityPage() {
                           <button
                             type="button"
                             title="Delete"
+                            aria-label="Delete"
                             onClick={() => {
                               if (
                                 confirm(

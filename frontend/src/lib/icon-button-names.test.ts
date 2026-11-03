@@ -41,6 +41,7 @@ import ts from "typescript";
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NAMING = new Set(["aria-label", "aria-labelledby", "title"]);
+const DURABLE = new Set(["aria-label", "aria-labelledby"]);
 const BUTTONS = new Set(["button", "Button", "HeaderButton"]);
 // A spread of a permission gate gives a title only while denied (#3160):
 // `permissionGate(...)`, `dhcpGate(...)`, `writeGate`. Matched as a whole
@@ -77,11 +78,20 @@ function unnamedIconButtons(fileName: string, code: string): number[] {
   const visit = (n: ts.Node) => {
     if (ts.isJsxElement(n) && BUTTONS.has(n.openingElement.tagName.getText())) {
       const props = n.openingElement.attributes.properties;
+      // A permission gate overwrites `title` with the refusal reason while
+      // denied, so beside one only a real aria-label / aria-labelledby is a
+      // name that survives (#3395).
+      const gated = props.some(
+        (a) =>
+          ts.isJsxSpreadAttribute(a) &&
+          GATE_SPREAD.test(a.expression.getText()),
+      );
+      const naming = gated ? DURABLE : NAMING;
       const named = props.some(
         (a) =>
           (ts.isJsxSpreadAttribute(a) &&
             !GATE_SPREAD.test(a.expression.getText())) ||
-          (ts.isJsxAttribute(a) && NAMING.has(a.name.getText())),
+          (ts.isJsxAttribute(a) && naming.has(a.name.getText())),
       );
       let content = false;
       let icon = false;
@@ -152,6 +162,10 @@ describe("icon-only buttons", () => {
     [
       "only a gate identifier spread",
       "<button onClick={f} {...writeGate}><Trash2 /></button>",
+    ],
+    [
+      "a title plus a gate spread (the gate replaces the title)",
+      "<button title='Edit' {...superadminGate}><Pencil /></button>",
     ],
     ["aria-hidden but no name", "<button aria-hidden='true'><X /></button>"],
   ])("flags an unnamed button holding %s", (_, jsx) => {

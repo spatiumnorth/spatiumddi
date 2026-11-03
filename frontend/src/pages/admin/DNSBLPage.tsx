@@ -301,6 +301,7 @@ export function DNSBLPage() {
                 type="button"
                 className="rounded p-1.5 hover:bg-accent"
                 title="Unpin"
+                aria-label="Unpin"
                 {...deleteGate}
                 onClick={() => setConfirmUnpin(p)}
               >
@@ -391,6 +392,7 @@ export function DNSBLPage() {
                             type="button"
                             className="rounded p-1.5 hover:bg-accent"
                             title="Delete custom list"
+                            aria-label="Delete custom list"
                             {...deleteGate}
                             onClick={() => setConfirmDelete(l)}
                           >

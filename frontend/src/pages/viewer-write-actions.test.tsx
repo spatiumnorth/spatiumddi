@@ -106,8 +106,28 @@ async function permissionsLoaded() {
   await act(async () => {});
 }
 
+/** A refused icon-only button keeps its action name (#3395) but is disabled. */
+function expectRefused(name: string | RegExp) {
+  for (const b of screen.queryAllByRole("button", { name }))
+    expect((b as HTMLButtonElement).disabled).toBe(true);
+}
+
+/** A refused icon-only button is named by its action (aria-label, #3395) and
+ *  carries the refusal reason as its tooltip: find it by either. */
+function gated(name: string | RegExp): HTMLElement {
+  const byRole = screen.queryAllByRole("button", { name });
+  if (byRole.length === 1) return byRole[0];
+  // Only the icon buttons carry an aria-label; a text button's title is
+  // the same reason and must not make the lookup ambiguous.
+  const byTitle = screen
+    .queryAllByTitle(name)
+    .filter((el) => el.hasAttribute("aria-label"));
+  if (byTitle.length !== 1) return screen.getByTitle(name);
+  return byTitle[0];
+}
+
 function button(name: string | RegExp): HTMLButtonElement {
-  return screen.getByRole("button", { name }) as HTMLButtonElement;
+  return gated(name) as HTMLButtonElement;
 }
 
 /** Each named control is disabled and says why. */
@@ -247,9 +267,7 @@ describe("#1338 the DNS page", () => {
     expectDenied(["Add Zone", /From Template/], ZONE_WRITE);
     // The tree's "New server group" is an icon button: while denied it is
     // named by its tooltip, the reason (as #1175's icon buttons are).
-    expect(
-      screen.queryByRole("button", { name: "New server group" }),
-    ).toBeNull();
+    expectRefused("New server group");
     for (const tab of TAB_CREATES.slice(1)) {
       cleanup();
       await openDns(tab[0]);
@@ -459,7 +477,7 @@ describe("#1339 the DHCP page", () => {
     );
     // The icon buttons are named by their tooltip, the reason, while denied.
     for (const name of ["New group", "Edit server", "Delete server"]) {
-      expect(screen.queryByRole("button", { name })).toBeNull();
+      expectRefused(name);
     }
     await eachKeaTab((create, reason) => expectDenied([create], reason));
   });
@@ -581,7 +599,7 @@ describe("#1340 the Network and integration pages", () => {
     await openPage("/network/vlans", "vlans/VLANsPage", "VLANsPage");
     await screen.findByTitle(/^Refresh routers/);
     await permissionsLoaded();
-    expect(screen.queryByRole("button", { name: "New Router" })).toBeNull();
+    expectRefused("New Router");
   });
 
   it("offers a Viewer neither a customer's Edit nor its Delete", async () => {
