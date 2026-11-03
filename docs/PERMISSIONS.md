@@ -158,6 +158,12 @@ on inactive.
    satisfy an unscoped check (one passed without `resource_id`). This prevents
    "I have write on *this one* subnet" from accidentally granting "write on
    subnets in general".
+   **Placing a child under a block (#3425).** Creating a subnet in a block,
+   allocating one from it, moving a subnet or block into it, and applying a
+   plan anchored on it need `write` on that **target block** as well as the
+   check on the thing being created or moved. A grant scoped to the block (or
+   an unscoped one) passes; a grant scoped to the block's space does not, since
+   grants match ids, not ancestry. A refusal is a 403 naming the target block.
    **IPAM subnets (#2438).** A `read` / `write` grant scoped to one subnet
    reaches that subnet and its addresses and nothing else. The routes it
    opens are an allow-list, so a route added later stays closed to it until
