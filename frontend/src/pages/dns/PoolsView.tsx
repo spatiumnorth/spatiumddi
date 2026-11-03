@@ -25,6 +25,8 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -419,17 +421,32 @@ function parseCidrs(raw: string): string[] {
     .filter(Boolean);
 }
 
-export function PoolModal({
-  group,
-  zone,
-  pool,
-  onClose,
-}: {
+type PoolModalProps = {
   group: DNSServerGroup;
   zone: DNSZone;
   pool?: DNSPool;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the pool (members included) fresh on open, Save sends only the
+// changed pool fields and reconciles members against that read (#3379), so a
+// member added elsewhere since the list loaded is kept.
+export function PoolModal(props: PoolModalProps) {
+  const fresh = useFreshRow(props.pool, () => dnsApi.getPool(props.pool!.id));
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit pool"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PoolModalForm {...props} pool={fresh.row} />;
+}
+
+function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
   const qc = useQueryClient();
   const editing = !!pool;
   const [name, setName] = useState(pool?.name ?? "");
@@ -507,7 +524,31 @@ export function PoolModal({
         hc_healthy_threshold: hcHealthy,
       };
       if (editing) {
-        const updated = await dnsApi.updatePool(pool!.id, body);
+        const diff = changedFields(
+          {
+            name: pool!.name,
+            description: pool!.description ?? "",
+            record_name: pool!.record_name,
+            record_type: pool!.record_type,
+            ttl: pool!.ttl,
+            enabled: pool!.enabled,
+            hc_type: pool!.hc_type,
+            hc_target_port: pool!.hc_target_port,
+            hc_path: pool!.hc_path,
+            hc_method: pool!.hc_method,
+            hc_verify_tls: pool!.hc_verify_tls,
+            hc_expected_status_codes: pool!.hc_expected_status_codes,
+            hc_interval_seconds: pool!.hc_interval_seconds,
+            hc_timeout_seconds: pool!.hc_timeout_seconds,
+            hc_unhealthy_threshold: pool!.hc_unhealthy_threshold,
+            hc_healthy_threshold: pool!.hc_healthy_threshold,
+          },
+          { ...body },
+        );
+        const updated =
+          Object.keys(diff).length === 0
+            ? pool!
+            : await dnsApi.updatePool(pool!.id, diff);
         // Reconcile members: add new, remove deleted, update existing.
         const existing = new Map(pool!.members.map((m) => [m.id, m]));
         const desired = new Map(

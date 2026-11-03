@@ -30,6 +30,8 @@ vi.mock("@/lib/api", async () => {
     dnsApi: {
       ...actual.dnsApi,
       listGroups: () => Promise.resolve([]),
+      // The edit dialog reads the server fresh on open (#3379).
+      listServers: () => Promise.resolve([STORED]),
       createServer: (...a: unknown[]) => createServer(...a),
       updateServer: (...a: unknown[]) => updateServer(...a),
     },
@@ -64,12 +66,12 @@ const STORED = {
   },
 } as unknown as DNSServer;
 
-function ui(server?: DNSServer) {
+function ui(server?: DNSServer, onClose: () => void = () => {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
       <MemoryRouter>
-        <ServerModal groupId="g1" server={server} onClose={() => {}} />
+        <ServerModal groupId="g1" server={server} onClose={onClose} />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -82,27 +84,29 @@ const useTls = () => control<HTMLInputElement>("Use HTTPS (port 5986)");
 const verifyTls = () => control<HTMLInputElement>("Verify TLS certificate");
 
 describe("Windows DNS WinRM settings round-trip", () => {
-  it("the edit dialog shows the stored settings", () => {
+  it("the edit dialog shows the stored settings", async () => {
     ui(STORED);
+    await screen.findByText("WinRM Port", { selector: "label" });
     expect(port().value).toBe("5986");
     expect(transport().value).toBe("credssp");
     expect(useTls().checked).toBe(true);
     expect(verifyTls().checked).toBe(true);
   });
 
-  it("an untouched save sends no WinRM block", async () => {
+  it("an untouched save sends nothing (no WinRM block) and closes", async () => {
     updateServer.mockResolvedValue({ id: "s1" });
-    ui(STORED);
+    const onClose = vi.fn();
+    ui(STORED, onClose);
+    await screen.findByText("WinRM Port", { selector: "label" });
     fireEvent.submit(port().form!);
-    await waitFor(() => expect(updateServer).toHaveBeenCalled());
-    expect(updateServer.mock.calls[0][2]).not.toHaveProperty(
-      "windows_credentials",
-    );
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateServer).not.toHaveBeenCalled();
   });
 
   it("an edit sends only the setting the operator changed", async () => {
     updateServer.mockResolvedValue({ id: "s1" });
     ui(STORED);
+    await screen.findByText("WinRM Port", { selector: "label" });
     fireEvent.change(transport(), { target: { value: "ntlm" } });
     fireEvent.submit(port().form!);
     await waitFor(() => expect(updateServer).toHaveBeenCalled());

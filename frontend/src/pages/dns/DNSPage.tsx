@@ -1486,15 +1486,34 @@ function GroupModalForm({
 
 // ── Server Modal (add / edit) ─────────────────────────────────────────────────
 
-export function ServerModal({
-  groupId,
-  server,
-  onClose,
-}: {
+type ServerModalProps = {
   groupId: string;
   server?: DNSServer;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the server fresh on open and Save sends only what changed
+// (#3379): the clicked row comes from a list loaded earlier.
+export function ServerModal(props: ServerModalProps) {
+  const fresh = useFreshRow(props.server, () =>
+    dnsApi
+      .listServers(props.groupId)
+      .then((rows) => rows.find((s) => s.id === props.server!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerModalForm {...props} server={fresh.row} />;
+}
+
+function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const editing = !!server;
@@ -1760,6 +1779,48 @@ export function ServerModal({
       }
     }
 
+    if (server) {
+      // Edit sends only what the operator changed (#3379); credentials,
+      // api_key, group move and primary flag are already conditional above.
+      const baseKeys = [
+        "name",
+        "driver",
+        "host",
+        "port",
+        "api_port",
+        "roles",
+        "notes",
+        "is_enabled",
+      ];
+      const base = Object.fromEntries(
+        baseKeys.filter((k) => k in payload).map((k) => [k, payload[k]]),
+      );
+      const rest = Object.fromEntries(
+        Object.entries(payload).filter(([k]) => !baseKeys.includes(k)),
+      );
+      const out = {
+        ...changedFields(
+          {
+            name: server.name,
+            driver: server.driver,
+            host: server.host,
+            port: server.port,
+            api_port: server.api_port ?? null,
+            roles: server.roles ?? [],
+            notes: server.notes ?? "",
+            is_enabled: server.is_enabled,
+          },
+          base,
+        ),
+        ...rest,
+      };
+      if (Object.keys(out).length === 0) {
+        onClose();
+        return;
+      }
+      mut.mutate(out);
+      return;
+    }
     mut.mutate(payload);
   }
 
@@ -7374,17 +7435,39 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   );
 }
 
-function TSIGKeyModal({
-  groupId,
-  existing,
-  onClose,
-  onCreated,
-}: {
+type TSIGKeyModalProps = {
   groupId: string;
   existing?: DNSTSIGKey;
   onClose: () => void;
   onCreated?: (s: { name: string; algorithm: string; secret: string }) => void;
-}) {
+};
+
+// Edit reads the key fresh on open and Save sends only what changed (#3379).
+export function TSIGKeyModal(props: TSIGKeyModalProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    dnsApi
+      .listTSIGKeys(props.groupId)
+      .then((rows) => rows.find((k) => k.id === props.existing!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit TSIG Key"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <TSIGKeyModalForm {...props} existing={fresh.row} />;
+}
+
+function TSIGKeyModalForm({
+  groupId,
+  existing,
+  onClose,
+  onCreated,
+}: TSIGKeyModalProps) {
   const qc = useQueryClient();
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
@@ -7405,12 +7488,17 @@ function TSIGKeyModal({
   const saveMut = useMutation({
     mutationFn: () => {
       if (isEdit && existing) {
-        return dnsApi.updateTSIGKey(groupId, existing.id, {
-          name,
-          algorithm,
-          purpose: purpose || null,
-          notes,
-        });
+        const diff = changedFields(
+          {
+            name: existing.name,
+            algorithm: existing.algorithm,
+            purpose: existing.purpose || null,
+            notes: existing.notes ?? "",
+          },
+          { name, algorithm, purpose: purpose || null, notes },
+        );
+        if (Object.keys(diff).length === 0) return Promise.resolve(existing);
+        return dnsApi.updateTSIGKey(groupId, existing.id, diff);
       }
       return dnsApi.createTSIGKey(groupId, {
         name,

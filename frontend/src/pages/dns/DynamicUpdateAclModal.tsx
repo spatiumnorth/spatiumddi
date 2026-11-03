@@ -1,15 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  AlertTriangle,
-  Loader2,
-  Plus,
-  ShieldAlert,
-  Trash2,
-} from "lucide-react";
+import { AlertTriangle, Plus, ShieldAlert, Trash2 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
-import { dnsApi, formatApiError, type UpdateAclEntryInput } from "@/lib/api";
+import {
+  dnsApi,
+  formatApiError,
+  type UpdateAclEntryInput,
+  type ZoneUpdateAcl,
+} from "@/lib/api";
+import { FreshRowError } from "@/components/FreshRowError";
+import { useFreshRow } from "@/hooks/useFreshRow";
 
 /**
  * Dynamic-update (RFC 2136) ACL editor for a single zone (issue #641).
@@ -32,59 +33,85 @@ type Row = UpdateAclEntryInput & { _key: number; _types_text?: string };
 // BIND update-policy ruletypes that take a name argument.
 const NAMED_SCOPES = ["subdomain", "name", "wildcard", "self"];
 
-export function DynamicUpdateAclModal({
-  groupId,
-  zoneId,
-  zoneName,
-  onClose,
-}: {
+type AclModalProps = {
   groupId: string;
   zoneId: string;
   zoneName: string;
   onClose: () => void;
-}) {
+};
+
+// The canonical wire form of one entry, so the saved ACL and the edited rows
+// compare equal regardless of which side produced them.
+function wireEntry(r: UpdateAclEntryInput): UpdateAclEntryInput {
+  return {
+    match_kind: r.match_kind,
+    action: r.action ?? "grant",
+    ip_cidr: r.match_kind === "ip" ? (r.ip_cidr ?? null) : null,
+    tsig_key_id: r.match_kind === "tsig_key" ? (r.tsig_key_id ?? null) : null,
+    name_scope: r.match_kind === "tsig_key" ? r.name_scope || null : null,
+    name_pattern: r.match_kind === "tsig_key" ? r.name_pattern || null : null,
+    record_types:
+      r.match_kind === "tsig_key" && r.record_types && r.record_types.length
+        ? r.record_types
+        : null,
+  };
+}
+
+// The ACL is read fresh on open (#3379): the save replaces the whole set, so
+// seeding from a cached read would delete an entry added elsewhere since.
+export function DynamicUpdateAclModal(props: AclModalProps) {
+  // The ACL is always "present", so the placeholder only switches the hook
+  // into edit mode; the loaded value is what the form uses.
+  const fresh = useFreshRow<ZoneUpdateAcl>({} as ZoneUpdateAcl, () =>
+    dnsApi.getZoneUpdateAcl(props.groupId, props.zoneId),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Dynamic updates · ${props.zoneName.replace(/\.$/, "")}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <DynamicUpdateAclForm {...props} acl={fresh.row} />;
+}
+
+function DynamicUpdateAclForm({
+  groupId,
+  zoneId,
+  zoneName,
+  onClose,
+  acl,
+}: AclModalProps & { acl: ZoneUpdateAcl }) {
   const qc = useQueryClient();
   const rowKey = useRef(0);
   const nextKey = () => (rowKey.current += 1);
 
-  const [enabled, setEnabled] = useState(false);
-  const [rows, setRows] = useState<Row[]>([]);
-  const seededRef = useRef(false);
-
-  const aclQuery = useQuery({
-    queryKey: ["dns-zone-update-acl", groupId, zoneId],
-    queryFn: () => dnsApi.getZoneUpdateAcl(groupId, zoneId),
-  });
+  const [enabled, setEnabled] = useState(acl.dynamic_update_enabled);
+  const [rows, setRows] = useState<Row[]>(() =>
+    acl.entries.map((e) => ({
+      _key: nextKey(),
+      match_kind: e.match_kind,
+      action: e.action,
+      ip_cidr: e.ip_cidr,
+      tsig_key_id: e.tsig_key_id,
+      name_scope: e.name_scope,
+      name_pattern: e.name_pattern,
+      record_types: e.record_types,
+    })),
+  );
+  // What the server holds as far as this dialog knows: the fresh read, then
+  // the last saved response (the dialog stays open after a save).
+  const [stored, setStored] = useState(acl);
 
   const keysQuery = useQuery({
     queryKey: ["dns-tsig-keys", groupId],
     queryFn: () => dnsApi.listTSIGKeys(groupId),
   });
 
-  // Seed local editable state once, the first time the server response
-  // arrives (a ref guard, not setState-during-render, so a later refetch
-  // doesn't clobber in-progress edits).
-  useEffect(() => {
-    if (!aclQuery.data || seededRef.current) return;
-    seededRef.current = true;
-    setEnabled(aclQuery.data.dynamic_update_enabled);
-    setRows(
-      aclQuery.data.entries.map((e) => ({
-        _key: nextKey(),
-        match_kind: e.match_kind,
-        action: e.action,
-        ip_cidr: e.ip_cidr,
-        tsig_key_id: e.tsig_key_id,
-        name_scope: e.name_scope,
-        name_pattern: e.name_pattern,
-        record_types: e.record_types,
-      })),
-    );
-    // nextKey is a stable ref bump; aclQuery.data is the real trigger.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [aclQuery.data]);
-
-  const caps = aclQuery.data?.caps;
+  const caps = acl.caps;
   const supported = caps?.supported ?? false;
   const fineGrained = caps?.supports_name_scoping ?? false;
   const hasIpEntry = rows.some((r) => r.match_kind === "ip");
@@ -107,34 +134,32 @@ export function DynamicUpdateAclModal({
   );
 
   const saveMut = useMutation({
-    mutationFn: () =>
-      dnsApi.replaceZoneUpdateAcl(groupId, zoneId, {
+    mutationFn: async () => {
+      const entries = rows.map(wireEntry);
+      const unchanged =
+        enabled === stored.dynamic_update_enabled &&
+        JSON.stringify(entries) ===
+          JSON.stringify(stored.entries.map(wireEntry));
+      // Nothing changed against the fresh read: send nothing (#3379).
+      if (unchanged) return null;
+      return dnsApi.replaceZoneUpdateAcl(groupId, zoneId, {
         dynamic_update_enabled: enabled,
-        entries: rows.map((r) => ({
-          match_kind: r.match_kind,
-          action: r.action ?? "grant",
-          ip_cidr: r.match_kind === "ip" ? (r.ip_cidr ?? null) : null,
-          tsig_key_id:
-            r.match_kind === "tsig_key" ? (r.tsig_key_id ?? null) : null,
-          name_scope: r.match_kind === "tsig_key" ? r.name_scope || null : null,
-          name_pattern:
-            r.match_kind === "tsig_key" ? r.name_pattern || null : null,
-          record_types:
-            r.match_kind === "tsig_key" &&
-            r.record_types &&
-            r.record_types.length
-              ? r.record_types
-              : null,
-        })),
-      }),
+        entries,
+      });
+    },
     onSuccess: (data) => {
+      if (!data) {
+        onClose();
+        return;
+      }
+      setStored(data);
       qc.setQueryData(["dns-zone-update-acl", groupId, zoneId], data);
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["dns-records", zoneId] });
     },
   });
 
-  const savedWarnings = saveMut.data?.warnings ?? aclQuery.data?.warnings ?? [];
+  const savedWarnings = saveMut.data?.warnings ?? acl.warnings ?? [];
 
   const addRow = () =>
     setRows((rs) => [
@@ -160,26 +185,13 @@ export function DynamicUpdateAclModal({
   return (
     <Modal title={`Dynamic updates · ${displayName}`} onClose={onClose} wide>
       <div className="space-y-4 text-sm">
-        {aclQuery.isLoading && (
-          <p className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Loader2 className="h-3 w-3 animate-spin" /> Loading ACL…
-          </p>
-        )}
-        {aclQuery.error && (
-          <p className="text-xs text-destructive">
-            {formatApiError(aclQuery.error, "Could not load the ACL")}
-          </p>
-        )}
-
-        {aclQuery.data && (
+        {acl && (
           <>
             <p className="text-xs text-muted-foreground">
               Authorize external RFC 2136 dynamic-update writers to this zone —
               by TSIG key or source IP/CIDR. This is on top of SpatiumDDI's own
               internal writes. Driver:{" "}
-              <span className="font-mono">
-                {aclQuery.data.driver_names.join(", ")}
-              </span>
+              <span className="font-mono">{acl.driver_names.join(", ")}</span>
             </p>
 
             {!supported && (
