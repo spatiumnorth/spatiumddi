@@ -5193,7 +5193,11 @@ async def update_space(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
     )
-    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
+    await assert_zones_exist(
+        db,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
+    )
     await _assert_dns_groups_exist(db, body.dns_group_ids, already=space.dns_group_ids)
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
@@ -5676,7 +5680,11 @@ async def update_block(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
     )
-    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
+    await assert_zones_exist(
+        db,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
+    )
     await _assert_dns_groups_exist(db, body.dns_group_ids, already=block.dns_group_ids)
 
     # Required custom fields (#2478): checked only when the request sends
@@ -7665,7 +7673,11 @@ async def update_subnet(
         subnet,
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
     )
-    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
+    await assert_zones_exist(
+        db,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[subnet.dns_zone_id, *(subnet.dns_additional_zone_ids or [])],
+    )
     # Per-row: a grant scoped to this subnet suffices (#2438); an unscoped one
     # still does. A scoped holder may not point the subnet at another resource
     # (block, customer, site, VLAN, DHCP / DNS servers) nor at a DNS zone it

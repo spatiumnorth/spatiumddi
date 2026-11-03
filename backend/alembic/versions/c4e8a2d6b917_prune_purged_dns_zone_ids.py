@@ -8,8 +8,9 @@ this removes the ids already stranded, and the ones in a not-yet-applied
 subnet plan's tree.
 
 A zone in the Trash is still a zone (a restore brings it back), so an id is
-dead only when no ``dns_zone`` row has it. Ids are compared as lower-case text
-and the order of the entries kept is preserved. Data-only; the downgrade is a
+dead only when no ``dns_zone`` row has it. Ids are compared by their hex
+digits (any spelling ``uuid.UUID`` reads) and the order of the entries kept is
+preserved. Data-only; the downgrade is a
 no-op (the removed ids named nothing).
 
 Revision ID: c4e8a2d6b917
@@ -31,12 +32,23 @@ branch_labels: str | None = None
 depends_on: str | None = None
 
 
+def _norm(expr: str) -> str:
+    # The 32 hex digits, whatever the spelling: before #2923 an id was stored
+    # as given, and the readers parse it with ``uuid.UUID``, which takes
+    # upper case, braces, no hyphens and ``urn:uuid:``. A plain text compare
+    # would clear such an id although it names a live zone.
+    return f"regexp_replace(lower({expr}), 'urn:|uuid:|[{{}}-]', '', 'g')"
+
+
+_LIVE = "(SELECT replace(id::text, '-', '') FROM dns_zone)"
+
+
 def upgrade() -> None:
     for table in ("ip_space", "ip_block", "subnet", "ipam_template"):
         op.execute(f"""
             UPDATE {table} SET dns_zone_id = NULL
             WHERE dns_zone_id IS NOT NULL AND dns_zone_id <> ''
-              AND lower(dns_zone_id) NOT IN (SELECT id::text FROM dns_zone)
+              AND {_norm("dns_zone_id")} NOT IN {_LIVE}
             """)
     for table, col in (
         ("ip_space", "dns_additional_zone_ids"),
@@ -49,12 +61,12 @@ def upgrade() -> None:
             UPDATE {table} SET {col} = COALESCE((
                 SELECT jsonb_agg(e ORDER BY o)
                 FROM jsonb_array_elements({col}) WITH ORDINALITY AS t(e, o)
-                WHERE lower(e #>> '{{}}') IN (SELECT id::text FROM dns_zone)
+                WHERE {_norm("e #>> '{}'")} IN {_LIVE}
             ), '[]'::jsonb)
             WHERE jsonb_typeof({col}) = 'array'
               AND EXISTS (
                 SELECT 1 FROM jsonb_array_elements({col}) x
-                WHERE lower(x #>> '{{}}') NOT IN (SELECT id::text FROM dns_zone)
+                WHERE {_norm("x #>> '{}'")} NOT IN {_LIVE}
               )
             """)
 

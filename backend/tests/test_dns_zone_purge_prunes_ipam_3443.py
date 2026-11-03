@@ -13,6 +13,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from httpx import AsyncClient
@@ -347,3 +348,186 @@ async def test_plan_naming_a_purged_zone_is_a_conflict(
     body = r.json()
     assert [(c["node_id"], c["kind"]) for c in body["conflicts"]] == [("b", "invalid_binding")]
     assert dead in body["conflicts"][0]["message"]
+
+
+# ── Validation follow-ups ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "factory,fk,url",
+    [
+        ("tailscale", "tailscale_tenant_id", "/api/v1/tailscale/tenants"),
+        ("netbird", "netbird_instance_id", "/api/v1/netbird/instances"),
+    ],
+    ids=["tailscale", "netbird"],
+)
+async def test_integration_delete_prunes_its_cascaded_zones(
+    client: AsyncClient, db_session: AsyncSession, factory: str, fk: str, url: str
+) -> None:
+    """The tenant / instance delete removes its zones by FK CASCADE (Trash rows
+    too), where no zone-delete path sees them."""
+    from app.models.netbird import NetbirdInstance
+    from app.models.tailscale import TailscaleTenant
+
+    db = db_session
+    h = await _headers(db)
+    keep, other = await _zones(db, 2)
+    space = IPSpace(name=f"i3443-{uuid.uuid4().hex[:6]}", description="")
+    db.add(space)
+    await db.flush()
+    if factory == "tailscale":
+        target: object = TailscaleTenant(name=f"t-{uuid.uuid4().hex[:6]}", ipam_space_id=space.id)
+    else:
+        target = NetbirdInstance(
+            name=f"n-{uuid.uuid4().hex[:6]}", api_key_encrypted=b"x", ipam_space_id=space.id
+        )
+    db.add(target)
+    await db.flush()
+    owned = DNSZone(
+        group_id=keep.group_id,
+        name=f"m-{uuid.uuid4().hex[:6]}.mesh.",
+        kind="forward",
+        deleted_at=datetime.now(UTC),
+        **{fk: target.id},  # type: ignore[attr-defined]
+    )
+    db.add(owned)
+    await db.flush()
+    target_id = target.id  # type: ignore[attr-defined]
+    r = await _ipam(db, str(owned.id), str(keep.id), str(other.id))
+    resp = await client.delete(f"{url}/{target_id}", headers=h)
+    assert resp.status_code == 204, resp.text
+    await _assert_pruned(db, r, str(keep.id), str(other.id))
+
+
+async def test_dns_factory_reset_prunes_every_zone_id(db_session: AsyncSession) -> None:
+    """A DNS-only factory reset keeps IPAM and empties dns_zone."""
+    from tests.test_factory_reset_fk_cascade import _wipe
+
+    db = db_session
+    dead, keep, other = await _zones(db, 3)
+    r = await _ipam(db, str(dead.id), str(keep.id), str(other.id))
+    await _wipe("dns")
+    db.expire_all()
+    assert await _col(db, "SELECT dns_zone_id FROM ip_space WHERE id=:i", r["space"]) is None
+    assert await _col(db, "SELECT dns_zone_id FROM ip_block WHERE id=:i", r["block"]) is None
+    for table, col, key in (
+        ("ip_space", "dns_additional_zone_ids", "space"),
+        ("subnet", "dns_additional_zone_ids", "trashed"),
+        ("ip_address", "extra_zone_ids", "addr"),
+        ("ipam_template", "dns_additional_zone_ids", "tpl"),
+    ):
+        assert await _col(db, f"SELECT {col} FROM {table} WHERE id=:i", r[key]) == []
+    tree = await _col(db, "SELECT tree FROM subnet_plan WHERE id=:i", r["plan"])
+    assert [tree["dns_zone_id"], *(c["dns_zone_id"] for c in tree["children"])] == [None] * 3
+
+
+def _spellings(z: uuid.UUID) -> tuple[str, str, str]:
+    return (z.hex, "{" + str(z).upper() + "}", f"urn:uuid:{z}")
+
+
+async def test_migration_keeps_a_live_id_in_another_spelling(db_session: AsyncSession) -> None:
+    """Before #2923 an id was stored as given; ``stored_zone_uuid`` still
+    resolves an unhyphenated or braced one, so the migration must not clear it."""
+    db = db_session
+    (live,) = await _zones(db, 1)
+    hexed, braced, urn = _spellings(live.id)
+    gone = str(uuid.uuid4())
+    space = IPSpace(
+        name=f"m3443-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_zone_id=hexed,
+        dns_additional_zone_ids=[braced, gone, urn],
+    )
+    db.add(space)
+    await db.flush()
+    space_id = space.id
+    await db.commit()
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "alembic/versions/c4e8a2d6b917_prune_purged_dns_zone_ids.py"
+    )
+    spec = importlib.util.spec_from_file_location("mig3443b", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def _run(sync_conn) -> None:
+        with Operations.context(MigrationContext.configure(sync_conn)):
+            mod.upgrade()
+
+    conn = await db.connection()
+    await conn.run_sync(_run)
+    await db.commit()
+    assert await _col(db, "SELECT dns_zone_id FROM ip_space WHERE id=:i", space_id) == hexed
+    assert await _col(db, "SELECT dns_additional_zone_ids FROM ip_space WHERE id=:i", space_id) == [
+        braced,
+        urn,
+    ]
+
+
+async def test_prune_matches_an_id_in_another_spelling(db_session: AsyncSession) -> None:
+    from app.services.ipam.zone_binding import prune_zone_ids
+
+    db = db_session
+    dead, keep = await _zones(db, 2)
+    dead_id, keep_id = dead.id, str(keep.id)
+    hexed, braced, _ = _spellings(dead_id)
+    space = IPSpace(
+        name=f"q3443-{uuid.uuid4().hex[:6]}",
+        description="",
+        dns_zone_id=braced,
+        dns_additional_zone_ids=[hexed, keep_id],
+    )
+    db.add(space)
+    await db.flush()
+    space_id = space.id
+    await db.commit()
+    await prune_zone_ids(db, [dead_id])
+    await db.commit()
+    assert await _col(db, "SELECT dns_zone_id FROM ip_space WHERE id=:i", space_id) is None
+    assert await _col(db, "SELECT dns_additional_zone_ids FROM ip_space WHERE id=:i", space_id) == [
+        keep_id
+    ]
+
+
+async def test_a_row_already_naming_a_dead_zone_still_takes_an_edit(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The edit dialogs send the stored zone on every Save. A row that already
+    names a dead zone (a selective IPAM restore whose zones are gone) must
+    still save an unrelated change; only a NEW dead id is refused."""
+    db = db_session
+    h = await _headers(db)
+    (keep,) = await _zones(db, 1)
+    gone = str(uuid.uuid4())
+    r = await _ipam(db, gone, str(keep.id), str(keep.id))
+    space = (await client.get(f"/api/v1/ipam/spaces/{r['space']}", headers=h)).json()
+    resp = await client.put(
+        f"/api/v1/ipam/spaces/{r['space']}",
+        headers=h,
+        json={
+            "description": "renamed",
+            "dns_zone_id": space["dns_zone_id"],
+            "dns_additional_zone_ids": space["dns_additional_zone_ids"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.put(
+        f"/api/v1/ipam/subnets/{r['subnet']}",
+        headers=h,
+        json={"description": "x", "dns_zone_id": gone, "dns_additional_zone_ids": [gone]},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.put(
+        f"/api/v1/ipam/templates/{r['tpl']}",
+        headers=h,
+        json={"description": "x", "dns_zone_id": gone},
+    )
+    assert resp.status_code == 200, resp.text
+    # A different dead id is still refused on the same row.
+    resp = await client.put(
+        f"/api/v1/ipam/subnets/{r['subnet']}",
+        headers=h,
+        json={"dns_zone_id": str(uuid.uuid4())},
+    )
+    assert resp.status_code == 422, resp.text

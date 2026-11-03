@@ -381,6 +381,7 @@ async def update_template(
             direct_changes.get("dns_zone_id"),
             *(direct_changes.get("dns_additional_zone_ids") or []),
         ],
+        already=[row.dns_zone_id, *(row.dns_additional_zone_ids or [])],
     )
     old_state = {
         "name": row.name,
