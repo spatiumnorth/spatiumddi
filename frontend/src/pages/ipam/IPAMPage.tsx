@@ -8369,7 +8369,9 @@ function EditSubnetModalForm({
           ? !autoAddresses // True = remove, False = add
           : undefined;
       const body = {
-        name: name || undefined,
+        // ``""`` when cleared: ``|| undefined`` was dropped by JSON.stringify,
+        // so the clear answered 200 and the old name stayed (#3370).
+        name,
         description,
         // Explicit null so the operator can clear the gateway (nullable
         // column); ``|| undefined`` was silently dropped (#502).
@@ -8425,7 +8427,7 @@ function EditSubnetModalForm({
       const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
       const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
       const was: Record<string, unknown> = {
-        name: subnet.name || undefined,
+        name: subnet.name ?? "",
         description: subnet.description ?? "",
         gateway: subnet.gateway || null,
         vlan_ref_id: subnet.vlan_ref_id ?? null,
@@ -13175,7 +13177,8 @@ function EditBlockModalForm({
   const mutation = useMutation({
     mutationFn: async () => {
       const now = {
-        name: name || undefined,
+        // ``""`` when cleared, as for a subnet (#3370).
+        name,
         description,
         custom_fields: customFields,
         dns_inherit_settings: dnsInherit,
@@ -13196,7 +13199,7 @@ function EditBlockModalForm({
       // inherited DNS / DHCP fields go out as null, so they are compared as
       // null whatever the stored row holds under an inheriting block.
       const was = {
-        name: block.name || undefined,
+        name: block.name ?? "",
         description: block.description ?? "",
         custom_fields: block.custom_fields ?? {},
         dns_inherit_settings: block.dns_inherit_settings ?? true,
