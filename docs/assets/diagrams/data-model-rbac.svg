@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="470" viewBox="0 0 920 470"
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="580" viewBox="0 0 920 580"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>Auth and RBAC — the permission chain</title>
-  <desc>User links to Group through the user_group association table and Group links to Role through group_role; a Role carries its permissions as a JSONB list of action, resource_type and optional resource_id.</desc>
+  <desc>User links to Group through the user_group association table and Group links to Role through group_role; a Role carries its permissions as a JSONB list of action, resource_type and optional resource_id. A time_bound_grant adds expiring permissions to a Group on top of its roles; auth_group_mapping maps an external directory or identity-provider group onto a Group; an api_token belongs to a User and its scopes and resource grants can only narrow that user's permissions.</desc>
   <defs>
     <linearGradient id="dmr-user" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#8b5cf6"/>
@@ -85,16 +85,44 @@
   <path d="M 814 234 V 296" stroke="#64748b" stroke-width="2" fill="none"
         marker-end="url(#dmr-arrow)"/>
 
-  <rect x="414" y="300" width="480" height="120" rx="12"
+  <rect x="440" y="300" width="454" height="120" rx="12"
         fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
-  <text x="438" y="332" font-size="13" font-weight="600" fill="#0f172a">permissions — a JSONB list on Role</text>
-  <text x="438" y="358" font-size="12" fill="#334155"
+  <text x="464" y="332" font-size="13" font-weight="600" fill="#0f172a">permissions — a JSONB list on Role</text>
+  <text x="464" y="358" font-size="12" fill="#334155"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{ action, resource_type, resource_id? }</text>
-  <text x="438" y="382" font-size="11" fill="#475569">wildcard * is accepted for action and resource_type</text>
-  <text x="438" y="400" font-size="11" fill="#475569">resource_id scopes a permission to a single resource</text>
+  <text x="464" y="382" font-size="11" fill="#475569">wildcard * is accepted for action and resource_type</text>
+  <text x="464" y="400" font-size="11" fill="#475569">resource_id scopes a permission to a single resource</text>
+
+  <!-- time_bound_grant (additive) -->
+  <rect x="40" y="300" width="300" height="84" rx="12"
+        fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="60" y="328" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">time_bound_grant</text>
+  <text x="60" y="350" font-size="11" fill="#475569">adds an action / resource_type / resource_id</text>
+  <text x="60" y="366" font-size="11" fill="#475569">permission to a group until expires_at</text>
+  <path d="M 340 342 H 400 V 238" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4" fill="none"
+        marker-end="url(#dmr-arrow)"/>
+
+  <!-- auth_group_mapping (external group → Group) -->
+  <rect x="40" y="436" width="300" height="84" rx="12"
+        fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="60" y="464" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">auth_group_mapping</text>
+  <text x="60" y="486" font-size="11" fill="#475569">maps a provider's external group to a Group;</text>
+  <text x="60" y="502" font-size="11" fill="#475569">sync_external_user applies it at each login</text>
+  <path d="M 340 478 H 424 V 238" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4" fill="none"
+        marker-end="url(#dmr-arrow)"/>
+
+  <!-- api_token (narrows its owner) -->
+  <rect x="440" y="436" width="454" height="84" rx="12"
+        fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="464" y="464" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">api_token</text>
+  <text x="464" y="486" font-size="11" fill="#475569">owned by a User (user_id); scopes and resource_grants</text>
+  <text x="464" y="502" font-size="11" fill="#475569">can only narrow the owner's permissions, never widen them</text>
 
   <!-- Legend -->
-  <path d="M 40 438 H 62" stroke="#64748b" stroke-width="2" fill="none"
+  <path d="M 40 552 H 62" stroke="#64748b" stroke-width="2" fill="none"
         marker-start="url(#dmr-one)" marker-end="url(#dmr-crow)"/>
-  <text x="82" y="442" font-size="11" fill="#475569">The crow's foot marks the many side; the tick marks the one side.</text>
+  <text x="82" y="556" font-size="11" fill="#475569">The crow's foot marks the many side; the tick marks the one side.</text>
 </svg>

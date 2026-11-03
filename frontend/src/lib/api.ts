@@ -6184,6 +6184,8 @@ export interface UpdateAclEntryInput {
 
 export interface ZoneUpdateAcl {
   zone_id: string;
+  // Version token of the stored ACL (#3381); send it back as expected_version.
+  version: string;
   dynamic_update_enabled: boolean;
   driver_names: string[];
   caps: DynamicUpdateCaps;
@@ -6194,6 +6196,8 @@ export interface ZoneUpdateAcl {
 export interface ZoneUpdateAclReplace {
   dynamic_update_enabled?: boolean | null;
   entries: UpdateAclEntryInput[];
+  // The `version` last read; a stale one answers 409 (#3381). Omitted = unconditional.
+  expected_version?: string | null;
 }
 
 // Generic server-side pagination envelope (#455). Matches the backend
@@ -9068,6 +9072,8 @@ export interface PXEArchMatch {
 }
 
 export interface PXEArchMatchInput {
+  /** Existing rule's id (#3374); omit for a new rule. */
+  id?: string;
   priority?: number;
   match_kind?: PXEMatchKind;
   vendor_class_match?: string | null;

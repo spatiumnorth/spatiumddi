@@ -89,7 +89,7 @@
   <text x="588" y="273" font-size="12" fill="#ffffff">:443 frontend → api</text>
 
   <rect x="572" y="296" width="312" height="40" rx="8" fill="url(#perft-store)"/>
-  <text x="588" y="321" font-size="12" fill="#ffffff">CNPG 1 / Redis 1 / worker 1</text>
+  <text x="588" y="321" font-size="12" fill="#ffffff">CNPG 1 / Redis 1 / api, worker, beat 1</text>
 
   <!-- ================= war-room poller ================= -->
   <path d="M 728 400 V 358" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 4"
