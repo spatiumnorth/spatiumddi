@@ -29,7 +29,8 @@
  *   - an icon wrapped in a lowercase element (`<span><X /></span>`) is not
  *     seen;
  *   - a button with a spread (`{...props}`) is assumed named, since the
- *     spread may carry `aria-label`. The one exception is a permission
+ *     spread may carry `aria-label`. The exceptions are dnd-kit's
+ *     `{...attributes}` / `{...listeners}` (they never carry one) and a permission
  *     gate (`{...permissionGate(...)}`, `{...dhcpGate(...)}`, `{...writeGate}`):
  *     it sets a `title` only while the control is DENIED, so a user who
  *     may press the button gets no name from it (#3160);
@@ -57,6 +58,14 @@ const BUTTONS = new Set(["button", "Button", "HeaderButton"]);
 // identifier, so a spread that merely contains the letters (`navigateProps`,
 // `aggregate`) is still assumed to carry a name.
 const GATE_SPREAD = /(?:^|\W)(?:gate|\w*Gate)\b/;
+// dnd-kit's `useDraggable` / `useSortable` return `attributes` (role, tabIndex,
+// aria-roledescription, aria-describedby) and `listeners` (event handlers).
+// Neither carries an aria-label, so a spread of them names nothing (#3395).
+const DND_SPREAD = /^(?:attributes|listeners)$/;
+const spreadMayName = (a: ts.JsxSpreadAttribute): boolean => {
+  const t = a.expression.getText();
+  return !GATE_SPREAD.test(t) && !DND_SPREAD.test(t);
+};
 
 /**
  * Unnamed icon-only buttons another open change fixes, by file. Each entry
@@ -119,8 +128,7 @@ function unnamedIconButtons(fileName: string, code: string): number[] {
       const naming = wrapper ? WRAPPER_DURABLE : gated ? DURABLE : NAMING;
       const named = props.some(
         (a) =>
-          (ts.isJsxSpreadAttribute(a) &&
-            !GATE_SPREAD.test(a.expression.getText())) ||
+          (ts.isJsxSpreadAttribute(a) && spreadMayName(a)) ||
           (ts.isJsxAttribute(a) && naming.has(a.name.getText())),
       );
       let content = false;
@@ -205,6 +213,10 @@ describe("icon-only buttons", () => {
     [
       "a wrapper component given a title and a gate",
       "<IconBtn title='Edit' onClick={f} {...writeGate}><Pencil /></IconBtn>",
+    ],
+    [
+      "dnd-kit attributes/listeners spreads (they carry no name)",
+      "<button {...listeners} {...attributes} title='Drag' {...writeGate}><GripVertical /></button>",
     ],
     ["an icon behind &&", "<button>{busy && <Loader2 />}</button>"],
     ["aria-hidden but no name", "<button aria-hidden='true'><X /></button>"],

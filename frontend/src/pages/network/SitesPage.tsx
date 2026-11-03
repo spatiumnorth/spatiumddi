@@ -469,6 +469,7 @@ function SiteTreeRow({
           ref={dragRef}
           {...listeners}
           {...attributes}
+          aria-label="Drag to re-parent"
           title="Drag to re-parent"
           className="cursor-grab rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
           // Dropping re-parents the site: a PUT the router asks write on
