@@ -113,7 +113,14 @@ async def subnet_has_surviving_addresses(
     The OPNsense and firewall-mirror reconcilers hand-rolled this check
     first; every other mirror goes through here so the predicate can't
     drift again.
+
+    The subnet's untouched gateway placeholder (#3347: the UniFi and
+    firewall-family mirrors keep one, unowned, as New Subnet does) is not a
+    survivor: the system wrote it and nobody has made it theirs, so it goes
+    with the subnet rather than keeping a mirror's subnet forever.
     """
+    from app.services.ipam.subnet_placeholders import untouched_gateway_row  # noqa: PLC0415
+
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
     survivor = or_(
@@ -124,8 +131,10 @@ async def subnet_has_surviving_addresses(
     count = await db.scalar(
         select(func.count())
         .select_from(IPAddress)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
         .where(IPAddress.subnet_id == subnet_id)
         .where(survivor)
+        .where(not_(untouched_gateway_row()))
     )
     return bool(count)
 

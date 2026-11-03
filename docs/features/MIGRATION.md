@@ -197,7 +197,20 @@ Three sources, all reducing to canonical `ImportedScope` +
   `reservations` → reservations, `option-data` → canonical options,
   and top-level `client-classes` → client classes (Kea `test`
   expressions are SpatiumDDI's native class shape, so they import
-  verbatim).
+  verbatim). Subnets under `shared-networks` are flattened into
+  individual scopes, as the ISC importer does: a member inherits the
+  network's `option-data` (option by option), `valid-lifetime`,
+  `min-` / `max-valid-lifetime` and `ddns-send-updates`, and its own
+  value wins. The preview says each network was flattened, and names
+  any setting a scope has no field for (`interface`, `relay`,
+  `client-class`, `match-client-id`, other `ddns-*`, …) on the
+  network or on a subnet, so a lost relay or interface binding is
+  never silent. A reservation whose
+  address is not an IP address, is the wrong family, or lies outside
+  its scope's subnet (the static form's rule) is dropped in the
+  preview and the commit with a warning naming it, and the scope is
+  still imported; a Dhcp6 reservation's further `ip-addresses` and its
+  `prefixes` are named as not imported.
 - **Windows DHCP live-pull** *(Phase 2)* — pick a registered
   `windows_dhcp` server with WinRM credentials; the importer reuses the
   Path A read driver (`Get-DhcpServerv4Scope` + option values +

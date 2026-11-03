@@ -112,7 +112,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `manage_nmap_scans` | On-demand nmap scans |
 | `multicast`       | Multicast group registry |
 | `nat_mapping`     | NAT mappings (1:1, PAT, hide) recorded against IPAM addresses and subnets |
-| `tls_cert`        | TLS certificate inventory and the expiry / chain monitoring on it |
+| `dnsbl`           | DNS blocklist (DNSBL) reputation checks — the `/api/v1/dnsbl/` routes, behind the `security.dnsbl` module |
+| `e911_location`   | E911 dispatchable location (#972) — Emergency Response Locations, bindings, resolver lookups and the HELD / provisioning surfaces (`/api/v1/e911/`), behind the `network.e911` module |
 | `use_network_tools` | The Tools page (ping / traceroute / dig / whois and the rest), plus Wake-on-LAN sends |
 | `*`               | Wildcard — match any resource type                    |
 
@@ -255,7 +256,7 @@ A route missing from the map admits no type-level grant at all, and
 | Routes | Needs |
 |---|---|
 | `/spaces…` | `ip_space` |
-| `/blocks…`, the aggregation snoozes, `/plans…` | `ip_block` |
+| `/blocks…`, the aggregation snoozes, `/plans…` (except `POST /blocks/{block_id}/allocate-subnet`, which needs `subnet` only) | `ip_block` |
 | `/subnets…`, including the subnet's own addresses, aliases, network context and reconciliation | `subnet` |
 | `/addresses/{id}` reads, address search, stale-IP / hygiene / vendor reports | `ip_address` |
 | Address writes: create, next-IP, bulk-allocate, edit, delete, aliases, bulk edit / delete, profile, wake, stale-IP deprecate, address import | `subnet` (the action of the method; the handler also checks the row's subnet, or an address set covering the address, #103) |
@@ -322,7 +323,7 @@ classified.
 
 | Routes | Needs |
 |---|---|
-| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` | `dns_group` |
+| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` (except `POST /servers/{server_id}/apply-record`, which needs `dns_record` only) | `dns_group` |
 | `/groups/{id}/zones`, a zone and its settings (DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
 | `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
 
@@ -373,7 +374,7 @@ starts at the server groups). The built-in roles keep what they had
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service`; `read` on `alert` |
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `certificate_store`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists; manage the TLS certificate store DoT / DoH / DoQ serve from (#3067), short of making a certificate the Web UI certificate. Infrastructure stays superadmin-only (see below), including the server-group options that turn a DoT / DoH / DoQ listener on |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`; `read` on `alert` |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`, `e911_location`; `read` on `alert` |
 | `Auditor`        | `read` on `conformity`, `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103); `read` on `alert` — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |

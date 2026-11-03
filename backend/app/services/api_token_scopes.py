@@ -26,11 +26,17 @@ Every prefix is matched on a whole path segment: ``/api/v1/dns`` covers
 ``/api/v1/dns`` and ``/api/v1/dns/...`` but not ``/api/v1/dnsbl/...``. A
 scope grants only the surface it names, including for routers mounted later
 whose prefix happens to start with the same letters.
-* ``agent`` — allows the agent push surface
-  (``/api/v1/dns/agents/*``, ``/api/v1/dhcp/agents/*``) only.
-  Used by the BIND9 / Kea sidecar agents that bootstrap with
-  PSK + JWT but can also be issued plain API tokens for ops
-  testing.
+
+There is no scope for the agent push surface (``/api/v1/dns/agents/*``,
+``/api/v1/dhcp/agents/*``). Those routes authenticate with the agent's own
+JWT or PSK and never reach the API-token resolver, so an ``sddi_*`` token
+gets 401 there whatever it carries (#3302). An ``agent`` scope used to be
+accepted at create time and reached nothing; it is retired (create / update
+refuse it, see :data:`RETIRED_SCOPES`). A token that already stores it
+cannot be made unrestricted by that: a non-empty scope list with no
+matching scope is refused everywhere, so ``["agent"]`` stays a token that
+can do nothing, and no migration rewrites it (stripping its only scope
+would leave ``[]``, which means no restriction).
 
 Empty ``scopes`` = no scope restriction (the existing RBAC path
 is the only gate). Non-empty = enforced BEFORE RBAC at the auth
@@ -48,11 +54,13 @@ endpoint reject the typo with 422 at issuance time.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
 _READ_ONLY_POST_ATTR = "__token_read_only_post__"
 _OUTBOUND_ATTR = "__token_outbound__"
+_WRITE_ATTR = "__token_write__"
 
 
 def read_only_post[F: Callable[..., Any]](fn: F) -> F:
@@ -96,6 +104,41 @@ def is_token_outbound(endpoint: object) -> bool:
     return bool(getattr(endpoint, _OUTBOUND_ATTR, False))
 
 
+# Reasons that say nothing. A reason is the review record for "this POST is
+# not read-only"; "not reviewed" is the absence of one (#3302).
+_EMPTY_REASON = re.compile(r"\b(not reviewed|unreviewed|todo|tbd|fixme|unknown)\b", re.I)
+
+
+def token_write[F: Callable[..., Any]](reason: str) -> Callable[[F], F]:
+    """Declare a POST handler a write for the coarse token-scope gate, and say why.
+
+    The counterpart of :func:`read_only_post`: every POST under a non-agent
+    prefix carries one of the two, so "a ``read`` token is refused" is a
+    recorded decision rather than the default nobody looked at (#3302,
+    ``tests/test_token_post_classification_3302.py``). Changes no behaviour -
+    an unmarked POST is already a write; this is metadata for the guard.
+
+    ``reason`` states what makes it a write or why it is deliberately kept
+    write-scoped: it mutates state, queues an op, sends traffic outward, or is
+    a read left behind a stronger gate on purpose. It must be a real sentence;
+    "not reviewed" and the like are refused at import. Apply under the
+    ``@router.post(...)`` decorator.
+    """
+    if len(reason.strip()) < 15 or _EMPTY_REASON.search(reason):
+        raise ValueError(f"token_write needs a real reason, got {reason!r}")
+
+    def deco(fn: F) -> F:
+        setattr(fn, _WRITE_ATTR, reason.strip())
+        return fn
+
+    return deco
+
+
+def token_write_reason(endpoint: object) -> str | None:
+    reason = getattr(endpoint, _WRITE_ATTR, None)
+    return reason if isinstance(reason, str) else None
+
+
 # Vocabulary — values stored verbatim in ``api_token.scopes``. Any
 # new entry needs a matching branch in ``scope_matches_request``.
 TOKEN_SCOPE_VOCABULARY: frozenset[str] = frozenset(
@@ -104,9 +147,20 @@ TOKEN_SCOPE_VOCABULARY: frozenset[str] = frozenset(
         "ipam:write",
         "dns:write",
         "dhcp:write",
-        "agent",
     }
 )
+
+# Scopes that were once accepted and are now refused at create / update
+# with an explanation. Stored rows may still carry them; the gate treats
+# them as matching nothing (never as "no restriction").
+RETIRED_SCOPES: dict[str, str] = {
+    "agent": (
+        "the 'agent' scope was retired: the agent push surface "
+        "(/api/v1/dns/agents, /api/v1/dhcp/agents) authenticates with the "
+        "agent's own JWT or pre-shared key, never an API token, so the scope "
+        "reached nothing"
+    ),
+}
 
 _SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -127,6 +181,8 @@ _IPAM_PREFIXES: tuple[str, ...] = (
 # ``/api/v1/dns-pools``, so it is not listed.
 _DNS_PREFIXES: tuple[str, ...] = ("/api/v1/dns",)
 _DHCP_PREFIXES: tuple[str, ...] = ("/api/v1/dhcp",)
+# Agent routes are nested under the dns / dhcp prefixes but authenticate
+# without an API token; the write scopes must not be read as covering them.
 _AGENT_PREFIXES: tuple[str, ...] = (
     "/api/v1/dns/agents",
     "/api/v1/dhcp/agents",
@@ -205,9 +261,8 @@ def scope_matches_request(
         if scope == "ipam:write" and _path_under(path, _IPAM_PREFIXES):
             return True
         if scope == "dns:write" and _path_under(path, _DNS_PREFIXES):
-            # Agent paths are nested under /api/v1/dns/* — explicitly
-            # require the ``agent`` scope for those rather than
-            # letting ``dns:write`` cover them too.
+            # Agent paths are nested under /api/v1/dns/* — no token scope
+            # covers them (they take the agent's own credential).
             if _path_under(path, _AGENT_PREFIXES):
                 continue
             return True
@@ -215,8 +270,8 @@ def scope_matches_request(
             if _path_under(path, _AGENT_PREFIXES):
                 continue
             return True
-        if scope == "agent" and _path_under(path, _AGENT_PREFIXES):
-            return True
+        # Any other value (a retired ``agent`` left in a stored row) matches
+        # nothing: the list is non-empty, so the token is not unrestricted.
     return False
 
 
@@ -225,6 +280,9 @@ def validate_scopes(scopes: list[str]) -> list[str]:
     vocabulary; raise ``ValueError`` otherwise. Used by the
     create / update endpoints + by Pydantic field_validator.
     """
+    retired = [s for s in scopes if s in RETIRED_SCOPES]
+    if retired:
+        raise ValueError("; ".join(RETIRED_SCOPES[s] for s in dict.fromkeys(retired)))
     invalid = [s for s in scopes if s not in TOKEN_SCOPE_VOCABULARY]
     if invalid:
         raise ValueError(
@@ -290,6 +348,8 @@ __all__ = [
     "scope_matches_request",
     "scopes_allow_outbound_tool",
     "token_outbound",
+    "token_write",
+    "token_write_reason",
     "validate_resource_grant_shape",
     "validate_scopes",
 ]

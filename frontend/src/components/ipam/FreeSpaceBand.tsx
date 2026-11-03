@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import {
@@ -40,7 +41,11 @@ export function FreeSpaceBand({
   childBlocks: IPBlock[];
   onSelectFree: (range: FreeCidrRange) => void;
 }) {
-  const { data: freeRanges = [], isLoading } = useQuery({
+  const {
+    data: freeRanges = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: [
       "block-free-space",
       block.id,
@@ -111,6 +116,16 @@ export function FreeSpaceBand({
 
   if (isLoading) {
     return <div className="h-5 w-full animate-pulse rounded-sm bg-muted/40" />;
+  }
+
+  // A refused or failed read says so, not "No allocation data" (#3337): the
+  // block's own grant may not reach the subnets the free-space walk needs.
+  if (error != null) {
+    return (
+      <p className="text-[11px]">
+        <ListReadError error={error} what="this block's allocation map" />
+      </p>
+    );
   }
 
   if (segments.length === 0) {
