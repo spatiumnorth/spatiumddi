@@ -693,6 +693,11 @@ async def commit_import(
             )
         results.append(result)
     await recount_subnets_and_blocks(db, touched_subnets)
+    # Every scope above has already committed, so this commits only the recount.
+    # It must not ride on _commit_client_classes' commit: that one runs only
+    # when a class is created, and an import without one would otherwise close
+    # the session with the corrected counters rolled back.
+    await db.commit()
 
     classes_created = await _commit_client_classes(
         db,

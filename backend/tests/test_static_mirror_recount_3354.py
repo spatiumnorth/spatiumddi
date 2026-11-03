@@ -188,3 +188,81 @@ async def test_scope_batch_teardown_recounts_every_scope_subnet(
     assert await _counts(db_session, subnet_a, block_a) == (0, 0)
     await db_session.refresh(subnet_b)
     assert subnet_b.allocated_ips == 0
+
+
+@pytest.mark.asyncio
+async def test_overwrite_import_recount_is_durable_without_client_classes(
+    db_session: AsyncSession,
+) -> None:
+    """An Overwrite import whose file carries no client class still commits the
+    recount: read through a FRESH session, the subnet and block show the freed
+    mirrors gone, not the stale count (#3354 walk, case 5)."""
+    from sqlalchemy import select
+
+    from app.models.auth import User
+    from app.services.dhcp_import import commit_import, parse_kea_config
+    from tests.conftest import _TestSessionLocal
+
+    scope, subnet, block, _st = await _setup(db_session)
+    # a second mirrored reservation, so the overwrite drops 2 and the file adds 1
+    st2 = DHCPStaticAssignment(
+        scope_id=scope.id,
+        ip_address="10.31.0.11",
+        mac_address="aa:bb:cc:00:03:02",
+        hostname="printer2",
+        description="",
+    )
+    db_session.add(st2)
+    await db_session.flush()
+    await upsert_ipam_for_static(db_session, scope, st2)
+    await recount_subnets_and_blocks(db_session, [subnet.id])
+    user = User(
+        username="imp3354",
+        email="imp3354@example.com",
+        display_name="imp",
+        hashed_password="x",
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    subnet_id, block_id, group_id = subnet.id, block.id, scope.group_id
+    async with _TestSessionLocal() as s:
+        before = (await s.get(Subnet, subnet_id)).allocated_ips  # type: ignore[union-attr]
+    assert before == 2
+
+    conf = (
+        b'{"Dhcp4": {"subnet4": [{"subnet": "10.31.0.0/24", "reservations": '
+        b'[{"hw-address": "aa:bb:cc:00:09:09", "ip-address": "10.31.0.50"}]}]}}'
+    )
+    preview = parse_kea_config(conf)
+    assert not preview.client_classes
+    result = await commit_import(
+        db_session,
+        preview=preview,
+        target_group_id=group_id,
+        ipam_space_id=None,
+        ipam_block_id=None,
+        conflict_actions={"10.31.0.0/24": "overwrite"},
+        current_user=user,
+    )
+    assert result.scopes[0].action_taken == "overwrote", result.scopes[0]
+    # What the request session's close does to anything left uncommitted.
+    await db_session.rollback()
+
+    async with _TestSessionLocal() as fresh:
+        sn = await fresh.get(Subnet, subnet_id)
+        blk = await fresh.get(IPBlock, block_id)
+        live = (
+            (
+                await fresh.execute(
+                    select(DHCPStaticAssignment).where(DHCPStaticAssignment.deleted_at.is_(None))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sn is not None and blk is not None
+        assert len(live) == 1
+        # the import mirrors nothing into IPAM; the overwrite freed both old mirrors
+        assert sn.allocated_ips == 0
+        assert blk.allocated_ips - _BLOCK_BASE[block_id] == 0
