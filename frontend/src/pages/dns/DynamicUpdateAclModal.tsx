@@ -50,6 +50,9 @@ export function DynamicUpdateAclModal({
   const [enabled, setEnabled] = useState(false);
   const [rows, setRows] = useState<Row[]>([]);
   const seededRef = useRef(false);
+  // Version token of the ACL the editor was seeded from / last saved (#3381).
+  const versionRef = useRef<string | undefined>(undefined);
+  const [conflict, setConflict] = useState(false);
 
   const aclQuery = useQuery({
     queryKey: ["dns-zone-update-acl", groupId, zoneId],
@@ -67,6 +70,8 @@ export function DynamicUpdateAclModal({
   useEffect(() => {
     if (!aclQuery.data || seededRef.current) return;
     seededRef.current = true;
+    versionRef.current = aclQuery.data.version;
+    setConflict(false);
     setEnabled(aclQuery.data.dynamic_update_enabled);
     setRows(
       aclQuery.data.entries.map((e) => ({
@@ -109,6 +114,7 @@ export function DynamicUpdateAclModal({
   const saveMut = useMutation({
     mutationFn: () =>
       dnsApi.replaceZoneUpdateAcl(groupId, zoneId, {
+        expected_version: versionRef.current,
         dynamic_update_enabled: enabled,
         entries: rows.map((r) => ({
           match_kind: r.match_kind,
@@ -127,12 +133,25 @@ export function DynamicUpdateAclModal({
               : null,
         })),
       }),
+    onMutate: () => setConflict(false),
+    onError: (err) => {
+      if ((err as { response?: { status?: number } })?.response?.status === 409)
+        setConflict(true);
+    },
     onSuccess: (data) => {
+      versionRef.current = data.version;
       qc.setQueryData(["dns-zone-update-acl", groupId, zoneId], data);
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["dns-records", zoneId] });
     },
   });
+
+  // Reload after a 409: re-read the ACL and re-seed the editor from it.
+  const reload = async () => {
+    seededRef.current = false;
+    saveMut.reset();
+    await aclQuery.refetch();
+  };
 
   const savedWarnings = saveMut.data?.warnings ?? aclQuery.data?.warnings ?? [];
 
@@ -388,7 +407,23 @@ export function DynamicUpdateAclModal({
               </div>
             )}
 
-            {saveMut.error && (
+            {conflict && (
+              <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                <span>
+                  Someone changed this ACL since you opened it. Reload to see
+                  the current entries; your edits here will be discarded.
+                </span>
+                <button
+                  type="button"
+                  className="shrink-0 rounded-md border px-2 py-1"
+                  onClick={reload}
+                >
+                  Reload
+                </button>
+              </div>
+            )}
+
+            {saveMut.error && !conflict && (
               <p className="text-xs text-destructive">
                 {formatApiError(saveMut.error, "Could not save the ACL")}
               </p>

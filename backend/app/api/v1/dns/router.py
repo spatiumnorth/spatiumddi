@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import ipaddress
+import json
 import re
 import uuid
 import zipfile
@@ -6880,16 +6882,47 @@ class ZoneUpdateAclReplace(BaseModel):
     # call so the UI can toggle + set the ACL atomically. None = leave as-is.
     dynamic_update_enabled: bool | None = None
     entries: list[UpdateAclEntryIn] = Field(default_factory=list)
+    # Optimistic-concurrency token (#3381): the ``version`` the caller read
+    # from GET / a previous PUT. A mismatch against the stored ACL answers
+    # 409 and changes nothing. Omitted = replace unconditionally.
+    expected_version: str | None = None
 
 
 class ZoneUpdateAclResponse(BaseModel):
     zone_id: uuid.UUID
+    # Opaque hash of the stored ACL state (flag + ordered entries).
+    version: str = ""
     dynamic_update_enabled: bool
     driver_names: list[str]
     caps: DynamicUpdateCapsOut
     entries: list[UpdateAclEntryOut]
     # Non-fatal warnings from the driver (e.g. "IP entries are UDP-spoofable").
     warnings: list[str] = Field(default_factory=list)
+
+
+def _acl_version(enabled: bool, entries: list[UpdateAclEntryOut]) -> str:
+    """Version token for a zone's dynamic-update ACL (#3381).
+
+    A hash of the canonical state — the enable flag plus the ordered entries,
+    excluding row ids (a replace re-creates every row, so ids would change
+    the token on a no-op save). Derived, so it needs no column.
+    """
+    canon = [
+        bool(enabled),
+        [
+            [
+                e.action,
+                e.match_kind,
+                e.ip_cidr,
+                str(e.tsig_key_id) if e.tsig_key_id else None,
+                e.name_scope,
+                e.name_pattern,
+                sorted(e.record_types) if e.record_types else None,
+            ]
+            for e in entries
+        ],
+    ]
+    return hashlib.sha256(json.dumps(canon, separators=(",", ":")).encode()).hexdigest()[:32]
 
 
 async def _group_driver_names(db: DB, group_id: uuid.UUID) -> list[str]:
@@ -7029,6 +7062,7 @@ async def get_zone_update_acl(
                 )
     return ZoneUpdateAclResponse(
         zone_id=zone.id,
+        version=_acl_version(zone.dynamic_update_enabled, entries),
         dynamic_update_enabled=zone.dynamic_update_enabled,
         driver_names=driver_names,
         caps=_caps_out(caps),
@@ -7188,6 +7222,24 @@ async def replace_zone_update_acl(
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
+    if body.expected_version is not None:
+        # Serialise concurrent replaces on the zone row so the compare and
+        # the write are one step, then refuse if the ACL moved (#3381).
+        await db.execute(select(DNSZone.id).where(DNSZone.id == zone.id).with_for_update())
+        await db.refresh(zone)
+        current = _acl_version(zone.dynamic_update_enabled, await _load_acl_out(db, zone.id))
+        if current != body.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ACL_VERSION_CONFLICT",
+                    "message": (
+                        "Someone changed this ACL since you opened it. "
+                        "Reload to see the current entries."
+                    ),
+                    "current_version": current,
+                },
+            )
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
     db.add(
@@ -7218,12 +7270,14 @@ async def replace_zone_update_acl(
     )
 
     caps = _effective_dynamic_update_caps(driver_names)
+    new_entries = await _load_acl_out(db, zone.id)
     return ZoneUpdateAclResponse(
         zone_id=zone.id,
+        version=_acl_version(zone.dynamic_update_enabled, new_entries),
         dynamic_update_enabled=zone.dynamic_update_enabled,
         driver_names=driver_names,
         caps=_caps_out(caps),
-        entries=await _load_acl_out(db, zone.id),
+        entries=new_entries,
         warnings=sorted(set(warnings + win_warnings)),
     )
 
