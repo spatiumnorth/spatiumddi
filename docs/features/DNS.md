@@ -2415,10 +2415,18 @@ entry is UDP-spoofable → recommend TSIG).
   can express (the UI greys unsupported controls; `supported=false` ⇒ the
   whole feature 422s).
 - `GET /dns/groups/{gid}/zones/{zid}/update-acl` — the current ACL +
-  `dynamic_update_enabled` + resolved `tsig_key_name`s + standing warnings.
+  `dynamic_update_enabled` + resolved `tsig_key_name`s + standing warnings +
+  an opaque `version` (hash of the stored flag and ordered entries).
 - `PUT /dns/groups/{gid}/zones/{zid}/update-acl` — full ordered replace
   (optionally flips `dynamic_update_enabled` in the same call). Superadmin;
   every mutation is audited; validation runs the driver capability gate.
+  Send the `version` you read as `expected_version`: if the stored ACL has
+  changed since, the call answers 409 (`ACL_VERSION_CONFLICT`) and changes
+  nothing. `expected_version` is optional — omit it and the replace is
+  unconditional, as before. The response carries the new `version`. Every
+  ACL replace is serialised per zone, so the check and the write are one
+  step. The MCP `propose_set_zone_update_acl` pins the version current when
+  it is proposed, and Apply refuses if the ACL has changed since.
 
 All three gate behind the default-on `dns.dynamic_update_acl` feature
 module. MCP: `find_zone_update_acls` (read, default-on) +
