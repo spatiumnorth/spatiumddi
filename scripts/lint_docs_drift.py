@@ -395,12 +395,50 @@ def check_inventory(root: pathlib.Path, manifest: dict) -> list[Finding]:
 # ----------------------------------------------------------------- identifier
 
 
+def _support_identifiers(tree: ast.Module) -> set[str]:
+    """What a mapped module outside ``backend/app/models`` vouches for: its top-level
+    function and class names, and the string members of its module-level UPPER_CASE
+    collection constants (``QUEUED_OP_STATES = ("pending", "in_flight")``). Not every
+    string literal: a service module is full of log keys and messages, and harvesting
+    those the way model modules are harvested would accept almost any token."""
+    out: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+            continue
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets, value = [node.target.id], node.value
+        elif isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            value = node.value
+        else:
+            continue
+        if not any(t.lstrip("_").isupper() for t in targets) or value is None:
+            continue
+        if (
+            isinstance(value, ast.Call) and value.args
+        ):  # frozenset({...}) / tuple([...])
+            value = value.args[0]
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            out.update(
+                e.value
+                for e in value.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            )
+    return out
+
+
 def model_identifiers(paths: Iterable[pathlib.Path]) -> tuple[set[str], set[str]]:
     """(all names, class names) defined across the given modules."""
     names: set[str] = set()
     classes: set[str] = set()
     for path in paths:
         tree = ast.parse(_read(path), filename=str(path))
+        if "/app/models/" not in path.as_posix():
+            support = _support_identifiers(tree)
+            names |= support
+            classes |= {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
+            continue
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 names.add(node.name)
@@ -438,7 +476,12 @@ def code_identifiers(text: str) -> set[str]:
     matching them would bury the findings that matter.
     """
     found = set(_SNAKE.findall(text)) | set(_CAMEL.findall(text))
-    return {tok for tok in found if not tok.isupper()}
+    # "ACLs", "ACKs": the plural of an acronym is English, not a class name.
+    return {
+        tok
+        for tok in found
+        if not tok.isupper() and not re.fullmatch(r"[A-Z]{2,}s", tok)
+    }
 
 
 def check_identifiers(root: pathlib.Path, manifest: dict) -> list[Finding]:
@@ -482,14 +525,20 @@ def check_identifiers(root: pathlib.Path, manifest: dict) -> list[Finding]:
                         f"{', '.join(modules)}",
                     )
                 )
-    # Like a dead inventory allowlist entry: an ignore no mapped diagram uses would
+    # Like a dead inventory allowlist entry: an ignore no diagram uses would
     # silently exempt the name the day a diagram starts showing it for real.
+    if ignore - used_ignores:
+        # An ignore is dead only when NO diagram shows the word: one that an unmapped
+        # diagram uses today is the exemption that will be needed when it is mapped.
+        for other in diagram_files(root):
+            for _, text, _ in svg_texts(_read(other)):
+                used_ignores |= code_identifiers(text) & ignore
     for tok in sorted(ignore - used_ignores):
         findings.append(
             Finding(
                 MANIFEST_NAME,
                 "identifier",
-                f"identifier_ignore entry {tok!r} matches nothing in a mapped diagram",
+                f"identifier_ignore entry {tok!r} matches nothing in any diagram",
             )
         )
     return findings

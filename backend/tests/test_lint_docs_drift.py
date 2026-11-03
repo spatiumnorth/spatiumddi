@@ -375,6 +375,65 @@ def test_identifier_ignore_and_unmapped_diagrams(
     assert [f for f in lint.run(tmp_path) if f.kind == "identifier"] == []
 
 
+def test_acronym_plurals_are_prose(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    build(tmp_path)
+    _write(
+        tmp_path,
+        "docs/assets/diagrams/model.svg",
+        _svg(["holds ACLs, TSIG keys", "agent ACKs each op", "DNSRecordOps"]),
+    )
+    found = [f.message for f in lint.run(tmp_path) if f.kind == "identifier"]
+    # The acronym plurals pass; a CamelCase token ending in 's' is still checked.
+    assert len(found) == 1 and "'DNSRecordOps'" in found[0]
+
+
+def test_a_mapped_service_module_vouches_for_functions_and_state_constants(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    build(
+        tmp_path,
+        identifier_diagrams={
+            "docs/assets/diagrams/model.svg": [
+                "backend/app/models/dns.py",
+                "backend/app/services/dns/record_ops.py",
+            ]
+        },
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/dns/record_ops.py",
+        'QUEUED_OP_STATES: tuple[str, ...] = ("pending", "in_flight")\n'
+        '_DONE = frozenset({"applied_ok"})\n'
+        "async def enqueue_record_op():\n"
+        '    log.info("op_shipped_late")\n',
+    )
+    _write(
+        tmp_path,
+        "docs/assets/diagrams/model.svg",
+        _svg(
+            [
+                "enqueue_record_op",
+                "state: in_flight",
+                "applied_ok",
+                "op_shipped_late",
+            ]
+        ),
+    )
+    found = [f.message for f in lint.run(tmp_path) if f.kind == "identifier"]
+    # A log key inside a function body is not something the module defines.
+    assert len(found) == 1 and "'op_shipped_late'" in found[0]
+
+
+def test_an_ignore_used_only_by_an_unmapped_diagram_is_not_dead(
+    lint: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    build(tmp_path, identifier_ignore={"FortiGate": "a vendor product"})
+    _write(tmp_path, "docs/assets/diagrams/other.svg", _svg(["a FortiGate firewall"]))
+    assert [f for f in lint.run(tmp_path) if f.kind == "identifier"] == []
+
+
 def test_a_dead_identifier_ignore_is_a_finding(
     lint: types.ModuleType, tmp_path: pathlib.Path
 ) -> None:

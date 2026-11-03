@@ -13,7 +13,8 @@
     "'from' up to the next naming 'to'. Drivers must be drawn in the data plane and integrations in",
     "the mirrors lane: a bare product name anywhere is not enough (the FortiGate DHCP driver is not",
     "the Fortinet FortiGate integration card). A heading that moves makes the check exit 2.",
-    "version_labels omits Kea on purpose: the docs compare Kea 2.4 / 2.6 / 3.0 behaviour throughout, so a bare 'Kea 2.6' is history far more often than a stale claim. Redis requires a major of 4+ so 'Redis 1' (a replica count) is not read as a version. Alpine also matches the image-tag form ('FROM alpine:3.24'), which the docs quote in code blocks; versions.json pins one Alpine for every agent image (#1037 moved them all to 3.24), so there is no per-image pin to choose between."
+    "version_labels omits Kea on purpose: the docs compare Kea 2.4 / 2.6 / 3.0 behaviour throughout, so a bare 'Kea 2.6' is history far more often than a stale claim. Redis requires a major of 4+ so 'Redis 1' (a replica count) is not read as a version. Alpine also matches the image-tag form ('FROM alpine:3.24'), which the docs quote in code blocks; versions.json pins one Alpine for every agent image (#1037 moved them all to 3.24), so there is no per-image pin to choose between.",
+    "identifier_diagrams may map a module outside backend/app/models (a service, core/auth): from those only top-level function / class names and the string members of UPPER_CASE collection constants (e.g. QUEUED_OP_STATES) count, never every string literal."
   ],
   "architecture_diagram": "docs/assets/architecture.svg",
   "version_labels": {
@@ -123,10 +124,14 @@
       "backend/app/models/ipam.py"
     ],
     "docs/assets/diagrams/data-model-rbac.svg": [
-      "backend/app/models/auth.py"
+      "backend/app/models/auth.py",
+      "backend/app/models/auth_provider.py",
+      "backend/app/models/time_bound_grant.py",
+      "backend/app/core/auth/user_sync.py"
     ],
     "docs/assets/diagrams/dns-record-propagation.svg": [
-      "backend/app/models/dns.py"
+      "backend/app/models/dns.py",
+      "backend/app/services/dns/record_ops.py"
     ],
     "docs/assets/diagrams/dns-namespace-views.svg": [
       "backend/app/models/dns.py"
@@ -142,10 +147,9 @@
   },
   "identifier_ignore": {
     "PowerDNS": "a product name, not a model identifier",
-    "ACKs": "the English verb",
     "resource_type": "key inside the Role.permissions JSONB, not a column",
     "resource_id": "key inside the Role.permissions JSONB, not a column",
-    "op_id": "the config-bundle / ack key carrying DNSRecordOp.id to the agent (services/dns/agent_config.py), not a column"
+    "FortiGate": "a vendor product (the FortiGate DHCP driver), not a model identifier"
   },
   "path_roots": [
     "backend",
