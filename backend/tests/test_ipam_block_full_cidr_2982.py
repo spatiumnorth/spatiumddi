@@ -138,8 +138,17 @@ async def test_host_row_on_network_address_is_not_counted_twice(
     h = await _headers(db_session)
     space_id, bid = await _space_block(db_session, "10.235.0.0/30")
     s = await _subnet(client, h, space_id, bid, "10.235.0.0/30", skip_auto_addresses=True)
-    for addr in ("10.235.0.0", "10.235.0.1", "10.235.0.2", "10.235.0.3"):
+    # #3321 refuses a host on the network / broadcast address over REST, but such
+    # rows still arrive from the wire (legacy data, DHCP lease mirrors, discovery),
+    # and the counting rule must still hold for them. So .0 and .3 are inserted
+    # directly, the way those paths create them; only .1 / .2 go through the API.
+    for addr in ("10.235.0.1", "10.235.0.2"):
         await _add(client, h, s["id"], addr)
+    for addr in ("10.235.0.0", "10.235.0.3"):
+        db_session.add(IPAddress(subnet_id=uuid.UUID(s["id"]), address=addr, status="discovered"))
+    await db_session.commit()
+    await recount_utilization(db_session)
+    await db_session.commit()
 
     blk = await _get(client, h, "blocks", bid)
     assert blk["allocated_ips"] == 4

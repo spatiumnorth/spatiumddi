@@ -95,6 +95,7 @@ from app.services.dns.sync_check import (
 from app.services.feature_modules import is_module_enabled, require_module
 from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
+    assert_not_boundary_address,
     assert_static_dhcp_has_mac,
     assert_subnet_takes_addresses,
     holds_address,
@@ -121,7 +122,15 @@ from app.services.ipam.hygiene import (
 )
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
-from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
+from app.services.ipam.subnet_boundary import boundary_addresses
+from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
+    create_placeholder_rows,
+    find_untouched_gateway_row,
+    gateway_target_problem,
+    has_boundary_rows,
+    holds_placeholder_rows,
+)
 from app.services.ipam.utilization import (
     block_allocated,
     block_subnet_contribution_sql,
@@ -505,6 +514,24 @@ def _parse_network(network: str) -> ipaddress.IPv4Network | ipaddress.IPv6Networ
 
 
 _BIGINT_MAX = 2**63 - 1
+
+
+def _int64_count(n: int) -> int:
+    """Saturate an address count at int64 for an ``int`` response field.
+
+    The published schema types these as ``integer``, which a generated client
+    (Swift ``Int``, Go ``int64``) decodes as 64-bit: a /64's 2^64 would fail
+    to decode the whole response. The true figure rides in the sibling
+    ``*_exact`` string field instead (#3322).
+    """
+    return min(n, _BIGINT_MAX)
+
+
+_COUNT_DESC = (
+    "Address count, saturating at 2^63-1 so it always fits int64. "
+    "An IPv6 /64 or wider reads the cap here; see the *_exact field."
+)
+_EXACT_DESC = "The exact address count as a decimal string (IPv6 sizes exceed int64)."
 
 
 def _total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
@@ -7502,6 +7529,16 @@ async def get_effective_subnet_dhcp(
     )
 
 
+def _same_ip(a: str | None, b: str | None) -> bool:
+    """Two optional IP strings name the same address (spelling-insensitive)."""
+    if a is None or b is None:
+        return a is b
+    try:
+        return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+    except ValueError:
+        return a == b
+
+
 @router.put("/subnets/{subnet_id}", response_model=SubnetResponse)
 async def update_subnet(
     subnet_id: uuid.UUID, body: SubnetUpdate, current_user: CurrentUser, db: DB
@@ -7561,11 +7598,34 @@ async def update_subnet(
                 detail=f"Subnet {subnet.network} is not contained within block {target.network}",
             )
 
-    # Validate new gateway is within the subnet (same rule as create, #2984).
+    # Validate new gateway: the same rule as create, #2984 — inside the subnet,
+    # and (when the subnet holds network / broadcast rows) not on either of
+    # them (#3318). A gateway the edit leaves as it was is not re-judged, so a
+    # re-save of a subnet whose stored gateway predates the rule still works.
+    old_gateway = str(subnet.gateway) if subnet.gateway else None
+    gateway_edit = "gateway" in body.model_fields_set and not _same_ip(body.gateway, old_gateway)
+    manages_gateway_row = gateway_edit and await holds_placeholder_rows(db, subnet)
     if body.gateway is not None:
-        gw_problem = gateway_problem(body.gateway, _parse_network(str(subnet.network)))
+        gw_problem = gateway_problem(
+            body.gateway,
+            _parse_network(str(subnet.network)),
+            reject_reserved=manages_gateway_row,
+        )
         if gw_problem:
             raise HTTPException(status_code=422, detail=gw_problem)
+    # The default "Gateway" row the old gateway holds, found while the stored
+    # gateway is still the old one (the setattr below would autoflush the new).
+    old_gateway_row: IPAddress | None = None
+    if manages_gateway_row:
+        if body.gateway is not None:
+            # A host, a lease or a discovered row already at the new address
+            # is refused, as Resize refuses it (#2413); a reserved row is kept.
+            target_problem = await gateway_target_problem(
+                db, subnet, str(ipaddress.ip_address(body.gateway))
+            )
+            if target_problem:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=target_problem)
+        old_gateway_row = await find_untouched_gateway_row(db, subnet)
 
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:
@@ -7704,6 +7764,26 @@ async def update_subnet(
             _val = getattr(body, _field)
             setattr(subnet, _field, _val)
             changes_for_audit[_field] = str(_val) if isinstance(_val, uuid.UUID) else _val
+
+    # A moved gateway is reserved the way create_subnet reserves a new subnet's
+    # gateway, so Next available never offers it to a host (#3317, the third
+    # path after Resize #2413 and the import #2979). The old default "Gateway"
+    # row is retired with its PTR; a renamed / DNS-bearing / owned one is the
+    # operator's and is kept, as is a reserved row already at the new address.
+    if manages_gateway_row:
+        if old_gateway_row is not None:
+            await _sync_dns_record(db, old_gateway_row, subnet, action="delete")
+            await db.delete(old_gateway_row)
+            await db.flush()
+        if subnet.gateway:
+            gw_row = await add_gateway_row(
+                db, subnet, str(subnet.gateway), created_by_user_id=current_user.id
+            )
+            if gw_row is not None:
+                # Same as create_subnet: the placeholder's PTR (spatiumddi#1150).
+                await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
+        await db.flush()
+        await _update_utilization(db, subnet.id)
 
     # Handle add/remove of auto-created network/broadcast/gateway records.
     # Kubernetes-semantics subnets (pod / service CIDRs) are routed
@@ -7888,8 +7968,10 @@ class SubnetResizePreviewResponse(BaseModel):
     new_network_ip: str
     old_broadcast_ip: str | None
     new_broadcast_ip: str | None
-    total_ips_before: int
-    total_ips_after: int
+    total_ips_before: int = Field(description=_COUNT_DESC)
+    total_ips_after: int = Field(description=_COUNT_DESC)
+    total_ips_before_exact: str = Field(description=_EXACT_DESC)
+    total_ips_after_exact: str = Field(description=_EXACT_DESC)
     gateway_current: str | None
     gateway_suggested_new_first_usable: str | None
     placeholders_default_named: list[_ResizePlaceholderRow]
@@ -7938,8 +8020,10 @@ class BlockResizePreviewResponse(BaseModel):
     network_address_shifts: bool
     old_network_ip: str
     new_network_ip: str
-    total_ips_before: int
-    total_ips_after: int
+    total_ips_before: int = Field(description=_COUNT_DESC)
+    total_ips_after: int = Field(description=_COUNT_DESC)
+    total_ips_before_exact: str = Field(description=_EXACT_DESC)
+    total_ips_after_exact: str = Field(description=_EXACT_DESC)
     child_blocks_count: int
     child_blocks: list[_BlockResizeChildRow]
     child_subnets_count: int
@@ -7992,8 +8076,10 @@ async def resize_subnet_preview(
         new_network_ip=preview.new_network_ip,
         old_broadcast_ip=preview.old_broadcast_ip,
         new_broadcast_ip=preview.new_broadcast_ip,
-        total_ips_before=preview.total_ips_before,
-        total_ips_after=preview.total_ips_after,
+        total_ips_before=_int64_count(preview.total_ips_before),
+        total_ips_after=_int64_count(preview.total_ips_after),
+        total_ips_before_exact=str(preview.total_ips_before),
+        total_ips_after_exact=str(preview.total_ips_after),
         gateway_current=preview.gateway_current,
         gateway_suggested_new_first_usable=preview.gateway_suggested_new_first_usable,
         placeholders_default_named=[
@@ -8103,8 +8189,10 @@ async def resize_block_preview(
         network_address_shifts=preview.network_address_shifts,
         old_network_ip=preview.old_network_ip,
         new_network_ip=preview.new_network_ip,
-        total_ips_before=preview.total_ips_before,
-        total_ips_after=preview.total_ips_after,
+        total_ips_before=_int64_count(preview.total_ips_before),
+        total_ips_after=_int64_count(preview.total_ips_after),
+        total_ips_before_exact=str(preview.total_ips_before),
+        total_ips_after_exact=str(preview.total_ips_after),
         child_blocks_count=preview.child_blocks_count,
         child_blocks=[_BlockResizeChildRow(**c) for c in preview.child_blocks],
         child_subnets_count=preview.child_subnets_count,
@@ -8370,7 +8458,8 @@ class FindFreeCandidate(BaseModel):
     cidr: str
     parent_block_id: uuid.UUID
     parent_block_cidr: str
-    free_addresses: int | None = None
+    free_addresses: int | None = Field(default=None, description=_COUNT_DESC)
+    free_addresses_exact: str | None = Field(default=None, description=_EXACT_DESC)
 
 
 class FindFreeResponse(BaseModel):
@@ -8428,7 +8517,12 @@ async def find_free_space_in_space(
                 cidr=c.cidr,
                 parent_block_id=c.parent_block_id,
                 parent_block_cidr=c.parent_block_cidr,
-                free_addresses=c.free_addresses,
+                free_addresses=(
+                    _int64_count(c.free_addresses) if c.free_addresses is not None else None
+                ),
+                free_addresses_exact=(
+                    str(c.free_addresses) if c.free_addresses is not None else None
+                ),
             )
             for c in result.candidates
         ],
@@ -9905,6 +9999,7 @@ async def create_address(
     assert_static_dhcp_has_mac(body.status, body.mac_address)
 
     # Check address not already in use
+    assert_not_boundary_address(subnet, body.address)
     await assert_address_unallocated(db, subnet_id, body.address)
 
     # GHSA-875w — a zone named in the body must be one the token may write.
@@ -11356,9 +11451,24 @@ async def _build_bulk_allocate_candidates(
     dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
 
     existing_rows = await db.execute(
-        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
+        # An ``available`` row is a free slot (#2980, #3319): the commit takes it
+        # over, as Next available and Specific IP do, so it is not "in use".
+        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id, holds_address())
     )
     existing_ips = {str(addr) for (addr,) in existing_rows.all()}
+    if isinstance(net, ipaddress.IPv4Network):
+        # A subnet made with skip_auto_addresses holds no network / broadcast
+        # rows, but its total leaves both out (#3321): refuse them, as a single
+        # create does, rather than store a host the figures cannot count.
+        for edge in sorted(boundary_addresses(net, subnet.kind) - existing_ips):
+            if start <= ipaddress.ip_address(edge) <= end:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{edge} is the network or broadcast address of {subnet.network} "
+                        "and cannot hold a host; leave it out of the range."
+                    ),
+                )
 
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
@@ -11393,6 +11503,8 @@ async def _build_bulk_allocate_candidates(
             select(IPAddress.hostname).where(
                 func.lower(IPAddress.hostname).in_(host_set),
                 IPAddress.forward_zone_id == effective_zone,
+                # A free ``available`` row's leftover name is not a taken one.
+                holds_address(),
             )
         )
         taken_hosts = {h.lower() for (h,) in rows.all() if h}
@@ -11581,9 +11693,11 @@ async def bulk_allocate_commit(
                 continue
             if _no_perm(item.address):
                 continue
-            ip = IPAddress(
-                subnet_id=subnet_id,
-                address=item.address,
+            ip = await take_address_row(
+                db,
+                subnet,
+                item.address,
+                current_user,
                 status=body.status,
                 hostname=item.hostname,
                 # Coalesce: description is `str | None` on the request but the
@@ -11595,8 +11709,6 @@ async def bulk_allocate_commit(
                 custom_fields=dict(body.custom_fields),
                 created_by_user_id=current_user.id,
             )
-            db.add(ip)
-            await db.flush()
 
             if body.create_dns_records:
                 await _sync_dns_record(
