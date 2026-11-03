@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.ipam import IPAddress, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.unifi import UnifiController
 from app.services.fortinet.client import _FortiInterface, _FortiLease
 from app.services.fortinet.reconcile import reconcile_firewall as fortinet_reconcile
@@ -287,3 +287,21 @@ async def test_lease_on_the_gateway_address_does_not_fail_the_sync(
     _, rows = await _rows(db_session, space_id)
     assert rows["10.214.20.1"].hostname == "gateway"
     assert rows["10.214.20.50"].status == "dhcp"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("name", "factory"), MIRRORS, ids=[m[0] for m in MIRRORS])
+async def test_gateway_row_recounts_the_parent_block_in_the_same_sync(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, name: str, factory
+) -> None:
+    """The block chain follows the subnet recount in the same transaction,
+    not at the hourly recount: a block counts the subnet's usable rows plus
+    its network and broadcast addresses (#2982)."""
+    sync, space_id, _fk, _tid = await factory(db_session, monkeypatch)
+    assert await sync("10.214.20.1") == []
+    subnet, _ = await _rows(db_session, space_id)
+    assert subnet.allocated_ips == 1
+    block = await db_session.get(IPBlock, subnet.block_id)
+    assert block is not None
+    await db_session.refresh(block)
+    assert block.allocated_ips == 3

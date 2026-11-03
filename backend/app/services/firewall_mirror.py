@@ -44,7 +44,7 @@ from app.services.integration_ownership import (
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 _BIGINT_MAX = 2**63 - 1
 
@@ -386,25 +386,6 @@ def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
     return best
 
 
-async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
-    allocated = (
-        await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == subnet_id)
-            .where(counts_toward_utilization())
-        )
-        or 0
-    )
-    subnet = await db.get(Subnet, subnet_id)
-    if subnet is None:
-        return
-    subnet.allocated_ips = allocated
-    subnet.utilization_percent = (
-        round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
-    )
-
-
 def _find_enclosing_operator_block(blocks: list[IPBlock], cidr: str) -> IPBlock | None:
     """The tightest unowned (operator) block that contains ``cidr`` — used as the
     subnet's parent so we don't create a redundant wrapper."""
@@ -552,8 +533,7 @@ async def apply_subnets(
             if changed:
                 summary.subnets_updated += 1
     await db.flush()
-    for gw_subnet in gw_subnets:
-        await _recompute_subnet_utilization(db, gw_subnet.id)
+    await recount_subnets_and_blocks(db, [s.id for s in gw_subnets])
 
     # Drop owner-owned wrapper blocks that no longer back a subnet.
     for cidr, wrapper in fw_wrappers.items():
@@ -664,9 +644,7 @@ async def apply_addresses(
                 summary.addresses_updated += 1
 
     if dirty:
-        await db.flush()
-        for sid in dirty:
-            await _recompute_subnet_utilization(db, sid)
+        await recount_subnets_and_blocks(db, dirty)
 
 
 __all__ = [

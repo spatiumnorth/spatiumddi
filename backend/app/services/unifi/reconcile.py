@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str
@@ -59,7 +59,7 @@ from app.services.integration_ownership import (
     unowned_subnets_at,
 )
 from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.router_naming import pick_unique_router_name
 from app.services.unifi.client import (
     UnifiClient,
@@ -253,25 +253,6 @@ def _find_enclosing_operator_block(
             best = b
             best_prefix = bnet.prefixlen
     return best
-
-
-async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
-    allocated = (
-        await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == subnet_id)
-            .where(counts_toward_utilization())
-        )
-        or 0
-    )
-    subnet = await db.get(Subnet, subnet_id)
-    if subnet is None:
-        return
-    subnet.allocated_ips = allocated
-    subnet.utilization_percent = (
-        round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
-    )
 
 
 # ── Desired state computation ────────────────────────────────────────
@@ -725,8 +706,7 @@ async def _apply_blocks_and_subnets(
                 summary.subnets_updated += 1
 
     await db.flush()
-    for gw_subnet in gw_subnets:
-        await _recompute_subnet_utilization(db, gw_subnet.id)
+    await recount_subnets_and_blocks(db, [s.id for s in gw_subnets])
 
     for net_str, wrapper in controller_owned_wrappers.items():
         if net_str in used_wrapper_cidrs:
@@ -970,9 +950,7 @@ async def _apply_addresses(
             summary.addresses_created += 1
 
     if dirty_subnets:
-        await db.flush()
-        for subnet_id in dirty_subnets:
-            await _recompute_subnet_utilization(db, subnet_id)
+        await recount_subnets_and_blocks(db, dirty_subnets)
 
 
 # ── Discovery payload ───────────────────────────────────────────────
