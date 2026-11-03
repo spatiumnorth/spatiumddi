@@ -668,6 +668,10 @@ async def approve_change_request(
     cr = await get_change_request(db, cr_id, for_update=True)
     if cr is None:
         raise DecisionNotFound(f"Change request {cr_id} not found")
+    # 1b. A scoped API token must hold the write scope of the operation's own
+    #     family (#3302); the route gate could only ask for "any write scope".
+    #     Before the expiry branch, which writes (mark_expired + commit).
+    _enforce_token_scope(request, cr.operation)
     if cr.state != "pending":
         raise DecisionConflict(f"Change request is not pending (state={cr.state!r})")
     # #10: one expiry convention everywhere — ``expires_at <= now`` means expired
@@ -697,10 +701,6 @@ async def approve_change_request(
     op = operations.get_operation(cr.operation)
     if op is None:
         raise DecisionError(f"Operation {cr.operation!r} is not registered")
-
-    # 2c. A scoped API token must hold the write scope of the operation's own
-    #     family (#3302); the route gate could only ask for "any write scope".
-    _enforce_token_scope(request, cr.operation)
 
     # 3. Approver holds the approve capability.
     if not _can_approve(approver):

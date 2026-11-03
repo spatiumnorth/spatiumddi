@@ -22,6 +22,11 @@ Five well-known scopes that compose by union:
   products that merely share the ``dns`` spelling.
 * ``dhcp:write`` — allows mutations under ``/api/v1/dhcp``.
 
+Each write scope also covers the plainly-domain routes mounted elsewhere
+(``_IPAM_PREFIXES`` and ``_ROUTE_RULES``), and the approve-and-provision
+routes, which then check the stored operation's family at apply time
+(:func:`enforce_operation_token_scope`, #3302).
+
 Every prefix is matched on a whole path segment: ``/api/v1/dns`` covers
 ``/api/v1/dns`` and ``/api/v1/dns/...`` but not ``/api/v1/dnsbl/...``. A
 scope grants only the surface it names, including for routers mounted later
@@ -136,15 +141,17 @@ _IPAM_PREFIXES: tuple[str, ...] = (
 # whole router being covered (#3302). A prefix would widen the scope onto the
 # siblings that share it: ``/nmap`` scan creation is an active probe, and
 # ``/acme/update`` is the acme-dns client's own credential, not an operator.
-# Each entry is ``(scope, method, path regex)``.
+# Each entry is ``(scope, method, path regex)``, matched whole (``fullmatch``).
 _ROUTE_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
-    ("ipam:write", "POST", re.compile(r"^/api/v1/nmap/scans/[^/]+/stamp-discovered$")),
-    ("dns:write", "POST", re.compile(r"^/api/v1/acme/register$")),
-    ("dns:write", "DELETE", re.compile(r"^/api/v1/acme/accounts/[^/]+$")),
-    # Registered-domain (RDAP / expiry) inventory.
-    ("dns:write", "*", re.compile(r"^/api/v1/domains(/.*)?$")),
+    ("ipam:write", "POST", re.compile(r"/api/v1/nmap/scans/[^/]+/stamp-discovered")),
+    ("dns:write", "POST", re.compile(r"/api/v1/acme/register")),
+    ("dns:write", "DELETE", re.compile(r"/api/v1/acme/accounts/[^/]+")),
+    # Registered-domain (RDAP / expiry) inventory, except the synchronous
+    # RDAP refresh: an off-prem lookup needs an unrestricted token, as
+    # ``lookup_whois_domain`` does over MCP.
+    ("dns:write", "*", re.compile(r"/api/v1/domains(?:/(?![^/]+/refresh-whois\Z).*)?")),
     # Blocks a MAC across DHCP groups; also needs ``write dhcp_mac_block`` RBAC.
-    ("dhcp:write", "POST", re.compile(r"^/api/v1/new-devices/block$")),
+    ("dhcp:write", "POST", re.compile(r"/api/v1/new-devices/block")),
 )
 
 # Approve-and-provision routes. A scoped token may enter any of them holding
@@ -152,10 +159,10 @@ _ROUTE_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
 # family (:func:`enforce_operation_token_scope`). The route gate cannot, since
 # the family is in the stored request, not the path.
 _APPLY_TIME_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("POST", re.compile(r"^/api/v1/requests$")),
-    ("POST", re.compile(r"^/api/v1/requests/[^/]+/(approve|reject|cancel)$")),
-    ("POST", re.compile(r"^/api/v1/change-requests/[^/]+/(approve|reject|cancel)$")),
-    ("POST", re.compile(r"^/api/v1/ai/proposals/[^/]+/apply$")),
+    ("POST", re.compile(r"/api/v1/requests")),
+    ("POST", re.compile(r"/api/v1/requests/[^/]+/(approve|reject|cancel)")),
+    ("POST", re.compile(r"/api/v1/change-requests/[^/]+/(approve|reject|cancel)")),
+    ("POST", re.compile(r"/api/v1/ai/proposals/[^/]+/apply")),
 )
 
 # Registered operation -> the write scope covering its REST twin. Keyed by
@@ -230,11 +237,13 @@ def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
 
 
 def _route_rule_matches(scope: str, method: str, path: str) -> bool:
-    return any(s == scope and m in ("*", method) and rx.match(path) for s, m, rx in _ROUTE_RULES)
+    return any(
+        s == scope and m in ("*", method) and rx.fullmatch(path) for s, m, rx in _ROUTE_RULES
+    )
 
 
 def _apply_time_route(method: str, path: str) -> bool:
-    return any(m == method and rx.match(path) for m, rx in _APPLY_TIME_ROUTES)
+    return any(m == method and rx.fullmatch(path) for m, rx in _APPLY_TIME_ROUTES)
 
 
 def enforce_operation_token_scope(request: object, operation_name: str) -> None:

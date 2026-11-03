@@ -68,6 +68,12 @@ def test_widened_route_admits_its_scope_and_only_its_scope(
         ("dns:write", "POST", "/api/v1/domainsx"),
         ("ipam:write", "POST", "/api/v1/custom-fieldsx"),
         ("ipam:write", "POST", "/api/v1/av/other"),
+        # The synchronous RDAP refresh is an off-prem lookup (unrestricted only).
+        ("dns:write", "POST", "/api/v1/domains/abc/refresh-whois"),
+        # Matched whole: no trailing slash, newline or extra segment.
+        ("dhcp:write", "POST", "/api/v1/new-devices/block/"),
+        ("dns:write", "POST", "/api/v1/acme/register\n"),
+        ("ipam:write", "POST", "/api/v1/requests/abc/approve/x"),
     ],
 )
 def test_siblings_of_a_widened_route_stay_refused(scope: str, method: str, path: str) -> None:
@@ -346,3 +352,45 @@ async def test_proposal_apply_checks_the_operations_family(
     await db_session.commit()
     r = await client.post(f"/api/v1/ai/proposals/{row2.id}/apply", headers=nofamily, json={})
     assert r.status_code == 403 and "unrestricted" in r.json()["detail"], r.text
+
+
+@pytest.mark.asyncio
+async def test_expired_request_is_not_touched_by_a_wrong_family_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The family check runs before approve's expiry branch, which writes
+    (``mark_expired`` + commit): a token that cannot decide the request must
+    not be able to move it either."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    await _enable(db_session, "governance.requests")
+    requester = await _user(db_session, "req", _REQUESTER_PERMS)
+    approver = await _user(db_session, "appr", _APPROVER_PERMS)
+    wrong = await _api_token(db_session, approver, ["dns:write"])
+    req_id = await _submit(client, db_session, requester)
+    await db_session.commit()
+    cr = (
+        await db_session.execute(select(ChangeRequest).where(ChangeRequest.id == uuid.UUID(req_id)))
+    ).scalar_one()
+    cr.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    await db_session.commit()
+
+    r = await client.post(f"/api/v1/requests/{req_id}/approve", headers=wrong, json={})
+    assert r.status_code == 403 and "ipam:write" in r.json()["detail"], r.text
+    db_session.expire_all()
+    cr = (
+        await db_session.execute(select(ChangeRequest).where(ChangeRequest.id == uuid.UUID(req_id)))
+    ).scalar_one()
+    assert cr.state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_domain_rdap_refresh_stays_unrestricted_only(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable(db_session, "network.domains")
+    owner = await _user(db_session, "own", None, sa=True)
+    dns = await _api_token(db_session, owner, ["dns:write"])
+    await db_session.commit()
+    r = await client.post(f"/api/v1/domains/{uuid.uuid4()}/refresh-whois", headers=dns)
+    assert r.status_code == 403 and "scope" in r.text.lower(), r.text

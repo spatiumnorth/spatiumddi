@@ -694,7 +694,7 @@ rejected with `422` rather than silently locking the operator out:
   groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
   (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
   that writes there needs an empty scope set, with RBAC as the gate. It also
-  covers `/api/v1/domains/*`, `POST /acme/register` and
+  covers `/api/v1/domains/*` (except the off-prem `refresh-whois` lookup), `POST /acme/register` and
   `DELETE /acme/accounts/{id}`.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`, and
   `POST /api/v1/new-devices/block`.

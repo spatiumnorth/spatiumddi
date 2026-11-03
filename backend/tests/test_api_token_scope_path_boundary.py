@@ -145,6 +145,9 @@ def test_write_scopes_grant_only_their_own_top_level_segments() -> None:
             # Approve-and-provision routes: any write scope enters, the
             # handler checks the operation's family.
             expected = expected or _is_apply_time_path(path)
+            # The synchronous RDAP refresh is an off-prem lookup: unrestricted only.
+            if path == "/api/v1/domains/{domain_id}/refresh-whois":
+                expected = False
             if scope_matches_request([scope], "POST", path) is not expected:
                 wrong.append(f"{scope} {path} -> expected {expected}")
     assert not wrong, "\n".join(wrong)
