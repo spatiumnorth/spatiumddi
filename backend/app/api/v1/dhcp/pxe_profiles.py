@@ -35,6 +35,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
@@ -47,6 +48,7 @@ from app.models.dhcp import (
     DHCPPXEProfile,
     DHCPServerGroup,
 )
+from app.services.dhcp.class_refs import describe_pools, pools_restricted_to
 from app.services.dhcp.option_validation import check_vendor_class_match
 
 router = APIRouter(
@@ -65,6 +67,11 @@ class ArchMatchInput(BaseModel):
     operators raise / lower it to control evaluation order
     (lower = higher priority)."""
 
+    # #3374 — the id of the stored rule this input edits. The Kea class name
+    # embeds it, so an edit that names the row keeps the class a pool is bound
+    # to even when its selector (vendor class / arch codes) changes. Omitted
+    # (API callers, new rules): paired by content, then by selector.
+    id: uuid.UUID | None = None
     priority: int = 100
     match_kind: str = "first_stage"
     vendor_class_match: str | None = Field(default=None, max_length=255)
@@ -221,25 +228,65 @@ def _selector(key: tuple[Any, ...]) -> tuple[Any, ...]:
     return key[1:4]
 
 
-def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
-    """Reconcile the stored matches with the input; return True when anything
-    differed (#3367).
+def _replace_matches(
+    p: DHCPPXEProfile, rows: list[ArchMatchInput]
+) -> tuple[bool, list[DHCPPXEArchMatch]]:
+    """Reconcile the stored matches with the input; return ``(changed,
+    removed)`` — whether anything differed (#3367) and the rows now deleted.
 
-    Rows whose content is already stored are kept as they are, ids included.
-    The Kea class name embeds the match id, so re-creating an identical row
-    renamed its class, shifted the bundle ETag and pushed a config to every
-    agent for a Save that changed nothing. A leftover input row is updated in
-    place only onto a stored row that selects the same clients (same kind,
-    vendor class and arch codes), so an edited priority or boot file keeps its
-    class name — and a pool whose ``class_restriction`` names that class keeps
-    meaning the same clients. Any other leftover is deleted and created anew:
-    reusing an id across selectors would silently move such a pool onto a
-    different set of clients.
+    An input row that carries an ``id`` edits that stored row in place, selector
+    included (#3374): the Kea class name embeds the match id, so a rule whose
+    arch codes or vendor class are edited keeps the class a pool's
+    ``class_restriction`` names. An id that is not one of this profile's rules
+    is a 422 (an id from another profile must never be adopted).
+
+    Rows without an id (API callers, new rules) are paired as before: rows
+    whose content is already stored are kept as they are, ids included — the
+    class name embeds the id, so re-creating an identical row renamed its class,
+    shifted the bundle ETag and pushed a config to every agent for a Save that
+    changed nothing. A leftover is updated in place only onto a stored row that
+    selects the same clients (same kind, vendor class and arch codes), so an
+    edited priority or boot file keeps its class name; any other leftover is
+    created anew, since reusing an id across selectors would silently move a
+    pool onto a different set of clients. Stored rows nothing refers to are
+    deleted.
     """
     existing = sorted(p.matches, key=lambda x: (x.priority, str(x.id)))
-    unmatched_rows: list[ArchMatchInput] = []
-    free: list[DHCPPXEArchMatch] = list(existing)
+    by_id = {m.id: m for m in existing}
+    seen_ids: set[uuid.UUID] = set()
     for r in rows:
+        if r.id is None:
+            continue
+        if r.id not in by_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Boot rule {r.id} does not belong to this PXE profile",
+            )
+        if r.id in seen_ids:
+            raise HTTPException(
+                status_code=422, detail=f"Boot rule {r.id} is listed more than once"
+            )
+        seen_ids.add(r.id)
+
+    changed = False
+    free: list[DHCPPXEArchMatch] = [m for m in existing if m.id not in seen_ids]
+    for r in rows:
+        if r.id is None:
+            continue
+        m = by_id[r.id]
+        if _row_key(m) != _input_key(r):
+            changed = True
+            m.priority = r.priority
+            m.match_kind = r.match_kind
+            m.vendor_class_match = r.vendor_class_match
+            m.arch_codes = r.arch_codes
+            m.boot_filename = r.boot_filename
+            m.boot_file_url_v6 = r.boot_file_url_v6
+
+    unmatched_rows: list[ArchMatchInput] = []
+    for r in rows:
+        if r.id is not None:
+            continue
         k = _input_key(r)
         for m in free:
             if _row_key(m) == k:
@@ -247,9 +294,8 @@ def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
                 break
         else:
             unmatched_rows.append(r)
-    if not unmatched_rows and not free:
-        return False
     for r in unmatched_rows:
+        changed = True
         sel = _selector(_input_key(r))
         for m in free:
             if _selector(_row_key(m)) == sel:
@@ -271,7 +317,27 @@ def _replace_matches(p: DHCPPXEProfile, rows: list[ArchMatchInput]) -> bool:
             )
     for m in free:
         p.matches.remove(m)
-    return True
+    return changed or bool(free), list(free)
+
+
+async def _refuse_if_pool_bound(
+    db: AsyncSession, p: DHCPPXEProfile, removed: list[DHCPPXEArchMatch]
+) -> None:
+    """409 when a deleted rule's generated class is still named by a pool's
+    ``class_restriction`` (#3374) — Kea would accept the pool and never match
+    it. Same refusal shape as deleting a client class (#2285)."""
+    for m in removed:
+        name = f"pxe-{str(p.id)[:8]}-{str(m.id)[:8]}"
+        pools = await pools_restricted_to(db, p.group_id, name)
+        if pools:
+            detail = (
+                f"Cannot remove boot rule '{m.boot_filename}': its generated class "
+                f"{name} is the class restriction of pool(s) "
+                f"{describe_pools(pools)}. Change those pools first."
+            )
+            # Drop the in-session edits so a refused Save leaves nothing staged.
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=detail)
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
@@ -418,7 +484,8 @@ async def update_profile(
 
     matches_changed = False
     if matches_input is not None:
-        matches_changed = _replace_matches(prof, matches_input)
+        matches_changed, removed = _replace_matches(prof, matches_input)
+        await _refuse_if_pool_bound(db, prof, removed)
 
     write_audit(
         db,
