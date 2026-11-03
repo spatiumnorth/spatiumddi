@@ -1832,7 +1832,10 @@ async def agent_lease_events(
 
     # #3345 — the mirror pass added / freed address rows; recount the touched
     # subnets and their block chains once, in the batch's own transaction.
-    await recount_subnets_and_blocks(db, recount_ids)
+    # No audit row follows: the only ones this batch writes (first_seen) are
+    # staged above, so the recount's flush takes the audit-chain lock before
+    # its row locks, and a batch without them never waits for that lock.
+    await recount_subnets_and_blocks(db, recount_ids, audit_lock=False)
     await db.commit()
     return {"upserted": upserted}
 

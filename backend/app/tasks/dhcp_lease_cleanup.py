@@ -151,7 +151,9 @@ async def _sweep() -> tuple[int, int]:
             await db.delete(lease)
             deleted += 1
 
-        await recount_subnets_and_blocks(db, touched_subnets)
+        # The sweep writes no audit row, so it never waits for the audit-chain
+        # lock and need not take it before the row locks (#3345).
+        await recount_subnets_and_blocks(db, touched_subnets, audit_lock=False)
         await db.commit()
         return cleaned, deleted
 

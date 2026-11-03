@@ -241,14 +241,14 @@ async def test_recount_is_one_batch_for_a_100_lease_post(
     def _count(conn: Any, cur: Any, statement: str, *a: Any) -> None:
         stmts.append(statement)
 
-    async def _wrapped(db: AsyncSession, ids: Any) -> None:
+    async def _wrapped(db: AsyncSession, ids: Any, **kw: Any) -> None:
         ids = list(ids)
         calls.append(len(ids))
         await db.flush()  # the batch's own pending writes are not the recount's
         stmts.clear()
         event.listen(Engine, "before_cursor_execute", _count)
         try:
-            await real(db, ids)
+            await real(db, ids, **kw)
         finally:
             event.remove(Engine, "before_cursor_execute", _count)
 
@@ -278,10 +278,10 @@ async def test_renewal_only_batch_skips_the_recount(
     real = agents.recount_subnets_and_blocks
     calls: list[list[Any]] = []
 
-    async def _wrapped(db: AsyncSession, ids: Any) -> None:
+    async def _wrapped(db: AsyncSession, ids: Any, **kw: Any) -> None:
         ids = list(ids)
         calls.append(ids)
-        await real(db, ids)
+        await real(db, ids, **kw)
 
     monkeypatch.setattr(agents, "recount_subnets_and_blocks", _wrapped)
     assert (await _post(client, server, [_ev(10), _ev(11)])).status_code == 200
@@ -326,9 +326,9 @@ async def test_block_recount_locks_in_one_order(db_session: AsyncSession) -> Non
 
         def _cap(conn: Any, cur: Any, statement: str, params: Any, *a: Any) -> None:
             sql = " ".join(statement.split())
-            if sql.upper().endswith("ORDER BY SUBNET.ID FOR UPDATE"):
+            if sql.upper().endswith("ORDER BY SUBNET.ID FOR NO KEY UPDATE"):
                 kind = "LOCK subnet"
-            elif sql.upper().endswith("ORDER BY IP_BLOCK.ID FOR UPDATE"):
+            elif sql.upper().endswith("ORDER BY IP_BLOCK.ID FOR NO KEY UPDATE"):
                 kind = "LOCK ip_block"
             elif sql.upper().startswith("UPDATE "):
                 kind = "UPDATE " + sql.split()[1]
