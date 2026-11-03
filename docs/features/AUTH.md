@@ -719,7 +719,7 @@ Prefixes match on a whole path segment, so `/api/v1/dns` covers
 
 - A write scope admits every method under its own prefixes, reads included,
   and nothing outside them: a token with only `ipam:write` can list subnets but
-  is refused a `GET /dns/zones`. Combine it with `read` for a token that reads
+  is refused a `GET /dns/groups`. Combine it with `read` for a token that reads
   everywhere and writes in one domain.
 - A write-only token cannot use MCP. The Operator Copilot endpoint
   (`POST /api/v1/ai/mcp`) is admitted by `read` alone, so a scoped token needs
