@@ -260,13 +260,17 @@ async def _check_overlap_in_target(
     """
     moved_net = ipaddress.ip_network(str(moved_block.network), strict=False)
 
+    # deleted_at IS NULL: raw SQL bypasses the ORM soft-delete filter. A trashed
+    # block frees its CIDR for a move as it does for a create (#490), and stays
+    # off the reparent chain, so a move never rewrites a row in the Trash (#3418).
     if target_parent_id is None:
         sql = (
             "SELECT id, network::text FROM ip_block "
             "WHERE space_id = CAST(:space AS uuid) "
             "AND parent_block_id IS NULL "
             "AND network && CAST(:net AS cidr) "
-            "AND id != CAST(:self AS uuid)"
+            "AND id != CAST(:self AS uuid) "
+            "AND deleted_at IS NULL"
         )
         params: dict[str, Any] = {
             "space": str(target_space_id),
@@ -279,7 +283,8 @@ async def _check_overlap_in_target(
             "WHERE space_id = CAST(:space AS uuid) "
             "AND parent_block_id = CAST(:parent AS uuid) "
             "AND network && CAST(:net AS cidr) "
-            "AND id != CAST(:self AS uuid)"
+            "AND id != CAST(:self AS uuid) "
+            "AND deleted_at IS NULL"
         )
         params = {
             "space": str(target_space_id),
