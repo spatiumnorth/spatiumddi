@@ -227,11 +227,11 @@ async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | No
     family = scope.address_family or "ipv4"
     if cc is None and is_generated(name):
         # #3388 — shaped like a generated class is not the same as being one.
-        problem = await generated_class_problem(db, scope.group_id, name)
+        problem = await generated_class_problem(db, scope, name)
         if problem:
             raise HTTPException(
                 status_code=422,
-                detail=f"Client class '{name}' is not defined: {problem}, so the pool "
+                detail=f"Client class '{name}' cannot restrict this pool: {problem}, so the pool "
                 "would match no client.",
             )
     if (
