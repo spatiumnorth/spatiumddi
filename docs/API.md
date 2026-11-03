@@ -410,14 +410,15 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   Path prefixes match on a whole segment: `dns:write` covers
   `/api/v1/dns/...` but not `/api/v1/dnsbl/...` or `/api/v1/dns-threat/...`.
   `read` permits only safe methods (`GET` / `HEAD` / `OPTIONS`) — plus
-  a JSON-RPC `POST` to the read-only MCP endpoint, plus the POST routes
+  a JSON-RPC `POST` to the MCP endpoint (`/api/v1/ai/mcp`, which dispatches no write tool), plus the POST routes
   that only read (a filter or preview body, no mutation, no outbound probe):
   those carry the `@read_only_post` marker from `api_token_scopes.py`
   (the DNS query log, its analytics and the DHCP activity log under
   `/logs/`, `/tools/mac-vendor`, and the side-effect-free previews /
   validations). The Windows Event Log and DHCP audit pulls (`/logs/query`,
   `/logs/dhcp-audit`) are not marked: they run PowerShell on the Windows
-  server over WinRM, so they need a write scope. The set is pinned by
+  server over WinRM, and no write scope covers `/logs`, so they need an
+  unrestricted token. The set is pinned by
   `tests/test_token_read_only_post_3223.py`.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
   specific `subnet` or `dns_zone` instance with an
