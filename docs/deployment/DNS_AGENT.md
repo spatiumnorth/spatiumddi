@@ -940,7 +940,7 @@ them nor manages that transfer.
 ### `dns-bind9` image
 
 ```
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 RUN apk add --no-cache bind bind-tools tini python3 py3-pip libcap ca-certificates tzdata
 # Agent
 COPY --from=agent-build /install /usr/local
