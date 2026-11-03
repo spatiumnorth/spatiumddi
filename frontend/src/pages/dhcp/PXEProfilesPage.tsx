@@ -309,6 +309,10 @@ export function ProfileEditor(props: ProfileEditorProps) {
 
 function sanitizeMatches(matches: PXEArchMatchInput[]) {
   return matches.map((m) => ({
+    // An existing rule names its row (#3374) so an edit to its arch codes or
+    // vendor class keeps the Kea class a pool may be bound to; new rules send
+    // none.
+    ...(m.id ? { id: m.id } : {}),
     priority: m.priority ?? 100,
     match_kind: m.match_kind ?? "first_stage",
     vendor_class_match:
@@ -335,6 +339,7 @@ function ProfileEditorForm({
   const [matches, setMatches] = useState<PXEArchMatchInput[]>(
     () =>
       existing?.matches.map((m) => ({
+        id: m.id,
         priority: m.priority,
         match_kind: m.match_kind,
         vendor_class_match: m.vendor_class_match,

@@ -9072,6 +9072,8 @@ export interface PXEArchMatch {
 }
 
 export interface PXEArchMatchInput {
+  /** Existing rule's id (#3374); omit for a new rule. */
+  id?: string;
   priority?: number;
   match_kind?: PXEMatchKind;
   vendor_class_match?: string | null;
