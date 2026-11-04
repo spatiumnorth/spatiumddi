@@ -175,9 +175,12 @@ class Tool:
     description: str
     args_model: type[BaseModel]
     executor: ToolExecutor
-    # True for a tool that mutates state. The MCP transport never
-    # dispatches one; the in-app chat gates them behind the
-    # per-conversation toggle and the preview / commit pattern.
+    # True for a tool that mutates state directly. Nothing offers one to
+    # the model: the MCP transport never dispatches it, the Tool Catalog
+    # save refuses to enable it (422), and the effective set and the in-app
+    # chat leave it out. A Copilot write is a ``propose_*`` tool instead
+    # (``writes=False``): it stages an ``AIOperationProposal``, and the
+    # change runs only when the operator applies it (#3415).
     writes: bool = False
     # Free-form category used by the admin "available tools" page to
     # group tools — "ipam", "dns", "dhcp", "network", "ops".
