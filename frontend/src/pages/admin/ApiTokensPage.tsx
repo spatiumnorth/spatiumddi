@@ -833,6 +833,10 @@ export function ApiTokensPage() {
       setConfirmRevokeAll(false);
     },
   });
+  const closeRevokeAll = () => {
+    setConfirmRevokeAll(false);
+    revokeAllMut.reset();
+  };
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiTokensApi.delete(id),
     onSuccess: () => {
@@ -1035,12 +1039,25 @@ export function ApiTokensPage() {
         <ConfirmModal
           open={confirmRevokeAll}
           title="Revoke all my API tokens"
-          message="Revoke every API token you own? Automation using them stops working; you can mint new ones."
+          message={
+            <>
+              Revoke every API token you own? Automation using them stops
+              working; you can mint new ones.
+              {revokeAllMut.isError && (
+                <span className="mt-2 block text-destructive">
+                  {formatDialogError(
+                    revokeAllMut.error,
+                    "Failed to revoke API tokens",
+                  )}
+                </span>
+              )}
+            </>
+          }
           confirmLabel="Revoke all"
           tone="destructive"
           loading={revokeAllMut.isPending}
           onConfirm={() => revokeAllMut.mutate()}
-          onClose={() => setConfirmRevokeAll(false)}
+          onClose={closeRevokeAll}
         />
         {confirmDelete && (
           <Modal

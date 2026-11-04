@@ -2697,10 +2697,11 @@ export const usersApi = {
   /** Link an external account to its provider (#1235). Clears the stored
    *  external id; the next sign-in through that provider with the
    *  account's username claims it. */
-  linkProvider: (id: string, authProviderId: string) =>
+  linkProvider: (id: string, authProviderId: string, revokeApiTokens = false) =>
     api
       .post<AppUser>(`/users/${id}/link-provider`, {
         auth_provider_id: authProviderId,
+        revoke_api_tokens: revokeApiTokens,
       })
       .then((r) => r.data),
   delete: (id: string) => api.delete(`/users/${id}`),

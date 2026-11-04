@@ -122,4 +122,21 @@ describe("Users, Revoke all API tokens", () => {
     expect(screen.queryByRole("button", { name: "Revoke all" })).toBeNull();
     expect(revokeApiTokens).not.toHaveBeenCalled();
   });
+
+  it("shows the server's refusal in the confirmation instead of failing silently", async () => {
+    superadmin = true;
+    revokeApiTokens.mockRejectedValue(
+      Object.assign(new Error("Request failed with status code 409"), {
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: { detail: "Refused for a test reason" },
+        },
+      }),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByLabelText("Revoke all API tokens"));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all" }));
+    expect(await screen.findByText(/Refused for a test reason/)).toBeTruthy();
+  });
 });

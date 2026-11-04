@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
-import { apiTokensApi, authApi } from "@/lib/api";
+import { apiTokensApi, authApi, formatApiError } from "@/lib/api";
 import { setMustChangePassword } from "@/lib/authToken";
 import { evaluatePolicy, parsePasswordError } from "@/lib/password-policy";
 import { cn } from "@/lib/utils";
@@ -107,8 +107,8 @@ export function ChangePasswordPage() {
     try {
       await apiTokensApi.revokeAll();
       navigate("/dashboard");
-    } catch {
-      setRevokeError("Failed to revoke API tokens — try again.");
+    } catch (err) {
+      setRevokeError(formatApiError(err, "Failed to revoke API tokens"));
     }
   }
 

@@ -106,7 +106,10 @@ group membership.
   without changing a password, `POST /api-tokens/revoke-all` revokes the
   caller's own tokens and a superadmin's `POST /users/{id}/revoke-api-tokens`
   revokes a user's; the account stays active, and the Users page has a
-  "Revoke all API tokens" button. `GET /users` carries `api_token_count` per
+  "Revoke all API tokens" button. Linking an external account to its
+  provider (`POST /users/{id}/link-provider`) follows the same rule: it ends
+  the sessions, reports `api_token_count`, and takes the same opt-in
+  `revoke_api_tokens`. `GET /users` carries `api_token_count` per
   user, as does the `list_users` copilot tool. No copilot tool revokes: that
   is a broad-blast-radius credential write. `backend/app/services/api_token_revocation.py`.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.

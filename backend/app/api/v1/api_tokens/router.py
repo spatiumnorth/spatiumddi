@@ -52,7 +52,11 @@ from app.models.auth import APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
 from app.services.api_token_revocation import revoke_user_api_tokens
-from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
+from app.services.api_token_scopes import (
+    token_write,
+    validate_resource_grant_shape,
+    validate_scopes,
+)
 
 router = APIRouter()
 
@@ -393,6 +397,7 @@ class RevokeAllResponse(BaseModel):
 
 
 @router.post("/revoke-all", response_model=RevokeAllResponse)
+@token_write("Revokes every API token the caller owns; a credential mutation.")
 async def revoke_all_own_tokens(db: DB, current_user: CurrentUser) -> RevokeAllResponse:
     """Revoke every API token the caller owns (#1359). Own tokens only: the
     path takes no user id, so it cannot reach anyone else's (an admin uses

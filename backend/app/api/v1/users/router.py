@@ -30,6 +30,7 @@ from app.services.api_token_revocation import (
     count_live_api_tokens_by_user,
     revoke_user_api_tokens,
 )
+from app.services.api_token_scopes import token_write
 from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
@@ -219,6 +220,9 @@ class UpdateUserRequest(BaseModel):
 
 class LinkProviderRequest(BaseModel):
     auth_provider_id: uuid.UUID
+    # #1359 — opt in to revoking the account's API tokens with the link. Off
+    # by default, as on a password reset: tokens are not sessions.
+    revoke_api_tokens: bool = False
 
 
 class TokenOutcome(BaseModel):
@@ -638,6 +642,7 @@ async def reset_password(
 
 
 @router.post("/{user_id}/revoke-api-tokens", response_model=TokenOutcome)
+@token_write("Revokes every API token a user holds; a credential mutation.")
 async def revoke_api_tokens(user_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> TokenOutcome:
     """Revoke every API token the user holds (#1359). The account stays
     active and its sessions are untouched; the user mints new tokens. User
@@ -708,7 +713,9 @@ async def link_provider(
     provider with the account's username claims it and records the
     provider's id for the subject. Only this administrator action
     authorises that username match. Every session the account holds is
-    revoked, so nothing opened under the previous identity survives it.
+    revoked, so no session opened under the previous identity survives it.
+    API tokens are not sessions and survive unless ``revoke_api_tokens`` is
+    set (#1359); the response's ``api_token_count`` says how many are live.
 
     A local account cannot be linked. It has a password, and linking it
     would hand it to whoever holds that username at the provider, which is
@@ -743,6 +750,9 @@ async def link_provider(
     # Sessions opened under the old identity must not outlive that, the
     # same reasoning as the admin password reset above (#400).
     await revoke_live_sessions(db, UserSession.user_id == user.id)
+    tokens_revoked = 0
+    if body.revoke_api_tokens:
+        tokens_revoked = await revoke_user_api_tokens(db, current_user, user.id, "provider_linked")
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -758,11 +768,13 @@ async def link_provider(
                 "auth_source": provider.type,
                 "auth_provider_id": str(provider.id),
                 "auth_provider": provider.name,
+                **({"api_tokens_revoked": tokens_revoked} if body.revoke_api_tokens else {}),
             },
         )
     )
     await db.commit()
     await db.refresh(user)
+    user.api_token_count = await count_live_api_tokens(db, user.id)  # type: ignore[attr-defined]
     logger.info(
         "user_provider_linked",
         target=user.username,

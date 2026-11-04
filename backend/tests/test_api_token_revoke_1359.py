@@ -368,3 +368,83 @@ async def test_user_list_carries_live_token_count(
 
     out = await list_users(db_session, admin, ListUsersArgs())
     assert {r["id"]: r["api_token_count"] for r in out}[str(target.id)] == 2
+
+
+# ── link-provider (issue comment: same rule as a reset) ─────────────────────
+
+
+async def _external(db: AsyncSession) -> tuple[User, object]:
+    from app.models.auth_provider import AuthProvider
+
+    provider = AuthProvider(
+        name=f"ldap-{uuid.uuid4().hex[:8]}",
+        type="ldap",
+        is_enabled=True,
+        config={},
+        auto_create_users=False,
+        auto_update_users=False,
+    )
+    db.add(provider)
+    u = await _user(db)
+    u.hashed_password = None
+    u.auth_source = "ldap"
+    u.external_id = "CN=old"
+    await db.flush()
+    await _token(db, u)
+    await _token(db, u)
+    await db.commit()
+    return u, provider
+
+
+async def test_link_provider_reports_live_tokens_and_opt_in_revokes(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _ensure_settings(db_session)
+    admin = await _user(db_session, is_superadmin=True)
+    target, provider = await _external(db_session)
+    plain = await client.post(
+        f"/api/v1/users/{target.id}/link-provider",
+        headers=_bearer(admin),
+        json={"auth_provider_id": str(provider.id)},  # type: ignore[attr-defined]
+    )
+    assert plain.status_code == 200, plain.text
+    assert plain.json()["api_token_count"] == 2
+    assert await _live(db_session, target) == 2
+    opted = await client.post(
+        f"/api/v1/users/{target.id}/link-provider",
+        headers=_bearer(admin),
+        json={
+            "auth_provider_id": str(provider.id),  # type: ignore[attr-defined]
+            "revoke_api_tokens": True,
+        },
+    )
+    assert opted.status_code == 200, opted.text
+    assert opted.json()["api_token_count"] == 0
+    assert await _live(db_session, target) == 0
+    reasons = (
+        await db_session.execute(
+            select(AuditLog.id).where(
+                AuditLog.resource_type == "api_token",
+                AuditLog.new_value["reason"].astext == "provider_linked",
+            )
+        )
+    ).all()
+    assert len(reasons) == 2
+
+
+async def test_link_provider_opt_in_refused_for_non_superadmin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _ensure_settings(db_session)
+    viewer = await _user(db_session)
+    target, provider = await _external(db_session)
+    r = await client.post(
+        f"/api/v1/users/{target.id}/link-provider",
+        headers=_bearer(viewer),
+        json={
+            "auth_provider_id": str(provider.id),  # type: ignore[attr-defined]
+            "revoke_api_tokens": True,
+        },
+    )
+    assert r.status_code == 403, r.text
+    assert await _live(db_session, target) == 2

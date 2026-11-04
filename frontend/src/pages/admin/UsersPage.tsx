@@ -378,8 +378,11 @@ function ProviderLink({ user }: { user: AppUser }) {
   });
   const [providerId, setProviderId] = useState(user.auth_provider_id ?? "");
   const [error, setError] = useState<string | null>(null);
+  // #1359 — a link ends the account's sessions, not its API tokens, unless
+  // asked.
+  const [revokeTokens, setRevokeTokens] = useState(false);
   const link = useMutation({
-    mutationFn: () => usersApi.linkProvider(user.id, providerId),
+    mutationFn: () => usersApi.linkProvider(user.id, providerId, revokeTokens),
     onSuccess: () => {
       setError(null);
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -407,8 +410,19 @@ function ProviderLink({ user }: { user: AppUser }) {
           </>
         )}{" "}
         Linking clears the stored identifier: the next sign-in through the
-        chosen provider as <code>{user.username}</code> claims this account.
+        chosen provider as <code>{user.username}</code> claims this account. It
+        ends the account's sessions; its API tokens keep working unless you
+        revoke them.
       </p>
+      <label className="flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={revokeTokens}
+          onChange={(e) => setRevokeTokens(e.target.checked)}
+        />
+        <span>Also revoke all of this user's API tokens</span>
+      </label>
       <div className="flex flex-col gap-2 sm:flex-row">
         <select
           className={inputCls}
@@ -433,6 +447,8 @@ function ProviderLink({ user }: { user: AppUser }) {
       {link.isSuccess && (
         <p className="text-xs text-emerald-700 dark:text-emerald-300">
           Linked. The next sign-in as {user.username} claims the account.
+          {(link.data?.api_token_count ?? 0) > 0 &&
+            ` ${link.data?.api_token_count} API token(s) are still active.`}
         </p>
       )}
       {error && <p className="text-xs text-destructive">{error}</p>}
@@ -677,6 +693,10 @@ export function UsersPage() {
       setRevokeUser(null);
     },
   });
+  const closeRevoke = () => {
+    setRevokeUser(null);
+    revokeMut.reset();
+  };
 
   const {
     data: users,
@@ -898,6 +918,14 @@ export function UsersPage() {
               <strong>{revokeUser.username}</strong>? Automation using them
               stops working. The account and its sessions are not affected. The
               user can mint new tokens.
+              {revokeMut.isError && (
+                <span className="mt-2 block text-destructive">
+                  {userDialogError(
+                    revokeMut.error,
+                    "Failed to revoke API tokens",
+                  )}
+                </span>
+              )}
             </>
           )
         }
@@ -905,7 +933,7 @@ export function UsersPage() {
         tone="destructive"
         loading={revokeMut.isPending}
         onConfirm={() => revokeUser && revokeMut.mutate(revokeUser)}
-        onClose={() => setRevokeUser(null)}
+        onClose={closeRevoke}
       />
       {deleteUser && (
         <DeleteUserModal
