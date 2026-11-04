@@ -1,3 +1,0 @@
-### Fixed
-
-- Building a support bundle or the appliance diagnostics bundle no longer holds every other request while it scrubs a large host log. Each scrubbing pass ran over the whole log in one step, and that step kept the API's event loop waiting even from the worker thread the build runs in: about half a second for a 6 MB log, and up to 4.9 s for a request beside a bundle of a 30 MB log. The host logs and the installer logs are now scrubbed in pieces cut at line ends, a few milliseconds each, so the console and the API keep answering during the build. The bundles hold the same files with the same contents, the manifest's counts are the same, and so is the scrub mapping (#3310).
