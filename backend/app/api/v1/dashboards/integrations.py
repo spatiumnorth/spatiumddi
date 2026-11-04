@@ -116,9 +116,19 @@ class IntegrationErrorRow(BaseModel):
     timestamp: datetime
 
 
+class WithheldIntegration(BaseModel):
+    kind: str
+    label: str
+
+
 class IntegrationsDashboardSummary(BaseModel):
     generated_at: datetime
     panels: list[IntegrationPanel]
+    # #3456 — enabled integrations the caller may not read. Their panels, and
+    # their rows in the two recent lists, are left out; this names them so a
+    # client never reads the gap as "nothing enabled" or an all-clear. A
+    # disabled integration the caller cannot read is not listed.
+    withheld: list[WithheldIntegration] = []
     recent_errors: list[IntegrationErrorRow]
     # #2577 — releases of rows a target owned outside its IP space. Same
     # shape as an error row; ``error_detail`` carries what was released.
@@ -359,6 +369,11 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
 
     readable = [row for row in _PANELS if user_has_permission(current_user, "read", row[4])]
     readable_types = [row[4] for row in readable]
+    withheld = [
+        WithheldIntegration(kind=row[0], label=row[1])
+        for row in _PANELS
+        if row not in readable and row[2] in enabled_modules
+    ]
 
     # #2577 — releases outside a target's IP space: the recent ones as the
     # target row's warning, and the latest ones as their own list.
@@ -453,6 +468,7 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
     return IntegrationsDashboardSummary(
         generated_at=now,
         panels=panels,
+        withheld=withheld,
         recent_errors=recent_errors,
         recent_warnings=recent_warnings,
     )

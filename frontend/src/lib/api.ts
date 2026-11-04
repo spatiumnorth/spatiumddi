@@ -11393,6 +11393,10 @@ export interface IntegrationsDashboardErrorRow {
 export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
+  /** Enabled integrations the caller may not read: left out of `panels` and
+   *  of both recent lists, so the tab names them rather than reading the gap
+   *  as "nothing enabled" or an all-clear (#3456). Absent from older servers. */
+  withheld?: { kind: string; label: string }[];
   recent_errors: IntegrationsDashboardErrorRow[];
   // #2577 — rows a sync released outside its target's IP space; same shape,
   // `error_detail` carries what was released. Absent from older servers.
