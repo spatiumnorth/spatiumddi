@@ -95,6 +95,7 @@ from app.services.dhcp.ipam_mirror import (
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -1621,6 +1622,10 @@ async def agent_lease_events(
         row.last_seen_at = now
         row.last_seen_method = "dhcp"
 
+    # Subnets whose mirror rows were created / taken over / deleted in this
+    # batch; recounted ONCE after the pass (#3345), never per lease.
+    recount_ids: set[Any] = set()
+
     # ── IPAM mirror pass ────────────────────────────────────────────────
     for idx, ev in enumerate(events):
         if idx in stale:
@@ -1659,12 +1664,20 @@ async def agent_lease_events(
                 # row instead of 500-ing on uq_ip_address_subnet_address.
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 ipam_by_key[(subnet.id, norm_ip(ev.ip_address))] = ipam_row
+                if created:
+                    recount_ids.add(subnet.id)
                 # A fresh insert already carries the right fields; only a
                 # race-lost incumbent we own gets the same update a
                 # pre-existing row would take (never a manual/static row).
-                if not created and (ipam_row.status == "available" or ipam_row.auto_from_lease):
+                elif ipam_row.status == "available" or ipam_row.auto_from_lease:
+                    if ipam_row.status != "dhcp":
+                        recount_ids.add(subnet.id)
                     _apply_lease_fields(ipam_row, ev, lease)
             elif ipam_row.status in ("available",) or ipam_row.auto_from_lease:
+                # Only a status change moves the count: a renewal of a row
+                # already at ``dhcp`` (the common event) costs no recount.
+                if ipam_row.status != "dhcp":
+                    recount_ids.add(subnet.id)
                 _apply_lease_fields(ipam_row, ev, lease)
             # else: manual/static — leave it alone
 
@@ -1754,6 +1767,7 @@ async def agent_lease_events(
                     )
                 await purge_trashed_address_records(db, [ipam_row.id])  # #3186
                 await db.delete(ipam_row)
+                recount_ids.add(subnet.id)
                 ipam_by_key.pop((subnet.id, norm_ip(ev.ip_address)), None)
 
     # ── New-device watch: classify the collected MAC sightings (issue #459) ──
@@ -1816,6 +1830,12 @@ async def agent_lease_events(
                 },
             )
 
+    # #3345 — the mirror pass added / freed address rows; recount the touched
+    # subnets and their block chains once, in the batch's own transaction.
+    # No audit row follows: the only ones this batch writes (first_seen) are
+    # staged above, so the recount's flush takes the audit-chain lock before
+    # its row locks, and a batch without them never waits for that lock.
+    await recount_subnets_and_blocks(db, recount_ids, audit_lock=False)
     await db.commit()
     return {"upserted": upserted}
 

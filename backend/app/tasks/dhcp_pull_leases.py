@@ -62,6 +62,9 @@ async def _run_pull() -> dict[str, Any]:
     from app.services.dhcp.pull_leases import (  # noqa: PLC0415
         pull_leases_from_server,
     )
+    from app.services.ipam.utilization import (  # noqa: PLC0415
+        recount_subnets_and_blocks,
+    )
 
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -140,6 +143,7 @@ async def _run_pull() -> dict[str, Any]:
             # every tick of that week.
             warnings: list[str] = []
             wake_group_ids: set[str] = set()  # #428 — DNS groups to wake post-commit
+            touched_subnet_ids: set[Any] = set()  # #3345 — recounted before commit
 
             for server in servers:
                 if not is_agentless(server.driver):
@@ -147,7 +151,8 @@ async def _run_pull() -> dict[str, Any]:
 
                 servers_scanned += 1
                 try:
-                    result = await pull_leases_from_server(db, server, apply=True)
+                    # #3345 — recounted once, after the last server's pull.
+                    result = await pull_leases_from_server(db, server, apply=True, recount=False)
                 except Exception as exc:  # noqa: BLE001 — don't let one server poison the run
                     errors.append(f"{server.name}: {exc}")
                     logger.warning(
@@ -185,6 +190,7 @@ async def _run_pull() -> dict[str, Any]:
                 total_statics_removed += result.statics_removed
                 total_scopes_deferred += result.scopes_deferred
                 wake_group_ids.update(result.dns_wake_group_ids)
+                touched_subnet_ids.update(result.touched_subnet_ids)
                 errors.extend(f"{server.name}: {e}" for e in result.errors)
                 warnings.extend(f"{server.name}: {w}" for w in result.warnings)
 
@@ -237,6 +243,10 @@ async def _run_pull() -> dict[str, Any]:
                         },
                     )
                 )
+            # #3345 — the mirrors every pull above created or removed. Last,
+            # after the audit row is staged and every driver call is done, so
+            # the audit-chain and subnet / block locks are held only to commit.
+            await recount_subnets_and_blocks(db, touched_subnet_ids)
             await db.commit()
 
             # #428 — wake the agent long-polls for any DNS group whose zone
