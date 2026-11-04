@@ -310,6 +310,20 @@ async def create_token(
         )
     # Resource grants (#374): existence + "can't exceed yourself" checks.
     await _validate_resource_grants(db, current_user, body.resource_grants)
+    # #3432 — disabling an account revokes its tokens under a lock on the
+    # account row. Re-read ``is_active`` under a share lock here: the caller
+    # was authenticated before that disable may have committed, and a token
+    # inserted after the disable read the account's tokens would stay live
+    # and work again once the account is re-enabled.
+    owner_active = (
+        await db.execute(
+            select(User.is_active).where(User.id == current_user.id).with_for_update(read=True)
+        )
+    ).scalar_one_or_none()
+    if not owner_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
     token = APIToken(
         name=body.name,
         description=body.description,
