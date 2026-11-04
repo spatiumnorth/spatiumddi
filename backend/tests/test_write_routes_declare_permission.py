@@ -48,7 +48,6 @@ _AGENT_JWT = "agent endpoint, authenticated by the agent's own JWT (_auth_agent)
 _SUP_CERT = "supervisor endpoint, authenticated by its mTLS client cert (_require_cert_auth)"
 _SUP_SESSION = "supervisor endpoint, authenticated by its pairing session token"
 _SETTINGS = "checked inline: user_has_permission(user, 'write', 'settings') in the handler"
-_SESSION = f"{_SELF}; the handler admits any signed-in caller"
 
 NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── public / pre-sign-in ────────────────────────────────────────────
