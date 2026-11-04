@@ -369,6 +369,11 @@ jobs:
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 
+      # get.trivy.dev, which trivy-action's own setup downloads from,
+      # is gone (#3464): install from the GitHub release instead.
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       # Trivy reports; trivy-gate.sh decides. Trivy's "fixed" means the
       # distro's security database names a fixed version — not that the
       # package is on the mirrors yet, and for Alpine the two diverge by
@@ -386,6 +391,7 @@ jobs:
       - name: Trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           image-ref: scan-target:${{ matrix.image }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true

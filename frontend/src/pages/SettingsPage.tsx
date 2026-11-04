@@ -31,6 +31,7 @@ import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSectio
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -614,6 +615,7 @@ function OUILookupSection({
   values,
   set,
   isSuperadmin,
+  canWrite,
   inputCls,
 }: {
   values: PlatformSettings;
@@ -622,6 +624,8 @@ function OUILookupSection({
     value: PlatformSettings[K],
   ) => void;
   isSuperadmin: boolean;
+  // POST /settings/oui/refresh takes `write` on `settings`, not superadmin.
+  canWrite: boolean;
   inputCls: string;
 }) {
   const [showRefreshModal, setShowRefreshModal] = useState(false);
@@ -704,7 +708,7 @@ function OUILookupSection({
       >
         <button
           onClick={() => setShowRefreshModal(true)}
-          disabled={!isSuperadmin || !values.oui_lookup_enabled}
+          disabled={!canWrite || !values.oui_lookup_enabled}
           className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-40"
         >
           <RefreshCw className="h-3.5 w-3.5" />
@@ -1304,6 +1308,13 @@ export function SettingsPage() {
     staleTime: 60_000,
   });
   const isSuperadmin = me?.is_superadmin ?? false;
+  // PUT /settings admits a superadmin OR anyone holding `write` on
+  // `settings` (#3429), so Save follows the same check. A delegate may write
+  // only the fields the API lists in `delegate_writable_fields` (its
+  // SETTINGS_DELEGATE_WRITABLE, served rather than copied here so the two
+  // cannot drift); every other control stays superadmin-only.
+  const { can } = usePermissions();
+  const canWrite = isSuperadmin || can("write", "settings");
 
   const { data, isLoading } = useQuery({
     queryKey: ["settings"],
@@ -1339,6 +1350,12 @@ export function SettingsPage() {
     if (!visibleSections.some((s) => s.id === activeId))
       setActiveId(SECTIONS[0].id);
   });
+
+  const delegateWritable = new Set<string>(
+    data?.delegate_writable_fields ?? [],
+  );
+  const canEdit = (key: keyof PlatformSettings): boolean =>
+    isSuperadmin || (canWrite && delegateWritable.has(key));
 
   const values: PlatformSettings = {
     ...(data ?? ({} as PlatformSettings)),
@@ -1494,7 +1511,9 @@ export function SettingsPage() {
           <p className="text-xs text-muted-foreground">
             {isSuperadmin
               ? "Configure SpatiumDDI."
-              : "View-only — superadmin required to edit."}
+              : canWrite
+                ? "You can edit the settings delegated to your role; the rest need a superadmin."
+                : "View-only — you need write access on settings to edit."}
           </p>
         </div>
         <div className="border-b p-3">
@@ -1574,11 +1593,15 @@ export function SettingsPage() {
                 {active.description}
               </p>
             </div>
-            {isSuperadmin && (
+            {canWrite && (
               <div className="flex flex-shrink-0 items-center gap-2">
                 <button
                   onClick={handleReset}
-                  disabled={!defaults || sectionIsDefault()}
+                  disabled={
+                    !defaults ||
+                    sectionIsDefault() ||
+                    !SECTION_FIELDS[activeId].every((k) => canEdit(k))
+                  }
                   title="Populate this section's fields with their default values — still requires Save to apply."
                   className="flex items-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium hover:bg-accent disabled:opacity-40"
                 >
@@ -1858,7 +1881,7 @@ export function SettingsPage() {
                       onChange={(e) =>
                         set("dns_default_ttl", Number(e.target.value))
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("dns_default_ttl")}
                       className={cn(inputCls, "w-28")}
                     />
                     <span className="text-xs text-muted-foreground">sec</span>
@@ -1873,7 +1896,7 @@ export function SettingsPage() {
                     onChange={(e) =>
                       set("dns_default_zone_type", e.target.value)
                     }
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_default_zone_type")}
                     className={inputCls}
                   >
                     <option value="primary">Primary</option>
@@ -1891,7 +1914,7 @@ export function SettingsPage() {
                     onChange={(e) =>
                       set("dns_default_dnssec_validation", e.target.value)
                     }
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_default_dnssec_validation")}
                     className={inputCls}
                   >
                     <option value="auto">auto (recommended)</option>
@@ -1906,7 +1929,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_recursive_by_default}
                     onChange={(v) => set("dns_recursive_by_default", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_recursive_by_default")}
                   />
                 </Field>
                 <Field
@@ -1929,7 +1952,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_auto_sync_enabled}
                     onChange={(v) => set("dns_auto_sync_enabled", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_auto_sync_enabled")}
                   />
                 </Field>
                 <Field
@@ -1947,7 +1970,10 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin || !values.dns_auto_sync_enabled}
+                      disabled={
+                        !canEdit("dns_auto_sync_interval_minutes") ||
+                        !values.dns_auto_sync_enabled
+                      }
                       className={cn(inputCls, "w-24")}
                     />
                     <span className="text-xs text-muted-foreground">min</span>
@@ -1960,7 +1986,10 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_auto_sync_delete_stale}
                     onChange={(v) => set("dns_auto_sync_delete_stale", v)}
-                    disabled={!isSuperadmin || !values.dns_auto_sync_enabled}
+                    disabled={
+                      !canEdit("dns_auto_sync_delete_stale") ||
+                      !values.dns_auto_sync_enabled
+                    }
                   />
                 </Field>
                 <Field
@@ -2047,7 +2076,8 @@ export function SettingsPage() {
                     <button
                       type="button"
                       onClick={() => runReverseDns.mutate()}
-                      disabled={!isSuperadmin || runReverseDns.isPending}
+                      // POST /settings/reverse-dns/run takes `write` on `settings`.
+                      disabled={!canWrite || runReverseDns.isPending}
                       className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
                     >
                       {runReverseDns.isPending ? "Queuing…" : "Run now"}
@@ -2076,7 +2106,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_pull_from_server_enabled}
                     onChange={(v) => set("dns_pull_from_server_enabled", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dns_pull_from_server_enabled")}
                   />
                 </Field>
                 <Field
@@ -2095,7 +2125,8 @@ export function SettingsPage() {
                         )
                       }
                       disabled={
-                        !isSuperadmin || !values.dns_pull_from_server_enabled
+                        !canEdit("dns_pull_from_server_interval_minutes") ||
+                        !values.dns_pull_from_server_enabled
                       }
                       className={cn(inputCls, "w-24")}
                     />
@@ -2126,7 +2157,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dhcp_pull_leases_enabled}
                     onChange={(v) => set("dhcp_pull_leases_enabled", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dhcp_pull_leases_enabled")}
                   />
                 </Field>
                 <Field
@@ -2145,7 +2176,8 @@ export function SettingsPage() {
                         )
                       }
                       disabled={
-                        !isSuperadmin || !values.dhcp_pull_leases_enabled
+                        !canEdit("dhcp_pull_leases_interval_seconds") ||
+                        !values.dhcp_pull_leases_enabled
                       }
                       className={cn(inputCls, "w-24")}
                     />
@@ -2213,7 +2245,7 @@ export function SettingsPage() {
                       set("dhcp_default_domain_name", e.target.value)
                     }
                     placeholder="corp.example.com"
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dhcp_default_domain_name")}
                     className={inputCls}
                   />
                 </Field>
@@ -2234,7 +2266,7 @@ export function SettingsPage() {
                       )
                     }
                     placeholder="corp.example.com, example.com"
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("dhcp_default_domain_search")}
                     className={inputCls}
                   />
                 </Field>
@@ -2271,7 +2303,7 @@ export function SettingsPage() {
                       onChange={(e) =>
                         set("dhcp_default_lease_time", Number(e.target.value))
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("dhcp_default_lease_time")}
                       className={cn(inputCls, "w-32")}
                     />
                     <span className="text-xs text-muted-foreground">sec</span>
@@ -2290,7 +2322,7 @@ export function SettingsPage() {
                   onChange={(e) =>
                     set("ip_allocation_strategy", e.target.value)
                   }
-                  disabled={!isSuperadmin}
+                  disabled={!canEdit("ip_allocation_strategy")}
                   className={inputCls}
                 >
                   <option value="sequential">Sequential</option>
@@ -2304,6 +2336,7 @@ export function SettingsPage() {
                 values={values}
                 set={set}
                 isSuperadmin={isSuperadmin}
+                canWrite={canWrite}
                 inputCls={inputCls}
               />
             )}
@@ -2408,7 +2441,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.vrf_strict_rd_validation}
                     onChange={(v) => set("vrf_strict_rd_validation", v)}
-                    disabled={!isSuperadmin}
+                    disabled={!canEdit("vrf_strict_rd_validation")}
                   />
                   <span className="text-sm text-muted-foreground">
                     {values.vrf_strict_rd_validation ? "Strict" : "Warn only"}
@@ -2712,7 +2745,7 @@ export function SettingsPage() {
                       Number(e.target.value),
                     )
                   }
-                  disabled={!isSuperadmin}
+                  disabled={!canEdit("subnet_tree_default_expanded_depth")}
                   className={cn(inputCls, "w-20")}
                 />
               </Field>
@@ -2776,7 +2809,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_warn_threshold")}
                       className={cn(inputCls, "w-20")}
                     />
                     <span className="text-xs text-muted-foreground">%</span>
@@ -2798,7 +2831,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_critical_threshold")}
                       className={cn(inputCls, "w-20")}
                     />
                     <span className="text-xs text-muted-foreground">%</span>
@@ -2821,7 +2854,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_max_prefix_ipv4")}
                       className={cn(inputCls, "w-20")}
                     />
                   </div>
@@ -2843,7 +2876,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={!isSuperadmin}
+                      disabled={!canEdit("utilization_max_prefix_ipv6")}
                       className={cn(inputCls, "w-20")}
                     />
                   </div>

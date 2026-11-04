@@ -94,8 +94,22 @@ async function openPanel(perms: MyPermissions) {
   await act(async () => {});
 }
 
+/** A refused icon-only button is named by its action (aria-label, #3395) and
+ *  carries the refusal reason as its tooltip: find it by either. */
+function gated(name: string | RegExp): HTMLElement {
+  const byRole = screen.queryAllByRole("button", { name });
+  if (byRole.length === 1) return byRole[0];
+  // Only the icon buttons carry an aria-label; a text button's title is
+  // the same reason and must not make the lookup ambiguous.
+  const byTitle = screen
+    .queryAllByTitle(name)
+    .filter((el) => el.hasAttribute("aria-label"));
+  if (byTitle.length !== 1) return screen.getByTitle(name);
+  return byTitle[0];
+}
+
 function button(name: string | RegExp): HTMLButtonElement {
-  return screen.getByRole("button", { name }) as HTMLButtonElement;
+  return gated(name) as HTMLButtonElement;
 }
 
 afterEach(() => {
@@ -144,11 +158,13 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
       "Requires write permission on DHCP scopes",
     );
     expect(button(/Add Pool/).disabled).toBe(true);
-    // The icon buttons are named by their tooltip, which is the reason
-    // while it is denied: edit + delete scope, edit + delete pool.
-    const denied = screen.getAllByRole("button", {
-      name: /^Requires (write|delete) permission on DHCP (scopes|pools)$/,
-    }) as HTMLButtonElement[];
+    // The icon buttons carry the reason as their tooltip while denied (and
+    // keep their action as the name, #3395): edit + delete scope and pool.
+    const denied = screen
+      .getAllByTitle(
+        /^Requires (write|delete) permission on DHCP (scopes|pools)$/,
+      )
+      .filter((el) => el.hasAttribute("aria-label")) as HTMLButtonElement[];
     expect(denied).toHaveLength(4);
     expect(denied.every((b) => b.disabled)).toBe(true);
     const toggle = screen.getByRole("checkbox", { name: /Enabled/ });

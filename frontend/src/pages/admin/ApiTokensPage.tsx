@@ -924,7 +924,9 @@ export function ApiTokensPage() {
                       <span
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
-                          t.is_active && !isExpired(t.expires_at)
+                          t.is_active &&
+                            !isExpired(t.expires_at) &&
+                            t.owner_is_active !== false
                             ? "bg-emerald-500/15 text-emerald-600"
                             : "bg-muted text-muted-foreground",
                         )}
@@ -933,7 +935,9 @@ export function ApiTokensPage() {
                           ? "Revoked"
                           : isExpired(t.expires_at)
                             ? "Expired"
-                            : "Active"}
+                            : t.owner_is_active === false
+                              ? "Owner disabled"
+                              : "Active"}
                       </span>
                     </td>
                     <td className="px-3 py-2">
@@ -953,6 +957,14 @@ export function ApiTokensPage() {
                               disabled
                               className="rounded p-1 text-muted-foreground opacity-40"
                               title="Expired — create a new token instead"
+                            >
+                              <Power className="h-3.5 w-3.5" />
+                            </button>
+                          ) : t.owner_is_active === false ? (
+                            <button
+                              disabled
+                              className="rounded p-1 text-muted-foreground opacity-40"
+                              title="The owner account is disabled — re-enable the owner first"
                             >
                               <Power className="h-3.5 w-3.5" />
                             </button>
