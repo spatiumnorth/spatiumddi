@@ -16,8 +16,16 @@ says where. The route tests in ``test_read_only_post_rbac_3302.py`` and
 ``test_operation_permission_declared.py`` cover the read-only-POST scope and the
 Copilot operation registry; neither walks the route table.
 
+A dependency that only asks for ``read`` does not count as a write gate: such a
+route is either ``@read_only_post`` or listed in ``READ_GATED_WRITE`` with where
+its write check lives.
+
 ``declared_gate`` reports what each gated route requires, so a later check can
 compare it with what the frontend gates on.
+
+Limit: the walk sees the routes ``app.main`` mounts under the test settings. A
+router mounted behind a settings flag (today only the slot-image mirror's
+``/internal/slot-images``, X-Mirror-Auth shared-secret gated) is not walked.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from typing import Any
 from app.api.deps import require_superadmin
 from app.core.permissions import _METHOD_TO_ACTION
 from app.main import app
+from app.services.api_token_scopes import is_read_only_post
 from tests.test_builtin_roles_match_routes import _dependency_calls, _iter_routes
 from tests.test_get_routes_declare_permission import route_is_gated
 
@@ -112,8 +121,11 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "PATCH /api/v1/saved-views/{view_id}": f"{_SELF} (_owned)",
     "DELETE /api/v1/saved-views/{view_id}": f"{_SELF} (_owned)",
     "POST /api/v1/ai/prompts": f"{_SELF}; a shared prompt needs superadmin (checked in the handler)",
-    "PUT /api/v1/ai/prompts/{prompt_id}": f"{_SELF}; shared prompts need superadmin (checked in the handler)",
-    "DELETE /api/v1/ai/prompts/{prompt_id}": f"{_SELF}; shared prompts need superadmin (checked in the handler)",
+    "PUT /api/v1/ai/prompts/{prompt_id}": (
+        f"{_SELF}: creator or superadmin; flipping is_shared needs superadmin "
+        "(checked in the handler)"
+    ),
+    "DELETE /api/v1/ai/prompts/{prompt_id}": f"{_SELF}: creator or superadmin (checked in the handler)",
     "PUT /api/v1/ai/sessions/{session_id}": _SELF,
     "DELETE /api/v1/ai/sessions/{session_id}": _SELF,
     "POST /api/v1/ai/proposals/{proposal_id}/discard": f"{_SELF} (proposal user_id match)",
@@ -177,6 +189,66 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
 # TODO naming the issue) rather than into NO_PERMISSION_DEPENDENCY, so the
 # two kinds of exception stay distinguishable.
 KNOWN_UNGATED: dict[str, str] = {}
+
+# Write routes whose only permission dependency asks for ``read``. Being
+# "gated" proves nothing for them: a Viewer passes the dependency, so the
+# write is refused only if the handler checks again, or not at all. A route
+# marked ``@read_only_post`` (``app.services.api_token_scopes``) is exempt —
+# that marker is the review record that it changes nothing. Anything else is
+# listed here with where the write check lives, or why ``read`` is the action.
+_INLINE_WRITE = "router gates on read; the handler checks {} on {} before any write"
+_TOOLS = (
+    "use_network_tools has no write action: read is the one the role matrix "
+    "grants for running a tool (tools/router.py)"
+)
+_WINRM_LOG_READ = (
+    "reads a Windows server's event / audit log over WinRM and writes nothing; "
+    "read on server is the action (logs/router.py _WINRM_READ)"
+)
+READ_GATED_WRITE: dict[str, str] = {
+    "POST /api/v1/domains": _INLINE_WRITE.format("write", "manage_domains"),
+    "PUT /api/v1/domains/{domain_id}": _INLINE_WRITE.format("write", "manage_domains"),
+    "DELETE /api/v1/domains/{domain_id}": _INLINE_WRITE.format("delete", "manage_domains"),
+    "POST /api/v1/domains/{domain_id}/refresh-whois": _INLINE_WRITE.format(
+        "write", "manage_domains"
+    ),
+    "POST /api/v1/domains/bulk-delete": _INLINE_WRITE.format("delete", "manage_domains"),
+    "POST /api/v1/network-devices": _INLINE_WRITE.format("write", "manage_network_devices"),
+    "PATCH /api/v1/network-devices/{device_id}": _INLINE_WRITE.format(
+        "write", "manage_network_devices"
+    ),
+    "DELETE /api/v1/network-devices/{device_id}": _INLINE_WRITE.format(
+        "delete", "manage_network_devices"
+    ),
+    "POST /api/v1/network-devices/{device_id}/test": _INLINE_WRITE.format(
+        "write", "manage_network_devices"
+    ),
+    "POST /api/v1/network-devices/{device_id}/poll-now": _INLINE_WRITE.format(
+        "write", "manage_network_devices"
+    ),
+    "POST /api/v1/appliance/diagnostics/self-test": (
+        "runs the read-only health probes and returns them; writes nothing"
+    ),
+    # Reads that leave the box (WinRM pulls), so not @read_only_post (a
+    # read-scoped token must not reach them) — but read is the right RBAC action.
+    "POST /api/v1/logs/query": _WINRM_LOG_READ,
+    "POST /api/v1/logs/dhcp-audit": _WINRM_LOG_READ,
+    **{
+        f"POST /api/v1/tools/{tool}": _TOOLS
+        for tool in (
+            "dig",
+            "dns-propagation",
+            "firewall-logs",
+            "mtr",
+            "ping",
+            "port-test",
+            "tls-cert",
+            "traceroute",
+            "whois",
+            "wol",
+        )
+    },
+}
 
 
 def _write_routes() -> list[tuple[str, Any]]:
@@ -244,6 +316,34 @@ def test_listed_routes_still_exist_and_are_still_ungated() -> None:
     assert not stale, f"remove these from the allowlists: {stale}"
 
 
+def _read_gated_write_keys() -> set[str]:
+    out: set[str] = set()
+    for key, route in _write_routes():
+        if not route_is_gated(route) or is_read_only_post(route.endpoint):
+            continue
+        gate = declared_gate(route, key.split(" ", 1)[0])
+        if gate == "superadmin" or "superadmin" in gate.split("&"):
+            continue
+        if all(p.startswith("read:") for p in gate.replace("&", "|").split("|")):
+            out.add(key)
+    return out
+
+
+def test_a_write_route_gated_only_on_read_is_listed() -> None:
+    missing = sorted(_read_gated_write_keys() - READ_GATED_WRITE.keys())
+    assert not missing, (
+        "Write routes whose only permission dependency is a 'read' grant, so a "
+        "Viewer passes it. Gate them on the write action, mark a genuinely "
+        "read-only POST @read_only_post, or list them in READ_GATED_WRITE with "
+        f"where the write check lives: {missing}"
+    )
+
+
+def test_read_gated_entries_are_still_read_gated() -> None:
+    stale = sorted(READ_GATED_WRITE.keys() - _read_gated_write_keys())
+    assert not stale, f"remove these from READ_GATED_WRITE: {stale}"
+
+
 def test_a_route_is_in_one_list_only() -> None:
     assert not NO_PERMISSION_DEPENDENCY.keys() & KNOWN_UNGATED.keys()
 
@@ -251,6 +351,7 @@ def test_a_route_is_in_one_list_only() -> None:
 def test_every_listed_route_has_a_reason() -> None:
     assert all(r.strip() for r in NO_PERMISSION_DEPENDENCY.values())
     assert all(r.strip() for r in KNOWN_UNGATED.values())
+    assert all(r.strip() for r in READ_GATED_WRITE.values())
 
 
 def test_declared_gate_reports_action_and_resource() -> None:
