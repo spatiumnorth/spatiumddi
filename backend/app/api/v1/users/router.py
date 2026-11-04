@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
@@ -16,7 +16,7 @@ from app.core.permissions import refuse_and_audit
 from app.core.security import hash_password
 from app.core.session_rotation import revoke_live_sessions
 from app.models.audit import AuditLog
-from app.models.auth import APIToken, User, UserSession
+from app.models.auth import User, UserSession
 from app.models.auth_provider import AuthProvider
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
@@ -24,6 +24,11 @@ from app.services.account_lockout import (
 )
 from app.services.account_lockout import (
     unlock as unlock_user,
+)
+from app.services.api_token_revocation import (
+    count_live_api_tokens,
+    count_live_api_tokens_by_user,
+    revoke_user_api_tokens,
 )
 from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
@@ -75,6 +80,9 @@ class UserResponse(BaseModel):
     # Regardless of ``is_active`` (#1412): a disabled role-only superadmin is
     # still one for the reset, and for the Role column.
     is_effective_superadmin: bool = False
+    # Live API tokens the account holds (#1359): active and unexpired. Filled
+    # by the list and by a single read; null elsewhere (unknown, not zero).
+    api_token_count: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -102,6 +110,8 @@ class UserResponse(BaseModel):
             # ``groups`` is selectin-loaded; never trigger an async lazy load
             # from this sync validator if a path skipped it.
             cols["is_effective_superadmin"] = loaded_user_holds_superadmin(data)
+            # #1359 — set by the list / single read; absent elsewhere.
+            cols["api_token_count"] = getattr(data, "api_token_count", None)
             return cols
         return data
 
@@ -211,6 +221,14 @@ class LinkProviderRequest(BaseModel):
     auth_provider_id: uuid.UUID
 
 
+class TokenOutcome(BaseModel):
+    """What a password reset / token revocation did to the account's API
+    tokens (#1359): how many it revoked, and how many are still live."""
+
+    api_tokens_revoked: int = 0
+    api_token_count: int = 0
+
+
 class ResetPasswordRequest(BaseModel):
     new_password: str
     # #1355 — the caller's own step-up (password, or authenticator code for
@@ -219,6 +237,10 @@ class ResetPasswordRequest(BaseModel):
     # passes every later step-up.
     stepup_password: str | None = None
     stepup_totp_code: str | None = None
+    # #1359 — opt in to revoking the account's API tokens with the reset. Off
+    # by default: tokens are not sessions, and revoking them silently would
+    # break the automation that runs on them.
+    revoke_api_tokens: bool = False
 
     @field_validator("new_password")
     @classmethod
@@ -278,7 +300,11 @@ async def _refuse_last_superadmin(
 @router.get("", response_model=list[UserResponse])
 async def list_users(current_user: SuperAdmin, db: DB) -> list[User]:
     result = await db.execute(select(User).order_by(User.username))
-    return list(result.scalars().all())
+    users = list(result.scalars().all())
+    counts = await count_live_api_tokens_by_user(db)
+    for u in users:
+        u.api_token_count = counts.get(u.id, 0)  # type: ignore[attr-defined]
+    return users
 
 
 async def _enforce_policy(db: DB, password: str) -> tuple[PasswordPolicy, str]:
@@ -407,6 +433,7 @@ async def get_user(user_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> User
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user.api_token_count = await count_live_api_tokens(db, user.id)  # type: ignore[attr-defined]
     return user
 
 
@@ -499,46 +526,12 @@ async def update_user(
         # none can be in honest use while the account is disabled. The owner
         # or an admin mints new ones.
         #
-        # The account row is locked first: ``create_token`` re-reads the
-        # owner's ``is_active`` under a share lock, so a mint racing a disable
-        # either commits before the SELECT below (and is revoked by it) or
-        # waits for this commit and is refused.
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-        live = (
-            await db.execute(
-                select(APIToken.id, APIToken.name).where(
-                    APIToken.user_id == user.id, APIToken.is_active.is_(True)
-                )
-            )
-        ).all()
-        if live:
-            await db.execute(
-                update(APIToken)
-                .where(APIToken.id.in_([tid for tid, _ in live]))
-                .values(is_active=False)
-            )
-        # One row per token as well, shaped like the token's own revoke
-        # (PATCH ``is_active: false``), so a token's history says why it
-        # went inactive.
-        for tid, name in live:
-            db.add(
-                AuditLog(
-                    user_id=current_user.id,
-                    user_display_name=current_user.display_name,
-                    auth_source=current_user.auth_source,
-                    action="update",
-                    resource_type="api_token",
-                    resource_id=str(tid),
-                    resource_display=name,
-                    result="success",
-                    changed_fields=["is_active"],
-                    new_value={
-                        "is_active": False,
-                        "reason": "owner_enabled" if body.is_active else "owner_disabled",
-                    },
-                )
-            )
-        changes["api_tokens_revoked"] = len(live)
+        # The shared revoker locks the account row first (see its docstring)
+        # and writes one audit row per token.
+        revoked = await revoke_user_api_tokens(
+            db, current_user, user.id, "owner_enabled" if body.is_active else "owner_disabled"
+        )
+        changes["api_tokens_revoked"] = revoked
         user.is_active = body.is_active
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin
@@ -554,13 +547,13 @@ async def update_user(
     return user
 
 
-@router.post("/{user_id}/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/{user_id}/reset-password", response_model=TokenOutcome)
 async def reset_password(
     user_id: uuid.UUID,
     body: ResetPasswordRequest,
     current_user: SuperAdmin,
     db: DB,
-) -> None:
+) -> TokenOutcome:
     forbid_in_demo_mode("Admin password reset is disabled")
     user = await db.get(User, user_id)
     if user is None:
@@ -622,14 +615,48 @@ async def reset_password(
     # else's account, so all of the target's sessions die. Same revocation
     # statement ``/auth/logout`` uses.
     await revoke_live_sessions(db, UserSession.user_id == user.id)
+    # #1359 — API tokens are NOT sessions and survive a reset unless the
+    # caller opts in; the response says how many are still live.
+    tokens_revoked = 0
+    if body.revoke_api_tokens:
+        tokens_revoked = await revoke_user_api_tokens(db, current_user, user.id, "password_reset")
     audit = _audit(
         current_user, "reset_password", str(user.id), f"Reset password for {user.username}"
     )
+    new_value: dict = {"api_tokens_revoked": tokens_revoked} if body.revoke_api_tokens else {}
     if method:
-        audit.new_value = {"stepup_method": method}
+        new_value["stepup_method"] = method
+    if new_value:
+        audit.new_value = new_value
     db.add(audit)
     await db.commit()
     logger.info("password_reset", target=user.username, by=current_user.username)
+    return TokenOutcome(
+        api_tokens_revoked=tokens_revoked,
+        api_token_count=await count_live_api_tokens(db, user.id),
+    )
+
+
+@router.post("/{user_id}/revoke-api-tokens", response_model=TokenOutcome)
+async def revoke_api_tokens(user_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> TokenOutcome:
+    """Revoke every API token the user holds (#1359). The account stays
+    active and its sessions are untouched; the user mints new tokens. User
+    management is superadmin-only, so this takes the same gate."""
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    revoked = await revoke_user_api_tokens(db, current_user, user.id, "admin_revoke_all")
+    audit = _audit(
+        current_user,
+        "revoke_api_tokens",
+        str(user.id),
+        f"Revoked {revoked} API token(s) of {user.username}",
+    )
+    audit.new_value = {"api_tokens_revoked": revoked}
+    db.add(audit)
+    await db.commit()
+    logger.info("api_tokens_revoked", target=user.username, by=current_user.username, n=revoked)
+    return TokenOutcome(api_tokens_revoked=revoked, api_token_count=0)
 
 
 @router.post("/{user_id}/unlock", status_code=status.HTTP_204_NO_CONTENT)

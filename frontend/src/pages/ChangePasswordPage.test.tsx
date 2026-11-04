@@ -113,7 +113,7 @@ describe("submit gate", () => {
     expect(submit.disabled).toBe(false);
     fireEvent.click(submit);
     await waitFor(() =>
-      expect(changePassword).toHaveBeenCalledWith("old", "Abcdefghij12"),
+      expect(changePassword).toHaveBeenCalledWith("old", "Abcdefghij12", false),
     );
   });
 

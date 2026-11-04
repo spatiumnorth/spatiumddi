@@ -2628,6 +2628,14 @@ export interface AppUser {
   /** #1355 — the flag OR a wildcard role; resetting such an account's
    *  password needs the caller's step-up. */
   is_effective_superadmin?: boolean;
+  /** Live API tokens the account holds (#1359); absent when unknown. */
+  api_token_count?: number | null;
+}
+
+/** What a password change / reset / revoke did to API tokens (#1359). */
+export interface ApiTokenOutcome {
+  api_tokens_revoked: number;
+  api_token_count: number;
 }
 
 /** #1355 — the caller's own step-up on actions that mint a credential:
@@ -2666,11 +2674,24 @@ export const usersApi = {
     > &
       StepUp,
   ) => api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
-  resetPassword: (id: string, newPassword: string, stepUp: StepUp = {}) =>
-    api.post(`/users/${id}/reset-password`, {
-      new_password: newPassword,
-      ...stepUp,
-    }),
+  resetPassword: (
+    id: string,
+    newPassword: string,
+    stepUp: StepUp = {},
+    revokeApiTokens = false,
+  ) =>
+    api
+      .post<ApiTokenOutcome>(`/users/${id}/reset-password`, {
+        new_password: newPassword,
+        ...stepUp,
+        revoke_api_tokens: revokeApiTokens,
+      })
+      .then((r) => r.data),
+  /** Revoke every API token the user holds (#1359). Superadmin. */
+  revokeApiTokens: (id: string) =>
+    api
+      .post<ApiTokenOutcome>(`/users/${id}/revoke-api-tokens`)
+      .then((r) => r.data),
   /** Clear lockout state on a user account (issue #71). */
   unlock: (id: string) => api.post(`/users/${id}/unlock`),
   /** Link an external account to its provider (#1235). Clears the stored
@@ -10305,11 +10326,18 @@ export const authApi = {
         { withCredentials: true, signal },
       )
       .then((r) => r.data),
-  changePassword: (currentPassword: string, newPassword: string) =>
-    api.post("/auth/change-password", {
-      current_password: currentPassword,
-      new_password: newPassword,
-    }),
+  changePassword: (
+    currentPassword: string,
+    newPassword: string,
+    revokeApiTokens = false,
+  ) =>
+    api
+      .post<ApiTokenOutcome>("/auth/change-password", {
+        current_password: currentPassword,
+        new_password: newPassword,
+        revoke_api_tokens: revokeApiTokens,
+      })
+      .then((r) => r.data),
   me: () =>
     api
       .get<{
@@ -10940,6 +10968,11 @@ export const apiTokensApi = {
   update: (id: string, body: ApiTokenUpdate) =>
     api.patch<ApiToken>(`/api-tokens/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/api-tokens/${id}`),
+  /** Revoke every token the caller owns (#1359). */
+  revokeAll: () =>
+    api
+      .post<{ api_tokens_revoked: number }>("/api-tokens/revoke-all")
+      .then((r) => r.data),
 };
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────
