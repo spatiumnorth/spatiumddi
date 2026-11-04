@@ -349,6 +349,16 @@ function captureFocusReturnTargets(): FocusReturnTargets {
   // that one would have returned to is where this one returns to as well.
   const inherited = cardReturnTargets.get(active);
   if (inherited) targets.push(...inherited);
+  // Focus is on a control inside a dialog (Enter in a form field submits it
+  // and the next dialog opens with focus still there, or a Tab moved it off
+  // the card): that dialog is being replaced just the same, and the control
+  // goes with it. Append what the enclosing dialog returns to, as a fallback
+  // behind the control itself, so a later hand-over still has a place to land
+  // (#3483).
+  const card = active.closest<HTMLElement>('[role="dialog"]');
+  const enclosing =
+    card && card !== active ? cardReturnTargets.get(card) : undefined;
+  if (enclosing) targets.push(...enclosing);
   const menu = active.closest<HTMLElement>('[role="menu"][id]');
   if (menu) {
     const trigger = Array.from(
