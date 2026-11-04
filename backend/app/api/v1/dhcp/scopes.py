@@ -22,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser, ensure_superadmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
+from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
+from app.api.v1.dhcp.pxe_profiles import refuse_if_pxe_pools_lose_class
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, snapshot
@@ -981,7 +983,18 @@ async def update_scope(
     # The audit's before-image, taken ahead of the detach below (which writes
     # the row directly) so a detach is named as a ``pxe_profile_id`` change.
     before = snapshot(scope, [*changes, "pxe_profile_id"])
-    if changes.pop("clear_pxe_profile", False):
+    _clear_pxe = bool(changes.pop("clear_pxe_profile", False))
+    if scope.pxe_profile_id is not None and (
+        _clear_pxe or changes.get("pxe_profile_id") not in (None, scope.pxe_profile_id)
+    ):
+        # #3388 — the profile's classes are evaluated only in the scopes bound
+        # to it (#2731), so this scope's pools naming one would match no client.
+        _old = await db.get(DHCPPXEProfile, scope.pxe_profile_id)
+        if _old is not None:
+            await refuse_if_pxe_pools_lose_class(
+                db, _old, "unbind this PXE profile from the scope", scope_id=scope.id
+            )
+    if _clear_pxe:
         scope.pxe_profile_id = None
     if changes.get("pxe_profile_id") is not None:
         # #2650 — profiles are group-scoped; binding one from another group
@@ -999,6 +1012,10 @@ async def update_scope(
     # #844 — activation is the other door into the rendered config: a scope
     # created inactive (or deactivated to dodge the create-time guard) must
     # pass the same overlapping-CIDR check before it starts rendering.
+    if changes.get("is_active") is False and scope.is_active:
+        # #3388 — a phone class renders only while its profile is attached to
+        # an active scope; another scope's pool may still name it.
+        await refuse_scope_removal_orphaning_classes(db, scope, "deactivate this scope")
     if changes.get("is_active") is True and not scope.is_active:
         subnet = await db.get(Subnet, scope.subnet_id)
         if subnet is not None:

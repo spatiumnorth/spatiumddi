@@ -50,6 +50,7 @@ import {
   useDraggable,
   useDroppable,
   type DragEndEvent,
+  type DraggableAttributes,
 } from "@dnd-kit/core";
 import {
   ipamApi,
@@ -7046,8 +7047,15 @@ export function SubnetDetail({
                                           onClick={() =>
                                             setConfirmPurgeAddr(addr)
                                           }
-                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                                           title="Permanently delete"
+                                          aria-label={`Permanently delete ${addr.address}`}
+                                          // #3392 — the purge is a DELETE: as
+                                          // the right-click Delete Forever….
+                                          {...permissionGate(
+                                            canDeleteIpam,
+                                            NEEDS_ADDRESS_DELETE,
+                                          )}
                                         >
                                           <Trash2 className="h-3.5 w-3.5" />
                                         </button>
@@ -7136,12 +7144,20 @@ export function SubnetDetail({
                                 <ContextMenuSeparator />
                                 <ContextMenuItem
                                   onSelect={() => restoreAddr.mutate(addr.id)}
+                                  {...permissionGate(
+                                    permitsWrite,
+                                    NEEDS_ADDRESS_WRITE,
+                                  )}
                                 >
                                   Restore
                                 </ContextMenuItem>
                                 <ContextMenuItem
                                   destructive
                                   onSelect={() => setConfirmPurgeAddr(addr)}
+                                  {...permissionGate(
+                                    permitsWrite && canDeleteIpam,
+                                    NEEDS_ADDRESS_DELETE,
+                                  )}
                                 >
                                   Delete Forever…
                                 </ContextMenuItem>
@@ -11716,6 +11732,24 @@ export function BulkDeleteAddressesModal({
  *  text is the chip's own `title`. */
 export const TREE_CHIP_CLS = "block min-w-0 max-w-[6rem] shrink truncate";
 
+/** dnd-kit's attributes for a tree row, minus what announces it as draggable
+ *  when the operator may not move it (#3392). With `disabled` dnd-kit still
+ *  sets `aria-disabled="true"`, which on a row that selects when clicked tells
+ *  a screen reader (and Playwright's enabled check) that the row itself is
+ *  unavailable; a read-only user's whole tree would read as disabled. */
+function treeDragAttributes(
+  attrs: DraggableAttributes,
+  draggable: boolean,
+): React.HTMLAttributes<HTMLElement> {
+  if (draggable) return attrs;
+  return {
+    ...attrs,
+    "aria-disabled": undefined,
+    "aria-roledescription": undefined,
+    "aria-describedby": undefined,
+  };
+}
+
 export function SubnetRow({
   subnet,
   isSelected,
@@ -11732,9 +11766,15 @@ export function SubnetRow({
   onAllocateIp?: (s: Subnet) => void;
 }) {
   const [showEdit, setShowEdit] = useState(false);
+  // #3392 — the right-click Edit / Delete and the drag-to-move ask what the
+  // header's Edit and Delete ask; a read-only user is offered none of them.
+  const perms = usePermissions();
+  const canEditSubnet = perms.can("write", "subnet", subnet.id);
+  const canDeleteSubnet = perms.can("delete", "subnet");
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `subnet:${subnet.id}`,
     data: { kind: "subnet", subnet },
+    disabled: !canEditSubnet,
   });
 
   return (
@@ -11742,7 +11782,7 @@ export function SubnetRow({
       <ContextMenuTrigger asChild>
         <div
           ref={setNodeRef}
-          {...attributes}
+          {...treeDragAttributes(attributes, canEditSubnet)}
           {...listeners}
           onClick={onSelect}
           role="treeitem"
@@ -11799,10 +11839,17 @@ export function SubnetRow({
             Allocate IP
           </ContextMenuItem>
         )}
-        <ContextMenuItem onSelect={() => setShowEdit(true)}>
+        <ContextMenuItem
+          onSelect={() => setShowEdit(true)}
+          {...permissionGate(canEditSubnet, NEEDS_SUBNET_WRITE)}
+        >
           Edit…
         </ContextMenuItem>
-        <ContextMenuItem destructive onSelect={() => onDelete()}>
+        <ContextMenuItem
+          destructive
+          onSelect={() => onDelete()}
+          {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+        >
           Delete…
         </ContextMenuItem>
       </ContextMenuContent>
@@ -13725,6 +13772,13 @@ export function BlockTreeRow({
     forceExpand || (expanded ?? (holdsSelection || depth < defaultDepth));
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
+  // #3392 — the right-click New / Edit / Delete and the drag-to-move ask what
+  // the header's twins ask.
+  const perms = usePermissions();
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canEditBlock = perms.can("write", "ip_block", node.block.id);
+  const canDeleteBlock = perms.can("delete", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const {
     attributes: dragAttrs,
     listeners: dragListeners,
@@ -13733,6 +13787,7 @@ export function BlockTreeRow({
   } = useDraggable({
     id: `block:${node.block.id}`,
     data: { kind: "block", block: node.block },
+    disabled: !canEditBlock,
   });
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: `block-drop:${node.block.id}`,
@@ -13756,7 +13811,7 @@ export function BlockTreeRow({
         <ContextMenuTrigger asChild>
           <div
             ref={setRefs}
-            {...dragAttrs}
+            {...treeDragAttributes(dragAttrs, canEditBlock)}
             {...dragListeners}
             className={cn(
               "group flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-muted/30 cursor-pointer",
@@ -13823,15 +13878,24 @@ export function BlockTreeRow({
         <ContextMenuContent>
           <ContextMenuLabel>{node.block.network}</ContextMenuLabel>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => onCreateChildBlock(node.block.id)}>
+          <ContextMenuItem
+            onSelect={() => onCreateChildBlock(node.block.id)}
+            {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+          >
             New child block…
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => onCreateSubnet(node.block.id)}>
+          <ContextMenuItem
+            onSelect={() => onCreateSubnet(node.block.id)}
+            {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+          >
             New subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
           {onEditBlock && (
-            <ContextMenuItem onSelect={() => onEditBlock(node.block)}>
+            <ContextMenuItem
+              onSelect={() => onEditBlock(node.block)}
+              {...permissionGate(canEditBlock, NEEDS_BLOCK_WRITE)}
+            >
               Edit…
             </ContextMenuItem>
           )}
@@ -13839,6 +13903,7 @@ export function BlockTreeRow({
             <ContextMenuItem
               destructive
               onSelect={() => onDeleteBlock(node.block)}
+              {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
             >
               Delete…
             </ContextMenuItem>
@@ -14382,6 +14447,9 @@ export function BlockDetailView({
               block={block}
               directSubnets={directSubnets}
               childBlocks={directChildBlocks}
+              createDisabledReason={
+                canWriteSubnets ? undefined : NEEDS_SUBNET_WRITE
+              }
               onSelectFree={(range) => {
                 setFreeRangePreset(range);
                 setShowCreateSubnet(true);
@@ -14518,6 +14586,7 @@ export function BlockDetailView({
           defaultBlockId={block.id}
           defaultBlockLabel={block.network}
           defaultBlockCidr={block.network}
+          canCreate={canWriteSubnets}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, parentBlockId) => {
             setFindFreeBlockId(parentBlockId);
@@ -16227,6 +16296,7 @@ export function SpaceTableView({
       {showFindFree && (
         <FindFreeModal
           space={space}
+          canCreate={canWriteSubnets}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, blockId) => {
             setFindFreePrefill({ network: cidr, blockId });
@@ -16489,6 +16559,12 @@ export function SpaceSection({
   const [blockToDelete, setBlockToDelete] = useState<IPBlock | null>(null);
   const [dndError, setDndError] = useState<string | null>(null);
   const qc = useQueryClient();
+  // #3392 — the right-click New / Edit items ask what the header's twins ask.
+  // Edit Space names the space: a grant scoped to it may edit it (#3039).
+  const perms = usePermissions();
+  const canEditSpace = perms.can("write", "ip_space", space.id);
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
@@ -16679,6 +16755,13 @@ export function SpaceSection({
       | undefined;
     if (!srcData || !dstData) return;
     const targetBlock = dstData.block;
+    // #3392 — a drag is a write; the rows are not draggable without the grant,
+    // and a drop that gets here without it is refused here, not by the server.
+    if (srcData.kind === "subnet" && srcData.subnet) {
+      if (!perms.can("write", "subnet", srcData.subnet.id)) return;
+    } else if (srcData.kind === "block" && srcData.block) {
+      if (!perms.can("write", "ip_block", srcData.block.id)) return;
+    }
 
     if (srcData.kind === "subnet" && srcData.subnet) {
       const sn = srcData.subnet;
@@ -16774,17 +16857,26 @@ export function SpaceSection({
         <ContextMenuContent>
           <ContextMenuLabel>{space.name}</ContextMenuLabel>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => setShowCreateBlock(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowCreateBlock(true)}
+            {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+          >
             New Block…
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => setShowCreateSubnet(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowCreateSubnet(true)}
+            {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+          >
             New Subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
           <ContextMenuItem onSelect={() => setExpanded((v) => !v)}>
             {expanded ? "Collapse" : "Expand"}
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => setShowEditSpace(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowEditSpace(true)}
+            {...permissionGate(canEditSpace, NEEDS_SPACE_WRITE)}
+          >
             Edit Space…
           </ContextMenuItem>
         </ContextMenuContent>
