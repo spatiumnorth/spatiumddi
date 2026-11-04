@@ -14,6 +14,9 @@ Covers:
 
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -143,6 +146,14 @@ async def test_set_maintenance_mode_apply_refreshes_the_middleware_cache(
     so the middleware enforces the new state at once, not at the TTL."""
     # A TTL no test outlives, so only the apply's own drop can refresh it.
     monkeypatch.setattr(maintenance_mode, "_CACHE_TTL_S", 3600.0)
+    # The drop marks the cache loaded at 0.0 on the monotonic clock, which
+    # counts from boot: on a runner up for less than the TTL, a dropped cache
+    # would still read as fresh. The module's clock runs two hours ahead.
+    monkeypatch.setattr(
+        maintenance_mode,
+        "time",
+        SimpleNamespace(monotonic=lambda: time.monotonic() + 7200.0),
+    )
     user = await _make_user(db_session, superadmin=True, username="aicache")
     op = _op()
     enabled, _, _ = await maintenance_mode.get_maintenance_state(db_session)
