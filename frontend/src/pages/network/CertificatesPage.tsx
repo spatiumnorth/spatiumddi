@@ -998,6 +998,7 @@ export function CertificatesPage() {
                     <button
                       type="button"
                       title="Probe now"
+                      aria-label="Probe now"
                       disabled={probeNow.isPending}
                       onClick={() => probeNow.mutate(t.id)}
                       className="ml-1 rounded p-1 hover:bg-muted disabled:opacity-50"
@@ -1015,6 +1016,7 @@ export function CertificatesPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(t)}
                       className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                       {...writeGate}
@@ -1024,6 +1026,7 @@ export function CertificatesPage() {
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete TLS cert target",

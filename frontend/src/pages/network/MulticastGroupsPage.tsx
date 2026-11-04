@@ -1421,6 +1421,7 @@ function GroupsTabBody({
                     type="button"
                     onClick={() => setEditing(g)}
                     title="Edit"
+                    aria-label="Edit"
                     className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     {...writeGate}
                   >
@@ -1437,6 +1438,7 @@ function GroupsTabBody({
                       });
                     }}
                     title="Delete"
+                    aria-label="Delete"
                     className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                     {...deleteGate}
                   >

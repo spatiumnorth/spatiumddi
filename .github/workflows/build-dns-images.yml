@@ -29,6 +29,8 @@ on:
       # change guaranteed to need the proof was the one change that
       # could not get it.
       - ".github/workflows/build-dns-images.yml"
+      # #3464 — the shared Trivy install step this lane scans with.
+      - ".github/actions/install-trivy/**"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -141,9 +143,15 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_dynamic_restart_check.py
 
+      # get.trivy.dev, which trivy-action's own setup downloads from,
+      # is gone (#3464): install from the GitHub release instead.
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           # Reference the locally-loaded image from the PR build
           # step above. Previously this referenced
           # ``ghcr.io/...:${{ github.sha }}`` which is never produced
