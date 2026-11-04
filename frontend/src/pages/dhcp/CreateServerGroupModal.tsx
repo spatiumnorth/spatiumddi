@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isAxiosError } from "axios";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -111,18 +112,45 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
         );
       }
 
+      // #3371 — a blank HA timer is refused, never swapped for a default the
+      // field did not show (the API has no "null = default" for these). Only
+      // when the HA block is on screen: otherwise the stored values ride along.
+      const haTimer = (
+        raw: string,
+        label: string,
+        min: number,
+        dflt: number,
+      ) => {
+        const n = raw.trim() === "" ? NaN : parseInt(raw, 10);
+        // Hidden (standalone): send back what the row holds. ``|| dflt`` would
+        // turn a stored 0 (a valid Max Unacked Clients, #2480) into 5 on any
+        // unrelated save.
+        if (!isHA) return Number.isNaN(n) ? dflt : n;
+        if (Number.isNaN(n) || n < min) {
+          throw new Error(`${label} must be a number of at least ${min}.`);
+        }
+        return n;
+      };
+      const heartbeatMs = haTimer(heartbeat, "Heartbeat Delay", 1000, 10000);
+      const maxResponseMs = haTimer(
+        maxResponse,
+        "Max Response Delay",
+        1000,
+        60000,
+      );
+      const maxAckMs = haTimer(maxAck, "Max Ack Delay", 100, 10000);
+      const maxUnackedN = haTimer(maxUnacked, "Max Unacked Clients", 0, 5);
+
       const data = {
         name,
         description,
         mode: mode as "standalone" | "hot-standby" | "load-balancing",
         dhcp_socket_mode: socketMode,
-        heartbeat_delay_ms: parseInt(heartbeat, 10) || 10000,
-        max_response_delay_ms: parseInt(maxResponse, 10) || 60000,
-        max_ack_delay_ms: parseInt(maxAck, 10) || 10000,
-        // #2480 — 0 is a valid value (the field's min); only a blank/NaN falls back.
-        max_unacked_clients: Number.isNaN(parseInt(maxUnacked, 10))
-          ? 5
-          : parseInt(maxUnacked, 10),
+        heartbeat_delay_ms: heartbeatMs,
+        max_response_delay_ms: maxResponseMs,
+        max_ack_delay_ms: maxAckMs,
+        // #2480 — 0 is a valid value (the field's min).
+        max_unacked_clients: maxUnackedN,
         auto_failover: autoFailover,
         lease_cache_threshold: parsedCacheThreshold,
         lease_cache_max_age: parsedCacheMaxAge,
@@ -158,7 +186,16 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },
-    onError: (e) => setError(errMsg(e, "Failed to save group")),
+    // A client-side refusal is a plain Error carrying its own reason; errMsg
+    // only reads API details and would answer "Failed to save group". Any
+    // axios error (a 4xx detail, or a network failure with no response,
+    // whose message is just "Network Error") still goes through errMsg.
+    onError: (e) =>
+      setError(
+        e instanceof Error && !isAxiosError(e)
+          ? e.message
+          : errMsg(e, "Failed to save group"),
+      ),
   });
 
   return (
@@ -329,6 +366,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
                   type="number"
                   min={1000}
                   className={inputCls}
+                  required
                   value={heartbeat}
                   onChange={(e) => setHeartbeat(e.target.value)}
                 />
@@ -341,6 +379,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
                   type="number"
                   min={1000}
                   className={inputCls}
+                  required
                   value={maxResponse}
                   onChange={(e) => setMaxResponse(e.target.value)}
                 />
@@ -350,6 +389,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
                   type="number"
                   min={100}
                   className={inputCls}
+                  required
                   value={maxAck}
                   onChange={(e) => setMaxAck(e.target.value)}
                 />
@@ -362,6 +402,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
                   type="number"
                   min={0}
                   className={inputCls}
+                  required
                   value={maxUnacked}
                   onChange={(e) => setMaxUnacked(e.target.value)}
                 />

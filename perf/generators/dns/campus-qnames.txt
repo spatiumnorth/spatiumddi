@@ -17,7 +17,7 @@
 ; §1.7 record-type mix below: A 55 / AAAA 10 / PTR 20 / SRV 5 / MX+TXT 5 / SOA+NS 3
 ;   / deliberate-miss 2.  Names derive from the deterministic device fleet
 ;   (spddi_perf.fleet) the DHCP generator drives — "lease then query by name" works
-;   by construction (§4.5).  Generated label shape = dhcp-<3rd>-<4th> (ddns.py:162).
+;   by construction (§4.5).  Generated label shape = dhcp-<a>-<b>-<c>-<d> (ddns.py _generate_hostname).
 ; ─────────────────────────────────────────────────────────────────────────────
 
 ; --- A 55% — seeded infra (www/vpn/mail/portal/ns) — NOERROR ---
@@ -80,57 +80,57 @@ dev-0000169.campus.example.edu A
 dev-0000111.campus.example.edu A
 dev-0000069.campus.example.edu A
 
-; --- A 55% — generated dhcp-<3rd>-<4th> labels over leased space (ddns.py:162) — NOERROR/NXDOMAIN ---
-dhcp-0-16.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-18.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-18.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-22.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-18.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-22.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-22.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-22.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-17.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-18.campus.example.edu A
-dhcp-0-22.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-18.campus.example.edu A
-dhcp-0-20.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-19.campus.example.edu A
-dhcp-0-16.campus.example.edu A
-dhcp-0-21.campus.example.edu A
-dhcp-0-22.campus.example.edu A
+; --- A 55% — generated dhcp-<a>-<b>-<c>-<d> labels over leased space (ddns.py) — NOERROR/NXDOMAIN ---
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-18.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-18.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-22.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-18.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-22.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-22.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-22.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-17.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-18.campus.example.edu A
+dhcp-10-0-0-22.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-18.campus.example.edu A
+dhcp-10-0-0-20.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-19.campus.example.edu A
+dhcp-10-0-0-16.campus.example.edu A
+dhcp-10-0-0-21.campus.example.edu A
+dhcp-10-0-0-22.campus.example.edu A
 
 ; --- AAAA 10% — same forward names (v6) — NOERROR / NOERROR-empty ---
 www.campus.example.edu AAAA
@@ -153,12 +153,12 @@ dev-0000065.campus.example.edu AAAA
 dev-0000102.campus.example.edu AAAA
 dev-0000051.campus.example.edu AAAA
 dev-0000043.campus.example.edu AAAA
-dhcp-0-16.campus.example.edu AAAA
-dhcp-0-21.campus.example.edu AAAA
-dhcp-0-18.campus.example.edu AAAA
-dhcp-0-21.campus.example.edu AAAA
-dhcp-0-18.campus.example.edu AAAA
-dhcp-0-19.campus.example.edu AAAA
+dhcp-10-0-0-16.campus.example.edu AAAA
+dhcp-10-0-0-21.campus.example.edu AAAA
+dhcp-10-0-0-18.campus.example.edu AAAA
+dhcp-10-0-0-21.campus.example.edu AAAA
+dhcp-10-0-0-18.campus.example.edu AAAA
+dhcp-10-0-0-19.campus.example.edu AAAA
 
 ; --- PTR 20% — in-addr.arpa for leased IPs (dig -x form) — NOERROR/NXDOMAIN ---
 16.0.0.10.in-addr.arpa PTR

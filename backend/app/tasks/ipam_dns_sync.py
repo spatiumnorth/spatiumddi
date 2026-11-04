@@ -124,7 +124,7 @@ async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int,
     """#428 — eventual-consistency net for DDNS-enabled subnets. Re-runs
     the DDNS policy for every active lease-mirrored row so a record that a
     swallowed inline ``apply_ddns_for_lease`` failure missed — including a
-    generated ``dhcp-<x-y>`` name the hostname-driven drift check can't
+    generated ``dhcp-<a-b-c-d>`` name the hostname-driven drift check can't
     see — gets regenerated. Idempotent: ``apply_ddns_for_lease`` skips a
     row whose hostname is unchanged and already published under that name.
     Returns (records_fired, errors)."""

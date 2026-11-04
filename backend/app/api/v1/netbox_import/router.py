@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import DB, SuperAdmin
 from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.ssrf import assert_safe_target
+from app.services.api_token_scopes import token_write
 from app.services.netbox_import import (
     CommitResult,
     EntityConflict,
@@ -453,6 +454,7 @@ async def _status_counts(nb: NetBoxClient) -> dict[str, int] | None:
     response_model=PreviewOut,
     responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
 )
+@token_write("Live pull from a NetBox instance with a caller-supplied token (outbound)")
 async def netbox_preview(
     current_user: SuperAdmin,
     db: DB,

@@ -35,6 +35,7 @@ gate or a role description, change this file with it.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -232,6 +233,61 @@ INFRASTRUCTURE: dict[str, list[tuple[str, str]]] = {
 }
 
 
+# What each Editor's description says it READS, and what it says it may not
+# read (#3453), as ``phrase -> routes``. Each phrase must appear in the
+# description, and each route must be reachable (read claims) or refused
+# (refused reads) on the role's grants alone, so the prose cannot promise a
+# read the grants do not open, nor name one as refused that they do.
+_LOGS = "/api/v1/logs"
+READ_CLAIMS: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "DNS Editor": {
+        "server groups": [("GET", f"{_DNS}/groups"), ("GET", f"{_DNS}/groups/{{group_id}}")],
+        "their servers and options": [
+            ("GET", f"{_DNS}/groups/{{group_id}}/servers"),
+            ("GET", f"{_DNS}/groups/{{group_id}}/options"),
+        ],
+        "TSIG keys": [("GET", f"{_DNS}/groups/{{group_id}}/tsig-keys")],
+        "DNSSEC policies": [("GET", f"{_DNS}/dnssec-policies")],
+        "zones": [("GET", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}")],
+        "records": [("GET", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records")],
+        "views": [("GET", f"{_DNS}/groups/{{group_id}}/views")],
+        "ACLs": [("GET", f"{_DNS}/groups/{{group_id}}/acls")],
+        "blocklists": [("GET", f"{_DNS}/blocklists"), ("GET", f"{_DNS}/blocklists/{{list_id}}")],
+        "GSLB pools": [("GET", f"{_DNS}/pools"), ("GET", f"{_DNS}/pools/{{pool_id}}")],
+    },
+    "DHCP Editor": {
+        "DHCP servers": [("GET", f"{_DHCP}/servers"), ("GET", f"{_DHCP}/servers/{{server_id}}")],
+        "server groups": [("GET", f"{_DHCP}/server-groups")],
+        "scopes": [
+            ("GET", f"{_DHCP}/scopes/{{scope_id}}"),
+            ("GET", f"{_DHCP}/server-groups/{{group_id}}/scopes"),
+        ],
+        "pools": [("GET", f"{_DHCP}/scopes/{{scope_id}}/pools")],
+        "static assignments": [("GET", f"{_DHCP}/scopes/{{scope_id}}/statics")],
+        "leases": [("GET", f"{_DHCP}/leases"), ("GET", f"{_DHCP}/servers/{{server_id}}/leases")],
+        "lease history": [("GET", f"{_DHCP}/lease-history")],
+    },
+}
+REFUSED_READS: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "DNS Editor": {
+        "DNS query log": [("POST", f"{_LOGS}/dns-queries")],
+        "its analytics": [("POST", f"{_LOGS}/dns-queries/analytics")],
+        "Top DNS clients": [("GET", "/api/v1/reports/top-dns-clients")],
+        "DNS threat views": [
+            ("GET", "/api/v1/dns-threat/summary"),
+            ("GET", "/api/v1/dns-threat/windows"),
+            ("GET", "/api/v1/dns-threat/rpz/hits"),
+        ],
+        "Windows event log": [("POST", f"{_LOGS}/query")],
+    },
+    "DHCP Editor": {
+        "DHCP activity log": [("POST", f"{_LOGS}/dhcp-activity")],
+        "Windows DHCP audit log": [("POST", f"{_LOGS}/dhcp-audit")],
+        "Windows event log": [("POST", f"{_LOGS}/query")],
+    },
+}
+
+
 # ── route table ────────────────────────────────────────────────────────────
 
 
@@ -355,7 +411,14 @@ def table() -> dict[tuple[str, str], Gate]:
 def test_inventory_finds_the_routes(table) -> None:
     # A walker that finds nothing makes every assertion below vacuous.
     assert len(table) > 500
-    for routes in (*PROMISES.values(), *INFRASTRUCTURE.values(), OPEN_DNS_DHCP_WRITES):
+    claimed = [
+        r
+        for table_ in (READ_CLAIMS, REFUSED_READS)
+        for phrases in table_.values()
+        for routes in phrases.values()
+        for r in routes
+    ]
+    for routes in (*PROMISES.values(), *INFRASTRUCTURE.values(), OPEN_DNS_DHCP_WRITES, claimed):
         missing = [r for r in routes if r not in table]
         assert not missing, f"routes named here that the app does not serve: {missing}"
 
@@ -409,6 +472,88 @@ def test_each_write_grant_backs_a_promise(table, role: str) -> None:
         f"the built-in {role} holds write grants none of its promised routes "
         "use; narrow the grant, or promise (and open) the route:\n" + "\n".join(unused)
     )
+
+
+def _description(role: str) -> str:
+    return " ".join(_BUILTIN_ROLES[role][0].split())
+
+
+@pytest.mark.parametrize("role", sorted(READ_CLAIMS))
+def test_each_read_the_description_claims_is_open(table, role: str) -> None:
+    desc = _description(role)
+    missing = [phrase for phrase in READ_CLAIMS[role] if phrase not in desc]
+    assert not missing, f"the {role} description no longer names these reads: {missing}"
+    refused = [
+        f"{phrase}: {m} {p}"
+        for phrase, routes in READ_CLAIMS[role].items()
+        for m, p in routes
+        if not role_can(table, role, m, p)
+    ]
+    assert (
+        not refused
+    ), f"the built-in {role} description claims reads its grants do not open:\n" + "\n".join(
+        refused
+    )
+
+
+@pytest.mark.parametrize("role", sorted(REFUSED_READS))
+def test_each_read_the_description_withholds_is_refused(table, role: str) -> None:
+    desc = _description(role)
+    missing = [phrase for phrase in REFUSED_READS[role] if phrase not in desc]
+    assert not missing, f"the {role} description no longer names these refusals: {missing}"
+    opened = [
+        f"{phrase}: {m} {p}"
+        for phrase, routes in REFUSED_READS[role].items()
+        for m, p in routes
+        if role_can(table, role, m, p)
+    ]
+    assert not opened, (
+        f"the built-in {role} description names reads as refused that its grants open:\n"
+        + "\n".join(opened)
+    )
+
+
+def test_editor_descriptions_claim_no_universal_read() -> None:
+    # "read every DNS surface" was the defect (#3453): a role that refuses any
+    # read in its area must not claim all of it.
+    universal = re.compile(r"\bread\b[^.;]*\b(every|all|any|full|entire)\b", re.IGNORECASE)
+    claims = {role: _description(role) for role in REFUSED_READS}
+    offenders = {role: m.group(0) for role, d in claims.items() if (m := universal.search(d))}
+    assert not offenders, f"descriptions claim a universal read: {offenders}"
+
+
+# The families each description names as superadmin-only (the routes behind
+# them are ``INFRASTRUCTURE`` above). Narrowing a read claim must not drop one:
+# the first rewrite for #3453 lost "server groups" from the DNS Editor's list.
+SUPERADMIN_ONLY_PHRASES: dict[str, list[str]] = {
+    "DNS Editor": [
+        "server groups",
+        "servers and their options",
+        "TSIG keys",
+        "DNSSEC signing and policies",
+        "blocklist subscriptions and assignments",
+        "GSLB pools",
+        "zone moves",
+        "importers",
+    ],
+    "DHCP Editor": [
+        "server groups",
+        "failover relationships",
+        "server sync / pause / approval",
+        "lease deletion",
+        "importers",
+    ],
+}
+
+
+@pytest.mark.parametrize("role", sorted(SUPERADMIN_ONLY_PHRASES))
+def test_description_names_its_superadmin_only_infrastructure(role: str) -> None:
+    desc = _description(role)
+    marker = "superadmin-only:"
+    assert marker in desc, f"the {role} description no longer says what stays superadmin-only"
+    tail = desc.split(marker, 1)[1]
+    missing = [phrase for phrase in SUPERADMIN_ONLY_PHRASES[role] if phrase not in tail]
+    assert not missing, f"the {role} description no longer names as superadmin-only: {missing}"
 
 
 @pytest.mark.parametrize("role", sorted(INFRASTRUCTURE))

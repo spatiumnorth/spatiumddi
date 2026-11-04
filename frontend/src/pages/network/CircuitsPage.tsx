@@ -930,6 +930,7 @@ export function CircuitsPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(c)}
                       className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                       {...writeGate}
@@ -939,6 +940,7 @@ export function CircuitsPage() {
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete circuit",

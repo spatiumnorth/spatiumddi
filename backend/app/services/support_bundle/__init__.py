@@ -26,6 +26,7 @@ instead of pretending the problem away.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import uuid
@@ -140,8 +141,10 @@ async def generate(db: AsyncSession, *, scrubbed: bool = True) -> BundleResult:
     sections["versions.json"] = await _safe(
         "versions", lambda: collect.collect_versions(db), errors, db
     )
+    # Not DB-backed: synchronous kubeapi + DNS probes, in a worker thread
+    # like the host collectors below.
     sections["health/self-test.txt"] = await _safe(
-        "self_test", lambda: collect.collect_self_test(scrub), errors
+        "self_test", lambda: asyncio.to_thread(collect.collect_self_test, scrub), errors
     )
     sections["health/db-connections.json"] = await _safe(
         "db_pool", lambda: collect.collect_db_pool(db), errors, db
@@ -175,19 +178,51 @@ async def generate(db: AsyncSession, *, scrubbed: bool = True) -> BundleResult:
     )
 
     # ── Host / runtime ──────────────────────────────────────────────
+    #
+    # Synchronous, and slow on an appliance: a kube API read per pod,
+    # every host log file read and scrubbed whole. On the event loop they
+    # held every other request, /health/live included, for the whole
+    # build (#3310), so each runs in a worker thread; ``_safe`` awaits
+    # what the factory returns and records a failure the same way. One at
+    # a time, never gathered: they share ``scrub``, which is not
+    # thread-safe.
     sections["system/env.txt"] = await _safe(
-        "environment", lambda: collect.collect_environment(scrub), errors
+        "environment", lambda: asyncio.to_thread(collect.collect_environment, scrub), errors
     )
-    _merge(sections, "system", await _safe("proc", lambda: collect.collect_proc(scrub), errors))
+    _merge(
+        sections,
+        "system",
+        await _safe("proc", lambda: asyncio.to_thread(collect.collect_proc, scrub), errors),
+    )
     _merge(
         sections,
         "containers",
-        await _safe("pods", lambda: collect.collect_container_logs(scrub), errors),
+        await _safe(
+            "pods", lambda: asyncio.to_thread(collect.collect_container_logs, scrub), errors
+        ),
     )
     _merge(
-        sections, "logs", await _safe("host_logs", lambda: collect.collect_host_logs(scrub), errors)
+        sections,
+        "logs",
+        await _safe(
+            "host_logs", lambda: asyncio.to_thread(collect.collect_host_logs, scrub), errors
+        ),
     )
 
+    # The safety net, the manifest and the zip are CPU work over all of
+    # the text, seconds of it with many MB of logs, so they run in a
+    # worker thread too, once every collector is done with ``sections``
+    # and ``scrub``.
+    return await asyncio.to_thread(_assemble, sections, scrub, scrubbed, errors)
+
+
+def _assemble(
+    sections: dict[str, str], scrub: Scrubber, scrubbed: bool, errors: list[str]
+) -> BundleResult:
+    """Sweep, describe and zip the collected sections.
+
+    Synchronous on purpose: :func:`generate` runs it in a worker thread.
+    """
     # ── Safety net ──────────────────────────────────────────────────
     #
     # Every collector is supposed to redact its own secrets. This runs

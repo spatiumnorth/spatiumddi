@@ -610,6 +610,7 @@ function SiteTable({
                 <button
                   type="button"
                   title="Edit"
+                  aria-label="Edit"
                   onClick={() => onEdit(r)}
                   className="rounded p-1 hover:bg-muted disabled:opacity-30"
                   {...writeGate}
@@ -619,6 +620,7 @@ function SiteTable({
                 <button
                   type="button"
                   title="Detach"
+                  aria-label="Detach"
                   onClick={() => onDelete(r)}
                   className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:opacity-30"
                   {...deleteGate}
@@ -1079,6 +1081,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                   <button
                     type="button"
                     title="Move up"
+                    aria-label="Move up"
                     disabled={idx === 0 || updatePriority.isPending}
                     onClick={() => move(idx, -1)}
                     className="rounded p-1 hover:bg-muted disabled:opacity-30"
@@ -1089,6 +1092,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                   <button
                     type="button"
                     title="Move down"
+                    aria-label="Move down"
                     disabled={
                       idx === (policiesQ.data?.length ?? 0) - 1 ||
                       updatePriority.isPending
@@ -1102,6 +1106,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                   <button
                     type="button"
                     title="Edit"
+                    aria-label="Edit"
                     onClick={() => setEditing(p)}
                     className="rounded p-1 hover:bg-muted disabled:opacity-30"
                     {...writeGate}
@@ -1111,6 +1116,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                   <button
                     type="button"
                     title="Delete"
+                    aria-label="Delete"
                     onClick={() => {
                       setConfirm({
                         name: p.name,

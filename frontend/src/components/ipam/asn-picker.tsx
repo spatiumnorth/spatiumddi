@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { usePermissions } from "@/hooks/usePermissions";
 import { asnsApi } from "@/lib/api";
 
 interface AsnPickerProps {
@@ -16,12 +17,33 @@ export function AsnPicker({
   className,
   disabled,
 }: AsnPickerProps) {
+  // The list route needs read on "manage_asns"; without it the list is never
+  // asked (#3451) and the picker says why instead of offering only "None".
+  const canRead = usePermissions().can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: canRead,
   });
   const asns = data?.items ?? [];
+
+  if (!canRead) {
+    // Disabled, so the form still sends the unchanged id (never a clear).
+    return (
+      <select
+        className={className}
+        value={value ? "linked" : ""}
+        disabled
+        title="Your role cannot read ASNs, so this cannot be changed here."
+      >
+        <option value="">— None —</option>
+        {value && (
+          <option value="linked">Linked (not visible to your role)</option>
+        )}
+      </select>
+    );
+  }
 
   return (
     <select

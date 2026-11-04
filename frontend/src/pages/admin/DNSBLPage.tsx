@@ -301,6 +301,7 @@ export function DNSBLPage() {
                 type="button"
                 className="rounded p-1.5 hover:bg-accent"
                 title="Unpin"
+                aria-label="Unpin"
                 {...deleteGate}
                 onClick={() => setConfirmUnpin(p)}
               >
@@ -375,6 +376,7 @@ export function DNSBLPage() {
                           type="button"
                           className="rounded p-1.5 hover:bg-accent"
                           title={l.enabled ? "Disable" : "Enable"}
+                          aria-label={l.enabled ? "Disable" : "Enable"}
                           disabled={!canWrite || toggleList.isPending}
                           {...(canWrite ? {} : { title: writeGate.title })}
                           onClick={() => toggleList.mutate(l)}
@@ -391,6 +393,7 @@ export function DNSBLPage() {
                             type="button"
                             className="rounded p-1.5 hover:bg-accent"
                             title="Delete custom list"
+                            aria-label="Delete custom list"
                             {...deleteGate}
                             onClick={() => setConfirmDelete(l)}
                           >

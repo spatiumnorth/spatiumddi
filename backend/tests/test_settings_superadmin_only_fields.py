@@ -1,9 +1,9 @@
 """Which ``PUT /settings`` fields a ``write:settings`` delegate may change.
 
-The Settings page offers every field to superadmins only. On the server, a
-delegate holding ``write`` on ``settings`` may change only the fields in
-``SETTINGS_DELEGATE_WRITABLE``; every other field is superadmin-only. These
-tests walk the whole ``SettingsUpdate`` model so a new field has to be
+A delegate holding ``write`` on ``settings`` may change only the fields in
+``SETTINGS_DELEGATE_WRITABLE``; every other field is superadmin-only, and
+``GET /settings`` serves that set as ``delegate_writable_fields`` so the
+Settings page enables the same fields (#3429). These tests walk the whole ``SettingsUpdate`` model so a new field has to be
 classified here before the suite passes.
 """
 
@@ -279,6 +279,22 @@ async def test_delegate_may_write_delegate_field(
     headers = await _settings_editor(db_session)
     r = await client.put("/api/v1/settings", headers=headers, json={field: DELEGATE_VALUES[field]})
     assert r.status_code == 200, f"{field}: {r.status_code} {r.text}"
+
+
+@pytest.mark.asyncio
+async def test_get_settings_serves_the_delegate_allowlist(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # #3429 — the Settings page reads this instead of copying the list, so a
+    # field added to SETTINGS_DELEGATE_WRITABLE is enabled for a delegate
+    # without a frontend change, and the two cannot disagree.
+    headers = await _settings_editor(db_session)
+    r = await client.get("/api/v1/settings", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["delegate_writable_fields"] == sorted(SETTINGS_DELEGATE_WRITABLE)
+    r = await client.put("/api/v1/settings", headers=headers, json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["delegate_writable_fields"] == sorted(SETTINGS_DELEGATE_WRITABLE)
 
 
 @pytest.mark.asyncio

@@ -25,7 +25,9 @@ CLAUDE.md non-negotiables that apply here:
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
@@ -285,6 +287,30 @@ def hidden_target_preview(
     )
 
 
+# Whose permissions a preview judges. A preview normally runs under the user
+# who will apply (the Copilot proposal's owner, a portal request's approver at
+# its re-preview), so a per-resource refusal the apply would raise belongs in
+# the preview. At portal SUBMIT it runs under the requester, who by definition
+# lacks the permission (#696): the approver must hold it, and the approve
+# spine re-previews under the approver. ``submit_request`` sets this so such a
+# check is skipped there and only there (#3425).
+_PREVIEW_FOR_REQUESTER: ContextVar[bool] = ContextVar("preview_for_requester", default=False)
+
+
+@contextmanager
+def previewing_for_requester() -> Iterator[None]:
+    """Run a preview for a portal requester (see ``_PREVIEW_FOR_REQUESTER``)."""
+    token = _PREVIEW_FOR_REQUESTER.set(True)
+    try:
+        yield
+    finally:
+        _PREVIEW_FOR_REQUESTER.reset(token)
+
+
+def preview_is_for_requester() -> bool:
+    return _PREVIEW_FOR_REQUESTER.get()
+
+
 def resource_reference_fields(args_model: type[BaseModel]) -> list[tuple[str, str]]:
     """``(field name, resource_type)`` for every ``x-resource`` field (#759)."""
     out: list[tuple[str, str]] = []
@@ -386,7 +412,11 @@ class CreateIPAddressArgs(BaseModel):
     )
     hostname: str | None = Field(default=None, description="Hostname (e.g. web01)")
     fqdn: str | None = Field(
-        default=None, description="Fully-qualified domain name (e.g. web01.prod.example.com)"
+        default=None,
+        description=(
+            "Fully-qualified domain name in the subnet's DNS zone (e.g. "
+            "web01.prod.example.com); the hostname is the part before the zone"
+        ),
     )
     mac_address: str | None = Field(default=None, description="MAC address in any standard format")
     description: str = Field(default="", description="Free-form description")
@@ -422,6 +452,47 @@ class CreateIPAddressArgs(BaseModel):
         if v is None or v.strip() == "":
             return None
         return canonicalize_mac(v)
+
+
+async def _hostname_from_fqdn(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+) -> tuple[CreateIPAddressArgs, str | None]:
+    """The args with the hostname an ``fqdn`` names, or why it names none (#3348).
+
+    The REST create takes only a hostname and publishes ``<hostname>.<zone>``
+    in the subnet's effective forward zone, which is also the ``fqdn`` it
+    stores. An address's ``fqdn`` reads as current only with a hostname
+    (#3297), so an ``fqdn`` is turned into the hostname that publishes exactly
+    that name: the part before the zone, which may be more than one label. An
+    ``fqdn`` outside the zone, or in a subnet with no zone, would be replaced
+    by a different name (or by none), so it is refused, as is a hostname that
+    names a different host than the ``fqdn``.
+    """
+    if not args.fqdn:
+        return args, None
+    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415 — avoid cycle
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    zone_id = await _resolve_effective_zone(db, subnet)
+    zone = await db.get(DNSZone, zone_id) if zone_id else None
+    if zone is None:
+        return args, (
+            f"fqdn {args.fqdn} cannot be published: subnet {subnet.network} has no "
+            "DNS zone. Give a hostname without an fqdn."
+        )
+    zone_name = zone.name.rstrip(".").lower()
+    if not args.fqdn.endswith("." + zone_name):
+        return args, (
+            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone this "
+            f"address publishes in. Give a hostname, or an fqdn ending in .{zone_name}."
+        )
+    hostname = args.fqdn[: -len(zone_name) - 1]
+    if args.hostname and args.hostname != hostname:
+        return args, (
+            f"hostname {args.hostname} and fqdn {args.fqdn} name different hosts: "
+            f"the address publishes {args.hostname}.{zone_name}. Give one of them."
+        )
+    return args.model_copy(update={"hostname": hostname}), None
 
 
 async def _preview_create_ip_address(
@@ -470,6 +541,10 @@ async def _preview_create_ip_address(
     boundary = boundary_address_refusal(subnet, args.address)
     if boundary is not None:
         return PreviewResult(ok=False, detail=boundary)
+
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:
+        return PreviewResult(ok=False, detail=fqdn_err)
 
     # Check for existing allocation — a non-blocking cue that apply
     # will likely 409. The preview deliberately doesn't reject; the
@@ -634,6 +709,9 @@ async def _validate_submit_create_ip_address(
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:  # preview already refused; defensive
         return
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:  # preview already refused; defensive
+        raise HTTPException(status_code=422, detail=fqdn_err)
     assert_subnet_takes_addresses(subnet)
     assert_static_dhcp_has_mac(args.status, args.mac_address)
     assert_not_boundary_address(subnet, args.address)
@@ -696,6 +774,12 @@ async def _apply_create_ip_address(
     boundary = boundary_address_refusal(subnet, args.address)
     if boundary is not None:
         raise ValueError(boundary)
+
+    # #3348 — an fqdn becomes the hostname that publishes it, re-resolved
+    # against the zone as it is now, not as it was when the request was made.
+    args, fqdn_err = await _hostname_from_fqdn(db, subnet, args)
+    if fqdn_err is not None:
+        raise ValueError(fqdn_err)
 
     # Re-check for existing allocation under the apply transaction.
     existing = (
@@ -1059,7 +1143,23 @@ async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, 
     return await wol.resolve_wake_params(db, aid)
 
 
+def _wake_host_refusal(user: User) -> OperationPermissionError | None:
+    """The REST wake route's second gate: the IPAM router needs type-level
+    ``write`` on ``subnet`` for ``POST /addresses/{id}/wake`` on top of the
+    route's own ``read`` on ``use_network_tools`` (#3461). ``None`` when held."""
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "subnet"):
+        return None
+    return OperationPermissionError("write", "subnet")
+
+
 async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
+    # wake_host is in neither the request-portal catalog nor the risky-op
+    # set, so the previewing user is always the one who applies.
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
     try:
         ip, mac, broadcast = await _load_wake_target(db, args)
     except ValueError as exc:
@@ -1080,6 +1180,9 @@ async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> 
     from app.services import wol  # noqa: PLC0415
 
     enforce_operation_permission(user, _OPERATIONS["wake_host"])
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        raise refusal
     ip, mac, broadcast = await _load_wake_target(db, args)
     # AI proposals always send from the control-plane (server) vantage.
     try:
@@ -1123,7 +1226,8 @@ register(
         preview=_preview_wake_host,
         apply=_apply_wake_host,
         category="network",
-        # ``read`` matches the rest of the network-tools surface.
+        # ``read`` matches the rest of the network-tools surface; the REST
+        # route also needs write on ``subnet`` (#3461), checked beside it.
         required_permission=("read", "use_network_tools"),
     )
 )
@@ -2063,6 +2167,17 @@ def _carve_candidate(
     return chosen
 
 
+def _target_block_refusal(user: User, block: IPBlock) -> OperationPermissionError | None:
+    """The REST allocate's target-block gate (#3425) as an operation refusal,
+    or ``None`` when ``user`` may write ``block``."""
+    from app.api.v1.ipam.router import target_block_write_refusal  # noqa: PLC0415 — cycle
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "ip_block", block.id):
+        return None
+    return OperationPermissionError("write", "ip_block", target_block_write_refusal(user, block))
+
+
 async def _preview_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> PreviewResult:
@@ -2079,6 +2194,14 @@ async def _preview_allocate_subnet(
         return hidden_target_preview(
             "ip_block", args.block_id, OperationPermissionError("write", "subnet")
         )
+    # The REST allocate also needs write on THIS block (#3425), so a caller who
+    # will apply without it is told here, not by a failed apply. Not judged for
+    # a portal requester: the approver must hold it, and is re-previewed.
+    refusal = _target_block_refusal(user, block)
+    if refusal is not None and not preview_is_for_requester():
+        if not _can_read_target(user, "ip_block", block.id):
+            return hidden_target_preview("ip_block", args.block_id, refusal)
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
     family_max = 32 if block_net.version == 4 else 128
@@ -2201,6 +2324,15 @@ async def _apply_allocate_subnet(
     # SECURITY (#400, C2): RBAC backstop — matches the IPAM router's
     # require_any_resource_permission("subnet", ...) write gate.
     enforce_operation_permission(user, _OPERATIONS["allocate_subnet"])
+    # The target-block gate (#3425) as an OperationPermissionError, not the
+    # REST handler's 403: it is about THIS applier, so an approve leaves the
+    # portal request pending for one who may write the block instead of
+    # failing it.
+    block = await db.get(IPBlock, UUID(args.block_id))
+    if block is not None:
+        refusal = _target_block_refusal(user, block)
+        if refusal is not None:
+            raise refusal
 
     alloc = SubnetAllocate(
         prefix_len=args.prefix_len,
