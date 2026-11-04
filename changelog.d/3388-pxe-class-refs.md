@@ -1,3 +1,0 @@
-### Fixed
-
-- A DHCP pool can no longer be left restricted to a PXE or phone class Kea never receives. While a pool names the class: disabling a PXE profile, or unbinding it from the pool's own scope, is refused (409, naming the pools); disabling, deleting or detaching a phone profile, or deleting or deactivating the last active scope it is attached to, is refused (409). A pool naming a `pxe-…` / `voip-…` class that no rule or phone profile generates, a disabled profile's class, or a PXE class of a profile its scope is not bound to, is a 422. Two boot rules selecting the same clients (same vendor class and architecture codes) in one profile are refused (422) (#3388).
