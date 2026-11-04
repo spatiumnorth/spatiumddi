@@ -94,6 +94,9 @@ export const ContextMenuContent = React.forwardRef<
 ));
 ContextMenuContent.displayName = "ContextMenuContent";
 
+// A disabled item keeps pointer events so its `title` (the reason a
+// permission gate gives, #3392) shows on hover; Radix itself refuses to focus,
+// highlight or select a disabled item, by mouse or by keyboard.
 export const ContextMenuItem = React.forwardRef<
   React.ElementRef<typeof ContextMenuPrimitive.Item>,
   React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Item> & {
@@ -104,7 +107,7 @@ export const ContextMenuItem = React.forwardRef<
     ref={ref}
     className={cn(
       "relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-xs outline-none",
-      "focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      "focus:bg-accent focus:text-accent-foreground data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50",
       destructive &&
         "text-destructive focus:bg-destructive/10 focus:text-destructive",
       className,

@@ -48,7 +48,11 @@ from app.models.dhcp import (
     DHCPPXEProfile,
     DHCPServerGroup,
 )
-from app.services.dhcp.class_refs import describe_pools, pools_restricted_to
+from app.services.dhcp.class_refs import (
+    describe_pools,
+    pools_restricted_to,
+    pxe_pool_refs,
+)
 from app.services.dhcp.option_validation import check_vendor_class_match
 
 router = APIRouter(
@@ -343,6 +347,68 @@ async def _refuse_if_pool_bound(
             raise HTTPException(status_code=409, detail=detail)
 
 
+async def refuse_if_pxe_pools_lose_class(
+    db: AsyncSession,
+    p: DHCPPXEProfile,
+    verb: str,
+    *,
+    scope_id: uuid.UUID | None = None,
+) -> None:
+    """409 when disabling the profile, or unbinding it from ``scope_id``, would
+    take a class away from a pool that names it (#3388). A PXE class reaches
+    only the scopes bound to its profile (#2731), so those pools are the ones
+    at stake: every bound scope's for a disable, ``scope_id``'s own for an
+    unbind, however many other scopes stay bound. A profile already disabled
+    renders nothing, so nothing is taken away."""
+    if not p.enabled:
+        return
+    for name, pools in await pxe_pool_refs(db, p, scope_id=scope_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {verb}: PXE profile '{p.name}' generates class '{name}', which is "
+                f"still referenced by {len(pools)} pool(s) ({describe_pools(pools)}). Kea "
+                "accepts a reference to an undefined class and the pool would silently "
+                "match no client. Clear or change those references first."
+            ),
+        )
+
+
+def _clients_selected(vendor_class_match: str | None, arch_codes: list[int] | None) -> Any:
+    """Which clients a rule's rendered ``test`` matches
+    (``_build_pxe_match_expression``): the vendor class and the SET of arch
+    codes. ``match_kind`` and priority never reach the test."""
+    return (vendor_class_match or None, frozenset(arch_codes or ()))
+
+
+def _reject_duplicate_selectors(
+    rows: list[ArchMatchInput], stored: list[DHCPPXEArchMatch] | None = None
+) -> None:
+    """422 on two rules selecting the same clients (#3388): Kea takes the boot
+    fields from the first matching class, so the second rule never boots anything.
+    Two rules differing only in ``match_kind`` or priority still collide.
+
+    A duplicate the profile already ``stored`` (saved before this check) is
+    let through rather than failing every later Save of it (#3367); adding a
+    new one is not."""
+    allowed: dict[Any, int] = {}
+    for m in stored or ():
+        sel = _clients_selected(m.vendor_class_match, m.arch_codes)
+        allowed[sel] = allowed.get(sel, 0) + 1
+    seen: dict[Any, int] = {}
+    for r in rows:
+        sel = _clients_selected(r.vendor_class_match, r.arch_codes)
+        seen[sel] = seen.get(sel, 0) + 1
+        if seen[sel] > max(1, allowed.get(sel, 0)):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Two boot rules in this profile select the same clients "
+                    "(same vendor class and architecture codes)"
+                ),
+            )
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
@@ -384,6 +450,7 @@ async def create_profile(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A PXE profile with that name exists")
 
+    _reject_duplicate_selectors(body.matches)
     # Construct the profile with its matches in one shot so SQLAlchemy
     # never lazy-loads ``matches`` on the just-added row (which would
     # try a sync DB read inside the async session and trip
@@ -480,6 +547,11 @@ async def update_profile(
     payload.pop("matches", None)
     if "tags" in payload:
         payload["tags"] = dict(payload["tags"] or {})
+
+    if payload.get("enabled") is False:
+        await refuse_if_pxe_pools_lose_class(db, prof, f"disable PXE profile '{prof.name}'")
+    if matches_input is not None:
+        _reject_duplicate_selectors(matches_input, list(prof.matches))
 
     before = snapshot(prof, payload)
     for k, v in payload.items():

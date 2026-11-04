@@ -178,8 +178,9 @@ export function AuditForwardTargets({
     <div className="space-y-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="max-w-2xl text-xs text-muted-foreground">
-          Every enabled target receives every committed AuditLog row. Delivery
-          is fire-and-forget — a dead target never blocks the audit write or the
+          Each enabled target receives the committed AuditLog rows that pass its
+          own minimum severity and resource type filters. Delivery is
+          fire-and-forget — a dead target never blocks the audit write or the
           other targets.
         </div>
         {isSuperadmin && (
