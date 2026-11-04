@@ -4571,18 +4571,20 @@ const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
 const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 
-// The IPAM router's gate: an address delete and the multi-row deletes (Bulk
-// delete, Clean Orphans) need ``delete`` on ``subnet`` — the subnet owns its
-// addresses (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or
-// on an address set.
-function canDeleteInIpam(
-  can: (action: string, type: string, id?: string | null) => boolean,
-  addressSetIds: string[] = [],
-): boolean {
+// The IPAM router's gate for an address delete and Bulk delete
+// (``DELETE /addresses/{id}``, ``POST /addresses/bulk-delete``): ``delete`` on
+// ``subnet`` at the type level — the subnet owns its addresses
+// (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or any
+// ``delete`` grant on an address set, scoped or not (the ``_ADDRESS_SET_ROUTES``
+// admit, ``has_any_grant_for``). The handler then wants write on the row.
+// Clean Orphans is not on that allow-list: it takes ``delete`` on ``subnet``.
+function canDeleteInIpam(perms: {
+  can: (action: string, type: string, id?: string | null) => boolean;
+  hasAnyGrantFor: (action: string, type: string) => boolean;
+}): boolean {
   return (
-    can("delete", "subnet") ||
-    can("delete", "address_set") ||
-    addressSetIds.some((id) => can("delete", "address_set", id))
+    perms.can("delete", "subnet") ||
+    perms.hasAnyGrantFor("delete", "address_set")
   );
 }
 
@@ -5089,12 +5091,10 @@ export function SubnetDetail({
   const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
   // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
   const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
-  // Bulk delete and Clean Orphans are deletes: the router gate wants
-  // ``delete``, the handler write on the row's subnet or address set.
-  const canDeleteIpam = canDeleteInIpam(
-    perms.can,
-    addressSets.map((s) => s.id),
-  );
+  // A row's Delete, the orphan purge and Bulk delete are deletes: the router
+  // gate wants ``delete``, the handler write on the row's subnet or address
+  // set (#3409). Clean Orphans asks its own, below.
+  const canDeleteIpam = canDeleteInIpam(perms);
 
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
@@ -5794,7 +5794,10 @@ export function SubnetDetail({
                 allocate: canAllocate,
                 reshape: canWriteSubnets,
                 scan: canScan,
-                purge: canWriteSubnets && canDeleteIpam,
+                // Clean Orphans takes ``delete`` on ``subnet``: an
+                // address-set grant does not reach it, as it does a row's
+                // Delete (#3409).
+                purge: canWriteSubnets && perms.can("delete", "subnet"),
               }}
               onBulkAllocate={() => setShowBulkAllocate(true)}
               onCleanOrphans={() => setShowOrphans(true)}
@@ -17223,7 +17226,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
   const perms = usePermissions();
-  const canDeleteIpam = canDeleteInIpam(perms.can);
+  const canDeleteIpam = canDeleteInIpam(perms);
   // ``POST /addresses/bulk-edit`` lets through write on subnets at the type
   // level or, for an address-set delegate (#103), a write grant on any
   // address set; its handler then skips each address the caller cannot
