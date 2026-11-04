@@ -750,14 +750,14 @@ function ScheduleRow({
       </td>
       <td className="px-3 py-2">
         <div className="flex shrink-0 items-center justify-end gap-1">
-          <IconBtn title="Run now" onClick={onRunNow} {...writeGate}>
+          <IconBtn label="Run now" onClick={onRunNow} {...writeGate}>
             <Play className="h-4 w-4" />
           </IconBtn>
-          <IconBtn title="Edit" onClick={onEdit} {...writeGate}>
+          <IconBtn label="Edit" onClick={onEdit} {...writeGate}>
             <Pencil className="h-4 w-4" />
           </IconBtn>
           <IconBtn
-            title="Delete"
+            label="Delete"
             tone="destructive"
             onClick={onDelete}
             {...deleteGate}
@@ -771,13 +771,18 @@ function ScheduleRow({
 }
 
 function IconBtn({
+  label,
   title,
   tone = "default",
   onClick,
   disabled,
   children,
 }: {
-  title: string;
+  /** The action, as the button's accessible name. Kept apart from
+   *  ``title``, which a permission gate replaces with its reason (#3395). */
+  label: string;
+  /** Tooltip; defaults to ``label``. */
+  title?: string;
   tone?: "default" | "destructive";
   onClick: () => void;
   /** #1341 — set (with the reason as ``title``) when the caller may not. */
@@ -787,7 +792,8 @@ function IconBtn({
   return (
     <button
       type="button"
-      title={title}
+      aria-label={label}
+      title={title ?? label}
       disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
@@ -1549,18 +1555,18 @@ function CalendarRow({
       </td>
       <td className="px-3 py-2">
         <div className="flex shrink-0 items-center justify-end gap-1">
-          <IconBtn title="Sync now" onClick={onSync} {...writeGate}>
+          <IconBtn label="Sync now" onClick={onSync} {...writeGate}>
             {syncing ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <RefreshCw className="h-4 w-4" />
             )}
           </IconBtn>
-          <IconBtn title="Edit" onClick={onEdit} {...writeGate}>
+          <IconBtn label="Edit" onClick={onEdit} {...writeGate}>
             <Pencil className="h-4 w-4" />
           </IconBtn>
           <IconBtn
-            title="Delete"
+            label="Delete"
             tone="destructive"
             onClick={onDelete}
             {...deleteGate}

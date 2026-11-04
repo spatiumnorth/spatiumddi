@@ -816,9 +816,19 @@ is exactly the danger: the pool loads and silently matches no client. So
 the API refuses both ways of getting there. Changing a class's family is a
 `409` while a pool in the family it would leave still restricts to it, and
 the pools are named. Setting a pool's `class_restriction` to an operator
-class not rendered for the pool's family is a `422`. Names that are not
-operator classes are not checked: the generated PXE, phone and
-device-policy classes, and Kea's built-in `KNOWN`.
+class not rendered for the pool's family is a `422`. Device-policy classes
+and Kea's built-ins such as `KNOWN` are not checked.
+
+Generated PXE (`pxe-…`) and phone (`voip-…`) classes are checked against
+what the bundle renders (#3388). A pool may name one only while it exists
+for that pool: a phone class while its profile is enabled and attached to
+an active scope, a PXE class while its profile is enabled and bound to the
+pool's OWN scope, since a PXE class is evaluated only in the scopes bound
+to its profile (#2731). Anything else is a `422`. Taking the class away
+while a pool names it is a `409` naming the pools: disabling a PXE
+profile, unbinding it from the pool's scope, deleting a rule (#3374);
+disabling, deleting or detaching a phone profile, or deleting or
+deactivating the last active scope it is attached to.
 
 The Kea importer keeps the daemon block each class came from. A class
 defined in both the `Dhcp4` and `Dhcp6` blocks, with the same test and no

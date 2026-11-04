@@ -996,6 +996,7 @@ function ZoneOptions({
 
 export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const canReadVrfs = usePermissions().can("read", "vrf");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [color, setColor] = useState<string | null>(null);
@@ -1130,16 +1131,19 @@ export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
           </p>
           <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Manage VRFs (RD + import / export RTs) under{" "}
-              <a
-                href="/network/vrfs"
-                className="underline hover:text-foreground"
-              >
-                Network → VRFs
-              </a>
-              .
-            </p>
+            {/* The VRFs page reads the same list the picker may not (#3451). */}
+            {canReadVrfs && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Manage VRFs (RD + import / export RTs) under{" "}
+                <a
+                  href="/network/vrfs"
+                  className="underline hover:text-foreground"
+                >
+                  Network → VRFs
+                </a>
+                .
+              </p>
+            )}
           </Field>
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
@@ -12405,7 +12409,9 @@ function EditSpaceModalForm({
 }: EditSpaceModalProps) {
   // The dialog opens for a holder of write on this one space, but the server
   // asks delete over every IP space (no id), so a grant on one space is not enough.
-  const canDeleteSpace = usePermissions().can("delete", "ip_space");
+  const { can } = usePermissions();
+  const canDeleteSpace = can("delete", "ip_space");
+  const canReadVrfs = can("read", "vrf");
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -12715,16 +12721,19 @@ function EditSpaceModalForm({
           </p>
           <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Manage VRFs (RD + import / export RTs) under{" "}
-              <a
-                href="/network/vrfs"
-                className="underline hover:text-foreground"
-              >
-                Network → VRFs
-              </a>
-              .
-            </p>
+            {/* The VRFs page reads the same list the picker may not (#3451). */}
+            {canReadVrfs && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Manage VRFs (RD + import / export RTs) under{" "}
+                <a
+                  href="/network/vrfs"
+                  className="underline hover:text-foreground"
+                >
+                  Network → VRFs
+                </a>
+                .
+              </p>
+            )}
             {space.vrf_name && !vrfId && (
               <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
                 Legacy freeform VRF: <code>{space.vrf_name}</code>

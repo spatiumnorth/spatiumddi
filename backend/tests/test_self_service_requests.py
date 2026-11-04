@@ -123,6 +123,8 @@ APPROVER_PERMS = [
     {"action": "write", "resource_type": "subnet"},
     {"action": "read", "resource_type": "subnet"},
     {"action": "read", "resource_type": "ip_block"},
+    # Provisioning a subnet writes into its parent block (#3425).
+    {"action": "write", "resource_type": "ip_block"},
 ]
 
 

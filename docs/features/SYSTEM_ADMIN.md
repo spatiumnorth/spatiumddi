@@ -1077,8 +1077,10 @@ syslog, SNMP, NTP, LLDP, resolver, timezone), and anything that makes an
 outbound connection. A new field is superadmin-only until it is added to
 that set. A delegate's request naming any superadmin-only field is
 refused whole with `403` and an audited denial, so nothing is written.
-`PUT /settings/resolver` is superadmin-only for the same reason. The
-Settings page offers every field to superadmins only.
+`PUT /settings/resolver` is superadmin-only for the same reason.
+`GET /settings` returns the set as `delegate_writable_fields`, and the
+Settings page reads it: a delegate gets Save and those fields, and every
+other field stays disabled for anyone but a superadmin (#3429).
 
 ### 6.1 Public branding endpoint
 

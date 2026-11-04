@@ -158,6 +158,23 @@ on inactive.
    satisfy an unscoped check (one passed without `resource_id`). This prevents
    "I have write on *this one* subnet" from accidentally granting "write on
    subnets in general".
+   **Placing a child under a block (#3425).** Creating a subnet in a block,
+   allocating one from it, moving a subnet or block into it, and applying a
+   plan anchored on it need `write` on that **target block** as well as the
+   check on the thing being created or moved. A grant scoped to the block (or
+   an unscoped one) passes. A grant scoped to the block's **space does not
+   cover the blocks in it**, exactly as it does not for `PUT /ipam/blocks/{id}`:
+   grants match ids, not ancestry. A refusal is a 403 naming the target block
+   (its CIDR and name only when the caller may read it, otherwise its id). A
+   self-service subnet request needs this of the **approver**, not the
+   requester: an approver without `write` on the block gets a 403 and the
+   request stays pending for one who has it.
+   **Growing into a block (#3439).** A resize is grow-only, so resizing a subnet
+   needs `write` on its parent block (a block resize applies the same check
+   to its parent block, though a nested block cannot grow into its ancestor
+   today). The preview lists the refusal as a
+   `permission` conflict; the resize itself is a 403. A top-level block has no
+   parent block and is unaffected.
    **IPAM subnets (#2438).** A `read` / `write` grant scoped to one subnet
    reaches that subnet and its addresses and nothing else. The routes it
    opens are an allow-list, so a route added later stays closed to it until

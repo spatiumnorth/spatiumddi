@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
+from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
 from app.services.api_token_scopes import read_only_post
 from app.services.ipam.custom_field_rules import (
@@ -283,6 +284,41 @@ async def _validate_tree(
                         network=n.network,
                         kind="invalid_binding",
                         message=f"{field} is not a valid UUID: {raw}",
+                    )
+                )
+
+    # 1d. ``dns_group_id`` lands in the new rows' ``dns_group_ids``, a JSONB
+    #     list with no foreign key, so a plan saved before its group was
+    #     deleted would bind the new blocks / subnets to a group that no
+    #     longer exists (#3433). Refused here, with the node that names it.
+    group_refs: dict[uuid.UUID, list[PlanNode]] = {}
+    for n in _walk(tree):
+        if not n.dns_group_id:
+            continue
+        try:
+            group_refs.setdefault(uuid.UUID(str(n.dns_group_id)), []).append(n)
+        except ValueError:
+            continue  # reported as invalid_binding above
+    if group_refs:
+        live = set(
+            (
+                await db.execute(
+                    select(DNSServerGroup.id).where(DNSServerGroup.id.in_(group_refs.keys()))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for gid, nodes in group_refs.items():
+            if gid in live:
+                continue
+            for n in nodes:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"dns_group_id names a DNS server group that does not exist: {gid}",
                     )
                 )
 
@@ -731,6 +767,17 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
         )
 
     tree = PlanNode.model_validate(plan.tree)
+    # A plan anchored on an existing block places everything under it, so the
+    # caller needs write on that block (#3425), as for a direct create.
+    if tree.existing_block_id:
+        try:
+            anchor = await db.get(IPBlock, uuid.UUID(tree.existing_block_id))
+        except ValueError:
+            anchor = None  # _validate_tree reports the bad id below
+        if anchor is not None:
+            from app.api.v1.ipam.router import require_target_block_write  # noqa: PLC0415
+
+            require_target_block_write(current_user, anchor)
     conflicts = await _validate_tree(db, plan.space_id, tree)
     if conflicts:
         raise HTTPException(
