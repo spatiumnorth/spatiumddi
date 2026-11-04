@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="470" viewBox="0 0 920 470"
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="490" viewBox="0 0 920 490"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <defs>
@@ -53,9 +53,9 @@
     <rect x="45" y="262" width="230" height="34" rx="6" fill="url(#t7-cp)"/>
     <text x="160" y="284" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">api · frontend · worker</text>
     <rect x="45" y="302" width="230" height="34" rx="6" fill="url(#t7-store)"/>
-    <text x="160" y="324" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">CNPG primary</text>
+    <text x="160" y="324" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">CNPG primary (initially)</text>
     <rect x="45" y="342" width="230" height="34" rx="6" fill="url(#t7-cache)"/>
-    <text x="160" y="364" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">redis · sentinel (master)</text>
+    <text x="160" y="364" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">redis · sentinel (master initially)</text>
   </g>
 
   <!-- Node 2 -->
@@ -90,11 +90,17 @@
   <line x1="290" y1="215" x2="330" y2="215" stroke="#6d28d9" stroke-width="2" stroke-dasharray="4 3"/>
   <line x1="590" y1="215" x2="630" y2="215" stroke="#6d28d9" stroke-width="2" stroke-dasharray="4 3"/>
 
+  <text x="310" y="210" text-anchor="middle" font-size="10" fill="#6d28d9">etcd</text>
+  <text x="610" y="210" text-anchor="middle" font-size="10" fill="#6d28d9">etcd</text>
+
   <!-- Caption -->
   <text x="460" y="428" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">
     embedded-etcd quorum (3 / 5 / 7) · CNPG primary + streaming replicas · Redis Sentinel
   </text>
   <text x="460" y="448" text-anchor="middle" font-size="11" fill="#64748b" font-style="italic">
     scaled by promoting appliances in /appliance → Fleet — no Patroni / load balancer / kubectl
+  </text>
+  <text x="460" y="468" text-anchor="middle" font-size="11" fill="#64748b" font-style="italic">
+    celery beat runs as a single replica on one node (not shown per node)
   </text>
 </svg>

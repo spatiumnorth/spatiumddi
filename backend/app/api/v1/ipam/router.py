@@ -465,6 +465,34 @@ def _require_type_write(
         )
 
 
+def require_target_block_write(current_user: User, block: IPBlock) -> None:
+    """Placing a child under ``block`` (create a subnet / block in it, or move
+    one into it) needs ``write`` on THAT block, resource-scoped (#3425), in
+    addition to the check on the thing being created or moved. A type-level
+    ``subnet`` / ``ip_block`` grant says nothing about the destination, so
+    without this a subnet-writer could drop a subnet into a block they cannot
+    write, or even read. A grant scoped to the block (or unscoped / wildcard)
+    passes; a grant scoped to the block's SPACE does not, exactly as it does
+    not for ``PUT /blocks/{id}`` — the resolver matches ids, not ancestry."""
+    if not user_has_permission(current_user, "write", "ip_block", block.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=target_block_write_refusal(current_user, block),
+        )
+
+
+def target_block_write_refusal(current_user: User, block: IPBlock) -> str:
+    """The 403 words for :func:`require_target_block_write`. The block's CIDR
+    and name only for a caller who may read it; otherwise just the id the
+    caller sent, so the refusal is no way to learn what a block holds."""
+    if user_has_permission(current_user, "read", "ip_block", block.id):
+        return (
+            f"Permission denied: need 'write' on target block "
+            f"{block.network} ({block.name}, {block.id})"
+        )
+    return f"Permission denied: need 'write' on target block {block.id}"
+
+
 router.include_router(io_router)
 
 # NAT mappings — operator-curated metadata cross-referenced from IPAM
@@ -5409,6 +5437,8 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
     # Verify parent block exists and belongs to the same space
     if body.parent_block_id:
         parent = await db.get(IPBlock, body.parent_block_id)
+        if parent is not None:
+            require_target_block_write(current_user, parent)
         if parent is None or parent.space_id != body.space_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Parent block not found in this space"
@@ -5615,6 +5645,8 @@ async def update_block(
             if new_parent_id == block.id:
                 raise HTTPException(status_code=422, detail="A block cannot be its own parent")
             new_parent = await db.get(IPBlock, new_parent_id)
+            if new_parent is not None and new_parent_id != block.parent_block_id:
+                require_target_block_write(current_user, new_parent)
             if new_parent is None or new_parent.space_id != block.space_id:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -6423,6 +6455,8 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     block = await db.get(IPBlock, body.block_id)
+    if block is not None:
+        require_target_block_write(current_user, block)
     if block is None or block.space_id != body.space_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Block not found in this space"
@@ -6699,6 +6733,9 @@ async def allocate_subnet(
     block = locked.scalar_one_or_none()
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+    # Before the answers below, which name the block's CIDR and what is free
+    # in it (#3425); create_subnet re-checks.
+    require_target_block_write(current_user, block)
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
     family_max = 32 if block_net.version == 4 else 128
@@ -7585,6 +7622,8 @@ async def update_subnet(
     # space and the subnet CIDR must fit inside the target block's CIDR.
     if body.block_id is not None and body.block_id != subnet.block_id:
         target = await db.get(IPBlock, body.block_id)
+        if target is not None:
+            require_target_block_write(current_user, target)
         if target is None or target.space_id != subnet.space_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -8303,6 +8342,19 @@ class BlockMoveCommitResponse(BaseModel):
     reparented_block_ids: list[str]
 
 
+async def _require_move_target_write(
+    current_user: User, db: AsyncSession, block: IPBlock, target_parent_id: uuid.UUID | None
+) -> None:
+    """A block move into a parent needs ``write`` on that parent (#3425); a move
+    to a space's top level has no parent block to check. A parent that does not
+    exist falls through to the service's own 404."""
+    if target_parent_id is None:
+        return
+    parent = await db.get(IPBlock, target_parent_id)
+    if parent is not None:
+        require_target_block_write(current_user, parent)
+
+
 @router.post(
     "/blocks/{block_id}/move/preview",
     response_model=BlockMovePreviewResponse,
@@ -8320,6 +8372,7 @@ async def move_block_preview(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    await _require_move_target_write(current_user, db, block, body.target_parent_id)
     try:
         plan = await preview_move(db, block, body.target_space_id, body.target_parent_id)
     except BlockMoveError as exc:
@@ -8361,6 +8414,7 @@ async def move_block_commit(
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
+    await _require_move_target_write(current_user, db, block, body.target_parent_id)
     old_space_id = str(block.space_id)
     old_parent_id = str(block.parent_block_id) if block.parent_block_id else None
 

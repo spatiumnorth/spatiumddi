@@ -157,6 +157,7 @@ export function FindFreeModal({
   defaultBlockId,
   defaultBlockLabel,
   defaultBlockCidr,
+  canCreate = true,
 }: {
   space: IPSpace;
   onClose: () => void;
@@ -168,6 +169,9 @@ export function FindFreeModal({
   defaultBlockLabel?: string;
   /** The scoped block's CIDR; sets the family and a prefix it can hold (#3324). */
   defaultBlockCidr?: string;
+  /** False for a caller who may not create a subnet (#3391): the search is a
+   *  read and stays, "Create subnet here" is disabled with the reason. */
+  canCreate?: boolean;
 }) {
   // Opened from a block the search covers that block only, not the space (#2419).
   const scope = defaultBlockId
@@ -324,7 +328,13 @@ export function FindFreeModal({
                               onPickCidr(c.cidr, c.parent_block_id);
                               onClose();
                             }}
-                            className="rounded border px-2 py-0.5 text-xs hover:bg-accent"
+                            className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                            {...(canCreate
+                              ? {}
+                              : {
+                                  disabled: true,
+                                  title: "Requires write permission on subnets",
+                                })}
                           >
                             Create subnet here
                           </button>

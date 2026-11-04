@@ -631,12 +631,17 @@ exercised as production would.
   **named correctness FAIL** (§8.2.4).
 - **REBINDING at T2=1800s** (only if T1 unanswered) — broadcast REQUEST; modeled
   so a Kea/agent stall produces realistic rebind traffic instead of silent loss.
-- **DEPARTING → LEFT** — ~5% explicit DHCPRELEASE (drives immediate expiry →
+  A rebind that also goes unanswered lapses the lease and the device goes
+  straight to LEFT; if Kea's rebind ACK still arrives afterwards, the device
+  comes back ONLINE with the extended lease. A NAK at any point drops the
+  lease and sends a fresh DISCOVER.
+- **Departure → LEFT** (from ONLINE, RENEWING or REBINDING; there is no
+  intermediate departing state) — ~5% explicit DHCPRELEASE (drives immediate expiry →
   `dhcp_lease_history` INSERT + IPAM DELETE + DDNS-revoke), 95% silent (reaped by
   `sweep_expired_leases` every 300s — the full-Subnet-scan-per-lease hot path,
   §5 H8).
 - **Re-arrival** — a device that LEFT can re-arrive later (commuter returns) as a
-  **fresh DORA**; same stable client-id makes it an update, not new-lease churn.
+  **fresh DORA**, going straight back to DISCOVERING; same stable client-id makes it an update, not new-lease churn.
 
 **Identity generation.** MACs from a locally-administered OUI (`02:00:00:xx:xx:xx`,
 24-bit index → 16M+ unique, partitioned across shards so they never collide).

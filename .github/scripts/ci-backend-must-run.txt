@@ -72,6 +72,12 @@ scripts/merge_test_durations.py
 # future widening of the deny-list must not silently drop this one.
 scripts/lint_versions.py
 
+# test_lint_docs_drift.py (#3414) loads the weekly docs drift check and pins
+# one failure per check kind plus the refusals (empty inventory, dead
+# allowlist entry, missing manifest) over a synthetic tree. It never reads the
+# real diagrams, which are known to carry drift while #3413 fixes them.
+scripts/lint_docs_drift.py
+
 # test_lint_workflow_shell.py (#1036) loads the workflow shell-status guard
 # and pins it against the real pre-fix trivy-scheduled.yml body, plus the
 # false-positive case that made the first draft unusable (a `set -e` inside a

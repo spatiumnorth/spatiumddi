@@ -89,6 +89,10 @@ const child = {
 
 describe("Create subnet here from a block's Find Free (#2417)", () => {
   it("sends the block the row names", async () => {
+    // Creating a subnet is the caller's to do (#3391 gates the button on it).
+    answer("authApi", "myPermissions", () =>
+      Promise.resolve({ is_superadmin: true, grants: [] }),
+    );
     answer("ipamApi", "listBlocks", () => Promise.resolve([outer, child]));
     answer("ipamApi", "listTemplates", () => Promise.resolve([]));
     answer("customFieldsApi", "list", () => Promise.resolve([]));

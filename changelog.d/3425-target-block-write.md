@@ -1,0 +1,3 @@
+### Fixed
+
+- IPAM: creating a subnet in a block, allocating one from it, moving a subnet or block into it, or applying a plan anchored on it now requires `write` on that target block, not only on the subnet or block being created or moved. A grant on the block's space does not cover its blocks, as for editing the block itself. A refused request gets a 403 naming the target block. The same applies to the approver of a self-service subnet request: one without `write` on the block is refused and the request stays pending for another approver. The Copilot's subnet-allocation preview says so up front rather than proposing a change that cannot apply (#3425).
