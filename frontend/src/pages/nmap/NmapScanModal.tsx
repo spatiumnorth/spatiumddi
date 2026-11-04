@@ -172,6 +172,11 @@ function PastScans({
                         ? "Cancel scan"
                         : "Delete scan"
                     }
+                    aria-label={
+                      s.status === "queued" || s.status === "running"
+                        ? "Cancel scan"
+                        : "Delete scan"
+                    }
                     disabled={deleteMut.isPending}
                     onClick={() => setPendingDelete(s)}
                     className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"

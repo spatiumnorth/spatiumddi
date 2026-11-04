@@ -158,6 +158,23 @@ on inactive.
    satisfy an unscoped check (one passed without `resource_id`). This prevents
    "I have write on *this one* subnet" from accidentally granting "write on
    subnets in general".
+   **Placing a child under a block (#3425).** Creating a subnet in a block,
+   allocating one from it, moving a subnet or block into it, and applying a
+   plan anchored on it need `write` on that **target block** as well as the
+   check on the thing being created or moved. A grant scoped to the block (or
+   an unscoped one) passes. A grant scoped to the block's **space does not
+   cover the blocks in it**, exactly as it does not for `PUT /ipam/blocks/{id}`:
+   grants match ids, not ancestry. A refusal is a 403 naming the target block
+   (its CIDR and name only when the caller may read it, otherwise its id). A
+   self-service subnet request needs this of the **approver**, not the
+   requester: an approver without `write` on the block gets a 403 and the
+   request stays pending for one who has it.
+   **Growing into a block (#3439).** A resize is grow-only, so resizing a subnet
+   needs `write` on its parent block (a block resize applies the same check
+   to its parent block, though a nested block cannot grow into its ancestor
+   today). The preview lists the refusal as a
+   `permission` conflict; the resize itself is a 403. A top-level block has no
+   parent block and is unaffected.
    **IPAM subnets (#2438).** A `read` / `write` grant scoped to one subnet
    reaches that subnet and its addresses and nothing else. The routes it
    opens are an allow-list, so a route added later stays closed to it until
@@ -372,8 +389,8 @@ starts at the server groups). The built-in roles keep what they had
 | `Superadmin`   | `[{"action": "*", "resource_type": "*"}]`                    |
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service`; `read` on `alert` |
-| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `certificate_store`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists; manage the TLS certificate store DoT / DoH / DoQ serve from (#3067), short of making a certificate the Web UI certificate. Infrastructure stays superadmin-only (see below), including the server-group options that turn a DoT / DoH / DoQ listener on |
-| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
+| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `certificate_store`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists; manage the TLS certificate store DoT / DoH / DoQ serve from (#3067), short of making a certificate the Web UI certificate. Infrastructure stays superadmin-only (see below), including the server-group options that turn a DoT / DoH / DoQ listener on. Holds no `read` on `server`, so the DNS query log and its analytics, Top DNS clients, DNS threat analytics and the Windows event log are refused (#3453) |
+| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below). Holds no `read` on `server`, so the DHCP activity log, the Windows DHCP audit log and the Windows event log are refused (#3453) |
 | `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`, `e911_location`; `read` on `alert` |
 | `Auditor`        | `read` on `conformity`, `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |

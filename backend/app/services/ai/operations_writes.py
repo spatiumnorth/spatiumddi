@@ -32,6 +32,7 @@ returns a file stream rather than an apply-shaped mutation. The backup
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from ipaddress import ip_network
 from typing import Any, Literal
 
@@ -40,6 +41,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dhcp._audit import write_audit
+from app.core import maintenance_mode
 from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
@@ -1198,6 +1200,13 @@ class SetZoneUpdateAclArgs(BaseModel):
         default_factory=list,
         description="Full ordered ACL to set (replaces the existing one). Empty clears it.",
     )
+    expected_version: str | None = Field(
+        default=None,
+        description=(
+            "Leave unset. The proposal pins the ACL version current when it is "
+            "proposed, and Apply refuses if the ACL has changed since."
+        ),
+    )
 
 
 def _build_acl_replace(args: SetZoneUpdateAclArgs) -> Any:
@@ -1217,7 +1226,11 @@ def _build_acl_replace(args: SetZoneUpdateAclArgs) -> Any:
         entries = [UpdateAclEntryIn(**e.model_dump()) for e in args.entries]
     except ValidationError as exc:
         raise ValueError(f"invalid ACL entry: {exc}") from exc
-    return ZoneUpdateAclReplace(dynamic_update_enabled=args.dynamic_update_enabled, entries=entries)
+    return ZoneUpdateAclReplace(
+        dynamic_update_enabled=args.dynamic_update_enabled,
+        entries=entries,
+        expected_version=args.expected_version,
+    )
 
 
 async def _preview_set_zone_update_acl(
@@ -1259,6 +1272,21 @@ async def _preview_set_zone_update_acl(
         except ValueError as exc:
             return PreviewResult(ok=False, detail=f"{name}: {exc}")
 
+    # #3381 — pin the ACL this proposal was previewed against. The args are
+    # persisted after the preview, so Apply replaces only that ACL and refuses
+    # (as the REST PUT answers 409) if anyone changed it in between.
+    current = dns_router._acl_version(  # noqa: SLF001
+        zone.dynamic_update_enabled,
+        await dns_router._load_acl_out(db, zone.id),  # noqa: SLF001
+    )
+    if args.expected_version is None:
+        args.expected_version = current
+    elif args.expected_version != current:
+        return PreviewResult(
+            ok=False,
+            detail="The zone's dynamic-update ACL has changed since this was read.",
+        )
+
     flag = ""
     if args.dynamic_update_enabled is not None:
         flag = f", dynamic updates {'ON' if args.dynamic_update_enabled else 'OFF'}"
@@ -1290,11 +1318,22 @@ async def _apply_set_zone_update_acl(
     try:
         zone = await dns_router._require_zone(args.group_id, args.zone_id, db)  # noqa: SLF001
         dns_router._reject_if_synthesised_zone(zone, "edit")  # noqa: SLF001
+        # #3381 — serialised with every other ACL writer, and refused if the
+        # ACL moved since the proposal was previewed (its pinned version).
+        await dns_router._lock_acl_and_check_version(  # noqa: SLF001
+            db, zone, body.expected_version
+        )
         _driver_names, warnings = await dns_router._replace_update_acl_rows(  # noqa: SLF001
             db, args.group_id, zone, body
         )
     except HTTPException as exc:
-        raise ValueError(str(exc.detail)) from exc
+        detail = exc.detail
+        if isinstance(detail, dict) and detail.get("code") == "ACL_VERSION_CONFLICT":
+            raise ValueError(
+                "The zone's dynamic-update ACL has changed since this was proposed. "
+                "Propose it again against the current ACL."
+            ) from exc
+        raise ValueError(str(detail)) from exc
     write_audit(
         db,
         user=user,
@@ -1713,6 +1752,120 @@ register(
         preview=_preview_update_syslog_settings,
         apply=_apply_update_syslog_settings,
         category="admin",
+        requires_superadmin=True,
+    )
+)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Maintenance mode (#57): superadmin only
+# ══════════════════════════════════════════════════════════════════════
+#
+# The Copilot's one way to flip the platform-wide read-only switch (#3415):
+# ``propose_set_maintenance_mode`` stages this, and the operator's Apply
+# runs it. The apply does what ``PUT /settings`` does for the two
+# maintenance fields (``app/api/v1/settings/router.py``): superadmin only,
+# the window's start stamped or cleared by the server, an audit row for a
+# flip or a reworded banner, and the middleware's cached state dropped once
+# the change is committed.
+
+
+class SetMaintenanceModeArgs(BaseModel):
+    enabled: bool = Field(
+        description="Desired state: true puts the whole platform read-only, false lifts it."
+    )
+    message: str | None = Field(
+        default=None,
+        description=(
+            "Optional banner / 503-body message shown to operators while the "
+            "window is active. Omit to leave the existing message unchanged. "
+            "Max 500 characters."
+        ),
+    )
+
+    @field_validator("message")
+    @classmethod
+    def _message_fits(cls, v: str | None) -> str | None:
+        # The column is VARCHAR(500); PUT /settings refuses a longer banner too.
+        if v is not None and len(v) > 500:
+            raise ValueError("message must be 500 characters or fewer")
+        return v
+
+
+async def _preview_set_maintenance_mode(
+    db: AsyncSession, user: User, args: SetMaintenanceModeArgs
+) -> PreviewResult:
+    if (block := _superadmin_preview_block(user)) is not None:
+        return block
+    enabled, _, _ = await maintenance_mode.get_maintenance_state(db)
+    if args.enabled:
+        text = (
+            "Turn maintenance mode ON: the whole platform goes read-only, and every "
+            "mutating request answers 503 except a superadmin's and the exempt "
+            "sign-in, settings, health and agent paths."
+        )
+    else:
+        text = "Turn maintenance mode OFF: the platform becomes fully writable again."
+    if enabled == args.enabled:
+        text += f" It is already {'on' if enabled else 'off'}."
+    if args.message is not None:
+        text += f" Banner message: {_clip(args.message)!r}."
+    return PreviewResult(ok=True, detail="ready", preview_text=text)
+
+
+async def _apply_set_maintenance_mode(
+    db: AsyncSession, user: User, args: SetMaintenanceModeArgs
+) -> dict[str, Any]:
+    _require_superadmin(user)
+    from app.api.v1.settings.router import _get_or_create  # noqa: PLC0415
+    from app.core.demo_mode import forbid_in_demo_mode  # noqa: PLC0415
+
+    forbid_in_demo_mode("Platform settings updates are disabled")
+    settings = await _get_or_create(db)
+    prev_enabled = bool(settings.maintenance_mode_enabled)
+    prev_message = settings.maintenance_message or ""
+    settings.maintenance_mode_enabled = args.enabled
+    if args.message is not None:
+        settings.maintenance_message = args.message
+    message = settings.maintenance_message or ""
+    flipped = args.enabled != prev_enabled
+    action: str | None = None
+    if flipped:
+        settings.maintenance_started_at = datetime.now(UTC) if args.enabled else None
+        action = "maintenance_mode.enabled" if args.enabled else "maintenance_mode.disabled"
+    elif message != prev_message:
+        # A reworded banner is an operator-visible change too (non-negotiable #4).
+        action = "maintenance_mode.message_changed"
+    if action is not None:
+        write_audit(
+            db,
+            user=user,
+            action=action,
+            resource_type="platform_settings",
+            resource_id="maintenance",
+            resource_display="Maintenance mode",
+            new_value={"enabled": args.enabled, "message": message, "via": "ai_proposal"},
+        )
+    started_at = settings.maintenance_started_at
+    out = {
+        "enabled": args.enabled,
+        "message": message,
+        "started_at": started_at.isoformat() if started_at else None,
+        "changed": flipped,
+    }
+    await db.commit()
+    maintenance_mode.invalidate_cache()
+    return out
+
+
+register(
+    Operation(
+        name="set_maintenance_mode",
+        description="Turn system-wide maintenance mode on or off (superadmin).",
+        args_model=SetMaintenanceModeArgs,
+        preview=_preview_set_maintenance_mode,
+        apply=_apply_set_maintenance_mode,
+        category="ops",
         requires_superadmin=True,
     )
 )

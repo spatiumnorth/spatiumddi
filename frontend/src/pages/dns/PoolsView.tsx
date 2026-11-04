@@ -25,6 +25,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import {
@@ -72,11 +73,16 @@ export function PoolsView({
   const [editPool, setEditPool] = useState<DNSPool | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSPool | null>(null);
 
-  const { data: pools = [], isFetching } = useQuery({
+  const {
+    data: poolsData,
+    isFetching,
+    error: poolsError,
+  } = useQuery({
     queryKey: ["dns-pools", group.id, zone.id],
     queryFn: () => dnsApi.listPools(group.id, zone.id),
     refetchInterval: 30_000,
   });
+  const pools = poolsData ?? [];
 
   const checkNow = useMutation({
     mutationFn: (poolId: string) => dnsApi.checkPoolNow(poolId),
@@ -128,7 +134,14 @@ export function PoolsView({
         {isFetching && pools.length === 0 && (
           <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
         )}
-        {pools.length === 0 && !isFetching && (
+        {/* A refused read (pools take `manage_dns_pools`, a grant apart from
+            `dns_zone`) or a failed one says so, not "No pools yet" (#3426). */}
+        {pools.length === 0 && !isFetching && poolsError != null && (
+          <p className="px-5 py-4 text-sm">
+            <ListReadError error={poolsError} what="this zone's pools" />
+          </p>
+        )}
+        {pools.length === 0 && !isFetching && poolsError == null && (
           <div className="flex h-40 flex-col items-center justify-center">
             <p className="text-sm italic text-muted-foreground">
               {technitiumApi ? (
@@ -247,6 +260,7 @@ function PoolCard({
             onClick={onCheckNow}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Check now"
+            aria-label="Check now"
             {...poolGate}
           >
             <RefreshCw className="h-3.5 w-3.5" />
@@ -255,6 +269,7 @@ function PoolCard({
             onClick={onEdit}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Edit"
+            aria-label="Edit"
             {...poolGate}
           >
             <Pencil className="h-3.5 w-3.5" />
@@ -263,6 +278,7 @@ function PoolCard({
             onClick={onDelete}
             className="rounded p-1 text-muted-foreground hover:text-destructive"
             title="Delete"
+            aria-label="Delete"
             {...poolGate}
           >
             <Trash2 className="h-3.5 w-3.5" />

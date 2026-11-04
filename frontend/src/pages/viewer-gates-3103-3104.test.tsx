@@ -107,11 +107,25 @@ function expectDenied(el: HTMLElement, reason: string) {
 function expectOffered(el: HTMLElement) {
   expect((el as HTMLButtonElement).disabled).toBe(false);
 }
-const byName = (n: string | RegExp) => screen.getByRole("button", { name: n });
+/** A refused icon-only button is named by its action (aria-label, #3395) and
+ *  carries the refusal reason as its tooltip: find it by either. */
+function gated(name: string | RegExp): HTMLElement {
+  const byRole = screen.queryAllByRole("button", { name });
+  if (byRole.length === 1) return byRole[0];
+  // Only the icon buttons carry an aria-label; a text button's title is
+  // the same reason and must not make the lookup ambiguous.
+  const byTitle = screen
+    .queryAllByTitle(name)
+    .filter((el) => el.hasAttribute("aria-label"));
+  if (byTitle.length !== 1) return screen.getByTitle(name);
+  return byTitle[0];
+}
 
-/** A gated icon button is named by its tooltip, so while it is denied the
- *  reason is its name. Every button carrying that reason is disabled; an
- *  enabled icon button is found by its own title instead. */
+const byName = (n: string | RegExp) => gated(n);
+
+/** A gated icon button carries the reason as its tooltip while it is
+ *  denied (its name stays the action, #3395). Every button carrying that
+ *  reason is disabled; an enabled icon button is found by its own title. */
 function expectIconsDenied(reason: string, count: number) {
   const found = screen.getAllByTitle(reason) as HTMLButtonElement[];
   expect(found.length).toBe(count);

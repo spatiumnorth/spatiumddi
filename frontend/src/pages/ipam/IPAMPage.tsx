@@ -50,6 +50,7 @@ import {
   useDraggable,
   useDroppable,
   type DragEndEvent,
+  type DraggableAttributes,
 } from "@dnd-kit/core";
 import {
   ipamApi,
@@ -995,6 +996,7 @@ function ZoneOptions({
 
 export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const canReadVrfs = usePermissions().can("read", "vrf");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [color, setColor] = useState<string | null>(null);
@@ -1129,16 +1131,19 @@ export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
           </p>
           <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Manage VRFs (RD + import / export RTs) under{" "}
-              <a
-                href="/network/vrfs"
-                className="underline hover:text-foreground"
-              >
-                Network → VRFs
-              </a>
-              .
-            </p>
+            {/* The VRFs page reads the same list the picker may not (#3451). */}
+            {canReadVrfs && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Manage VRFs (RD + import / export RTs) under{" "}
+                <a
+                  href="/network/vrfs"
+                  className="underline hover:text-foreground"
+                >
+                  Network → VRFs
+                </a>
+                .
+              </p>
+            )}
           </Field>
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
@@ -4556,6 +4561,11 @@ const NEEDS_ADDRESS_DELETE =
   "Requires delete permission on subnets, and write on this subnet or on an address set in it";
 const NEEDS_DNS_SYNC =
   "Requires read permission on subnets and IP addresses, and write permission on subnets";
+// A block's and a space's Sync DNS ask the same of their own type (#3334).
+const NEEDS_BLOCK_DNS_SYNC =
+  "Requires read permission on IP blocks and IP addresses, and write permission on IP blocks";
+const NEEDS_SPACE_DNS_SYNC =
+  "Requires read permission on IP spaces and IP addresses, and write permission on IP spaces";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
@@ -7041,8 +7051,15 @@ export function SubnetDetail({
                                           onClick={() =>
                                             setConfirmPurgeAddr(addr)
                                           }
-                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                                           title="Permanently delete"
+                                          aria-label={`Permanently delete ${addr.address}`}
+                                          // #3392 — the purge is a DELETE: as
+                                          // the right-click Delete Forever….
+                                          {...permissionGate(
+                                            canDeleteIpam,
+                                            NEEDS_ADDRESS_DELETE,
+                                          )}
                                         >
                                           <Trash2 className="h-3.5 w-3.5" />
                                         </button>
@@ -7131,12 +7148,20 @@ export function SubnetDetail({
                                 <ContextMenuSeparator />
                                 <ContextMenuItem
                                   onSelect={() => restoreAddr.mutate(addr.id)}
+                                  {...permissionGate(
+                                    permitsWrite,
+                                    NEEDS_ADDRESS_WRITE,
+                                  )}
                                 >
                                   Restore
                                 </ContextMenuItem>
                                 <ContextMenuItem
                                   destructive
                                   onSelect={() => setConfirmPurgeAddr(addr)}
+                                  {...permissionGate(
+                                    permitsWrite && canDeleteIpam,
+                                    NEEDS_ADDRESS_DELETE,
+                                  )}
                                 >
                                   Delete Forever…
                                 </ContextMenuItem>
@@ -7517,7 +7542,9 @@ export function DnsSyncModal({
         const r = await backfillFn(scope.id);
         setBackfillResult(r);
       } catch (e) {
-        setBackfillError((e as Error).message || "Backfill failed");
+        // #3334: the server's reason, not axios's "Request failed with
+        // status code N"; the error's own message only when there is none.
+        setBackfillError(formatApiError(e, "Backfill failed"));
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
@@ -11709,6 +11736,24 @@ export function BulkDeleteAddressesModal({
  *  text is the chip's own `title`. */
 export const TREE_CHIP_CLS = "block min-w-0 max-w-[6rem] shrink truncate";
 
+/** dnd-kit's attributes for a tree row, minus what announces it as draggable
+ *  when the operator may not move it (#3392). With `disabled` dnd-kit still
+ *  sets `aria-disabled="true"`, which on a row that selects when clicked tells
+ *  a screen reader (and Playwright's enabled check) that the row itself is
+ *  unavailable; a read-only user's whole tree would read as disabled. */
+function treeDragAttributes(
+  attrs: DraggableAttributes,
+  draggable: boolean,
+): React.HTMLAttributes<HTMLElement> {
+  if (draggable) return attrs;
+  return {
+    ...attrs,
+    "aria-disabled": undefined,
+    "aria-roledescription": undefined,
+    "aria-describedby": undefined,
+  };
+}
+
 export function SubnetRow({
   subnet,
   isSelected,
@@ -11725,9 +11770,15 @@ export function SubnetRow({
   onAllocateIp?: (s: Subnet) => void;
 }) {
   const [showEdit, setShowEdit] = useState(false);
+  // #3392 — the right-click Edit / Delete and the drag-to-move ask what the
+  // header's Edit and Delete ask; a read-only user is offered none of them.
+  const perms = usePermissions();
+  const canEditSubnet = perms.can("write", "subnet", subnet.id);
+  const canDeleteSubnet = perms.can("delete", "subnet");
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `subnet:${subnet.id}`,
     data: { kind: "subnet", subnet },
+    disabled: !canEditSubnet,
   });
 
   return (
@@ -11735,7 +11786,7 @@ export function SubnetRow({
       <ContextMenuTrigger asChild>
         <div
           ref={setNodeRef}
-          {...attributes}
+          {...treeDragAttributes(attributes, canEditSubnet)}
           {...listeners}
           onClick={onSelect}
           role="treeitem"
@@ -11792,10 +11843,17 @@ export function SubnetRow({
             Allocate IP
           </ContextMenuItem>
         )}
-        <ContextMenuItem onSelect={() => setShowEdit(true)}>
+        <ContextMenuItem
+          onSelect={() => setShowEdit(true)}
+          {...permissionGate(canEditSubnet, NEEDS_SUBNET_WRITE)}
+        >
           Edit…
         </ContextMenuItem>
-        <ContextMenuItem destructive onSelect={() => onDelete()}>
+        <ContextMenuItem
+          destructive
+          onSelect={() => onDelete()}
+          {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+        >
           Delete…
         </ContextMenuItem>
       </ContextMenuContent>
@@ -12351,7 +12409,9 @@ function EditSpaceModalForm({
 }: EditSpaceModalProps) {
   // The dialog opens for a holder of write on this one space, but the server
   // asks delete over every IP space (no id), so a grant on one space is not enough.
-  const canDeleteSpace = usePermissions().can("delete", "ip_space");
+  const { can } = usePermissions();
+  const canDeleteSpace = can("delete", "ip_space");
+  const canReadVrfs = can("read", "vrf");
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -12661,16 +12721,19 @@ function EditSpaceModalForm({
           </p>
           <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Manage VRFs (RD + import / export RTs) under{" "}
-              <a
-                href="/network/vrfs"
-                className="underline hover:text-foreground"
-              >
-                Network → VRFs
-              </a>
-              .
-            </p>
+            {/* The VRFs page reads the same list the picker may not (#3451). */}
+            {canReadVrfs && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Manage VRFs (RD + import / export RTs) under{" "}
+                <a
+                  href="/network/vrfs"
+                  className="underline hover:text-foreground"
+                >
+                  Network → VRFs
+                </a>
+                .
+              </p>
+            )}
             {space.vrf_name && !vrfId && (
               <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
                 Legacy freeform VRF: <code>{space.vrf_name}</code>
@@ -13718,6 +13781,13 @@ export function BlockTreeRow({
     forceExpand || (expanded ?? (holdsSelection || depth < defaultDepth));
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
+  // #3392 — the right-click New / Edit / Delete and the drag-to-move ask what
+  // the header's twins ask.
+  const perms = usePermissions();
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canEditBlock = perms.can("write", "ip_block", node.block.id);
+  const canDeleteBlock = perms.can("delete", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const {
     attributes: dragAttrs,
     listeners: dragListeners,
@@ -13726,6 +13796,7 @@ export function BlockTreeRow({
   } = useDraggable({
     id: `block:${node.block.id}`,
     data: { kind: "block", block: node.block },
+    disabled: !canEditBlock,
   });
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: `block-drop:${node.block.id}`,
@@ -13749,7 +13820,7 @@ export function BlockTreeRow({
         <ContextMenuTrigger asChild>
           <div
             ref={setRefs}
-            {...dragAttrs}
+            {...treeDragAttributes(dragAttrs, canEditBlock)}
             {...dragListeners}
             className={cn(
               "group flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-muted/30 cursor-pointer",
@@ -13816,15 +13887,24 @@ export function BlockTreeRow({
         <ContextMenuContent>
           <ContextMenuLabel>{node.block.network}</ContextMenuLabel>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => onCreateChildBlock(node.block.id)}>
+          <ContextMenuItem
+            onSelect={() => onCreateChildBlock(node.block.id)}
+            {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+          >
             New child block…
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => onCreateSubnet(node.block.id)}>
+          <ContextMenuItem
+            onSelect={() => onCreateSubnet(node.block.id)}
+            {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+          >
             New subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
           {onEditBlock && (
-            <ContextMenuItem onSelect={() => onEditBlock(node.block)}>
+            <ContextMenuItem
+              onSelect={() => onEditBlock(node.block)}
+              {...permissionGate(canEditBlock, NEEDS_BLOCK_WRITE)}
+            >
               Edit…
             </ContextMenuItem>
           )}
@@ -13832,6 +13912,7 @@ export function BlockTreeRow({
             <ContextMenuItem
               destructive
               onSelect={() => onDeleteBlock(node.block)}
+              {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
             >
               Delete…
             </ContextMenuItem>
@@ -13985,6 +14066,14 @@ export function BlockDetailView({
   const canWriteBlocks = perms.can("write", "ip_block");
   const canEditBlock = perms.can("write", "ip_block", block.id);
   const canWriteSubnets = perms.can("write", "subnet");
+  // #3334: Sync DNS, gated as #2571 gates the subnet's. The drift preview
+  // reads the block and its addresses, and Apply's reverse-zone backfill and
+  // commit are write on IP blocks, all at the type level (a grant scoped to
+  // this one block reaches none of them).
+  const canDnsSync =
+    perms.can("read", "ip_block") &&
+    perms.can("read", "ip_address") &&
+    canWriteBlocks;
 
   const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
     string | null
@@ -14122,6 +14211,11 @@ export function BlockDetailView({
   const selectedBlockKeys = [...selected].filter((k) => k.startsWith("block:"));
   const hasBlocksSelected = selectedBlockKeys.length > 0;
   const selectedCount = selected.size;
+  // #3384: the selection's Bulk Edit, Split… and Merge…, gated as the subnet
+  // view gates its own Split… and Merge… (#1155). Each asks write on subnets
+  // at the type level: the bulk edit and the split and merge commits at the
+  // router gate, and every handler, the previews included, itself.
+  const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
   const toggleOne = (key: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -14170,17 +14264,24 @@ export function BlockDetailView({
                   <HeaderButton
                     icon={Pencil}
                     onClick={() => setShowBulkEdit(true)}
+                    {...subnetWriteGate}
                   >
                     Bulk Edit ({selectedSubnetIds.length})
                   </HeaderButton>
                 )}
                 {!hasBlocksSelected && selectedSubnetIds.length === 1 && (
-                  <HeaderButton onClick={() => setShowSplitSubnet(true)}>
+                  <HeaderButton
+                    onClick={() => setShowSplitSubnet(true)}
+                    {...subnetWriteGate}
+                  >
                     Split…
                   </HeaderButton>
                 )}
                 {!hasBlocksSelected && selectedSubnetIds.length >= 2 && (
-                  <HeaderButton onClick={() => setShowMergeSubnet(true)}>
+                  <HeaderButton
+                    onClick={() => setShowMergeSubnet(true)}
+                    {...subnetWriteGate}
+                  >
                     Merge…
                   </HeaderButton>
                 )}
@@ -14206,6 +14307,7 @@ export function BlockDetailView({
                     icon={Globe2}
                     onClick={() => setShowDnsSync(true)}
                     title="Reconcile IPAM-managed DNS records across every subnet under this block"
+                    {...permissionGate(canDnsSync, NEEDS_BLOCK_DNS_SYNC)}
                   >
                     Sync DNS
                   </HeaderButton>
@@ -14366,6 +14468,9 @@ export function BlockDetailView({
               block={block}
               directSubnets={directSubnets}
               childBlocks={directChildBlocks}
+              createDisabledReason={
+                canWriteSubnets ? undefined : NEEDS_SUBNET_WRITE
+              }
               onSelectFree={(range) => {
                 setFreeRangePreset(range);
                 setShowCreateSubnet(true);
@@ -14502,6 +14607,7 @@ export function BlockDetailView({
           defaultBlockId={block.id}
           defaultBlockLabel={block.network}
           defaultBlockCidr={block.network}
+          canCreate={canWriteSubnets}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, parentBlockId) => {
             setFindFreeBlockId(parentBlockId);
@@ -15398,6 +15504,12 @@ export function SpaceTableView({
   const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
+  // #3334: Sync DNS, as on a block: read on IP spaces and IP addresses for
+  // the preview, write on IP spaces for Apply, all at the type level.
+  const canDnsSync =
+    perms.can("read", "ip_space") &&
+    perms.can("read", "ip_address") &&
+    canWriteSpaces;
   const {
     data: blocks,
     isLoading: blocksLoading,
@@ -15586,6 +15698,9 @@ export function SpaceTableView({
   const selectedSubnetIds = [...selected]
     .filter((k) => k.startsWith("subnet:"))
     .map((k) => k.slice("subnet:".length));
+  // #3384: Bulk Edit, Split… and Merge… ask write on subnets at the type
+  // level, as on a block's selection.
+  const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -15672,6 +15787,7 @@ export function SpaceTableView({
                     icon={Pencil}
                     onClick={() => setBulkOpen(true)}
                     title="Bulk-edit applies to subnets only"
+                    {...subnetWriteGate}
                   >
                     Bulk Edit ({selectedCount})
                   </HeaderButton>
@@ -15680,6 +15796,7 @@ export function SpaceTableView({
                   <HeaderButton
                     onClick={() => setShowSplitSubnet(true)}
                     title="Split this subnet into 2^k aligned children"
+                    {...subnetWriteGate}
                   >
                     Split…
                   </HeaderButton>
@@ -15688,6 +15805,7 @@ export function SpaceTableView({
                   <HeaderButton
                     onClick={() => setShowMergeSubnet(true)}
                     title="Merge contiguous sibling subnets"
+                    {...subnetWriteGate}
                   >
                     Merge…
                   </HeaderButton>
@@ -15709,6 +15827,7 @@ export function SpaceTableView({
                 icon={Globe2}
                 onClick={() => setShowDnsSync(true)}
                 title="Reconcile IPAM-managed DNS records across every subnet in this space"
+                {...permissionGate(canDnsSync, NEEDS_SPACE_DNS_SYNC)}
               >
                 Sync DNS
               </HeaderButton>
@@ -16204,6 +16323,7 @@ export function SpaceTableView({
       {showFindFree && (
         <FindFreeModal
           space={space}
+          canCreate={canWriteSubnets}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, blockId) => {
             setFindFreePrefill({ network: cidr, blockId });
@@ -16330,7 +16450,9 @@ function BulkEditSubnetsModal({
       qc.invalidateQueries({ queryKey: ["blocks"] });
       onDone();
     },
-    onError: (e: Error) => setError(e.message),
+    // #3384: the server's reason, not axios's "Request failed with status
+    // code N". The checks above throw plain errors, said word for word.
+    onError: (e: Error) => setError(formatApiError(e, "Bulk edit failed")),
   });
 
   return (
@@ -16466,6 +16588,12 @@ export function SpaceSection({
   const [blockToDelete, setBlockToDelete] = useState<IPBlock | null>(null);
   const [dndError, setDndError] = useState<string | null>(null);
   const qc = useQueryClient();
+  // #3392 — the right-click New / Edit items ask what the header's twins ask.
+  // Edit Space names the space: a grant scoped to it may edit it (#3039).
+  const perms = usePermissions();
+  const canEditSpace = perms.can("write", "ip_space", space.id);
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
@@ -16656,6 +16784,13 @@ export function SpaceSection({
       | undefined;
     if (!srcData || !dstData) return;
     const targetBlock = dstData.block;
+    // #3392 — a drag is a write; the rows are not draggable without the grant,
+    // and a drop that gets here without it is refused here, not by the server.
+    if (srcData.kind === "subnet" && srcData.subnet) {
+      if (!perms.can("write", "subnet", srcData.subnet.id)) return;
+    } else if (srcData.kind === "block" && srcData.block) {
+      if (!perms.can("write", "ip_block", srcData.block.id)) return;
+    }
 
     if (srcData.kind === "subnet" && srcData.subnet) {
       const sn = srcData.subnet;
@@ -16751,17 +16886,26 @@ export function SpaceSection({
         <ContextMenuContent>
           <ContextMenuLabel>{space.name}</ContextMenuLabel>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => setShowCreateBlock(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowCreateBlock(true)}
+            {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+          >
             New Block…
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => setShowCreateSubnet(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowCreateSubnet(true)}
+            {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+          >
             New Subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
           <ContextMenuItem onSelect={() => setExpanded((v) => !v)}>
             {expanded ? "Collapse" : "Expand"}
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => setShowEditSpace(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowEditSpace(true)}
+            {...permissionGate(canEditSpace, NEEDS_SPACE_WRITE)}
+          >
             Edit Space…
           </ContextMenuItem>
         </ContextMenuContent>
@@ -17064,6 +17208,13 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
   const [showBulkDelete, setShowBulkDelete] = useState(false);
   const perms = usePermissions();
   const canDeleteIpam = canDeleteInIpam(perms.can);
+  // ``POST /addresses/bulk-edit`` lets through write on subnets at the type
+  // level or, for an address-set delegate (#103), a write grant on any
+  // address set; its handler then skips each address the caller cannot
+  // write. Anyone else is refused at the gate (#3423).
+  const canBulkEdit =
+    perms.can("write", "subnet") ||
+    perms.hasAnyGrantFor("write", "address_set");
 
   const params = {
     q: applied.q || undefined,
@@ -17363,6 +17514,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
               disabled={selected.size === 0}
               onClick={() => setShowBulkEdit(true)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              {...permissionGate(canBulkEdit, NEEDS_ADDRESS_WRITE)}
             >
               <Pencil className="h-3.5 w-3.5" />
               Bulk edit{" "}

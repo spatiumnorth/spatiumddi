@@ -182,6 +182,15 @@ export function IPDetailModal({
     nmapPerms.can("write", "manage_nmap_scans") &&
     nmapPerms.can("read", "manage_nmap_scans");
 
+  // Wake sends a packet from the control plane: the route needs read on
+  // 'use_network_tools' and write on subnets (#3452). The IPAM gate checks
+  // that write type-wide: a grant scoped to this one subnet does not reach
+  // the route (it names the address, not the subnet), so ``can`` is asked
+  // without an id, exactly as the server asks it.
+  const canWake =
+    nmapPerms.can("read", "use_network_tools") &&
+    nmapPerms.can("write", "subnet");
+
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
   // Fire-and-forget: no data changes, so no query invalidation; we just
   // surface a transient result line under the header.
@@ -334,6 +343,10 @@ export function IPDetailModal({
                   disabled={wake.isPending}
                   className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
                   title="Send a Wake-on-LAN magic packet to this MAC"
+                  {...permissionGate(
+                    canWake,
+                    "Requires read on network tools and write on subnets",
+                  )}
                 >
                   {wake.isPending ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -350,7 +363,7 @@ export function IPDetailModal({
                     type="checkbox"
                     checked={verifyAfterWake}
                     onChange={(e) => setVerifyAfterWake(e.target.checked)}
-                    disabled={wake.isPending}
+                    disabled={wake.isPending || !canWake}
                   />
                   verify
                 </label>

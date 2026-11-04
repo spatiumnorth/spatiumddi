@@ -12,7 +12,7 @@ The driver registry ([`registry.py`](https://github.com/spatiumnorth/spatiumddi/
 | Axis | Values | What it means |
 |---|---|---|
 | `AGENTLESS_DRIVERS` | `windows_dhcp`, `fortigate` | Driver runs from the control plane. No co-located agent, no `ConfigBundle` long-poll. |
-| `READ_ONLY_DRIVERS` | `windows_dhcp` | Driver implements lease reads only. Config push / reload / restart raise `NotImplementedError`. |
+| `READ_ONLY_DRIVERS` | `windows_dhcp` | No bundle push: config push / reload / restart raise `NotImplementedError`. Lease and scope reads plus per-object writes (scope, reservation, exclusion) go over WinRM through the write-through path. |
 | `CLOUD_DHCP_DRIVERS` | `fortigate` | Agentless **and** write-capable: pushes whole-scope config to a provider REST API. `is_cloud()` gates the write-through + port defaults. |
 
 All other drivers (currently just `kea`) are agented: the control plane renders a `ConfigBundle`, hash-keyed by SHA-256 ETag, and the co-located `spatium-dhcp-agent` long-polls `/config` to pick up changes.
@@ -21,13 +21,13 @@ All other drivers (currently just `kea`) are agented: the control plane renders 
 
 ## 1. Driver shapes
 
-Today's drivers split into three shapes:
+Today's drivers split into three shapes (Kea agented; Windows agentless with per-object WinRM write-through; FortiGate agentless with whole-scope REST push):
 
 <p align="center">
   <img src="../assets/diagrams/dhcp-driver-shapes.svg" alt="DHCP driver shapes — agented vs agentless, read-only vs write" width="900"/>
 </p>
 
-The abstract base (`DHCPDriver`) has methods for both halves. Read-only agentless drivers (Windows) implement only the read methods + a stub `apply_config` / `reload` / `restart` / `validate_config` that raises; the API layer consults `READ_ONLY_DRIVERS` before offering write endpoints. Cloud agentless drivers (FortiGate) are write-capable but push the **whole scope object** synchronously over a REST API instead of rendering a daemon config bundle — see §5.
+The abstract base (`DHCPDriver`) has methods for both halves. Windows DHCP implements the read methods plus per-object writes (`apply_scope`, `apply_reservation(s)`, `apply_exclusion(s)`, driven by `services/dhcp/windows_writethrough.py`), and stubs the bundle-push methods `apply_config` / `reload` / `restart` / `validate_config` to raise; the API layer consults `READ_ONLY_DRIVERS` before offering bundle-push / config-sync endpoints. Cloud agentless drivers (FortiGate) are write-capable but push the **whole scope object** synchronously over a REST API instead of rendering a daemon config bundle — see §5.
 
 ---
 

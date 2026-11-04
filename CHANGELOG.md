@@ -25,6 +25,601 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 1.0.0-beta.4 — 2026-11-04
+
+**The fourth 1.0.0 beta.** 114 commits since 1.0.0-beta.3, almost all
+of them fixes, most found by the QA proving ground and the beta
+installs. Like the earlier betas it is a GitHub pre-release: no
+install is offered it in-product, and `:latest` stays where it is
+until 1.0.0. Install it from its GitHub release page, by its version.
+**Wrong-answer and data fixes:** a DHCP client on a DDNS subnet can no
+longer publish a name another record holds, such as `www` beside the
+real web server (#3362), and two DDNS subnets sharing a zone no longer
+give two addresses the same generated name (#3364); the zone Drift
+report no longer calls a server `ok` that is behind the zone or
+missing records (#3198); renaming a zone that holds records is refused
+instead of stranding every record and PTR on the old name (#3265); a
+DHCP pool can no longer be left restricted to a PXE or phone class Kea
+never receives (#3388), and editing a PXE boot rule no longer renames
+the class a pool matches (#3374); deleting a DNS server group clears
+its id from the IPAM rows that named it (#3433); edit dialogs across
+DNS, DHCP and IPAM no longer undo a change saved elsewhere since their
+list loaded (#3269, #3365, #3379), and a zone's dynamic-updates ACL
+save refuses a concurrent change (#3381); Mark as Orphan no longer
+permanently deletes an alias already in the Trash (#3189); an
+appliance switched back to an older slot gets that slot's container
+images again (#3169); and a Fleet Boot once runs once and no longer
+sticks (#3283, #3284). **Security and RBAC:** a `read`-scoped API
+token can no longer make SpatiumDDI send traffic to another host
+(#3302); disabling a user revokes their API tokens (#3432); creating,
+moving or growing a subnet needs `write` on the target or parent block
+(#3425, #3439); the request portal runs the same checks as the normal
+creates (#3243); waking a host needs subnet write on every path
+(#3461); and pages across the console stop offering controls the
+server refuses, and say a refused read is refused instead of drawing
+it as empty or all-clear (#3148, #3234, #3337, #3449). **Also:** the
+support and diagnostics bundles no longer stall every other request
+while they build (#3310), a read-only account or `read` token can use
+the POST routes that only read (#3223, #3302), and CI's Trivy scans
+run again after their installer's host went away (#3464).
+
+**Before you upgrade:** this release adds 1 database migration (listed
+under Migrations), a data-only cleanup whose downgrade is a no-op;
+take a database backup first anyway, and do not go back to
+1.0.0-beta.3 afterwards without restoring it. **API tokens:** a token
+whose scope does not cover a request now gets 403 instead of 401
+(#3223). A `read` token is refused the GET routes that reach another
+host (zone drift, the backup archive listing and download, the
+`/bgp/*` and CT-log lookups and others), so a backup pull job now
+needs an unrestricted token (#3302). The `agent` scope is retired and
+refused on create or update (#3302). Disabling a user revokes their
+tokens, and re-enabling an account revokes any token it still held
+while disabled: mint new ones (#3432). **Permissions:** a custom role
+that creates, moves or grows subnets needs `write` on the target or
+parent block (#3425, #3439), and blocking a MAC from New Devices needs
+write on DHCP MAC blocks (#3302). **API:** renaming a zone that holds
+records answers 409 (#3265); a request-portal submit whose arguments
+do not validate answers 422 with field errors, not 400 (#3246);
+`GET /dns/groups/{id}/options` no longer creates the row on first read
+and returns a null `id` until the options are saved (#3302). **DDNS:**
+generated names take the whole address (`dhcp-10-1-20-5`), and records
+already published move to the new name at their next renewal (#3364);
+a client asking for a name another record holds is published under its
+`dhcp-<ip>` name instead, with a `ddns_name_conflict` warning (#3362).
+
+### Changed
+
+- **The docs diagrams and the architecture pages match the code again
+  (#3413).** The README architecture diagram, the seven deployment
+  topologies, the DNS / DHCP / auth / IPAM / perf diagrams and the
+  pages that repeat them now describe what ships: Redis 8 and BIND 9.20;
+  Windows DHCP as full write-through over WinRM rather than read-only;
+  every DNS server in a group as an independent authoritative copy, not
+  a master and a slave; the Kubernetes chart's in-chart Redis, regular
+  migrate Job and fixed worker count; Patroni marked as not supported in
+  1.0; the real five-cell Platform Health strip; OIDC / SAML on their own
+  authorize and callback routes, TOTP via `/auth/login/mfa`, and group
+  sync for external users only; the DHCP agent long-polling its config
+  with a Redis wake; and the perf client's states as the orchestrator
+  actually runs them. The README diagram also gains a background, so its
+  title is readable on GitHub's dark theme.
+
+- **The README is one feature tour with current screenshots near the top
+  (#3410).** The dashboard now sits directly under the beta banner and
+  an eleven-image gallery follows the opening section; the long "Full
+  feature detail" section, the duplicated "Why SpatiumDDI", "About
+  SpatiumNorth" and deployment lists are folded into the single feature
+  tour, a Documentation table and Support the project. The detail that
+  left the README now lives in the docs: a new Operator Copilot
+  reference (`docs/features/COPILOT.md`), the factory-reset detail in
+  System Administration, and network entities, discovery, audit chain,
+  conformity and PXE detail in the feature pages. The Project Status
+  table now shows Phase 5 as in progress, matching `CLAUDE.md`.
+
+- **One set of security response times, and a deprecation rule for
+  `/api/v1` (#3399).** `SECURITY.md` now promises what the website
+  does: an acknowledgement within two business days and an initial
+  assessment within five (it said 48 hours and 7 days). `docs/API.md`
+  now says how `/api/v1` changes from 1.0.0: within 1.x it only grows,
+  anything going away is deprecated at least one minor release ahead,
+  and the removal itself waits for the next major release.
+
+- Every POST route now has to declare whether a read-scoped API token may call it: `@read_only_post`, or the new `@token_write("reason")`. A new POST with neither fails CI, and the older unclassified routes are a checked-in baseline that can only shrink. The hand-kept list of "deliberately write" routes and its name-matching guard are gone; its entries are now annotations on the handlers, with reasons that were checked against each one. No endpoint behaves differently.
+
+### Fixed
+
+- CI's Trivy image scans run again. `aquasecurity/trivy-action` installs Trivy from `get.trivy.dev`, which stopped resolving on 3 Nov 2026, so every scan failed before it started: the nightly image builds, the release gate (no release could publish), and the agent-image PR checks. Trivy v0.70.0, the version the action used, is now installed from its GitHub release archive and checked against the release's checksums file before use, and every scan step skips the action's own installer. `make trivy` and the weekly scheduled scan run the Trivy container image and were not affected.
+
+- Waking a host now needs the same permissions everywhere: the Copilot `wake_host` operation and Wake-on-LAN schedules both require write on subnets, as waking an address through the IPAM API always has. The Copilot preview says when you lack it, and a schedule whose owner lacks it wakes nothing, checked again on every run.
+
+- The built-in DNS Editor and DHCP Editor role descriptions no longer promise to "read every DNS / DHCP surface". They now list what each role reads, and name what needs read on servers, which neither role holds: the DNS query log and its analytics, Top DNS clients, the DNS threat views, the DHCP activity log, the Windows DHCP audit log and the Windows event log. Existing installs pick up the new text on the next start. (#3453)
+
+- The IP detail's Wake button is now disabled, with the reason as its tooltip, for users the Wake-on-LAN route would refuse (it needs read on network tools and write on subnets), instead of failing only after the press. (#3452)
+
+- New and Edit IP Space / IP Block no longer offer a VRF or Origin ASN picker holding only "None" to a user who cannot read VRFs or ASNs: the picker is disabled with the reason, and an existing link shows as "Linked (not visible to your role)" instead of "None", and the space dialogs no longer link the VRFs page to that user. Saving leaves the link untouched ([#3451](https://github.com/spatiumnorth/spatiumddi/issues/3451)).
+
+- The Dashboard Security tab's DNS tunneling card no longer asks for its summary every 60 s when your role cannot read servers (the server logs permission); each ask was refused with a 403 and logged as a denied request. The card now says it needs read on servers instead of being silently missing, and its poll stops after a refusal if the permission is withdrawn while the tab is open. (#3450)
+
+- The Dashboard Network tab no longer shows "0" or an all-clear for panels your role may not read: the API now reports which panels it withheld (`withheld` on `/dashboards/network/summary`), and the tab shows "not visible to your role" for them instead. On the combined orphan-services and overlay card, the half your role may not read is named even when the other half has rows. A refused summary now says so and stops asking every 60 s.
+
+- IPAM: growing a subnet now requires `write` on its parent block, not only on the subnet. The resize preview lists the refusal as a conflict, and the resize itself is refused with a 403 before anything changes (#3439).
+
+- Deleting a DNS server group now removes its id from every IP space, block and subnet that referenced it (Trash included), so Edit Subnet no longer shows "Inheriting from parent: 1 group(s)" and the effective DNS no longer returns a deleted group. A DNS-only factory reset clears the ids it leaves behind, and a migration cleans ids already stranded by earlier deletes (keeping a live group's id in any spelling an older build stored), and creating or editing a space, block or subnet, or validating or applying a subnet plan, now refuses a DNS server group id that does not exist (422, or a plan conflict) instead of storing it; an edit that re-sends an id the row already holds is still accepted. (#3433)
+
+- Disabling a user now also revokes the user's API tokens, as it already ended their sessions. The user's audit row records the count (`api_tokens_revoked`) and each token gets its own audit row, as a token revoke does; a token minted while the disable is being saved is refused rather than left live. Re-enabling the account does not bring the tokens back, and revokes any token an account disabled before this release still held; mint new ones. The Edit user dialog says so before Save.
+
+- The API Tokens list no longer calls a token "Active" while its owner is disabled (it reads "Owner disabled"), and re-enabling such a token is refused with a 409 naming the owner, with the Re-enable button disabled and explaining why.
+
+- Settings page: a user whose role grants `write` on `settings` now gets Save and can edit the settings the API delegates to them, plus the reverse-DNS "Run now" and OUI "Refresh now" actions, instead of "View-only - superadmin required". `GET /settings` now returns that list as `delegate_writable_fields`, which the page reads, so the page and the API cannot disagree about it; every other field stays superadmin-only (#3429).
+
+- The Alerts page header no longer says rules cover only subnet utilization and server health. It now says they cover IPAM, DHCP, DNS, infrastructure, security and more.
+
+- Settings, Audit Event Forwarding now names email (SMTP) beside syslog and webhook as a target kind, and says each target receives the audit rows that pass its own minimum severity and resource type filters, instead of "every row".
+
+- IPAM: creating a subnet in a block, allocating one from it, moving a subnet or block into it, or applying a plan anchored on it now requires `write` on that target block, not only on the subnet or block being created or moved. A grant on the block's space does not cover its blocks, as for editing the block itself. A refused request gets a 403 naming the target block. The same applies to the approver of a self-service subnet request: one without `write` on the block is refused and the request stays pending for another approver. The Copilot's subnet-allocation preview says so up front rather than proposing a change that cannot apply (#3425).
+
+- Icon-only Edit, Delete, Enable and similar buttons on about 30 pages (every alert rule and conformity policy row, roles, groups, sites, domains, certificates, the integration pages and more) are no longer announced by a screen reader as just "Requires superadmin" or another refusal reason for a read-only user. Each now keeps a name for its action, with the reason still shown as the tooltip, and a test fails any new icon-only button beside a permission gate that has no `aria-label`.
+
+- Appliance → Logs & Diagnostics → Diagnostic bundle: "Download bundle" no longer lands on `{"detail":"Not authenticated"}`. It now fetches the bundle through the console's authenticated client, shows a "Building bundle…" state while it builds, saves it under the server's filename, and shows the server's reason inline if the download is refused (#3394).
+
+- The certificate store's View CSR dialog no longer offers "Have the signed cert? Paste it now" to a user without write permission on the certificate store. The button is disabled with the same reason as the row's Paste signed cert, and viewing, copying and downloading the CSR still work.
+
+- IPAM: the tree's right-click menus (space, block, subnet) disable their New, Edit and Delete items for a user without the matching permission, an orphan address's right-click Restore and Delete Forever (and its inline purge button, for a user who may write but not delete) are disabled the same way, and tree rows can no longer be dragged to another block by a user who may not write them; the rows themselves stay selectable. A disabled right-click item now shows its reason on hover. (#3392)
+
+- IPAM: Find Free's "Create subnet here" and a free segment of a block's allocation band are disabled, with the reason, for a user who may not create subnets, as "Add Subnet" and "New Subnet" already are; the Find Free search itself stays available. (#3391)
+
+- A DHCP pool can no longer be left restricted to a PXE or phone class Kea never receives. While a pool names the class: disabling a PXE profile, or unbinding it from the pool's own scope, is refused (409, naming the pools); disabling, deleting or detaching a phone profile, or deleting or deactivating the last active scope it is attached to, is refused (409). A pool naming a `pxe-…` / `voip-…` class that no rule or phone profile generates, a disabled profile's class, or a PXE class of a profile its scope is not bound to, is a 422. Two boot rules selecting the same clients (same vendor class and architecture codes) in one profile are refused (422) (#3388).
+
+- Saving a zone's dynamic-updates ACL no longer silently overwrites a change someone else made while the dialog was open. The ACL now carries a version; if it moved, the save is refused with 409 and the dialog says "Someone changed this ACL since you opened it" with a Reload button that re-reads the current entries. API clients may send `expected_version` (the `version` from `GET .../update-acl`) for the same check; leaving it out replaces unconditionally, as before. A Copilot proposal to set the ACL likewise applies only if the ACL has not changed since it was proposed.
+
+- Six more edit dialogs (DNS Edit Server, TSIG key Edit metadata, DNS Pool, the zone Dynamic updates ACL, DHCP Phone Profile and DHCP Device policy) read the object fresh when they open and save only the fields you changed, so a change made elsewhere since the list loaded is no longer undone by an unrelated edit. Pool members, ACL entries and phone-profile scopes added elsewhere are kept, and a Save with nothing changed sends nothing and closes (#3379).
+
+- Editing a PXE boot rule's arch codes or vendor class no longer renames its generated Kea class, so a DHCP pool restricted to that class keeps matching. The Edit PXE profile dialog now identifies each existing rule, and a Save that would delete a rule a pool still names, or deleting the whole profile, is refused with the pools listed.
+
+- Edit Server Group (DHCP) refuses a blank Heartbeat Delay, Max Response Delay, Max Ack Delay or Max Unacked Clients with a reason, instead of saving a default the field never showed (#3371).
+
+- Edit Subnet and Edit Block now store a cleared Name as cleared. Before, the clear was dropped from the request, the Save answered 200, the dialog closed and the old name stayed (#3370).
+
+- Bulk edit's DNS Zone and the Edit IP dialog read the subnet's DNS settings afresh every time they open, and Apply waits for them, so a primary zone moved in Edit Block a few seconds earlier is the one marked "(primary)" and offered instead of the zone the block left. Saving a block or an IP space now refreshes the effective DNS settings its subnets are read from (#3368).
+
+- An untouched Save of a DHCP PXE profile no longer deletes and re-creates its boot rules under new ids, audits `matches` as changed, or changes the rendered Kea config (the class names embed the rule id, so it used to push a config to every agent). Unchanged rules keep their ids, changed ones are updated in place, and only a real addition or removal creates or deletes a rule. An untouched Save of a phone profile no longer writes a second audit row naming `scope_attachments`; the scope list is only rewritten when it actually changed.
+
+- Edit Server Group (DNS), Edit Blocking List, Edit MAC Block, Edit PXE profile and Edit address set no longer undo a change made elsewhere since their list loaded: each reads the object when it opens and its Save sends only the fields you changed (Edit DNSSEC policy and Edit NAT mapping got the same fix) (#3365)
+
+- Generated DDNS names now carry the whole address, `dhcp-10-1-20-5` instead of `dhcp-20-5` (IPv6 uses all 128 bits, not the low 32), so two DDNS subnets that share a zone no longer give `10.1.20.5` and `10.2.20.5` the same name. Records already published under the old form are left alone and move to the new name when their lease next renews; both forms stay reserved for the address they encode (#3364).
+
+- An address created through the Copilot `create_ip_address` operation or a self-service request with an FQDN and no hostname now takes as its hostname the part of the FQDN before the subnet's DNS zone, so the name it publishes and shows is the FQDN given. An FQDN outside that zone, in a subnet with no zone, or naming a different host than the hostname given is refused with the reason. A NetBox import stores an FQDN only beside the hostname it names: it no longer stores one whose host label sanitises to nothing, an overwrite no longer pairs the existing hostname with another host's FQDN, and the FQDN is folded the same way as the hostname (#3348).
+
+- The UniFi, Meraki, Fortinet and PAN-OS integration mirrors now give each subnet they own the same reserved `Gateway` row New Subnet creates, and move it when the controller reports a new gateway, so Next available no longer offers the subnet's router address to a host. An address another row already holds is never taken over: the sync leaves that row alone and lists it in its warnings.
+- The Meraki, Fortinet and PAN-OS mirrors no longer fail the whole sync when a DHCP lease or reservation they report sits on an address another row already holds, such as the subnet's gateway: that address is skipped and listed in the sync's warnings.
+
+- **Six more dialogs say why the server refused (#3346).** Deleting an IP
+  space, a subnet alias (in the subnet's Aliases tab and in Edit address),
+  an address set or a NAT mapping, and the DNSBL Check now button, now show
+  the server's reason where you pressed instead of nothing.
+
+- **IPAM dialog labels now name their controls (#3340).** The create
+  and edit dialogs for spaces, blocks, subnets and addresses, and the
+  subnet planner, drew a label beside each field without tying it to
+  it, so a screen reader announced no name for Edit Block's Name and
+  Description (and every other field) and a search by label found
+  nothing. They now use the same labelled field the DHCP dialogs use.
+
+- **Docs: six passages that did not match the build (#3339).** The
+  permissions page lists `dnsbl`, `e911_location` and `tls_cert` once
+  each and names the two routes that need a different type than their
+  row. The certificate store is described as on Fleet off the appliance
+  too (README, DNS, and the product's own hint text). The alert
+  rule-type count, the SIZING chart-default column and the Windows DHCP
+  failover-management row now say what the build does.
+
+- A list the server refused is no longer drawn as an empty one: the DNS and DHCP server group lists, a DNS group's zone tree, Zones and Records tabs, a zone's records, a DHCP group's Scopes, Pools and Statics tabs, an IP space's tree node and view, a block's contents and its allocation map now say "You don't have permission to see …" instead of "No server groups yet.", "No zones", "No blocks yet." and the like. Where one read answered and the next was refused (blocks readable, subnets not), the rows that could be read are drawn with a line saying the rest were refused. A failure that is not a refusal says the list could not be loaded. A holder of a grant scoped to one block, space, subnet, site or provider who changes a setting the items under it inherit, or a pointer at another resource, is now told the change needs `write` on every item of that type, not that it lacks the `write` it holds (#3337, #3338).
+
+- The Kea importer now names what it cannot take. A reservation whose address is not an IP address, is the wrong family or lies outside its scope's subnet is dropped with a warning in the preview and the commit (it used to be stored, or fail the whole scope in generic words), and subnets under `shared-networks` are imported as scopes that inherit the network's options and lifetimes, with a warning that the grouping was flattened and naming any setting a scope cannot carry, such as `interface` or `relay` (they used to be left out silently, and a config of shared networks alone was refused as not a Kea config). A Dhcp6 reservation's extra addresses and prefixes, and a reservation with no address or an unreadable MAC, are named as not imported.
+
+- **A block's and a space's Sync DNS are no longer offered to a holder
+  the server refuses (#3334).** Like the subnet's since #2571, each
+  stays visible and disabled with its reason, asking what its routes
+  ask: read on IP blocks (or IP spaces) and IP addresses for the
+  preview, and write on IP blocks (or IP spaces) for Apply, all at the
+  type level. A read-only user (the built-in Viewer) could open the
+  dialog and press Apply, and both of Apply's requests were refused.
+  The API gates are unchanged.
+- **The Sync DNS dialog's reverse-zone backfill note says the server's
+  reason (#3334).** A refused backfill read "Reverse-zone backfill
+  skipped: Request failed with status code 403"; it now carries the
+  server's own words, as the Apply failed line beside it does.
+
+- **Subnet merge previews name every setting the target's value
+  overrides (#3326).** Sources that disagree on tags, custom fields,
+  VXLAN ID, domain, DNS servers, DNS groups, extra DNS zones or the IPv6
+  allocation policy now get a preview warning showing each value and the
+  one the merge keeps, as role already did.
+
+- **The Subnet Planner and New IP Space say why the server refused
+  (#3323).** An invalid node CIDR in the planner (validate and Save) and
+  a taken name in New IP Space now show the server's reason where you
+  pressed, instead of nothing; the plan list's Delete and Sync DNS's
+  Apply do the same.
+
+- IPv6 subnet sizes are no longer printed as the 64-bit storage cap: Find Free, the IPAM CSV/JSON/XLSX export and the Resize preview now show a /64 as 2^64 addresses (and a /63 as twice that). The API's integer count fields still saturate at 2^63 - 1 so a generated 64-bit client keeps decoding them; the exact figure is in new `free_addresses_exact` / `total_ips_before_exact` / `total_ips_after_exact` string fields. Find Free opened from an IPv6 block now starts on IPv6 with a /64 prefix, and an empty result names the family it searched (#3322, #3324).
+
+- Subnet and block utilization figures follow every write that adds or frees an address: the reservation expiry sweep, an IP discovery pass and an nmap "Stamp discovered" now recount in the same pass instead of waiting for the hourly recount (#3320). The IPAM page also refetches block figures after address writes such as Bulk allocate, an address edit or a DHCP reservation save, so a parent block's Used figure follows without a reload (#3325). The IPAM tree, the Subnets list and the Dashboard's capacity figures draw amber and red from Settings' Warning and Critical Thresholds instead of a fixed 80% and 95% (#3327).
+
+- **Bulk allocate takes over an `available` address, and no host sits
+  on a network or broadcast address (#3319, #3321).** Bulk allocate
+  called an address held as `available` "in use" and skipped it (or
+  refused the whole range on abort), while Next available offered it.
+  It now takes the row over under the template's hostname. A subnet
+  made with skip auto addresses no longer stores hosts on its IPv4
+  network and broadcast addresses, which read 8 of 6, 133%: a single
+  create answers 409, a bulk range over one answers 422, and a Copilot
+  or request-portal create and an IPAM address import refuse it too.
+  /31, /32 and IPv6 subnets are unaffected, and DHCP leases, discovery
+  and integrations still record what they find there.
+
+- Editing a subnet's gateway now follows New Subnet's rules, on Edit Subnet and on the subnet import's `overwrite`. The new gateway address gets its own reserved `Gateway` row and PTR and the old default `Gateway` row is retired with its PTR, so Next available no longer offers the subnet's router address to the next host (a renamed or operator-owned old row is kept). A gateway on the subnet's network or broadcast address is refused with a 422 naming it, as it is on New Subnet, instead of being stored; and a gateway moved onto an address a host, a DHCP lease or a discovered row already holds is refused with a 409 naming that row, as Resize refuses it. An existing reserved row at the new address is kept as the gateway's row.
+
+- Building a support bundle or the appliance diagnostics bundle no longer holds every other request until it ends. The support bundle (its preview, its download and the decode map, and the Copilot's support bundle preview tool) ran its synchronous steps on the API's event loop: the appliance self-test, a kube API read per pod, every host log file and `/proc`, then the safety-net sweep and the zip. The diagnostics bundle ran whole on the loop. Every console and API request, `/health/live` included, waited for the build: about 13 s for a preview on a quiet one-node appliance, and as long as the self-test's lookup took with an unreachable resolver. Those steps now run in a worker thread, one at a time; the database sections stay on the request's session, and the bundles hold the same files (#3310).
+
+- Building a support bundle or the appliance diagnostics bundle no longer holds every other request while it scrubs a large host log. Each scrubbing pass ran over the whole log in one step, and that step kept the API's event loop waiting even from the worker thread the build runs in: about half a second for a 6 MB log, and up to 4.9 s for a request beside a bundle of a 30 MB log. The host logs and the installer logs are now scrubbed in pieces cut at line ends, a few milliseconds each, so the console and the API keep answering during the build. The bundles hold the same files with the same contents, the manifest's counts are the same, and so is the scrub mapping (#3310).
+
+- `docs/PRIVACY.md` now lists the appliance self-test's DNS lookup of `registry-1.docker.io` (on demand only, a name query through the host resolver, no connection to Docker Hub), the outbound-host CI guard also catches bare hostnames passed to resolve and connect calls, and the self-test endpoint no longer blocks the API event loop (#3307).
+
+- The Operator Copilot's `ping_host` tool now refuses targets inside a do-not-probe space, block or subnet (#722) like every other network tool, and is switched off with the Network tools feature module. `tls_cert_check` follows the same module gate.
+
+- A `read`-scoped API token can no longer make SpatiumDDI send traffic to another host. Over MCP, a scoped token no longer sees or can call the tools that probe a host, pull live state from a managed server or look something up off-prem (`network_ping`, `ping_host`, `find_dns_zone_drift`, the WHOIS / BGP / CT-log lookups and others) unless it also holds the write scope the same REST route needs; the REST `/tools/*` probes already refused it. The GET routes that do the same — zone drift, FortiGate interfaces, backup archive listing / download / manifest preview, the `/bgp/*` lookups, CT-log search, the GitHub release listings, an AI provider's model list, the appliance kubeapi proxy reads and the diagnostics bundle — now answer a `read`-only token with `403` and a reason. A session, an unrestricted token, or a write scope covering the path keeps them; a backup pull job now needs an unrestricted token.
+
+- A read-only account (the Viewer role) can now use the POST routes that only read. `POST /ipam/spaces/{id}/find-free`, `POST /ipam/blocks/{id}/plan-allocation` and `POST /av/allocation-preview` answered 403 "need 'write'" because the permission gate read every POST as a write; a route marked read-only now admits `read` as well as the `write` it took before. Resize, import and bulk-allocate previews are still refused to a read-only account, and an import preview refuses it before the upload is read.
+- A `read` API token can use the four previews that only read the database: `POST /appliance/acme/preview`, `POST /appliance/firewall/preview`, and the two `POST /wake-scheduler/.../preview-targets` routes.
+- `POST /held` (E911 HELD location request) works with a `read` API token and with an account holding only `e911_location: read`. The E911 doc no longer tells operators to scope a token with a path that does not exist.
+- `POST /logs/dns-queries/analytics` serves a token bound to subnets or DNS zones the way `POST /logs/dns-queries` does, instead of being refused by the token-binding check.
+- `GET /dns/groups/{id}/options` no longer writes a default options row on first read; it returns the defaults with a null `id` and `modified_at`, and the row is created when the options are first saved.
+
+- Blocking a MAC from New Devices now also requires write permission on DHCP MAC blocks in every target server group; holding only IP address write no longer creates DHCP blocks (#3302). The Block button is disabled with the reason when the grant is missing.
+
+- The `agent` API-token scope is retired. It was described as the agent push surface, but those routes only accept the agent's own credentials, so an `sddi_*` token could never use it. Creating or updating a token with it is now refused with an explanation, and it is gone from the scope picker. A token that already holds it still can do nothing; it does not become unrestricted.
+
+- API-token write scopes now cover the plainly-domain routes that sat outside their path prefixes (#3302): `ipam:write` admits address sets, multicast, AV flows and reserved ranges, custom-field definitions and `POST /nmap/scans/{id}/stamp-discovered`; `dns:write` admits domains (not the off-prem RDAP `refresh-whois`, which stays unrestricted-only) and ACME account register / revoke; `dhcp:write` admits `POST /new-devices/block`. Request submit / approve / reject / cancel, change-request decisions and Copilot proposal apply now admit a token holding any write scope, then refuse with a 403 naming the missing scope unless it is the one the operation's own family needs. Cutover, Trash restore / purge and other cross-domain routes still need an unrestricted token.
+
+- API-token docs and the token dialog now describe the scopes as they behave (#3302): a `read` token is refused mutations with a 403 but may call read-only POSTs and MCP; a write scope grants no reads outside its prefixes and a write-only token cannot use MCP; writes outside the IPAM, DNS and DHCP scopes need an unrestricted token; and each scope's cross-domain effects are named. The advice to restrict a token with `allowed_paths` (backup pull, E911) is removed, since that column is reserved and enforced nowhere.
+
+- An address whose hostname was cleared no longer reports its old FQDN as current: the address list and detail, address search, the IPAM exports, the Ansible inventory, the TLS probe host and the Copilot IP tools now show an FQDN only while the address has a hostname. The stored FQDN is kept for the orphan restore.
+
+- **Fleet's "Service lifecycle apply failed" banner no longer blames
+  docker compose (#3295).** When an appliance's role apply failed, the
+  banner said the supervisor's `docker compose` returned a non-zero
+  exit and that "the previous container state remains", though since
+  #183 Phase 7 the supervisor applies roles through the appliance's
+  Kubernetes API (k3s) and the reason printed under the banner names
+  the kube API (for example `kubeapi /readyz not ok`). The banner now
+  says the supervisor could not apply the assigned roles through the
+  appliance's Kubernetes API, that it tries again on the next
+  heartbeat, and to check k3s over SSH if the reason persists. The
+  reason line under it is unchanged.
+
+- The IPAM tree now honours Settings → IPAM "Default Expanded Depth": blocks nested deeper than the stored depth start collapsed instead of every level opening. A block deeper than that still opens when the selected subnet or block is inside it, so a selection is never hidden.
+
+- **Editing a backup destination is held to the bounds Add holds it to,
+  and can take a stored secret away (#3288, #3289).** An empty name, a
+  name over 120 characters or a description over 500 is now refused
+  with a 422 naming the field, and a null on a required field leaves it
+  as it was instead of answering 500. Moving an Azure destination to
+  an account key (or an SCP one between password and key, or an HTTPS
+  PUT one to auth `none`) now drops the credential it left, and naming
+  both Azure or SCP modes in one edit is refused. Through the API, a
+  `null` for a secret field clears it, and a `null` for the whole
+  `config` leaves it as it was instead of answering 500. The Edit dialog
+  shows "(set ...)" on a secret only when one is stored.
+
+- **The restore card no longer offers an archive from a newer schema
+  (#3287).** The backup manifest preview now runs the restore's own
+  schema-direction check, so an archive whose schema head this install
+  cannot place shows as not restorable, with the reason, and Apply
+  stays disabled. The destination "Restore from archive" dialog now
+  blocks a Full restore the same way.
+
+- Fleet's "Service lifecycle apply failed" no longer sticks forever after an approved-again node's forced role apply fails (for example `kubeapi /readyz not ok` just after a k3s restart): the supervisor now retries on the next heartbeat instead of skipping it as "env unchanged" (#3285).
+
+- **A Fleet Boot once now arms its slot once, and a trial that falls back no longer leaves the request stuck (#3284).**
+  The node re-ran set-next-boot on every heartbeat until the slot booted, and
+  when the trial of that slot fell back to the running slot the request was
+  never cleared: the node armed the failed slot again about every 30 seconds,
+  the Boot once button stayed disabled and the heartbeat long-poll stayed off.
+  The supervisor now runs one set-next-boot per request and reports the run
+  with the boot it ran in, and once a reboot has spent the request the control
+  plane retires it, whether the slot booted or fell back.
+
+- **A Boot once trigger left behind by a reboot no longer blocks every later Boot once on the node (#3283).**
+  A reboot while the host runner was arming the slot left the trigger file in
+  place, and the watcher does not fire for a file already there at boot, so
+  every later Boot once answered success and never ran. The supervisor now
+  writes a new request over a trigger left by an earlier boot, so the runner
+  picks it up.
+
+- **"Scan with nmap" is no longer offered to a role that cannot read the
+  scan (#3279).** Starting a scan takes write on `manage_nmap_scans` and
+  watching it takes read, so a custom role with only write started a scan
+  and then got a 403 from the viewer. The scan form, the subnet Tools menu,
+  and the "Scan with Nmap" buttons on the IP detail and Edit address dialogs
+  now need both grants (or admin) and say so when disabled. A Copilot nmap
+  scan proposal run by such a role now says its progress cannot be shown,
+  instead of polling a 403 behind a "Loading scan…" spinner. The API gates
+  are unchanged.
+- **With the nmap module turned off, "Scan with nmap" is no longer offered
+  (#3279).** The server refuses every scan route then, but the subnet Tools
+  menu and the IP detail and Edit address buttons were still shown. They are
+  now hidden, whatever the role's grants.
+
+- The frontend lockfile now carries the `picomatch` 4.x entry that `package.json` implies, so `npm ci` succeeds with the npm bundled in Node 22 instead of failing with "Missing: picomatch@4.0.7 from lock file" (#3278).
+
+- The frontend lockfile again carries the `picomatch` entry that `npm ci` on node 22 needs: a Dependabot group update dropped it after #3280 added it. CI's Frontend Lint job now runs `npm ci --dry-run`, so a lockfile out of sync with `package.json` fails CI instead of being repaired silently by `npm install` (#3278).
+
+- **A TSIG key's Rotate no longer asks its last step as a permanent
+  deletion (#3277).** On a DNS server group's TSIG Keys tab, a key's
+  Rotate opened the two-step confirm with the delete wording on its
+  second step: "Confirm Permanent Deletion", "This action cannot be
+  undone." and a Delete button that read "Deleting…" while the request
+  ran, though the button only rotates the key (a new secret replaces
+  the old one and the key stays). That step now reads "Confirm TSIG Key
+  Rotation", warns that the old secret is replaced and stops working on
+  the next config push, and its button reads "Rotate key" ("Rotating…"
+  while it runs). The two steps and the checkbox stay.
+
+- **Re-profile now is no longer offered to a user who cannot read the
+  scan (#3271).** An IPAM Editor could start a profile scan from an
+  address's detail but not read it back (`manage_nmap_scans`), so the
+  button stayed on "Scanning..." until the modal closed. The button and
+  the scan read now need that grant, and the section says so instead.
+  A started scan whose progress cannot be read for any other reason now
+  ends the "Scanning..." state and shows the error.
+  With the Nmap tools module turned off, Re-profile now is gone too
+  (it used to answer "Feature 'tools.nmap' is disabled."), and a stored
+  profile's scan is not read; the section says scanning is turned off.
+
+- **Edit Zone, Edit View and Edit Subnet no longer put back a value saved elsewhere (#3269, #3270).**
+  The three dialogs filled their form from the cached list row and sent every
+  field on Save, so a Save that changed only the Color reverted a Default TTL
+  someone else had saved a moment earlier. They now read the object fresh when
+  they open and send only the fields you changed; a Save with no changes sends
+  nothing. The zone's "Sync with server" failure dialog also no longer claims
+  that only Windows DNS can pull a zone, and mentions DNS Manager only for a
+  Windows DNS group.
+
+- **Sync DNS no longer offers a fix that its Apply always refuses (#3268).** When a subnet's DNS zone has an underscore label in its name, Sync DNS listed an address's A or PTR as missing or mismatched, the Apply refused it with the record API's reason, and the same row came back after every Apply. The preview now applies the rule the Apply does: an address whose name cannot be published in its own zone gets no row, and neither do its extra zones, which the refused Apply never reaches either.
+
+- **A zone made from a template stores record owners in the record API's form, and the Email zone always gets its DMARC stub (#3266, #3267).**
+  From Template stored owners as typed (`Sel1._domainkey`, `café._domainkey`, the
+  AD site name), so a BIND9 group served a non-ASCII DKIM owner as raw octets and
+  its drift report never came clean. Owners are now lower-cased and IDNA-encoded
+  exactly as the record API does. The Email zone template also makes a
+  monitor-only `_dmarc` record (`v=DMARC1; p=none`) when the DMARC mailbox is
+  left blank, as its description promises.
+
+- **A zone that holds records can no longer be renamed through the API (#3265).**
+  The rename answered 200 and left every record's name, the name IPAM keeps on
+  each address and every PTR value IPAM published on the old name, and a name
+  with an underscore label took the zone out of service while the console read
+  "in sync". The API now answers 409 while the zone holds records, as the
+  console's greyed-out name already implied; records in the Trash count, since a
+  restore brings them back under the old name. A zone with no records still renames.
+
+- A user the API refuses is no longer offered controls that fail: Network Tools disables Run and says up front that the user lacks read on `use_network_tools`; Conformity's Export PDF and E911's CSV and IOS snippets are disabled when the page's own read is refused, and a started export that fails now says "not permitted" (403) or "unavailable" (5xx) in words instead of a status code or silence. The IPAM, DNS zone and support-bundle downloads now show the server's reason when refused, too (#3254, #3255).
+
+- The request portal now says what happened in words. An approval whose provisioning was refused keeps its dialog open and shows the reason instead of closing like a success; a request refused for a DHCP dynamic pool or a public-facing zone gives its reason as a sentence; an approver sees the IPAM template a subnet request will apply; the list shows each request once in plain text, headlined by the subnet it actually got, with an empty state that uses the filter's own label; and the New request form uses plain labels and hints, offers status and record type as choices, and explains a refused submit without validator phrasing. For API clients: a request whose arguments do not validate is now answered 422 with FastAPI's usual list of field errors (each located under `body.args`), where it was a 400 with one string (#3246, #3247, #3251, #3252, #3253).
+
+- **The request portal now runs the same checks as the normal creates, at submit and at approval (#3243, #3244, #3245, #3248, #3249, #3250).**
+  An address request that the manual create refuses (a name already taken in the zone, a MAC already recorded in the space, an address inside a DHCP dynamic pool, a private address in a public-facing zone, a name too long for its zone) is refused when it is submitted, in words, instead of queuing and failing at approval. An address request with no hostname is held to the same MAC and dynamic-pool checks at approval. A subnet request is checked at submit for a malformed or unknown template and for a Required subnet custom field no template or block supplies. A DNS record request with a priority, weight or port its type does not take is refused in the record create's words, and the approver no longer reads a text promising fields that are dropped. A `static_dhcp` address request is refused at submit, and fails at approval with nothing created, when no DHCP reservation can be made for it (no single DHCP scope serves the subnet, the MAC or address is already reserved there, or the approver may not write DHCP reservations), so no request ends provisioned without its reservation. The approver is no longer told an address recorded as available will fail the approval.
+
+- **A DHCP server that leaves its HA relationship no longer keeps
+  showing its old HA state (#3241).** A Kea server moved out of a
+  hot-standby or load-balancing group, or whose group became
+  standalone, whose partner left, or whose peer URL was cleared, kept
+  the `ha_state` and `ha_last_heartbeat_at` it last reported, so
+  `GET /api/v1/dhcp/servers` and the DHCP page's "HA v4" pill still said
+  `hot-standby` for a standalone server whose Kea had unloaded the HA
+  hook. Both are now cleared as soon as the server's config carries no
+  HA hook (at its agent's next config poll, which also clears a row
+  left stale by an earlier build), and a late HA report from a server
+  that takes part in no HA relationship stores nothing.
+
+- An InfluxDB export target that does not answer now says so in words ("Connection to 192.0.2.13:8086 timed out after 2s") in both the Test result and the push status, instead of "ConnectTimeout:" with nothing after the colon. The same wording now reaches the update check, webhook delivery, the Fingerbank lookup, OPNsense sync errors, DNS pool health checks, the TLD registry refresh, the upgrade pre-flight and the container list hint, and a TLS certificate probe that fails with an error carrying no text no longer stores "TLS connection failed:" with nothing after it. Only host and port are quoted, never a URL's credentials, path or query string, nor a header the HTTP library refused.
+
+- **The Dashboard no longer shows reads a user may not make as an empty estate, or withheld Security lists as all-clear (#3234, #3235).** A user refused the IPAM, DNS or DHCP reads (the built-in Requester role) saw "No subnets have allocated IPs yet.", subnet, allocation, zone and server counts of 0, 100% headroom, "No DNS servers registered" and "0% of 0 subnets"; those faces now show a dash and say the read was refused (or couldn't be loaded, for a server error), and the DHCP reads stop polling once refused. On the Security tab, a user who gets only the headline counts saw "Every local user has TOTP enrolled." and the other all-clear sentences under counts that said otherwise; the summary now says it withheld the lists (`detail_withheld`) and the tab says the detail is not shown to that role.
+
+- An open alert no longer shows a rule's edited threshold (or its free-address floor) as its current reading (`[now: 73%]` on a subnet that still reads 71.4%): the event's message restates the new threshold in place, and `[now: …]` carries only readings, even when a reading changes in the same pass as the threshold (#3233). The seeded `/var` rule's description now says it resolves once usage is 5 points below the threshold, as it does, and existing untouched rows are refreshed (#3232).
+
+- **The console starts when the browser refuses site data (#3231).**
+  With site data blocked for the console's origin, Chrome and Edge
+  refuse web storage outright, and the console stayed a blank page on
+  every route, the login page included. With the storage quota full,
+  every signed-in page fell to "Something went wrong". The console now
+  works either way: the theme follows the system preference, and the
+  sidebar's collapse, the dashboard's tab, a module's last URL and a
+  dismissed VIP advisory are simply not remembered.
+
+- A `read`-scoped API token can now call the POST routes that only read: the DNS query log and its analytics, the DHCP activity log, the MAC-vendor lookup, and the side-effect-free previews and validations. They used to answer 401 because every POST was treated as a write. A token whose scope doesn't cover a request now gets 403 instead of 401, so a client no longer drops a valid token; invalid, revoked and expired tokens still get 401. The Windows Event Log and DHCP audit-log pulls still need a write scope, because they run commands on the Windows server (#3223).
+
+- **Dialogs that show a secret once no longer lose it to a stray click (#3222).**
+  The API-token, webhook-secret, TSIG-secret, ephemeral pairing-code,
+  replacement pairing-code and regenerated recovery-code dialogs now ask
+  "close anyway?" when Done, Esc or the close button is used before the
+  value was copied (or, for the masked API token, revealed). A copy that
+  failed does not count; selecting the value and copying it by hand does.
+  A webhook secret you typed yourself, and a persistent pairing code (which
+  can be re-revealed later), still close without asking.
+
+- The Delete IP Address dialog now names the host beside the address ("192.168.0.22 (printer-3.corp.example.com)") and lists the DNS records that go with it by name and type (the A or AAAA record, its PTR, its aliases, and a count of any additional zones it is published in), in both the Mark as Orphan and Delete Permanently options. The Permanently Delete confirmation for an orphan and the bulk delete dialog name the addresses too. A row whose hostname was cleared is named by its IP alone, not by the old FQDN it still holds. If the aliases cannot be read the dialog says so, still lists the host's own A and PTR records, and still works (#3210).
+
+- **Moving one node's DHCP group in Fleet no longer restarts Kea on
+  every node of a cluster (#3202).** Every node writes the one shared
+  role chart, and its dhcp-kea pod template carried the writing node's
+  DHCP group as `AGENT_GROUP`. A Fleet group move of one node therefore
+  changed the template, and Kubernetes replaced the Kea pod on every
+  node, one at a time, a working hot-standby pair included. The
+  template now carries no DHCP group. The agent used it only to pick the
+  group of the server row its first registration creates, and the
+  control plane now places that row in the DHCP group its appliance is
+  assigned in Fleet. An agent no appliance claims (a Compose or
+  Kubernetes agent) still joins the group its `AGENT_GROUP` names.
+  Registration never moves an existing row, and a group move still
+  moves the node's own Kea row, as before.
+
+- **The zone Drift report no longer calls a server `ok` that is not serving the zone as saved (#3198).** A server's status meant only that the zone transfer worked, so a server stuck below the zone's serial, or missing saved records, read `ok`. A server that transferred is now `ok` only when nothing saved is missing, nothing extra is served and its serial is not below the zone's; `syncing` while a change made in the last two minutes is still on its way; `behind` when saved records are missing or it sits below the serial after that; `drift` when it serves records SpatiumDDI does not hold. A signed zone served at a later serial than the zone's is not behind, and BIND's private signing-state record no longer shows as drift. A failed transfer is still `error` / `unsupported`. The Drift tab, the API (new `reason`, `current_serial`, `target_serial`) and the `find_dns_zone_drift` copilot tool all carry it.
+
+- **A customer in the Trash no longer breaks the services, overlays and circuits that still name it (#3192).** The customer delete promises that anything naming the customer is left unchanged, but saving a service, overlay or circuit that kept its customer was refused with "customer_id not found", even for a notes-only edit. An update that keeps the stored customer now saves; only a new or changed reference to a customer in the Trash is refused, and circuits now refuse one on create and update like services and overlays do. The edit forms keep the hidden customer selected as "(customer in Trash)" instead of an empty choice, and the overlay's Customer card says so instead of "Loading…" for ever; a refused or failed read is reported as that, not as a customer in the Trash. A service update that sends `customer_id: null` is now refused with 422 instead of a server error. A NetBox import no longer attaches rows to a customer in the Trash. A customer that a service still names is still refused at permanent delete (a service must have a customer), and the Trash confirmation now says so.
+
+- **Global search no longer finds a deleted circuit (#3191).** A circuit
+  deleted from the Circuits page still turned up in the header search, by
+  name and by carrier id, and its result opened a Circuits list that did
+  not contain it. Search now skips deleted circuits, as the list does. An
+  overlay site's preferred circuits no longer accept a deleted circuit
+  (422, as for an unknown id), and the overlay simulation no longer names
+  one as a site's primary circuit, while a deleted circuit still counts when
+  it is taken down in a what-if, so a transport-class policy is not reported
+  unaffected while its site is blackholed. A new test walks the search providers
+  and fails if one reads a soft-deletable table without excluding deleted
+  rows.
+
+- An alias withdrawn by Mark as Orphan is no longer listed in the Trash as a stand-alone DNS Record. Restoring it alone served a CNAME to a withdrawn host, and Delete permanently lost it for good. It now follows its address: it comes back when the address is restored and is deleted when the address is deleted permanently, and the Trash refuses a direct Restore or Delete permanently on it while the address is an orphan (#3189).
+- Mark as Orphan no longer deletes for good, with no audit entry, an alias or other IPAM record you had already moved to the Trash yourself. It stays in the Trash and ages out as usual; while its address is an orphan the Trash refuses to restore it (alone or with the other records of a bulk delete), and once the address is restored it can be restored too. A record that went to the Trash with its zone is still removed, so restoring the zone publishes nothing for the orphan (#3189).
+
+- **An appliance switched back to a slot that an upgrade wrote gets that
+  slot's container images again (#3169).** k3s imports images from one shared
+  directory on `/var`, which holds the tarballs of whichever slot was last
+  upgraded to. A rollback, a Fleet "set default" to the other slot, or a
+  "boot this slot next" now copies the target slot's own tarballs into that
+  directory first, stamped with the current time so k3s re-imports them (it
+  skips a same-size file with an older timestamp). The running k3s imports
+  them straight away, and the target slot's k3s imports any it had not
+  finished when the node rebooted, so the rolled-back slot's pods no longer come
+  up `ErrImageNeverPull` on a node whose image store was wiped by a cluster
+  join, promote or demote, or trimmed by image garbage collection. A reboot
+  requested while that copy runs (about 1 GB) waits for it, up to 15 minutes,
+  instead of cutting it off before the switch is made, and the console's
+  slot-rollback action now allows 15 minutes instead of 30 seconds. A slot
+  holding another architecture's image is not copied. The installer
+  now also keeps the tarballs on the first slot's own filesystem (an install
+  that cannot fit them fails instead of leaving a partial set), so switching
+  back to a node's original slot restores them too; a node installed before
+  this still carries none there, the switch goes ahead, the log says so, and
+  `docs/TROUBLESHOOTING.md` has the recovery. An upgrade still copies
+  the new slot's images once, as before.
+
+- **The `?` shortcuts sheet no longer lists the Add Record key to a role
+  that writes DNS zones but not records (#3167).** Since #3100 a zone's
+  Add Record and its `n` key need write on DNS records, but the sheet
+  still listed `n` for a write grant on server groups, zones or records,
+  so such a role was offered a key that opens nothing. The sheet now asks
+  for write on DNS records, as the key does.
+
+- **Cancelling a reboot with F9 after the database handoff began now says the
+  switchover still completes, and a cancelled reboot no longer leaves its unit
+  "failed" (#3162).** Once the handoff has cordoned the node, CloudNativePG has
+  been asked to move the PostgreSQL primary, and a switchover it has begun
+  cannot be taken back; the console now tells the operator that the switchover
+  completes (a few seconds of API unavailability) and that the node stays up.
+  A cancel inside the console's 10 s grace still asks the database for nothing.
+  A cancelled power action, and a cancelled Fleet reboot, now end as a clean
+  stop, so `systemctl` no longer reports `spatium-power-action@reboot.service`
+  or `spatiumddi-reboot-agent.service` as failed; a `systemctl reboot` that
+  fails is still reported as a failure.
+
+- **Edit and Delete buttons on a DHCP group's Scopes, Client Classes
+  and Option Templates, on IPAM Templates, on the DNS blocking lists
+  and on Firewall aliases have accessible names (#3160).** They were
+  bare pencil and bin icons, announced by a screen reader as just
+  "button" (the permission gate only adds a tooltip while the button
+  is refused). Each is now named for the action and the row, for
+  example "Edit client class VOIP". The icon-only button guard now
+  also treats a permission-gate spread as not naming a button, so
+  the next one is caught.
+
+- **Filter-mode, Saved views, Spaces and aggregation pickers close on
+  Esc and on a click elsewhere (#3159).** The address table's and DNS
+  records table's Filter mode picker, the Views menu, the Dashboard's
+  Spaces filter and IPAM's aggregation suggestions popover ignored Esc
+  (and the Filter mode picker also ignored a click elsewhere, so it
+  could sit open beside the Tools menu). They now follow the header
+  menu's contract: Esc closes and returns focus to the button, a click
+  elsewhere closes, and only one is open at a time. The Filter mode
+  button is also named "Filter mode: <mode>" instead of by its glyph.
+
+- **The appliance Fleet row opens its detail dialog from the keyboard
+  (#3158).** The row's detail (CPUs, memory, storage, NICs, Packet
+  capture link) opened only on a mouse click. The hostname is now a
+  button that opens it on Enter or Space, with a visible focus ring,
+  as the DNS / DHCP server and IP address rows already do.
+
+- **Esc on a list suggestion reached with Tab no longer closes the
+  whole dialog (#3157).** In the DHCP option search, the IP picker,
+  the request resource picker and the tag filter, an Esc pressed on an
+  entry of the open list now closes the list and keeps the dialog and
+  what was typed, as an Esc in the search field already did.
+  The request resource picker also no longer closes its list on a
+  150 ms timer after focus moves onto an option, so that Esc no longer
+  reaches the dialog.
+
+- **Esc that ends an IME composition no longer closes the search
+  palette (#3156).** Cancelling a Japanese, Chinese or Korean
+  composition with Esc left the palette open with its query, as it
+  already does in dialogs. The same guard now covers the Copilot
+  drawer, its prompt menu, the IP table's inline editors and the tag
+  filter's suggestion list.
+
+- **A refused Delete or Save in a dialog no longer leaves keyboard
+  focus outside it (#3155).** A dialog whose focused submit button is
+  disabled while its request runs now takes focus back onto its own
+  card, so a refusal (a name in use, a reference) leaves focus inside
+  the open dialog, and the reason is announced as an alert.
+
+- **The DNSSEC card no longer promises a BIND9 zone's DS within 30
+  seconds (#3154).** While a signed zone had no DS to show, the card said
+  "typically <30 s after signing". PowerDNS reports the DS with its sign
+  op, but the BIND9 agent reports a key's DS only once BIND would publish
+  it as CDS, about a day after signing on the default policy. The card
+  now says so for each, and the DNS feature doc's "about two hours" is
+  corrected to the same.
+
+- **Applying a Copilot approve or reject proposal now says why it was refused (#3152).** The apply answered 403 "need 'approve' on 'change_request'" for every refusal, including when the approver holds that permission and the real reason was, for example, no write on the target subnet, or approving their own request. It now returns the same reason the REST approval gives. It is still a 403, and nothing else about the refusal changes.
+
+- The DNS bulk record delete and the customer delete (row and bulk) no longer promise a restore from Administration → Trash to a user the Trash refuses: every Trash route is superadmin-only, so the dialogs now say a superadmin can restore, as the IPAM, zone and DHCP scope deletes do (#3150).
+
+- A page no longer keeps asking for a read the server refused. The Dashboard's integration lists, Looking Glass card, Integrations tab and Conformity tab, Packet Capture's capture list (every 5 s) and the Looking Glass sessions and peers (every 15 s) now stop their timers after a 403, so a user without those reads no longer writes a denied audit row every few seconds for as long as the page stays open. Packet Capture and the Dashboard's Looking Glass card now say the read was refused instead of "Failed to load", and the Integrations tab no longer blames the reader's role when the read failed for another reason (#3149).
+
+- A read the server refuses is now said to be refused in five more places instead of drawn as a result: the Audit Log's chain badge no longer reads "Checking integrity…" forever, the AI Tool Catalog no longer counts "0 of 0 enabled", the Dashboard's Conformity tab no longer shows zero frameworks and "Nothing currently failing", a DNS server's Stats tab no longer shows three empty "No data in window." cards under its refusal, and a service's Resources picker is disabled with the reason instead of offering an empty list (#3148).
+
+- A backup destination's "Restore from archive" window now reads the chosen archive's database dump format before it offers Selective restore. A plain-SQL archive (for example one copied into the destination by hand) shows Selective disabled with the reason, instead of being refused only after Apply. The new read-only `GET /api/v1/backup/targets/{id}/archives/{filename}/manifest-preview` gives the same answer as the manual-restore preview, for the one archive picked rather than the whole listing.
+
+### Security
+
+- **A DHCP client can no longer publish a name another record holds
+  (#3362).** On a DDNS-enabled subnet, a laptop that called itself
+  `www` got `www A <its lease IP>` added beside the operator's real
+  `www A 203.0.113.10`, so about half the lookups for the web server
+  went to the laptop. The same happened against a static IPAM host or
+  another lease at the name. DDNS now publishes a name only when
+  nothing else is at it or the address already owns it (RFC 4703).
+  Any record counts, so an MX- or TXT-only name, a CNAME or an NS
+  delegation is not taken over either, and another address's
+  generated `dhcp-<ip>` name is never available to a client. On a
+  clash the lease is published as its own `dhcp-<ip>` instead and the
+  other record is left alone; if that name is taken too, nothing is
+  published and the IPAM row is left without a name, so Sync DNS
+  cannot publish the client's name later. A `ddns_name_conflict`
+  warning and audit row name the subnet, IP, MAC, requested name and
+  the holder, at most once per address every five minutes. The lease
+  keeps the client's own hostname; the IPAM row shows the name that
+  was published.
+
+### Migrations
+
+- `b3d7e19a5c40` — #3433, removes from `ip_space`, `ip_block` and
+  `subnet` (Trash rows included) every `dns_group_ids` entry that names
+  a DNS server group that no longer exists, keeping a live group's id
+  in any spelling an older build stored and the order of the entries
+  kept. Data-only; the downgrade is a no-op.
+
 ## 1.0.0-beta.3 — 2026-11-01
 
 **The third 1.0.0 beta.** 129 commits since 1.0.0-beta.2, almost all

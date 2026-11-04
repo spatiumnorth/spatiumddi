@@ -211,6 +211,7 @@ export function FirewallFeedsPage() {
                           onClick={() => setReveal(f)}
                           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Reveal poll URL"
+                          aria-label="Reveal poll URL"
                           {...superadminGate}
                         >
                           <Eye className="h-3.5 w-3.5" />
@@ -219,6 +220,7 @@ export function FirewallFeedsPage() {
                           onClick={() => setRotate(f)}
                           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Rotate token"
+                          aria-label="Rotate token"
                           {...superadminGate}
                         >
                           <RotateCw className="h-3.5 w-3.5" />
@@ -227,6 +229,7 @@ export function FirewallFeedsPage() {
                           onClick={() => setEdit(f)}
                           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Edit"
+                          aria-label="Edit"
                           {...superadminGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
@@ -235,6 +238,7 @@ export function FirewallFeedsPage() {
                           onClick={() => setDel(f)}
                           className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                           title="Delete"
+                          aria-label="Delete"
                           {...superadminGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />

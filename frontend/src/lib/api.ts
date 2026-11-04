@@ -3842,6 +3842,10 @@ export interface BrandingLogoInfo {
 export interface PlatformSettings {
   app_title: string;
   app_base_url: string;
+  // Read-only: the fields a non-superadmin holding `write` on `settings` may
+  // change through PUT /settings (the API's SETTINGS_DELEGATE_WRITABLE,
+  // #3429). Never sent back; the PUT body is only the edited fields.
+  delegate_writable_fields?: string[];
   // Login-screen acceptable-use banner — issue #885.
   login_banner_enabled: boolean;
   login_banner_title: string;
@@ -6184,6 +6188,8 @@ export interface UpdateAclEntryInput {
 
 export interface ZoneUpdateAcl {
   zone_id: string;
+  // Version token of the stored ACL (#3381); send it back as expected_version.
+  version: string;
   dynamic_update_enabled: boolean;
   driver_names: string[];
   caps: DynamicUpdateCaps;
@@ -6194,6 +6200,8 @@ export interface ZoneUpdateAcl {
 export interface ZoneUpdateAclReplace {
   dynamic_update_enabled?: boolean | null;
   entries: UpdateAclEntryInput[];
+  // The `version` last read; a stale one answers 409 (#3381). Omitted = unconditional.
+  expected_version?: string | null;
 }
 
 // Generic server-side pagination envelope (#455). Matches the backend
@@ -9068,6 +9076,8 @@ export interface PXEArchMatch {
 }
 
 export interface PXEArchMatchInput {
+  /** Existing rule's id (#3374); omit for a new rule. */
+  id?: string;
   priority?: number;
   match_kind?: PXEMatchKind;
   vendor_class_match?: string | null;
@@ -10869,6 +10879,9 @@ export interface ApiToken {
   /** Set by the list endpoint (#2443). */
   owner_username?: string | null;
   owner_display_name?: string | null;
+  /** False when the owner is disabled: the token is refused (403) whatever
+   *  its own flag says (#3431). Set by the list endpoint. */
+  owner_is_active?: boolean | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -11293,8 +11306,18 @@ export interface NetworkDashboardOverlayImpactRow {
   site_count: number;
   note: string;
 }
+export interface NetworkDashboardWithheld {
+  asn: boolean;
+  circuit: boolean;
+  service: boolean;
+  overlay: boolean;
+}
 export interface NetworkDashboardSummary {
   generated_at: string;
+  /** Panels the server emptied because the caller may not read them: their
+   *  zeros are "not visible to you", never an all-clear (#3449). Optional
+   *  for an older server. */
+  withheld?: Partial<NetworkDashboardWithheld>;
   asn_drift_count: number;
   rpki_expiring_count: number;
   rpki_expired_count: number;
@@ -11370,6 +11393,10 @@ export interface IntegrationsDashboardErrorRow {
 export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
+  /** Enabled integrations the caller may not read: left out of `panels` and
+   *  of both recent lists, so the tab names them rather than reading the gap
+   *  as "nothing enabled" or an all-clear (#3456). Absent from older servers. */
+  withheld?: { kind: string; label: string }[];
   recent_errors: IntegrationsDashboardErrorRow[];
   // #2577 — rows a sync released outside its target's IP space; same shape,
   // `error_detail` carries what was released. Absent from older servers.
@@ -14497,9 +14524,26 @@ export const applianceDiagnosticsApi = {
     api
       .post<ApplianceSelfTestReport>("/appliance/diagnostics/self-test")
       .then((r) => r.data),
-  // Bundle download uses a direct URL — the browser handles the
-  // attachment + filename via Content-Disposition.
-  bundleUrl: () => "/api/v1/appliance/diagnostics/bundle",
+  // The API authenticates by the Authorization bearer only, so a plain
+  // <a href> navigation 401s (#3394). Fetch through the client as a blob,
+  // decode a refusal, and take the filename from Content-Disposition (the
+  // fallback matches the server's own `spatium-diagnostic-<UTC stamp>.zip`).
+  downloadBundle: async (): Promise<{ blob: Blob; filename: string }> => {
+    const res = await api
+      .get("/appliance/diagnostics/bundle", { responseType: "blob" })
+      .catch(rethrowBlobError);
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    return {
+      blob: new Blob([res.data as BlobPart]),
+      filename: match ? match[1] : `spatium-diagnostic-${ts}.zip`,
+    };
+  },
 };
 
 /**

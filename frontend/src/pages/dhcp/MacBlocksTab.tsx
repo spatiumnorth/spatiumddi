@@ -5,6 +5,7 @@ import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import {
   dhcpApi,
+  formatApiError,
   type DHCPMACBlock,
   type DHCPMACBlockReason,
   type DHCPMACBlockWrite,
@@ -283,6 +284,7 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
                         onClick={() => setEdit(b)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        aria-label="Edit"
                         {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -291,6 +293,7 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
                         onClick={() => setDel(b)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        aria-label="Delete"
                         {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -319,8 +322,16 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
           title="Unblock MAC"
           description={`Remove the block on ${del.mac_address}? The device will immediately be able to request leases again.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>

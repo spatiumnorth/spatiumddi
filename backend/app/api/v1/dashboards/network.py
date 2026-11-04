@@ -83,6 +83,20 @@ class OverlayImpactRow(BaseModel):
     note: str
 
 
+class NetworkWithheld(BaseModel):
+    """Which panels the server emptied because the caller may not read them.
+
+    A withheld panel's counts are zeros and its lists empty; this is what
+    tells that apart from a real all-clear (#3449). ASN drift and the RPKI
+    KPIs share the ``manage_asns`` grant, so both ride ``asn``.
+    """
+
+    asn: bool = False
+    circuit: bool = False
+    service: bool = False
+    overlay: bool = False
+
+
 class NetworkDashboardSummary(BaseModel):
     """Headline counts + top-N detail rows per panel.
 
@@ -92,6 +106,8 @@ class NetworkDashboardSummary(BaseModel):
     """
 
     generated_at: datetime
+
+    withheld: NetworkWithheld = NetworkWithheld()
 
     asn_drift_count: int
     rpki_expiring_count: int
@@ -392,8 +408,14 @@ async def network_summary(db: DB, current_user: CurrentUser) -> NetworkDashboard
 
 
 def _mask_unreadable_panels(summary: NetworkDashboardSummary, user: Any) -> NetworkDashboardSummary:
-    """Empty every panel ``user`` may not read (ASN + RPKI share ``manage_asns``)."""
+    """Empty every panel ``user`` may not read (ASN + RPKI share ``manage_asns``).
+
+    Each emptied panel is flagged in ``summary.withheld`` so a client never
+    reads the zeros as an all-clear (#3449).
+    """
+    summary.withheld = NetworkWithheld()
     if not user_has_permission(user, "read", "manage_asns"):
+        summary.withheld.asn = True
         summary.asn_drift_count = 0
         summary.asn_drift = []
         summary.rpki_expiring_count = 0
@@ -402,13 +424,16 @@ def _mask_unreadable_panels(summary: NetworkDashboardSummary, user: Any) -> Netw
         summary.rpki_last_checked_at = None
         summary.rpki_expiring = []
     if not user_has_permission(user, "read", "circuit"):
+        summary.withheld.circuit = True
         summary.circuit_term_expiring_count = 0
         summary.circuit_status_changed_count = 0
         summary.circuit_alerts = []
     if not user_has_permission(user, "read", "network_service"):
+        summary.withheld.service = True
         summary.service_orphan_count = 0
         summary.orphan_services = []
     if not user_has_permission(user, "read", "overlay_network"):
+        summary.withheld.overlay = True
         summary.overlay_impacted_count = 0
         summary.overlay_impact = []
     return summary

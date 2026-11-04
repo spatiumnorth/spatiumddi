@@ -72,6 +72,12 @@ export function PXEProfilesPage() {
       setDeleting(null);
     },
   });
+  // A refusal is shown in the dialog (#3396), so closing it forgets the
+  // refusal: the next profile's dialog starts clean.
+  function closeDelete() {
+    deleteMut.reset();
+    setDeleting(null);
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -155,16 +161,27 @@ export function PXEProfilesPage() {
         />
       )}
       {deleting && (
-        <Modal title="Delete PXE profile" onClose={() => setDeleting(null)}>
+        <Modal title="Delete PXE profile" onClose={closeDelete}>
           <div className="space-y-4 text-sm">
             <p>
               Permanently delete <strong>{deleting.name}</strong>? Any scope
               currently bound to this profile will detach automatically (FK SET
               NULL).
             </p>
+            {/* #3396: the server's reason when it refuses the delete (a pool
+                whose class restriction names one of the profile's rule
+                classes answers 409, #3374); the dialog stays open. */}
+            {deleteMut.isError && (
+              <div
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              >
+                {formatApiError(deleteMut.error, "Delete failed.")}
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setDeleting(null)}
+                onClick={closeDelete}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
               >
                 Cancel
@@ -214,6 +231,7 @@ function ProfileCard({
             onClick={onEdit}
             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Edit"
+            aria-label="Edit"
             {...permissionGate(
               perms.can("write", "dhcp_scope"),
               NEEDS_PXE_WRITE,
@@ -225,6 +243,7 @@ function ProfileCard({
             onClick={onDelete}
             className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
             title="Delete"
+            aria-label="Delete"
             {...permissionGate(
               perms.can("delete", "dhcp_scope"),
               NEEDS_PXE_DELETE,
@@ -309,6 +328,10 @@ export function ProfileEditor(props: ProfileEditorProps) {
 
 function sanitizeMatches(matches: PXEArchMatchInput[]) {
   return matches.map((m) => ({
+    // An existing rule names its row (#3374) so an edit to its arch codes or
+    // vendor class keeps the Kea class a pool may be bound to; new rules send
+    // none.
+    ...(m.id ? { id: m.id } : {}),
     priority: m.priority ?? 100,
     match_kind: m.match_kind ?? "first_stage",
     vendor_class_match:
@@ -335,6 +358,7 @@ function ProfileEditorForm({
   const [matches, setMatches] = useState<PXEArchMatchInput[]>(
     () =>
       existing?.matches.map((m) => ({
+        id: m.id,
         priority: m.priority,
         match_kind: m.match_kind,
         vendor_class_match: m.vendor_class_match,

@@ -40,10 +40,16 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → OS Versions` or `/appliance → Releases`.
 
-### Two HelmChart CRs
+### HelmChart CRs
 
-- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install role (Control plane / Appliance). Owns the always-on resources (supervisor on every role; agent-landing on Appliance; control plane pods on Control plane).
-- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the role DaemonSets (dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+Four HelmChart CRs make up an appliance. Firstboot writes three of them into k3s's auto-deploy directory on every boot; the supervisor writes the fourth.
+
+- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` as `spatium-bootstrap.yaml`, from the `spatiumddi-appliance` chart tarball. Content depends on install role (Control plane / Appliance). Owns only the always-on resources: the supervisor on every role, plus agent-landing on an Appliance. It does **not** own the control plane pods.
+- **`spatium-control`** — written by firstboot as `spatium-control.yaml`, from the `spatiumddi` umbrella chart tarball, on the Control plane role. Owns the control plane pods (api, frontend, worker, beat, migrate, Postgres, Redis). The supervisor's sizing overrides land in the `spatium-control` HelmChartConfig.
+- **`spatium-metallb`** — written by firstboot as `spatium-metallb.yaml`, from the `spatiumddi-metallb` chart tarball. Runs MetalLB in its own `metallb-system` namespace for the shared control-plane VIP; the seed supervisor enables it and writes the pool through its HelmChartConfig.
+- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the role DaemonSets (dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / looking-glass). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+
+Firstboot also stages `spatium-appliance-tls.yaml` (the Web UI certificate Secret) beside them; it is a plain manifest, not a HelmChart.
 
 ### Why k3s
 
