@@ -1,3 +1,0 @@
-### Fixed
-
-- Subnet and block utilization figures follow every write that adds or frees an address: the reservation expiry sweep, an IP discovery pass and an nmap "Stamp discovered" now recount in the same pass instead of waiting for the hourly recount (#3320). The IPAM page also refetches block figures after address writes such as Bulk allocate, an address edit or a DHCP reservation save, so a parent block's Used figure follows without a reload (#3325). The IPAM tree, the Subnets list and the Dashboard's capacity figures draw amber and red from Settings' Warning and Critical Thresholds instead of a fixed 80% and 95% (#3327).
