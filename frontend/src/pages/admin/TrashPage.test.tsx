@@ -406,6 +406,8 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
   it("names a zone's records and pools", async () => {
     const t = await openDelete("dns_zone", 3);
     expect(t).toMatch(/All of its DNS records and its DNS pools/);
+    // #3504 — a shared reverse zone's purge would take another batch's PTRs.
+    expect(t).toMatch(/another trashed subnet's records cannot be purged/);
     expect(t).not.toMatch(/other row/);
   });
 
