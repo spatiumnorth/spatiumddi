@@ -1143,7 +1143,23 @@ async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, 
     return await wol.resolve_wake_params(db, aid)
 
 
+def _wake_host_refusal(user: User) -> OperationPermissionError | None:
+    """The REST wake route's second gate: the IPAM router needs type-level
+    ``write`` on ``subnet`` for ``POST /addresses/{id}/wake`` on top of the
+    route's own ``read`` on ``use_network_tools`` (#3461). ``None`` when held."""
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "subnet"):
+        return None
+    return OperationPermissionError("write", "subnet")
+
+
 async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
+    # wake_host is in neither the request-portal catalog nor the risky-op
+    # set, so the previewing user is always the one who applies.
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
     try:
         ip, mac, broadcast = await _load_wake_target(db, args)
     except ValueError as exc:
@@ -1164,6 +1180,9 @@ async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> 
     from app.services import wol  # noqa: PLC0415
 
     enforce_operation_permission(user, _OPERATIONS["wake_host"])
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        raise refusal
     ip, mac, broadcast = await _load_wake_target(db, args)
     # AI proposals always send from the control-plane (server) vantage.
     try:
@@ -1207,7 +1226,8 @@ register(
         preview=_preview_wake_host,
         apply=_apply_wake_host,
         category="network",
-        # ``read`` matches the rest of the network-tools surface.
+        # ``read`` matches the rest of the network-tools surface; the REST
+        # route also needs write on ``subnet`` (#3461), checked beside it.
         required_permission=("read", "use_network_tools"),
     )
 )
