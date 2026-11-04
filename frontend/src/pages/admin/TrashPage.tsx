@@ -262,7 +262,7 @@ function purgeScope(entry: TrashEntry): string {
     case "subnet":
       return ` Its DHCP scopes (with their pools and static assignments), its addresses and the DNS records published for them are removed with it.`;
     case "dns_zone":
-      return ` All of its DNS records and its DNS pools are removed with it. An auto-created reverse zone that still holds another trashed subnet's records cannot be purged on its own: purge or restore those subnets first.`;
+      return ` All of its DNS records and its DNS pools are removed with it. An auto-created reverse zone that still holds another trashed subnet's records cannot be purged on its own: purge those subnets first, or purge or restore the subnet the zone was deleted with.`;
     case "dhcp_scope":
       return ` Its pools and static assignments are removed with it.`;
     case "customer":
