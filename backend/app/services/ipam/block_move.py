@@ -79,6 +79,9 @@ class MovePlan:
     reparent_chain_block_ids: list[str] = field(default_factory=list)
     integration_blockers: list[IntegrationBlocker] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Subnets in the Trash under the moved subtree. They move with it (#3436),
+    # but the counts and the integration blockers cover live subnets only.
+    trashed_subnet_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -116,11 +119,17 @@ async def _try_advisory_lock(db: AsyncSession, resource_id: uuid.UUID) -> bool:
 
 async def _collect_descendants(
     db: AsyncSession, root_block_id: uuid.UUID
-) -> tuple[list[str], list[str], int]:
+) -> tuple[list[str], list[str], list[str], int]:
     """Return ``(descendant_block_ids, descendant_subnet_ids,
-    address_count)`` rooted at ``root_block_id`` (exclusive of the
-    root). Descendant subnet IDs cover every subnet under any
-    descendant block; address count is a SUM across those subnets.
+    trashed_subnet_ids, address_count)`` rooted at ``root_block_id``
+    (exclusive of the root). Descendant subnet IDs cover every live
+    subnet under any descendant block; address count is a SUM across
+    those subnets.
+
+    ``trashed_subnet_ids`` are the subnets in the Trash under the same
+    blocks. Their space follows the block too, as the trashed descendant
+    blocks' does, so a restore brings them back beside their block
+    (#3436). They stay out of the counts and the integration blockers.
     """
     blocks = (
         await db.execute(
@@ -138,19 +147,20 @@ async def _collect_descendants(
     ).fetchall()
     descendant_block_ids = [str(r[0]) for r in blocks]
     # Subnets are direct children of blocks (block_id FK); collect
-    # under the moved block AND every descendant block.
+    # under the moved block AND every descendant block, the Trash
+    # included, and keep the two apart.
     block_filter = [str(root_block_id), *descendant_block_ids]
     subnets = (
         await db.execute(
             text(
-                "SELECT id FROM subnet "
-                "WHERE block_id = ANY(CAST(:ids AS uuid[])) "
-                "AND deleted_at IS NULL"
+                "SELECT id, deleted_at IS NOT NULL FROM subnet "
+                "WHERE block_id = ANY(CAST(:ids AS uuid[]))"
             ),
             {"ids": block_filter},
         )
     ).fetchall()
-    descendant_subnet_ids = [str(r[0]) for r in subnets]
+    descendant_subnet_ids = [str(r[0]) for r in subnets if not r[1]]
+    trashed_subnet_ids = [str(r[0]) for r in subnets if r[1]]
     address_count = 0
     if descendant_subnet_ids:
         address_count = int(
@@ -164,7 +174,7 @@ async def _collect_descendants(
                 )
             ).scalar_one()
         )
-    return descendant_block_ids, descendant_subnet_ids, address_count
+    return descendant_block_ids, descendant_subnet_ids, trashed_subnet_ids, address_count
 
 
 def _owned_by_any(model: Any) -> Any:
@@ -195,7 +205,9 @@ async def _collect_integration_blockers(
     block holding UniFi / OPNsense / Cloud / NetBird / firewall-owned rows
     moved, and the reconciler re-created them in the source space.
     ``include_deleted`` keeps the old raw SQL's behaviour: soft-deleted
-    rows move with the block, so they block it too.
+    rows move with the block, so they block it too. The subnets checked
+    are the live ones, as they always were: the trashed subnets move as
+    well (#3436), but they do not refuse the move.
     """
     block_ids = [uuid.UUID(i) for i in (str(moved_block_id), *descendant_block_ids)]
     subnet_ids = [uuid.UUID(i) for i in descendant_subnet_ids]
@@ -260,13 +272,17 @@ async def _check_overlap_in_target(
     """
     moved_net = ipaddress.ip_network(str(moved_block.network), strict=False)
 
+    # deleted_at IS NULL: raw SQL bypasses the ORM soft-delete filter. A trashed
+    # block frees its CIDR for a move as it does for a create (#490), and stays
+    # off the reparent chain, so a move never rewrites a row in the Trash (#3418).
     if target_parent_id is None:
         sql = (
             "SELECT id, network::text FROM ip_block "
             "WHERE space_id = CAST(:space AS uuid) "
             "AND parent_block_id IS NULL "
             "AND network && CAST(:net AS cidr) "
-            "AND id != CAST(:self AS uuid)"
+            "AND id != CAST(:self AS uuid) "
+            "AND deleted_at IS NULL"
         )
         params: dict[str, Any] = {
             "space": str(target_space_id),
@@ -279,7 +295,8 @@ async def _check_overlap_in_target(
             "WHERE space_id = CAST(:space AS uuid) "
             "AND parent_block_id = CAST(:parent AS uuid) "
             "AND network && CAST(:net AS cidr) "
-            "AND id != CAST(:self AS uuid)"
+            "AND id != CAST(:self AS uuid) "
+            "AND deleted_at IS NULL"
         )
         params = {
             "space": str(target_space_id),
@@ -373,9 +390,12 @@ async def assemble_move_plan(
     if target_parent_id is not None:
         await _validate_target_parent(db, moved_block, target_space_id, target_parent_id)
 
-    descendant_block_ids, descendant_subnet_ids, ip_count = await _collect_descendants(
-        db, moved_block.id
-    )
+    (
+        descendant_block_ids,
+        descendant_subnet_ids,
+        trashed_subnet_ids,
+        ip_count,
+    ) = await _collect_descendants(db, moved_block.id)
 
     blockers = await _collect_integration_blockers(
         db, moved_block.id, descendant_block_ids, descendant_subnet_ids
@@ -420,6 +440,7 @@ async def assemble_move_plan(
         reparent_chain_block_ids=reparent_chain,
         integration_blockers=blockers,
         warnings=warnings,
+        trashed_subnet_ids=trashed_subnet_ids,
     )
 
 
@@ -490,11 +511,14 @@ async def commit_move(
             .values(space_id=uuid.UUID(plan.target_space_id))
         )
 
-    # 3. Descendant subnets — Subnet has its own space_id column.
-    if plan.descendant_subnet_ids:
+    # 3. Descendant subnets: Subnet has its own space_id column. The ones in
+    # the Trash move too, as the trashed descendant blocks do in step 2, so a
+    # restore brings them back beside their block (#3436).
+    subnet_ids = [*plan.descendant_subnet_ids, *plan.trashed_subnet_ids]
+    if subnet_ids:
         await db.execute(
             update(Subnet)
-            .where(Subnet.id.in_([uuid.UUID(s) for s in plan.descendant_subnet_ids]))
+            .where(Subnet.id.in_([uuid.UUID(s) for s in subnet_ids]))
             .values(space_id=uuid.UUID(plan.target_space_id))
         )
 

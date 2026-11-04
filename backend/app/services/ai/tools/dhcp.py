@@ -690,11 +690,14 @@ async def list_phone_profiles(
         return []
 
     # Roll up scope-attachment counts in one query rather than per-row.
+    # Counted through ``DHCPScope`` so the soft-delete filter leaves a scope
+    # in the Trash out, as the profile's own read does (#3448).
     counts_stmt = (
         select(
             DHCPPhoneProfileScope.profile_id,
-            func.count(DHCPPhoneProfileScope.scope_id),
+            func.count(DHCPScope.id),
         )
+        .join(DHCPScope, DHCPScope.id == DHCPPhoneProfileScope.scope_id)
         .where(DHCPPhoneProfileScope.profile_id.in_([p.id for p in rows]))
         .group_by(DHCPPhoneProfileScope.profile_id)
     )

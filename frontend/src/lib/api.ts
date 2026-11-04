@@ -11306,8 +11306,18 @@ export interface NetworkDashboardOverlayImpactRow {
   site_count: number;
   note: string;
 }
+export interface NetworkDashboardWithheld {
+  asn: boolean;
+  circuit: boolean;
+  service: boolean;
+  overlay: boolean;
+}
 export interface NetworkDashboardSummary {
   generated_at: string;
+  /** Panels the server emptied because the caller may not read them: their
+   *  zeros are "not visible to you", never an all-clear (#3449). Optional
+   *  for an older server. */
+  withheld?: Partial<NetworkDashboardWithheld>;
   asn_drift_count: number;
   rpki_expiring_count: number;
   rpki_expired_count: number;
@@ -11383,6 +11393,10 @@ export interface IntegrationsDashboardErrorRow {
 export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
+  /** Enabled integrations the caller may not read: left out of `panels` and
+   *  of both recent lists, so the tab names them rather than reading the gap
+   *  as "nothing enabled" or an all-clear (#3456). Absent from older servers. */
+  withheld?: { kind: string; label: string }[];
   recent_errors: IntegrationsDashboardErrorRow[];
   // #2577 — rows a sync released outside its target's IP space; same shape,
   // `error_detail` carries what was released. Absent from older servers.

@@ -19,6 +19,7 @@ import {
   type DNSZone,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -60,11 +61,16 @@ export function DNSPoolsPage() {
     null,
   );
 
-  const { data: pools = [], isFetching } = useQuery({
+  const {
+    data: poolsData,
+    isFetching,
+    error: poolsError,
+  } = useQuery({
     queryKey: ["dns-pools-all"],
     queryFn: () => dnsApi.listAllPools(),
     refetchInterval: 30_000,
   });
+  const pools = poolsData ?? [];
 
   const checkNow = useMutation({
     mutationFn: (poolId: string) => dnsApi.checkPoolNow(poolId),
@@ -107,7 +113,15 @@ export function DNSPoolsPage() {
         {isFetching && pools.length === 0 && (
           <p className="text-sm text-muted-foreground">Loading…</p>
         )}
-        {!isFetching && pools.length === 0 && (
+        {/* A refused read (pools take `manage_dns_pools`, and the sidebar
+            offers this page to every DNS reader) or a failed one says so,
+            not "No DNS pools yet" (#3426). */}
+        {!isFetching && pools.length === 0 && poolsError != null && (
+          <p className="text-sm">
+            <ListReadError error={poolsError} what="DNS pools" />
+          </p>
+        )}
+        {!isFetching && pools.length === 0 && poolsError == null && (
           <div className="flex flex-col items-center justify-center rounded-md border border-dashed bg-card py-16 text-center">
             <p className="text-sm text-muted-foreground">No DNS pools yet.</p>
             <p className="mt-1 max-w-md text-xs text-muted-foreground">
