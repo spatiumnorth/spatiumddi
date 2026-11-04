@@ -166,10 +166,11 @@ function GroupSidebar({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
   });
-  const { data: ungrouped = [] } = useQuery({
+  const { data: serversData, error: serversError } = useQuery({
     queryKey: ["dhcp-servers", "all"],
     queryFn: () => dhcpApi.listServers(),
   });
+  const ungrouped = serversData ?? [];
 
   function toggle(id: string) {
     setExpanded((prev) => {
@@ -285,18 +286,29 @@ function GroupSidebar({
                   <Wifi className="h-3.5 w-3.5 flex-shrink-0" />
                   <span className="text-sm font-medium truncate">{g.name}</span>
                   <span className="ml-auto text-xs text-muted-foreground">
-                    {serversInGroup.length}
+                    {/* A refused, failed or unanswered read has no count (#3426). */}
+                    {serversData !== undefined ? serversInGroup.length : null}
                   </span>
                 </button>
               </div>
 
               {isExpanded && (
                 <div className="ml-6 mb-1">
-                  {serversInGroup.length === 0 && (
-                    <p className="py-1 text-xs text-muted-foreground/70">
-                      No servers in this group.
+                  {/* A refused or failed read says so, and one not answered
+                      yet says nothing: neither is "No servers in this
+                      group." (#3426). */}
+                  {serversInGroup.length === 0 && serversError != null && (
+                    <p className="py-1 text-xs">
+                      <ListReadError error={serversError} what="DHCP servers" />
                     </p>
                   )}
+                  {serversInGroup.length === 0 &&
+                    serversData !== undefined &&
+                    serversError == null && (
+                      <p className="py-1 text-xs text-muted-foreground/70">
+                        No servers in this group.
+                      </p>
+                    )}
                   {serversInGroup.map((s) => {
                     const active =
                       selection?.type === "server" &&
@@ -2461,8 +2473,16 @@ export function OptionTemplatesTab({ groupId }: { groupId: string }) {
           title="Delete Option Template"
           description={`Delete template "${del.name}"? Scopes that already had it applied keep their options.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>

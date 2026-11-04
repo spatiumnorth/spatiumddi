@@ -14,6 +14,7 @@ import {
 
 import { applianceApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useSessionState } from "@/lib/useSessionState";
 import { FleetTab } from "./FleetTab";
 import { ClusterTab } from "./ClusterTab";
@@ -159,10 +160,16 @@ const TABS: TabSpec[] = [
 ];
 
 export function AppliancePage() {
+  // #3420: `/appliance/info` takes read on `appliance`. A caller who comes
+  // here for the certificate store alone (#3067, below) would be refused it
+  // on every load, each refusal a `denied` audit row under their name, so
+  // only a caller who may read it asks.
+  const canReadAppliance = usePermissions().can("read", "appliance");
   const { data: info } = useQuery({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
     staleTime: 5 * 60 * 1000,
+    enabled: canReadAppliance,
   });
 
   // #3067 — what kind of install this is comes from the public `/version`.

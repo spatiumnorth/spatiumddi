@@ -275,7 +275,7 @@ from app.services.dns_io import (
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
-from app.services.ipam.zone_binding import prune_group_ids
+from app.services.ipam.zone_binding import prune_group_ids, prune_zone_ids
 from app.services.soft_delete import (
     SoftDeleteBatch,
     add_to_batch,
@@ -2386,6 +2386,9 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
     # and effective-dns kept returning it (#3433). Pruned here, Trash rows
     # included, in any spelling the readers resolve.
     await prune_group_ids(db, [group.id])
+    # Its Trash zones go with it by FK cascade; IPAM names zones with no
+    # foreign key, so their ids are pruned here too (#3443).
+    await prune_zone_ids(db, [z.id for z in trashed_zones])
     collect_wake(dns_group_channel(group.id))
     await db.delete(group)
     await db.commit()

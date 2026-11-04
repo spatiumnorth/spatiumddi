@@ -114,7 +114,9 @@ def block_utilization_percent(allocated: int, network: object) -> float:
     return utilization_percent(block_allocated(allocated, network), total)
 
 
-async def recount_subnets_and_blocks(db: AsyncSession, subnet_ids: Iterable[uuid.UUID]) -> None:
+async def recount_subnets_and_blocks(
+    db: AsyncSession, subnet_ids: Iterable[uuid.UUID], *, audit_lock: bool = True
+) -> None:
     """Recount the cached counters of ``subnet_ids`` and every block above them.
 
     For the background paths that add or free address rows outside a
@@ -122,6 +124,12 @@ async def recount_subnets_and_blocks(db: AsyncSession, subnet_ids: Iterable[uuid
     ``discovered`` inserts): they recount in the same transaction rather
     than leave the figures to the hourly recount. Reads the flushed rows,
     so it is idempotent and safe to re-run. Does not commit.
+
+    Takes the audit-chain lock before any row lock (#3345), so pass
+    ``audit_lock=False`` only from a transaction that writes no audit row
+    after this call; see ``_lock_for_recount`` in the IPAM router. Holds the
+    rows until commit, so call it last, never before slow work such as a
+    driver call.
     """
     # The writers live in the IPAM router; imported here, not at module
     # level, because the router imports this module.
@@ -130,12 +138,17 @@ async def recount_subnets_and_blocks(db: AsyncSession, subnet_ids: Iterable[uuid
         _update_subnets_utilization,
     )
 
+    # The writers take the audit-chain lock, then subnet rows, then the block
+    # chain, each in id order, so concurrent batches (a Kea HA pair reports
+    # every lease twice) and audited writers cannot deadlock on them (#3345).
     ids = list(dict.fromkeys(subnet_ids))
     if not ids:
         return
     await db.flush()
-    await _update_subnets_utilization(db, ids)
+    await _update_subnets_utilization(db, ids, audit_lock=audit_lock)
     block_ids = (
         (await db.execute(select(Subnet.block_id).where(Subnet.id.in_(ids)))).scalars().all()
     )
-    await _update_blocks_utilization(db, [b for b in block_ids if b is not None])
+    await _update_blocks_utilization(
+        db, [b for b in block_ids if b is not None], audit_lock=audit_lock
+    )

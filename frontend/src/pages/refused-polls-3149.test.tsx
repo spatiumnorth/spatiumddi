@@ -48,6 +48,10 @@ const REFUSED = new Set([
   "lookingGlassApi.listPeers",
   "dashboardsApi.integrationsSummary",
   "dashboardsApi.networkSummary",
+  "dashboardsApi.securitySummary",
+  "dhcpApi.fleetPoolOccupancy",
+  "alertsApi.listEvents",
+  "alertsApi.listRules",
   "conformityApi.summary",
   "conformityApi.listResults",
   "pcapApi.listCaptures",
@@ -182,6 +186,32 @@ describe("refused reads are not polled (#3149)", () => {
     expect(document.body.textContent).toContain(
       "You don't have permission to see network signals",
     );
+  });
+
+  it("Dashboard Compliance and Security tabs (#3456)", async () => {
+    localStorage.setItem("dashboard-tab", "compliance");
+    await held(<DashboardPage />, 130_000);
+    // Two queries read events (the header's open alerts and this tab's):
+    // each asks once.
+    expect(calls.get("alertsApi.listEvents")).toBe(2);
+    cleanup();
+    calls.clear();
+    localStorage.setItem("dashboard-tab", "security");
+    await held(<DashboardPage />, 130_000);
+    expectAskedOnce(["dashboardsApi.securitySummary"]);
+    expect(document.body.textContent).toContain(
+      "You don't have permission to see security signals",
+    );
+  });
+
+  it("Dashboard Overview open alerts and DHCP pool pressure (#3456)", async () => {
+    await held(<DashboardPage />, 130_000);
+    expectAskedOnce(["alertsApi.listEvents"]);
+    cleanup();
+    calls.clear();
+    localStorage.setItem("dashboard-tab", "dhcp");
+    await held(<DashboardPage />, 130_000);
+    expectAskedOnce(["dhcpApi.fleetPoolOccupancy"]);
   });
 
   it("Dashboard Conformity tab", async () => {
