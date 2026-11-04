@@ -23,6 +23,8 @@ import {
   render,
   screen,
 } from "@testing-library/react";
+import { useState } from "react";
+import { Modal } from "./modal";
 import { HeaderMenu, type HeaderMenuItem } from "./header-menu";
 
 afterEach(cleanup);
@@ -360,4 +362,67 @@ describe("badge", () => {
     render(<HeaderMenu label="Zone" items={[item()]} />);
     expect(screen.queryByLabelText(/missing/)).toBeNull();
   });
+});
+
+describe("focus return for a dialog opened from an item (#3485)", () => {
+  // A dialog that opens only after an async read mounts once the menu item
+  // is gone; the trigger must already hold focus or the dialog records
+  // <body> as its opener and closing it strands the keyboard.
+  // jsdom keeps a detached element as activeElement; a browser drops focus
+  // on <body> the moment the focused node leaves the document.
+  const dropDetachedFocus = () => {
+    const a = document.activeElement as HTMLElement | null;
+    if (a && a !== document.body && !a.isConnected) a.blur();
+  };
+
+  function AsyncHarness({ sync }: { sync?: boolean }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <HeaderMenu
+          label="Zone"
+          items={[
+            item({
+              onSelect: () =>
+                sync
+                  ? setOpen(true)
+                  : void new Promise((r) => setTimeout(r, 2)).then(() => {
+                      dropDetachedFocus();
+                      setOpen(true);
+                    }),
+            }),
+          ]}
+        />
+        {open && (
+          <Modal title="Dlg" onClose={() => setOpen(false)}>
+            <button type="button">Cancel</button>
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  for (const sync of [false, true]) {
+    it(`returns focus to the trigger (${sync ? "sync" : "after an async read"})`, async () => {
+      render(<AsyncHarness sync={sync} />);
+      const trigger = screen.getByRole("button", { name: /Zone/ });
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      const menuItem = screen.getByRole("menuitem", { name: /Alpha/ });
+      menuItem.focus();
+      fireEvent.click(menuItem);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      expect(screen.getByRole("dialog")).toBeTruthy();
+      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(trigger);
+    });
+  }
 });
