@@ -187,6 +187,7 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
                       <button
                         type="button"
                         title="Edit"
+                        aria-label="Edit"
                         onClick={() => setEdit(p)}
                         className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                         {...writeGate}
@@ -196,6 +197,7 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
                       <button
                         type="button"
                         title="Delete"
+                        aria-label="Delete"
                         onClick={() => setDel(p)}
                         className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                         {...deleteGate}
