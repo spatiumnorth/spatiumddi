@@ -1475,6 +1475,7 @@ export function ServicesPage() {
                     <button
                       type="button"
                       title="Edit"
+                      aria-label="Edit"
                       onClick={() => setEditing(s)}
                       className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                       {...writeGate}
@@ -1484,6 +1485,7 @@ export function ServicesPage() {
                     <button
                       type="button"
                       title="Delete"
+                      aria-label="Delete"
                       onClick={() => {
                         setConfirm({
                           title: "Delete service",

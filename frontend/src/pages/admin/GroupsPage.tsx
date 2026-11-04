@@ -457,6 +457,7 @@ export function GroupsPage() {
                         onClick={() => setEditGroup(group)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        aria-label="Edit"
                         {...adminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -465,6 +466,7 @@ export function GroupsPage() {
                         onClick={() => setDeleteGroup(group)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        aria-label="Delete"
                         {...adminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />

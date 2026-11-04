@@ -64,6 +64,7 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           onClick={() => setEdit(true)}
           className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
           title="Edit pool"
+          aria-label="Edit pool"
           {...permissionGate(perms.can("write", "dhcp_pool"), NEEDS_POOL_WRITE)}
         >
           <Pencil className="h-3.5 w-3.5" />
@@ -72,6 +73,7 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           onClick={() => setDel(true)}
           className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
           title="Delete pool"
+          aria-label="Delete pool"
           {...permissionGate(
             perms.can("delete", "dhcp_pool"),
             NEEDS_POOL_DELETE,
@@ -194,6 +196,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             onClick={() => setEditScope(true)}
             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
             title="Edit scope"
+            aria-label="Edit scope"
             {...permissionGate(canWriteScope, NEEDS_SCOPE_WRITE)}
           >
             <Pencil className="h-3.5 w-3.5" />
@@ -202,6 +205,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             onClick={() => setDeleteScope(true)}
             className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
             title="Delete scope"
+            aria-label="Delete scope"
             {...permissionGate(
               perms.can("delete", "dhcp_scope"),
               NEEDS_SCOPE_DELETE,

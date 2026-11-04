@@ -244,6 +244,7 @@ export function BgpMonitorTab({
                           <button
                             className="rounded p-1 hover:bg-muted"
                             title="Acknowledge"
+                            aria-label="Acknowledge"
                             onClick={() => setAckTarget(h)}
                             {...writeGate}
                           >
@@ -332,6 +333,7 @@ export function BgpMonitorTab({
                       <button
                         className="rounded p-1 hover:bg-muted"
                         title="Stop tracking"
+                        aria-label="Stop tracking"
                         onClick={() => delM.mutate(p.id)}
                         {...deleteGate}
                       >

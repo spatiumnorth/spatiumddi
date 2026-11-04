@@ -247,6 +247,7 @@ function PoolCard({
             onClick={onCheckNow}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Check now"
+            aria-label="Check now"
             {...poolGate}
           >
             <RefreshCw className="h-3.5 w-3.5" />
@@ -255,6 +256,7 @@ function PoolCard({
             onClick={onEdit}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Edit"
+            aria-label="Edit"
             {...poolGate}
           >
             <Pencil className="h-3.5 w-3.5" />
@@ -263,6 +265,7 @@ function PoolCard({
             onClick={onDelete}
             className="rounded p-1 text-muted-foreground hover:text-destructive"
             title="Delete"
+            aria-label="Delete"
             {...poolGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
