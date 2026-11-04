@@ -4827,17 +4827,21 @@ export function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
-  const { data, isLoading, isError } = useQuery<NetworkDashboardSummary>({
-    queryKey: ["dashboards", "network"],
-    queryFn: () => dashboardsApi.networkSummary(),
-    refetchInterval: 60_000,
-  });
+  const { data, isLoading, isError, error } = useQuery<NetworkDashboardSummary>(
+    {
+      queryKey: ["dashboards", "network"],
+      queryFn: () => dashboardsApi.networkSummary(),
+      // A refusal ends the poll (#3149).
+      refetchInterval: pollUnlessRefused(60_000),
+    },
+  );
 
+  // A refusal says so; any other failure says the read failed, never that
+  // the role may lack access (#3149).
   if (isError) {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
-        Network signals are unavailable. Your role may not include read access
-        to ASNs, circuits, services or overlays.
+        <ListReadError error={error} what="network signals" />
       </div>
     );
   }
@@ -4850,48 +4854,88 @@ function NetworkPanel() {
     );
   }
 
+  const w = data.withheld ?? {};
+  const NV = "not visible to your role";
+
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
       <div className="grid gap-3 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
         <NetworkKpi
           label="ASN drift"
-          value={data.asn_drift_count}
-          tone={data.asn_drift_count > 0 ? "warn" : "good"}
+          value={w.asn ? "—" : data.asn_drift_count}
+          tone={w.asn ? "default" : data.asn_drift_count > 0 ? "warn" : "good"}
+          hint={w.asn ? NV : undefined}
           to="/network/asns"
         />
-        <RpkiExpiringKpi data={data} />
+        {w.asn ? (
+          <NetworkKpi
+            label="RPKI expiring"
+            value="—"
+            tone="default"
+            to="/network/asns"
+            hint={NV}
+          />
+        ) : (
+          <RpkiExpiringKpi data={data} />
+        )}
         <NetworkKpi
           label="RPKI expired"
-          value={data.rpki_expired_count}
-          tone={data.rpki_expired_count > 0 ? "bad" : "good"}
+          value={w.asn ? "—" : data.rpki_expired_count}
+          tone={
+            w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
+          }
+          hint={w.asn ? NV : undefined}
           to="/network/asns"
         />
         <NetworkKpi
           label="Circuit alerts"
           value={
-            data.circuit_term_expiring_count + data.circuit_status_changed_count
+            w.circuit
+              ? "—"
+              : data.circuit_term_expiring_count +
+                data.circuit_status_changed_count
           }
           tone={
-            data.circuit_term_expiring_count +
-              data.circuit_status_changed_count >
-            0
-              ? "warn"
-              : "good"
+            w.circuit
+              ? "default"
+              : data.circuit_term_expiring_count +
+                    data.circuit_status_changed_count >
+                  0
+                ? "warn"
+                : "good"
           }
           to="/network/circuits"
-          hint={`${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`}
+          hint={
+            w.circuit
+              ? NV
+              : `${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`
+          }
         />
         <NetworkKpi
           label="Orphan services"
-          value={data.service_orphan_count}
-          tone={data.service_orphan_count > 0 ? "bad" : "good"}
+          value={w.service ? "—" : data.service_orphan_count}
+          tone={
+            w.service
+              ? "default"
+              : data.service_orphan_count > 0
+                ? "bad"
+                : "good"
+          }
+          hint={w.service ? NV : undefined}
           to="/network/services"
         />
         <NetworkKpi
           label="Overlays impacted"
-          value={data.overlay_impacted_count}
-          tone={data.overlay_impacted_count > 0 ? "warn" : "good"}
+          value={w.overlay ? "—" : data.overlay_impacted_count}
+          tone={
+            w.overlay
+              ? "default"
+              : data.overlay_impacted_count > 0
+                ? "warn"
+                : "good"
+          }
+          hint={w.overlay ? NV : undefined}
           to="/network/overlays"
         />
       </div>
@@ -4899,6 +4943,8 @@ function NetworkPanel() {
       <div className="grid gap-5 lg:grid-cols-2">
         <DashboardListCard
           title="ASN holder drift"
+          withheld={w.asn}
+          withheldHint="Not visible to your role."
           emptyHint="No ASNs in drift state right now."
         >
           {data.asn_drift.map((row) => (
@@ -4923,6 +4969,8 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="RPKI ROAs expiring soon"
+          withheld={w.asn}
+          withheldHint="Not visible to your role."
           emptyHint="No ROAs are expiring in the next 30 days."
         >
           {data.rpki_expiring.map((row) => (
@@ -4948,6 +4996,8 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="Circuit alerts"
+          withheld={w.circuit}
+          withheldHint="Not visible to your role."
           emptyHint="No circuits past term or in suspended/decom status."
         >
           {data.circuit_alerts.map((row) => (
@@ -4980,7 +5030,25 @@ function NetworkPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="Orphan services + overlay impact"
-          emptyHint="Service catalog clean and no overlays touching down circuits."
+          withheld={w.service && w.overlay}
+          withheldHint="Not visible to your role."
+          // With one half withheld, the card names that half whether or not
+          // the other half has rows: a list of orphan services alone must not
+          // read as "and no overlay impact" (#3449).
+          emptyHint={
+            w.service
+              ? "No overlays touching down circuits."
+              : w.overlay
+                ? "Service catalog clean."
+                : "Service catalog clean and no overlays touching down circuits."
+          }
+          note={
+            w.service && !w.overlay
+              ? "Orphan services are not visible to your role."
+              : w.overlay && !w.service
+                ? "Overlay impact is not visible to your role."
+                : undefined
+          }
         >
           {data.orphan_services.map((row) => (
             <Link
@@ -5728,10 +5796,18 @@ function DashboardListCard({
   title,
   emptyHint,
   withheld = false,
+  withheldHint,
+  note,
   children,
 }: {
   title: string;
   emptyHint: string;
+  /** A line under the list or the empty sentence, shown either way: for a
+   *  card part of which the server withheld (#3449). */
+  note?: string;
+  /** Replaces the default withheld sentence where there is no count above
+   *  the card to lean on (#3449). */
+  withheldHint?: string;
   /** The server stripped this list for the caller (#400): say so in place of
    *  the all-clear sentence (#3235). */
   withheld?: boolean;
@@ -5752,7 +5828,8 @@ function DashboardListCard({
       {childArray.length === 0 ? (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
           {withheld
-            ? "The detail is not shown to your role. The count above is the whole headline."
+            ? (withheldHint ??
+              "The detail is not shown to your role. The count above is the whole headline.")
             : emptyHint}
         </div>
       ) : (
@@ -5761,6 +5838,11 @@ function DashboardListCard({
             <li key={i}>{child}</li>
           ))}
         </ul>
+      )}
+      {note && (
+        <p className="border-t px-4 py-2 text-center text-[11px] text-muted-foreground">
+          {note}
+        </p>
       )}
     </div>
   );

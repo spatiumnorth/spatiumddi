@@ -1,0 +1,58 @@
+# Install a pinned Trivy from its GitHub release archive (#3464).
+#
+# aquasecurity/trivy-action installs Trivy through aquasecurity/setup-trivy,
+# whose install.sh downloads from get.trivy.dev. That host went NXDOMAIN on
+# 2026-11-03 (aquasecurity/setup-trivy#42), failing every Trivy step with
+# curl exit 6 -- the nightly scans, the release gate and the agent-image PR
+# gates all at once. This installs the same version straight from the GitHub
+# release instead, and every trivy-action use sets `skip-setup-trivy: true`
+# so the action runs the `trivy` this puts on PATH.
+#
+# The archive is verified against the release's checksums file and the step
+# fails closed: no checksum line for the archive, or a mismatch, is an error,
+# never an install of an unverified binary.
+#
+# The version is pinned in versions.json (component `trivy`). Keep it equal
+# to trivy-action's own `version` default, so dropping this step once
+# setup-trivy is fixed upstream changes nothing about what scans.
+name: Install Trivy
+description: Install a pinned Trivy release from GitHub, checksum-verified, onto PATH.
+inputs:
+  version:
+    description: Trivy version, without the leading v.
+    required: false
+    default: '0.70.0'
+runs:
+  using: composite
+  steps:
+    - name: Install Trivy from the GitHub release
+      shell: bash
+      env:
+        TRIVY_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_ARCH}" in
+          X64) arch=64bit ;;
+          ARM64) arch=ARM64 ;;
+          *) echo "::error::install-trivy: unsupported runner architecture ${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+        archive="trivy_${TRIVY_VERSION}_Linux-${arch}.tar.gz"
+        sums="trivy_${TRIVY_VERSION}_checksums.txt"
+        dl="${RUNNER_TEMP}/trivy-download"
+        bin="${RUNNER_TEMP}/trivy-bin"
+        rm -rf "${dl}" "${bin}"
+        mkdir -p "${dl}" "${bin}"
+        curl -fsSL --retry 3 --retry-all-errors -o "${dl}/${archive}" "${base}/${archive}"
+        curl -fsSL --retry 3 --retry-all-errors -o "${dl}/${sums}" "${base}/${sums}"
+        # --ignore-missing alone passes when the archive has NO line in the
+        # checksums file, so require the line first: an unlisted archive is
+        # unverified, not verified.
+        if ! grep -q "  ${archive}\$" "${dl}/${sums}"; then
+          echo "::error::install-trivy: ${archive} is not listed in ${sums}"
+          exit 1
+        fi
+        (cd "${dl}" && sha256sum -c --ignore-missing "${sums}")
+        tar -xzf "${dl}/${archive}" -C "${bin}" trivy
+        echo "${bin}" >> "${GITHUB_PATH}"
+        "${bin}/trivy" --version

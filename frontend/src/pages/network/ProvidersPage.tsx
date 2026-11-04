@@ -514,6 +514,7 @@ export function ProvidersPage() {
                       <button
                         type="button"
                         title="Edit"
+                        aria-label="Edit"
                         onClick={() => setEditing(p)}
                         className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                         {...editGate(p.id)}
@@ -523,6 +524,7 @@ export function ProvidersPage() {
                       <button
                         type="button"
                         title="Delete"
+                        aria-label="Delete"
                         onClick={() => {
                           setConfirm({
                             title: "Delete provider",

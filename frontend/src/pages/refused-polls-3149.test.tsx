@@ -2,8 +2,8 @@
  * @vitest-environment jsdom
  *
  * A read the server refused (403) is not asked again on a timer: the
- * Dashboard's integration lists, Looking Glass card, Integrations and
- * Conformity tabs, Packet Capture's list and the Looking Glass sessions and
+ * Dashboard's integration lists, Looking Glass card, Integrations, Network
+ * and Conformity tabs, Packet Capture's list and the Looking Glass sessions and
  * peers each ask once, since every refusal writes a `denied` audit row
  * (#3149).
  */
@@ -47,6 +47,7 @@ const REFUSED = new Set([
   "lookingGlassApi.listSessions",
   "lookingGlassApi.listPeers",
   "dashboardsApi.integrationsSummary",
+  "dashboardsApi.networkSummary",
   "conformityApi.summary",
   "conformityApi.listResults",
   "pcapApi.listCaptures",
@@ -171,6 +172,15 @@ describe("refused reads are not polled (#3149)", () => {
     expect(calls.get("pcapApi.listCaptures")).toBeGreaterThan(1);
     expect(document.body.textContent).toContain(
       "Couldn't load packet captures",
+    );
+  });
+
+  it("Dashboard Network tab (#3449)", async () => {
+    localStorage.setItem("dashboard-tab", "network");
+    await held(<DashboardPage />, 130_000);
+    expectAskedOnce(["dashboardsApi.networkSummary"]);
+    expect(document.body.textContent).toContain(
+      "You don't have permission to see network signals",
     );
   });
 

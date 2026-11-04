@@ -169,6 +169,12 @@ on inactive.
    self-service subnet request needs this of the **approver**, not the
    requester: an approver without `write` on the block gets a 403 and the
    request stays pending for one who has it.
+   **Growing into a block (#3439).** A resize is grow-only, so resizing a subnet
+   needs `write` on its parent block (a block resize applies the same check
+   to its parent block, though a nested block cannot grow into its ancestor
+   today). The preview lists the refusal as a
+   `permission` conflict; the resize itself is a 403. A top-level block has no
+   parent block and is unaffected.
    **IPAM subnets (#2438).** A `read` / `write` grant scoped to one subnet
    reaches that subnet and its addresses and nothing else. The routes it
    opens are an allow-list, so a route added later stays closed to it until

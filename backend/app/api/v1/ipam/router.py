@@ -142,6 +142,7 @@ from app.services.ipam.zone_binding import (
     check_group_uuid_list,
     check_zone_uuid,
     check_zone_uuid_list,
+    stored_uuid_list,
     stored_zone_uuid,
 )
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
@@ -491,6 +492,29 @@ def target_block_write_refusal(current_user: User, block: IPBlock) -> str:
             f"{block.network} ({block.name}, {block.id})"
         )
     return f"Permission denied: need 'write' on target block {block.id}"
+
+
+async def _resize_parent_refusal(
+    db: AsyncSession, current_user: User, parent_block_id: uuid.UUID | None
+) -> str | None:
+    """A resize is grow-only, so it always takes address space from the
+    parent block; that is the parent owner's to allocate (#3439). Returns the
+    refusal words when ``current_user`` may not write the parent, else None.
+    A top-level block has no parent block (the space bounds it)."""
+    if parent_block_id is None:
+        return None
+    parent = await db.get(IPBlock, parent_block_id)
+    if parent is None or user_has_permission(current_user, "write", "ip_block", parent.id):
+        return None
+    return target_block_write_refusal(current_user, parent)
+
+
+async def _require_resize_parent_write(
+    db: AsyncSession, current_user: User, parent_block_id: uuid.UUID | None
+) -> None:
+    refusal = await _resize_parent_refusal(db, current_user, parent_block_id)
+    if refusal is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
 
 
 router.include_router(io_router)
@@ -1211,6 +1235,43 @@ def _refuse_container_scan_for_bound_token(user: Any) -> None:
                 "API token is bound to specific subnets; free-space queries over a "
                 "block or space need a credential that is not"
             ),
+        )
+
+
+async def _assert_dns_groups_exist(
+    db: AsyncSession,
+    group_ids: Iterable[Any] | None,
+    *,
+    already: Iterable[Any] | None = None,
+) -> None:
+    """422 when ``dns_group_ids`` names a DNS server group that does not exist
+    (#3433).
+
+    The column is a JSONB id list with no foreign key, so nothing in the
+    database refuses an id that names no group: it would be stored, counted as
+    an inherited group by every subnet underneath and returned by
+    effective-dns, while the group picker shows none. The validators already
+    refuse a non-UUID; this refuses a UUID that names nothing.
+
+    ``already`` is what the row stores now. Those ids pass whatever they name:
+    the edit dialogs send the row's groups on every Save, so a row that carries
+    a dead id (a selective IPAM restore from a backup whose groups are gone)
+    must still take an unrelated edit. Only a NEW dead id is refused."""
+    stored = set(stored_uuid_list(already))
+    wanted = {uuid.UUID(str(g)) for g in group_ids or [] if g} - stored
+    if not wanted:
+        return
+    found = set(
+        (await db.execute(select(DNSServerGroup.id).where(DNSServerGroup.id.in_(wanted))))
+        .scalars()
+        .all()
+    )
+    missing = sorted(str(g) for g in wanted - found)
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"dns_group_ids names DNS server group(s) that do not exist: "
+            f"{', '.join(missing)}",
         )
 
 
@@ -5056,6 +5117,7 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await _assert_dns_groups_exist(db, body.dns_group_ids)
     # Pre-check the unique-name constraint so we can return a clean 409
     # instead of letting the DB raise an IntegrityError (→ 500).
     existing = await db.execute(select(IPSpace).where(IPSpace.name == body.name))
@@ -5129,6 +5191,7 @@ async def update_space(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
     )
+    await _assert_dns_groups_exist(db, body.dns_group_ids, already=space.dns_group_ids)
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
     # Rename uniqueness pre-check (#491): the partial unique index on name
@@ -5433,6 +5496,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await _assert_dns_groups_exist(db, body.dns_group_ids)
 
     # Verify parent block exists and belongs to the same space
     if body.parent_block_id:
@@ -5608,6 +5672,7 @@ async def update_block(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
     )
+    await _assert_dns_groups_exist(db, body.dns_group_ids, already=block.dns_group_ids)
 
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the block already holds.
@@ -6578,6 +6643,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # same fields does with ``dns_inherit_settings=false``.
     if body.dns_group_id is not None and not body.dns_group_ids:
         body.dns_group_ids = [str(body.dns_group_id)]
+    await _assert_dns_groups_exist(db, body.dns_group_ids)
     if body.dns_zone_id:
         body.dns_inherit_settings = False
 
@@ -7615,6 +7681,7 @@ async def update_subnet(
             subnet,
             [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         )
+    await _assert_dns_groups_exist(db, body.dns_group_ids, already=subnet.dns_group_ids)
 
     old_block_id = subnet.block_id
 
@@ -8095,7 +8162,7 @@ async def resize_subnet_preview(
     db: DB,
 ) -> SubnetResizePreviewResponse:
     _require_type_write(current_user, "subnet")
-    from app.services.ipam.resize import preview_subnet_resize
+    from app.services.ipam.resize import ResizeConflict, preview_subnet_resize
 
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
@@ -8107,6 +8174,9 @@ async def resize_subnet_preview(
         body.new_cidr,
         move_gateway_to_first_usable=body.move_gateway_to_first_usable,
     )
+    refusal = await _resize_parent_refusal(db, current_user, subnet.block_id)
+    if refusal is not None:
+        preview.conflicts.insert(0, ResizeConflict(type="permission", detail=refusal))
     return SubnetResizePreviewResponse(
         old_cidr=preview.old_cidr,
         new_cidr=preview.new_cidr,
@@ -8152,6 +8222,7 @@ async def resize_subnet_commit(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    await _require_resize_parent_write(db, current_user, subnet.block_id)
 
     old_snapshot = {
         "network": str(subnet.network),
@@ -8216,12 +8287,15 @@ async def resize_block_preview(
     db: DB,
 ) -> BlockResizePreviewResponse:
     _require_type_write(current_user, "ip_block")
-    from app.services.ipam.resize import preview_block_resize
+    from app.services.ipam.resize import ResizeConflict, preview_block_resize
 
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
     preview = await preview_block_resize(db, block, body.new_cidr)
+    refusal = await _resize_parent_refusal(db, current_user, block.parent_block_id)
+    if refusal is not None:
+        preview.conflicts.insert(0, ResizeConflict(type="permission", detail=refusal))
     return BlockResizePreviewResponse(
         old_cidr=preview.old_cidr,
         new_cidr=preview.new_cidr,
@@ -8255,6 +8329,8 @@ async def resize_block_commit(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+
+    await _require_resize_parent_write(db, current_user, block.parent_block_id)
 
     old_snapshot = {"network": str(block.network)}
 

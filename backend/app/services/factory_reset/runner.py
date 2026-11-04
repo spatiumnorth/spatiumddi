@@ -55,6 +55,7 @@ from app.services.factory_reset.sections import (
     FactorySection,
     expand_everything,
 )
+from app.services.ipam.zone_binding import prune_dead_group_ids_asyncpg
 
 logger = structlog.get_logger(__name__)
 
@@ -552,6 +553,11 @@ async def _execute_truncate_sections(
         await conn.execute(f"TRUNCATE TABLE {quoted} RESTART IDENTITY")
     for t in to_delete:
         await conn.execute(f'DELETE FROM "{t}"')
+    if "dns_server_group" in wanted:
+        # IPAM names DNS groups in a JSONB id list with no foreign key, so a
+        # DNS reset that keeps IPAM would leave every ``dns_group_ids`` entry
+        # naming a group that is gone (#3433).
+        await prune_dead_group_ids_asyncpg(conn)
     logger.info(
         "factory_reset_sections_wiped",
         sections=[s.key for s in sections],
