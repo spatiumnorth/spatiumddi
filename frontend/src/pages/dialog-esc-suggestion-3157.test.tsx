@@ -6,7 +6,7 @@
  */
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -141,6 +141,77 @@ describe("Esc on a suggestion reached with Tab (#3157)", () => {
     await user.tab(); // second suggestion
     await user.tab(); // out of the list, onto the value field
     expect(screen.queryByText("subnet-mask")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("DHCP option list: a mouse click on a suggestion still picks it (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    await user.click(screen.getByText("time-offset"));
+    expect((box as HTMLInputElement).value).toBe("2 — time-offset");
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("DHCP option list: a click on another suggestion after Tab picks the clicked one (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    await user.tab(); // focus on the first suggestion
+    await user.click(screen.getByText("time-offset"));
+    expect((box as HTMLInputElement).value).toBe("2 — time-offset");
+  });
+
+  it("DHCP option list: a press inside the list off a suggestion keeps it open (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    const list = document.getElementById(box.getAttribute("aria-controls")!)!;
+    // A browser moves focus to the body on a press of a non-focusable spot
+    // (jsdom does not), which would blur the search with no related target
+    // and close the list; the list must cancel that press.
+    expect(fireEvent.mouseDown(list)).toBe(false);
+    await user.click(list);
+    expect(screen.queryByText("subnet-mask")).not.toBeNull();
+    expect(document.activeElement).toBe(box);
+  });
+
+  it("DHCP option search is a combobox that names its list (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user, box } = await openOptionList(onClose);
+    expect(box.getAttribute("role")).toBe("combobox");
+    expect(box.getAttribute("aria-expanded")).toBe("true");
+    const list = document.getElementById(box.getAttribute("aria-controls")!);
+    expect(list?.textContent).toContain("subnet-mask");
+    await user.keyboard("{Escape}");
+    expect(box.getAttribute("aria-expanded")).toBe("false");
+    expect(box.hasAttribute("aria-controls")).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("IP picker: Shift+Tab out closes the list; a click on a result still picks it (#3486)", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<PickerDialog onClose={onClose} />);
+    const box = screen.getByPlaceholderText(/Search by IP/);
+    await user.type(box, "10.0");
+    await screen.findByText("h1 · 10.0.0.0/24 · default");
+    await user.tab({ shift: true });
+    expect(screen.queryByText("h1 · 10.0.0.0/24 · default")).toBeNull();
+    await user.click(box);
+    await screen.findByText("h1 · 10.0.0.0/24 · default");
+    await user.click(screen.getByText("10.0.0.1"));
+    expect((box as HTMLInputElement).value).toContain("10.0.0.1");
+    expect(screen.queryByText("h1 · 10.0.0.0/24 · default")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("tag filter: Shift+Tab out closes the list (#3486)", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<TagDialog onClose={onClose} />);
+    await user.click(screen.getByPlaceholderText(/Filter by tag/));
+    await screen.findByText("env");
+    await user.tab({ shift: true });
+    expect(screen.queryByText("env")).toBeNull();
     expect(onClose).not.toHaveBeenCalled();
   });
 
