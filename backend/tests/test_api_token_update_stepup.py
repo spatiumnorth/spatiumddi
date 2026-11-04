@@ -290,3 +290,61 @@ def test_scopes_widen() -> None:
     assert scopes_widen(None, ["read"]) is False
     assert scopes_widen([], []) is False
     assert scopes_widen(["read", "dns:write"], ["dns:write"]) is False
+
+
+@pytest.mark.asyncio
+async def test_token_of_a_disabled_owner_cannot_be_reenabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Auth refuses a disabled owner's token whatever is_active says, so the
+    re-enable would report success and change nothing (#3431)."""
+    owner, _ = await _user(db_session, superadmin=False)
+    _admin, headers = await _user(db_session, superadmin=True)
+    tok = await _token(db_session, owner, active=False)
+    owner.is_active = False
+    await db_session.commit()
+    r = await client.patch(
+        f"/api/v1/api-tokens/{tok.id}",
+        headers=headers,
+        json={"is_active": True, "stepup_password": _PW},
+    )
+    assert r.status_code == 409, r.text
+    assert "owner account is disabled" in r.json()["detail"]
+    assert (await _state(db_session, tok.id)).is_active is False
+    # Revoking and renaming stay available.
+    r = await client.patch(f"/api/v1/api-tokens/{tok.id}", headers=headers, json={"name": "n"})
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_list_reports_owner_is_active(client: AsyncClient, db_session: AsyncSession) -> None:
+    owner, _ = await _user(db_session, superadmin=False)
+    _admin, headers = await _user(db_session, superadmin=True)
+    tok = await _token(db_session, owner, active=True)
+    rows = {t["id"]: t for t in (await client.get("/api/v1/api-tokens", headers=headers)).json()}
+    assert rows[str(tok.id)]["owner_is_active"] is True
+    owner.is_active = False
+    await db_session.commit()
+    rows = {t["id"]: t for t in (await client.get("/api/v1/api-tokens", headers=headers)).json()}
+    assert rows[str(tok.id)]["owner_is_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_single_token_responses_report_the_owner(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """GET and PATCH fill the owner fields the list does: None there would
+    read as "owner state unknown" to a client (#3431)."""
+    owner, _ = await _user(db_session, superadmin=False)
+    _admin, headers = await _user(db_session, superadmin=True)
+    tok = await _token(db_session, owner, active=True)
+    owner.is_active = False
+    await db_session.commit()
+    r = await client.get(f"/api/v1/api-tokens/{tok.id}", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["owner_is_active"] is False
+    assert r.json()["owner_username"] == owner.username
+    r = await client.patch(f"/api/v1/api-tokens/{tok.id}", headers=headers, json={"name": "n2"})
+    assert r.status_code == 200, r.text
+    assert r.json()["owner_is_active"] is False
+    assert r.json()["owner_username"] == owner.username

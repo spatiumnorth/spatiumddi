@@ -41,6 +41,7 @@ function token(
   name: string,
   isActive: boolean,
   expiresAt: string | null = null,
+  ownerIsActive: boolean | null = true,
 ) {
   return {
     id,
@@ -51,6 +52,7 @@ function token(
     scopes: [],
     resource_grants: [],
     user_id: "u1",
+    owner_is_active: ownerIsActive,
     expires_at: expiresAt,
     last_used_at: null,
     is_active: isActive,
@@ -126,5 +128,39 @@ describe("API token Re-enable", () => {
     fireEvent.click(screen.getByTitle("Revoke"));
     await waitFor(() => expect(update).toHaveBeenCalled());
     expect(update).toHaveBeenCalledWith("t-live", { is_active: false });
+  });
+});
+
+describe("API token of a disabled owner (#3431)", () => {
+  async function showDisabledOwner(isActive: boolean) {
+    myPermissions.mockResolvedValue({ is_superadmin: true, grants: [] });
+    list.mockResolvedValue([
+      token("t-x", "orphan-token", isActive, null, false),
+    ]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("orphan-token");
+    await act(async () => {});
+  }
+
+  it("is not labelled Active", async () => {
+    await showDisabledOwner(true);
+    expect(screen.getByText("Owner disabled")).toBeTruthy();
+    expect(screen.queryByText("Active")).toBeNull();
+  });
+
+  it("disables Re-enable and says why", async () => {
+    await showDisabledOwner(false);
+    expect(screen.queryByTitle("Re-enable")).toBeNull();
+    const btn = screen.getByTitle(
+      /owner account is disabled/,
+    ) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
   });
 });

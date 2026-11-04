@@ -40,6 +40,7 @@ from app.services.ai.operations import (
     CreateIPAddressArgs,
     OperationPermissionError,
     get_operation,
+    previewing_for_requester,
     resource_reference_fields,
 )
 from app.services.requests.catalog import REQUEST_KINDS
@@ -660,9 +661,13 @@ async def test_previews_name_a_readable_target(db_session: AsyncSession) -> None
         ),
     )
     assert st.ok and SCOPE_NAME in st.preview_text
-    blk = await get_operation("allocate_subnet").preview(  # type: ignore[union-attr]
-        db_session, user, AllocateSubnetArgs(block_id=str(env.block.id), prefix_len=26)
-    )
+    # As a portal requester: for the user who will apply, a block they may
+    # not write is refused (#3425), which test_ipam_target_block_write_3425
+    # covers.
+    with previewing_for_requester():
+        blk = await get_operation("allocate_subnet").preview(  # type: ignore[union-attr]
+            db_session, user, AllocateSubnetArgs(block_id=str(env.block.id), prefix_len=26)
+        )
     assert blk.ok and "10.77.0.0/16" in blk.preview_text
 
 

@@ -308,6 +308,7 @@ export function TailscalePage() {
                             }
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
                             title="Sync Now"
+                            aria-label="Sync Now"
                             {...superadminGate}
                           >
                             <RotateCw
@@ -322,6 +323,7 @@ export function TailscalePage() {
                             onClick={() => setEdit(t)}
                             className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             title="Edit"
+                            aria-label="Edit"
                             {...superadminGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
@@ -330,6 +332,7 @@ export function TailscalePage() {
                             onClick={() => setDel(t)}
                             className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                             title="Delete"
+                            aria-label="Delete"
                             {...superadminGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />

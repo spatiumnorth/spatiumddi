@@ -29,6 +29,8 @@ on:
       # change guaranteed to need the proof was the one change that
       # could not get it.
       - ".github/workflows/build-supervisor-image.yml"
+      # #3464 — the shared Trivy install step this lane scans with.
+      - ".github/actions/install-trivy/**"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -72,9 +74,15 @@ jobs:
           cache-from: type=gha,scope=spatium-supervisor
           cache-to: type=gha,mode=max,scope=spatium-supervisor
 
+      # get.trivy.dev, which trivy-action's own setup downloads from,
+      # is gone (#3464): install from the GitHub release instead.
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           image-ref: ghcr.io/spatiumnorth/spatium-supervisor:pr-scan
           format: json
           output: trivy-report.json
