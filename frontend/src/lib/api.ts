@@ -3842,6 +3842,10 @@ export interface BrandingLogoInfo {
 export interface PlatformSettings {
   app_title: string;
   app_base_url: string;
+  // Read-only: the fields a non-superadmin holding `write` on `settings` may
+  // change through PUT /settings (the API's SETTINGS_DELEGATE_WRITABLE,
+  // #3429). Never sent back; the PUT body is only the edited fields.
+  delegate_writable_fields?: string[];
   // Login-screen acceptable-use banner — issue #885.
   login_banner_enabled: boolean;
   login_banner_title: string;
