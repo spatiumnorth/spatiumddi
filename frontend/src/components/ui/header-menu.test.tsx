@@ -425,4 +425,89 @@ describe("focus return for a dialog opened from an item (#3485)", () => {
       expect(document.activeElement).toBe(trigger);
     });
   }
+
+  it("lets an item that moves focus itself keep it", () => {
+    function Harness() {
+      return (
+        <>
+          <HeaderMenu
+            label="Zone"
+            items={[
+              item({
+                onSelect: () => document.getElementById("target")?.focus(),
+              }),
+            ]}
+          />
+          <input id="target" aria-label="Target" />
+        </>
+      );
+    }
+    render(<Harness />);
+    openMenu();
+    const menuItem = screen.getByRole("menuitem", { name: /Alpha/ });
+    menuItem.focus();
+    fireEvent.click(menuItem);
+    expect(document.activeElement).toBe(screen.getByLabelText("Target"));
+  });
+
+  it("leaves focus on a checkbox item, which keeps the menu open", () => {
+    const onSelect = vi.fn();
+    render(
+      <HeaderMenu
+        label="Zone"
+        items={[item({ key: "c", label: "Include", checked: false, onSelect })]}
+      />,
+    );
+    openMenu();
+    const box = screen.getByRole("menuitemcheckbox", { name: /Include/ });
+    box.focus();
+    fireEvent.click(box);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    expect(document.activeElement).toBe(box);
+  });
+
+  it("returns to a trigger inside a dialog, which stays open (#3483)", async () => {
+    function Nested() {
+      const [inner, setInner] = useState(false);
+      return (
+        <Modal title="Outer" onClose={() => {}}>
+          <HeaderMenu
+            label="Zone"
+            items={[
+              item({
+                onSelect: () =>
+                  void new Promise((r) => setTimeout(r, 2)).then(() => {
+                    dropDetachedFocus();
+                    setInner(true);
+                  }),
+              }),
+            ]}
+          />
+          {inner && (
+            <Modal title="Inner" onClose={() => setInner(false)}>
+              <button type="button">Cancel</button>
+            </Modal>
+          )}
+        </Modal>
+      );
+    }
+    render(<Nested />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    fireEvent.click(trigger);
+    const menuItem = screen.getByRole("menuitem", { name: /Alpha/ });
+    menuItem.focus();
+    fireEvent.click(menuItem);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(screen.getAllByRole("dialog")).toHaveLength(2);
+    const dialogs = screen.getAllByRole("dialog");
+    fireEvent.keyDown(dialogs[dialogs.length - 1], { key: "Escape" });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(document.activeElement).toBe(trigger);
+  });
 });
