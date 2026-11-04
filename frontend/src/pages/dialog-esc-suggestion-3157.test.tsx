@@ -113,6 +113,37 @@ describe("Esc on a suggestion reached with Tab (#3157)", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  async function openOptionList(onClose: () => void) {
+    const user = userEvent.setup();
+    wrap(<OptionsDialog onClose={onClose} />);
+    await user.click(screen.getByRole("button", { name: /Custom options/ }));
+    await user.click(screen.getByRole("button", { name: /Add custom option/ }));
+    const box = screen.getByPlaceholderText("Search code or name…");
+    await user.click(box);
+    await screen.findByText("subnet-mask");
+    return { user, box };
+  }
+
+  it("DHCP option list: Shift+Tab out closes the list; Esc then closes the dialog (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user } = await openOptionList(onClose);
+    await user.tab({ shift: true });
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("DHCP option list: Tab out past the list closes it (#3486)", async () => {
+    const onClose = vi.fn();
+    const { user } = await openOptionList(onClose);
+    await user.tab(); // into the first suggestion: list stays open
+    expect(screen.queryByText("subnet-mask")).not.toBeNull();
+    await user.tab(); // second suggestion
+    await user.tab(); // out of the list, onto the value field
+    expect(screen.queryByText("subnet-mask")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("IP picker: closes the list, the dialog stays", async () => {
     const onClose = vi.fn();
     const user = userEvent.setup();

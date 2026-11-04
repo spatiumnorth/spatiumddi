@@ -204,6 +204,14 @@ function CustomOptionRow({
               setOpen(false),
             )
           }
+          // Focus leaving the search and its list (Tab / Shift+Tab) closes
+          // the list; a move into the list itself keeps it open (#3486).
+          // Otherwise the next Esc, now outside the wrapper, closes the
+          // dialog with the list still showing.
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+              setOpen(false);
+          }}
         >
           <input
             className={inputCls}
