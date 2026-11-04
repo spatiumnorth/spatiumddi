@@ -525,3 +525,77 @@ describe("Find Free and the allocation band (#3391)", () => {
     await waitFor(() => expect(headings()).toContain("New Subnet"));
   });
 });
+
+describe("a regular address's Delete (#3409)", () => {
+  async function openRegular() {
+    answers.ipamApi = {
+      listAddresses: () =>
+        Promise.resolve([
+          {
+            id: "r",
+            subnet_id: "sub-1",
+            address: "10.142.1.20",
+            status: "allocated",
+            role: null,
+            hostname: "h-reg",
+            fqdn: null,
+            description: "",
+            mac_address: null,
+            tags: {},
+            custom_fields: {},
+            created_at: STAMP,
+            modified_at: STAMP,
+          },
+        ]),
+    };
+    answers.dhcpApi = { listScopesBySubnet: () => Promise.resolve([]) };
+    wrap(<SubnetDetail subnet={subnet} onSubnetEdited={() => {}} />);
+    await screen.findByText("10.142.1.20");
+    await settle();
+    return screen.getByText("10.142.1.20").closest("tr") as HTMLElement;
+  }
+  const inline = (row: HTMLElement) =>
+    row.querySelector(
+      'button[aria-label="Delete 10.142.1.20"]',
+    ) as HTMLButtonElement;
+
+  it("disables it, inline and right-click, with write but not delete", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+    ]);
+    const del = vi.fn(() => Promise.resolve({}));
+    const row = await openRegular();
+    answers.ipamApi.deleteAddress = del;
+    const btn = inline(row);
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toMatch(/delete/i);
+    fireEvent.click(btn);
+    await settle();
+    const m = await menuItems(row);
+    expect(m["Edit…"]).toBe(false);
+    expect(m["Delete…"]).toBe(true);
+    expect(item("Delete…").getAttribute("title")).toMatch(/delete/i);
+    fireEvent.click(item("Delete…"));
+    await settle();
+    expect(q('[role="dialog"]')).toBeNull();
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("still works for an editor with delete", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "*"],
+    ]);
+    const row = await openRegular();
+    expect(inline(row).disabled).toBe(false);
+    fireEvent.click(inline(row));
+    await waitFor(() => expect(q('[role="dialog"]')).toBeTruthy());
+    cleanup();
+    const row2 = await openRegular();
+    const m = await menuItems(row2);
+    expect(m["Delete…"]).toBe(false);
+  });
+});

@@ -7091,9 +7091,15 @@ export function SubnetDetail({
                                         onClick={() =>
                                           setConfirmDeleteAddr(addr)
                                         }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                                         title={`Delete ${addr.address}`}
                                         aria-label={`Delete ${addr.address}`}
+                                        // #3409 — DELETE /addresses/{id} takes
+                                        // delete, not write.
+                                        {...permissionGate(
+                                          canDeleteIpam,
+                                          NEEDS_ADDRESS_DELETE,
+                                        )}
                                       >
                                         <Trash2 className="h-3.5 w-3.5" />
                                       </button>
@@ -7138,6 +7144,10 @@ export function SubnetDetail({
                                 <ContextMenuItem
                                   destructive
                                   onSelect={() => setConfirmDeleteAddr(addr)}
+                                  {...permissionGate(
+                                    canDeleteIpam,
+                                    NEEDS_ADDRESS_DELETE,
+                                  )}
                                 >
                                   Delete…
                                 </ContextMenuItem>
@@ -7341,11 +7351,17 @@ export function SubnetDetail({
             setEditingAddress(a);
           }}
           onScan={() => setScanFromDetail(viewingAddress)}
-          onDelete={() => {
-            const a = viewingAddress;
-            setViewingAddress(null);
-            setConfirmDeleteAddr(a);
-          }}
+          // #3409 — the detail's Delete is the same DELETE: not offered
+          // without delete.
+          onDelete={
+            canDeleteIpam
+              ? () => {
+                  const a = viewingAddress;
+                  setViewingAddress(null);
+                  setConfirmDeleteAddr(a);
+                }
+              : undefined
+          }
           onTagClick={(chip) => {
             // Click-a-tag-to-filter affordance from the issue spec.
             // Dedupe — clicking the same tag twice on consecutive
