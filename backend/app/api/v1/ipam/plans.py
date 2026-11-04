@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
+from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
 from app.services.api_token_scopes import read_only_post
 from app.services.ipam.custom_field_rules import (
@@ -283,6 +284,41 @@ async def _validate_tree(
                         network=n.network,
                         kind="invalid_binding",
                         message=f"{field} is not a valid UUID: {raw}",
+                    )
+                )
+
+    # 1d. ``dns_group_id`` lands in the new rows' ``dns_group_ids``, a JSONB
+    #     list with no foreign key, so a plan saved before its group was
+    #     deleted would bind the new blocks / subnets to a group that no
+    #     longer exists (#3433). Refused here, with the node that names it.
+    group_refs: dict[uuid.UUID, list[PlanNode]] = {}
+    for n in _walk(tree):
+        if not n.dns_group_id:
+            continue
+        try:
+            group_refs.setdefault(uuid.UUID(str(n.dns_group_id)), []).append(n)
+        except ValueError:
+            continue  # reported as invalid_binding above
+    if group_refs:
+        live = set(
+            (
+                await db.execute(
+                    select(DNSServerGroup.id).where(DNSServerGroup.id.in_(group_refs.keys()))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for gid, nodes in group_refs.items():
+            if gid in live:
+                continue
+            for n in nodes:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"dns_group_id names a DNS server group that does not exist: {gid}",
                     )
                 )
 
