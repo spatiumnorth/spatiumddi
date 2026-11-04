@@ -10879,6 +10879,9 @@ export interface ApiToken {
   /** Set by the list endpoint (#2443). */
   owner_username?: string | null;
   owner_display_name?: string | null;
+  /** False when the owner is disabled: the token is refused (403) whatever
+   *  its own flag says (#3431). Set by the list endpoint. */
+  owner_is_active?: boolean | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;

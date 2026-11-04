@@ -112,10 +112,15 @@ class ApiTokenResponse(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     resource_grants: list[dict] = Field(default_factory=list)
     user_id: uuid.UUID | None
-    # Whose token this is (#2443). Filled by the list endpoint, which a
-    # superadmin sees across users; None elsewhere or for an ownerless token.
+    # Whose token this is (#2443), which a superadmin sees across users.
+    # None only for an ownerless token.
     owner_username: str | None = None
     owner_display_name: str | None = None
+    # False when the owner account is disabled: auth refuses every call with
+    # the token (403) whatever its own is_active says (#3431). None only for
+    # an ownerless token, so a client can read None as "no owner", never as
+    # "not looked up".
+    owner_is_active: bool | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
     is_active: bool
@@ -265,17 +270,18 @@ async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenRespons
     """List tokens owned by the caller. Superadmin sees everyone's, each
     row naming its owner."""
     stmt = (
-        select(APIToken, User.username, User.display_name)
+        select(APIToken, User.username, User.display_name, User.is_active)
         .outerjoin(User, User.id == APIToken.user_id)
         .order_by(APIToken.created_at.desc())
     )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
     out: list[ApiTokenResponse] = []
-    for token, username, display_name in (await db.execute(stmt)).all():
+    for token, username, display_name, owner_active in (await db.execute(stmt)).all():
         row = ApiTokenResponse.model_validate(token)
         row.owner_username = username
         row.owner_display_name = display_name or None
+        row.owner_is_active = owner_active
         out.append(row)
     return out
 
@@ -374,6 +380,9 @@ async def create_token(
         "last_used_at": token.last_used_at,
         "is_active": token.is_active,
         "created_at": token.created_at,
+        "owner_username": current_user.username,
+        "owner_display_name": current_user.display_name or None,
+        "owner_is_active": True,
         "token": raw,
     }
 
@@ -454,9 +463,9 @@ async def get_token(
     token_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
-) -> APIToken:
+) -> ApiTokenResponse:
     token = await _require_owned(token_id, db, current_user)
-    return token
+    return await _with_owner(db, token)
 
 
 @router.patch("/{token_id}", response_model=ApiTokenResponse)
@@ -466,7 +475,7 @@ async def update_token(
     request: Request,
     db: DB,
     current_user: CurrentUser,
-) -> APIToken:
+) -> ApiTokenResponse:
     """Rename, describe, revoke, re-enable or re-scope a token.
 
     Re-enabling an inactive token is superadmin-only and needs the step-up;
@@ -505,6 +514,21 @@ async def update_token(
                 "authenticate. Create a new token instead."
             ),
         )
+    # A disabled owner's tokens are refused at auth (403) whatever is_active
+    # says, so re-enabling would report success and change nothing (#3431).
+    if reenables and token.user_id is not None:
+        owner_active = (
+            await db.execute(select(User.is_active).where(User.id == token.user_id))
+        ).scalar_one_or_none()
+        if owner_active is False:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The owner account is disabled, so re-enabling this API token "
+                    "would not let it authenticate. Re-enable the owner first, "
+                    "then create a new token."
+                ),
+            )
     stepup_method: str | None = None
     if reenables or widens:
         stepup_method = await require_operator_stepup(
@@ -535,7 +559,7 @@ async def update_token(
     )
     await db.commit()
     await db.refresh(token)
-    return token
+    return await _with_owner(db, token)
 
 
 @router.delete("/{token_id}", status_code=204)
@@ -560,6 +584,25 @@ async def delete_token(
     )
     await db.execute(delete(APIToken).where(APIToken.id == token_id))
     await db.commit()
+
+
+async def _with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
+    """The single-token response with the owner fields the list fills, so a
+    GET or PATCH does not read as "owner state unknown" (#3431)."""
+    row = ApiTokenResponse.model_validate(token)
+    if token.user_id is not None:
+        owner = (
+            await db.execute(
+                select(User.username, User.display_name, User.is_active).where(
+                    User.id == token.user_id
+                )
+            )
+        ).one_or_none()
+        if owner is not None:
+            row.owner_username = owner.username
+            row.owner_display_name = owner.display_name or None
+            row.owner_is_active = owner.is_active
+    return row
 
 
 async def _require_owned(token_id: uuid.UUID, db: DB, current_user: CurrentUser) -> APIToken:
