@@ -4,28 +4,27 @@
   maintenance mode, the operator message, and when it started.
   Default-enabled (discovery, no secrets, read-only).
 
-* ``set_maintenance_mode`` — write. Flips maintenance mode on / off (and
-  optionally sets the banner message) through the same service path the
-  Settings toggle uses: server-stamps ``maintenance_started_at``, writes
-  an ``AuditLog`` row, and invalidates the middleware cache. Default-
-  DISABLED — turning the whole platform read-only is a broad-blast-radius
-  write per non-negotiable #13, so the operator opts this tool in.
+* ``propose_set_maintenance_mode``: stages turning maintenance mode on or
+  off (and optionally the banner message) as a proposal. The
+  ``set_maintenance_mode`` operation (``services/ai/operations_writes.py``)
+  runs only when the operator applies it, through the same rules as the
+  Settings toggle: server-stamped ``maintenance_started_at``, an
+  ``AuditLog`` row, and the middleware cache invalidated (#3415).
+  Default-DISABLED: turning the whole platform read-only is a
+  broad-blast-radius write per non-negotiable #13, so the operator opts
+  this tool in from the Tool Catalog.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
-from sqlalchemy import select
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import maintenance_mode as _maintenance_mode
-from app.core.permissions import is_effective_superadmin
-from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.settings import PlatformSettings
+from app.services.ai.operations_writes import SetMaintenanceModeArgs
 from app.services.ai.tools.base import register_tool
 
 # ── maintenance_status (read) ───────────────────────────────────────
@@ -71,97 +70,32 @@ async def maintenance_status(
     }
 
 
-# ── set_maintenance_mode (write, default-disabled) ──────────────────
-
-
-class SetMaintenanceModeArgs(BaseModel):
-    enabled: bool = Field(
-        description="Desired state: true puts the whole platform read-only, false lifts it."
-    )
-    message: str | None = Field(
-        default=None,
-        description=(
-            "Optional banner / 503-body message shown to operators while the "
-            "window is active. Omit to leave the existing message unchanged. "
-            "Max 500 characters."
-        ),
-    )
+# ── propose_set_maintenance_mode (proposal, default-disabled) ───────
 
 
 @register_tool(
-    name="set_maintenance_mode",
+    name="propose_set_maintenance_mode",
     permission="superadmin",
     description=(
-        "Turn system-wide maintenance mode on or off (issue #57). DISABLED by "
-        "default — flipping maintenance mode makes the ENTIRE platform "
-        "read-only (every mutating request 503s for non-superadmins), so this "
-        "broad-blast-radius write is opt-in per non-negotiable #13. Superadmin "
-        "only. Stamps the start time on enable, clears it on disable, and "
-        "writes an audit row. Optionally set the operator banner message."
+        "Propose turning system-wide maintenance mode on or off (issue #57), "
+        "optionally with the operator banner message. Preview/apply: the "
+        "model proposes, the operator clicks Apply. Maintenance mode makes "
+        "the ENTIRE platform read-only (every mutating request 503s for "
+        "non-superadmins), so this broad-blast-radius write is disabled by "
+        "default per non-negotiable #13. Superadmin only."
     ),
     args_model=SetMaintenanceModeArgs,
-    writes=True,
+    writes=False,  # The propose tool itself is read-only; apply is the write.
     category="ops",
     default_enabled=False,
     module=None,
 )
-async def set_maintenance_mode(
+async def propose_set_maintenance_mode(
     db: AsyncSession, user: User, args: SetMaintenanceModeArgs
 ) -> dict[str, Any]:
-    if not is_effective_superadmin(user):
-        return {
-            "error": (
-                "Maintenance mode can only be toggled by a superadmin. "
-                "Ask your platform admin to run this."
-            )
-        }
-    if args.message is not None and len(args.message) > 500:
-        return {"error": "message must be 500 characters or fewer"}
+    from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
 
-    row = (
-        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
-    ).scalar_one_or_none()
-    if row is None:
-        row = PlatformSettings(id=1)
-        db.add(row)
-
-    prev = bool(row.maintenance_mode_enabled)
-    row.maintenance_mode_enabled = args.enabled
-    if args.message is not None:
-        row.maintenance_message = args.message
-
-    flipped = args.enabled != prev
-    if flipped:
-        row.maintenance_started_at = datetime.now(UTC) if args.enabled else None
-        db.add(
-            AuditLog(
-                user_id=user.id,
-                user_display_name=user.display_name,
-                auth_source=user.auth_source,
-                action=(
-                    "maintenance_mode.enabled" if args.enabled else "maintenance_mode.disabled"
-                ),
-                resource_type="platform_settings",
-                resource_id="maintenance",
-                resource_display="Maintenance mode",
-                result="success",
-                new_value={"enabled": args.enabled, "message": row.maintenance_message or ""},
-            )
-        )
-
-    await db.commit()
-    await db.refresh(row)
-    _maintenance_mode.invalidate_cache()
-
-    return {
-        "ok": True,
-        "enabled": bool(row.maintenance_mode_enabled),
-        "message": row.maintenance_message or "",
-        "started_at": (
-            row.maintenance_started_at.isoformat() if row.maintenance_started_at else None
-        ),
-        "changed": flipped,
-    }
+    return await _propose_via(db=db, user=user, operation_name="set_maintenance_mode", args=args)
 
 
-__all__ = ["maintenance_status", "set_maintenance_mode"]
+__all__ = ["maintenance_status", "propose_set_maintenance_mode"]

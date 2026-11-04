@@ -58,12 +58,26 @@ async def test_next_ip_threads_extra_zone_ids_and_decom_date(
 ) -> None:
     _, token = await _make_admin(db_session)
     subnet = await _seed_subnet(db_session, "10.20.0.0/24")
+    group = DNSServerGroup(name=f"nx-{uuid.uuid4().hex[:6]}")
+    db_session.add(group)
+    await db_session.flush()
+    zone = DNSZone(group_id=group.id, name="extra.example.", zone_type="primary")
+    db_session.add(zone)
+    await db_session.flush()
+    extra_zone = str(zone.id)
     await db_session.commit()
     hdr = {"Authorization": f"Bearer {token}"}
 
-    # A non-existent extra zone UUID is harmless — the DNS fanout skips a zone
-    # it can't resolve — but the value must still land on the row (parity).
-    extra_zone = str(uuid.uuid4())
+    # An extra zone id that names no zone is refused (#3443): the columns carry
+    # no foreign key, so the write is where a dead id is stopped.
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{subnet.id}/next",
+        headers=hdr,
+        json={"hostname": "host0", "extra_zone_ids": [str(uuid.uuid4())]},
+    )
+    assert resp.status_code == 422, resp.text
+
+    # A real one must land on the row (parity).
     resp = await client.post(
         f"/api/v1/ipam/subnets/{subnet.id}/next",
         headers=hdr,

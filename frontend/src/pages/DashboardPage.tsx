@@ -709,11 +709,15 @@ function AttentionAgentsPanel({
 function OpenAlertsPanel({
   events,
   failed = false,
+  error,
   truncated = false,
 }: {
   events: AlertEvent[];
   /** The fetch failed. Distinct from "no open alerts" — see below. */
   failed?: boolean;
+  /** The fetch's error, so a refusal reads as one rather than as an outage
+   *  (#3456): the IPAM / DNS / DHCP Editor roles hold no `read alert`. */
+  error?: unknown;
   /** The response came back at the fetch cap, so the count is a floor. */
   truncated?: boolean;
 }) {
@@ -726,6 +730,14 @@ function OpenAlertsPanel({
   // A failed fetch renders as unknown, never as an all-clear. React Query
   // hands back the `[]` default on error, which would otherwise paint the
   // exact green "No open alerts" this panel exists to disprove.
+  if (failed && isRefused(error)) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+        <span className="font-medium">Open alerts</span>
+        <ListReadError error={error} what="alert events" />
+      </div>
+    );
+  }
   if (failed) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400">
@@ -1565,7 +1577,7 @@ export function DashboardPage() {
     queries: dnsGroups.map((g) => ({
       queryKey: ["dns-servers", g.id],
       queryFn: () => dnsApi.listServers(g.id),
-      refetchInterval: 30_000,
+      refetchInterval: pollUnlessRefused(30_000),
     })),
   });
   const allDnsServers: DNSServer[] = serverQueries.flatMap((q) => q.data ?? []);
@@ -1695,7 +1707,7 @@ export function DashboardPage() {
   const { data: platformHealth } = useQuery<PlatformHealthResponse>({
     queryKey: ["platform-health"],
     queryFn: platformHealthApi.get,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   // Open alert events (#942). Drives BOTH the header pill and the
@@ -1711,14 +1723,18 @@ export function DashboardPage() {
   // practice. When the response comes back exactly full the total is
   // rendered as "N+" rather than as a number we know is wrong.
   const OPEN_ALERT_FETCH_LIMIT = 1000;
-  const { data: openAlerts = [], isError: openAlertsFailed } = useQuery({
+  const {
+    data: openAlerts = [],
+    isError: openAlertsFailed,
+    error: openAlertsError,
+  } = useQuery({
     queryKey: ["alert-events", { open: true }],
     queryFn: () =>
       alertsApi.listEvents({
         open_only: true,
         limit: OPEN_ALERT_FETCH_LIMIT,
       }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   const openAlertsTruncated = openAlerts.length >= OPEN_ALERT_FETCH_LIMIT;
 
@@ -2251,6 +2267,7 @@ export function DashboardPage() {
             <OpenAlertsPanel
               events={openAlerts}
               failed={openAlertsFailed}
+              error={openAlertsError}
               truncated={openAlertsTruncated}
             />
           </WidgetErrorBoundary>
@@ -3236,17 +3253,25 @@ function ServerRow({
  * either would render as a red exhaustion bar for behaving correctly.
  */
 function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     // Belt and braces with the caller's ``dhcpOn`` guard (#2130).
     enabled: dhcpOn,
   });
 
   // A failed fetch must not render as "no pools configured" — that is the
   // same false-calm this panel exists to prevent, and an error boundary
-  // does not catch a rejected query.
+  // does not catch a rejected query. A refusal is neither: the role may
+  // not read pools, so say that rather than "could not load" (#3456).
+  if (isError && isRefused(error)) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs">
+        <ListReadError error={error} what="DHCP pool occupancy" />
+      </div>
+    );
+  }
   if (isError) {
     return (
       <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
@@ -4226,7 +4251,10 @@ function CompliancePanel({
   const hipaaCount = subnets.filter((s) => s.hipaa_scope).length;
   const internetCount = subnets.filter((s) => s.internet_facing).length;
 
-  const { data: rules = [] } = useQuery<AlertRule[]>({
+  // Both reads need `read alert`, which the IPAM / DNS / DHCP Editor roles
+  // lack: a refusal is shown as one, not as an empty list, and is asked once
+  // (#3456).
+  const { data: rules = [], error: rulesError } = useQuery<AlertRule[]>({
     queryKey: ["alert-rules"],
     queryFn: () => alertsApi.listRules(),
     staleTime: 30_000,
@@ -4237,10 +4265,10 @@ function CompliancePanel({
 
   // Open + recently-resolved compliance-change events. ``subject_type``
   // for these is ``audit:<resource_type>`` (see services/alerts.py).
-  const { data: events = [] } = useQuery<AlertEvent[]>({
+  const { data: events = [], error: eventsError } = useQuery<AlertEvent[]>({
     queryKey: ["alert-events", { compliance: true }],
     queryFn: () => alertsApi.listEvents({ limit: 200 }),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const complianceEvents = events
     .filter((e) => e.subject_type.startsWith("audit:"))
@@ -4291,7 +4319,11 @@ function CompliancePanel({
               Manage rules →
             </Link>
           </div>
-          {complianceRules.length === 0 ? (
+          {rulesError ? (
+            <div className="px-4 py-6 text-center text-xs">
+              <ListReadError error={rulesError} what="alert rules" />
+            </div>
+          ) : complianceRules.length === 0 ? (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
               No <code>compliance_change</code> rules yet. Three disabled seed
               rules ship at first boot — toggle one on in{" "}
@@ -4355,7 +4387,11 @@ function CompliancePanel({
               View all →
             </Link>
           </div>
-          {complianceEvents.length === 0 ? (
+          {eventsError ? (
+            <div className="px-4 py-6 text-center text-xs">
+              <ListReadError error={eventsError} what="alert events" />
+            </div>
+          ) : complianceEvents.length === 0 ? (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
               No compliance-change events. Either no rules are enabled or
               nothing scoped has been mutated yet.
@@ -5222,27 +5258,50 @@ function IntegrationsDashboardTabPanel() {
   }
 
   const enabledPanels = data.panels.filter((p) => p.enabled);
+  const withheld = data.withheld ?? [];
+  const withheldNote =
+    withheld.length > 0
+      ? `Not visible to your role: ${withheld.map((w) => w.label).join(", ")}.`
+      : undefined;
   if (enabledPanels.length === 0) {
     return (
       <div className="rounded-lg border border-dashed p-10 text-center">
         <Plug className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-        <p className="text-sm font-medium">No integrations are enabled yet</p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Head to{" "}
-          <Link
-            to="/admin/features"
-            className="text-primary underline underline-offset-2"
-          >
-            Features → Integrations
-          </Link>{" "}
-          to enable read-only infrastructure mirrors.
-        </p>
+        {withheld.length > 0 ? (
+          <>
+            <p className="text-sm font-medium">
+              No integrations your role can read are enabled
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">{withheldNote}</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm font-medium">
+              No integrations are enabled yet
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Head to{" "}
+              <Link
+                to="/admin/features"
+                className="text-primary underline underline-offset-2"
+              >
+                Features → Integrations
+              </Link>{" "}
+              to enable read-only infrastructure mirrors.
+            </p>
+          </>
+        )}
       </div>
     );
   }
 
   return (
     <div className="space-y-5">
+      {withheldNote && (
+        <p className="rounded-lg border border-dashed px-4 py-2 text-center text-xs text-muted-foreground">
+          {withheldNote} The error and warning lists below leave them out too.
+        </p>
+      )}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         {enabledPanels.map((p) => (
           <IntegrationCard key={p.kind} panel={p} />
@@ -5251,7 +5310,11 @@ function IntegrationsDashboardTabPanel() {
 
       <DashboardListCard
         title="Recent reconciler errors"
-        emptyHint="No reconciler errors in recent history."
+        emptyHint={
+          withheld.length > 0
+            ? "No reconciler errors in the integrations you can read."
+            : "No reconciler errors in recent history."
+        }
       >
         {data.recent_errors.map((e) => (
           <div key={e.id} className="px-4 py-2 text-xs">
@@ -5274,7 +5337,11 @@ function IntegrationsDashboardTabPanel() {
 
       <DashboardListCard
         title="Recent reconciler warnings"
-        emptyHint="No reconciler warnings in recent history."
+        emptyHint={
+          withheld.length > 0
+            ? "No reconciler warnings in the integrations you can read."
+            : "No reconciler warnings in recent history."
+        }
       >
         {(data.recent_warnings ?? []).map((w) => (
           <div key={w.id} className="px-4 py-2 text-xs">
@@ -5574,11 +5641,21 @@ export function DNSThreatCard() {
 // query. MFA coverage uses local-auth users only — external-auth
 // users authenticate against the upstream provider.
 function SecurityPanel() {
-  const { data, isLoading } = useQuery<SecurityDashboardSummary>({
-    queryKey: ["dashboards", "security"],
-    queryFn: () => dashboardsApi.securitySummary(),
-    refetchInterval: 60_000,
-  });
+  const { data, isLoading, isError, error } =
+    useQuery<SecurityDashboardSummary>({
+      queryKey: ["dashboards", "security"],
+      queryFn: () => dashboardsApi.securitySummary(),
+      refetchInterval: pollUnlessRefused(60_000),
+    });
+
+  // A failed read used to leave "Loading security signals…" up for good.
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        <ListReadError error={error} what="security signals" />
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
