@@ -417,6 +417,11 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
                           ? "Cancel scan"
                           : "Delete scan"
                       }
+                      aria-label={
+                        s.status === "queued" || s.status === "running"
+                          ? "Cancel scan"
+                          : "Delete scan"
+                      }
                       disabled={singleDelete.isPending}
                       onClick={() => setPendingSingle(s)}
                       className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"

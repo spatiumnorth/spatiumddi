@@ -210,6 +210,7 @@ function GroupSidebar({
             className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
             onClick={onCreateGroup}
             title="New group"
+            aria-label="New group"
             {...superadminGate}
           >
             <Plus className="h-3.5 w-3.5" />
@@ -1277,6 +1278,7 @@ function GroupServersList({
                       onEditServer(s);
                     }}
                     title="Edit server"
+                    aria-label="Edit server"
                     {...superadminGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
@@ -1288,6 +1290,7 @@ function GroupServersList({
                       onDeleteServer(s);
                     }}
                     title="Delete server"
+                    aria-label="Delete server"
                     {...superadminGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />

@@ -737,6 +737,7 @@ export function AlertsPage() {
                         <button
                           onClick={() => toggle.mutate(r)}
                           title={r.enabled ? "Disable" : "Enable"}
+                          aria-label={r.enabled ? "Disable" : "Enable"}
                           className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           {...superadminGate}
                         >
@@ -745,6 +746,7 @@ export function AlertsPage() {
                         <button
                           onClick={() => setEditing(r)}
                           title="Edit"
+                          aria-label="Edit"
                           className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           {...superadminGate}
                         >
@@ -757,6 +759,7 @@ export function AlertsPage() {
                             }
                           }}
                           title="Delete"
+                          aria-label="Delete"
                           className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
                           {...superadminGate}
                         >

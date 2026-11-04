@@ -1017,7 +1017,12 @@ rather than swallowing the failure. Permission-related rejections
   left, so a re-enabled account starts with no sessions, even one disabled
   before this change. While an account is disabled, a request on one of
   its sessions is refused with `403` and is not recorded as activity
-  (`last_seen_at` stays), and a refresh returns `401`.
+  (`last_seen_at` stays), and a refresh returns `401`. Disabling also
+  revokes the account's API tokens (#3432; `api_tokens_revoked` on the
+  user's audit row, and one `api_token` audit row per token). A token
+  minted while the disable is saving is refused (403). Re-enabling does
+  not bring them back, and revokes any token still live (one an account
+  disabled before this change kept): mint new ones.
   `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
 - **Open streams re-check their caller.** A streaming response (cluster
   health, pod logs, nmap progress, AI chat) re-runs the same session,

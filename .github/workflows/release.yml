@@ -257,6 +257,11 @@ jobs:
           mkdir -p digests
           printf '%s\n' "$DIGEST" > "digests/${IMAGE}"
 
+      # get.trivy.dev, which trivy-action's own setup downloads from,
+      # is gone (#3464): install from the GitHub release instead.
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       # Trivy reports; trivy-gate.sh decides (see its header: a fix Trivy
       # knows about but the package mirrors do not have yet is deferred,
       # anything a rebuild would cure fails). ``exit-code: 0`` because the
@@ -264,6 +269,7 @@ jobs:
       - name: Trivy (amd64)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           image-ref: scan-target:${{ matrix.image }}-amd64
           severity: HIGH,CRITICAL
           ignore-unfixed: true
@@ -276,6 +282,7 @@ jobs:
       - name: Trivy (arm64)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           image-ref: scan-target:${{ matrix.image }}-arm64
           severity: HIGH,CRITICAL
           ignore-unfixed: true

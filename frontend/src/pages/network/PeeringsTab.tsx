@@ -392,6 +392,7 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
                             setShowForm(true);
                           }}
                           title="Edit"
+                          aria-label="Edit"
                           className="rounded p-1 hover:bg-accent disabled:opacity-50"
                           {...writeGate}
                         >
@@ -413,6 +414,7 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
                           }}
                           disabled={deleteMut.isPending}
                           title="Delete"
+                          aria-label="Delete"
                           className="rounded p-1 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50"
                           {...deleteGate}
                         >

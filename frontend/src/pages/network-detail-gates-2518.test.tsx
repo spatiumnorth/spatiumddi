@@ -107,11 +107,33 @@ function expectDenied(el: HTMLElement, reason: string) {
 function expectOffered(el: HTMLElement) {
   expect((el as HTMLButtonElement).disabled).toBe(false);
 }
-const byName = (n: string | RegExp) => screen.getByRole("button", { name: n });
+/** A refused icon-only button keeps its action name (#3395) but is
+ *  disabled. At least one must be found, so a button that vanished, or one
+ *  named by its refusal again, fails here instead of passing vacuously. */
+function expectRefused(name: string | RegExp) {
+  const found = screen.getAllByRole("button", { name });
+  for (const b of found) expect((b as HTMLButtonElement).disabled).toBe(true);
+}
 
-/** A gated icon button is named by its tooltip, so while it is denied the
- *  reason is its name. Every button carrying that reason is disabled; an
- *  enabled icon button is found by its own title instead. */
+/** A refused icon-only button is named by its action (aria-label, #3395) and
+ *  carries the refusal reason as its tooltip: find it by either. */
+function gated(name: string | RegExp): HTMLElement {
+  const byRole = screen.queryAllByRole("button", { name });
+  if (byRole.length === 1) return byRole[0];
+  // Only the icon buttons carry an aria-label; a text button's title is
+  // the same reason and must not make the lookup ambiguous.
+  const byTitle = screen
+    .queryAllByTitle(name)
+    .filter((el) => el.hasAttribute("aria-label"));
+  if (byTitle.length !== 1) return screen.getByTitle(name);
+  return byTitle[0];
+}
+
+const byName = (n: string | RegExp) => gated(n);
+
+/** A gated icon button carries the reason as its tooltip while it is
+ *  denied (its name stays the action, #3395). Every button carrying that
+ *  reason is disabled; an enabled icon button is found by its own title. */
 function expectIconsDenied(reason: string, count: number) {
   const found = screen.getAllByTitle(reason) as HTMLButtonElement[];
   expect(found.length).toBe(count);
@@ -279,7 +301,7 @@ describe("an ASN's tabs (#2518)", () => {
     await settled();
     expectIconsDenied(WRITE, 2); // Add Peering + the row's Edit
     expectIconsDenied(DELETE, 1);
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expectRefused("Edit");
   });
 
   it("offers a Viewer no community write", async () => {
@@ -294,7 +316,7 @@ describe("an ASN's tabs (#2518)", () => {
     await settled();
     expectIconsDenied(WRITE, 2); // Add Community + the row's Edit
     expectIconsDenied(DELETE, 1);
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expectRefused("Edit");
   });
 
   it("offers an ASN manager every one", async () => {
@@ -394,7 +416,7 @@ describe("an overlay's tabs (#2518)", () => {
     await openOverlay(VIEWER, /^Sites/);
     expectIconsDenied(WRITE, 2); // Attach site + the row's Edit
     expectIconsDenied(DELETE, 1); // Detach
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expectRefused("Edit");
   });
 
   it("offers a Viewer no policy write", async () => {
@@ -403,7 +425,7 @@ describe("an overlay's tabs (#2518)", () => {
     // New policy + Move up + Move down + Edit
     expectIconsDenied(WRITE, 4);
     expectIconsDenied(DELETE, 1);
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expectRefused("Edit");
   });
 
   it("offers a superadmin the site and policy writes", async () => {
