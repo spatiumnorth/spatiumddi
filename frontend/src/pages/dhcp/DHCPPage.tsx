@@ -1921,6 +1921,7 @@ export function ServerPoolsOrStaticsTab({
   // ``dhcp_static`` (#1861), so gate the UI the same way.
   const qc = useQueryClient();
   const perms = usePermissions();
+  const dhcpGate = useDhcpGate();
   const [showCreate, setShowCreate] = useState(false);
   const [createScopeId, setCreateScopeId] = useState("");
   const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
@@ -2104,6 +2105,11 @@ export function ServerPoolsOrStaticsTab({
                   >
                     Hostname
                   </SortableTh>
+                  {kind === "statics" && (
+                    <th className="px-3 py-2">
+                      <span className="sr-only">Actions</span>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
@@ -2121,6 +2127,30 @@ export function ServerPoolsOrStaticsTab({
                             {s.ip_address}
                           </td>
                           <td className="px-3 py-2">{s.hostname || "—"}</td>
+                          {kind === "statics" && (
+                            <td className="px-3 py-2 text-right whitespace-nowrap">
+                              <button
+                                onClick={() =>
+                                  setEditStatic({ scope, item: s })
+                                }
+                                className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                                aria-label={`Edit static assignment ${s.ip_address}`}
+                                title="Edit static assignment"
+                                {...dhcpGate("write", "dhcp_static")}
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                onClick={() => setDelStatic({ scope, item: s })}
+                                className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                                aria-label={`Delete static assignment ${s.ip_address}`}
+                                title="Delete static assignment"
+                                {...dhcpGate("delete", "dhcp_static")}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </td>
+                          )}
                         </tr>
                       </ContextMenuTrigger>
                       <ContextMenuContent>
