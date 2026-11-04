@@ -82,10 +82,21 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
     onSuccess: invalidate,
   });
 
+  // The delete confirm is opened from a trash button inside the panel,
+  // and the panel closes as the dialog opens, so the button is unmounted
+  // and the dialog's own focus return has nowhere to go (the panel is not
+  // an ARIA menu, so it cannot fall back to the trigger either): focus
+  // would drop on <body> (#3484). Hand it to the Views trigger instead,
+  // whether the dialog is cancelled, closed with Esc or the delete lands.
+  const closeConfirm = () => {
+    setToDelete(null);
+    triggerRef.current?.focus();
+  };
+
   const remove = useMutation({
     mutationFn: (id: string) => savedViewsApi.remove(id),
     onSuccess: () => {
-      setToDelete(null);
+      closeConfirm();
       invalidate();
     },
   });
@@ -226,7 +237,7 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
         onConfirm={() => {
           if (toDelete) remove.mutate(toDelete.id);
         }}
-        onClose={() => setToDelete(null)}
+        onClose={closeConfirm}
       />
     </div>
   );
