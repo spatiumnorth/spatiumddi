@@ -477,7 +477,7 @@ function CertificateCard({
                 type="button"
                 onClick={onPasteCert}
                 {...writeGate}
-                className="inline-flex items-center gap-1 rounded-md border bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                className="inline-flex items-center gap-1 rounded-md border bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-400"
               >
                 <Upload className="h-3 w-3" />
                 Paste signed cert

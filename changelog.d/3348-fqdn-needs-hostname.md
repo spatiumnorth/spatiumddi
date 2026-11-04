@@ -1,3 +1,0 @@
-### Fixed
-
-- An address created through the Copilot `create_ip_address` operation or a self-service request with an FQDN and no hostname now takes as its hostname the part of the FQDN before the subnet's DNS zone, so the name it publishes and shows is the FQDN given. An FQDN outside that zone, in a subnet with no zone, or naming a different host than the hostname given is refused with the reason. A NetBox import stores an FQDN only beside the hostname it names: it no longer stores one whose host label sanitises to nothing, an overwrite no longer pairs the existing hostname with another host's FQDN, and the FQDN is folded the same way as the hostname (#3348).

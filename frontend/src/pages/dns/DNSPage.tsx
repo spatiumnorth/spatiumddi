@@ -4574,7 +4574,10 @@ export function ZoneDetailView({
       { replace: true },
     );
   };
-  const { data: poolsForCount = [] } = useQuery({
+  // The Pools tab's count waits for its read: pools take `manage_dns_pools`,
+  // a grant apart from `dns_zone`, so a reader of the zone can be refused
+  // them, and a refused, failed or unanswered read has no count (#3426).
+  const { data: poolsForCount } = useQuery({
     queryKey: ["dns-pools", group.id, zone.id],
     queryFn: () => dnsApi.listPools(group.id, zone.id),
     enabled: !isForward && !zone.tailscale_tenant_id,
@@ -5017,7 +5020,9 @@ export function ZoneDetailView({
                 : "border-transparent text-muted-foreground hover:text-foreground")
             }
           >
-            Records ({recordsTotal.toLocaleString()})
+            {/* No count until the records have loaded (#3385). */}
+            Records
+            {recordsPage !== undefined && ` (${recordsTotal.toLocaleString()})`}
           </button>
           <button
             type="button"
@@ -5029,7 +5034,9 @@ export function ZoneDetailView({
                 : "border-transparent text-muted-foreground hover:text-foreground")
             }
           >
-            Pools ({poolsForCount.length})
+            {/* No count until the pools have loaded (#3426). */}
+            Pools
+            {poolsForCount !== undefined && ` (${poolsForCount.length})`}
           </button>
           {(!modulesReady || tlsCertsOn) && (
             <button
@@ -5176,12 +5183,15 @@ export function ZoneDetailView({
                 setRecordPage(1);
               }}
             />
-            <span className="text-xs text-muted-foreground">
-              {recordsTotal.toLocaleString()}{" "}
-              {recordsTotal === 1 ? "record" : "records"}
-              {hasRecFilter && " · page filtered"}
-              {isFetching && " · loading…"}
-            </span>
+            {/* A refused, failed or unanswered read has no count (#3385). */}
+            {recordsPage !== undefined && (
+              <span className="text-xs text-muted-foreground">
+                {recordsTotal.toLocaleString()}{" "}
+                {recordsTotal === 1 ? "record" : "records"}
+                {hasRecFilter && " · page filtered"}
+                {isFetching && " · loading…"}
+              </span>
+            )}
             <div className="ml-auto">
               <Pager
                 page={recordPage}
@@ -5546,15 +5556,21 @@ export function ZoneDetailView({
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem
-                              disabled={!canWriteRecords}
                               onSelect={() => setEditRecord(r)}
+                              {...permissionGate(
+                                canWriteRecords,
+                                NEEDS_DNS_WRITE,
+                              )}
                             >
                               Edit…
                             </ContextMenuItem>
                             <ContextMenuItem
                               destructive
-                              disabled={!canDeleteRecords}
                               onSelect={() => setConfirmDeleteRecord(r)}
+                              {...permissionGate(
+                                canDeleteRecords,
+                                NEEDS_DNS_DELETE,
+                              )}
                             >
                               Delete…
                             </ContextMenuItem>
@@ -6068,7 +6084,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
     // Beat-scheduled dns-health-sweep task updates server rows.
     refetchInterval: 30_000,
   });
-  const { data: zones = [] } = useQuery({
+  // The serials line counts the group's zones, so it waits for that read: a
+  // refused or failed one draws no "no zones" (#3385).
+  const { data: zones } = useQuery({
     queryKey: ["dns-zones", group.id],
     queryFn: () => dnsApi.listZones(group.id),
   });
@@ -6137,7 +6155,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   </span>
                 ) : null,
             )}
-            <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
+            {zones !== undefined && (
+              <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
+            )}
           </div>
         </div>
       )}
@@ -6417,10 +6437,11 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
   const [error, setError] = useState("");
 
-  const { data: views = [] } = useQuery({
+  const { data: viewsData, error: viewsError } = useQuery({
     queryKey: ["dns-views", group.id],
     queryFn: () => dnsApi.listViews(group.id),
   });
+  const views = viewsData ?? [];
   const { data: servers = [] } = useQuery({
     queryKey: ["dns-servers", group.id],
     queryFn: () => dnsApi.listServers(group.id),
@@ -6488,7 +6509,14 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </div>
       )}
 
-      {views.length === 0 ? (
+      {/* A refused or failed read says so, and one not answered yet says
+          nothing: neither is "No views defined." (#3426). */}
+      {views.length === 0 && viewsError != null && (
+        <p className="text-sm">
+          <ListReadError error={viewsError} what="this group's views" />
+        </p>
+      )}
+      {views.length === 0 && viewsData !== undefined && viewsError == null ? (
         <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
           <p className="font-medium text-foreground">No views defined.</p>
           <p className="mt-1">
@@ -6502,7 +6530,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
             rendered into all of them.
           </p>
         </div>
-      ) : (
+      ) : views.length === 0 ? null : (
         <div className="space-y-2">
           {views.map((v) => {
             const scoped = blocklists.filter((b) =>
@@ -7028,10 +7056,11 @@ export function AclsTab({ groupId }: { groupId: string }) {
   // cites (409); the reason is shown in the dialog, which stays open.
   const [deleteError, setDeleteError] = useState("");
 
-  const { data: acls = [] } = useQuery({
+  const { data: aclsData, error: aclsError } = useQuery({
     queryKey: ["dns-acls", groupId],
     queryFn: () => dnsApi.listAcls(groupId),
   });
+  const acls = aclsData ?? [];
 
   const createMut = useMutation({
     mutationFn: (d: Record<string, unknown>) => dnsApi.createAcl(groupId, d),
@@ -7134,11 +7163,21 @@ export function AclsTab({ groupId }: { groupId: string }) {
           </div>
         </form>
       )}
-      {acls.length === 0 && !showCreate && (
-        <p className="text-sm text-muted-foreground italic">
-          No named ACLs defined.
+      {/* A refused or failed read says so, and one not answered yet says
+          nothing: neither is "No named ACLs defined." (#3426). */}
+      {acls.length === 0 && !showCreate && aclsError != null && (
+        <p className="text-sm">
+          <ListReadError error={aclsError} what="this group's ACLs" />
         </p>
       )}
+      {acls.length === 0 &&
+        !showCreate &&
+        aclsData !== undefined &&
+        aclsError == null && (
+          <p className="text-sm text-muted-foreground italic">
+            No named ACLs defined.
+          </p>
+        )}
       <div className="space-y-2">
         {acls.map((acl) => (
           <div
@@ -7228,10 +7267,15 @@ export function AclsTab({ groupId }: { groupId: string }) {
 export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
-  const { data: keys = [], isFetching } = useQuery({
+  const {
+    data: keysData,
+    isFetching,
+    error: keysError,
+  } = useQuery({
     queryKey: ["dns-tsig-keys", group.id],
     queryFn: () => dnsApi.listTSIGKeys(group.id),
   });
+  const keys = keysData ?? [];
   const [showAdd, setShowAdd] = useState(false);
   const [editKey, setEditKey] = useState<DNSTSIGKey | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSTSIGKey | null>(null);
@@ -7277,7 +7321,12 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-          {keys.length} TSIG key{keys.length !== 1 ? "s" : ""}
+          {/* A refused, failed or unanswered read has no count (#3426). */}
+          {keysData !== undefined && (
+            <>
+              {keys.length} TSIG key{keys.length !== 1 ? "s" : ""}
+            </>
+          )}
         </span>
         <div className="flex items-center gap-2">
           <button
@@ -7310,7 +7359,14 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
         <code>key {"<name>;"}</code>.
       </p>
 
-      {keys.length === 0 && (
+      {/* A refused or failed read says so, and one not answered yet says
+          nothing: neither is "No TSIG keys yet" (#3426). */}
+      {keys.length === 0 && keysError != null && (
+        <p className="text-xs">
+          <ListReadError error={keysError} what="this group's TSIG keys" />
+        </p>
+      )}
+      {keys.length === 0 && keysData !== undefined && keysError == null && (
         <p className="text-xs italic text-muted-foreground">
           No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
         </p>
@@ -9325,11 +9381,14 @@ function RecordsTab({
               setGroupRecordPage(1);
             }}
           />
-          <p className="text-xs text-muted-foreground">
-            {filtered.length.toLocaleString()} of{" "}
-            {recordsTotal.toLocaleString()}{" "}
-            {recordsTotal === 1 ? "record" : "records"}
-          </p>
+          {/* A refused, failed or unanswered read has no count (#3385). */}
+          {groupRecordsPage !== undefined && (
+            <p className="text-xs text-muted-foreground">
+              {filtered.length.toLocaleString()} of{" "}
+              {recordsTotal.toLocaleString()}{" "}
+              {recordsTotal === 1 ? "record" : "records"}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Pager
@@ -9624,7 +9683,7 @@ function ZonesTab({
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   const {
-    data: zones = [],
+    data: zonesData,
     isFetching,
     error: zonesError,
   } = useQuery({
@@ -9635,6 +9694,7 @@ function ZonesTab({
         tagFilters.length > 0 ? { tag: tagFilters } : undefined,
       ),
   });
+  const zones = zonesData ?? [];
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", group.id],
@@ -9886,10 +9946,16 @@ function ZonesTab({
     <div>
       <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-          {hasZoneFilter
-            ? `${filteredZones.length} / ${zones.length}`
-            : zones.length}{" "}
-          zone{zones.length !== 1 ? "s" : ""}
+          {/* The count is the length of the list below it, so a read that was
+              refused, failed or has not answered yet draws none (#3385). */}
+          {zonesData !== undefined && (
+            <>
+              {hasZoneFilter
+                ? `${filteredZones.length} / ${zones.length}`
+                : zones.length}{" "}
+              zone{zones.length !== 1 ? "s" : ""}
+            </>
+          )}
           {selected.size > 0 && (
             <span className="ml-2 text-primary normal-case tracking-normal">
               {selected.size} selected
@@ -10368,7 +10434,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
 
   const {
-    data: lists = [],
+    data: listsData,
     isFetching,
     error: listError,
   } = useQuery({
@@ -10380,6 +10446,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     // every pending row's last_synced_at has advanced past its baseline.
     refetchInterval: refreshing.size > 0 ? 3000 : false,
   });
+  const lists = listsData ?? [];
 
   // Clear the per-row pending flag as soon as the row's last_synced_at
   // advances past the value it had when the refresh was kicked off.
@@ -10604,7 +10671,12 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-          {lists.length} blocking list{lists.length !== 1 ? "s" : ""}
+          {/* A refused, failed or unanswered read has no count (#3385). */}
+          {listsData !== undefined && (
+            <>
+              {lists.length} blocking list{lists.length !== 1 ? "s" : ""}
+            </>
+          )}
         </span>
         <div className="flex items-center gap-2">
           <button
@@ -11208,7 +11280,7 @@ export function BlocklistDetail({
   const [excDomain, setExcDomain] = useState("");
   const [excReason, setExcReason] = useState("");
 
-  const { data: page } = useQuery({
+  const { data: page, error: entriesError } = useQuery({
     queryKey: ["dns-blocklist-entries", list.id, q, limit, offset],
     queryFn: () =>
       dnsBlocklistApi.listEntries(list.id, {
@@ -11217,10 +11289,11 @@ export function BlocklistDetail({
         offset,
       }),
   });
-  const { data: exceptions = [] } = useQuery({
+  const { data: exceptionsData, error: exceptionsError } = useQuery({
     queryKey: ["dns-blocklist-exceptions", list.id],
     queryFn: () => dnsBlocklistApi.listExceptions(list.id),
   });
+  const exceptions = exceptionsData ?? [];
 
   const addEntry = useMutation({
     // is_wildcard defaults to true server-side (Pi-hole semantics); toggle
@@ -11331,7 +11404,14 @@ export function BlocklistDetail({
         </button>
         <h3 className="font-semibold text-sm">{list.name}</h3>
         <span className="text-xs text-muted-foreground">
-          {total} entries · {exceptions.length} exceptions
+          {/* Each count waits for its own read: a refused, failed or
+              unanswered one draws none (#3426). */}
+          {[
+            page !== undefined && `${total} entries`,
+            exceptionsData !== undefined && `${exceptions.length} exceptions`,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
         </span>
         {list.feed_url && (
           <button
@@ -11447,16 +11527,26 @@ export function BlocklistDetail({
               </tr>
             </thead>
             <tbody className={zebraBodyCls}>
-              {items.length === 0 && (
-                <tr>
-                  <td
-                    colSpan={6}
-                    className="px-3 py-4 text-center text-xs text-muted-foreground italic"
-                  >
-                    No entries
-                  </td>
-                </tr>
-              )}
+              {/* A refused or failed read says so, and one not answered yet
+                  says nothing: neither is "No entries" (#3426). */}
+              {items.length === 0 &&
+                (entriesError != null || page !== undefined) && (
+                  <tr>
+                    <td
+                      colSpan={6}
+                      className="px-3 py-4 text-center text-xs text-muted-foreground italic"
+                    >
+                      {entriesError != null ? (
+                        <ListReadError
+                          error={entriesError}
+                          what="this blocking list's entries"
+                        />
+                      ) : (
+                        "No entries"
+                      )}
+                    </td>
+                  </tr>
+                )}
               {items.map((e: DNSBlockListEntry) => (
                 <tr key={e.id} className="border-t hover:bg-accent/30">
                   <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
@@ -11607,16 +11697,25 @@ export function BlocklistDetail({
               </tr>
             </thead>
             <tbody className={zebraBodyCls}>
-              {exceptions.length === 0 && (
-                <tr>
-                  <td
-                    colSpan={3}
-                    className="px-3 py-4 text-center text-xs text-muted-foreground italic"
-                  >
-                    No exceptions
-                  </td>
-                </tr>
-              )}
+              {/* The same for the exceptions (#3426). */}
+              {exceptions.length === 0 &&
+                (exceptionsError != null || exceptionsData !== undefined) && (
+                  <tr>
+                    <td
+                      colSpan={3}
+                      className="px-3 py-4 text-center text-xs text-muted-foreground italic"
+                    >
+                      {exceptionsError != null ? (
+                        <ListReadError
+                          error={exceptionsError}
+                          what="this blocking list's exceptions"
+                        />
+                      ) : (
+                        "No exceptions"
+                      )}
+                    </td>
+                  </tr>
+                )}
               {exceptions.map((ex: DNSBlockListException) => (
                 <tr key={ex.id} className="border-t hover:bg-accent/30">
                   <td className="px-3 py-1 font-mono text-xs">{ex.domain}</td>

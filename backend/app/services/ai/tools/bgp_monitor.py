@@ -205,7 +205,7 @@ class AllowlistBgpOriginArgs(BaseModel):
         "explicitly apply."
     ),
     args_model=AllowlistBgpOriginArgs,
-    writes=True,
+    writes=False,  # The propose tool itself is read-only; apply is the write.
     category="network",
     module="network.asn",
     default_enabled=False,
