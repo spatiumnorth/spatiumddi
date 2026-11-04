@@ -524,6 +524,21 @@ async def test_a_row_already_naming_a_dead_zone_still_takes_an_edit(
         json={"description": "x", "dns_zone_id": gone},
     )
     assert resp.status_code == 200, resp.text
+    # An address sending back its own extra zones (one of them dead) with an
+    # unrelated change saves too; the walk found this one refused.
+    addr = (await client.get(f"/api/v1/ipam/addresses/{r['addr']}", headers=h)).json()
+    resp = await client.put(
+        f"/api/v1/ipam/addresses/{r['addr']}",
+        headers=h,
+        json={"description": "x", "extra_zone_ids": addr["extra_zone_ids"]},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.put(
+        f"/api/v1/ipam/addresses/{r['addr']}",
+        headers=h,
+        json={"extra_zone_ids": [*addr["extra_zone_ids"], str(uuid.uuid4())]},
+    )
+    assert resp.status_code == 422, resp.text
     # A different dead id is still refused on the same row.
     resp = await client.put(
         f"/api/v1/ipam/subnets/{r['subnet']}",

@@ -10574,6 +10574,7 @@ async def update_address(
                 body.dns_zone_id if "dns_zone_id" in touched else None,
                 *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
             ],
+            already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
         )
     # "Touched" means CHANGED, not merely present: the Edit dialog sends its
     # hostname, MAC and zone on every Save, so presence alone re-ran every
