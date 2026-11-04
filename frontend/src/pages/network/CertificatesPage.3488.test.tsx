@@ -26,6 +26,11 @@ const TARGET = {
   tags: {},
 };
 
+// Same host:port, told apart only by SNI (the table's dedupe key is
+// host + port + server_name), so each row's button needs its own name.
+const SNI_A = { ...TARGET, id: "t2", port: 8443, server_name: "a.sni.test" };
+const SNI_B = { ...TARGET, id: "t3", port: 8443, server_name: "b.sni.test" };
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});
@@ -41,7 +46,7 @@ vi.mock("@/lib/api", async () => {
               typeof method === "symbol"
                 ? undefined
                 : name === "tlsCertsApi" && method === "list"
-                  ? async () => ({ items: [TARGET], total: 1 })
+                  ? async () => ({ items: [TARGET, SNI_A, SNI_B], total: 3 })
                   : name === "authApi" && method === "myPermissions"
                     ? async () => ({ is_superadmin: true, grants: [] })
                     : pending,
@@ -60,6 +65,19 @@ const { CertificatesPage } = await import("./CertificatesPage");
 
 afterEach(cleanup);
 
+function renderPage() {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={["/network/certificates"]}>
+        <CertificatesPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
 describe("CertificatesPage keyboard access (#3488)", () => {
   it("opens the detail from a focusable button, not only a row click", async () => {
     const qc = new QueryClient({
@@ -73,7 +91,7 @@ describe("CertificatesPage keyboard access (#3488)", () => {
       </QueryClientProvider>,
     );
     const btn = await screen.findByRole("button", {
-      name: /View certificate details for example\.test:443/,
+      name: "View certificate details for example.test:443",
     });
     btn.focus();
     expect(document.activeElement).toBe(btn);
@@ -83,5 +101,35 @@ describe("CertificatesPage keyboard access (#3488)", () => {
     expect(btn.getAttribute("type")).toBe("button");
     fireEvent.click(btn);
     expect(await screen.findByText(/Subject alternative names/)).toBeTruthy();
+  });
+
+  it("names each row's button uniquely when targets differ only by SNI", async () => {
+    renderPage();
+    const names = (
+      await screen.findAllByRole("button", {
+        name: /^View certificate details for /,
+      })
+    ).map((b) => b.getAttribute("aria-label"));
+    expect(names).toEqual([
+      "View certificate details for example.test:443",
+      "View certificate details for example.test:8443 (SNI a.sni.test)",
+      "View certificate details for example.test:8443 (SNI b.sni.test)",
+    ]);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it("moves focus into the dialog and returns it to the button on close", async () => {
+    renderPage();
+    const btn = await screen.findByRole("button", {
+      name: "View certificate details for example.test:443",
+    });
+    btn.focus();
+    fireEvent.click(btn);
+    const dialog = await screen.findByRole("dialog");
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Close dialog" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(btn);
   });
 });

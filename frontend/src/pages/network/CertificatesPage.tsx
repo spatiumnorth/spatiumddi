@@ -962,7 +962,12 @@ export function CertificatesPage() {
                   <td className="px-3 py-2 align-top break-words">
                     <button
                       type="button"
-                      aria-label={`View certificate details for ${t.host}:${t.port}`}
+                      // Two targets may share host:port and differ only by
+                      // SNI (the dedupe key is host + port + server_name),
+                      // so the SNI is part of the name or the rows collide.
+                      aria-label={`View certificate details for ${t.host}:${t.port}${
+                        t.server_name ? ` (SNI ${t.server_name})` : ""
+                      }`}
                       title="View certificate details"
                       onClick={(e) => {
                         e.stopPropagation();
