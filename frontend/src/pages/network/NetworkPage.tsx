@@ -650,6 +650,7 @@ export function NetworkPage() {
                           <button
                             onClick={() => setEditing(d)}
                             title="Edit device"
+                            aria-label="Edit device"
                             className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             {...writeGate}
                           >

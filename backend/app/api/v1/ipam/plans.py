@@ -767,6 +767,17 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
         )
 
     tree = PlanNode.model_validate(plan.tree)
+    # A plan anchored on an existing block places everything under it, so the
+    # caller needs write on that block (#3425), as for a direct create.
+    if tree.existing_block_id:
+        try:
+            anchor = await db.get(IPBlock, uuid.UUID(tree.existing_block_id))
+        except ValueError:
+            anchor = None  # _validate_tree reports the bad id below
+        if anchor is not None:
+            from app.api.v1.ipam.router import require_target_block_write  # noqa: PLC0415
+
+            require_target_block_write(current_user, anchor)
     conflicts = await _validate_tree(db, plan.space_id, tree)
     if conflicts:
         raise HTTPException(

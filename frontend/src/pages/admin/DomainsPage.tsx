@@ -710,6 +710,7 @@ function DomainRow({
             onClick={onRefresh}
             disabled={refreshing}
             title="Refresh WHOIS"
+            aria-label="Refresh WHOIS"
             className="rounded p-1.5 hover:bg-accent disabled:opacity-50"
             {...writeGate}
           >
@@ -720,6 +721,7 @@ function DomainRow({
           <button
             onClick={onEdit}
             title="Edit"
+            aria-label="Edit"
             className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
             {...writeGate}
           >
@@ -728,6 +730,7 @@ function DomainRow({
           <button
             onClick={onDelete}
             title="Delete"
+            aria-label="Delete"
             className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
             {...deleteGate}
           >

@@ -17,7 +17,15 @@ from collections.abc import Iterable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope
+from app.models.dhcp import (
+    DHCPClientClass,
+    DHCPPhoneProfile,
+    DHCPPhoneProfileScope,
+    DHCPPool,
+    DHCPPXEArchMatch,
+    DHCPPXEProfile,
+    DHCPScope,
+)
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 
 # Classes Kea defines itself. ``HA_*`` / ``VENDOR_CLASS_*`` are Kea's
@@ -54,6 +62,10 @@ def reserved_name_reason(name: str) -> str | None:
     return None
 
 
+def is_generated(name: str) -> bool:
+    return bool(_GENERATED_RE.match(name))
+
+
 def is_builtin_or_generated(name: str) -> bool:
     return (
         name in KEA_BUILTIN_CLASSES
@@ -63,17 +75,23 @@ def is_builtin_or_generated(name: str) -> bool:
 
 
 async def pools_restricted_to(
-    db: AsyncSession, group_id: uuid.UUID, name: str
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    name: str,
+    *,
+    exclude_scope_id: uuid.UUID | None = None,
 ) -> list[tuple[str, str, str]]:
-    """``(scope name, start_ip, end_ip)`` of every pool in the group bound to ``name``."""
-    rows = (
-        await db.execute(
-            select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip)
-            .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
-            .where(DHCPScope.group_id == group_id, DHCPPool.class_restriction == name)
-            .order_by(DHCPScope.name, DHCPPool.start_ip)
-        )
-    ).all()
+    """``(scope name, start_ip, end_ip)`` of every pool in the group bound to
+    ``name``, leaving out ``exclude_scope_id``'s own pools."""
+    q = (
+        select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip)
+        .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
+        .where(DHCPScope.group_id == group_id, DHCPPool.class_restriction == name)
+        .order_by(DHCPScope.name, DHCPPool.start_ip)
+    )
+    if exclude_scope_id is not None:
+        q = q.where(DHCPScope.id != exclude_scope_id)
+    rows = (await db.execute(q)).all()
     return [(r[0] or "", str(r[1]), str(r[2])) for r in rows]
 
 
@@ -164,3 +182,139 @@ def dangling_changed(server_id: str, dangling: list[tuple[str, str]]) -> bool:
     else:
         _last_reported.pop(server_id, None)
     return True
+
+
+def pxe_class_name(profile_id: uuid.UUID, match_id: uuid.UUID) -> str:
+    """The Kea class the bundle generates for a PXE boot rule."""
+    return f"pxe-{str(profile_id)[:8]}-{str(match_id)[:8]}"
+
+
+def phone_class_name(profile_id: uuid.UUID) -> str:
+    """The Kea class the bundle generates for a phone profile."""
+    return f"voip-{str(profile_id)[:8]}"
+
+
+async def _profile_rules(db: AsyncSession, profile: DHCPPXEProfile) -> list[DHCPPXEArchMatch]:
+    return list(
+        (
+            await db.execute(
+                select(DHCPPXEArchMatch).where(DHCPPXEArchMatch.profile_id == profile.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def pxe_pool_refs(
+    db: AsyncSession, profile: DHCPPXEProfile, *, scope_id: uuid.UUID | None = None
+) -> list[tuple[str, list[tuple[str, str, str]]]]:
+    """``(class name, pools)`` for each of the profile's rules named by a pool
+    the class actually serves: a pool in a scope bound to the profile, or in
+    ``scope_id`` alone (#3388).
+
+    Since #2731 a PXE class is rendered ``only-in-additional-list`` and listed
+    on the subnets of the scopes bound to its profile, so Kea evaluates it
+    there and nowhere else. A pool in any other scope never matched; it is not
+    this profile's change that breaks it."""
+    out = []
+    for m in await _profile_rules(db, profile):
+        name = pxe_class_name(profile.id, m.id)
+        q = (
+            select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip)
+            .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
+            .where(DHCPScope.group_id == profile.group_id, DHCPPool.class_restriction == name)
+            .order_by(DHCPScope.name, DHCPPool.start_ip)
+        )
+        if scope_id is not None:
+            q = q.where(DHCPScope.id == scope_id)
+        else:
+            q = q.where(DHCPScope.pxe_profile_id == profile.id)
+        pools = [(r[0] or "", str(r[1]), str(r[2])) for r in (await db.execute(q)).all()]
+        if pools:
+            out.append((name, pools))
+    return out
+
+
+async def phone_profile_rendered(
+    db: AsyncSession,
+    profile: DHCPPhoneProfile,
+    *,
+    enabled: bool | None = None,
+    scope_ids: Iterable[uuid.UUID] | None = None,
+    exclude_scope_id: uuid.UUID | None = None,
+) -> bool:
+    """Whether the bundle defines the profile's class: it is enabled AND
+    attached to an active scope of its group (``_assemble_phone_classes``).
+    ``enabled`` / ``scope_ids`` (the attachments after a replace) /
+    ``exclude_scope_id`` (a scope being deleted or deactivated) ask the
+    question for a pending change."""
+    if not (profile.enabled if enabled is None else enabled):
+        return False
+    q = select(DHCPScope.id).where(
+        DHCPScope.group_id == profile.group_id, DHCPScope.is_active.is_(True)
+    )
+    if scope_ids is not None:
+        q = q.where(DHCPScope.id.in_(list(scope_ids)))
+    else:
+        q = q.join(DHCPPhoneProfileScope, DHCPPhoneProfileScope.scope_id == DHCPScope.id).where(
+            DHCPPhoneProfileScope.profile_id == profile.id
+        )
+    if exclude_scope_id is not None:
+        q = q.where(DHCPScope.id != exclude_scope_id)
+    return (await db.execute(q.limit(1))).first() is not None
+
+
+async def generated_class_problem(db: AsyncSession, scope: DHCPScope, name: str) -> str | None:
+    """Why a generated ``pxe-…`` / ``voip-…`` name cannot be the class of a
+    pool in ``scope`` (#3388), else None. The shape alone proves nothing: a
+    typo, or the name of a deleted rule, is shaped right and Kea never gets the
+    class. A phone class must also be rendered (profile enabled and attached to
+    an active scope, or to this one); a PXE class only exists for the scopes
+    bound to its profile (#2731), so this scope must be one of them."""
+    if name.startswith("voip-"):
+        phones = (
+            (
+                await db.execute(
+                    select(DHCPPhoneProfile).where(DHCPPhoneProfile.group_id == scope.group_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for ph in phones:
+            if phone_class_name(ph.id) != name:
+                continue
+            if not ph.enabled:
+                return f"phone profile '{ph.name}' is disabled"
+            attached = (
+                await db.execute(
+                    select(DHCPPhoneProfileScope.scope_id).where(
+                        DHCPPhoneProfileScope.profile_id == ph.id,
+                        DHCPPhoneProfileScope.scope_id == scope.id,
+                    )
+                )
+            ).first()
+            if attached is None and not await phone_profile_rendered(db, ph):
+                return f"phone profile '{ph.name}' is not attached to an active scope"
+            return None
+        return f"no phone profile in this server group generates class '{name}'"
+    profiles = (
+        (await db.execute(select(DHCPPXEProfile).where(DHCPPXEProfile.group_id == scope.group_id)))
+        .unique()
+        .scalars()
+        .all()
+    )
+    for prof in profiles:
+        for m in await _profile_rules(db, prof):
+            if pxe_class_name(prof.id, m.id) != name:
+                continue
+            if not prof.enabled:
+                return f"PXE profile '{prof.name}' is disabled"
+            if scope.pxe_profile_id != prof.id:
+                return (
+                    f"Kea evaluates it only in the scopes bound to PXE profile "
+                    f"'{prof.name}', and this scope is not one of them"
+                )
+            return None
+    return f"no PXE boot rule in this server group generates class '{name}'"

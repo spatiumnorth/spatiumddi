@@ -469,6 +469,7 @@ function SiteTreeRow({
           ref={dragRef}
           {...listeners}
           {...attributes}
+          aria-label="Drag to re-parent"
           title="Drag to re-parent"
           className="cursor-grab rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
           // Dropping re-parents the site: a PUT the router asks write on
@@ -518,6 +519,7 @@ function SiteTreeRow({
           <button
             type="button"
             title="Move"
+            aria-label="Move"
             onClick={() => onMove(site)}
             className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
             {...writeGate}
@@ -527,6 +529,7 @@ function SiteTreeRow({
           <button
             type="button"
             title="Edit"
+            aria-label="Edit"
             onClick={() => onEdit(site)}
             className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
             {...editGate}
@@ -536,6 +539,7 @@ function SiteTreeRow({
           <button
             type="button"
             title="Delete"
+            aria-label="Delete"
             onClick={() => onDelete(site)}
             className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
             {...deleteGate}
@@ -1051,6 +1055,7 @@ export function SitesPage() {
                       <button
                         type="button"
                         title="Move"
+                        aria-label="Move"
                         onClick={() => setMoving(s)}
                         className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                         {...writeGate}
@@ -1060,6 +1065,7 @@ export function SitesPage() {
                       <button
                         type="button"
                         title="Edit"
+                        aria-label="Edit"
                         onClick={() => setEditing(s)}
                         className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                         {...editGate(s.id)}
@@ -1069,6 +1075,7 @@ export function SitesPage() {
                       <button
                         type="button"
                         title="Delete"
+                        aria-label="Delete"
                         onClick={() => askDelete(s)}
                         className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
                         {...deleteGate}

@@ -685,6 +685,7 @@ export function VRFsPage() {
                       onClick={() => setEditing(v)}
                       className="ml-1 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                       title="Edit VRF"
+                      aria-label="Edit VRF"
                       {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />

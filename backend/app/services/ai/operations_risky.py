@@ -954,11 +954,17 @@ class DeleteScopeArgs(BaseModel):
 async def _preview_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> PreviewResult:
+    from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
     from app.models.dhcp import DHCPLease, DHCPScope
 
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         return PreviewResult(ok=False, detail="Scope not found")
+    # #3388 — the apply refuses this; say so before an approval is queued.
+    try:
+        await refuse_scope_removal_orphaning_classes(db, scope, "delete this scope")
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=str(exc.detail))
     mode = "Permanently delete" if args.permanent else "Soft-delete"
     # A scope carries its pools + reservations into the batch (#617), so both
     # modes report a real blast radius. This used to claim a scope was a cascade
@@ -993,6 +999,7 @@ async def _apply_delete_scope(
     """Body factored verbatim from dhcp/scopes.py:delete_scope."""
     from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
+    from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
     from app.core.agent_wake import collect_wake, dhcp_group_channel
     from app.models.dhcp import DHCPScope
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope
@@ -1009,6 +1016,9 @@ async def _apply_delete_scope(
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+    # #3388 — refused before any side effect: a phone class this scope keeps
+    # rendering may be named by another scope's pool.
+    await refuse_scope_removal_orphaning_classes(db, scope, "delete this scope")
     collect_wake(dhcp_group_channel(scope.group_id))
 
     # Deleted means deleted on every backend (#616). Agent-based (Kea) members
