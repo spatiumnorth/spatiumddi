@@ -1155,10 +1155,10 @@ def _wake_host_refusal(user: User) -> OperationPermissionError | None:
 
 
 async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
-    # Judged for the user who will apply; skipped at portal submit, where the
-    # approver is re-previewed (#3425).
+    # wake_host is in neither the request-portal catalog nor the risky-op
+    # set, so the previewing user is always the one who applies.
     refusal = _wake_host_refusal(user)
-    if refusal is not None and not preview_is_for_requester():
+    if refusal is not None:
         return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
     try:
         ip, mac, broadcast = await _load_wake_target(db, args)

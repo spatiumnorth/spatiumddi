@@ -18,7 +18,6 @@ from app.services.ai.operations import (
     OperationPermissionError,
     WakeHostArgs,
     get_operation,
-    previewing_for_requester,
 )
 
 
@@ -79,10 +78,6 @@ async def test_wake_host_needs_subnet_write_at_preview_and_apply(db_session: Asy
             await op.apply(db_session, tools_only, args)
         send.assert_not_awaited()
 
-    # A portal requester is not judged on it; the approver is.
-    with previewing_for_requester():
-        assert (await op.preview(db_session, tools_only, args)).ok
-
 
 @pytest.mark.asyncio
 async def test_wake_host_works_with_both_and_for_superadmin(db_session: AsyncSession) -> None:
@@ -104,3 +99,95 @@ async def test_wake_host_works_with_both_and_for_superadmin(db_session: AsyncSes
             out = await op.apply(db_session, u, args)
             send.assert_awaited_once()
         assert out["sent"] is True
+
+
+async def _tagged_subnet(db: AsyncSession) -> Subnet:
+    from app.models.ipam import IPBlock
+
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}")
+    db.add(space)
+    await db.flush()
+    block = IPBlock(space_id=space.id, network="10.8.0.0/16", name="b")
+    db.add(block)
+    await db.flush()
+    subnet = Subnet(
+        space_id=space.id, block_id=block.id, network="10.8.1.0/24", name="s", kind="unicast"
+    )
+    db.add(subnet)
+    await db.flush()
+    db.add(
+        IPAddress(
+            subnet_id=subnet.id,
+            address="10.8.1.5",
+            status="allocated",
+            mac_address="aa:bb:cc:dd:ee:01",
+            tags={"wake": "nightly"},
+        )
+    )
+    await db.flush()
+    return subnet
+
+
+@pytest.mark.asyncio
+async def test_schedule_owner_without_subnet_write_wakes_nothing(db_session: AsyncSession) -> None:
+    """A wake schedule fires as its owner, through ``resolve_wol_targets``
+    (REST preview, run-now, the beat runner and the copilot schedule ops all
+    call it). An owner who can read the subnet but could not wake its hosts by
+    hand must not wake them on a schedule either."""
+    from app.services.wol_scheduler import resolve_wol_targets
+
+    subnet = await _tagged_subnet(db_session)
+    tag_sel = {"mode": "address_tags", "tags": ["wake:nightly"]}
+    subnet_sel = {"mode": "subnet", "subnet_ids": [str(subnet.id)]}
+
+    read_only = await _user(db_session, [_g("write", "use_network_tools"), _g("read", "subnet")])
+    assert (await resolve_wol_targets(db_session, read_only, tag_sel)).wakes == []
+    by_subnet = await resolve_wol_targets(db_session, read_only, subnet_sel)
+    assert by_subnet.wakes == []
+    assert [s.reason for s in by_subnet.skipped] == ["no_permission"]
+
+    writer = await _user(
+        db_session,
+        [_g("write", "use_network_tools"), _g("read", "subnet"), _g("write", "subnet")],
+    )
+    assert len((await resolve_wol_targets(db_session, writer, tag_sel)).wakes) == 1
+    assert len((await resolve_wol_targets(db_session, writer, subnet_sel)).wakes) == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_fire_rechecks_owner_subnet_write(db_session: AsyncSession) -> None:
+    """The beat runner loads the owner fresh on every fire, so a schedule
+    created while the owner could wake stops waking once they cannot."""
+    import app.tasks.wol_scheduler as task
+    from app.models.wol_schedule import WolSchedule
+
+    await _tagged_subnet(db_session)
+    owner = await _user(db_session, [_g("write", "use_network_tools"), _g("read", "subnet")])
+    schedule = WolSchedule(
+        name="nightly",
+        enabled=True,
+        target_selector={"mode": "address_tags", "tags": ["wake:nightly"]},
+        schedule_cron="0 7 * * *",
+        timezone="UTC",
+        vantage={"kind": "server", "id": None},
+        repeat_count=1,
+        repeat_interval_ms=0,
+        stagger_ms=0,
+        port=9,
+        created_by_user_id=owner.id,
+    )
+    db_session.add(schedule)
+    await db_session.flush()
+    db_session.expunge(owner)
+
+    with patch("app.services.wol.wake_from_server", new=AsyncMock()) as send:
+        summary = await task.run_wol_schedule(
+            db_session,
+            schedule,
+            trigger="scheduled",
+            actor_id=None,
+            actor_display="scheduler",
+            apply_gate=False,
+        )
+    send.assert_not_awaited()
+    assert summary.get("sent", 0) == 0
