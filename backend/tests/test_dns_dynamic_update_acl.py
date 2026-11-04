@@ -656,3 +656,140 @@ async def test_ingest_audit_names_are_capped(client: AsyncClient, db_session: As
     assert row.new_value["added"] == 80
     assert len(row.new_value["added_records"]) == 50
     assert row.new_value["truncated"] is True
+
+
+# ── Version check on replace (#3381) ────────────────────────────────────────
+
+
+async def test_replace_update_acl_version_check(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _superadmin(db_session)
+    group, zone, _key = await _bind9_group_zone_key(db_session)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/zones/{zone.id}/update-acl"
+
+    g = await client.get(url, headers=headers)
+    v0 = g.json()["version"]
+    assert v0
+
+    # Current token -> 200, and the response carries a NEW token.
+    r1 = await client.put(
+        url,
+        headers=headers,
+        json={
+            "dynamic_update_enabled": True,
+            "entries": [{"match_kind": "ip", "ip_cidr": "10.0.0.5"}],
+            "expected_version": v0,
+        },
+    )
+    assert r1.status_code == 200, r1.text
+    v1 = r1.json()["version"]
+    assert v1 != v0
+    assert (await client.get(url, headers=headers)).json()["version"] == v1
+
+    # A second save with the token from the response works.
+    r2 = await client.put(
+        url,
+        headers=headers,
+        json={
+            "dynamic_update_enabled": True,
+            "entries": [{"match_kind": "ip", "ip_cidr": "10.0.0.6"}],
+            "expected_version": v1,
+        },
+    )
+    assert r2.status_code == 200, r2.text
+    v2 = r2.json()["version"]
+    assert v2 != v1
+
+    # Stale token -> 409, nothing changed.
+    r3 = await client.put(
+        url,
+        headers=headers,
+        json={
+            "dynamic_update_enabled": False,
+            "entries": [],
+            "expected_version": v0,
+        },
+    )
+    assert r3.status_code == 409, r3.text
+    assert "changed this ACL" in r3.json()["detail"]["message"]
+    after = (await client.get(url, headers=headers)).json()
+    assert after["version"] == v2
+    assert after["dynamic_update_enabled"] is True
+    assert [e["ip_cidr"] for e in after["entries"]] == ["10.0.0.6/32"]
+
+    # The enable flag alone moves the token.
+    r4 = await client.put(
+        url,
+        headers=headers,
+        json={
+            "dynamic_update_enabled": False,
+            "entries": [{"match_kind": "ip", "ip_cidr": "10.0.0.6"}],
+            "expected_version": v2,
+        },
+    )
+    assert r4.status_code == 200
+    assert r4.json()["version"] != v2
+
+    # No token -> unconditional replace, as before.
+    r5 = await client.put(url, headers=headers, json={"entries": []})
+    assert r5.status_code == 200
+    assert r5.json()["entries"] == []
+
+
+async def test_copilot_proposal_pins_acl_version(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3381 — a Copilot proposal applies only over the ACL it previewed.
+
+    propose -> Apply can be minutes apart; an ACL changed in between must not
+    be silently replaced by the proposal's copy.
+    """
+    from app.services.ai.operations_writes import (
+        SetZoneUpdateAclArgs,
+        _apply_set_zone_update_acl,
+        _preview_set_zone_update_acl,
+    )
+
+    user, headers = await _superadmin(db_session)
+    group, zone, _key = await _bind9_group_zone_key(db_session)
+    await db_session.commit()
+    group_id, zone_id, user_id = group.id, zone.id, user.id
+    url = f"/api/v1/dns/groups/{group_id}/zones/{zone_id}/update-acl"
+    v0 = (await client.get(url, headers=headers)).json()["version"]
+
+    def _args() -> SetZoneUpdateAclArgs:
+        return SetZoneUpdateAclArgs(
+            group_id=group_id,
+            zone_id=zone_id,
+            entries=[{"match_kind": "ip", "ip_cidr": "10.9.9.9"}],
+        )
+
+    # Preview pins the current version into the (persisted) args.
+    stale = _args()
+    assert (await _preview_set_zone_update_acl(db_session, user, stale)).ok
+    assert stale.expected_version == v0
+
+    # Someone edits the ACL before Apply.
+    r = await client.put(
+        url,
+        headers=headers,
+        json={"entries": [{"match_kind": "ip", "ip_cidr": "10.0.0.7"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    with pytest.raises(ValueError, match="changed since this was proposed"):
+        await _apply_set_zone_update_acl(db_session, user, stale)
+    await db_session.rollback()
+    after = (await client.get(url, headers=headers)).json()
+    assert [e["ip_cidr"] for e in after["entries"]] == ["10.0.0.7/32"]
+    user = await db_session.get(User, user_id)
+    assert user is not None
+
+    # A fresh proposal over the current ACL applies.
+    fresh = _args()
+    assert (await _preview_set_zone_update_acl(db_session, user, fresh)).ok
+    await _apply_set_zone_update_acl(db_session, user, fresh)
+    after = (await client.get(url, headers=headers)).json()
+    assert [e["ip_cidr"] for e in after["entries"]] == ["10.9.9.9/32"]

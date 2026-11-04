@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>DHCP scope containment hierarchy</title>
-  <desc>A subnet holds one DHCPScope per DHCP server group, and each scope holds one or more DHCPPools plus zero or many DHCPStaticAssignments.</desc>
+  <desc>A subnet holds one DHCPScope per DHCP server group, and each scope holds DHCPPools (zero or more) plus zero or many DHCPStaticAssignments.</desc>
   <defs>
     <linearGradient id="dhcpc-store" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#34d399"/>
@@ -47,7 +47,7 @@
 
   <rect x="618" y="70" width="250" height="72" rx="8" fill="url(#dhcpc-agent)"/>
   <text x="743" y="100" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPPool</text>
-  <text x="743" y="122" text-anchor="middle" font-size="11" fill="#fed7aa">one or more dynamic ranges</text>
+  <text x="743" y="122" text-anchor="middle" font-size="11" fill="#fed7aa">dynamic / excluded / reserved / PD ranges</text>
 
   <rect x="618" y="158" width="250" height="72" rx="8" fill="url(#dhcpc-accent)"/>
   <text x="743" y="188" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPStaticAssignment</text>

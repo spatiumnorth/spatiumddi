@@ -150,6 +150,7 @@ export function VLANsPage() {
             <button
               onClick={() => setShowCreateRouter(true)}
               title="New Router"
+              aria-label="New Router"
               className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
               {...writeGate}
             >

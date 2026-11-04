@@ -19,6 +19,8 @@ import {
   DeleteConfirmModal,
 } from "./_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 
 const PROFILE_KEY_BASE = "dhcp-phone-profiles";
 
@@ -176,6 +178,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
                         onClick={() => setEdit(p)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit profile"
+                        aria-label="Edit profile"
                         {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -184,6 +187,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
                         onClick={() => setDel(p)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete profile"
+                        aria-label="Delete profile"
                         {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -225,15 +229,38 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
 
 // ── Editor modal ───────────────────────────────────────────────────────────
 
-function PhoneProfileEditorModal({
-  groupId,
-  profile,
-  onClose,
-}: {
+type PhoneProfileEditorProps = {
   groupId: string;
   profile?: PhoneProfile;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the profile (scope set included) fresh on open and Save sends
+// only what changed (#3379): the clicked row comes from a list loaded earlier.
+export function PhoneProfileEditorModal(props: PhoneProfileEditorProps) {
+  const fresh = useFreshRow(props.profile, () =>
+    dhcpApi
+      .listPhoneProfiles(props.groupId)
+      .then((rows) => rows.find((p) => p.id === props.profile!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Phone Profile"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PhoneProfileEditorForm {...props} profile={fresh.row} />;
+}
+
+function PhoneProfileEditorForm({
+  groupId,
+  profile,
+  onClose,
+}: PhoneProfileEditorProps) {
   const qc = useQueryClient();
   const isEdit = !!profile;
 
@@ -301,8 +328,35 @@ function PhoneProfileEditorModal({
         scope_ids: scopeIds,
       };
       if (isEdit) {
-        const updated = await dhcpApi.updatePhoneProfile(profile.id, body);
-        await dhcpApi.setPhoneProfileScopes(profile.id, scopeIds);
+        // Only what changed against the fresh read (#3379); the scope set is
+        // its own endpoint and is replaced only when it differs.
+        const { scope_ids: _scopes, ...fields } = body;
+        void _scopes;
+        const diff = changedFields(
+          {
+            name: profile.name,
+            description: profile.description ?? "",
+            enabled: profile.enabled,
+            vendor: profile.vendor ?? null,
+            vendor_class_match: profile.vendor_class_match ?? null,
+            // Filtered the way the body is, so a stored blank-valued row
+            // does not read as a change on an untouched Save.
+            option_set: (profile.option_set ?? [])
+              .filter((o) => o.value.trim())
+              .map((o) => ({
+                code: o.code,
+                name: o.name ?? null,
+                value: o.value,
+              })),
+          },
+          fields,
+        );
+        let updated: PhoneProfile = profile;
+        if (Object.keys(diff).length > 0)
+          updated = await dhcpApi.updatePhoneProfile(profile.id, diff);
+        const sorted = (ids: string[]) => [...ids].sort().join(",");
+        if (sorted(scopeIds) !== sorted(profile.scope_ids ?? []))
+          updated = await dhcpApi.setPhoneProfileScopes(profile.id, scopeIds);
         return updated;
       }
       return dhcpApi.createPhoneProfile(groupId, body);

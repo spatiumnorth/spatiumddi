@@ -151,7 +151,7 @@ write-amplifying *first-lease* path harder per device).
 | `lease_time` | **7200s (2h)** | 3600s (1h ceiling lever); 86400s (24h stale-row soak) | Lease time affects **expiry/reap + pool occupancy + stale-row accumulation only** — *not* renewal pressure (constant at 900s). `DHCPScope.lease_time` default = 86400 (`models/dhcp.py:325`); the headline overrides it to 7200. |
 | Address space | **8 × /16** under `10.0.0.0/8` (≈524k usable, ~90% pools ≈472k) | 256 × /22 (subnet-scan stress, §1.7) | No prefix floor, no v4 pool size cap (`pools.py`); one pool spans a /16 (`render_kea.py:299`). |
 | Reverse-zone shape | **8 per-octet `N.10.in-addr.arpa`** (spreads PTR serial-bump contention) | single `10.in-addr.arpa` (labeled **H3 hot-row-stress** variant) | Single-zone *works* via longest-suffix match (`_resolve_reverse_zone`, `router.py:806-844`) but forces all PTR serial bumps onto **one** `dns_zone` row = maximal hot-row contention. **Make it an explicit profile axis** — do not let the single zone be an accidental default. |
-| DDNS policy | `always_generate` (max write volume, deterministic `dhcp-<3rd>-<4th>` names) | `client_or_generated` (realistic names) | `disabled` zeroes the DNS write path — never on test subnets. |
+| DDNS policy | `always_generate` (max write volume, deterministic `dhcp-<a>-<b>-<c>-<d>` names) | `client_or_generated` (realistic names) | `disabled` zeroes the DNS write path — never on test subnets. |
 | `query_log_enabled` | **OFF** | ON in a bounded **firehose sub-run** only | The single largest row driver; confounds the DB ceiling if left on (§4.4, §5.4). |
 | `ddns_enabled` | **ON** | OFF (isolate the bare lease firehose) | The DDNS toggle drives the `dns_record`/`dns_record_op`/`dns_zone`-serial write path. |
 | Operator-mutation stream | **ON in the headline run** (2–5/s) | dedicated audit-contention **ramp** variant | Folded into the headline so criterion (a)'s lock dimension is actually answered (§1.6, §5 H1). |
@@ -631,12 +631,17 @@ exercised as production would.
   **named correctness FAIL** (§8.2.4).
 - **REBINDING at T2=1800s** (only if T1 unanswered) — broadcast REQUEST; modeled
   so a Kea/agent stall produces realistic rebind traffic instead of silent loss.
-- **DEPARTING → LEFT** — ~5% explicit DHCPRELEASE (drives immediate expiry →
+  A rebind that also goes unanswered lapses the lease and the device goes
+  straight to LEFT; if Kea's rebind ACK still arrives afterwards, the device
+  comes back ONLINE with the extended lease. A NAK at any point drops the
+  lease and sends a fresh DISCOVER.
+- **Departure → LEFT** (from ONLINE, RENEWING or REBINDING; there is no
+  intermediate departing state) — ~5% explicit DHCPRELEASE (drives immediate expiry →
   `dhcp_lease_history` INSERT + IPAM DELETE + DDNS-revoke), 95% silent (reaped by
   `sweep_expired_leases` every 300s — the full-Subnet-scan-per-lease hot path,
   §5 H8).
 - **Re-arrival** — a device that LEFT can re-arrive later (commuter returns) as a
-  **fresh DORA**; same stable client-id makes it an update, not new-lease churn.
+  **fresh DORA**, going straight back to DISCOVERING; same stable client-id makes it an update, not new-lease churn.
 
 **Identity generation.** MACs from a locally-administered OUI (`02:00:00:xx:xx:xx`,
 24-bit index → 16M+ unique, partitioned across shards so they never collide).
@@ -782,7 +787,7 @@ so they align with appliance 60s metric buckets.
 Ground-truth names that exist in our zones:
 
 - **DDNS forward names** — `_generate_hostname(ip_str)` (`ddns.py:162`): for IPv4,
-  **`dhcp-<3rd>-<4th>`** (e.g. `10.1.20.5` → `dhcp-20-5`) under `always_generate`,
+  **`dhcp-<a>-<b>-<c>-<d>`** (e.g. `10.1.20.5` → `dhcp-10-1-20-5`) under `always_generate`,
   or the sanitised client hostname under `client_or_generated`. Either way an `A`
   (and `AAAA` for v6) in the subnet's forward zone, with a matching `PTR` in the
   reverse zone (`router.py:1308-1344`).
@@ -849,7 +854,7 @@ table/index bloat trajectory.
    device.
 2. The DHCP generator drives DORA/renew from it; each leased device's IP mirrors
    to IPAM and (DDNS subnets) publishes A(+AAAA)+PTR. Forward name is
-   deterministic (`client_hostname` or `dhcp-<3rd>-<4th>`).
+   deterministic (`client_hostname` or `dhcp-<a>-<b>-<c>-<d>`).
 3. The DNS query set/streams are generated from the SAME manifest.
 
 This yields the realistic ordering: device arrives → lease → DDNS publishes name

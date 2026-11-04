@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import {
@@ -34,13 +35,21 @@ export function FreeSpaceBand({
   directSubnets,
   childBlocks,
   onSelectFree,
+  createDisabledReason,
 }: {
   block: IPBlock;
   directSubnets: Subnet[];
   childBlocks: IPBlock[];
   onSelectFree: (range: FreeCidrRange) => void;
+  /** Set when the caller may not create a subnet (#3391): a free segment is
+   *  then disabled and this is its tooltip. */
+  createDisabledReason?: string;
 }) {
-  const { data: freeRanges = [], isLoading } = useQuery({
+  const {
+    data: freeRanges = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: [
       "block-free-space",
       block.id,
@@ -113,6 +122,16 @@ export function FreeSpaceBand({
     return <div className="h-5 w-full animate-pulse rounded-sm bg-muted/40" />;
   }
 
+  // A refused or failed read says so, not "No allocation data" (#3337): the
+  // block's own grant may not reach the subnets the free-space walk needs.
+  if (error != null) {
+    return (
+      <p className="text-[11px]">
+        <ListReadError error={error} what="this block's allocation map" />
+      </p>
+    );
+  }
+
   if (segments.length === 0) {
     return (
       <div className="flex h-5 w-full items-center justify-center rounded-sm border border-dashed border-border/60 text-[10px] text-muted-foreground">
@@ -136,7 +155,11 @@ export function FreeSpaceBand({
                 if (fr) onSelectFree(fr);
               }
             }}
-            title={seg.label}
+            title={
+              seg.kind === "free" && createDisabledReason
+                ? createDisabledReason
+                : seg.label
+            }
             style={{
               left: `${seg.start * 100}%`,
               width: `${Math.max(seg.width * 100, 0.25)}%`,
@@ -151,7 +174,7 @@ export function FreeSpaceBand({
                 "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.5)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.6)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.500/.6)_0_4px,transparent_4px_8px)] dark:hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
             )}
             aria-label={seg.label}
-            disabled={seg.kind !== "free"}
+            disabled={seg.kind !== "free" || !!createDisabledReason}
           >
             {(seg.kind === "block" || seg.kind === "subnet") && (
               <span

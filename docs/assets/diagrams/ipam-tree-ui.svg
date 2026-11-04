@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>Combined IPAM tree navigator</title>
-  <desc>A single left-hand tree lists every IP space, block and subnet — including free-space rows — and clicking a subnet row opens its IP address list panel on the right.</desc>
+  <desc>A single left-hand tree lists every IP space, block and subnet, and clicking a subnet row opens its IP address list panel on the right.</desc>
 
   <defs>
     <marker id="ipamu-arrow" viewBox="0 0 10 10" refX="9" refY="5"
@@ -27,9 +27,8 @@
     <path d="M 53 124 V 300"/>
     <path d="M 53 140 H 68"/>
     <path d="M 53 300 H 68"/>
-    <path d="M 75 156 V 268"/>
+    <path d="M 75 156 V 172"/>
     <path d="M 75 172 H 90"/>
-    <path d="M 75 268 H 90"/>
     <path d="M 97 188 V 236"/>
     <path d="M 97 204 H 112"/>
     <path d="M 97 236 H 112"/>
@@ -72,11 +71,6 @@
   <text x="279" y="240" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
   <text x="324" y="241" font-size="11" fill="#475569">Workstations</text>
 
-  <!-- free space row -->
-  <rect x="96" y="267" width="6" height="2" rx="1" fill="#cbd5e1"/>
-  <text x="110" y="273" font-size="11" font-style="italic" fill="#94a3b8"
-        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">(free: 10.1.0.0/8 – 10.255.0.0/8)</text>
-
   <!-- OOB (IPSpace) -->
   <path d="M 72 297 L 82 297 L 77 304 Z" fill="#64748b"/>
   <text x="88" y="305" font-size="13" font-weight="600" fill="#0f172a">OOB</text>
@@ -106,7 +100,7 @@
   <text x="600" y="192" font-size="14" font-weight="600" fill="#0f172a">IP address list</text>
   <text x="600" y="212" font-size="12" font-weight="600" fill="#0e7490"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.1.0/24</text>
-  <text x="600" y="232" font-size="11" fill="#475569">collapsible · auto-collapse above 1000 IPs</text>
+  <text x="600" y="232" font-size="11" fill="#475569">addresses · free ranges as gap rows</text>
 
-  <text x="32" y="418" font-size="12" fill="#475569">Muted rows mark unallocated free space inside a block; clicking a subnet opens its IP address list on the right.</text>
+  <text x="32" y="418" font-size="12" fill="#475569">Clicking a subnet opens its IP address list on the right; unallocated ranges appear there as gap rows.</text>
 </svg>

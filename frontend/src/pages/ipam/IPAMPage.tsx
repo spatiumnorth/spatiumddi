@@ -1,11 +1,13 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
+import { Field } from "@/pages/dhcp/_shared";
 import {
   useQuery,
   useQueries,
   useMutation,
   useQueryClient,
+  type QueryClient,
 } from "@tanstack/react-query";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import {
@@ -48,6 +50,7 @@ import {
   useDraggable,
   useDroppable,
   type DragEndEvent,
+  type DraggableAttributes,
 } from "@dnd-kit/core";
 import {
   ipamApi,
@@ -918,26 +921,6 @@ function CustomFieldsSection({
 
 // ─── Modal helpers ────────────────────────────────────────────────────────────
 
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
-
 // `focus:ring-inset` draws the focus ring inside the element, which prevents
 // the left/right edges of the ring from being clipped by the modal's
 // `overflow-y-auto` container (browsers default `overflow-x` to `auto` too
@@ -1013,6 +996,7 @@ function ZoneOptions({
 
 export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const canReadVrfs = usePermissions().can("read", "vrf");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [color, setColor] = useState<string | null>(null);
@@ -1147,16 +1131,19 @@ export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
           </p>
           <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Manage VRFs (RD + import / export RTs) under{" "}
-              <a
-                href="/network/vrfs"
-                className="underline hover:text-foreground"
-              >
-                Network → VRFs
-              </a>
-              .
-            </p>
+            {/* The VRFs page reads the same list the picker may not (#3451). */}
+            {canReadVrfs && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Manage VRFs (RD + import / export RTs) under{" "}
+                <a
+                  href="/network/vrfs"
+                  className="underline hover:text-foreground"
+                >
+                  Network → VRFs
+                </a>
+                .
+              </p>
+            )}
           </Field>
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
@@ -2041,21 +2028,19 @@ export function DdnsSettingsSection({
   // tab changes), read with parseTtlInput: "1h" is refused, not sent as 1.
   const ttlParsed = parseTtlInput(ttlText);
   const ttlError = typeof ttlParsed === "string" ? ttlParsed : null;
-  // Preview: synthesise what ``dhcp-<tail>`` would look like for the
+  // Preview: synthesise what ``dhcp-<address>`` would look like for the
   // first host IP in this subnet. Mirrors the Python implementation in
-  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — keep in
-  // sync when policy generators change.
+  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — the whole
+  // address, hyphenated (#3364) — keep in sync when policy generators change.
   const preview = (() => {
     if (!subnetNetwork) return null;
     const match = subnetNetwork.match(/^([\d.]+)\/(\d+)$/);
     if (!match) return null;
     const octets = match[1].split(".").map((s) => parseInt(s, 10));
     if (octets.length !== 4 || octets.some((n) => isNaN(n))) return null;
-    const prefix = parseInt(match[2], 10);
-    if (prefix < 16) return null;
     // First usable: network + 1 for /30 and shorter, + 1 for /31 / /32
     octets[3] = (octets[3] + 1) & 0xff;
-    return `dhcp-${octets[2]}-${octets[3]}`;
+    return `dhcp-${octets.join("-")}`;
   })();
 
   // While inheriting, the controls show what the subnet resolves to (the
@@ -4186,7 +4171,11 @@ export function AddAddressModal({
           values={shownCustomFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         {pendingWarnings && (
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
@@ -4572,6 +4561,11 @@ const NEEDS_ADDRESS_DELETE =
   "Requires delete permission on subnets, and write on this subnet or on an address set in it";
 const NEEDS_DNS_SYNC =
   "Requires read permission on subnets and IP addresses, and write permission on subnets";
+// A block's and a space's Sync DNS ask the same of their own type (#3334).
+const NEEDS_BLOCK_DNS_SYNC =
+  "Requires read permission on IP blocks and IP addresses, and write permission on IP blocks";
+const NEEDS_SPACE_DNS_SYNC =
+  "Requires read permission on IP spaces and IP addresses, and write permission on IP spaces";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
@@ -7057,8 +7051,15 @@ export function SubnetDetail({
                                           onClick={() =>
                                             setConfirmPurgeAddr(addr)
                                           }
-                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                                           title="Permanently delete"
+                                          aria-label={`Permanently delete ${addr.address}`}
+                                          // #3392 — the purge is a DELETE: as
+                                          // the right-click Delete Forever….
+                                          {...permissionGate(
+                                            canDeleteIpam,
+                                            NEEDS_ADDRESS_DELETE,
+                                          )}
                                         >
                                           <Trash2 className="h-3.5 w-3.5" />
                                         </button>
@@ -7147,12 +7148,20 @@ export function SubnetDetail({
                                 <ContextMenuSeparator />
                                 <ContextMenuItem
                                   onSelect={() => restoreAddr.mutate(addr.id)}
+                                  {...permissionGate(
+                                    permitsWrite,
+                                    NEEDS_ADDRESS_WRITE,
+                                  )}
                                 >
                                   Restore
                                 </ContextMenuItem>
                                 <ContextMenuItem
                                   destructive
                                   onSelect={() => setConfirmPurgeAddr(addr)}
+                                  {...permissionGate(
+                                    permitsWrite && canDeleteIpam,
+                                    NEEDS_ADDRESS_DELETE,
+                                  )}
                                 >
                                   Delete Forever…
                                 </ContextMenuItem>
@@ -7533,7 +7542,9 @@ export function DnsSyncModal({
         const r = await backfillFn(scope.id);
         setBackfillResult(r);
       } catch (e) {
-        setBackfillError((e as Error).message || "Backfill failed");
+        // #3334: the server's reason, not axios's "Request failed with
+        // status code N"; the error's own message only when there is none.
+        setBackfillError(formatApiError(e, "Backfill failed"));
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
@@ -8384,7 +8395,9 @@ function EditSubnetModalForm({
           ? !autoAddresses // True = remove, False = add
           : undefined;
       const body = {
-        name: name || undefined,
+        // ``""`` when cleared: ``|| undefined`` was dropped by JSON.stringify,
+        // so the clear answered 200 and the old name stayed (#3370).
+        name,
         description,
         // Explicit null so the operator can clear the gateway (nullable
         // column); ``|| undefined`` was silently dropped (#502).
@@ -8440,7 +8453,7 @@ function EditSubnetModalForm({
       const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
       const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
       const was: Record<string, unknown> = {
-        name: subnet.name || undefined,
+        name: subnet.name ?? "",
         description: subnet.description ?? "",
         gateway: subnet.gateway || null,
         vlan_ref_id: subnet.vlan_ref_id ?? null,
@@ -9434,10 +9447,13 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   });
 
   // Fetch effective DNS for the subnet this IP belongs to
+  // Re-read on open: an Edit Block / Edit Subnet may have moved the zones
+  // since the last read (#3368, as #3078).
   const { data: effectiveDns } = useQuery({
     queryKey: ["effective-dns-subnet", address.subnet_id],
     queryFn: () => ipamApi.getEffectiveSubnetDns(address.subnet_id),
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // Aliases live in the DNS zone but are owned by this IP (auto-deleted on purge).
@@ -9468,9 +9484,14 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   });
   const delAliasMut = useMutation({
     mutationFn: (rid: string) => ipamApi.deleteAlias(address.id, rid),
+    // A new attempt clears the previous refusal; a success leaves none.
+    onMutate: () => setError(null),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
+    },
+    onError: (e: unknown) => {
+      setError(formatDialogError(e, "Failed to delete alias"));
     },
   });
 
@@ -10032,7 +10053,11 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         {pendingWarnings && (
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
@@ -10332,7 +10357,7 @@ function NatMappingsForIpModal({
   );
 }
 
-function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
+export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
   const qc = useQueryClient();
   const { data: aliases = [], isLoading } = useQuery({
     queryKey: ["subnet-aliases", subnetId],
@@ -10436,8 +10461,18 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
               id: confirmDel.id,
             })
           }
-          onClose={() => setConfirmDel(null)}
+          onClose={() => {
+            // A refusal belongs to the attempt it answered; the next
+            // alias opened must not inherit it (#3346).
+            delAlias.reset();
+            setConfirmDel(null);
+          }}
           isPending={delAlias.isPending}
+          error={
+            delAlias.isError
+              ? formatDialogError(delAlias.error, "Failed to delete alias")
+              : undefined
+          }
         />
       )}
     </div>
@@ -10464,7 +10499,7 @@ function addressSetRangeLabel(s: AddressSet): string {
   return "—";
 }
 
-function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
+export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   const qc = useQueryClient();
   const perms = usePermissions();
   const { data: sets = [], isLoading } = useQuery({
@@ -10629,30 +10664,65 @@ function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
         confirmLabel="Delete"
         loading={delSet.isPending}
         message={
-          confirmDel
-            ? `Delete address set "${confirmDel.name}"? Any permissions ` +
-              `granted on this set will no longer match. The IP addresses ` +
-              `themselves are not removed.`
-            : ""
+          <>
+            {confirmDel
+              ? `Delete address set "${confirmDel.name}"? Any permissions ` +
+                `granted on this set will no longer match. The IP addresses ` +
+                `themselves are not removed.`
+              : ""}
+            {delSet.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatDialogError(
+                  delSet.error,
+                  "Failed to delete address set",
+                )}
+              </p>
+            )}
+          </>
         }
         onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
-        onClose={() => setConfirmDel(null)}
+        onClose={() => {
+          // Drop the last refusal so the next set opened starts clean.
+          delSet.reset();
+          setConfirmDel(null);
+        }}
       />
     </div>
   );
 }
 
-function AddressSetModal({
-  subnet,
-  existing,
-  onClose,
-  onSaved,
-}: {
+type AddressSetModalProps = {
   subnet: Subnet;
   existing?: AddressSet;
   onClose: () => void;
   onSaved: () => void;
-}) {
+};
+
+// Edit reads the set fresh on open and Save sends only what changed (#3365):
+// the row the page holds is from a list loaded earlier.
+export function AddressSetModal(props: AddressSetModalProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    addressSetsApi.get(props.existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit address set"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <AddressSetModalForm {...props} existing={fresh.row} />;
+}
+
+function AddressSetModalForm({
+  subnet,
+  existing,
+  onClose,
+  onSaved,
+}: AddressSetModalProps) {
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -10685,7 +10755,7 @@ function AddressSetModal({
     mutationFn: () => {
       const explicit = parseExplicit();
       if (isEdit && existing) {
-        const body: AddressSetUpdate = {
+        const after: AddressSetUpdate = {
           name,
           description,
           customer_id: customerId,
@@ -10695,6 +10765,32 @@ function AddressSetModal({
           end_address: rangeKind === "contiguous" ? endAddress : null,
           explicit_addresses: rangeKind === "explicit" ? explicit : [],
         };
+        const body: AddressSetUpdate = changedFields(
+          {
+            name: existing.name,
+            description: existing.description ?? "",
+            customer_id: existing.customer_id ?? null,
+            site_id: existing.site_id ?? null,
+            range_kind: existing.range_kind,
+            start_address: existing.start_address ?? null,
+            end_address: existing.end_address ?? null,
+            explicit_addresses: existing.explicit_addresses ?? [],
+          },
+          { ...after },
+        );
+        // The range is one unit: when any part of it changed, send all of it.
+        if (
+          "range_kind" in body ||
+          "start_address" in body ||
+          "end_address" in body ||
+          "explicit_addresses" in body
+        ) {
+          body.range_kind = after.range_kind;
+          body.start_address = after.start_address;
+          body.end_address = after.end_address;
+          body.explicit_addresses = after.explicit_addresses;
+        }
+        if (Object.keys(body).length === 0) return Promise.resolve(existing);
         return addressSetsApi.update(existing.id, body);
       }
       const body: AddressSetCreate = {
@@ -10829,7 +10925,7 @@ function AddressSetModal({
 
 // ─── Bulk Edit / Bulk Delete modals ──────────────────────────────────────────
 
-function BulkEditAddressesModal({
+export function BulkEditAddressesModal({
   ipIds,
   subnetId,
   onClose,
@@ -10862,6 +10958,7 @@ function BulkEditAddressesModal({
   const [editCustomFields, setEditCustomFields] = useState(false);
   const [editDnsZone, setEditDnsZone] = useState(false);
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   const [editRole, setEditRole] = useState(false);
   const [role, setRole] = useState<string>("");
   const [editReservedUntil, setEditReservedUntil] = useState(false);
@@ -10876,11 +10973,19 @@ function BulkEditAddressesModal({
   // Same shape the single-address modal uses: load the effective DNS config
   // for the subnet, then restrict the picker to explicit primary + additional
   // zones. Falling back to all group zones only when nothing is pinned.
-  const { data: effectiveDns } = useQuery({
+  // Re-read on open: Edit Block / Edit Subnet can have moved the primary zone
+  // since the last read, and Apply sends what the picker shows (#3368, as
+  // #3078 for Allocate IP).
+  const {
+    data: effectiveDns,
+    isFetching: effectiveFetching,
+    isRefetchError: effectiveRefetchFailed,
+  } = useQuery({
     queryKey: ["effective-dns-subnet", subnetId ?? "none"],
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId as string),
     enabled: !!subnetId,
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   // #2135 — no zone reads while core.dns is off, so no zone picker either.
   const dnsOn = useModuleOn("core.dns");
@@ -10905,16 +11010,36 @@ function BulkEditAddressesModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // The pick is not final while the subnet's DNS is re-read over a cached
+  // copy, or its zones are on their way: Apply and the picker wait (#3368).
+  // Both settle on error or offline (isFetching / isLoading go false), so
+  // this never blocks for good; a failed re-read keeps the cached answer
+  // and says so below.
+  const zonesPending =
+    editDnsZone &&
+    dnsOn &&
+    ((effectiveFetching && effectiveDns !== undefined) ||
+      !zoneQueries.every((q: { isLoading: boolean }) => !q.isLoading));
+  // The section is hidden when the fresh answer leaves no zone to pick; a
+  // tick made over the cached copy must not then send a zone the dialog no
+  // longer shows.
+  const dnsZoneEditing = editDnsZone && availableZones.length > 0;
+  // Re-pick the primary when the fresh answer changes it, until the operator
+  // has chosen.
   useEffect(() => {
-    if (editDnsZone && !dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z: DNSZone) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [editDnsZone, availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!editDnsZone || dnsZoneTouched || availableZones.length === 0) return;
+    const primary = effectiveDns?.dns_zone_id;
+    const target =
+      primary && availableZones.some((z: DNSZone) => z.id === primary)
+        ? primary
+        : availableZones[0].id;
+    if (target !== dnsZoneId) setDnsZoneId(target);
+  }, [
+    editDnsZone,
+    dnsZoneTouched,
+    availableZones.length,
+    effectiveDns?.dns_zone_id,
+  ]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Needed for "replace all tags" mode: we need the union of existing keys
   // across the selected IPs so we can null them out server-side.
@@ -10989,7 +11114,7 @@ function BulkEditAddressesModal({
         }
         if (Object.keys(cfObj).length > 0) changes.custom_fields = cfObj;
       }
-      if (editDnsZone) changes.dns_zone_id = dnsZoneId; // "" clears the zone
+      if (dnsZoneEditing) changes.dns_zone_id = dnsZoneId; // "" clears the zone
       return ipamApi.bulkEditAddresses({ ip_ids: ipIds, changes });
     },
     onSuccess: (res) => {
@@ -11031,7 +11156,7 @@ function BulkEditAddressesModal({
     editDescription ||
     hasTagChanges ||
     hasCfChanges ||
-    editDnsZone ||
+    dnsZoneEditing ||
     editRole ||
     editReservedUntil;
 
@@ -11164,7 +11289,13 @@ function BulkEditAddressesModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  // Not choosable until the re-read answers: a pick made
+                  // from the cached list could name a zone it drops (#3368).
+                  disabled={zonesPending}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}
@@ -11173,6 +11304,17 @@ function BulkEditAddressesModal({
                     noneOption="None (remove DNS records)"
                   />
                 </select>
+                {zonesPending && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Re-reading the subnet&rsquo;s DNS zones&hellip;
+                  </p>
+                )}
+                {effectiveRefetchFailed && !zonesPending && (
+                  <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                    Could not re-read the subnet&rsquo;s DNS settings; these
+                    zones are from an earlier read and may be out of date.
+                  </p>
+                )}
                 <p className="text-[11px] text-muted-foreground">
                   Moves every selected IP's forward record to this zone (and
                   deletes the old record if present). Picking &ldquo;None&rdquo;
@@ -11400,7 +11542,11 @@ function BulkEditAddressesModal({
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -11413,7 +11559,12 @@ function BulkEditAddressesModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!hasChanges || mutation.isPending}
+            disabled={!hasChanges || zonesPending || mutation.isPending}
+            title={
+              zonesPending
+                ? "Waiting for the subnet's DNS zones to load"
+                : undefined
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Applying…" : "Apply to all"}
@@ -11541,7 +11692,11 @@ export function BulkDeleteAddressesModal({
         <p className="text-[11px] text-muted-foreground">
           System rows (network, broadcast) are always skipped.
         </p>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -11581,6 +11736,24 @@ export function BulkDeleteAddressesModal({
  *  text is the chip's own `title`. */
 export const TREE_CHIP_CLS = "block min-w-0 max-w-[6rem] shrink truncate";
 
+/** dnd-kit's attributes for a tree row, minus what announces it as draggable
+ *  when the operator may not move it (#3392). With `disabled` dnd-kit still
+ *  sets `aria-disabled="true"`, which on a row that selects when clicked tells
+ *  a screen reader (and Playwright's enabled check) that the row itself is
+ *  unavailable; a read-only user's whole tree would read as disabled. */
+function treeDragAttributes(
+  attrs: DraggableAttributes,
+  draggable: boolean,
+): React.HTMLAttributes<HTMLElement> {
+  if (draggable) return attrs;
+  return {
+    ...attrs,
+    "aria-disabled": undefined,
+    "aria-roledescription": undefined,
+    "aria-describedby": undefined,
+  };
+}
+
 export function SubnetRow({
   subnet,
   isSelected,
@@ -11597,9 +11770,15 @@ export function SubnetRow({
   onAllocateIp?: (s: Subnet) => void;
 }) {
   const [showEdit, setShowEdit] = useState(false);
+  // #3392 — the right-click Edit / Delete and the drag-to-move ask what the
+  // header's Edit and Delete ask; a read-only user is offered none of them.
+  const perms = usePermissions();
+  const canEditSubnet = perms.can("write", "subnet", subnet.id);
+  const canDeleteSubnet = perms.can("delete", "subnet");
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `subnet:${subnet.id}`,
     data: { kind: "subnet", subnet },
+    disabled: !canEditSubnet,
   });
 
   return (
@@ -11607,7 +11786,7 @@ export function SubnetRow({
       <ContextMenuTrigger asChild>
         <div
           ref={setNodeRef}
-          {...attributes}
+          {...treeDragAttributes(attributes, canEditSubnet)}
           {...listeners}
           onClick={onSelect}
           role="treeitem"
@@ -11664,10 +11843,17 @@ export function SubnetRow({
             Allocate IP
           </ContextMenuItem>
         )}
-        <ContextMenuItem onSelect={() => setShowEdit(true)}>
+        <ContextMenuItem
+          onSelect={() => setShowEdit(true)}
+          {...permissionGate(canEditSubnet, NEEDS_SUBNET_WRITE)}
+        >
           Edit…
         </ContextMenuItem>
-        <ContextMenuItem destructive onSelect={() => onDelete()}>
+        <ContextMenuItem
+          destructive
+          onSelect={() => onDelete()}
+          {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+        >
           Delete…
         </ContextMenuItem>
       </ContextMenuContent>
@@ -11695,6 +11881,7 @@ function ConfirmDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   title: string;
   message: string;
@@ -11702,11 +11889,17 @@ function ConfirmDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending?: boolean;
+  error?: string;
 }) {
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
         <p className="break-words text-sm text-muted-foreground">{message}</p>
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -12182,6 +12375,16 @@ type EditSpaceModalProps = {
 
 // Reads the space fresh on open (#3075): the panel holds the space as it was
 // when clicked, and the form is seeded once from it.
+/** Every effective-DNS read a space / block / subnet save can change. */
+function invalidateEffectiveDns(qc: QueryClient) {
+  for (const k of [
+    "effective-dns-subnet",
+    "effective-dns-block",
+    "effective-dns-space",
+  ])
+    qc.invalidateQueries({ queryKey: [k] });
+}
+
 export function EditSpaceModal(props: EditSpaceModalProps) {
   const fresh = useFreshRow<IPSpace>(props.space, () =>
     ipamApi.getSpace(props.space.id),
@@ -12206,7 +12409,9 @@ function EditSpaceModalForm({
 }: EditSpaceModalProps) {
   // The dialog opens for a holder of write on this one space, but the server
   // asks delete over every IP space (no id), so a grant on one space is not enough.
-  const canDeleteSpace = usePermissions().can("delete", "ip_space");
+  const { can } = usePermissions();
+  const canDeleteSpace = can("delete", "ip_space");
+  const canReadVrfs = can("read", "vrf");
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -12300,6 +12505,8 @@ function EditSpaceModalForm({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
+      // A space's DNS settings reach every block and subnet below it (#3368).
+      invalidateEffectiveDns(qc);
       onClose();
     },
     // #516 — surface save failures (403/409/etc.) instead of leaving the
@@ -12514,16 +12721,19 @@ function EditSpaceModalForm({
           </p>
           <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Manage VRFs (RD + import / export RTs) under{" "}
-              <a
-                href="/network/vrfs"
-                className="underline hover:text-foreground"
-              >
-                Network → VRFs
-              </a>
-              .
-            </p>
+            {/* The VRFs page reads the same list the picker may not (#3451). */}
+            {canReadVrfs && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Manage VRFs (RD + import / export RTs) under{" "}
+                <a
+                  href="/network/vrfs"
+                  className="underline hover:text-foreground"
+                >
+                  Network → VRFs
+                </a>
+                .
+              </p>
+            )}
             {space.vrf_name && !vrfId && (
               <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
                 Legacy freeform VRF: <code>{space.vrf_name}</code>
@@ -13142,7 +13352,8 @@ function EditBlockModalForm({
   const mutation = useMutation({
     mutationFn: async () => {
       const now = {
-        name: name || undefined,
+        // ``""`` when cleared, as for a subnet (#3370).
+        name,
         description,
         custom_fields: customFields,
         dns_inherit_settings: dnsInherit,
@@ -13163,7 +13374,7 @@ function EditBlockModalForm({
       // inherited DNS / DHCP fields go out as null, so they are compared as
       // null whatever the stored row holds under an inheriting block.
       const was = {
-        name: block.name || undefined,
+        name: block.name ?? "",
         description: block.description ?? "",
         custom_fields: block.custom_fields ?? {},
         dns_inherit_settings: block.dns_inherit_settings ?? true,
@@ -13199,6 +13410,8 @@ function EditBlockModalForm({
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
+      // A block's DNS settings reach its subnets' effective DNS (#3368).
+      invalidateEffectiveDns(qc);
       onClose(updated);
     },
     onError: (err: unknown) => {
@@ -13568,6 +13781,13 @@ export function BlockTreeRow({
     forceExpand || (expanded ?? (holdsSelection || depth < defaultDepth));
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
+  // #3392 — the right-click New / Edit / Delete and the drag-to-move ask what
+  // the header's twins ask.
+  const perms = usePermissions();
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canEditBlock = perms.can("write", "ip_block", node.block.id);
+  const canDeleteBlock = perms.can("delete", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const {
     attributes: dragAttrs,
     listeners: dragListeners,
@@ -13576,6 +13796,7 @@ export function BlockTreeRow({
   } = useDraggable({
     id: `block:${node.block.id}`,
     data: { kind: "block", block: node.block },
+    disabled: !canEditBlock,
   });
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: `block-drop:${node.block.id}`,
@@ -13599,7 +13820,7 @@ export function BlockTreeRow({
         <ContextMenuTrigger asChild>
           <div
             ref={setRefs}
-            {...dragAttrs}
+            {...treeDragAttributes(dragAttrs, canEditBlock)}
             {...dragListeners}
             className={cn(
               "group flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-muted/30 cursor-pointer",
@@ -13666,15 +13887,24 @@ export function BlockTreeRow({
         <ContextMenuContent>
           <ContextMenuLabel>{node.block.network}</ContextMenuLabel>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => onCreateChildBlock(node.block.id)}>
+          <ContextMenuItem
+            onSelect={() => onCreateChildBlock(node.block.id)}
+            {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+          >
             New child block…
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => onCreateSubnet(node.block.id)}>
+          <ContextMenuItem
+            onSelect={() => onCreateSubnet(node.block.id)}
+            {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+          >
             New subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
           {onEditBlock && (
-            <ContextMenuItem onSelect={() => onEditBlock(node.block)}>
+            <ContextMenuItem
+              onSelect={() => onEditBlock(node.block)}
+              {...permissionGate(canEditBlock, NEEDS_BLOCK_WRITE)}
+            >
               Edit…
             </ContextMenuItem>
           )}
@@ -13682,6 +13912,7 @@ export function BlockTreeRow({
             <ContextMenuItem
               destructive
               onSelect={() => onDeleteBlock(node.block)}
+              {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
             >
               Delete…
             </ContextMenuItem>
@@ -13764,6 +13995,7 @@ export function BlockDetailView({
   ancestors,
   allBlocks,
   allSubnets,
+  readError,
   space,
   onSelectSpace,
   onSelectBlock,
@@ -13774,6 +14006,9 @@ export function BlockDetailView({
   ancestors: IPBlock[];
   allBlocks: IPBlock[];
   allSubnets: Subnet[];
+  /** The error of the block or subnet list behind this view, when its read
+   *  was refused or failed: an empty list is then not an empty block (#3337). */
+  readError?: unknown;
   space?: IPSpace;
   onSelectSpace: () => void;
   onSelectBlock: (b: IPBlock) => void;
@@ -13831,6 +14066,14 @@ export function BlockDetailView({
   const canWriteBlocks = perms.can("write", "ip_block");
   const canEditBlock = perms.can("write", "ip_block", block.id);
   const canWriteSubnets = perms.can("write", "subnet");
+  // #3334: Sync DNS, gated as #2571 gates the subnet's. The drift preview
+  // reads the block and its addresses, and Apply's reverse-zone backfill and
+  // commit are write on IP blocks, all at the type level (a grant scoped to
+  // this one block reaches none of them).
+  const canDnsSync =
+    perms.can("read", "ip_block") &&
+    perms.can("read", "ip_address") &&
+    canWriteBlocks;
 
   const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
     string | null
@@ -14052,6 +14295,7 @@ export function BlockDetailView({
                     icon={Globe2}
                     onClick={() => setShowDnsSync(true)}
                     title="Reconcile IPAM-managed DNS records across every subnet under this block"
+                    {...permissionGate(canDnsSync, NEEDS_BLOCK_DNS_SYNC)}
                   >
                     Sync DNS
                   </HeaderButton>
@@ -14212,6 +14456,9 @@ export function BlockDetailView({
               block={block}
               directSubnets={directSubnets}
               childBlocks={directChildBlocks}
+              createDisabledReason={
+                canWriteSubnets ? undefined : NEEDS_SUBNET_WRITE
+              }
               onSelectFree={(range) => {
                 setFreeRangePreset(range);
                 setShowCreateSubnet(true);
@@ -14347,6 +14594,8 @@ export function BlockDetailView({
           space={space}
           defaultBlockId={block.id}
           defaultBlockLabel={block.network}
+          defaultBlockCidr={block.network}
+          canCreate={canWriteSubnets}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, parentBlockId) => {
             setFindFreeBlockId(parentBlockId);
@@ -14548,9 +14797,16 @@ export function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {hasBlockFilter || hasTagFilter || hasRoleFilter
-                    ? "No results match the active filters."
-                    : "This block has no child blocks or subnets yet."}
+                  {readError != null ? (
+                    <ListReadError
+                      error={readError}
+                      what="this block's child blocks and subnets"
+                    />
+                  ) : hasBlockFilter || hasTagFilter || hasRoleFilter ? (
+                    "No results match the active filters."
+                  ) : (
+                    "This block has no child blocks or subnets yet."
+                  )}
                 </p>
               </div>
             );
@@ -14558,6 +14814,16 @@ export function BlockDetailView({
 
           return (
             <div className="overflow-x-auto">
+              {/* Child blocks read, subnets refused: the rows shown are not
+                  the whole block, so say so above them (#3337). */}
+              {readError != null && (
+                <p className="px-4 py-2 text-xs">
+                  <ListReadError
+                    error={readError}
+                    what="all of this block's contents"
+                  />
+                </p>
+              )}
               <table className="w-full min-w-[720px] text-sm">
                 <thead>
                   <tr className="border-b bg-muted/40 text-xs">
@@ -15226,12 +15492,26 @@ export function SpaceTableView({
   const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
-  const { data: blocks, isLoading: blocksLoading } = useQuery({
+  // #3334: Sync DNS, as on a block: read on IP spaces and IP addresses for
+  // the preview, write on IP spaces for Apply, all at the type level.
+  const canDnsSync =
+    perms.can("read", "ip_space") &&
+    perms.can("read", "ip_address") &&
+    canWriteSpaces;
+  const {
+    data: blocks,
+    isLoading: blocksLoading,
+    error: blocksError,
+  } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
   });
 
-  const { data: subnets, isLoading: subnetsLoading } = useQuery({
+  const {
+    data: subnets,
+    isLoading: subnetsLoading,
+    error: subnetsError,
+  } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
   });
@@ -15529,6 +15809,7 @@ export function SpaceTableView({
                 icon={Globe2}
                 onClick={() => setShowDnsSync(true)}
                 title="Reconcile IPAM-managed DNS records across every subnet in this space"
+                {...permissionGate(canDnsSync, NEEDS_SPACE_DNS_SYNC)}
               >
                 Sync DNS
               </HeaderButton>
@@ -15587,10 +15868,37 @@ export function SpaceTableView({
           <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>
         ) : isEmpty ? (
           <p className="px-6 py-4 text-sm text-muted-foreground">
-            No blocks or subnets in this space yet.
+            {blocksError != null || subnetsError != null ? (
+              <ListReadError
+                error={blocksError ?? subnetsError}
+                what={
+                  blocksError != null && subnetsError != null
+                    ? "this space's blocks and subnets"
+                    : blocksError != null
+                      ? "this space's blocks"
+                      : "this space's subnets"
+                }
+              />
+            ) : (
+              "No blocks or subnets in this space yet."
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">
+            {/* One of the two reads answered and the other was refused: the
+                rows shown are not the whole space (#3337). */}
+            {(blocksError != null || subnetsError != null) && (
+              <p className="px-6 py-2 text-xs">
+                <ListReadError
+                  error={blocksError ?? subnetsError}
+                  what={
+                    blocksError != null
+                      ? "this space's blocks"
+                      : "this space's subnets"
+                  }
+                />
+              </p>
+            )}
             <table className="w-full min-w-[720px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/40 text-xs">
@@ -15997,6 +16305,7 @@ export function SpaceTableView({
       {showFindFree && (
         <FindFreeModal
           space={space}
+          canCreate={canWriteSubnets}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr, blockId) => {
             setFindFreePrefill({ network: cidr, blockId });
@@ -16259,17 +16568,27 @@ export function SpaceSection({
   const [blockToDelete, setBlockToDelete] = useState<IPBlock | null>(null);
   const [dndError, setDndError] = useState<string | null>(null);
   const qc = useQueryClient();
+  // #3392 — the right-click New / Edit items ask what the header's twins ask.
+  // Edit Space names the space: a grant scoped to it may edit it (#3039).
+  const perms = usePermissions();
+  const canEditSpace = perms.can("write", "ip_space", space.id);
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
 
-  const { data: subnets, isLoading } = useQuery({
+  const {
+    data: subnets,
+    isLoading,
+    error: subnetsError,
+  } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
     enabled: expanded || filtering,
   });
 
-  const { data: blocks } = useQuery({
+  const { data: blocks, error: blocksError } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
     enabled: expanded || filtering,
@@ -16445,6 +16764,13 @@ export function SpaceSection({
       | undefined;
     if (!srcData || !dstData) return;
     const targetBlock = dstData.block;
+    // #3392 — a drag is a write; the rows are not draggable without the grant,
+    // and a drop that gets here without it is refused here, not by the server.
+    if (srcData.kind === "subnet" && srcData.subnet) {
+      if (!perms.can("write", "subnet", srcData.subnet.id)) return;
+    } else if (srcData.kind === "block" && srcData.block) {
+      if (!perms.can("write", "ip_block", srcData.block.id)) return;
+    }
 
     if (srcData.kind === "subnet" && srcData.subnet) {
       const sn = srcData.subnet;
@@ -16540,17 +16866,26 @@ export function SpaceSection({
         <ContextMenuContent>
           <ContextMenuLabel>{space.name}</ContextMenuLabel>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => setShowCreateBlock(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowCreateBlock(true)}
+            {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+          >
             New Block…
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => setShowCreateSubnet(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowCreateSubnet(true)}
+            {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+          >
             New Subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
           <ContextMenuItem onSelect={() => setExpanded((v) => !v)}>
             {expanded ? "Collapse" : "Expand"}
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => setShowEditSpace(true)}>
+          <ContextMenuItem
+            onSelect={() => setShowEditSpace(true)}
+            {...permissionGate(canEditSpace, NEEDS_SPACE_WRITE)}
+          >
             Edit Space…
           </ContextMenuItem>
         </ContextMenuContent>
@@ -16572,9 +16907,10 @@ export function SpaceSection({
 
             {/* Block tree (recursive) — filtered + force-expanded when a
                 quick-filter is active, and capped to TREE_GROUP_CAP top-level
-                rows with a reveal (never capped while filtering). */}
+                rows with a reveal (never capped while filtering). A refused
+                subnet read still draws the blocks it can see (#3337). */}
             {blocks &&
-              subnets &&
+              (subnets || subnetsError != null) &&
               (() => {
                 const top = buildBlockTree(treeBlocks, treeSubnets, null);
                 const capped =
@@ -16618,11 +16954,32 @@ export function SpaceSection({
                 );
               })()}
 
-            {!isLoading && !subnets?.length && !blocks?.length && (
-              <p className="py-1 pl-2 text-xs text-muted-foreground">
-                No blocks yet.
+            {/* A refused or failed read says so, not "No blocks yet", and
+                beside the blocks it could read when only subnets were
+                refused (#3337). */}
+            {!isLoading && (blocksError != null || subnetsError != null) && (
+              <p className="py-1 pl-2 text-xs">
+                <ListReadError
+                  error={blocksError ?? subnetsError}
+                  what={
+                    blocksError != null && subnetsError != null
+                      ? "this space's blocks and subnets"
+                      : blocksError != null
+                        ? "this space's blocks"
+                        : "this space's subnets"
+                  }
+                />
               </p>
             )}
+            {!isLoading &&
+              !subnets?.length &&
+              !blocks?.length &&
+              blocksError == null &&
+              subnetsError == null && (
+                <p className="py-1 pl-2 text-xs text-muted-foreground">
+                  No blocks yet.
+                </p>
+              )}
           </div>
         </DndContext>
       )}
@@ -17383,13 +17740,13 @@ export function IPAMPage() {
   const activeSpaceId =
     selectedBlock?.space_id ?? selectedSubnet?.space_id ?? selectedSpace?.id;
 
-  const { data: detailBlocks } = useQuery({
+  const { data: detailBlocks, error: detailBlocksError } = useQuery({
     queryKey: ["blocks", activeSpaceId],
     queryFn: () => ipamApi.listBlocks(activeSpaceId!),
     enabled: !!activeSpaceId,
   });
 
-  const { data: detailSubnets } = useQuery({
+  const { data: detailSubnets, error: detailSubnetsError } = useQuery({
     queryKey: ["subnets", activeSpaceId],
     queryFn: () => ipamApi.listSubnets({ space_id: activeSpaceId }),
     enabled: !!activeSpaceId,
@@ -17697,6 +18054,7 @@ export function IPAMPage() {
             ancestors={selectedBlockAncestors}
             allBlocks={detailBlocks ?? []}
             allSubnets={detailSubnets ?? []}
+            readError={detailSubnetsError ?? detailBlocksError}
             onSelectSpace={() => {
               const sp = spaces?.find(
                 (s: IPSpace) => s.id === selectedBlock.space_id,

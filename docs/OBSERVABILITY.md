@@ -1103,8 +1103,8 @@ running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The
 conformity evaluator follows the same rules.
 
-Rule types described on this page. The build has 73 (`RULE_TYPES` in
-`backend/app/services/alerts.py`) and 41 of them have a row below.
+Rule types described on this page. Most of the build's `RULE_TYPES` (in
+`backend/app/services/alerts.py`) have a row below.
 `GET /api/v1/alerts/rule-types` lists every type whose feature module is
 enabled, with its parameters, and some are documented on their own feature page
 instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in
@@ -1301,3 +1301,54 @@ Agent logs are structured JSON (non-negotiable #7) and include the canonical
 - `dns_agent_registered` — bootstrap complete
 - `dns_agent_token_rotated` — JWT rotation
 - `dns_agent_stale_sweep` — control-plane Celery task marked servers unreachable
+
+---
+
+## Reference summaries — dashboards, Platform Insights, alert delivery, webhooks
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Dashboard-at-a-glance
+
+nine sub-tabs: Overview / IPAM / DNS / DHCP / **Network** (ASN drift + RPKI expiry + circuit alerts + service orphans) / **Integrations** (per-mirror counts + last-sync staleness) / **Security** (lockout state + active sessions + audit-chain status + MFA enrolment) / **Compliance** (PCI / HIPAA / internet-facing flag counts) / **Conformity** (per-framework status + auditor PDF download).
+
+- Platform health card (API / Postgres / Redis / workers / beat)
+- Live DNS query rate + DHCP traffic charts — self-contained, no Prometheus needed
+  - Sources: BIND9 statistics-channels + Kea `statistic-get-all`
+- Subnet utilization heatmap
+- Live activity feed
+
+### Platform Insights admin page
+
+native diagnostics, no extra agents.
+
+- Postgres: DB size, cache hit ratio, WAL position, slow queries via `pg_stat_statements`, table sizes, idle-in-transaction watch
+- Containers: per-container CPU / memory / network / IO from the local Docker socket
+
+### Alerts + audit forwarding
+
+multi-target delivery with pluggable wire formats.
+
+- Rule-based alerts framework (subnet utilization, server unreachable)
+- Multi-target syslog (UDP / TCP / TLS), HTTP webhook, SMTP email, Slack / Teams / Discord chat
+- Wire formats: RFC 5424 JSON, CEF, LEEF, RFC 3164, JSON lines
+- Per-target filters
+
+### Typed-event webhooks
+
+curated automation surface for downstream consumers.
+
+- 144 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.allocated`)
+- HMAC-SHA256 signed POSTs with reserved `X-SpatiumDDI-*` headers
+- Outbox-backed at-least-once delivery with exponential backoff + dead-letter
+- Per-subscription manual retry, custom headers, and one-time secret reveal
+
+### Compliance change alerts
+
+reactive: catch every mutation against PCI / HIPAA / internet-facing scope.
+
+- New `compliance_change` rule type with two params: `classification` (which Subnet flag the rule watches) and `change_scope` (`any_change` / `create` / `delete`)
+- Audit-log scanner runs on the existing 60 s alert tick. Watermark column on the rule baselines to `now()` on first run so historical audit history doesn't retro-page operators when a rule is first enabled
+- Resolves IP-address / DHCP-scope audit rows back to their parent subnet for classification lookup; deletes fall back to `audit_log.old_value.subnet_id` so a delete still resolves the originating subnet
+- One event per matching audit row, auto-resolves after 24 h, fans through the existing audit-forward syslog / webhook / SMTP targets
+- Three disabled seed rules ship at first boot: PCI scope changes, HIPAA scope changes, internet-facing scope changes — operator opts in by toggling enabled

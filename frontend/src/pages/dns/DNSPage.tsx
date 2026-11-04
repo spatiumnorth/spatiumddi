@@ -1156,7 +1156,28 @@ function patchCachedRow(
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
-export function GroupModal({
+// Edit reads the group fresh on open and Save sends only what changed (#3365).
+export function GroupModal(props: {
+  group?: DNSServerGroup;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow(props.group, () =>
+    dnsApi.getGroup(props.group!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server Group"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <GroupModalForm group={fresh.row} onClose={props.onClose} />;
+}
+
+function GroupModalForm({
   group,
   onClose,
 }: {
@@ -1239,7 +1260,7 @@ export function GroupModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError("");
-          mut.mutate({
+          const body = {
             name,
             description,
             group_type: groupType,
@@ -1248,7 +1269,32 @@ export function GroupModal({
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
             auto_reverse_zones_at_provider: autoReverseAtProvider,
-          });
+          };
+          if (!group) {
+            mut.mutate(body);
+            return;
+          }
+          // Edit sends only what the operator changed (#3365).
+          const diff = changedFields(
+            {
+              name: group.name,
+              description: group.description ?? "",
+              group_type: group.group_type ?? "internal",
+              is_recursive: group.is_recursive ?? true,
+              catalog_zones_enabled: group.catalog_zones_enabled ?? false,
+              catalog_zone_name:
+                group.catalog_zone_name ?? "catalog.spatium.invalid.",
+              is_public_facing: group.is_public_facing ?? false,
+              auto_reverse_zones_at_provider:
+                group.auto_reverse_zones_at_provider ?? false,
+            },
+            body,
+          );
+          if (Object.keys(diff).length === 0) {
+            onClose();
+            return;
+          }
+          mut.mutate(diff);
         }}
         className="space-y-3"
       >
@@ -1440,15 +1486,34 @@ export function GroupModal({
 
 // ── Server Modal (add / edit) ─────────────────────────────────────────────────
 
-export function ServerModal({
-  groupId,
-  server,
-  onClose,
-}: {
+type ServerModalProps = {
   groupId: string;
   server?: DNSServer;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the server fresh on open and Save sends only what changed
+// (#3379): the clicked row comes from a list loaded earlier.
+export function ServerModal(props: ServerModalProps) {
+  const fresh = useFreshRow(props.server, () =>
+    dnsApi
+      .listServers(props.groupId)
+      .then((rows) => rows.find((s) => s.id === props.server!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerModalForm {...props} server={fresh.row} />;
+}
+
+function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const editing = !!server;
@@ -1714,6 +1779,48 @@ export function ServerModal({
       }
     }
 
+    if (server) {
+      // Edit sends only what the operator changed (#3379); credentials,
+      // api_key, group move and primary flag are already conditional above.
+      const baseKeys = [
+        "name",
+        "driver",
+        "host",
+        "port",
+        "api_port",
+        "roles",
+        "notes",
+        "is_enabled",
+      ];
+      const base = Object.fromEntries(
+        baseKeys.filter((k) => k in payload).map((k) => [k, payload[k]]),
+      );
+      const rest = Object.fromEntries(
+        Object.entries(payload).filter(([k]) => !baseKeys.includes(k)),
+      );
+      const out = {
+        ...changedFields(
+          {
+            name: server.name,
+            driver: server.driver,
+            host: server.host,
+            port: server.port,
+            api_port: server.api_port ?? null,
+            roles: server.roles ?? [],
+            notes: server.notes ?? "",
+            is_enabled: server.is_enabled,
+          },
+          base,
+        ),
+        ...rest,
+      };
+      if (Object.keys(out).length === 0) {
+        onClose();
+        return;
+      }
+      mut.mutate(out);
+      return;
+    }
     mut.mutate(payload);
   }
 
@@ -4253,7 +4360,11 @@ export function ZoneDetailView({
     if (recordSearch.trim()) p.search = recordSearch.trim();
     return p;
   }, [recordPage, recordSearch]);
-  const { data: recordsPage, isFetching } = useQuery({
+  const {
+    data: recordsPage,
+    isFetching,
+    error: recordsError,
+  } = useQuery({
     queryKey: ["dns-records", zone.id, recordParams],
     queryFn: () => dnsApi.listRecords(group.id, zone.id, recordParams),
   });
@@ -5086,9 +5197,16 @@ export function ZoneDetailView({
           {filtered.length === 0 && !isFetching && (
             <div className="flex flex-col items-center justify-center h-40">
               <p className="text-sm text-muted-foreground italic">
-                {hasRecFilter
-                  ? "No records match the current filter."
-                  : 'No records yet. Click "Add Record" to create one.'}
+                {recordsError != null ? (
+                  <ListReadError
+                    error={recordsError}
+                    what="this zone's records"
+                  />
+                ) : hasRecFilter ? (
+                  "No records match the current filter."
+                ) : (
+                  'No records yet. Click "Add Record" to create one.'
+                )}
               </p>
             </div>
           )}
@@ -5377,6 +5495,7 @@ export function ZoneDetailView({
                                   className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                                   onClick={() => setEditRecord(r)}
                                   title="Edit record"
+                                  aria-label="Edit record"
                                   {...permissionGate(
                                     canWriteRecords,
                                     NEEDS_DNS_WRITE,
@@ -5388,6 +5507,7 @@ export function ZoneDetailView({
                                   className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                                   onClick={() => setConfirmDeleteRecord(r)}
                                   title="Delete record"
+                                  aria-label="Delete record"
                                   {...permissionGate(
                                     canDeleteRecords,
                                     NEEDS_DNS_DELETE,
@@ -6177,6 +6297,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   setEditServer(s);
                 }}
                 title="Edit server"
+                aria-label="Edit server"
                 {...serverGate}
               >
                 <Pencil className="h-3.5 w-3.5" />
@@ -6188,6 +6309,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   setConfirmDeleteServer(s);
                 }}
                 title="Delete server"
+                aria-label="Delete server"
                 {...serverGate}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -6409,6 +6531,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                       title="Edit view"
+                      aria-label="Edit view"
                       onClick={() => {
                         setError("");
                         setEditing(v);
@@ -6423,6 +6546,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                       title="Delete view"
+                      aria-label="Delete view"
                       onClick={() => {
                         setError("");
                         setConfirmDelete(v);
@@ -7039,6 +7163,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
                   setConfirmDelete(acl);
                 }}
                 title="Delete ACL"
+                aria-label="Delete ACL"
                 {...permissionGate(
                   can("delete", "dns_group"),
                   NEEDS_GROUP_DELETE,
@@ -7234,6 +7359,7 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                       onClick={() => setEditKey(k)}
                       className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted/50 disabled:opacity-40"
                       title="Edit metadata"
+                      aria-label="Edit metadata"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Pencil className="h-3 w-3" />
@@ -7245,6 +7371,7 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                       }}
                       className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                       title="Delete key"
+                      aria-label="Delete key"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Trash2 className="h-3 w-3" />
@@ -7317,17 +7444,39 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   );
 }
 
-function TSIGKeyModal({
-  groupId,
-  existing,
-  onClose,
-  onCreated,
-}: {
+type TSIGKeyModalProps = {
   groupId: string;
   existing?: DNSTSIGKey;
   onClose: () => void;
   onCreated?: (s: { name: string; algorithm: string; secret: string }) => void;
-}) {
+};
+
+// Edit reads the key fresh on open and Save sends only what changed (#3379).
+export function TSIGKeyModal(props: TSIGKeyModalProps) {
+  const fresh = useFreshRow(props.existing, () =>
+    dnsApi
+      .listTSIGKeys(props.groupId)
+      .then((rows) => rows.find((k) => k.id === props.existing!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit TSIG Key"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <TSIGKeyModalForm {...props} existing={fresh.row} />;
+}
+
+function TSIGKeyModalForm({
+  groupId,
+  existing,
+  onClose,
+  onCreated,
+}: TSIGKeyModalProps) {
   const qc = useQueryClient();
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
@@ -7348,12 +7497,17 @@ function TSIGKeyModal({
   const saveMut = useMutation({
     mutationFn: () => {
       if (isEdit && existing) {
-        return dnsApi.updateTSIGKey(groupId, existing.id, {
-          name,
-          algorithm,
-          purpose: purpose || null,
-          notes,
-        });
+        const diff = changedFields(
+          {
+            name: existing.name,
+            algorithm: existing.algorithm,
+            purpose: existing.purpose || null,
+            notes: existing.notes ?? "",
+          },
+          { name, algorithm, purpose: purpose || null, notes },
+        );
+        if (Object.keys(diff).length === 0) return Promise.resolve(existing);
+        return dnsApi.updateTSIGKey(groupId, existing.id, diff);
       }
       return dnsApi.createTSIGKey(groupId, {
         name,
@@ -8953,7 +9107,11 @@ function RecordsTab({
     if (groupRecordSearch.trim()) p.search = groupRecordSearch.trim();
     return p;
   }, [groupRecordPage, groupRecordSearch]);
-  const { data: groupRecordsPage, isLoading } = useQuery({
+  const {
+    data: groupRecordsPage,
+    isLoading,
+    error: groupRecordsError,
+  } = useQuery({
     queryKey: ["dns-group-records", group.id, groupRecordParams],
     queryFn: () => dnsApi.listGroupRecords(group.id, groupRecordParams),
   });
@@ -9250,9 +9408,16 @@ function RecordsTab({
                   colSpan={8}
                   className="px-4 py-8 text-center text-sm text-muted-foreground"
                 >
-                  {recordsTotal === 0
-                    ? "No records in this group yet."
-                    : "No records match the active filters."}
+                  {groupRecordsError != null ? (
+                    <ListReadError
+                      error={groupRecordsError}
+                      what="this group's records"
+                    />
+                  ) : recordsTotal === 0 ? (
+                    "No records in this group yet."
+                  ) : (
+                    "No records match the active filters."
+                  )}
                 </td>
               </tr>
             ) : (
@@ -9320,6 +9485,7 @@ function RecordsTab({
                               ? "Auto-managed — edit the source IP/lease"
                               : "Edit"
                           }
+                          aria-label="Edit"
                           {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
                         >
                           <Pencil className="h-3.5 w-3.5" />
@@ -9333,6 +9499,7 @@ function RecordsTab({
                               ? "Auto-managed — delete the source IP/lease"
                               : "Delete"
                           }
+                          aria-label="Delete"
                           {...permissionGate(
                             canDeleteRecords,
                             NEEDS_DNS_DELETE,
@@ -9456,7 +9623,11 @@ function ZonesTab({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
-  const { data: zones = [], isFetching } = useQuery({
+  const {
+    data: zones = [],
+    isFetching,
+    error: zonesError,
+  } = useQuery({
     queryKey: ["dns-zones", group.id, tagFilters],
     queryFn: () =>
       dnsApi.listZones(
@@ -9863,7 +10034,9 @@ function ZonesTab({
       )}
       {zones.length === 0 && !isFetching && (
         <p className="text-sm text-muted-foreground italic">
-          {tagFilters.length > 0 ? (
+          {zonesError != null ? (
+            <ListReadError error={zonesError} what="this group's zones" />
+          ) : tagFilters.length > 0 ? (
             <>
               No zones match the selected tags.{" "}
               <button
@@ -10680,6 +10853,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       {views.length > 0 && (
                         <button
                           title="Scope to specific views"
+                          aria-label="Scope to specific views"
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => setScopeList(l)}
                           {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
@@ -10694,6 +10868,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                               ? "Refresh in progress…"
                               : "Refresh from feed"
                           }
+                          aria-label="Refresh from feed"
                           disabled={refreshing.has(l.id)}
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
                           onClick={() => refreshMut.mutate(l.id)}
@@ -10771,7 +10946,28 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   );
 }
 
-function BlocklistModal({
+// Edit reads the list fresh on open and Save sends only what changed (#3365).
+export function BlocklistModal(props: {
+  list?: DNSBlockList;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow(props.list, () =>
+    dnsBlocklistApi.get(props.list!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Blocking List"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <BlocklistModalForm list={fresh.row} onClose={props.onClose} />;
+}
+
+function BlocklistModalForm({
   list,
   onClose,
 }: {
@@ -10816,24 +11012,48 @@ function BlocklistModal({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          mut.mutate(
-            blocklistPayload(
-              {
-                name,
-                description,
-                category,
-                sourceType,
-                feedUrl,
-                feedFormat,
-                blockMode,
-                sinkholeIp,
-                updateHours,
-                feedWildcard,
-                enabled,
-              },
-              !!list,
-            ),
+          const body = blocklistPayload(
+            {
+              name,
+              description,
+              category,
+              sourceType,
+              feedUrl,
+              feedFormat,
+              blockMode,
+              sinkholeIp,
+              updateHours,
+              feedWildcard,
+              enabled,
+            },
+            !!list,
           );
+          if (!list) {
+            mut.mutate(body);
+            return;
+          }
+          // Edit sends only what the operator changed (#3365).
+          const diff = changedFields(
+            {
+              name: list.name,
+              description: list.description ?? "",
+              category: list.category ?? "custom",
+              source_type: list.source_type ?? "manual",
+              feed_url: list.feed_url ?? null,
+              feed_format: list.feed_format ?? "hosts",
+              block_mode: list.block_mode ?? "nxdomain",
+              sinkhole_ip: list.sinkhole_ip ?? null,
+              update_interval_hours: list.update_interval_hours ?? 24,
+              feed_entries_are_wildcard: list.feed_entries_are_wildcard ?? true,
+              enabled: list.enabled ?? true,
+            },
+            body,
+          );
+          if (Object.keys(diff).length === 0) {
+            onClose();
+            return;
+          }
+          mut.mutate(diff);
         }}
       >
         <Field label="Name">
@@ -11284,6 +11504,7 @@ export function BlocklistDetail({
                             setEditEntryWildcard(e.is_wildcard);
                           }}
                           title="Edit domain"
+                          aria-label="Edit domain"
                           {...permissionGate(
                             can("write", "dns_blocklist"),
                             NEEDS_BLOCKLIST_WRITE,
@@ -11300,6 +11521,7 @@ export function BlocklistDetail({
                             ? "Remove entry"
                             : "Remove (will return on next feed refresh)"
                         }
+                        aria-label="Remove entry"
                         {...permissionGate(
                           can("delete", "dns_blocklist"),
                           NEEDS_BLOCKLIST_DELETE,
@@ -11409,6 +11631,7 @@ export function BlocklistDetail({
                           setEditExcReason(ex.reason ?? "");
                         }}
                         title="Edit exception"
+                        aria-label="Edit exception"
                         {...permissionGate(
                           can("write", "dns_blocklist"),
                           NEEDS_BLOCKLIST_WRITE,
@@ -11420,6 +11643,7 @@ export function BlocklistDetail({
                         className="text-muted-foreground hover:text-destructive"
                         onClick={() => deleteException.mutate(ex.id)}
                         title="Remove exception"
+                        aria-label="Remove exception"
                         {...permissionGate(
                           can("delete", "dns_blocklist"),
                           NEEDS_BLOCKLIST_DELETE,
@@ -12073,7 +12297,7 @@ function ZoneTreeRows({
   );
   const [createZoneName, setCreateZoneName] = useState<string | null>(null);
 
-  const { data: zones = [] } = useQuery({
+  const { data: zones = [], error: zonesError } = useQuery({
     queryKey: ["dns-zones", groupId],
     queryFn: () => dnsApi.listZones(groupId),
   });
@@ -12088,7 +12312,11 @@ function ZoneTreeRows({
   if (tree.length === 0)
     return (
       <p className="px-3 py-1.5 text-xs text-muted-foreground italic">
-        No zones
+        {zonesError != null ? (
+          <ListReadError error={zonesError} what="this group's zones" />
+        ) : (
+          "No zones"
+        )}
       </p>
     );
 
@@ -12299,7 +12527,11 @@ export function DNSPage() {
     );
   }
 
-  const { data: groups = [], isLoading } = useQuery({
+  const {
+    data: groups = [],
+    isLoading,
+    error: groupsError,
+  } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
   });
@@ -12463,6 +12695,7 @@ export function DNSPage() {
               className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={() => setShowCreateGroup(true)}
               title="New server group"
+              aria-label="New server group"
               {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Plus className="h-3.5 w-3.5" />
@@ -12474,7 +12707,13 @@ export function DNSPage() {
           {isLoading && (
             <p className="px-4 py-2 text-xs text-muted-foreground">Loading…</p>
           )}
-          {groups.length === 0 && !isLoading && (
+          {/* A refused or failed read says so, not an empty estate (#3337). */}
+          {groups.length === 0 && !isLoading && groupsError != null && (
+            <p className="px-4 pt-6 text-center text-xs">
+              <ListReadError error={groupsError} what="DNS server groups" />
+            </p>
+          )}
+          {groups.length === 0 && !isLoading && groupsError == null && (
             <div className="px-4 pt-6 text-center">
               <Globe className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
               <p className="text-xs text-muted-foreground mb-3">

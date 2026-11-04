@@ -21,7 +21,7 @@ Include in your report:
 - Potential impact assessment
 - Any suggested remediation (optional)
 
-We aim to acknowledge reports within **48 hours** and provide an initial assessment within **7 days**. If the issue is confirmed, we will work toward a fix and coordinated disclosure.
+We aim to acknowledge reports within **two business days** and provide an initial assessment within **five business days**. If the issue is confirmed, we will work toward a fix and coordinated disclosure.
 
 ## Security Design Principles
 

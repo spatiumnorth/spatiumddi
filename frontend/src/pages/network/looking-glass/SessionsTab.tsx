@@ -241,6 +241,7 @@ export function SessionsTab({
                         <button
                           type="button"
                           title="Edit peer"
+                          aria-label="Edit peer"
                           className="rounded p-1 hover:bg-muted"
                           onClick={() => onEdit(peer)}
                           {...writeGate}
@@ -250,6 +251,7 @@ export function SessionsTab({
                         <button
                           type="button"
                           title="Delete peer"
+                          aria-label="Delete peer"
                           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                           onClick={() => setDeleteTarget(peer)}
                           {...deleteGate}
