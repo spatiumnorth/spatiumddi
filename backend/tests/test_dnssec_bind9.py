@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -290,3 +291,157 @@ async def test_stored_nonzero_iterations_ship_as_zero(db_session: AsyncSession) 
     zero = await render_bundle_body(db_session, server)
     assert zero.etag == stored.etag
     assert zero.body["structural_etag"] == stored.body["structural_etag"]
+
+
+# ── Key lifetimes BIND refuses (#3411) ──────────────────────────────────
+#
+# named-checkconf 9.20 refuses a ``dnssec-policy`` key lifetime that is
+# negative ("expected ISO 8601 duration or TTL value near '-1d'"), past 49710
+# days ("duration or TTL out of range"), or shorter than a rollover of that key
+# takes with the default timings a policy renders with ("key lifetime is
+# shorter than the time it takes to do a rollover": a KSK under 2 days, a ZSK
+# under 11). Any of them fails the whole named.conf, so once a zone is signed
+# with the policy every later apply on its group is quarantined.
+
+
+@pytest.mark.parametrize(
+    ("field", "days", "allowed"),
+    [
+        ("ksk_lifetime_days", -1, "0 (unlimited) or 2 to 49710 days"),
+        ("zsk_lifetime_days", -1, "0 (unlimited) or 11 to 49710 days"),
+        ("ksk_lifetime_days", 1000000, "0 (unlimited) or 2 to 49710 days"),
+        ("zsk_lifetime_days", 49711, "0 (unlimited) or 11 to 49710 days"),
+        ("ksk_lifetime_days", 1, "0 (unlimited) or 2 to 49710 days"),
+        ("zsk_lifetime_days", 7, "0 (unlimited) or 11 to 49710 days"),
+        ("zsk_lifetime_days", 10, "0 (unlimited) or 11 to 49710 days"),
+        ("ksk_lifetime_days", 2147483648, "0 (unlimited) or 2 to 49710 days"),
+    ],
+)
+async def test_key_lifetime_bind_refuses_is_422_on_create(
+    client: AsyncClient, db_session: AsyncSession, field: str, days: int, allowed: str
+) -> None:
+    """A lifetime BIND refuses is a 422 naming the field and what it may be."""
+    token = await _admin(db_session)
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": f"lt-{uuid.uuid4().hex[:8]}", field: days},
+    )
+    assert r.status_code == 422, r.text
+    assert field in r.text, r.text
+    assert allowed in r.text, r.text
+    assert "BIND 9.20" in r.text, r.text
+
+
+@pytest.mark.parametrize(("ksk", "zsk"), [(0, 0), (0, 90), (2, 11), (49710, 49710)])
+async def test_key_lifetime_bind_takes_is_stored(
+    client: AsyncClient, db_session: AsyncSession, ksk: int, zsk: int
+) -> None:
+    """Unlimited (0), each key's floor and the ceiling all load in named-checkconf 9.20."""
+    token = await _admin(db_session)
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "name": f"lt-{uuid.uuid4().hex[:8]}",
+            "ksk_lifetime_days": ksk,
+            "zsk_lifetime_days": zsk,
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert (r.json()["ksk_lifetime_days"], r.json()["zsk_lifetime_days"]) == (ksk, zsk)
+
+
+async def test_key_lifetime_bind_refuses_is_422_on_update(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An edit to a lifetime BIND refuses is a 422 and leaves the policy as it was."""
+    token = await _admin(db_session)
+    h = {"Authorization": f"Bearer {token}"}
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": f"lt-{uuid.uuid4().hex[:8]}", "zsk_lifetime_days": 30},
+    )
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    for body in (
+        {"ksk_lifetime_days": -1},
+        {"ksk_lifetime_days": 1},
+        {"zsk_lifetime_days": 10},
+        {"zsk_lifetime_days": 1000000},
+    ):
+        r = await client.put(f"/api/v1/dns/dnssec-policies/{pid}", headers=h, json=body)
+        assert r.status_code == 422, (body, r.text)
+    r = await client.get("/api/v1/dns/dnssec-policies", headers=h)
+    (row,) = [p for p in r.json() if p["id"] == pid]
+    assert (row["ksk_lifetime_days"], row["zsk_lifetime_days"]) == (0, 30)
+    r = await client.put(
+        f"/api/v1/dns/dnssec-policies/{pid}", headers=h, json={"zsk_lifetime_days": 11}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["zsk_lifetime_days"] == 11
+
+
+async def _signed_with(db: AsyncSession, ksk: int, zsk: int) -> tuple[DNSServer, DNSSECPolicy]:
+    """A BIND9 server whose group has a zone signed with a policy stored with
+    these lifetimes, as the API accepted them before #3411."""
+    grp = await _group_with_driver(db, "bind9")
+    server = (await db.execute(select(DNSServer).where(DNSServer.group_id == grp.id))).scalar_one()
+    pol = DNSSECPolicy(
+        name=f"old-{uuid.uuid4().hex[:8]}", ksk_lifetime_days=ksk, zsk_lifetime_days=zsk
+    )
+    db.add(pol)
+    await db.flush()
+    zone = await _zone_row(db, grp)
+    zone.dnssec_enabled = True
+    zone.dnssec_policy_id = pol.id
+    await db.commit()
+    return server, pol
+
+
+@pytest.mark.parametrize(
+    ("stored", "shipped"),
+    [
+        ((-1, -1), (0, 0)),
+        ((1, 7), (2, 11)),
+        ((1000000, 49711), (49710, 49710)),
+    ],
+)
+async def test_stored_key_lifetimes_bind_refuses_ship_in_range(
+    db_session: AsyncSession, stored: tuple[int, int], shipped: tuple[int, int]
+) -> None:
+    """A row saved before the API refused it must not reach named (#3411).
+
+    The agent bundle carries the nearest lifetime BIND takes: a negative one
+    as 0 (unlimited), a short one at the key's floor, a long one at the
+    ceiling. Its ETag is the one a policy stored with those values gives, so
+    an agent that applied it does not see a change that is not there.
+    """
+    from app.services.dns.agent_config import render_bundle_body
+
+    server, pol = await _signed_with(db_session, *stored)
+    before = await render_bundle_body(db_session, server)
+    (p,) = [p for p in before.body["dnssec_policies"] if p["name"] == pol.name]
+    assert (p["ksk_lifetime_days"], p["zsk_lifetime_days"]) == shipped
+
+    pol.ksk_lifetime_days, pol.zsk_lifetime_days = shipped
+    await db_session.commit()
+    held = await render_bundle_body(db_session, server)
+    assert held.etag == before.etag
+    assert held.body["structural_etag"] == before.body["structural_etag"]
+
+
+async def test_stored_key_lifetimes_bind_refuses_render_in_range(
+    db_session: AsyncSession,
+) -> None:
+    """The control plane's own BIND9 render holds a stored row to BIND's range too."""
+    from app.services.dns.config_bundle import build_config_bundle as build_dataclass_bundle
+
+    server, _ = await _signed_with(db_session, -1, 1000000)
+    bundle = await build_dataclass_bundle(db_session, server)
+    out = BIND9Driver().render_server_config(server, ServerOptions(), bundle=bundle)
+    assert "ksk lifetime unlimited algorithm ecdsap256sha256;" in out
+    assert "zsk lifetime 49710d algorithm ecdsap256sha256;" in out
+    assert "-1d" not in out
+    assert "1000000d" not in out

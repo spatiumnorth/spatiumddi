@@ -171,6 +171,7 @@ from app.services.dns.named_conf_validation import (
     validate_acl_entries,
     validate_acl_name,
     validate_address_match_list,
+    validate_key_lifetime_days,
     validate_nsec3_iterations,
     validate_nsec3_salt_length,
     validate_server_option,
@@ -7361,6 +7362,16 @@ class DNSSECPolicyCreate(BaseModel):
             raise ValueError("name must be 1-64 chars of [A-Za-z0-9_-]")
         return v
 
+    @field_validator("ksk_lifetime_days")
+    @classmethod
+    def _ksk_lifetime(cls, v: int) -> int:
+        return validate_key_lifetime_days(v, key="ksk")
+
+    @field_validator("zsk_lifetime_days")
+    @classmethod
+    def _zsk_lifetime(cls, v: int) -> int:
+        return validate_key_lifetime_days(v, key="zsk")
+
     @field_validator("nsec3_iterations")
     @classmethod
     def _iterations(cls, v: int) -> int:
@@ -7388,6 +7399,16 @@ class DNSSECPolicyUpdate(BaseModel):
         if v is not None and v not in DNSSEC_ALGORITHMS:
             raise ValueError(f"algorithm must be one of {sorted(DNSSEC_ALGORITHMS)}")
         return v
+
+    @field_validator("ksk_lifetime_days")
+    @classmethod
+    def _ksk_lifetime(cls, v: int | None) -> int | None:
+        return None if v is None else validate_key_lifetime_days(v, key="ksk")
+
+    @field_validator("zsk_lifetime_days")
+    @classmethod
+    def _zsk_lifetime(cls, v: int | None) -> int | None:
+        return None if v is None else validate_key_lifetime_days(v, key="zsk")
 
     @field_validator("nsec3_iterations")
     @classmethod

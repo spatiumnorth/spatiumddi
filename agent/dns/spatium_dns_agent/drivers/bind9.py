@@ -964,9 +964,35 @@ def _format_forwarder(entry: str, opts: dict[str, Any]) -> str:
     return out
 
 
-def _lifetime(days: int) -> str:
-    """BIND ``lifetime`` token — 0 ⇒ unlimited, else ``<days>d``."""
-    return "unlimited" if not days else f"{int(days)}d"
+#: BIND 9.20's range for a ``dnssec-policy`` key lifetime in days (#3411),
+#: verified against named-checkconf 9.20.30: a negative count is not a
+#: duration, past 49710 days it no longer fits BIND's 32-bit seconds, and a KSK
+#: under 2 days or a ZSK under 11 is shorter than a rollover takes. Any of them
+#: rejects the whole named.conf. The control plane refuses such a value and
+#: holds a stored one to this range; an older control plane may still ship one.
+_LIFETIME_MAX_DAYS = 49710
+_LIFETIME_MIN_DAYS = {"ksk": 2, "zsk": 11}
+
+
+def _lifetime(days: int, *, key: str, policy: str | None = None) -> str:
+    """BIND ``lifetime`` token: 0 is unlimited, else ``<days>d`` held to BIND's range."""
+    stored = int(days or 0)
+    held = stored
+    if stored < 0:
+        held = 0
+    elif 0 < stored < _LIFETIME_MIN_DAYS[key]:
+        held = _LIFETIME_MIN_DAYS[key]
+    elif stored > _LIFETIME_MAX_DAYS:
+        held = _LIFETIME_MAX_DAYS
+    if held != stored:
+        log.warning(
+            "dnssec_policy_key_lifetime_clamped",
+            policy=policy,
+            key=key,
+            stored=stored,
+            rendered=held,
+        )
+    return "unlimited" if not held else f"{held}d"
 
 
 def _format_master(entry: str) -> str:
@@ -1658,11 +1684,13 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
         if not name or name == "default":
             continue
         algo = p.get("algorithm") or "ecdsap256sha256"
+        ksk = _lifetime(p.get("ksk_lifetime_days", 0), key="ksk", policy=name)
+        zsk = _lifetime(p.get("zsk_lifetime_days", 90), key="zsk", policy=name)
         block = (
             f'dnssec-policy "{name}" {{\n'
             "    keys {\n"
-            f"        ksk lifetime {_lifetime(p.get('ksk_lifetime_days', 0))} algorithm {algo};\n"
-            f"        zsk lifetime {_lifetime(p.get('zsk_lifetime_days', 90))} algorithm {algo};\n"
+            f"        ksk lifetime {ksk} algorithm {algo};\n"
+            f"        zsk lifetime {zsk} algorithm {algo};\n"
             "    };\n"
         )
         if p.get("nsec3"):
