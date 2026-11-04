@@ -33,7 +33,11 @@ from app.services.ipam.templates import (
     find_block_instances,
     find_subnet_instances,
 )
-from app.services.ipam.zone_binding import check_zone_uuid, check_zone_uuid_list
+from app.services.ipam.zone_binding import (
+    assert_zones_exist,
+    check_zone_uuid,
+    check_zone_uuid_list,
+)
 
 router = APIRouter(
     prefix="/templates",
@@ -323,6 +327,7 @@ async def list_templates(
 async def create_template(
     body: IPAMTemplateCreate, current_user: CurrentUser, db: DB
 ) -> IPAMTemplateResponse:
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     row = IPAMTemplate(**body.model_dump())
     db.add(row)
     try:
@@ -370,6 +375,14 @@ async def update_template(
     changes = body.model_dump(exclude_unset=True)
     clear_flags = {k: v for k, v in changes.items() if k.startswith("clear_") and v}
     direct_changes = {k: v for k, v in changes.items() if not k.startswith("clear_")}
+    await assert_zones_exist(
+        db,
+        [
+            direct_changes.get("dns_zone_id"),
+            *(direct_changes.get("dns_additional_zone_ids") or []),
+        ],
+        already=[row.dns_zone_id, *(row.dns_additional_zone_ids or [])],
+    )
     old_state = {
         "name": row.name,
         "description": row.description,

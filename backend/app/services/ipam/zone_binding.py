@@ -12,11 +12,13 @@ stored — including one an older build accepted — without raising.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterable
 from typing import Any
 
-from sqlalchemy import text
+from fastapi import HTTPException, status
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 ZONE_ID_ERROR = "dns_zone_id must be the UUID of a DNS zone"
@@ -171,3 +173,184 @@ async def prune_dead_group_ids_asyncpg(conn: Any) -> None:
         await conn.execute(
             _group_prune_sql(table, keep="{v} IN " + live, drop="{v} NOT IN " + live)
         )
+
+
+async def assert_zones_exist(
+    db: AsyncSession,
+    zone_ids: Iterable[object] | None,
+    *,
+    already: Iterable[object] | None = None,
+) -> None:
+    """422 when a zone id a request carries names no zone (#3443).
+
+    The columns are text / JSONB with no foreign key, so nothing in the
+    database refuses an id that names no zone. A zone in the Trash still
+    exists (a restore brings it back), so it passes: the model is queried
+    with ``include_deleted``. Blank entries and non-UUIDs are the validators'
+    business, not this check's.
+
+    ``already`` is what the row stores now. Those ids pass whatever they name:
+    the edit dialogs send the row's zone on every Save, so a row that carries
+    a dead id (a selective IPAM restore from a backup whose zones are gone)
+    must still take an unrelated edit. Only a NEW dead id is refused.
+    """
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    stored = {u for u in (stored_zone_uuid(z) for z in already or []) if u is not None}
+    wanted = {u for u in (stored_zone_uuid(z) for z in zone_ids or []) if u is not None} - stored
+    if not wanted:
+        return
+    found = set(
+        (
+            await db.execute(
+                select(DNSZone.id)
+                .where(DNSZone.id.in_(wanted))
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    missing = sorted(str(z) for z in wanted - found)
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"DNS zone(s) that do not exist: {', '.join(missing)}",
+        )
+
+
+# (table, text zone column, JSONB zone-list column) for every IPAM row that
+# names a DNS zone without a foreign key (#3443).
+_ZONE_ID_COLUMNS: tuple[tuple[str, str | None, str], ...] = (
+    ("ip_space", "dns_zone_id", "dns_additional_zone_ids"),
+    ("ip_block", "dns_zone_id", "dns_additional_zone_ids"),
+    ("subnet", "dns_zone_id", "dns_additional_zone_ids"),
+    ("ipam_template", "dns_zone_id", "dns_additional_zone_ids"),
+    ("ip_address", None, "extra_zone_ids"),
+)
+
+
+def _strip_plan_zones(node: Any, dead: set[str]) -> bool:
+    if not isinstance(node, dict):
+        return False
+    changed = False
+    zid = stored_zone_uuid(node.get("dns_zone_id"))
+    if zid is not None and str(zid) in dead:
+        node["dns_zone_id"] = None
+        changed = True
+    for child in node.get("children") or []:
+        changed = _strip_plan_zones(child, dead) or changed
+    return changed
+
+
+async def prune_zone_ids(db: AsyncSession, zone_ids: Iterable[object]) -> None:
+    """Remove ``zone_ids`` from every IPAM row that names a DNS zone (#3443).
+
+    Called by every path that deletes a zone row (Trash purge, permanent
+    delete, the scheduled purge, a reverse-zone retirement, an importer's
+    overwrite, deleting the group a trashed zone belongs to, deleting the
+    Tailscale tenant / NetBird instance whose zones cascade with it). Raw UPDATEs, so
+    rows in the Trash lose the id too and a restore brings back no dead
+    reference. Ids compare by their hex digits, so any spelling
+    ``stored_zone_uuid`` resolves is matched, and the entries kept stay in
+    order (the first one picks the reverse-zone group). Unapplied subnet plans
+    have the id cleared from their tree nodes; an applied plan is a record of
+    what was created and is left alone. The caller owns the commit.
+    """
+    uuids = {u for u in (stored_zone_uuid(z) for z in zone_ids) if u is not None}
+    if not uuids:
+        return
+    dead = {str(u) for u in uuids}
+    ids = sorted(u.hex for u in uuids)
+    for table, text_col, list_col in _ZONE_ID_COLUMNS:
+        if text_col:
+            await db.execute(
+                text(
+                    f"UPDATE {table} SET {text_col} = NULL "  # noqa: S608
+                    f"WHERE {norm_uuid_sql(text_col)} = ANY(CAST(:ids AS text[]))"
+                ),
+                {"ids": ids},
+            )
+        await db.execute(
+            text(f"""
+                UPDATE {table} SET {list_col} = COALESCE((
+                    SELECT jsonb_agg(e ORDER BY o)
+                    FROM jsonb_array_elements({list_col}) WITH ORDINALITY AS t(e, o)
+                    WHERE NOT COALESCE(
+                        {norm_uuid_sql("e #>> '{}'")} = ANY(CAST(:ids AS text[])), false
+                    )
+                ), '[]'::jsonb)
+                WHERE jsonb_typeof({list_col}) = 'array'
+                  AND EXISTS (
+                    SELECT 1 FROM jsonb_array_elements({list_col}) x
+                    WHERE {norm_uuid_sql("x #>> '{}'")} = ANY(CAST(:ids AS text[]))
+                  )
+                """),  # noqa: S608
+            {"ids": ids},
+        )
+
+    from app.models.ipam import SubnetPlan  # noqa: PLC0415
+
+    for plan in (
+        (await db.execute(select(SubnetPlan).where(SubnetPlan.applied_at.is_(None))))
+        .scalars()
+        .all()
+    ):
+        tree = plan.tree
+        if _strip_plan_zones(tree, dead):
+            plan.tree = dict(tree)
+            from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+            flag_modified(plan, "tree")
+
+
+async def prune_dead_zone_ids_asyncpg(conn: Any) -> None:
+    """Clear every IPAM zone id that names no ``dns_zone`` row (#3443).
+
+    For the factory reset, which wipes DNS over a raw asyncpg connection and
+    so cannot name the zones it removes: after the wipe, every id that no
+    longer resolves is dropped, by the same rules as ``prune_zone_ids``.
+    """
+    live = "(SELECT replace(id::text, '-', '') FROM dns_zone)"
+    for table, text_col, list_col in _ZONE_ID_COLUMNS:
+        if text_col:
+            await conn.execute(
+                f"UPDATE {table} SET {text_col} = NULL "  # noqa: S608
+                f"WHERE {text_col} IS NOT NULL AND {text_col} <> '' "
+                f"AND {norm_uuid_sql(text_col)} NOT IN {live}"
+            )
+        await conn.execute(f"""
+            UPDATE {table} SET {list_col} = COALESCE((
+                SELECT jsonb_agg(e ORDER BY o)
+                FROM jsonb_array_elements({list_col}) WITH ORDINALITY AS t(e, o)
+                WHERE {norm_uuid_sql("e #>> '{}'")} IN {live}
+            ), '[]'::jsonb)
+            WHERE jsonb_typeof({list_col}) = 'array'
+              AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements({list_col}) x
+                WHERE {norm_uuid_sql("x #>> '{}'")} NOT IN {live}
+              )
+            """)  # noqa: S608
+    live_ids = {str(r[0]) for r in await conn.fetch("SELECT id FROM dns_zone")}
+    for row in await conn.fetch("SELECT id, tree FROM subnet_plan WHERE applied_at IS NULL"):
+        tree = row["tree"]
+        if isinstance(tree, str):
+            tree = json.loads(tree)
+        dead = {
+            str(u)
+            for u in (stored_zone_uuid(z) for z in _plan_zone_values(tree))
+            if u is not None and str(u) not in live_ids
+        }
+        if dead and _strip_plan_zones(tree, dead):
+            await conn.execute(
+                "UPDATE subnet_plan SET tree = $1::jsonb WHERE id = $2", json.dumps(tree), row["id"]
+            )
+
+
+def _plan_zone_values(node: Any) -> list[object]:
+    if not isinstance(node, dict):
+        return []
+    out: list[object] = [node.get("dns_zone_id")]
+    for child in node.get("children") or []:
+        out.extend(_plan_zone_values(child))
+    return out

@@ -182,7 +182,17 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
       if (Object.keys(diff).length === 0) return group!;
       return dhcpApi.updateGroup(group!.id, diff);
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // #3369 — put the stored group into the cached list the page draws its
+      // panel from before the refetch lands.
+      if (editing && saved?.id)
+        qc.setQueriesData({ queryKey: ["dhcp-groups"] }, (old: unknown) =>
+          Array.isArray(old)
+            ? old.map((r: DHCPServerGroup) =>
+                r.id === saved.id ? { ...r, ...saved } : r,
+              )
+            : old,
+        );
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },

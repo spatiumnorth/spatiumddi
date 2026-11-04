@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, select
 
 from app.models.dns import DNSRecord, DNSZone
+from app.services.ipam.zone_binding import prune_zone_ids
 
 
 async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
@@ -66,3 +67,5 @@ async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
     await db.execute(
         delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
     )
+    # IPAM names zones in text / JSONB columns with no foreign key (#3443).
+    await prune_zone_ids(db, [zone.id])

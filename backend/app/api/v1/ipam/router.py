@@ -75,6 +75,7 @@ from app.services.ai.operations_risky import (
 )
 from app.services.api_token_scopes import read_only_post
 from app.services.approvals.gate import gate_or_execute
+from app.services.audit_chain import lock_audit_chain
 from app.services.dhcp.agent_wake_targets import dhcp_group_channels_for_subnets
 from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
@@ -139,6 +140,7 @@ from app.services.ipam.utilization import (
 )
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.ipam.zone_binding import (
+    assert_zones_exist,
     check_group_uuid_list,
     check_zone_uuid,
     check_zone_uuid_list,
@@ -704,8 +706,32 @@ async def _assert_no_block_overlap(
     return reparent
 
 
-async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
+async def _lock_for_recount(db: AsyncSession, audit_lock: bool) -> None:
+    """The first step of every recount (#3345): the audit-chain lock.
+
+    Recounts lock subnet and block rows, and nearly every caller also writes
+    an audit row, whose flush takes the global audit-chain advisory lock.
+    Two transactions that take those two in opposite orders deadlock: one
+    holds the audit lock and waits for a row, the other holds the row and
+    waits for the audit lock. So the order is fixed here: audit lock, then
+    subnet rows in id order, then block rows in id order. A caller that has
+    staged its audit row already gets it from the autoflush; one that audits
+    after the recount gets it now instead of after taking the rows.
+
+    ``audit_lock=False`` is for a transaction that writes no audit row after
+    this point (a lease-event batch, the expiry and orphan sweeps): it never
+    waits for the audit lock, so it cannot close that cycle, and taking it
+    would only serialise those batches behind every audited write.
+    """
+    if audit_lock:
+        await lock_audit_chain(db)
+
+
+async def _update_utilization(
+    db: AsyncSession, subnet_id: uuid.UUID, *, audit_lock: bool = True
+) -> None:
     """Recompute and persist allocated_ips and utilization_percent for a subnet."""
+    await _lock_for_recount(db, audit_lock)
     allocated = (
         await db.scalar(
             select(func.count())
@@ -724,31 +750,56 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
         )
 
 
-async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> None:
+async def _update_block_utilization(
+    db: AsyncSession, block_id: uuid.UUID, *, audit_lock: bool = True
+) -> None:
     """Recompute utilization_percent for a block by summing allocated IPs across all
     descendant subnets (recursive), expressed as a fraction of the block's CIDR size.
     Each subnet's network/broadcast addresses count as used here (#2982), so a
     block fully carved into full subnets reads 100%; the subnet's own counter
     still leaves them out (#2411). Also updates all ancestor blocks up the tree.
     """
-    block = await db.get(IPBlock, block_id)
-    while block is not None:
-        await _recount_block(db, block)
-        block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
+    await _update_blocks_utilization(db, [block_id], audit_lock=audit_lock)
 
 
-async def _update_blocks_utilization(db: AsyncSession, block_ids: Iterable[uuid.UUID]) -> None:
+async def _update_blocks_utilization(
+    db: AsyncSession, block_ids: Iterable[uuid.UUID], *, audit_lock: bool = True
+) -> None:
     """``_update_block_utilization`` for many blocks at once (#2981): every
     block on the union of their chains is recounted exactly once, rather than
     once per block below it. A block's sum reads its descendant SUBNETS, not
-    its child blocks, so the order does not matter."""
-    seen: set[uuid.UUID] = set()
+    its child blocks, so the order does not matter for the result.
+
+    It does matter for locking (#3345): two transactions recounting chains
+    that share an ancestor (a Kea HA pair reports every lease twice, and the
+    lease paths, the router and the hourly recount all write these rows)
+    deadlock if they lock the rows in different orders. So the whole chain
+    is locked up front, in id order, before anything is written, after the
+    audit-chain lock (``_lock_for_recount``).
+
+    The rows are taken FOR NO KEY UPDATE, the strength the UPDATE of the
+    counts takes anyway, never FOR UPDATE: every insert of a child row holds
+    FOR KEY SHARE on its parent block through the foreign key, FOR UPDATE
+    waits on that, and two concurrent creates under one block then deadlock
+    with the audit lock (ddi-pg walk of #3353)."""
+    blocks: dict[uuid.UUID, IPBlock] = {}
     for start in block_ids:
         block = await db.get(IPBlock, start)
-        while block is not None and block.id not in seen:
-            seen.add(block.id)
-            await _recount_block(db, block)
+        while block is not None and block.id not in blocks:
+            blocks[block.id] = block
             block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
+    if not blocks:
+        return
+    order = sorted(blocks)
+    await _lock_for_recount(db, audit_lock)
+    await db.execute(
+        select(IPBlock.id)
+        .where(IPBlock.id.in_(order))
+        .order_by(IPBlock.id)
+        .with_for_update(key_share=True)
+    )
+    for block_id in order:
+        await _recount_block(db, blocks[block_id])
 
 
 async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
@@ -785,11 +836,25 @@ async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
     block.total_ips = min(block_total, _BIGINT_MAX)
 
 
-async def _update_subnets_utilization(db: AsyncSession, subnet_ids: Iterable[uuid.UUID]) -> None:
+async def _update_subnets_utilization(
+    db: AsyncSession, subnet_ids: Iterable[uuid.UUID], *, audit_lock: bool = True
+) -> None:
     """``_update_utilization`` for many subnets in one grouped count (#2981)."""
     ids = list(dict.fromkeys(subnet_ids))
     if not ids:
         return
+    # Locked in id order before counting, after the audit-chain lock, the
+    # order every recount takes: two batches over overlapping subnets cannot
+    # deadlock, and the second counts only after the first commits (#3345).
+    # FOR NO KEY UPDATE, so an address insert's KEY SHARE on the subnet does
+    # not block it (see ``_update_blocks_utilization``).
+    await _lock_for_recount(db, audit_lock)
+    await db.execute(
+        select(Subnet.id)
+        .where(Subnet.id.in_(ids))
+        .order_by(Subnet.id)
+        .with_for_update(key_share=True)
+    )
     counts: dict[uuid.UUID, int] = {
         sid: int(n)
         for sid, n in (
@@ -5117,6 +5182,7 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     await _assert_dns_groups_exist(db, body.dns_group_ids)
     # Pre-check the unique-name constraint so we can return a clean 409
     # instead of letting the DB raise an IntegrityError (→ 500).
@@ -5188,6 +5254,11 @@ async def update_space(
         db,
         current_user,
         None,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
+    )
+    await assert_zones_exist(
+        db,
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
     )
@@ -5496,6 +5567,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     await _assert_dns_groups_exist(db, body.dns_group_ids)
 
     # Verify parent block exists and belongs to the same space
@@ -5669,6 +5741,11 @@ async def update_block(
         db,
         current_user,
         None,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
+    )
+    await assert_zones_exist(
+        db,
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
     )
@@ -6516,6 +6593,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     await _enforce_zone_token_scope(
         db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])])
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -7658,6 +7736,11 @@ async def update_subnet(
         current_user,
         subnet,
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+    )
+    await assert_zones_exist(
+        db,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[subnet.dns_zone_id, *(subnet.dns_additional_zone_ids or [])],
     )
     # Per-row: a grant scoped to this subnet suffices (#2438); an unscoped one
     # still does. A scoped holder may not point the subnet at another resource
@@ -10136,6 +10219,7 @@ async def create_address(
     await _enforce_zone_token_scope(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.extra_zone_ids or [])])
 
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
@@ -10542,6 +10626,14 @@ async def update_address(
             db,
             current_user,
             await db.get(Subnet, ip.subnet_id),
+            [
+                body.dns_zone_id if "dns_zone_id" in touched else None,
+                *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
+            ],
+            already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
+        )
+        await assert_zones_exist(
+            db,
             [
                 body.dns_zone_id if "dns_zone_id" in touched else None,
                 *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
@@ -11673,6 +11765,7 @@ async def bulk_allocate_preview(
     # The preview reports name collisions in the zone the body names, so it
     # is held to the same zone rule as the commit.
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
+    await assert_zones_exist(db, [body.dns_zone_id])
 
     # Address-set write delegation (#103): the same per-address test the
     # commit applies. A caller who can write nothing on this subnet is refused
@@ -11760,6 +11853,7 @@ async def bulk_allocate_commit(
     _enforce_subnet_token_scope(current_user, subnet_id)
     # GHSA-875w — a zone named in the body must be one the token may write.
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
+    await assert_zones_exist(db, [body.dns_zone_id])
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -12047,6 +12141,7 @@ async def allocate_next_ip(
     await _enforce_zone_token_scope(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
     )
+    await assert_zones_exist(db, [body.dns_zone_id, *(body.extra_zone_ids or [])])
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     # ``dns_zone_id: ""`` is the dialog's "None (no DNS record)" (#2466): the
     # address is allocated with no forward zone, no A and no PTR. Absent / null

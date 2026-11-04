@@ -34,6 +34,7 @@ from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, rever
     reverse_zone_network,
     reverse_zone_pieces,
 )
+from app.services.ipam.zone_binding import prune_zone_ids
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -564,6 +565,7 @@ async def retire_auto_reverse_zones(
             await _push_zone_to_agentless_servers(db, zone, "delete")
             await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
             await db.delete(zone)
+            await prune_zone_ids(db, [zone.id])
         wake.add(zone.group_id)
         retired.append(zone)
         logger.info(

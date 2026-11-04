@@ -94,6 +94,7 @@ from app.services.dhcp.windows_failover import (
     record_failover_observation,
     record_scope_observation,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 
 def _refresh_lease_owned_row(
@@ -159,6 +160,9 @@ class PullLeasesResult:
     # #2262 — surplus ``dhcp_lease`` rows for one address deleted by this pull
     # (left behind by overlapping pulls before they were serialised).
     duplicates_removed: int = 0
+    # #3345 — subnets whose mirror rows this pull created or removed, for the
+    # one recount at the end (``pull_leases_from_server``, or its caller).
+    touched_subnet_ids: set[Any] = field(default_factory=set)
 
 
 # #2262 — namespace for the per-server lease-pull advisory lock. The second key
@@ -201,6 +205,7 @@ async def pull_leases_from_server(
     server: DHCPServer,
     *,
     apply: bool = True,
+    recount: bool = True,
 ) -> PullLeasesResult:
     """Pull leases, then record the outcome on the server row (#2306).
 
@@ -214,6 +219,12 @@ async def pull_leases_from_server(
     has no outcome to report, and the pass that holds the server records its
     own. Writing the row here would also wait on that pass's row lock, so a
     manual Sync that should answer 409 at once would hang until it finished.
+
+    Ends by recounting the subnets whose mirrors changed (#3345). A caller
+    pulling several servers in one transaction passes ``recount=False`` and
+    recounts ``result.touched_subnet_ids`` itself after the last pull: the
+    recount takes the audit-chain lock and subnet / block row locks until
+    commit, and must not hold them through the next server's driver call.
     """
     result = await _pull_leases_core(db, server, apply=apply)
     if apply and not result.busy and is_agentless(server.driver):
@@ -224,6 +235,8 @@ async def pull_leases_from_server(
             server.last_sync_error = None
             server.last_sync_error_at = None
         await db.flush()
+    if apply and recount:
+        await recount_subnets_and_blocks(db, result.touched_subnet_ids)
     return result
 
 
@@ -243,6 +256,9 @@ async def _pull_leases_core(
     and would double-count.
     """
     result = PullLeasesResult()
+    # Subnets whose mirror rows this pull created or removed; recounted once
+    # at the end, never per lease (#3345).
+    touched_subnets = result.touched_subnet_ids
 
     if not is_agentless(server.driver):
         result.errors.append(
@@ -482,6 +498,7 @@ async def _pull_leases_core(
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 if created:
                     result.ipam_created += 1
+                    touched_subnets.add(containing.id)
                 elif ipam_row.auto_from_lease:
                     # Lost the race to a lease-owned row — refresh it
                     # like the elif path below.
@@ -642,7 +659,9 @@ async def _pull_leases_core(
             # lease. Pass the subnet we already resolved so the helper keeps the
             # per-poll O(1) resolution. Same helper the delete_lease endpoint
             # and scope deletion use (DRY).
-            if await purge_lease(db, stale, subnet_id=stale_subnet_id, now=now):
+            if await purge_lease(
+                db, stale, subnet_id=stale_subnet_id, now=now, touched_subnets=touched_subnets
+            ):
                 result.ipam_revoked += 1
         elif stale_subnet_id is not None:
             # Dry-run (apply=False): count the mirror the purge WOULD remove,
