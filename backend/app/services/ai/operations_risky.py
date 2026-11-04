@@ -379,7 +379,7 @@ async def _apply_delete_subnet(
         # done, so the audit-chain and subnet / block locks are held only to
         # commit: the scopes' freed mirrors (#3354), and the parent block's
         # rollup, which must stop counting the trashed subnet (#2412).
-        await recount_subnets_and_blocks(db, touched)
+        await recount_subnets_and_blocks(db, touched, include_deleted=True)
         await _update_block_utilization(db, subnet.block_id)
         await db.commit()
         for gid in wake_group_ids:
@@ -642,7 +642,7 @@ async def _apply_delete_block(
     # subnet / block locks are held only to commit (#3354): the scopes' freed
     # mirrors, then the ancestors' rollups, which stop counting the trashed
     # subtree (#2412).
-    await recount_subnets_and_blocks(db, touched)
+    await recount_subnets_and_blocks(db, touched, include_deleted=True)
     if block.parent_block_id is not None:
         await db.flush()
         await _update_block_utilization(db, block.parent_block_id)
@@ -801,7 +801,7 @@ async def _apply_delete_space(
                 old_value=batch.audit_old_value(row),
             )
         )
-    await recount_subnets_and_blocks(db, touched)  # last, before commit (#3354)
+    await recount_subnets_and_blocks(db, touched, include_deleted=True)  # last (#3354)
     await db.commit()
     for gid in wake_group_ids:
         collect_wake(dhcp_group_channel(gid))
