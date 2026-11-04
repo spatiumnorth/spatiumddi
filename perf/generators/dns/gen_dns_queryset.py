@@ -40,7 +40,7 @@ CLI (registry contract + extras):
                           out-of-zone name
 
 Grounding (real SpatiumDDI shapes — do NOT invent):
-  * generated forward label ``dhcp-<3rd>-<4th>`` — backend/app/services/dns/ddns.py:162
+  * generated forward label ``dhcp-<a>-<b>-<c>-<d>`` — backend/app/services/dns/ddns.py
     (_generate_hostname; mirrored deterministically in spddi_perf.fleet.generated_forward_name)
   * reverse-zone name from a CIDR — backend/app/services/dns/reverse_zone.py:36
     (compute_reverse_zone_name); per-subnet PTR resolution
@@ -279,8 +279,8 @@ def build_forward_names(seed: SeedModel, shard: int, shards: int, cap: int) -> l
 
     Two deterministic sources, both in-zone by construction:
       * per-device client hostnames (``dev-NNNNNNN.<forward>``) — fleet.client_hostname
-      * per-leased-IP generated labels (``dhcp-<3rd>-<4th>.<forward>``) —
-        fleet.generated_forward_name (ddns.py:162) over the pool space
+      * per-leased-IP generated labels (``dhcp-<a>-<b>-<c>-<d>.<forward>``) —
+        fleet.generated_forward_name (ddns.py) over the pool space
     Plus seeded infra hosts (www/vpn/mail/...).
     """
     zone = seed.primary_forward
@@ -301,7 +301,7 @@ def build_forward_names(seed: SeedModel, shard: int, shards: int, cap: int) -> l
         if len(names) >= cap:
             break
 
-    # Per-leased-IP generated names (the always_generate dhcp-<3rd>-<4th> shape).
+    # Per-leased-IP generated names (the always_generate dhcp-<a>-<b>-<c>-<d> shape).
     remaining = max(0, cap - len(names))
     for ip in _iter_pool_ips(seed, remaining):
         names.append(fleet.forward_fqdn(fleet.generated_forward_name(ip), zone))

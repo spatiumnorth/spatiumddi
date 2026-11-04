@@ -816,9 +816,19 @@ is exactly the danger: the pool loads and silently matches no client. So
 the API refuses both ways of getting there. Changing a class's family is a
 `409` while a pool in the family it would leave still restricts to it, and
 the pools are named. Setting a pool's `class_restriction` to an operator
-class not rendered for the pool's family is a `422`. Names that are not
-operator classes are not checked: the generated PXE, phone and
-device-policy classes, and Kea's built-in `KNOWN`.
+class not rendered for the pool's family is a `422`. Device-policy classes
+and Kea's built-ins such as `KNOWN` are not checked.
+
+Generated PXE (`pxe-…`) and phone (`voip-…`) classes are checked against
+what the bundle renders (#3388). A pool may name one only while it exists
+for that pool: a phone class while its profile is enabled and attached to
+an active scope, a PXE class while its profile is enabled and bound to the
+pool's OWN scope, since a PXE class is evaluated only in the scopes bound
+to its profile (#2731). Anything else is a `422`. Taking the class away
+while a pool names it is a `409` naming the pools: disabling a PXE
+profile, unbinding it from the pool's scope, deleting a rule (#3374);
+disabling, deleting or detaching a phone profile, or deleting or
+deactivating the last active scope it is attached to.
 
 The Kea importer keeps the daemon block each class came from. A class
 defined in both the `Dhcp4` and `Dhcp6` blocks, with the same test and no
@@ -883,7 +893,7 @@ Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Wind
 
 ## 4b. Kea Lease Cache (#637)
 
-Kea 3.0 (shipped from Alpine 3.23) enables **lease caching** by default —
+Kea 3.0 (shipped from Alpine since 3.23) enables **lease caching** by default —
 `cache-threshold: 0.25`. When a client re-requests a lease that still has more
 than 75% of its lifetime remaining, Kea hands back the *same* lease with an
 **unchanged expiry** and skips the lease-database write entirely.
@@ -1340,8 +1350,12 @@ DHCPLease (not persisted long-term — cached in Redis, written to DB for histor
 
 ### Lease Sync Strategy
 
-- **Real-time (preferred)**: Kea `lease_cmds` hook + webhook to SpatiumDDI on lease events
-- **Polling fallback**: Celery task pulls lease dump every N minutes via DHCP driver API
+- **Kea (agent)**: the agent tails Kea's lease CSV and posts each lease change
+  to `POST /api/v1/dhcp/agents/lease-events` in batches, spooling them on disk
+  while the control plane is unreachable
+- **Agentless (Windows DHCP, FortiGate)**: the `auto_pull_dhcp_leases` Celery
+  task pulls leases through the driver API on the interval set in
+  `dhcp_pull_leases_interval_seconds` (see §15)
 - Leases are used to update `IPAddress.status`, `IPAddress.last_seen`, and trigger DDNS
 
 ### Lease History (forensic trail)
@@ -1379,7 +1393,11 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
 ### Agent Behavior
 
 **When control plane is reachable:**
-1. Agent polls SpatiumDDI API for config changes every N seconds (configurable, default 30s)
+1. Agent long-polls `GET /api/v1/dhcp/agents/config` with its last ETag; the
+   control plane holds the request (up to `LONGPOLL_TIMEOUT`, default 30 s)
+   and answers as soon as the bundle changes, woken by a Redis pub/sub
+   message published after the change commits. A heartbeat goes out
+   separately every `HEARTBEAT_INTERVAL` (default 30 s)
 2. On config change: agent validates new config, writes to local cache, applies to DHCP daemon
 3. Agent reports lease events back to SpatiumDDI API in real time
 4. Agent writes a "last successful sync" timestamp to local disk
@@ -1626,11 +1644,13 @@ Full reference: [Migration](MIGRATION.md). Parser internals:
 ## 10. Environment Variables for DHCP
 
 ```bash
-DHCP_SYNC_INTERVAL_SECONDS=30       # How often agents poll for config
-DHCP_LEASE_SYNC_INTERVAL_MINUTES=5  # Fallback polling for leases
-DHCP_CONFIG_CACHE_PATH=/var/cache/spatiumddi/dhcp-config.json
-DHCP_AGENT_RECONNECT_INTERVAL=60    # Seconds between reconnect attempts
-DHCP_AGENT_MAX_CACHE_AGE_HOURS=72   # Alert if cache older than this
+# DHCP agent (read by agent/dhcp/spatium_dhcp_agent/config.py)
+SPATIUM_API_URL=https://spatium.example.com  # control plane URL
+SPATIUM_AGENT_KEY=...                # bootstrap PSK, exchanged for a JWT
+CACHE_DIR=/var/lib/spatium-dhcp-agent # token, config cache, spool
+LONGPOLL_TIMEOUT=30                 # seconds the control plane holds /config
+HEARTBEAT_INTERVAL=30               # seconds between heartbeats
+AGENT_SPOOL_MAX_BYTES=268435456     # on-disk spool cap during an outage (#1077)
 ```
 
 ---
@@ -1783,7 +1803,7 @@ HA is configured on the server group, not a separate page. Edit the group under 
 
 ---
 
-## 15. Windows DHCP — Path A (read-only)
+## 15. Windows DHCP (agentless, WinRM)
 
 SpatiumDDI supports Windows Server DHCP as an **agentless** backend, driven over WinRM. It polls each Windows server for its leases and scopes and reflects them into IPAM, and writes scope / pool / reservation edits through to the server per object (it does not push config bundles — Windows has no whole-config entry point). A group with more than one Windows member is covered in §15.8.
 
@@ -2422,3 +2442,25 @@ REST (gated by the module): `GET /dhcp/ra/groups/{id}/ra-config`
 /dhcp/ra/groups/{id}/ra-allowlist`. Operator-Copilot tools:
 `find_ra_subnets`, `find_observed_ra_routers`, `count_rogue_ra_routers`
 (reads, default on) + `propose_allowlist_ra_router` (write proposal).
+
+---
+
+## 20. DHCP server management — reference summary
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Kea servers, scope authoring and PXE profiles
+
+Kea container + agent with lease tracking.
+
+- Group-centric HA (hot-standby + load-balancing) with live state reporting
+- Self-healing peer-IP drift
+- Supervised daemons for crash-loop-safe restarts
+- **Scope authoring**:
+  - 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row (search by code or name, description shown inline)
+  - Named option templates (group-scoped, e.g. "VoIP phones", "PXE BIOS clients") — apply to a scope in one click; apply is a stamp not a binding, so later template edits don't propagate
+- **PXE / iPXE provisioning profiles** — netboot a mixed-architecture estate without hand-writing Kea client classes
+  - A profile is group-scoped and reusable; a scope selects one via `pxe_profile_id`. It carries the `next_server` (TFTP / HTTP boot host) and N **architecture matches**
+  - Each match pairs a vendor-class + DHCP arch-code filter with the boot file that architecture should pull — `undionly.kpxe` for BIOS, `ipxe.efi` for UEFI x64, the arm64 or ia32 equivalents, or a chained iPXE config URL
+  - **iPXE chainloading** is the case that makes this worth modelling: the classic two-stage boot needs a class guarded on `dhcp.user-class` matching the iPXE signature, so the second request (from iPXE itself) is answered with a script URL instead of the binary it already loaded — otherwise the client loops
+  - Profiles can be **disabled** rather than deleted; a disabled profile renders no classes at all, so an operator can A/B-test boot files and roll back by flipping one switch

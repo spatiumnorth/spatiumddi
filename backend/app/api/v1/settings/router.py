@@ -58,6 +58,7 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services import feature_modules as fm_svc
+from app.services.api_token_scopes import token_write
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
     mask_proxy_url,
@@ -332,6 +333,11 @@ class SettingsResponse(BaseModel):
     apt_unattended_blocklist: list[str] = []
     apt_unattended_automatic_reboot: bool = False
     apt_unattended_reboot_time: str = "02:00"
+    # #3429 — not a column: the fields a non-superadmin holding ``write`` on
+    # ``settings`` may change (``SETTINGS_DELEGATE_WRITABLE``, sorted), filled
+    # in by ``_settings_response``. Served so the Settings page enables exactly
+    # these for a delegate instead of keeping its own copy of the list.
+    delegate_writable_fields: list[str] = []
 
     model_config = {"from_attributes": True}
 
@@ -896,8 +902,9 @@ def _merge_apt_auth(
 # platform hands to an identity provider, host configuration pushed to
 # appliances, or a connection the platform makes to anything off-prem. The
 # rest is either one of those or points clients and appliances at servers
-# (DHCP default DNS / NTP servers, resolvers), so it stays with superadmins,
-# matching the Settings page, which offers every field to superadmins only.
+# (DHCP default DNS / NTP servers, resolvers), so it stays with superadmins.
+# ``GET /settings`` serves this list as ``delegate_writable_fields`` and the
+# Settings page enables exactly these fields for a delegate (#3429).
 # Integration switches are handled separately (only a real flip is gated),
 # and the two acknowledgement flags are not fields.
 SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
@@ -1991,7 +1998,12 @@ async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResp
     column that a module turned on before this row existed never received
     would otherwise be reported here as off."""
     resp = SettingsResponse.model_validate(settings)
-    return resp.model_copy(update=await fm_svc.integration_flags(db))
+    return resp.model_copy(
+        update={
+            **await fm_svc.integration_flags(db),
+            "delegate_writable_fields": sorted(SETTINGS_DELEGATE_WRITABLE),
+        }
+    )
 
 
 @router.get("", response_model=SettingsResponse)
@@ -3161,6 +3173,9 @@ class AptValidateResponse(BaseModel):
 
 
 @router.post("/apt/validate", response_model=AptValidateResponse)
+@token_write(
+    "Structural check of a candidate APT config, no save; kept write-scoped because it needs write on settings and may create the settings singleton row on first read"
+)
 async def validate_apt_config(
     body: AptValidateRequest,
     current_user: CurrentUser,

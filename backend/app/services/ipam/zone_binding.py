@@ -14,6 +14,10 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
+from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 ZONE_ID_ERROR = "dns_zone_id must be the UUID of a DNS zone"
 
@@ -88,3 +92,82 @@ def stored_uuid_list(values: Iterable[object] | None) -> list[uuid.UUID]:
         except (ValueError, TypeError):
             continue
     return out
+
+
+def norm_uuid_sql(expr: str) -> str:
+    """SQL folding a stored id (text) to its 32 lower-case hex digits.
+
+    Before #2923 the IPAM bindings stored an id as given, so a value Python's
+    ``uuid.UUID`` reads as an id (upper-case, braced, unhyphenated,
+    ``urn:uuid:``) need not equal ``<table>.id::text``, while every reader
+    (:func:`stored_uuid_list`, :func:`stored_zone_uuid`) resolves it. Compare
+    ``norm_uuid_sql(col)`` against ``uuid.hex`` (or against
+    ``replace(id::text, '-', '')``) to match exactly the values the readers
+    resolve. Shared by the DNS group prune (#3433) and the zone prune (#3443).
+    """
+    return f"regexp_replace(lower({expr}), 'urn:|uuid:|[{{}}-]', '', 'g')"
+
+
+# The IPAM tables whose ``dns_group_ids`` can name a DNS server group (#3433).
+DNS_GROUP_ID_TABLES = ("ip_space", "ip_block", "subnet")
+
+
+def _group_prune_sql(table: str, keep: str, drop: str) -> str:
+    """UPDATE keeping the ``dns_group_ids`` entries for which ``keep`` holds,
+    in order (the first one picks the reverse-zone group), on rows with an
+    entry for which ``drop`` holds. ``e`` / ``x`` are the folded entries."""
+    elem_e = norm_uuid_sql("e #>> '{}'")
+    elem_x = norm_uuid_sql("x #>> '{}'")
+    return f"""
+        UPDATE {table} SET dns_group_ids = COALESCE((
+            SELECT jsonb_agg(e ORDER BY o)
+            FROM jsonb_array_elements(dns_group_ids) WITH ORDINALITY AS t(e, o)
+            WHERE COALESCE({keep.format(v=elem_e)}, false)
+        ), '[]'::jsonb)
+        WHERE jsonb_typeof(dns_group_ids) = 'array'
+          AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(dns_group_ids) x
+            WHERE COALESCE({drop.format(v=elem_x)}, false)
+          )
+        """  # noqa: S608
+
+
+async def prune_group_ids(db: AsyncSession, group_ids: Iterable[object]) -> None:
+    """Remove these DNS server group ids from every IPAM ``dns_group_ids``
+    (#3433).
+
+    The column is a JSONB id list with no foreign key, so deleting a group
+    leaves every space, block and subnet that named it counting a group that
+    is gone. Raw UPDATEs, so Trash rows lose the id too and a restore brings
+    back no dead reference. Ids compare by their hex digits, so any spelling
+    the readers resolve is matched. The caller owns the commit.
+    """
+    ids = sorted({u.hex for u in stored_uuid_list(group_ids)})
+    if not ids:
+        return
+    for table in DNS_GROUP_ID_TABLES:
+        await db.execute(
+            text(
+                _group_prune_sql(
+                    table,
+                    keep="NOT ({v} = ANY(CAST(:ids AS text[])))",
+                    drop="{v} = ANY(CAST(:ids AS text[]))",
+                )
+            ),
+            {"ids": ids},
+        )
+
+
+async def prune_dead_group_ids_asyncpg(conn: Any) -> None:
+    """Remove every IPAM ``dns_group_ids`` entry that names no
+    ``dns_server_group`` row (#3433).
+
+    For the factory reset, which wipes DNS over a raw asyncpg connection and
+    keeps IPAM when only the DNS section is chosen: after the wipe every
+    entry is dead. Same rules as :func:`prune_group_ids`.
+    """
+    live = "(SELECT replace(id::text, '-', '') FROM dns_server_group)"
+    for table in DNS_GROUP_ID_TABLES:
+        await conn.execute(
+            _group_prune_sql(table, keep="{v} IN " + live, drop="{v} NOT IN " + live)
+        )

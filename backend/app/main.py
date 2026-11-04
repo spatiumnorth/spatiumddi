@@ -232,10 +232,16 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "entries and exceptions of existing blocklists; manage the TLS "
         "certificate store DoT / DoH / DoQ serve from (upload, CSR, Let's "
         "Encrypt, delete — not activating one as the Web UI certificate); "
-        "read every DNS surface. Infrastructure stays superadmin-only: server groups, servers and "
-        "their options, TSIG keys, DNSSEC signing and policies, dynamic-update "
-        "ACLs, blocklist subscriptions and assignments, GSLB pools (their "
-        "health checks probe the network), zone moves and the importers.",
+        "read DNS server groups and their servers and options, TSIG keys "
+        "(never their secrets), DNSSEC policies, zones, records, views, ACLs, "
+        "blocklists and GSLB pools. Not readable without read on servers, "
+        "which this role does not hold: the DNS query log and its analytics, "
+        "Top DNS clients, the DNS threat views and the Windows event log. "
+        "Changes to infrastructure stay superadmin-only: server groups, "
+        "servers and their options, TSIG keys, DNSSEC signing and policies, "
+        "dynamic-update ACLs, blocklist subscriptions and assignments, GSLB "
+        "pools (their health checks probe the network), zone moves and the "
+        "importers.",
         [
             {"action": "admin", "resource_type": "dns_group"},
             {"action": "admin", "resource_type": "dns_zone"},
@@ -250,10 +256,13 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "Create, edit and delete DHCP scopes, pools, static assignments, "
         "client classes and device policies, option templates, phone and PXE "
         "profiles, and MAC blocks; acknowledge rogue-responder and "
-        "router-advertisement findings; read every DHCP surface. "
-        "Infrastructure stays superadmin-only: DHCP servers and server "
-        "groups, failover relationships, server sync / pause / approval, "
-        "lease deletion and the importers.",
+        "router-advertisement findings; read DHCP servers, server groups, "
+        "scopes, pools, static assignments, leases and lease history. Not "
+        "readable without read on servers, which this role does not hold: "
+        "the DHCP activity log, the Windows DHCP audit log and the Windows "
+        "event log. Changes to infrastructure stay superadmin-only: DHCP "
+        "servers and server groups, failover relationships, server sync / "
+        "pause / approval, lease deletion and the importers.",
         [
             {"action": "admin", "resource_type": "dhcp_server"},
             {"action": "admin", "resource_type": "dhcp_scope"},

@@ -68,10 +68,9 @@ describe("Edit MAC Block reason (#3083)", () => {
       .nextElementSibling as HTMLSelectElement;
     expect(select.value).toBe("xp found on desk");
     fireEvent.submit(select.closest("form")!);
-    await waitFor(() => expect(updateMacBlock).toHaveBeenCalled());
-    expect((updateMacBlock.mock.calls[0] as unknown[])[2]).toMatchObject({
-      reason: "xp found on desk",
-    });
+    // An untouched Save sends nothing (#3365), so the stored reason stays.
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(updateMacBlock).not.toHaveBeenCalled();
   });
 
   it("keeps the stored reason offered after another one is picked", async () => {
@@ -91,9 +90,8 @@ describe("Edit MAC Block reason (#3083)", () => {
     fireEvent.change(select, { target: { value: "xp found on desk" } });
     expect(select.value).toBe("xp found on desk");
     fireEvent.submit(select.closest("form")!);
-    await waitFor(() => expect(updateMacBlock).toHaveBeenCalled());
-    expect((updateMacBlock.mock.calls[0] as unknown[])[2]).toMatchObject({
-      reason: "xp found on desk",
-    });
+    // Back on the stored reason, nothing differs from what is stored.
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(updateMacBlock).not.toHaveBeenCalled();
   });
 });

@@ -291,7 +291,7 @@ With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab
 - **Reserved** — held for static assignments only.
 - **Excluded** — this range exists in the subnet but DHCP will never offer it (e.g. infrastructure).
 
-For Windows DHCP servers in Path A (read-only) you can't create scopes from SpatiumDDI — you create them in the Windows DHCP MMC, and SpatiumDDI auto-imports them on the next lease sync.
+For Windows DHCP servers, scopes you create here are written through to the Windows server over WinRM, and scopes that already exist on it are imported on the next lease sync. A group with more than one Windows member asks which server (or failover relationship) a new scope goes to — see [DHCP.md §15](features/DHCP.md#15-windows-dhcp-agentless-winrm).
 
 > **Worked example — Ridgeline College.** On `10.20.21.0/24`, Ridgeline creates one scope and accepts the pre-filled defaults except the suggested initial pool: it replaces `10.20.21.10–10.20.21.254` with `10.20.21.100–10.20.21.199`, a **dynamic** pool for staff laptops. Kept as suggested, the pool would take in `10.20.21.10`, the address step 10 gives `print-01`, and that allocation would stop to ask for confirmation. Then **Add Pool** on the new scope creates an **excluded** pool `10.20.21.1–10.20.21.9` for network infrastructure. Everything else is left for static allocation in step 10.
 

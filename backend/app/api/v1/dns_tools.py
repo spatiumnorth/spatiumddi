@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.api.deps import CurrentUser
 from app.api.token_binding import honours_token_binding
 from app.core.permissions import require_route_types
+from app.services.api_token_scopes import token_write
 from app.services.nettools.schemas import assert_target_allowed
 
 # Route templates relative to the ``/dns`` mount, as the DNS router's map.
@@ -199,6 +200,7 @@ async def _query_one(
 
 @router.post("/propagation-check", response_model=PropagationCheckResult)
 @honours_token_binding
+@token_write("Sends DNS queries to public resolvers (outbound)")
 async def propagation_check(
     body: PropagationCheckRequest, current_user: CurrentUser
 ) -> PropagationCheckResult:

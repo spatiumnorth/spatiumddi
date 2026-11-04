@@ -888,7 +888,7 @@ async def apply_record_change(
 
 ## 7. Dynamic DNS (DDNS) — DHCP Lease → DNS Record
 
-> **Implementation status:** Subnet-level opt-in DDNS has shipped. When a lease lands via the agentless pull path (Windows DHCP) *or* an agent lease event (Kea), SpatiumDDI resolves a hostname per the subnet's policy and publishes A/AAAA + PTR via the same RFC 2136 / WinRM path static allocations use. The Kea path runs through `apply_ddns_for_lease` in the `POST /api/v1/dhcp/agents/lease-events` handler.
+> **Implementation status:** Subnet-level opt-in DDNS has shipped. When a lease lands via the agentless pull path (Windows DHCP, FortiGate) *or* an agent lease event (Kea), SpatiumDDI resolves a hostname per the subnet's policy and publishes A/AAAA + PTR through `_sync_dns_record`, the same path static allocations use: for an agent-managed group it queues one `DNSRecordOp` per agent server (the BIND9 agent applies it with nsupdate, PowerDNS and Technitium agents through their own API), and agentless drivers (Windows DNS, cloud, `technitium_api`) are driven from the control plane. The Kea path runs through `apply_ddns_for_lease` in the `POST /api/v1/dhcp/agents/lease-events` handler.
 
 ### Architecture
 
@@ -923,10 +923,13 @@ The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle l
 | `disabled` | Never publish, even if `ddns_enabled`. (Useful for temporarily parking DDNS without losing your config.) |
 
 **Generated hostnames:**
-- IPv4 — `dhcp-<third-octet>-<fourth-octet>`. So `10.1.20.5` → `dhcp-20-5`.
-- IPv6 — `dhcp-<low-32-bits-hex>`. Rare path; the format is ugly but unique.
+- IPv4 — `dhcp-<a>-<b>-<c>-<d>`, the whole address. So `10.1.20.5` → `dhcp-10-1-20-5`. Two subnets that share a zone can both hold a `.20.5`, so a shorter form would give them one name.
+- IPv6 — `dhcp-<32 hex digits>`, the whole address, 37 characters. Rare path; the format is ugly but unique.
+- Records published before this (`dhcp-20-5`, `dhcp-<8 hex>`) are left alone and move to the new name when the lease next renews. Both forms stay reserved for the address they encode, so a client cannot name itself one. The old IPv4 form is shared by every address ending in the same two octets (`dhcp-20-5` is the old name of `10.1.20.5` and of `10.2.20.5`), so for those addresses it is free only while no record holds it: a lease still published as `dhcp-20-5` keeps it from the other until it renews.
 
 **Static assignment override:** if the lease IP matches a `DHCPStaticAssignment` that has a hostname set, that hostname always wins — regardless of policy, including `always_generate`. Rationale: a static hostname is an explicit admin choice.
+
+**Name conflicts (#3362):** DDNS publishes a name only when nothing else is at it in the zone it writes into, or the address already owns it (RFC 4703). Any record holds the name: an operator A / AAAA / CNAME of another value, an MX- or TXT-only name, an NS delegation, a record in any view, or a record generated for another address (a static host, another lease). Not holders: the address's own generated records (a renewal keeps its name) and an operator A / AAAA in no view with the address's own value, which is adopted as before (#1867). Another address's generated `dhcp-<tail>` name is reserved and never taken from a client. On a clash the lease is published under its own generated name; if that is held too, nothing is published and the IPAM row is left without a name. Each clash logs `ddns_name_conflict` and writes an audit row (`result=denied`, details in `new_value`), at most once per address every five minutes. Two leases that ask for the same new name at the same moment, through different requests, can both publish it; the first of them to renew then moves to its generated name. Windows DHCP's own dynamic updates straight to Windows DNS do not pass through SpatiumDDI and are not covered.
 
 **Sanitisation:** all hostnames (client-provided or static) are folded to lower-case, non-`[a-z0-9-]` characters collapse to `-`, leading/trailing hyphens strip, and the result truncates at RFC 1035's 63-character label limit.
 
@@ -2412,10 +2415,18 @@ entry is UDP-spoofable → recommend TSIG).
   can express (the UI greys unsupported controls; `supported=false` ⇒ the
   whole feature 422s).
 - `GET /dns/groups/{gid}/zones/{zid}/update-acl` — the current ACL +
-  `dynamic_update_enabled` + resolved `tsig_key_name`s + standing warnings.
+  `dynamic_update_enabled` + resolved `tsig_key_name`s + standing warnings +
+  an opaque `version` (hash of the stored flag and ordered entries).
 - `PUT /dns/groups/{gid}/zones/{zid}/update-acl` — full ordered replace
   (optionally flips `dynamic_update_enabled` in the same call). Superadmin;
   every mutation is audited; validation runs the driver capability gate.
+  Send the `version` you read as `expected_version`: if the stored ACL has
+  changed since, the call answers 409 (`ACL_VERSION_CONFLICT`) and changes
+  nothing. `expected_version` is optional — omit it and the replace is
+  unconditional, as before. The response carries the new `version`. Every
+  ACL replace is serialised per zone, so the check and the write are one
+  step. The MCP `propose_set_zone_update_acl` pins the version current when
+  it is proposed, and Apply refuses if the ACL has changed since.
 
 All three gate behind the default-on `dns.dynamic_update_acl` feature
 module. MCP: `find_zone_update_acls` (read, default-on) +
@@ -3240,3 +3251,37 @@ No new MCP tool (non-negotiable #13 — one field on an existing read), and
 none for the refresh, which is an off-prem call. Not a feature module
 (#14) — it extends the existing zone resource rather than adding a
 top-level family.
+
+---
+
+## 23. Reference summaries — drift report coverage, PowerDNS-only records, pools
+
+_Moved here from the README feature tour (#3410), so the detail stays in the documentation._
+
+### Record-level drift report
+
+per zone, AXFR the live zone from every server in the group and diff it against the database: *extra on server* (someone edited the host by hand), *missing on server* (a change never landed), *in sync*. Strictly read-only — it never applies anything, and the Sync path stays the way you push. A changed value shows as a missing+extra pair, because the diff key includes the value. Split-horizon zones carry a caveat banner: a transfer is addressed by zone *name*, so the server answers from whichever view matches the control plane's source address. **Driver coverage: every driver except PowerDNS**, which implements no record pull at all. Windows Path B, the cloud drivers and agentless Technitium (`technitium_api`) pull over an API; agent-managed BIND9 and Technitium use a TSIG-signed AXFR, because their agents grant transfer to the group's key rather than to an address ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)) — a group with no TSIG key reports that rather than a bare refusal
+
+### PowerDNS-only record types
+
+synthesised at query time by `pdns_server`, so they have no BIND9 equivalent:
+  - **ALIAS** — an apex CNAME-equivalent. Lets `example.com` itself point at a cloud load balancer's hostname, which a real CNAME can't do at the apex without breaking the SOA / NS rrset
+  - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. Authoring is gated on the usual DNS write permission — scope that permission accordingly, and treat it as more privileged than authoring an A record
+
+### DNS pools (GSLB-lite)
+
+health-checked DNS round-robin.
+
+- One DNS name returns one record per healthy + enabled member; members flip in / out of the rrset as state changes
+- **Health checks**:
+  - `tcp` — open-connection probe
+  - `http` / `https` — status-code match with optional TLS verification
+  - `icmp` — echo-request via `iputils-ping`
+  - `none` — always healthy (for pools that just want manual-enable + multi-RR semantics)
+- Per-pool interval (default 30 s), timeout, and consecutive-failure / consecutive-success thresholds so single flapping checks don't churn records
+- **Operator UX**:
+  - Top-level `/dns/pools` page — every pool across every zone with live health summary
+  - Per-zone Pools tab on the zone detail page
+  - Manual enable / disable per member, like a load-balancer pool
+- **Driver-agnostic** — members render as regular A/AAAA records via the normal record pipeline, so BIND9 + Windows DNS serve them unchanged
+- **Tradeoff (UI-warned)** — TTL races. DNS is cached client-side; a member dropping out doesn't take effect until TTL expires. This is not a real L4/L7 load balancer. Default TTL is 30 s with an inline pointer to the LB-mapping roadmap item.

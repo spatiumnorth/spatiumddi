@@ -3,7 +3,7 @@
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <title>DHCP server host internals</title>
-  <desc>Inside the DHCP server host a SpatiumDDI agent keeps a local config cache on disk, applies config to the Kea or ISC daemon, and pulls config from and pushes lease events to the SpatiumDDI control plane API.</desc>
+  <desc>Inside the DHCP server host a SpatiumDDI agent keeps a local config cache on disk, applies config to the Kea daemon, and pulls config from and pushes lease events to the SpatiumDDI control plane API.</desc>
   <defs>
     <linearGradient id="dhcph-surface" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#f1f5f9"/>
@@ -38,12 +38,12 @@
   <!-- DHCP daemon -->
   <rect x="170" y="160" width="190" height="76" rx="8" fill="url(#dhcph-agentbox)"/>
   <text x="265" y="190" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCP daemon</text>
-  <text x="265" y="212" text-anchor="middle" font-size="11" fill="#fed7aa">Kea / ISC</text>
+  <text x="265" y="212" text-anchor="middle" font-size="11" fill="#fed7aa">Kea</text>
 
   <!-- Agent -->
   <rect x="460" y="146" width="290" height="156" rx="12" fill="#475569"/>
   <text x="605" y="176" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">SpatiumDDI Agent</text>
-  <text x="605" y="196" text-anchor="middle" font-size="11" fill="#cbd5e1">polls /config every 30s</text>
+  <text x="605" y="196" text-anchor="middle" font-size="11" fill="#cbd5e1">long-polls /config (ETag, Redis wake)</text>
 
   <rect x="486" y="212" width="238" height="72" rx="8" fill="url(#dhcph-accent)"/>
   <text x="605" y="242" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">config cache</text>

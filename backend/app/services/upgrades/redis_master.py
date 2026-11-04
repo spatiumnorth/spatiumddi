@@ -229,7 +229,12 @@ async def _replica_state(url: str, host: str, port: int) -> tuple[str, int]:
         reply = await client.config_get("replica-priority")
     finally:
         await client.aclose()
-    return str(info["run_id"]), int(reply["replica-priority"])
+    priority = reply.get("replica-priority")
+    if priority is None:
+        # redis-py types CONFIG GET values as optional; a server that does not
+        # report the setting cannot have its real value restored afterwards.
+        raise RuntimeError(f"{host}:{port} did not report replica-priority")
+    return str(info["run_id"]), int(priority)
 
 
 async def _set_priority(url: str, host: str, port: int, value: int) -> None:

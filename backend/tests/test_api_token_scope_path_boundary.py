@@ -57,7 +57,6 @@ def test_dns_write_covers_its_own_surface(path: str) -> None:
 
 def test_dns_write_still_excludes_the_agent_surface() -> None:
     assert scope_matches_request(["dns:write"], "POST", "/api/v1/dns/agents/register") is False
-    assert scope_matches_request(["agent"], "POST", "/api/v1/dns/agents/register") is True
     assert scope_matches_request(["dhcp:write"], "POST", "/api/v1/dhcp/agents/x") is False
 
 
@@ -69,7 +68,6 @@ def test_dns_write_still_excludes_the_agent_surface() -> None:
         ("ipam:write", "/api/v1/vrfs/abc", "/api/v1/vrfsx"),
         ("ipam:write", "/api/v1/network-devices/abc", "/api/v1/network-devices2"),
         ("dhcp:write", "/api/v1/dhcp/scopes", "/api/v1/dhcpx/scopes"),
-        ("agent", "/api/v1/dns/agents/heartbeat", "/api/v1/dns/agentsx"),
     ],
 )
 def test_every_prefix_respects_the_segment_boundary(scope: str, inside: str, outside: str) -> None:
@@ -85,10 +83,31 @@ def test_read_scope_mcp_post_respects_the_segment_boundary() -> None:
 # ── Route table: every mounted route against every write scope ──────────
 
 _SCOPE_OWNERS: dict[str, set[str]] = {
-    "ipam:write": {"ipam", "vlans", "vrfs", "network-devices"},
-    "dns:write": {"dns"},
+    "ipam:write": {"ipam", "vlans", "vrfs", "network-devices", "address-sets", "multicast"}
+    | {"custom-fields"},
+    "dns:write": {"dns", "domains"},
     "dhcp:write": {"dhcp"},
 }
+
+
+_SINGLE_ROUTES: set[tuple[str, str]] = {
+    ("ipam:write", "/api/v1/nmap/scans/{scan_id}/stamp-discovered"),
+    ("dns:write", "/api/v1/acme/register"),
+    ("dhcp:write", "/api/v1/new-devices/block"),
+}
+
+
+def _is_apply_time_path(path: str) -> bool:
+    return path in (
+        "/api/v1/requests",
+        "/api/v1/requests/{req_id}/approve",
+        "/api/v1/requests/{req_id}/reject",
+        "/api/v1/requests/{req_id}/cancel",
+        "/api/v1/change-requests/{cr_id}/approve",
+        "/api/v1/change-requests/{cr_id}/reject",
+        "/api/v1/change-requests/{cr_id}/cancel",
+        "/api/v1/ai/proposals/{proposal_id}/apply",
+    )
 
 
 def _mounted_paths() -> set[str]:
@@ -102,7 +121,7 @@ def _mounted_paths() -> set[str]:
 def test_write_scopes_grant_only_their_own_top_level_segments() -> None:
     """For every mounted route, a write scope matches if and only if the
     route's first segment under ``/api/v1`` is one the scope names (agent
-    paths excepted, which need ``agent``)."""
+    paths excepted, which no scope covers)."""
     paths = _mounted_paths()
     assert any(p.startswith("/api/v1/dnsbl/") for p in paths)
     assert any(p.startswith("/api/v1/dns-threat/") for p in paths)
@@ -112,6 +131,21 @@ def test_write_scopes_grant_only_their_own_top_level_segments() -> None:
         is_agent = path.startswith(("/api/v1/dns/agents/", "/api/v1/dhcp/agents/"))
         for scope, owners in _SCOPE_OWNERS.items():
             expected = segment in owners and not is_agent
+            # Single routes / sub-prefixes admitted on purpose (#3302).
+            expected = (
+                expected
+                or (scope, path) in _SINGLE_ROUTES
+                or (
+                    scope == "ipam:write"
+                    and path.startswith(("/api/v1/av/flows", "/api/v1/av/reserved-ranges"))
+                )
+            )
+            # Approve-and-provision routes: any write scope enters, the
+            # handler checks the operation's family.
+            expected = expected or _is_apply_time_path(path)
+            # The synchronous RDAP refresh is an off-prem lookup: unrestricted only.
+            if path == "/api/v1/domains/{domain_id}/refresh-whois":
+                expected = False
             if scope_matches_request([scope], "POST", path) is not expected:
                 wrong.append(f"{scope} {path} -> expected {expected}")
     assert not wrong, "\n".join(wrong)
