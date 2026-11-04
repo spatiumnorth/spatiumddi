@@ -110,7 +110,7 @@ afterEach(() => {
 });
 
 describe("AppliancePage for a certificate-store-only caller (#3067)", () => {
-  it("shows the appliance's store when /appliance/info is refused", async () => {
+  it("shows the appliance's store to a caller /appliance/info refuses", async () => {
     mocks.getInfo.mockImplementation(refused);
     mocks.version.mockResolvedValue({ version: "t", appliance_mode: true });
     const qc = new QueryClient({
@@ -124,7 +124,9 @@ describe("AppliancePage for a certificate-store-only caller (#3067)", () => {
       </QueryClientProvider>,
     );
     await screen.findByText("served-cert");
-    await waitFor(() => expect(mocks.getInfo).toHaveBeenCalled());
+    await waitFor(() => expect(mocks.version).toHaveBeenCalled());
+    // #3420: the page does not ask `/appliance/info` of this caller at all.
+    expect(mocks.getInfo).not.toHaveBeenCalled();
     expect(await screen.findByText("Web UI Certificate")).toBeTruthy();
     expect(screen.queryByText("TLS certificates")).toBeNull();
     expect(screen.queryByText("docker/k8s")).toBeNull();
