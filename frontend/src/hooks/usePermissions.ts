@@ -61,6 +61,7 @@ export function usePermissions(): {
     resourceType: string,
     resourceId?: string | null,
   ) => boolean;
+  hasAnyGrantFor: (action: string, resourceType: string) => boolean;
   isSuperadmin: boolean;
   isLoading: boolean;
 } {
@@ -84,7 +85,21 @@ export function usePermissions(): {
     );
   }
 
-  return { can, isSuperadmin, isLoading: query.isLoading };
+  /** Whether the caller holds ANY grant of ``action`` on ``resourceType``,
+   *  scoped to an instance or not: the backend's ``has_any_grant_for``,
+   *  which ignores the grant's ``resource_id``. A coarse router gate admits
+   *  an instance-scoped delegate (an address set, #103) this way and leaves
+   *  the real boundary to its handler's per-row check, so gate a control on
+   *  this only where its route's gate does. Fail-closed like ``can()``. */
+  function hasAnyGrantFor(action: string, resourceType: string): boolean {
+    if (isSuperadmin) return true;
+    if (!query.data) return false;
+    return query.data.grants.some((g) =>
+      permissionMatch({ ...g, resource_id: null }, action, resourceType),
+    );
+  }
+
+  return { can, hasAnyGrantFor, isSuperadmin, isLoading: query.isLoading };
 }
 
 /** Props for a write control whose permission check failed (#1155): it

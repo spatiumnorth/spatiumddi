@@ -9,6 +9,9 @@
  * follows `admin` on `appliance`. Which install this is comes from the
  * public `/version`, never from `/appliance/info`, which a store-only
  * caller is refused.
+ *
+ * #3419: a CSR-pending row's Paste signed cert, disabled by that gate,
+ * dims as its row's Delete does.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -19,6 +22,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { applianceTlsApi } from "@/lib/api";
 
 const certs = vi.hoisted(() => [
   {
@@ -277,5 +281,56 @@ describe("CertificatesTab View CSR dialog (#3393)", () => {
     expect(paste.disabled).toBe(false);
     fireEvent.click(paste);
     await screen.findByText(/Paste signed certificate/);
+  });
+});
+
+describe("CertificatesTab, a CSR-pending row's Paste signed cert (#3419)", () => {
+  // A row as POST /appliance/tls/csr leaves it: a key, a CSR, no cert yet.
+  const pending = {
+    ...certs[1],
+    id: "3",
+    name: "pending-csr",
+    source: "csr",
+    pending: true,
+    issuer_cn: null,
+    fingerprint_sha256: null,
+    valid_from: null,
+    valid_to: null,
+  };
+  const dimmed = ["disabled:cursor-not-allowed", "disabled:opacity-50"];
+  const list = applianceTlsApi.list as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    list.mockResolvedValue([...certs, pending]);
+  });
+  afterEach(() => {
+    list.mockResolvedValue(certs);
+  });
+
+  it("dims when disabled, as the row's Delete does", async () => {
+    grants.current = new Set(["read:certificate_store"]);
+    renderTab(true);
+    await screen.findByText("pending-csr");
+    const paste = screen.getByText("Paste signed cert").closest("button")!;
+    expect(paste.disabled).toBe(true);
+    expect(paste.title).toMatch(/certificate_store/);
+    // Its neighbour on the same row, disabled by the store's delete gate.
+    const deletes = screen
+      .getAllByText("Delete")
+      .map((el) => el.closest("button")!);
+    const rowDelete = deletes[deletes.length - 1];
+    expect(rowDelete.disabled).toBe(true);
+    for (const cls of dimmed) {
+      expect(rowDelete.classList.contains(cls)).toBe(true);
+      expect(paste.classList.contains(cls)).toBe(true);
+    }
+  });
+
+  it("stays enabled for a caller who may write the store", async () => {
+    grants.current = new Set(["write:certificate_store"]);
+    renderTab(true);
+    await screen.findByText("pending-csr");
+    const paste = screen.getByText("Paste signed cert").closest("button")!;
+    expect(paste.disabled).toBe(false);
   });
 });

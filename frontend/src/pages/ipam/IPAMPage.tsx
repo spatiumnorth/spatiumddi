@@ -4571,18 +4571,20 @@ const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
 const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 
-// The IPAM router's gate: an address delete and the multi-row deletes (Bulk
-// delete, Clean Orphans) need ``delete`` on ``subnet`` — the subnet owns its
-// addresses (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or
-// on an address set.
-function canDeleteInIpam(
-  can: (action: string, type: string, id?: string | null) => boolean,
-  addressSetIds: string[] = [],
-): boolean {
+// The IPAM router's gate for an address delete and Bulk delete
+// (``DELETE /addresses/{id}``, ``POST /addresses/bulk-delete``): ``delete`` on
+// ``subnet`` at the type level — the subnet owns its addresses
+// (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or any
+// ``delete`` grant on an address set, scoped or not (the ``_ADDRESS_SET_ROUTES``
+// admit, ``has_any_grant_for``). The handler then wants write on the row.
+// Clean Orphans is not on that allow-list: it takes ``delete`` on ``subnet``.
+function canDeleteInIpam(perms: {
+  can: (action: string, type: string, id?: string | null) => boolean;
+  hasAnyGrantFor: (action: string, type: string) => boolean;
+}): boolean {
   return (
-    can("delete", "subnet") ||
-    can("delete", "address_set") ||
-    addressSetIds.some((id) => can("delete", "address_set", id))
+    perms.can("delete", "subnet") ||
+    perms.hasAnyGrantFor("delete", "address_set")
   );
 }
 
@@ -5089,12 +5091,10 @@ export function SubnetDetail({
   const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
   // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
   const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
-  // Bulk delete and Clean Orphans are deletes: the router gate wants
-  // ``delete``, the handler write on the row's subnet or address set.
-  const canDeleteIpam = canDeleteInIpam(
-    perms.can,
-    addressSets.map((s) => s.id),
-  );
+  // A row's Delete, the orphan purge and Bulk delete are deletes: the router
+  // gate wants ``delete``, the handler write on the row's subnet or address
+  // set (#3409). Clean Orphans asks its own, below.
+  const canDeleteIpam = canDeleteInIpam(perms);
 
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
@@ -5794,7 +5794,10 @@ export function SubnetDetail({
                 allocate: canAllocate,
                 reshape: canWriteSubnets,
                 scan: canScan,
-                purge: canWriteSubnets && canDeleteIpam,
+                // Clean Orphans takes ``delete`` on ``subnet``: an
+                // address-set grant does not reach it, as it does a row's
+                // Delete (#3409).
+                purge: canWriteSubnets && perms.can("delete", "subnet"),
               }}
               onBulkAllocate={() => setShowBulkAllocate(true)}
               onCleanOrphans={() => setShowOrphans(true)}
@@ -7091,9 +7094,15 @@ export function SubnetDetail({
                                         onClick={() =>
                                           setConfirmDeleteAddr(addr)
                                         }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                                         title={`Delete ${addr.address}`}
                                         aria-label={`Delete ${addr.address}`}
+                                        // #3409 — DELETE /addresses/{id} takes
+                                        // delete, not write.
+                                        {...permissionGate(
+                                          canDeleteIpam,
+                                          NEEDS_ADDRESS_DELETE,
+                                        )}
                                       >
                                         <Trash2 className="h-3.5 w-3.5" />
                                       </button>
@@ -7138,6 +7147,10 @@ export function SubnetDetail({
                                 <ContextMenuItem
                                   destructive
                                   onSelect={() => setConfirmDeleteAddr(addr)}
+                                  {...permissionGate(
+                                    canDeleteIpam,
+                                    NEEDS_ADDRESS_DELETE,
+                                  )}
                                 >
                                   Delete…
                                 </ContextMenuItem>
@@ -7341,11 +7354,17 @@ export function SubnetDetail({
             setEditingAddress(a);
           }}
           onScan={() => setScanFromDetail(viewingAddress)}
-          onDelete={() => {
-            const a = viewingAddress;
-            setViewingAddress(null);
-            setConfirmDeleteAddr(a);
-          }}
+          // #3409 — the detail's Delete is the same DELETE: not offered
+          // without delete.
+          onDelete={
+            canDeleteIpam
+              ? () => {
+                  const a = viewingAddress;
+                  setViewingAddress(null);
+                  setConfirmDeleteAddr(a);
+                }
+              : undefined
+          }
           onTagClick={(chip) => {
             // Click-a-tag-to-filter affordance from the issue spec.
             // Dedupe — clicking the same tag twice on consecutive
@@ -14179,6 +14198,15 @@ export function BlockDetailView({
     setBlock(initialBlock);
   }, [initialBlock.id]);
 
+  // #3369 — the page's selection is a click-time snapshot; once the blocks
+  // list is read again after a Save (the tree's Edit…, another panel), show
+  // the stored row. react-query keeps an unchanged row's reference, so this
+  // runs only when the row actually changed.
+  const listedBlock = allBlocks.find((b) => b.id === initialBlock.id);
+  useEffect(() => {
+    if (listedBlock) setBlock(listedBlock);
+  }, [listedBlock]);
+
   const { data: subnetCfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "subnet"],
     queryFn: () => customFieldsApi.list("subnet"),
@@ -14211,6 +14239,11 @@ export function BlockDetailView({
   const selectedBlockKeys = [...selected].filter((k) => k.startsWith("block:"));
   const hasBlocksSelected = selectedBlockKeys.length > 0;
   const selectedCount = selected.size;
+  // #3384: the selection's Bulk Edit, Split… and Merge…, gated as the subnet
+  // view gates its own Split… and Merge… (#1155). Each asks write on subnets
+  // at the type level: the bulk edit and the split and merge commits at the
+  // router gate, and every handler, the previews included, itself.
+  const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
   const toggleOne = (key: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -14259,17 +14292,24 @@ export function BlockDetailView({
                   <HeaderButton
                     icon={Pencil}
                     onClick={() => setShowBulkEdit(true)}
+                    {...subnetWriteGate}
                   >
                     Bulk Edit ({selectedSubnetIds.length})
                   </HeaderButton>
                 )}
                 {!hasBlocksSelected && selectedSubnetIds.length === 1 && (
-                  <HeaderButton onClick={() => setShowSplitSubnet(true)}>
+                  <HeaderButton
+                    onClick={() => setShowSplitSubnet(true)}
+                    {...subnetWriteGate}
+                  >
                     Split…
                   </HeaderButton>
                 )}
                 {!hasBlocksSelected && selectedSubnetIds.length >= 2 && (
-                  <HeaderButton onClick={() => setShowMergeSubnet(true)}>
+                  <HeaderButton
+                    onClick={() => setShowMergeSubnet(true)}
+                    {...subnetWriteGate}
+                  >
                     Merge…
                   </HeaderButton>
                 )}
@@ -14503,6 +14543,10 @@ export function BlockDetailView({
           onCommitted={(result) => {
             setBlock(result.block);
             setShowMoveBlock(false);
+            // The block left this space: the page's selection (and with it
+            // the active space, the tree highlight and the breadcrumb) is
+            // the click-time copy, so hand it the moved block (#3369).
+            onSelectBlock(result.block);
           }}
         />
       )}
@@ -15686,6 +15730,9 @@ export function SpaceTableView({
   const selectedSubnetIds = [...selected]
     .filter((k) => k.startsWith("subnet:"))
     .map((k) => k.slice("subnet:".length));
+  // #3384: Bulk Edit, Split… and Merge… ask write on subnets at the type
+  // level, as on a block's selection.
+  const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -15772,6 +15819,7 @@ export function SpaceTableView({
                     icon={Pencil}
                     onClick={() => setBulkOpen(true)}
                     title="Bulk-edit applies to subnets only"
+                    {...subnetWriteGate}
                   >
                     Bulk Edit ({selectedCount})
                   </HeaderButton>
@@ -15780,6 +15828,7 @@ export function SpaceTableView({
                   <HeaderButton
                     onClick={() => setShowSplitSubnet(true)}
                     title="Split this subnet into 2^k aligned children"
+                    {...subnetWriteGate}
                   >
                     Split…
                   </HeaderButton>
@@ -15788,6 +15837,7 @@ export function SpaceTableView({
                   <HeaderButton
                     onClick={() => setShowMergeSubnet(true)}
                     title="Merge contiguous sibling subnets"
+                    {...subnetWriteGate}
                   >
                     Merge…
                   </HeaderButton>
@@ -16432,7 +16482,9 @@ function BulkEditSubnetsModal({
       qc.invalidateQueries({ queryKey: ["blocks"] });
       onDone();
     },
-    onError: (e: Error) => setError(e.message),
+    // #3384: the server's reason, not axios's "Request failed with status
+    // code N". The checks above throw plain errors, said word for word.
+    onError: (e: Error) => setError(formatApiError(e, "Bulk edit failed")),
   });
 
   return (
@@ -17187,7 +17239,14 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
   const perms = usePermissions();
-  const canDeleteIpam = canDeleteInIpam(perms.can);
+  const canDeleteIpam = canDeleteInIpam(perms);
+  // ``POST /addresses/bulk-edit`` lets through write on subnets at the type
+  // level or, for an address-set delegate (#103), a write grant on any
+  // address set; its handler then skips each address the caller cannot
+  // write. Anyone else is refused at the gate (#3423).
+  const canBulkEdit =
+    perms.can("write", "subnet") ||
+    perms.hasAnyGrantFor("write", "address_set");
 
   const params = {
     q: applied.q || undefined,
@@ -17487,6 +17546,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
               disabled={selected.size === 0}
               onClick={() => setShowBulkEdit(true)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              {...permissionGate(canBulkEdit, NEEDS_ADDRESS_WRITE)}
             >
               <Pencil className="h-3.5 w-3.5" />
               Bulk edit{" "}
@@ -17763,6 +17823,17 @@ export function IPAMPage() {
       setSelectedSubnet(fresh);
     }
   }, [detailSubnets, selectedSubnet]);
+
+  // The block selection follows the refetched list as well (#3369): the
+  // breadcrumb's ancestors are computed from it, so a block moved or edited
+  // from the tree kept its old parent chain until clicked again.
+  useEffect(() => {
+    if (!selectedBlock || !detailBlocks) return;
+    const fresh = detailBlocks.find((b) => b.id === selectedBlock.id);
+    if (fresh && JSON.stringify(fresh) !== JSON.stringify(selectedBlock)) {
+      setSelectedBlock(fresh);
+    }
+  }, [detailBlocks, selectedBlock]);
 
   // The space panel's snapshot follows the refetched list too (#3075), as the
   // subnet's does (#509): an Edit IP Space Save refreshed the list and left

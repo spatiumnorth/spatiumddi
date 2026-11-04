@@ -206,8 +206,25 @@ export function CreateServerModal({
         ? dhcpApi.updateServer(server!.id, data)
         : dhcpApi.createServer(data);
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // #3366 — the server page reads ["dhcp-server", id] on a 30 s poll and
+      // opens this dialog from it; write the Save's answer into that copy and
+      // the cached lists first, or a reopen before the poll shows the old row
+      // and an untouched Save writes it back.
+      if (editing && saved?.id) {
+        qc.setQueryData(["dhcp-server", saved.id], (old: unknown) =>
+          old ? { ...(old as DHCPServer), ...saved } : saved,
+        );
+        qc.setQueriesData({ queryKey: ["dhcp-servers"] }, (old: unknown) =>
+          Array.isArray(old)
+            ? old.map((r: DHCPServer) =>
+                r.id === saved.id ? { ...r, ...saved } : r,
+              )
+            : old,
+        );
+      }
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-server"] });
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },

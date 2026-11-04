@@ -948,10 +948,13 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
 
     from app.models.dns import DNSRecord
     from app.services.dns.record_ops import sweep_zone_ops
+    from app.services.ipam.zone_binding import prune_zone_ids
 
     await sweep_zone_ops(db, zone, zone.group_id)
     await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
     await db.delete(zone)
+    # IPAM names zones in text / JSONB columns with no foreign key (#3443).
+    await prune_zone_ids(db, [zone.id])
     await db.commit()
     return {"zone_id": str(args.zone_id), "mode": "delete"}
 

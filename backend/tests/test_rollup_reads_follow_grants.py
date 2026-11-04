@@ -21,6 +21,7 @@ from app.main import _BUILTIN_ROLES
 from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
+from app.models.feature_module import FeatureModule
 from app.models.ipam import IPSpace
 
 pytestmark = pytest.mark.asyncio
@@ -217,6 +218,40 @@ async def test_integrations_summary_only_shows_readable_integrations(
     body = resp.json()
     assert len(body["panels"]) == 11
     assert "docker-reconcile-target" in [e["target_display"] for e in body["recent_errors"]]
+
+
+async def test_integrations_summary_names_the_enabled_integrations_it_withheld(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3456: an enabled integration the caller cannot read is named, so the
+    tab can tell it from "nothing is enabled"; a disabled one is not."""
+    db_session.add(FeatureModule(id="integrations.kubernetes", enabled=True))
+    db_session.add(FeatureModule(id="integrations.docker", enabled=True))
+    db_session.add(FeatureModule(id="integrations.proxmox", enabled=False))
+    await db_session.flush()
+
+    k8s_reader = await _headers(db_session, permissions=_grant("read", "kubernetes_cluster"))
+    resp = await client.get("/api/v1/dashboards/integrations/summary", headers=k8s_reader)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Other integrations may default on; what matters is who is named.
+    kinds = {w["kind"] for w in body["withheld"]}
+    assert "docker" in kinds
+    assert not kinds & {"kubernetes", "proxmox"}
+
+    # Only a disabled integration readable: panels are all disabled, and the
+    # enabled ones are what the caller is not shown.
+    proxmox_reader = await _headers(db_session, permissions=_grant("read", "proxmox_node"))
+    resp = await client.get("/api/v1/dashboards/integrations/summary", headers=proxmox_reader)
+    body = resp.json()
+    assert [p["enabled"] for p in body["panels"]] == [False]
+    kinds = {w["kind"] for w in body["withheld"]}
+    assert {"kubernetes", "docker"} <= kinds
+    assert "proxmox" not in kinds
+
+    viewer = await _headers(db_session, role="Viewer")
+    resp = await client.get("/api/v1/dashboards/integrations/summary", headers=viewer)
+    assert resp.json()["withheld"] == []
 
 
 # ── Tag autocomplete ───────────────────────────────────────────────────────

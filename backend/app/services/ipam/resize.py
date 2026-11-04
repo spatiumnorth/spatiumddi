@@ -19,7 +19,9 @@ tree may have changed between preview and commit):
    the parent. Chain-resize is too easy to blow a silent hole in the tree.
 5. **No overlap with siblings or cousins.** Scan the **entire IPSpace**,
    not just siblings under the same parent — a cousin under a different
-   block in the same space could still collide.
+   block in the same space could still collide. The resource's own
+   ancestor blocks contain it, so they are left out; rule 4 speaks for
+   them (#3382).
 6. **Block resize: children must still fit.** Mathematically redundant
    (old ⊂ new ⇒ children ⊂ new) but re-checked as a belt-and-braces.
 7. **Space immutable.** ``space_id`` never changes during a resize.
@@ -438,6 +440,12 @@ async def _overlap_conflicts_space_blocks(
     strict superset of the old and therefore of the old's descendants
     (that containment is re-validated in commit with the recursive CTE
     "child_outside_new_cidr" check).
+
+    Its ancestors are excluded too (#3382). Each one contains the block,
+    so each overlaps any CIDR the block can grow to, and counting them
+    refused every nested block's growth with its own parent named as the
+    obstacle. Whether the new CIDR still fits inside the parent is
+    ``_parent_containment_conflicts_block``'s question, asked on its own.
     """
     q = (
         "SELECT id, network FROM ip_block "
@@ -457,6 +465,21 @@ async def _overlap_conflicts_space_blocks(
             "      INNER JOIN descendants d ON b.parent_block_id = d.id"
             "  )"
             "  SELECT id FROM descendants"
+            ")"
+        )
+        # ...and every ancestor, walking parent_block_id up to the root.
+        # The root's NULL parent is filtered out: one NULL in a NOT IN
+        # list would hide every overlap. UNION stops on a cyclic chain.
+        q += (
+            " AND id NOT IN ("
+            "  WITH RECURSIVE ancestors AS ("
+            "    SELECT parent_block_id AS id FROM ip_block"
+            "      WHERE id = CAST(:exclude_id AS uuid)"
+            "    UNION"
+            "    SELECT b.parent_block_id FROM ip_block b"
+            "      INNER JOIN ancestors a ON b.id = a.id"
+            "  )"
+            "  SELECT id FROM ancestors WHERE id IS NOT NULL"
             ")"
         )
         params["exclude_id"] = str(exclude_block_id)
@@ -965,7 +988,10 @@ async def preview_block_resize(
     canonical_new = str(new_net)
 
     if not conflicts:
-        # Space-wide block overlap (not limited to siblings) + subnet overlap.
+        # The parent's edge, then space-wide block overlap (not limited to
+        # siblings; the block's ancestors left out) + subnet overlap, in
+        # the order the commit refuses them.
+        conflicts.extend(await _parent_containment_conflicts_block(db, block, new_net))
         conflicts.extend(
             await _overlap_conflicts_space_blocks(
                 db,
@@ -982,7 +1008,6 @@ async def preview_block_resize(
                 block_id=block.id,
             )
         )
-        conflicts.extend(await _parent_containment_conflicts_block(db, block, new_net))
 
     # Walk the full descendant tree (recursive CTE) — for the count summary
     # and to confirm every child still fits. Mathematically old ⊂ new
@@ -1421,10 +1446,18 @@ async def commit_block_resize(
     canonical_new = str(new_net)
     canonical_old = str(old_net)
 
+    # The parent's edge first: growth past it is refused by the check that
+    # names it, whatever else stands in the new range (#3382).
+    parent_conflicts = await _parent_containment_conflicts_block(db, block, new_net)
+    if parent_conflicts:
+        raise ResizeError(parent_conflicts[0].detail, status_code=422)
+
     # Space-wide block overlap — a block growing can collide with a
     # cousin under a different parent, not just a same-level sibling.
     # Descendant blocks are excluded because old ⊂ new guarantees they
-    # stay inside (belt-and-braces check below confirms).
+    # stay inside (belt-and-braces check below confirms); ancestors
+    # because they contain the block, and the parent check above has
+    # already held the new CIDR inside the parent.
     block_overlap = await _overlap_conflicts_space_blocks(
         db,
         block.space_id,
@@ -1449,9 +1482,6 @@ async def commit_block_resize(
             "New CIDR overlaps an existing subnet: " + "; ".join(c.detail for c in subnet_overlap),
             status_code=409,
         )
-    parent_conflicts = await _parent_containment_conflicts_block(db, block, new_net)
-    if parent_conflicts:
-        raise ResizeError(parent_conflicts[0].detail, status_code=422)
 
     # Belt-and-braces: every descendant must still fit.
     descendants = await db.execute(

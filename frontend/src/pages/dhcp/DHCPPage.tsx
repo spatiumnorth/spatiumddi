@@ -166,10 +166,11 @@ function GroupSidebar({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
   });
-  const { data: ungrouped = [] } = useQuery({
+  const { data: serversData, error: serversError } = useQuery({
     queryKey: ["dhcp-servers", "all"],
     queryFn: () => dhcpApi.listServers(),
   });
+  const ungrouped = serversData ?? [];
 
   function toggle(id: string) {
     setExpanded((prev) => {
@@ -285,18 +286,29 @@ function GroupSidebar({
                   <Wifi className="h-3.5 w-3.5 flex-shrink-0" />
                   <span className="text-sm font-medium truncate">{g.name}</span>
                   <span className="ml-auto text-xs text-muted-foreground">
-                    {serversInGroup.length}
+                    {/* A refused, failed or unanswered read has no count (#3426). */}
+                    {serversData !== undefined ? serversInGroup.length : null}
                   </span>
                 </button>
               </div>
 
               {isExpanded && (
                 <div className="ml-6 mb-1">
-                  {serversInGroup.length === 0 && (
-                    <p className="py-1 text-xs text-muted-foreground/70">
-                      No servers in this group.
+                  {/* A refused or failed read says so, and one not answered
+                      yet says nothing: neither is "No servers in this
+                      group." (#3426). */}
+                  {serversInGroup.length === 0 && serversError != null && (
+                    <p className="py-1 text-xs">
+                      <ListReadError error={serversError} what="DHCP servers" />
                     </p>
                   )}
+                  {serversInGroup.length === 0 &&
+                    serversData !== undefined &&
+                    serversError == null && (
+                      <p className="py-1 text-xs text-muted-foreground/70">
+                        No servers in this group.
+                      </p>
+                    )}
                   {serversInGroup.map((s) => {
                     const active =
                       selection?.type === "server" &&
@@ -2461,8 +2473,16 @@ export function OptionTemplatesTab({ groupId }: { groupId: string }) {
           title="Delete Option Template"
           description={`Delete template "${del.name}"? Scopes that already had it applied keep their options.`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
@@ -3693,6 +3713,32 @@ export function DHCPPage() {
     if (selection?.type !== "server") return null;
     return freshServer ?? selection.server;
   }, [selection, freshServer]);
+  // #3369 — the selection holds the group as it was when clicked; draw the
+  // panel from the refreshed list so a saved edit shows at once. On a
+  // server's page the group is the one the server is in NOW, so moving it
+  // with Edit DHCP Server moves the page's "Group:" line with it.
+  const liveGroup = useMemo(() => {
+    if (!selection) return null;
+    if (selection.type === "server" && effectiveServer) {
+      const gid = effectiveServer.server_group_id;
+      if (!gid) return null;
+      return (
+        allGroups?.find((g) => g.id === gid) ??
+        (selection.group?.id === gid ? selection.group : null)
+      );
+    }
+    if (!selection.group) return null;
+    return (
+      allGroups?.find((g) => g.id === selection.group!.id) ?? selection.group
+    );
+  }, [selection, allGroups, effectiveServer]);
+  // The read-only server inspector opened from a group's server list is a
+  // click-time snapshot too: its Pause / Resume refreshes the server lists,
+  // so draw it from the refreshed list or the button never flips.
+  const liveModalServer = useMemo(() => {
+    if (!modalServer) return null;
+    return allServers?.find((s) => s.id === modalServer.id) ?? modalServer;
+  }, [modalServer, allServers]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -3715,9 +3761,9 @@ export function DHCPPage() {
         )}
         {selection?.type === "group" && (
           <GroupDetailView
-            group={selection.group}
-            onEdit={() => setEditGroup(selection.group)}
-            onDelete={() => setDelGroup(selection.group)}
+            group={liveGroup ?? selection.group}
+            onEdit={() => setEditGroup(liveGroup ?? selection.group)}
+            onDelete={() => setDelGroup(liveGroup ?? selection.group)}
             onAddServer={() => setAddServerFor(selection.group.id)}
             // Issue #181: open the read-only modal instead of
             // navigating to the full standalone server view. Mirrors
@@ -3730,7 +3776,7 @@ export function DHCPPage() {
         {selection?.type === "server" && effectiveServer && (
           <ServerDetailView
             server={effectiveServer}
-            group={selection.group}
+            group={liveGroup}
             onEdit={() => setEditServer(effectiveServer)}
             onDelete={() => setDelServer(effectiveServer)}
             onSelectGroup={(g) => setSelection({ type: "group", group: g })}
@@ -3790,9 +3836,9 @@ export function DHCPPage() {
           }
         />
       )}
-      {modalServer && (
+      {liveModalServer && (
         <ServerDetailModal
-          server={modalServer}
+          server={liveModalServer}
           onClose={() => setModalServer(null)}
         />
       )}

@@ -119,6 +119,8 @@ def test_gates_match_the_rest_endpoints() -> None:
         "update_snmp_settings",
         "update_ntp_settings",
         "update_syslog_settings",
+        # settings/router.py: either maintenance field needs a superadmin (#3415)
+        "set_maintenance_mode",
         "commit_dns_import",
         "commit_dhcp_import",
         "commit_netbox_import",

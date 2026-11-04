@@ -38,6 +38,7 @@ from app.services.dns.record_ops import (
     resolve_primary_server,
 )
 from app.services.dns.view_collisions import RenderGuard
+from app.services.ipam.zone_binding import prune_zone_ids
 
 from . import cname_check
 from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
@@ -481,6 +482,7 @@ async def _delete_zone(db: AsyncSession, zone: DNSZone) -> int:
     ).scalar_one() or 0
     await db.delete(zone)
     await db.flush()
+    await prune_zone_ids(db, [zone.id])
     return int(n)
 
 
