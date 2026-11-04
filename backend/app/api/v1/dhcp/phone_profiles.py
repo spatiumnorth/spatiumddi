@@ -158,8 +158,15 @@ def _to_option_response(rows: list[dict]) -> list[PhoneOptionResponse]:
 
 
 async def _scope_ids_for(db: DB, profile_id: uuid.UUID) -> list[uuid.UUID]:
+    """The profile's live scopes (#3448). Selected through ``DHCPScope``, so
+    the soft-delete filter leaves out a scope in the Trash: the profile reads
+    what it can be saved with (``_validate_scope_ids`` cannot see that scope
+    either), as the bundle renders it. The attachment row itself stays, so a
+    restored scope comes back attached."""
     res = await db.execute(
-        select(DHCPPhoneProfileScope.scope_id).where(DHCPPhoneProfileScope.profile_id == profile_id)
+        select(DHCPScope.id)
+        .join(DHCPPhoneProfileScope, DHCPPhoneProfileScope.scope_id == DHCPScope.id)
+        .where(DHCPPhoneProfileScope.profile_id == profile_id)
     )
     return [row[0] for row in res.all()]
 
@@ -464,8 +471,9 @@ async def replace_scope_attachments(
     """Replace the profile's scope attachments with the provided list.
 
     Atomic — passes through validation that every scope id belongs to
-    the same group as the profile, then deletes existing rows and
-    inserts the new set in one transaction.
+    the same group as the profile, then detaches the live scopes left out
+    and attaches the new ones in one transaction. A scope in the Trash is
+    neither listed nor accepted, so its attachment is left as it is (#3448).
     """
     prof = await db.get(DHCPPhoneProfile, profile_id)
     if prof is None:
@@ -475,7 +483,8 @@ async def replace_scope_attachments(
 
     # #3367 — an untouched Save re-sends the same list. Nothing to rewrite,
     # audit or wake agents for.
-    if set(await _scope_ids_for(db, profile_id)) == set(body.scope_ids):
+    current = set(await _scope_ids_for(db, profile_id))
+    if current == set(body.scope_ids):
         return await _to_response(db, prof)
     await refuse_if_phone_class_stops_rendering(
         db,
@@ -484,11 +493,19 @@ async def replace_scope_attachments(
         scope_ids=list(body.scope_ids),
     )
 
-    await db.execute(
-        delete(DHCPPhoneProfileScope).where(DHCPPhoneProfileScope.profile_id == profile_id)
-    )
+    # #3448: only the live attachments are replaced. A Trash scope's row
+    # stays, so a save made meanwhile does not detach it from its restore.
+    dropped = current - set(body.scope_ids)
+    if dropped:
+        await db.execute(
+            delete(DHCPPhoneProfileScope).where(
+                DHCPPhoneProfileScope.profile_id == profile_id,
+                DHCPPhoneProfileScope.scope_id.in_(list(dropped)),
+            )
+        )
     for sid in dict.fromkeys(body.scope_ids):
-        db.add(DHCPPhoneProfileScope(profile_id=profile_id, scope_id=sid))
+        if sid not in current:
+            db.add(DHCPPhoneProfileScope(profile_id=profile_id, scope_id=sid))
 
     write_audit(
         db,
