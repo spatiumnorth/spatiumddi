@@ -2,6 +2,7 @@ import hmac
 import re
 import time
 
+import structlog
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -9,6 +10,8 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.config import settings
+
+logger = structlog.get_logger(__name__)
 
 # API metrics
 REQUEST_COUNT = Counter(
@@ -226,4 +229,23 @@ async def metrics_endpoint(request: Request) -> Response:
             headers={"WWW-Authenticate": 'Bearer realm="metrics"'},
         )
     data = await run_in_threadpool(generate_latest)
+    # #2146 — business series carry subnet CIDRs and space / group / scope
+    # names, so they are served only to an authenticated scrape: with
+    # PROMETHEUS_METRICS_REQUIRE_AUTH=false they are left out entirely.
+    if settings.prometheus_metrics_require_auth and settings.prometheus_business_metrics_enabled:
+        data += await _business_block()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+
+async def _business_block() -> bytes:
+    """The IPAM / DHCP business series, or nothing if they cannot be computed
+    (a database blip must not fail the scrape of the process metrics)."""
+    from app.db import AsyncSessionLocal
+    from app.services.business_metrics import business_metrics_text
+
+    try:
+        async with AsyncSessionLocal() as db:
+            return (await business_metrics_text(db)).encode()
+    except Exception:  # noqa: BLE001 — degrade to the process metrics only
+        logger.warning("business_metrics_failed", exc_info=True)
+        return b""

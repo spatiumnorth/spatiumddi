@@ -712,6 +712,36 @@ or API port is reachable.
 > shipped, agent-driven dashboard metrics path, see
 > **Built-in Dashboard Time-Series** below — that one is real.
 
+### IPAM / DHCP business metrics (implemented, #2146)
+
+Computed at scrape time from the collectors the InfluxDB push (#889) uses
+(`services/influxdb/collect.py`), so both exporters report the same
+numbers: utilization is the stored `allocated_ips` / `total_ips` counters,
+and the lease gauge counts **distinct addresses**, so a Kea HA pair's
+mirrored lease is counted once. The block is cached for 15 s and costs
+a small constant number of queries per scrape (no per-subnet queries).
+
+```
+spatiumddi_subnet_allocated_ips{subnet_id, subnet, space}
+spatiumddi_subnet_total_ips{subnet_id, subnet, space}
+spatiumddi_subnet_utilization_percent{subnet_id, subnet, space}
+spatiumddi_dhcp_scope_active_leases{scope_id, scope, group, subnet}
+spatiumddi_dhcp_scope_active{scope_id, scope, group, subnet}   # 1 enabled / 0 disabled
+spatiumddi_business_metrics_truncated                            # 1 if a family hit the cap
+```
+
+**Cardinality:** one series per live subnet in each of the first three
+families and one per live DHCP scope in the next two, capped at 10,000
+series per family. There are never per-IP, per-lease or per-client labels.
+
+**Exposure:** the labels carry subnet CIDRs and space / group / scope
+names, so these series are served **only on an authenticated scrape**. With
+`PROMETHEUS_METRICS_REQUIRE_AUTH=false` they are omitted entirely. Set
+`PROMETHEUS_BUSINESS_METRICS_ENABLED=false` to drop them on an
+authenticated endpoint too. The DNS / DHCP traffic deltas the InfluxDB
+export carries are not republished here: they are time-bucketed deltas
+with a retention window, not monotonic counters.
+
 ### API Service Metrics (implemented)
 
 ```

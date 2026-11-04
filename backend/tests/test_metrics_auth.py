@@ -36,6 +36,15 @@ def _app() -> FastAPI:
     return app
 
 
+@pytest.fixture(autouse=True)
+def _no_business_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These cases are about who may scrape. The business series (#2146) open
+    a pooled DB session from the app's global engine, which a TestClient's
+    short-lived event loop would leave bound to a closed loop for the next
+    test; they have their own tests in test_business_metrics.py."""
+    monkeypatch.setattr(settings, "prometheus_business_metrics_enabled", False)
+
+
 @pytest.fixture
 def require_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "prometheus_metrics_require_auth", True)
