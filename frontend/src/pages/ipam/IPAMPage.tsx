@@ -14179,6 +14179,15 @@ export function BlockDetailView({
     setBlock(initialBlock);
   }, [initialBlock.id]);
 
+  // #3369 — the page's selection is a click-time snapshot; once the blocks
+  // list is read again after a Save (the tree's Edit…, another panel), show
+  // the stored row. react-query keeps an unchanged row's reference, so this
+  // runs only when the row actually changed.
+  const listedBlock = allBlocks.find((b) => b.id === initialBlock.id);
+  useEffect(() => {
+    if (listedBlock) setBlock(listedBlock);
+  }, [listedBlock]);
+
   const { data: subnetCfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "subnet"],
     queryFn: () => customFieldsApi.list("subnet"),
@@ -14515,6 +14524,10 @@ export function BlockDetailView({
           onCommitted={(result) => {
             setBlock(result.block);
             setShowMoveBlock(false);
+            // The block left this space: the page's selection (and with it
+            // the active space, the tree highlight and the breadcrumb) is
+            // the click-time copy, so hand it the moved block (#3369).
+            onSelectBlock(result.block);
           }}
         />
       )}
@@ -17791,6 +17804,17 @@ export function IPAMPage() {
       setSelectedSubnet(fresh);
     }
   }, [detailSubnets, selectedSubnet]);
+
+  // The block selection follows the refetched list as well (#3369): the
+  // breadcrumb's ancestors are computed from it, so a block moved or edited
+  // from the tree kept its old parent chain until clicked again.
+  useEffect(() => {
+    if (!selectedBlock || !detailBlocks) return;
+    const fresh = detailBlocks.find((b) => b.id === selectedBlock.id);
+    if (fresh && JSON.stringify(fresh) !== JSON.stringify(selectedBlock)) {
+      setSelectedBlock(fresh);
+    }
+  }, [detailBlocks, selectedBlock]);
 
   // The space panel's snapshot follows the refetched list too (#3075), as the
   // subnet's does (#509): an Edit IP Space Save refreshed the list and left
