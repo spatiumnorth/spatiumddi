@@ -3740,6 +3740,9 @@ async def apply_record(
     now = datetime.now(UTC)
     target_serial = bump_zone_serial(zone)
     zone.last_pushed_at = now
+    # #3389: the zone row before the audit-chain lock (see
+    # ``_replace_update_acl_rows``).
+    await db.flush()
 
     db.add(
         AuditLog(
@@ -6778,6 +6781,11 @@ async def update_zone(
         await enqueue_dnssec_op(db, zone, "dnssec_sign")
     elif dnssec_flip == "dnssec_unsign":
         await _flip_dnssec_off(db, zone)
+    # #3389: write the zone row before the audit row, so this request takes
+    # the zone row before the audit-chain lock, as every record writer does.
+    # Left for the commit, this UPDATE ran after the lock and deadlocked with
+    # a record writer holding the row (see ``_replace_update_acl_rows``).
+    await db.flush()
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -7249,6 +7257,13 @@ async def _replace_update_acl_rows(
         )
     if body.dynamic_update_enabled is not None:
         zone.dynamic_update_enabled = body.dynamic_update_enabled
+        # #3389: write the zone row now, before the caller adds its audit row.
+        # The flush that carries an audit row takes the audit-chain lock first
+        # (``compute_audit_hashes`` runs in ``before_flush``), so a flag change
+        # left for the commit waited for the zone row while holding that lock,
+        # and a record writer, which holds the row from its serial-bump flush
+        # on, waited for the lock at its own commit: Postgres aborted one (500).
+        await db.flush()
     return driver_names, warnings
 
 
