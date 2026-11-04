@@ -760,3 +760,35 @@ async def find_influxdb_targets(
         ],
         "count": len(rows),
     }
+
+
+# ── get_platform_summary (issue #2143) ────────────────────────────────
+
+
+class GetPlatformSummaryArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="get_platform_summary",
+    honours_token_binding=True,
+    permission="authenticated",
+    description=(
+        "One snapshot of how the install is doing right now: platform health "
+        "and version, IPAM counts (plus subnets tagged ha:track), DNS and DHCP "
+        "server-group health, DNS query / NXDOMAIN / SERVFAIL rates, blocked "
+        "RPZ hits, blocklist on/off state, the fullest DHCP pools, open alerts "
+        "by severity and new-device counts. Same data as GET /api/v1/summary. "
+        "Sections the caller may not read come back null with the reason in "
+        "'withheld'. Use for 'how is everything?' before drilling into a "
+        "specific find_* tool."
+    ),
+    args_model=GetPlatformSummaryArgs,
+    category="ops",
+)
+async def get_platform_summary(
+    db: AsyncSession, user: User, args: GetPlatformSummaryArgs
+) -> dict[str, Any]:
+    from app.services.platform_summary import build_summary  # noqa: PLC0415
+
+    return (await build_summary(db, user)).model_dump(mode="json")
