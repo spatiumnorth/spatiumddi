@@ -214,6 +214,7 @@ function ProfileCard({
             onClick={onEdit}
             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Edit"
+            aria-label="Edit"
             {...permissionGate(
               perms.can("write", "dhcp_scope"),
               NEEDS_PXE_WRITE,
@@ -225,6 +226,7 @@ function ProfileCard({
             onClick={onDelete}
             className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
             title="Delete"
+            aria-label="Delete"
             {...permissionGate(
               perms.can("delete", "dhcp_scope"),
               NEEDS_PXE_DELETE,

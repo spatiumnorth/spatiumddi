@@ -25,7 +25,9 @@ CLAUDE.md non-negotiables that apply here:
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
@@ -283,6 +285,30 @@ def hidden_target_preview(
         detail=target_not_found_detail(resource_type, resource_id),
         forbidden_detail=str(refusal),
     )
+
+
+# Whose permissions a preview judges. A preview normally runs under the user
+# who will apply (the Copilot proposal's owner, a portal request's approver at
+# its re-preview), so a per-resource refusal the apply would raise belongs in
+# the preview. At portal SUBMIT it runs under the requester, who by definition
+# lacks the permission (#696): the approver must hold it, and the approve
+# spine re-previews under the approver. ``submit_request`` sets this so such a
+# check is skipped there and only there (#3425).
+_PREVIEW_FOR_REQUESTER: ContextVar[bool] = ContextVar("preview_for_requester", default=False)
+
+
+@contextmanager
+def previewing_for_requester() -> Iterator[None]:
+    """Run a preview for a portal requester (see ``_PREVIEW_FOR_REQUESTER``)."""
+    token = _PREVIEW_FOR_REQUESTER.set(True)
+    try:
+        yield
+    finally:
+        _PREVIEW_FOR_REQUESTER.reset(token)
+
+
+def preview_is_for_requester() -> bool:
+    return _PREVIEW_FOR_REQUESTER.get()
 
 
 def resource_reference_fields(args_model: type[BaseModel]) -> list[tuple[str, str]]:
@@ -1117,7 +1143,23 @@ async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, 
     return await wol.resolve_wake_params(db, aid)
 
 
+def _wake_host_refusal(user: User) -> OperationPermissionError | None:
+    """The REST wake route's second gate: the IPAM router needs type-level
+    ``write`` on ``subnet`` for ``POST /addresses/{id}/wake`` on top of the
+    route's own ``read`` on ``use_network_tools`` (#3461). ``None`` when held."""
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "subnet"):
+        return None
+    return OperationPermissionError("write", "subnet")
+
+
 async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
+    # wake_host is in neither the request-portal catalog nor the risky-op
+    # set, so the previewing user is always the one who applies.
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
     try:
         ip, mac, broadcast = await _load_wake_target(db, args)
     except ValueError as exc:
@@ -1138,6 +1180,9 @@ async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> 
     from app.services import wol  # noqa: PLC0415
 
     enforce_operation_permission(user, _OPERATIONS["wake_host"])
+    refusal = _wake_host_refusal(user)
+    if refusal is not None:
+        raise refusal
     ip, mac, broadcast = await _load_wake_target(db, args)
     # AI proposals always send from the control-plane (server) vantage.
     try:
@@ -1181,7 +1226,8 @@ register(
         preview=_preview_wake_host,
         apply=_apply_wake_host,
         category="network",
-        # ``read`` matches the rest of the network-tools surface.
+        # ``read`` matches the rest of the network-tools surface; the REST
+        # route also needs write on ``subnet`` (#3461), checked beside it.
         required_permission=("read", "use_network_tools"),
     )
 )
@@ -2121,6 +2167,17 @@ def _carve_candidate(
     return chosen
 
 
+def _target_block_refusal(user: User, block: IPBlock) -> OperationPermissionError | None:
+    """The REST allocate's target-block gate (#3425) as an operation refusal,
+    or ``None`` when ``user`` may write ``block``."""
+    from app.api.v1.ipam.router import target_block_write_refusal  # noqa: PLC0415 — cycle
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "ip_block", block.id):
+        return None
+    return OperationPermissionError("write", "ip_block", target_block_write_refusal(user, block))
+
+
 async def _preview_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> PreviewResult:
@@ -2137,6 +2194,14 @@ async def _preview_allocate_subnet(
         return hidden_target_preview(
             "ip_block", args.block_id, OperationPermissionError("write", "subnet")
         )
+    # The REST allocate also needs write on THIS block (#3425), so a caller who
+    # will apply without it is told here, not by a failed apply. Not judged for
+    # a portal requester: the approver must hold it, and is re-previewed.
+    refusal = _target_block_refusal(user, block)
+    if refusal is not None and not preview_is_for_requester():
+        if not _can_read_target(user, "ip_block", block.id):
+            return hidden_target_preview("ip_block", args.block_id, refusal)
+        return PreviewResult(ok=False, detail=str(refusal), forbidden_detail=str(refusal))
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
     family_max = 32 if block_net.version == 4 else 128
@@ -2259,6 +2324,15 @@ async def _apply_allocate_subnet(
     # SECURITY (#400, C2): RBAC backstop — matches the IPAM router's
     # require_any_resource_permission("subnet", ...) write gate.
     enforce_operation_permission(user, _OPERATIONS["allocate_subnet"])
+    # The target-block gate (#3425) as an OperationPermissionError, not the
+    # REST handler's 403: it is about THIS applier, so an approve leaves the
+    # portal request pending for one who may write the block instead of
+    # failing it.
+    block = await db.get(IPBlock, UUID(args.block_id))
+    if block is not None:
+        refusal = _target_block_refusal(user, block)
+        if refusal is not None:
+            raise refusal
 
     alloc = SubnetAllocate(
         prefix_len=args.prefix_len,

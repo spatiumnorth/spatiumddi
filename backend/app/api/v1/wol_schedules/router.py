@@ -33,7 +33,8 @@ Target resolution reuses the one shared resolver
 surfaces (REST preview + beat runner + MCP), non-negotiables #1 / #13. It
 enforces the schedule owner's readable-subnet scope at resolve time
 (non-negotiable #3), so a schedule can never wake hosts in subnets its owner
-has lost read access to.
+has lost read access to, nor any host once the owner lacks the type-level
+``write`` on ``subnet`` the manual wake route needs (#3461).
 """
 
 from __future__ import annotations

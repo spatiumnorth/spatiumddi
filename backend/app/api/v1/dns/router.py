@@ -275,6 +275,7 @@ from app.services.dns_io import (
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
+from app.services.ipam.zone_binding import prune_group_ids
 from app.services.soft_delete import (
     SoftDeleteBatch,
     add_to_batch,
@@ -2379,6 +2380,12 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             result="success",
         )
     )
+    # IPAM names DNS groups in ``dns_group_ids``, a JSONB id list with no
+    # foreign key, so nothing removes the id when the group goes: every space,
+    # block and subnet that named it kept counting it as an inherited group
+    # and effective-dns kept returning it (#3433). Pruned here, Trash rows
+    # included, in any spelling the readers resolve.
+    await prune_group_ids(db, [group.id])
     collect_wake(dns_group_channel(group.id))
     await db.delete(group)
     await db.commit()

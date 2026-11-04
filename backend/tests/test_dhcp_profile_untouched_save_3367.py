@@ -190,15 +190,32 @@ async def test_pxe_identical_rules_are_kept_one_for_one(
     h = await _headers(db_session)
     grp, _srv, _scope = await _make_group_server_scope(db_session)
     await db_session.commit()
+    # Two identical rules are refused on create since #3388; a profile saved
+    # before that may still hold them, so they are stored directly here.
     created = await client.post(
         f"/api/v1/dhcp/server-groups/{grp.id}/pxe-profiles",
         headers=h,
-        json={"name": "dup", "next_server": "10.0.0.5", "matches": [_m(10, 7, "a.efi")] * 2},
+        json={"name": "dup", "next_server": "10.0.0.5", "matches": [_m(10, 7, "a.efi")]},
     )
     assert created.status_code == 201, created.text
     prof = created.json()
+    db_session.add(
+        DHCPPXEArchMatch(
+            profile_id=uuid.UUID(prof["id"]),
+            priority=10,
+            match_kind="first_stage",
+            vendor_class_match="PXEClient",
+            arch_codes=[7],
+            boot_filename="a.efi",
+        )
+    )
+    await db_session.commit()
+    # The API shares this session; a ``matches`` collection it already loaded
+    # would otherwise be served stale.
+    db_session.expire_all()
     url = f"/api/v1/dhcp/pxe-profiles/{prof['id']}"
-    ids = sorted(m["id"] for m in prof["matches"])
+    ids = sorted(m["id"] for m in (await client.get(url, headers=h)).json()["matches"])
+    assert len(ids) == 2
 
     resp = await client.put(url, headers=h, json={"matches": [_m(10, 7, "a.efi")] * 2})
     assert sorted(m["id"] for m in resp.json()["matches"]) == ids

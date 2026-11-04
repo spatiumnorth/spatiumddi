@@ -99,8 +99,22 @@ function wrap(ui: React.ReactNode, perms: MyPermissions) {
   );
 }
 
+/** A refused icon-only button is named by its action (aria-label, #3395) and
+ *  carries the refusal reason as its tooltip: find it by either. */
+function gated(name: string | RegExp): HTMLElement {
+  const byRole = screen.queryAllByRole("button", { name });
+  if (byRole.length === 1) return byRole[0];
+  // Only the icon buttons carry an aria-label; a text button's title is
+  // the same reason and must not make the lookup ambiguous.
+  const byTitle = screen
+    .queryAllByTitle(name)
+    .filter((el) => el.hasAttribute("aria-label"));
+  if (byTitle.length !== 1) return screen.getByTitle(name);
+  return byTitle[0];
+}
+
 function button(name: string | RegExp): HTMLButtonElement {
-  return screen.getByRole("button", { name }) as HTMLButtonElement;
+  return gated(name) as HTMLButtonElement;
 }
 
 afterEach(() => {

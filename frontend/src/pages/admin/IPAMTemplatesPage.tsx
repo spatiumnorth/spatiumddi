@@ -830,6 +830,7 @@ export function IPAMTemplatesPage() {
                       disabled={t.applied_count === 0}
                       className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
                       title="Reapply across all instances"
+                      aria-label="Reapply across all instances"
                       {...writeGate}
                     >
                       <RefreshCw className="h-3 w-3" />
