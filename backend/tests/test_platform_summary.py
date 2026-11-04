@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.services.ai.tools  # noqa: F401 — registers the tools
@@ -213,8 +213,6 @@ async def _seed_estate(db: AsyncSession, *, groups: int = 1, tag: str = "") -> N
 
 
 async def _subnet_id(db: AsyncSession, tag: str = "") -> uuid.UUID:
-    from sqlalchemy import select
-
     return (await db.execute(select(Subnet.id).where(Subnet.name == f"tracked{tag}"))).scalar_one()
 
 
@@ -333,6 +331,43 @@ async def test_dhcp_without_pool_read_hides_the_pools_but_not_the_servers(
     body = (await _get(client, h)).json()
     assert body["dhcp"] is not None and body["dhcp"]["fullest_pools"] is None
     assert body["withheld"]["dhcp.pools"] == "permission"
+
+
+@pytest.mark.asyncio
+async def test_a_grant_scoped_to_one_group_reads_no_estate_wide_dns(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A role scoped to one DNS group is not a type-wide grant: the snapshot
+    aggregates every group, so the section is withheld, not narrowed."""
+    await _seed_estate(db_session, groups=2)
+    u, h = await _user(db_session, role="DNS Editor")
+    gid = (await db_session.execute(select(DNSServerGroup.id).limit(1))).scalar_one()
+    u.groups[0].roles[0].permissions = [
+        {"action": "read", "resource_type": "dns_group", "resource_id": str(gid)}
+    ]
+    await db_session.commit()
+    body = (await _get(client, h)).json()
+    assert body["dns"] is None and body["withheld"]["dns"] == "permission"
+
+
+@pytest.mark.asyncio
+async def test_trashed_subnets_and_spaces_are_not_counted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The counts agree with the list routes, which hide the Trash."""
+    await _seed_estate(db_session)
+    _, h = await _user(db_session, superadmin=True)
+    before = (await _get(client, h)).json()["ipam"]
+    assert (before["spaces"], before["subnets"]) == (1, 2)
+    await db_session.execute(
+        update(Subnet).where(Subnet.name == "tracked").values(deleted_at=datetime.now(UTC))
+    )
+    await db_session.commit()
+    after = (await _get(client, h)).json()["ipam"]
+    assert after["subnets"] == 1 and after["tracked_subnets"] == []
+    await db_session.execute(update(IPSpace).values(deleted_at=datetime.now(UTC)))
+    await db_session.commit()
+    assert (await _get(client, h)).json()["ipam"]["spaces"] == 0
 
 
 @pytest.mark.asyncio

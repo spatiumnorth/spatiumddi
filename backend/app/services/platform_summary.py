@@ -306,8 +306,21 @@ async def _platform(db: AsyncSession) -> PlatformSection:
 
 
 async def _ipam(db: AsyncSession) -> IPAMSection:
-    spaces = select(func.count()).select_from(IPSpace).scalar_subquery()
-    subnets = select(func.count()).select_from(Subnet).scalar_subquery()
+    # The global soft-delete filter (app.db) cannot see a model that appears
+    # only inside a scalar subquery, so these two counts name ``deleted_at``
+    # themselves; without it a subnet in the Trash still counts.
+    spaces = (
+        select(func.count())
+        .select_from(IPSpace)
+        .where(IPSpace.deleted_at.is_(None))
+        .scalar_subquery()
+    )
+    subnets = (
+        select(func.count())
+        .select_from(Subnet)
+        .where(Subnet.deleted_at.is_(None))
+        .scalar_subquery()
+    )
     n_spaces, n_subnets = (await db.execute(select(spaces, subnets))).one()
     tracked = (
         await db.execute(

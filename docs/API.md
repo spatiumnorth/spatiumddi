@@ -766,7 +766,7 @@ queries however large the estate is. The result is cached in-process for about
 **Each section is gated on the permission its own list route needs**, and one the
 caller may not read is `null` with the reason in `withheld`; the call itself is
 never refused for it. The gates: `ipam` needs read on `ip_space` and `subnet`;
-`new_devices` read on `ip_address` (and the Network-device watch module); `dns`
+`new_devices` read on `ip_address` (and the `security.new_device_watch` module); `dns`
 read on `dns_group` (and `core.dns`), with `dns.blocklists` needing
 `dns_blocklist` and `dns.rpz` needing `server` plus the DNS-threat module;
 `dhcp` read on `dhcp_server` (and `core.dhcp`), with `dhcp.pools` needing
