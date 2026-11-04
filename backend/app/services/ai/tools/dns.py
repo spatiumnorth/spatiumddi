@@ -1624,7 +1624,7 @@ async def find_zone_update_acls(
     ),
     args_model=SetZoneUpdateAclArgs,
     category="dns",
-    writes=True,
+    writes=False,  # The propose tool itself is read-only; apply is the write.
     default_enabled=False,
     module="dns.dynamic_update_acl",
 )
