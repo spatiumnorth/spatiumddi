@@ -1068,3 +1068,64 @@ def effective_nsec3_iterations(policy_name: str, value: int | None, log: Any = N
             )
         return BIND_NSEC3_ITERATIONS
     return v
+
+
+#: What BIND 9.20 takes as a ``dnssec-policy`` key ``lifetime``, in days, for a
+#: policy as the agents render it (``keys`` only, so BIND's default timings),
+#: each bound verified against ``named-checkconf`` 9.20.30 (#3411). 0 renders
+#: as ``unlimited``. A negative count is not a duration ("expected ISO 8601
+#: duration or TTL value"), past 49710 days it no longer fits BIND's 32-bit
+#: seconds ("duration or TTL out of range"), and a KSK under 2 days or a ZSK
+#: under 11 is "shorter than the time it takes to do a rollover". Like an NSEC3
+#: iteration count, any of them rejects the WHOLE ``named.conf``, so once a
+#: zone is signed with the policy no later change on the group applies.
+BIND_KEY_LIFETIME_MAX_DAYS = 49710
+BIND_KEY_LIFETIME_MIN_DAYS = {"ksk": 2, "zsk": 11}
+
+
+def validate_key_lifetime_days(value: int, *, key: str) -> int:
+    """Raise ``ValueError`` (a 422 inside a pydantic validator) unless BIND
+    takes ``value`` as the lifetime of ``key`` (``ksk`` or ``zsk``)."""
+    low = BIND_KEY_LIFETIME_MIN_DAYS[key]
+    if value == 0 or low <= value <= BIND_KEY_LIFETIME_MAX_DAYS:
+        return value
+    if value < 0:
+        why = "a negative lifetime"
+    elif value > BIND_KEY_LIFETIME_MAX_DAYS:
+        why = f"a lifetime past {BIND_KEY_LIFETIME_MAX_DAYS} days"
+    else:
+        why = f"a {key.upper()} lifetime shorter than the time a rollover takes"
+    raise ValueError(
+        f"{key}_lifetime_days must be 0 (unlimited) or {low} to "
+        f"{BIND_KEY_LIFETIME_MAX_DAYS} days: BIND 9.20 refuses {why}, and a "
+        "policy it refuses stops the whole server group's config from applying"
+    )
+
+
+def effective_key_lifetime_days(
+    policy_name: str, key: str, value: int | None, log: Any = None
+) -> int:
+    """What a stored lifetime renders as. Rows saved before the API refused a
+    lifetime BIND cannot take still exist (#3411); rendering one as stored
+    would make BIND reject the whole config, so it renders as the nearest one
+    BIND takes, with a warning: a negative lifetime as 0 (unlimited), a short
+    one at the key's floor, a long one at the ceiling."""
+    v = int(value or 0)
+    low = BIND_KEY_LIFETIME_MIN_DAYS[key]
+    if v < 0:
+        rendered = 0
+    elif 0 < v < low:
+        rendered = low
+    elif v > BIND_KEY_LIFETIME_MAX_DAYS:
+        rendered = BIND_KEY_LIFETIME_MAX_DAYS
+    else:
+        return v
+    if log is not None:
+        log.warning(
+            "dnssec_policy_key_lifetime_clamped",
+            policy=policy_name,
+            key=key,
+            stored=v,
+            rendered=rendered,
+        )
+    return rendered
