@@ -138,6 +138,13 @@ export function TagFilterChips({
           setFocused(false),
         );
       }}
+      // Focus leaving the control (Tab / Shift+Tab past it) closes the list,
+      // or the next Esc, now outside it, closes the dialog with the list
+      // still showing (#3486). A move onto a suggestion keeps it open.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setFocused(false);
+      }}
     >
       <Tag className="h-3 w-3 text-muted-foreground" />
       {value.map((chip, idx) => (
@@ -195,7 +202,12 @@ export function TagFilterChips({
         className="min-w-[8rem] flex-1 border-0 bg-transparent px-1 py-0.5 outline-none placeholder:text-muted-foreground/70"
       />
       {focused && dropdownItems.length > 0 && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-64 overflow-auto rounded-md border bg-popover py-1 shadow-md">
+        <div
+          className="absolute left-0 right-0 top-full z-20 mt-1 max-h-64 overflow-auto rounded-md border bg-popover py-1 shadow-md"
+          // A press in the list (its padding included) keeps focus in the
+          // input, so the blur above cannot close it mid-click.
+          onMouseDown={(e) => e.preventDefault()}
+        >
           {dropdownItems.map((item) => (
             <button
               key={item}
