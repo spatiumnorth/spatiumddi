@@ -7,6 +7,7 @@ import {
   type CustomerListResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { missingCustomerLabel, useReadsEveryCustomer } from "./missingCustomer";
 
 interface PickerProps {
   value: string | null;
@@ -29,7 +30,8 @@ interface PickerProps {
  * placeholder. Nothing is shown until the list has loaded: a list that failed
  * says nothing about the customer. When the list is truncated (more customers
  * than one page) the id may simply be on a later page, so it is named as the
- * current customer, not as one in the Trash.
+ * current customer, not as one in the Trash; so is one missing from a list
+ * narrowed to the caller's per-customer grants (#3506).
  */
 export function MissingCustomerOption({
   customerId,
@@ -38,14 +40,9 @@ export function MissingCustomerOption({
   customerId: string | null | undefined;
   list: { isSuccess: boolean; data?: CustomerListResponse };
 }) {
-  if (!customerId || !list.isSuccess || !list.data) return null;
-  const { items, total } = list.data;
-  if (items.some((c) => c.id === customerId)) return null;
-  return (
-    <option value={customerId}>
-      {total > items.length ? "(current customer)" : "(customer in Trash)"}
-    </option>
-  );
+  const readsEvery = useReadsEveryCustomer();
+  const label = missingCustomerLabel(customerId, list, readsEvery);
+  return label ? <option value={customerId!}>{label}</option> : null;
 }
 
 export function CustomerPicker({
@@ -54,12 +51,12 @@ export function CustomerPicker({
   className,
   disabled,
 }: PickerProps) {
-  const { data } = useQuery({
+  const list = useQuery({
     queryKey: ["customers-picker"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
   });
-  const items = data?.items ?? [];
+  const items = list.data?.items ?? [];
   return (
     <select
       className={className}
@@ -68,6 +65,7 @@ export function CustomerPicker({
       disabled={disabled}
     >
       <option value="">— None —</option>
+      <MissingCustomerOption customerId={value} list={list} />
       {items.map((c) => (
         <option key={c.id} value={c.id}>
           {c.name}
@@ -147,7 +145,9 @@ export function ProviderPicker({
 // one page share one fetch.
 //
 // Returns null when the id is null OR when the lookup hasn't loaded
-// yet — saves a render-flash and keeps row heights stable.
+// yet — saves a render-flash and keeps row heights stable. A customer id
+// a complete list read with type-wide customer read does not hold is a
+// customer in the Trash (#3506): the chip says so rather than vanishing.
 
 const chipBaseCls =
   "inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium";
@@ -159,15 +159,36 @@ export function CustomerChip({
   customerId: string | null | undefined;
   className?: string;
 }) {
-  const { data } = useQuery({
+  const list = useQuery({
     queryKey: ["customers-picker"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
     enabled: !!customerId,
   });
+  const readsEvery = useReadsEveryCustomer();
   if (!customerId) return null;
-  const c = (data?.items ?? []).find((x) => x.id === customerId);
-  if (!c) return null;
+  const c = (list.data?.items ?? []).find((x) => x.id === customerId);
+  if (!c) {
+    // Only a complete, unnarrowed list can say Trash; a truncated one, or one
+    // narrowed to the caller's per-customer grants, shows nothing.
+    if (
+      missingCustomerLabel(customerId, list, readsEvery) !==
+      "(customer in Trash)"
+    )
+      return null;
+    return (
+      <span
+        className={cn(
+          chipBaseCls,
+          "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+          className,
+        )}
+        title="This customer is in the Trash; it is still linked here"
+      >
+        (customer in Trash)
+      </span>
+    );
+  }
   return (
     <span
       className={cn(

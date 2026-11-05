@@ -13,7 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bookmark, ChevronDown, Star, Trash2 } from "lucide-react";
 
-import { savedViewsApi, type SavedView } from "@/lib/api";
+import { formatApiError, savedViewsApi, type SavedView } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useDismissableMenu } from "@/hooks/useDismissableMenu";
@@ -82,10 +82,28 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
     onSuccess: invalidate,
   });
 
+  // The delete confirm is opened from a trash button inside the panel,
+  // and the panel closes as the dialog opens, so the button is unmounted
+  // and the dialog's own focus return has nowhere to go (the panel is not
+  // an ARIA menu, so it cannot fall back to the trigger either): focus
+  // would drop on <body> (#3484). Hand it to the Views trigger instead,
+  // whether the dialog is cancelled, closed with Esc or the delete lands.
+  // (Not role="menu" + aria-controls, which the shared fallback reads: the
+  // panel holds a text field and a Save form, which an ARIA menu may not.)
+  // ``confirmOpen`` says whether the confirm is still up: a delete still in
+  // flight when the dialog is dismissed (Esc / backdrop) must not pull focus
+  // back to the trigger when it lands, as the operator has moved on.
+  const confirmOpen = useRef(false);
+  const closeConfirm = () => {
+    confirmOpen.current = false;
+    setToDelete(null);
+    triggerRef.current?.focus();
+  };
+
   const remove = useMutation({
     mutationFn: (id: string) => savedViewsApi.remove(id),
     onSuccess: () => {
-      setToDelete(null);
+      if (confirmOpen.current) closeConfirm();
       invalidate();
     },
   });
@@ -172,6 +190,8 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
                   onClick={() => {
                     // Close first, so the confirm dialog owns Esc.
                     setOpen(false);
+                    remove.reset();
+                    confirmOpen.current = true;
                     setToDelete(v);
                   }}
                   title="Delete view"
@@ -220,13 +240,23 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
       <ConfirmModal
         open={toDelete !== null}
         title="Delete saved view"
-        message={`Delete the saved view "${toDelete?.name ?? ""}"?`}
+        message={
+          <>
+            <p>{`Delete the saved view "${toDelete?.name ?? ""}"?`}</p>
+            {remove.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(remove.error, "Couldn't delete the view.")}
+              </p>
+            )}
+          </>
+        }
         confirmLabel="Delete"
         tone="destructive"
+        loading={remove.isPending}
         onConfirm={() => {
           if (toDelete) remove.mutate(toDelete.id);
         }}
-        onClose={() => setToDelete(null)}
+        onClose={closeConfirm}
       />
     </div>
   );

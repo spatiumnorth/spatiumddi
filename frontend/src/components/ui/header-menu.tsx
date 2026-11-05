@@ -208,7 +208,15 @@ export function HeaderMenu({
                 title={it.title}
                 disabled={it.disabled}
                 onClick={() => {
-                  if (it.checked === undefined) setOpen(false);
+                  if (it.checked === undefined) {
+                    // Hand focus back to the trigger BEFORE the item runs, so
+                    // a dialog that opens later (after an async fresh read,
+                    // once this item has unmounted) records the trigger as its
+                    // opener instead of <body> (#3485). An onSelect that moves
+                    // focus itself still wins: it runs after this.
+                    triggerRef.current?.focus();
+                    setOpen(false);
+                  }
                   it.onSelect();
                 }}
                 className={cn(

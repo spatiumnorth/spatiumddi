@@ -187,6 +187,23 @@ describe("IPAM delete confirmations", () => {
     ).toBe(true);
   });
 
+  it("announces a refused delete's reason in both steps (#3489)", () => {
+    const reason = "Subnet 10.231.12.0/24 still has allocated addresses.";
+    open(
+      <ConfirmDestroyModal
+        title="Delete Subnet"
+        description="Delete subnet 10.231.12.0/24?"
+        checkLabel="I understand 10.231.12.0/24 and its contents will be moved to Trash."
+        onConfirm={() => {}}
+        onClose={() => {}}
+        error={reason}
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toBe(reason);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(within(topDialog()).getByRole("alert").textContent).toBe(reason);
+  });
+
   it("calls nothing in IPAM permanent but the deletes that are", () => {
     // The only IPAM deletes that do not go to Trash are an IP address's:
     // its purge (DELETE /ipam/addresses/{id}?permanent=true), the orphan
