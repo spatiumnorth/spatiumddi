@@ -5733,10 +5733,6 @@ export interface DNSServerOptions {
   recursion_enabled: boolean;
   allow_recursion: string[];
   dnssec_validation: string;
-  gss_tsig_enabled: boolean;
-  gss_tsig_keytab_path: string | null;
-  gss_tsig_realm: string | null;
-  gss_tsig_principal: string | null;
   notify_enabled: string;
   also_notify: string[];
   allow_notify: string[];

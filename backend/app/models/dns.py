@@ -802,12 +802,6 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DNSSEC — auto | yes | no
     dnssec_validation: Mapped[str] = mapped_column(String(10), nullable=False, default="auto")
 
-    # GSS-TSIG (Kerberos)
-    gss_tsig_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    gss_tsig_keytab_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    gss_tsig_realm: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    gss_tsig_principal: Mapped[str | None] = mapped_column(String(500), nullable=True)
-
     # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")
     also_notify: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)

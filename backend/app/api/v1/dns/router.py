@@ -1063,10 +1063,6 @@ class ServerOptionsUpdate(BaseModel):
     recursion_enabled: bool | None = None
     allow_recursion: list[str] | None = None
     dnssec_validation: str | None = None
-    gss_tsig_enabled: bool | None = None
-    gss_tsig_keytab_path: str | None = None
-    gss_tsig_realm: str | None = None
-    gss_tsig_principal: str | None = None
     notify_enabled: str | None = None
     also_notify: list[str] | None = None
     allow_notify: list[str] | None = None
@@ -1212,10 +1208,6 @@ class ServerOptionsResponse(BaseModel):
     recursion_enabled: bool
     allow_recursion: list[str]
     dnssec_validation: str
-    gss_tsig_enabled: bool
-    gss_tsig_keytab_path: str | None
-    gss_tsig_realm: str | None
-    gss_tsig_principal: str | None
     notify_enabled: str
     also_notify: list[str]
     allow_notify: list[str]

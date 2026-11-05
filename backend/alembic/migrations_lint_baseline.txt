@@ -570,6 +570,7 @@ backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:81
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:82
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:83
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_constraint_fk:78
+backend/alembic/versions/d5a1f3c7e208_drop_gss_tsig_options.py:drop_column:31
 backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_column:33
 backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_column:34
 backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_column:35

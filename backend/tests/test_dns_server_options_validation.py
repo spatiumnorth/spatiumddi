@@ -162,16 +162,8 @@ def test_query_log_path_must_be_a_plain_file_under_the_log_dir():
         assert _bad("query_log_file", bad).value == bad
 
 
-def test_keytab_path_must_be_a_plain_file_under_etc_or_var_lib():
-    assert _ok("gss_tsig_keytab_path", "/etc/bind/dns.keytab") == "/etc/bind/dns.keytab"
-    assert _ok("gss_tsig_keytab_path", "/var/lib/bind/dns.keytab") == "/var/lib/bind/dns.keytab"
-    for bad in ("/root/dns.keytab", "/etc/../root/k", '/etc/k"'):
-        _bad("gss_tsig_keytab_path", bad)
-
-
 def test_fields_without_a_grammar_pass_through():
     assert _ok("rrl_window", 15) == 15
-    assert _ok("gss_tsig_realm", "EXAMPLE.COM") == "EXAMPLE.COM"
 
 
 # ── API ───────────────────────────────────────────────────────────────
@@ -507,3 +499,27 @@ async def test_stored_tls_without_name_is_warned_on_technitium(
     r = await client.get(f"/api/v1/dns/groups/{group.id}/options", headers=headers)
     warnings = r.json()["technitium_warnings"]
     assert any(w.startswith("forward_transport 'tls'") for w in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_gss_tsig_fields_are_gone_and_a_stale_client_is_ignored(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """#3561: the unrendered gss_tsig_* options left the API. The schema ignores
+    unknown keys (no ``extra=forbid`` anywhere on these models), so an old client
+    or Terraform config that still sends them gets a 200 and nothing is stored."""
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+
+    assert not [k for k in (await client.get(url, headers=headers)).json() if "gss" in k]
+
+    r = await client.put(
+        url,
+        json={"allow_query": ["any"], "gss_tsig_enabled": True, "gss_tsig_realm": "X.COM"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert not [k for k in r.json() if "gss" in k]
+    assert not [c.name for c in DNSServerOptions.__table__.columns if "gss" in c.name]
