@@ -1174,6 +1174,11 @@ async def commit_address_import(
                 )
             seen_addr.add(canonical)
 
+    # #3503: added after the loop, before the recount. A row's audit row
+    # flushed ahead of a later row's DNS sync takes the audit-chain lock before
+    # that sync bumps a zone serial, which deadlocks against a record create
+    # holding the zone.
+    audit_rows: list[AuditLog] = []
     for row in payload.addresses:
         canonical, fields, err = _row_address_fields(row)
         if err or canonical is None:
@@ -1220,7 +1225,7 @@ async def commit_address_import(
                         existing_ip.tags = merged_tags
                     else:
                         setattr(existing_ip, k, v)
-                db.add(
+                audit_rows.append(
                     AuditLog(
                         user_id=current_user.id,
                         user_display_name=current_user.display_name,
@@ -1297,7 +1302,7 @@ async def commit_address_import(
         db.add(new_ip)
         await db.flush()
         existing[canonical] = new_ip
-        db.add(
+        audit_rows.append(
             AuditLog(
                 user_id=current_user.id,
                 user_display_name=current_user.display_name,
@@ -1341,6 +1346,7 @@ async def commit_address_import(
     # change up every block on the chain (#2981). A created ``available`` row is
     # free and an overwritten status can move a row in or out of the count, so
     # a running delta is not the answer.
+    db.add_all(audit_rows)
     if result_obj.created or result_obj.updated:
         await db.flush()
         await _update_utilization(db, subnet.id)
