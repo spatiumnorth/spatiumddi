@@ -1,0 +1,2 @@
+### Changed
+- The curated blocklist catalog is refreshed against upstream (version 2026.11.05). URLhaus moved to AdGuard's HostlistsRegistry mirror because abuse.ch no longer serves an anonymous download, and 1Hosts Lite now points at the maintained upstream list rather than a stale ~3.7k-entry mirror. DigitalSide Threat-Intel (dead host) is removed, OISD's and 1Hosts' license labels are corrected, and Hagezi Light, Hagezi Normal and Hagezi Threat Intelligence (Medium) are added.
