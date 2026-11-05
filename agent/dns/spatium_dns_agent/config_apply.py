@@ -128,6 +128,12 @@ def truncate_error(text: str) -> str:
     return text[: MAX_ERROR_LEN - 1] + "…"
 
 
+#: :attr:`ApplyStatus.reason` values (#3552), mirrored by the control plane's
+#: ``app.services.agents.config_apply``.
+REASON_OOM = "oom"
+REASON_DAEMON_DIED = "daemon_died"
+
+
 @dataclass
 class ApplyStatus:
     """The agent's verdict on its most recent config apply."""
@@ -144,8 +150,11 @@ class ApplyStatus:
     #: operator whether the daemon was ever disturbed.
     phase: str | None = None
     error: str | None = None
-    #: Why, when the agent knows (#3552): ``"oom"`` when the previous process
-    #: died to the container's OOM killer. ``None`` = unknown, never "not OOM".
+    #: Why, for a verdict about a death during an apply (#3552):
+    #: :data:`REASON_OOM` when the agent has evidence the container's OOM killer
+    #: did it, :data:`REASON_DAEMON_DIED` when it does not know what did (the
+    #: control plane names it OOM when the kubelet saw one). ``None``: not a
+    #: death verdict. Neither value ever means "not out of memory".
     reason: str | None = None
     #: ``memory.max`` in bytes at that time; only meaningful with ``reason``.
     memory_limit_bytes: int | None = None

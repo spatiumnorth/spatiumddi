@@ -311,3 +311,17 @@ async def test_the_alert_text_carries_the_oom_reason(db_session: AsyncSession) -
 
     matches = await _matching_agent_config_rejected_subjects(db_session, _RULE)
     assert "out of memory while applying config (limit 1 GiB)" in matches[0][2]
+
+
+def test_daemon_died_without_kubelet_evidence_is_stored_unchanged() -> None:
+    row = _row()
+    _report(
+        row,
+        {
+            "status": STATUS_NO_PREVIOUS,
+            "failed_etag": "b",
+            "error": "died",
+            "reason": "daemon_died",
+        },
+    )
+    assert row.config_apply_error == "died"

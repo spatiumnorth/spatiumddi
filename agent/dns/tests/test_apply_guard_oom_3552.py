@@ -115,7 +115,9 @@ def test_the_heartbeat_verdict_names_oom_and_the_limit(tmp_path: Path, monkeypat
     assert "OOM killer" in (loop.apply_status.error or "")
 
 
-def test_a_plain_crash_sends_no_reason(tmp_path: Path, monkeypatch) -> None:
+def test_a_crash_with_no_evidence_says_daemon_died_not_oom(tmp_path: Path, monkeypatch) -> None:
+    """No evidence is ``daemon_died``: the cause is unknown to the agent, and
+    the control plane may still know it was an OOM kill (the kubelet)."""
     cg = tmp_path / "cg"
     cg.mkdir()
     _fake_cgroup(monkeypatch, cg, 5)
@@ -124,6 +126,83 @@ def test_a_plain_crash_sends_no_reason(tmp_path: Path, monkeypatch) -> None:
 
     loop = _loop(state, _Driver(state))
 
-    assert loop.apply_status.reason is None
+    assert loop.apply_status.reason == "daemon_died"
     wire = loop.heartbeat.config_apply.as_dict()
-    assert "reason" not in wire and "memory_limit_bytes" not in wire
+    assert wire["reason"] == "daemon_died"
+    assert "memory_limit_bytes" not in wire
+    assert "OOM killer" not in (loop.apply_status.error or "")
+
+
+# ── Compose: the counter does not survive the restart, the record does ──
+#
+# Docker's ``restart:`` starts the container in a NEW cgroup whose ``oom_kill``
+# reads 0 (measured: 1 before the exit, 0 after), so the counter comparison
+# above never fires there. The agent outlives ``named`` there, though, and the
+# supervisor loop sees the counter move before it exits: that watched OOM death
+# is what names the next start's verdict.
+
+
+def test_a_watched_oom_death_is_an_oom_verdict_after_a_fresh_cgroup(tmp_path: Path) -> None:
+    (tmp_path / "cg").mkdir()
+    files = _events(tmp_path / "cg", 1)
+    state = tmp_path / "state"
+    ensure_layout(state)
+    g = ApplyGuard(state, oom_files=files)
+    g.arm("big")
+    assert g.daemon_died(oom_killed=True) == "big"
+    Path(files[0]).write_text("oom_kill 0\n")  # the restarted container's cgroup
+
+    g2 = ApplyGuard(state, oom_files=files)
+    assert g2.startup() == "big"
+    assert g2.died_oom_killed is True
+
+
+def test_a_watched_oom_death_is_reported_by_one_start_only(tmp_path: Path) -> None:
+    (tmp_path / "cg").mkdir()
+    files = _events(tmp_path / "cg", 0)
+    state = tmp_path / "state"
+    ensure_layout(state)
+    g = ApplyGuard(state, oom_files=files)
+    g.arm("big")
+    g.daemon_died(oom_killed=True)
+    assert ApplyGuard(state, oom_files=files).startup() == "big"
+
+    # The next death of the same bundle is a plain one: no OOM this time.
+    g3 = ApplyGuard(state, oom_files=files)
+    g3.arm("big")
+    g3.daemon_died(oom_killed=False)
+    g4 = ApplyGuard(state, oom_files=files)
+    assert g4.startup() == "big"
+    assert g4.died_oom_killed is False
+
+
+def test_a_watched_death_without_oom_is_not_oom(tmp_path: Path) -> None:
+    (tmp_path / "cg").mkdir()
+    files = _events(tmp_path / "cg", 0)
+    state = tmp_path / "state"
+    ensure_layout(state)
+    g = ApplyGuard(state, oom_files=files)
+    g.arm("big")
+    g.daemon_died()
+    g2 = ApplyGuard(state, oom_files=files)
+    assert g2.startup() == "big"
+    assert g2.died_oom_killed is False
+
+
+def test_the_compose_heartbeat_verdict_names_oom(tmp_path: Path, monkeypatch) -> None:
+    """End to end over the sync loop: the agent watched named die to the OOM
+    killer, the container restarted into a fresh cgroup, and the next start's
+    verdict still says ``oom`` with the limit read at the kill."""
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    _fake_cgroup(monkeypatch, cg, 3)
+    state = tmp_path / "state"
+    _die_on_cached(state)
+    ApplyGuard(state, oom_files=(str(cg / "memory.events"),)).daemon_died(oom_killed=True)
+    (cg / "memory.events").write_text("oom_kill 0\n")
+
+    loop = _loop(state, _Driver(state))
+
+    wire = loop.heartbeat.config_apply.as_dict()
+    assert wire["reason"] == "oom"
+    assert wire["memory_limit_bytes"] == 512 << 20

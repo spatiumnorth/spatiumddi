@@ -40,6 +40,8 @@ from .config import AgentConfig
 from .config_apply import (
     PHASE_RELOAD,
     PHASE_VALIDATE,
+    REASON_DAEMON_DIED,
+    REASON_OOM,
     STATUS_NO_PREVIOUS,
     STATUS_OK,
     STATUS_REVERT_FAILED,
@@ -505,6 +507,15 @@ class SyncLoop:
             f"within {int(SETTLE_SECONDS)} s of it{seen}{oom}"
         )
 
+    def _death_cause(self) -> dict[str, Any]:
+        """``reason`` / ``memory_limit_bytes`` for a verdict about the death
+        the startup counted (#3552): ``oom`` when the agent has evidence the
+        OOM killer did it, otherwise ``daemon_died`` (cause unknown here; the
+        control plane names it OOM when the kubelet saw one)."""
+        if self._guard.died_oom_killed:
+            return {"reason": REASON_OOM, "memory_limit_bytes": self._guard.oom_limit_bytes}
+        return {"reason": REASON_DAEMON_DIED}
+
     def _report_boot_hold(self, status: ApplyStatus) -> None:
         self.apply_status = status
         self.heartbeat.config_apply = status
@@ -532,10 +543,7 @@ class SyncLoop:
                 etag=None,
                 failed_etag=etag,
                 phase=PHASE_RELOAD,
-                reason="oom" if self._guard.died_oom_killed else None,
-                memory_limit_bytes=(
-                    self._guard.oom_limit_bytes if self._guard.died_oom_killed else None
-                ),
+                **self._death_cause(),
                 error=truncate_error(
                     f"{reason}; held back at startup, so the server is not serving "
                     "until the control plane sends a bundle"
@@ -986,10 +994,11 @@ class SyncLoop:
             if etag is not None and self._quarantine.etag == etag:
                 self._quarantine.clear()
 
-    def note_daemon_death(self) -> None:
+    def note_daemon_death(self, oom_killed: bool = False) -> None:
         """The supervisor watched the daemon exit while the agent lives: the
-        evidence that lets a bundle be quarantined for it (#2019)."""
-        etag = self._guard.daemon_died()
+        evidence that lets a bundle be quarantined for it (#2019).
+        ``oom_killed``: the cgroup's OOM killer fired (#3552)."""
+        etag = self._guard.daemon_died(oom_killed=oom_killed)
         if etag is not None:
             log.error("dns_daemon_died_during_config_apply_watched", etag=etag)
 

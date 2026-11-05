@@ -49,14 +49,23 @@ guard stops at sync-first: the crash loop on a bundle the control plane still
 serves is the kubelet's to back off, and the operator's fix is fetched on the
 next start, which is what #2019 needed.
 
-Naming an OOM kill (#3552): the guard persists the cgroup's ``oom_kill`` counter
-at every arm, and :meth:`ApplyGuard.startup` compares it with the counter at the
-next start. A rise means the kernel killed something in this cgroup during the
-apply window, and the verdict then carries ``reason="oom"`` plus ``memory.max``.
-That needs the counter to survive the restart, i.e. the same cgroup (an agent
-restarted inside its container, or Docker's restart of a surviving cgroup); a
-brand-new container cgroup starts at zero and reads as unknown, which the
-kubelet's ``OOMKilled`` path (``container_oom``) covers instead.
+Naming an OOM kill (#3552). Two pieces of evidence, either of which makes the
+startup verdict carry ``reason="oom"`` plus the memory limit:
+
+* a watched death the OOM killer caused: the supervisor loop saw the daemon
+  exit and the cgroup's ``oom_kill`` counter had moved, so
+  :meth:`ApplyGuard.daemon_died` persists "this bundle's death was an OOM kill"
+  before the agent exits. That is Compose, where Docker kills ``named`` alone.
+* the counter itself rising across the restart (persisted at every arm,
+  compared at startup). Only where the cgroup outlives the process; a
+  restarted container is a new cgroup whose counter starts at zero, which is
+  Docker's ``restart:`` (measured) and every Kubernetes restart.
+
+Neither sees a kill that took the whole container, the agent with ``named``
+(the kubelet's ``memory.oom.group``). The verdict then carries
+``reason="daemon_died"``: cause unknown to the agent, and the control plane
+names it OOM when the kubelet's ``OOMKilled`` for this container is current
+(``backend/app/services/agents/container_oom.py``).
 """
 
 from __future__ import annotations
@@ -144,6 +153,11 @@ class ApplyGuard:
         self.died_oom_killed = False
         #: ``memory.max`` at that startup, bytes, ``None`` when unlimited.
         self.oom_limit_bytes: int | None = None
+        #: The armed etag a WATCHED death was an OOM kill of (#3552), and the
+        #: memory limit then. Persisted by :meth:`daemon_died`, consumed by the
+        #: next :meth:`startup`, so one kill is reported by one start only.
+        self.oom_etag: str | None = None
+        self._oom_etag_limit: int | None = None
         self._lock = threading.Lock()
         #: etag being applied or settling; ``None`` when nothing is pending.
         self.armed: str | None = None
@@ -187,11 +201,21 @@ class ApplyGuard:
                     continue
         oom = data.get("oom_count")
         self.oom_count = oom if isinstance(oom, int) and oom >= 0 else None
+        oom_etag = data.get("oom_etag")
+        self.oom_etag = str(oom_etag) if oom_etag else None
+        oom_limit = data.get("oom_limit_bytes")
+        self._oom_etag_limit = oom_limit if isinstance(oom_limit, int) and oom_limit > 0 else None
         stamp = data.get("last_death_at")
         self.last_death_at = float(stamp) if isinstance(stamp, (int, float)) else None
 
     def _save(self) -> None:
-        if not self.armed and not self.deaths and not self.observed and self.oom_count is None:
+        if (
+            not self.armed
+            and not self.deaths
+            and not self.observed
+            and self.oom_count is None
+            and self.oom_etag is None
+        ):
             try:
                 self._path.unlink(missing_ok=True)
             except OSError:
@@ -208,6 +232,8 @@ class ApplyGuard:
                         "observed": self.observed,
                         "last_death_at": self.last_death_at,
                         "oom_count": self.oom_count,
+                        "oom_etag": self.oom_etag,
+                        "oom_limit_bytes": self._oom_etag_limit,
                     }
                 )
             )
@@ -235,8 +261,18 @@ class ApplyGuard:
                 self.died_oom_killed = now_count > self.oom_count
                 if self.died_oom_killed:
                     self.oom_limit_bytes = cgroup_memory_limit_bytes()
-            if now_count is not None and now_count != self.oom_count:
-                self.oom_count = now_count
+            # The watched-OOM record (Compose: the counter does not survive the
+            # container restart, the record does). Consumed here whatever it
+            # names, so a record for another bundle is never read twice.
+            if died is not None and self.oom_etag == died:
+                self.died_oom_killed = True
+                self.oom_limit_bytes = self._oom_etag_limit
+            consumed = self.oom_etag is not None
+            self.oom_etag = None
+            self._oom_etag_limit = None
+            if consumed or (now_count is not None and now_count != self.oom_count):
+                if now_count is not None:
+                    self.oom_count = now_count
                 self._save()
             if died is None:
                 return None
@@ -280,16 +316,21 @@ class ApplyGuard:
         it, rather than merely having the process end inside the window."""
         return self.observed_for(etag) >= QUARANTINE_AFTER_DEATHS
 
-    def daemon_died(self) -> str | None:
+    def daemon_died(self, oom_killed: bool = False) -> str | None:
         """The agent watched the daemon exit while a bundle was armed.
 
         Recorded before the agent exits with it; the marker stays armed so the
-        next start counts the death as usual, now with evidence attached."""
+        next start counts the death as usual, now with evidence attached.
+        ``oom_killed``: the cgroup's OOM killer fired (#3552); the next start
+        reports the death as out of memory, with the limit read now."""
         with self._lock:
             etag = self.armed
             if etag is None:
                 return None
             self.observed[etag] = self.observed.get(etag, 0) + 1
+            if oom_killed:
+                self.oom_etag = etag
+                self._oom_etag_limit = cgroup_memory_limit_bytes()
             self._save()
             return etag
 
