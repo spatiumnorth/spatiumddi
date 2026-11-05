@@ -1371,6 +1371,7 @@ async def _matching_unknown_mac_in_static_range_subjects(
         await db.execute(
             select(IPAddress, IpMacHistory.mac_address, IpMacHistory.last_seen)
             .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)  # trashed subnet drops out (#3492)
             .where(
                 IPAddress.status.in_(("reserved", "static_dhcp")),
                 IPAddress.mac_address.is_not(None),
@@ -2091,6 +2092,8 @@ async def _matching_new_mac_seen_subjects(
                 IPAddress, IpMacHistory.mac_address, IpMacHistory.first_seen, IpMacHistory.source
             )
             .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            # Inner join so a subnet in the Trash drops its addresses (#3492).
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(*conds)
             .order_by(IpMacHistory.first_seen.desc())
             .limit(_IP_HYGIENE_MAX_EVENTS)
