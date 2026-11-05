@@ -1222,7 +1222,7 @@ function DnsSettingsSection({
   // "dns_zone"; the IPAM Editor holds neither. Without them neither is asked
   // (#3466), and a stored group or zone reads as linked, never as "No groups
   // configured." or a raw id.
-  const { can } = usePermissions();
+  const { can, unanswered } = usePermissions();
   const canReadGroups = can("read", "dns_group");
   const canReadZones = can("read", "dns_zone");
   const { data: allGroups = [] } = useQuery({
@@ -1312,7 +1312,7 @@ function DnsSettingsSection({
         <p className="text-xs text-muted-foreground italic">
           {effectiveDns &&
           (effectiveDns.dns_group_ids.length > 0 || effectiveDns.dns_zone_id)
-            ? `Inheriting from ${inheritedFrom ?? "parent"}: ${effectiveDns.dns_group_ids.length} group(s), zone: ${effectiveDns.dns_zone_id ? (availableZones.find((z) => z.id === effectiveDns.dns_zone_id)?.name ?? (canReadZones ? effectiveDns.dns_zone_id : "linked, not shown")) : "none"}`
+            ? `Inheriting from ${inheritedFrom ?? "parent"}: ${effectiveDns.dns_group_ids.length} group(s), zone: ${effectiveDns.dns_zone_id ? (availableZones.find((z) => z.id === effectiveDns.dns_zone_id)?.name ?? (canReadZones ? effectiveDns.dns_zone_id : unanswered ? "linked, checking permissions" : "linked, not shown")) : "none"}`
             : "No DNS settings configured in parent chain."}
         </p>
       )}
@@ -1328,13 +1328,16 @@ function DnsSettingsSection({
             <select
               value={displayGroupIds[0] ? "linked" : ""}
               disabled
-              title="Your role cannot read DNS server groups, so this cannot be changed here."
+              title={
+                unanswered ??
+                "Your role cannot read DNS server groups, so this cannot be changed here."
+              }
               className={`${inputCls} w-full`}
             >
               <option value="">{"\u2014 None \u2014"}</option>
               {displayGroupIds[0] && (
                 <option value="linked">
-                  Linked (not visible to your role)
+                  {unanswered ?? "Linked (not visible to your role)"}
                 </option>
               )}
             </select>
@@ -1373,20 +1376,28 @@ function DnsSettingsSection({
             <select
               value="linked"
               disabled
-              title="Your role cannot read DNS zones, so this cannot be changed here."
+              title={
+                unanswered ??
+                "Your role cannot read DNS zones, so this cannot be changed here."
+              }
               className={`${inputCls} w-full`}
             >
-              <option value="linked">Linked (not visible to your role)</option>
+              <option value="linked">
+                {unanswered ?? "Linked (not visible to your role)"}
+              </option>
             </select>
           </div>
         )}
         {!canReadZones && !inherit && displayAdditionalIds.length > 0 && (
           <p
             className="text-xs text-muted-foreground"
-            title="Your role cannot read DNS zones, so these cannot be changed here."
+            title={
+              unanswered ??
+              "Your role cannot read DNS zones, so these cannot be changed here."
+            }
           >
-            Additional Zones: {displayAdditionalIds.length} linked (not visible
-            to your role)
+            Additional Zones: {displayAdditionalIds.length} linked (
+            {unanswered ?? "not visible to your role"})
           </p>
         )}
 
@@ -1487,7 +1498,8 @@ function DhcpSettingsSection({
   // The server group list takes read on "dhcp_server", which the IPAM Editor
   // lacks: not asked without it (#3466), and a stored group reads as linked,
   // never as "No DHCP server groups configured.".
-  const canReadGroups = usePermissions().can("read", "dhcp_server");
+  const dhcpPerms = usePermissions();
+  const canReadGroups = dhcpPerms.can("read", "dhcp_server");
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
@@ -1545,7 +1557,7 @@ function DhcpSettingsSection({
           {effectiveDhcp?.dhcp_server_group_id
             ? canReadGroups
               ? `Inheriting from ${inheritedFrom ?? "parent"}: group "${displayGroup?.name ?? "unknown"}".`
-              : `Inheriting from ${inheritedFrom ?? "parent"}: a group not visible to your role.`
+              : `Inheriting from ${inheritedFrom ?? "parent"}: a group (${dhcpPerms.unanswered ?? "not visible to your role"}).`
             : "No DHCP group configured in parent chain."}
         </p>
       )}
@@ -1560,13 +1572,16 @@ function DhcpSettingsSection({
             <select
               value={displayGroupId ? "linked" : ""}
               disabled
-              title="Your role cannot read DHCP server groups, so this cannot be changed here."
+              title={
+                dhcpPerms.unanswered ??
+                "Your role cannot read DHCP server groups, so this cannot be changed here."
+              }
               className={`${inputCls} w-full`}
             >
               <option value="">{"\u2014 None \u2014"}</option>
               {displayGroupId && (
                 <option value="linked">
-                  Linked (not visible to your role)
+                  {dhcpPerms.unanswered ?? "Linked (not visible to your role)"}
                 </option>
               )}
             </select>
