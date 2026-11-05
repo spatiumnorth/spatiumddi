@@ -350,25 +350,22 @@ export function DHCPOptionsEditor({
     onChange(next);
   }
 
-  const customOptions = value.filter(
-    (o) => !STANDARD_OPTIONS.some((s) => s.code === o.code),
-  );
+  // Each custom row with its place in `value`. An edit or a remove goes to
+  // that place: two rows can hold the same contents (two blank rows are both
+  // `{ code: 0, value: "" }`), so a row is never found by comparing them,
+  // which wrote a pick in the second blank row into the first (#3508).
+  const customRows = value
+    .map((opt, at) => ({ opt, at }))
+    .filter(({ opt }) => !STANDARD_OPTIONS.some((s) => s.code === opt.code));
 
-  function updateCustomAt(idx: number, next: DHCPOption) {
-    const fullIdx = value.findIndex(
-      (o) =>
-        o === customOptions[idx] ||
-        (o.code === customOptions[idx].code &&
-          o.value === customOptions[idx].value),
-    );
-    if (fullIdx < 0) return;
+  function updateCustomAt(at: number, next: DHCPOption) {
     const out = [...value];
-    out[fullIdx] = next;
+    out[at] = next;
     onChange(out);
   }
 
-  function removeCustomAt(idx: number) {
-    onChange(value.filter((o) => o !== customOptions[idx]));
+  function removeCustomAt(at: number) {
+    onChange(value.filter((_, i) => i !== at));
   }
 
   return (
@@ -423,19 +420,18 @@ export function DHCPOptionsEditor({
           ) : (
             <ChevronRight className="h-3.5 w-3.5" />
           )}
-          Custom options{" "}
-          {customOptions.length > 0 && `(${customOptions.length})`}
+          Custom options {customRows.length > 0 && `(${customRows.length})`}
         </button>
 
         {showCustom && (
           <div className="mt-2 space-y-3">
-            {customOptions.map((opt, idx) => (
+            {customRows.map(({ opt, at }, idx) => (
               <CustomOptionRow
                 key={idx}
                 opt={opt}
                 catalog={catalog}
-                onChange={(next) => updateCustomAt(idx, next)}
-                onRemove={() => removeCustomAt(idx)}
+                onChange={(next) => updateCustomAt(at, next)}
+                onRemove={() => removeCustomAt(at)}
               />
             ))}
             <button
