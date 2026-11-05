@@ -574,7 +574,7 @@ EXEMPT: dict[str, str] = {}
 # entry must then be deleted).
 KNOWN_VIOLATIONS: dict[str, str] = {
     "/held": (
-        "#TBD (file an issue): POST /held INSERTs an e911_resolution_log row (the lookup trail) on every "
+        "#3514: POST /held INSERTs an e911_resolution_log row (the lookup trail) on every "
         "request, so a read-scoped token grows a table. Deliberate and documented in "
         "held_router.py, but it is a write behind @read_only_post."
     ),
