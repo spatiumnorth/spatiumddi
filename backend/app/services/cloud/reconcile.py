@@ -67,6 +67,7 @@ from app.services.integration_ownership import (
     SpaceRelease,
     address_taken,
     addresses_in_space,
+    drop_wrapper_block,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
@@ -576,9 +577,7 @@ async def _apply_blocks_and_subnets(
         for net_str, block in endpoint_blocks.items():
             if net_str in desired_block_cidrs:
                 continue
-            refs = await db.execute(select(Subnet).where(Subnet.block_id == block.id))
-            if refs.scalar_one_or_none() is None:
-                await db.delete(block)
+            if await drop_wrapper_block(db, block, "cloud_endpoint_id", warnings=summary.warnings):
                 summary.blocks_deleted += 1
 
 

@@ -306,6 +306,54 @@ async def subnet_operator_state(db: AsyncSession, subnet: Subnet, own_fk: str) -
     return reasons
 
 
+async def drop_wrapper_block(
+    db: AsyncSession, wrapper: IPBlock, own_fk: str, *, warnings: list[str] | None = None
+) -> bool:
+    """Delete an integration's wrapper block that backs no mirrored subnet (#3556).
+
+    Every mirror's wrapper-block pass calls this in place of its own
+    soft-delete-filtered "any subnet left?" check. That check misses a subnet
+    in the Trash, and the block delete then fails on the ``subnet.block_id``
+    ``RESTRICT`` foreign key, failing the whole sync on every tick. A child
+    block (live or trashed) is counted too: ``ip_block.parent_block_id`` is
+    ``CASCADE``, so the delete would destroy it with the wrapper (#3492's
+    rule, as :func:`release_outside_space` applies it). Returns True when the
+    block was deleted (the caller counts it).
+
+    Anything still under it keeps the block, still owned by the caller, and
+    changes nothing. Kept owned rather than released, so a network that
+    reappears is mirrored back into this same wrapper (it is the caller's
+    wrapper at that CIDR), and the block goes on the first tick after the
+    Trash entry is purged, instead of being left behind as an orphaned
+    "Auto-created for …" block nothing will ever remove. A subnet in the Trash
+    still restores into it. ``warnings`` gets a line while a trashed subnet is
+    what holds it, which the Trash's own retention bounds.
+    """
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    child = aliased(IPBlock)
+    any_subnet, any_child = (
+        await db.execute(
+            select(
+                exists_including_deleted(Subnet.block_id == wrapper.id),
+                exists_including_deleted(child.parent_block_id == wrapper.id),
+            )
+        )
+    ).one()
+    if not (any_subnet or any_child):
+        await db.delete(wrapper)
+        return True
+    live_subnet = await db.scalar(
+        select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
+    )
+    if any_subnet and not live_subnet and warnings is not None:
+        warnings.append(
+            f"wrapper block {wrapper.network} of {INTEGRATION_OWNERSHIP[own_fk]} was kept: "
+            "a subnet in the Trash still sits under it (#3556)"
+        )
+    return False
+
+
 async def retire_vanished_subnet(
     db: AsyncSession, subnet: Subnet, own_fk: str, *, warnings: list[str] | None = None
 ) -> bool:
@@ -978,7 +1026,11 @@ async def _report_release(
     name = (
         await db.execute(select(target_model.name).where(target_model.id == target_id))
     ).scalar_one_or_none()
-    db.add(
+    # Deferred to the commit like retire_vanished_subnet's rows: this runs
+    # mid-sync, and an audit row added here would be autoflushed (taking the
+    # audit-chain lock) before the sync's later DNS zone writes (#3556, #3503).
+    _defer_audit(
+        db,
         AuditLog(
             user_display_name="system",
             auth_source="system",
@@ -992,7 +1044,7 @@ async def _report_release(
                 "space_ids": [str(i) for i in space_ids],
                 "message": out.describe(),
             },
-        )
+        ),
     )
 
 
@@ -1225,6 +1277,7 @@ __all__ = [
     "owned_addresses_in_space",
     "owned_subnets_in_space",
     "ownership_target_model",
+    "drop_wrapper_block",
     "release_outside_space",
     "retire_vanished_subnet",
     "SpaceRelease",

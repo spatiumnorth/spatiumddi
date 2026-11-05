@@ -31,6 +31,7 @@ from app.services.fortinet.client import _FortiInterface
 from app.services.fortinet.reconcile import reconcile_firewall
 from app.services.integration_ownership import release_outside_space
 from app.services.kubernetes.reconcile import reconcile_cluster
+from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch, restore_batch
 from tests.test_docker_reconcile import (
     _engine,
     _FakeClient,
@@ -369,6 +370,230 @@ async def test_retired_subnet_audit_does_not_take_the_chain_lock_before_a_zone_w
         ),
     )
     assert audit.action == "delete"
+
+
+@pytest.mark.asyncio
+async def test_release_outside_space_audit_does_not_take_the_chain_lock_before_a_zone_write(
+    db_session: AsyncSession,
+) -> None:
+    """#3556: ``release_outside_space`` runs mid-sync. Its audit row must not
+    be flushed (taking the audit-chain lock) before the same sync's address
+    absence-delete bumps a zone serial. The conftest lock-order guard fails
+    this test if it is."""
+    net_a = _DockerNetwork(
+        id="na",
+        name="a",
+        driver="bridge",
+        scope="local",
+        subnets=[("172.31.0.0/24", "172.31.0.1")],
+    )
+    web = _DockerContainer(
+        id="c1",
+        name="web",
+        image="nginx",
+        state="running",
+        status="Up",
+        ip_bindings=[("a", "172.31.0.5")],
+    )
+    _grp, _server, zone = await _dns(db_session)
+    space = await _make_space(db_session)
+    old = await _make_space(db_session)
+    await _make_block(db_session, space, "172.16.0.0/12")
+    host = await _make_host(db_session, space, mirror_containers=True)
+    await db_session.commit()
+    with _patch_client(_FakeClient(networks=[net_a], containers=[web])):
+        assert (await reconcile_host(db_session, host)).ok
+    addr_id = await db_session.scalar(
+        select(IPAddress.id).where(
+            IPAddress.docker_host_id == host.id, IPAddress.address == "172.31.0.5"
+        )
+    )
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="web",
+            fqdn=f"web.{zone.name}",
+            record_type="A",
+            value="172.31.0.5",
+            auto_generated=True,
+            ip_address_id=addr_id,
+        )
+    )
+    # A pure mirror subnet left behind in a space the host no longer targets.
+    block = IPBlock(space_id=old.id, network="10.77.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    db_session.add(
+        Subnet(
+            space_id=old.id,
+            block_id=block.id,
+            network="10.77.1.0/24",
+            name="stray",
+            docker_host_id=host.id,
+        )
+    )
+    await db_session.commit()
+
+    # The container goes: its address is absence-deleted, its record retracted.
+    await db_session.refresh(host)
+    with _patch_client(_FakeClient(networks=[net_a], containers=[])):
+        summary = await reconcile_host(db_session, host)
+    assert summary.ok, summary.error
+    assert summary.released.subnets_deleted == 1
+    assert summary.addresses_deleted == 1
+    db_session.expire_all()
+    assert (
+        await db_session.scalar(
+            select(AuditLog.id).where(AuditLog.action == "integration.release_outside_space")
+        )
+        is not None
+    )
+
+
+async def _trashed_wrapper(db: AsyncSession, cidr: str):
+    """A mirrored subnet trashed (as the Trash does it), then its network gone."""
+    space, host, subnets = await _mirror(db, [cidr])
+    sid = subnets[cidr]
+    subnet = await db.get(Subnet, sid)
+    wrapper_id = subnet.block_id
+    wrapper = await db.get(IPBlock, wrapper_id)
+    assert wrapper.docker_host_id == host.id
+    batch = await collect_soft_delete_batch(db, subnet)
+    await apply_soft_delete(db, batch, None)
+    await db.commit()
+    await db.refresh(host)
+    with _patch_client(_engine([], [])):
+        summary = await reconcile_host(db, host)
+    return space.id, host, sid, wrapper_id, batch.batch_id, summary
+
+
+async def _block_row(db: AsyncSession, block_id):
+    return (
+        await db.execute(
+            select(IPBlock.id, IPBlock.docker_host_id)
+            .where(IPBlock.id == block_id)
+            .execution_options(**_INC)
+        )
+    ).one_or_none()
+
+
+@pytest.mark.asyncio
+async def test_wrapper_block_holding_only_a_trashed_subnet_is_kept_not_deleted(
+    db_session: AsyncSession,
+) -> None:
+    """#3556: the wrapper-block pass saw no live subnet and deleted the block,
+    which the trashed subnet's RESTRICT FK refused: every sync tick failed.
+    The block is kept, still the host's, with nothing written."""
+    _space_id, host, sid, wrapper_id, _b, summary = await _trashed_wrapper(
+        db_session, "203.0.113.0/24"
+    )
+    assert summary.ok, summary.error
+    assert summary.blocks_deleted == 0
+    assert any("Trash" in w for w in summary.warnings)
+    host_id = host.id
+    db_session.expire_all()
+    assert await _block_row(db_session, wrapper_id) == (wrapper_id, host_id)
+    assert await _exists(db_session, Subnet, sid)
+
+    # Idempotent: the next tick is clean too.
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        assert (await reconcile_host(db_session, host)).ok
+    assert await _block_row(db_session, wrapper_id) == (wrapper_id, host_id)
+
+
+@pytest.mark.asyncio
+async def test_kept_wrapper_is_reused_when_the_network_returns_and_goes_after_purge(
+    db_session: AsyncSession,
+) -> None:
+    """#3556: a released (un-owned) wrapper would be mirrored into as an
+    operator block when the network returned, and never be deleted again: an
+    orphaned "Auto-created" block once the Trash entry was purged. Kept owned,
+    it is the host's wrapper again, and goes once nothing is under it."""
+    cidr = "203.0.113.0/24"
+    space_id, host, sid, wrapper_id, _b, summary = await _trashed_wrapper(db_session, cidr)
+    assert summary.ok, summary.error
+    host_id = host.id
+
+    # The network comes back: mirrored into the same wrapper, no second block.
+    for _ in range(2):
+        await db_session.refresh(host)
+        with _patch_client(_engine([("n0", cidr, "203.0.113.1")], [])):
+            back = await reconcile_host(db_session, host)
+        assert back.ok, back.error
+        assert back.blocks_created == 0
+    db_session.expire_all()
+    assert (
+        await db_session.execute(
+            select(IPBlock.id, IPBlock.docker_host_id).where(IPBlock.space_id == space_id)
+        )
+    ).all() == [(wrapper_id, host_id)]
+    live = await db_session.scalar(
+        select(Subnet.block_id).where(Subnet.space_id == space_id, Subnet.docker_host_id == host_id)
+    )
+    assert live == wrapper_id
+
+    # It goes again, and the trashed subnet is purged: the wrapper goes with it.
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        assert (await reconcile_host(db_session, host)).ok
+    trashed = await db_session.scalar(
+        select(Subnet).where(Subnet.id == sid).execution_options(**_INC)
+    )
+    await db_session.delete(trashed)
+    await db_session.commit()
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        gone = await reconcile_host(db_session, host)
+    assert gone.ok, gone.error
+    assert gone.blocks_deleted == 1
+    assert await _block_row(db_session, wrapper_id) is None
+
+
+@pytest.mark.asyncio
+async def test_trashed_subnet_restores_into_the_kept_wrapper(db_session: AsyncSession) -> None:
+    _space_id, host, sid, wrapper_id, batch_id, summary = await _trashed_wrapper(
+        db_session, "203.0.113.0/24"
+    )
+    assert summary.ok, summary.error
+    result = await restore_batch(db_session, batch_id)
+    assert not result.conflicts
+    await db_session.commit()
+    db_session.expire_all()
+    row = await db_session.scalar(select(Subnet).where(Subnet.id == sid))
+    assert row is not None and row.block_id == wrapper_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trashed", [False, True], ids=["live", "trashed"])
+async def test_wrapper_with_a_child_block_is_not_deleted_into_it(
+    db_session: AsyncSession, trashed: bool
+) -> None:
+    """``ip_block.parent_block_id`` is CASCADE: deleting the wrapper silently
+    destroyed an operator's block under it (#3556, #3492)."""
+    space, host, subnets = await _mirror(db_session, ["198.18.40.0/24"])
+    sid = subnets["198.18.40.0/24"]
+    subnet = await db_session.get(Subnet, sid)
+    wrapper_id = subnet.block_id
+    child = IPBlock(
+        space_id=space.id,
+        parent_block_id=wrapper_id,
+        network="198.18.40.128/25",
+        name="operator",
+        deleted_at=datetime.now(UTC) if trashed else None,
+    )
+    db_session.add(child)
+    await db_session.commit()
+    child_id = child.id
+
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        summary = await reconcile_host(db_session, host)
+    assert summary.ok, summary.error
+    assert summary.blocks_deleted == 0
+    db_session.expire_all()
+    assert await _exists(db_session, IPBlock, child_id)
+    assert await _exists(db_session, IPBlock, wrapper_id)
 
 
 async def _dashboard_warnings(
