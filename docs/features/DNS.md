@@ -1432,9 +1432,14 @@ letting one silently win.
   feeds in the profile are the mitigation, not a fix. Blocking outbound
   :53 and :853 to anything but your resolvers at the firewall is what
   actually closes it.
-- **Blocklists disable DNSSEC validation** on a group that has any (RPZ
-  rewriting is by definition answer tampering). The agent handles this
-  automatically; it is why a filtered group cannot also validate.
+- **Blocklists do not change DNSSEC validation.** A filtered group keeps
+  the `dnssec-validation` it is configured with. Every `response-policy`
+  is rendered with `break-dnssec yes`, so a blocked name is rewritten for
+  clients that set the DO bit as well as for those that do not, while
+  every other name is still validated (a bogus answer is still SERVFAIL).
+  Before [#3563](https://github.com/spatiumnorth/spatiumddi/issues/3563)
+  the agent forced `dnssec-validation no` on any group with a blocklist,
+  silently, while Settings still showed validation on.
 
 #### How often are feeds refreshed?
 
