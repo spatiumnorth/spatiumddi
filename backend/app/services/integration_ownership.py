@@ -26,9 +26,21 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import Select, String, and_, cast, exists, func, not_, or_, select, update
+from sqlalchemy import (
+    Select,
+    String,
+    and_,
+    cast,
+    event,
+    exists,
+    func,
+    not_,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import Session, SessionTransaction, aliased
 
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
@@ -205,6 +217,35 @@ def _jsonb_nonempty(col: Any) -> Any:
     return and_(col.is_not(None), cast(col, String).not_in(("{}", "[]", "null")))
 
 
+# #3532 / #3503 — the audit rows ``retire_vanished_subnet`` writes, held on the
+# session until its commit. A reconciler retires its vanished subnets early in
+# a sync and goes on to retract DNS records (its address absence-delete, the
+# next subnet's retraction), which bumps zone serials. An audit row added in
+# between is flushed by the next query's autoflush, which takes the audit-chain
+# lock, so every zone row written after it is written under the lock: the
+# order that deadlocks against a record create holding that zone (#3389,
+# #3503). Added at commit, they are flushed after every zone write.
+_DEFERRED_AUDIT_KEY = "integration_ownership_deferred_audit"
+
+
+def _defer_audit(db: AsyncSession, row: AuditLog) -> None:
+    db.info.setdefault(_DEFERRED_AUDIT_KEY, []).append(row)
+
+
+@event.listens_for(Session, "before_commit")
+def _add_deferred_audit(session: Session) -> None:
+    rows = session.info.pop(_DEFERRED_AUDIT_KEY, None)
+    if rows:
+        session.add_all(rows)
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _drop_deferred_audit(session: Session, transaction: SessionTransaction) -> None:
+    # A rolled-back sync wrote nothing, so neither do its audit rows.
+    if transaction.parent is None:
+        session.info.pop(_DEFERRED_AUDIT_KEY, None)
+
+
 async def subnet_operator_state(db: AsyncSession, subnet: Subnet, own_fk: str) -> list[str]:
     """What keeps a mirrored subnet from being deleted with its source (#3532).
 
@@ -277,7 +318,9 @@ async def retire_vanished_subnet(
     Either way one system audit row names the subnet, the integration and
     the outcome, so a sync never removes or abandons a subnet silently, and
     a released subnet carries the record that its source network is gone.
-    ``warnings`` (the sync summary's list) gets a line for a release. A
+    The row is added at the session's commit, after the sync's DNS
+    retractions, so it never takes the audit-chain lock ahead of a zone
+    write (#3503). ``warnings`` (the sync summary's list) gets a line for a release. A
     released subnet is no longer owned, so the next sync does not see it
     again: idempotent.
     """
@@ -294,7 +337,8 @@ async def retire_vanished_subnet(
     }
     if reasons:
         setattr(subnet, own_fk, None)
-        db.add(
+        _defer_audit(
+            db,
             AuditLog(
                 user_display_name="system",
                 auth_source="system",
@@ -306,7 +350,7 @@ async def retire_vanished_subnet(
                 old_value={own_fk: detail["target_id"]},
                 new_value={**detail, own_fk: None, "outcome": "released", "kept_for": reasons},
                 result="success",
-            )
+            ),
         )
         if warnings is not None:
             warnings.append(
@@ -315,7 +359,8 @@ async def retire_vanished_subnet(
             )
         return True
     await retract_address_dns(db, subnet_ids=[subnet.id])
-    db.add(
+    _defer_audit(
+        db,
         AuditLog(
             user_display_name="system",
             auth_source="system",
@@ -326,7 +371,7 @@ async def retire_vanished_subnet(
             old_value=detail,
             new_value={"outcome": "deleted"},
             result="success",
-        )
+        ),
     )
     await db.delete(subnet)
     return False
@@ -368,9 +413,11 @@ async def release_integration_rows(
     * Addresses the target owns that an operator touched
       (``user_modified_at``), another integration owns, or that carry a DNS
       record / static reservation are un-claimed (FK cleared, row kept).
-    * A subnet is un-claimed when any address in it survives, a DHCP scope
-      or a subnet-domain link hangs off it, or it carries tags / custom
-      fields. Otherwise it is purely mirrored and removed.
+    * A subnet is un-claimed when :func:`subnet_operator_state` finds
+      operator content on it: an address in it survives, a DHCP scope (live
+      or in Trash), a registry row or a subnet-domain link hangs off it, it
+      carries tags / custom fields, or a person edited it (#3532). Otherwise
+      it is purely mirrored and removed.
     * A block is un-claimed when it carries tags / custom fields or still
       has a child block or subnet that is not being removed.
     * Soft-deleted (Trash) rows are un-claimed so the cascade cannot
