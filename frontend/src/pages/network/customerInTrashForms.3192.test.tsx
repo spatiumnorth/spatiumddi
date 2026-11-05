@@ -74,9 +74,11 @@ vi.mock("@/lib/api", async () => {
                 ? undefined
                 : name === "customersApi" && method === "list"
                   ? customersList
-                  : name === "servicesApi" && method === "get"
-                    ? async () => SERVICE
-                    : pending,
+                  : name === "authApi" && method === "myPermissions"
+                    ? async () => ({ is_superadmin: true, grants: [] })
+                    : name === "servicesApi" && method === "get"
+                      ? async () => SERVICE
+                      : pending,
           },
         ),
       ]),
