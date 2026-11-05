@@ -624,6 +624,31 @@ async def _trashed_sharer(
     return (await db.execute(stmt)).scalars().first()
 
 
+async def trashed_sharers(db: AsyncSession, zone: DNSZone) -> list[Subnet]:
+    """Every trashed subnet whose trashed records still sit in the trashed auto
+    reverse ``zone`` under a batch other than the zone's own (spatiumddi#3504):
+    the subnets a purge of the zone's own Trash row would take records from.
+    Empty for a live zone or one the operator made."""
+    if zone.deleted_at is None or not zone.is_auto_generated:
+        return []
+    stmt: Any = (
+        select(Subnet)
+        .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+        .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+        .where(
+            DNSRecord.zone_id == zone.id,
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.is_distinct_from(zone.deletion_batch_id),
+            Subnet.deleted_at.is_not(None),
+            Subnet.deletion_batch_id.is_not(None),
+        )
+        .distinct()
+        .order_by(Subnet.network)
+        .execution_options(include_deleted=True)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
 async def _hand_over(db: AsyncSession, zone: DNSZone, heir: Subnet) -> None:
     """Re-link ``zone`` to the trashed ``heir`` and stamp it, with the records
     riding it, into the heir's deletion batch (spatiumddi#3190).
