@@ -7,7 +7,7 @@ Two columns on ``platform_settings``: the per-caller budget of logged
 values the constants used to have.
 
 Revision ID: d8f3b6a41e52
-Revises: c4e8a2d6b917
+Revises: d8f3a61c2e47
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "d8f3b6a41e52"
-down_revision: str | None = "c4e8a2d6b917"
+down_revision: str | None = "d8f3a61c2e47"
 branch_labels: str | None = None
 depends_on: str | None = None
 

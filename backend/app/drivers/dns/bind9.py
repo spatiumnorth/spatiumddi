@@ -221,6 +221,36 @@ def _render_update_clause(zone: ZoneData) -> str:
     return f"allow-update {{ {' '.join(items)} }};" if items else ""
 
 
+def _shared_zone_views(
+    zones: Sequence[ZoneData], views: Sequence[Any]
+) -> dict[tuple[str | None, str], str]:
+    """``{(view, zone name): defining view}`` for every view copy of a zone
+    that is identical to an earlier view's copy (#3551).
+
+    The mirror of the agent renderer's ``in-view`` sharing: such a copy is
+    loaded once, in the first view that holds it, and referenced from the
+    later views, so memory scales with distinct zone data rather than with
+    views × data. Views keep their order (it decides a client's view), and
+    the defining view is always the earlier one, which ``in-view`` requires.
+    Forward zones never share: BIND refuses ``in-view`` of one. RPZ zones
+    are not considered at all: BIND refuses a response-policy zone defined
+    by ``in-view``.
+    """
+    shared: dict[tuple[str | None, str], str] = {}
+    defined: dict[str, list[tuple[ZoneData, str]]] = {}
+    for view in views:
+        for z in zones:
+            if z.view_name != view.name or z.zone_type == "forward":
+                continue
+            bare = dataclasses.replace(z, view_name=None)
+            owner = next((v for d, v in defined.get(z.name, []) if d == bare), None)
+            if owner is not None:
+                shared[(view.name, z.name)] = owner
+            else:
+                defined.setdefault(z.name, []).append((bare, view.name))
+    return shared
+
+
 def _zone_forward_view(zone: ZoneData) -> dict[str, Any]:
     """The bundle-shaped mapping ``_forwarders`` reads, from a ``ZoneData``."""
     return {
@@ -273,6 +303,7 @@ class BIND9Driver(DNSDriver):
         # zone name appears once per view, so a name-only key would collapse
         # the copies and drop all but one view's stanza from the preview.
         zone_stanzas = {(z.view_name, z.name): self.render_zone_config(z) for z in zones}
+        zone_in_view = _shared_zone_views(zones, views)
         # One ``tls`` statement per upstream hostname a TLS forward zone uses
         # (#2121), rendered above ``options`` exactly as the agent does.
         zone_tls_hosts = {
@@ -299,6 +330,7 @@ class BIND9Driver(DNSDriver):
             blocklists=blocklists,
             dnssec_policies=dnssec_policies,
             zone_stanzas=zone_stanzas,
+            zone_in_view=zone_in_view,
             zone_tls_statements=zone_tls_statements,
             # Issue #50 — this preview renders from ``ServerOptions`` alone,
             # which carries the operator's intent but not the cert material

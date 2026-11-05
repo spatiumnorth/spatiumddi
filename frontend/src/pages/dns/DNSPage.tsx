@@ -65,6 +65,7 @@ import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
+import { DnsMemoryBanner } from "./DnsMemoryBanner";
 import { DelegationModal } from "./DelegationModal";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
@@ -88,6 +89,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
+import { Field } from "@/pages/dhcp/_shared";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
@@ -132,6 +134,7 @@ import {
   type DNSGroupSyncResult,
   type ResolverPreset,
 } from "@/lib/api";
+import { feedSkippedTitle, feedSkippedTotal } from "@/lib/blocklistFeedSkipped";
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -209,23 +212,6 @@ function useDnsGrants() {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 type ApiError = { response?: { data?: { detail?: string } } };
 
@@ -3647,61 +3633,63 @@ function RecordModalForm({
           </Field>
         </div>
         <Field label="Value">
-          {type === "LUA" ? (
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <select
-                  className="rounded-md border bg-background px-2 py-1 text-xs"
-                  value=""
-                  onChange={(e) => {
-                    if (e.target.value) {
-                      setValue(e.target.value);
-                      e.target.value = "";
-                    }
-                  }}
-                  aria-label="Insert LUA snippet template"
+          {/* The label names the value box. The LUA snippet picker
+              beside it keeps its own name (#3509). */}
+          {type === "LUA" && (
+            <div className="flex items-center justify-between gap-2">
+              <select
+                className="rounded-md border bg-background px-2 py-1 text-xs"
+                value=""
+                onChange={(e) => {
+                  if (e.target.value) {
+                    setValue(e.target.value);
+                    e.target.value = "";
+                  }
+                }}
+                aria-label="Insert LUA snippet template"
+              >
+                <option value="">Insert snippet…</option>
+                <option
+                  value={`A "pickrandom({'10.0.0.1','10.0.0.2','10.0.0.3'})"`}
                 >
-                  <option value="">Insert snippet…</option>
-                  <option
-                    value={`A "pickrandom({'10.0.0.1','10.0.0.2','10.0.0.3'})"`}
-                  >
-                    pickrandom — round-robin A
-                  </option>
-                  <option value={`A "ifportup(443, {'10.0.0.1','10.0.0.2'})"`}>
-                    ifportup — failover by TCP probe
-                  </option>
-                  <option
-                    value={`A "ifurlup('https://example.com/health', {'10.0.0.1','10.0.0.2'})"`}
-                  >
-                    ifurlup — failover by HTTP(S) probe
-                  </option>
-                  <option
-                    value={`CNAME "createReverse('%5%.%4%.%3%.%2%.in-addr.arpa.')"`}
-                  >
-                    createReverse — generated PTR
-                  </option>
-                  <option
-                    value={`A "pickwhashed({{1, '10.0.0.1'}, {3, '10.0.0.2'}})"`}
-                  >
-                    pickwhashed — sticky weighted
-                  </option>
-                  <option value={`A "pickclosest({'10.0.0.1','192.168.1.1'})"`}>
-                    pickclosest — geo / latency
-                  </option>
-                </select>
-                <span className="text-[11px] text-muted-foreground">
-                  Templates are starting points — edit to fit your zone.
-                </span>
-              </div>
-              <textarea
-                className={`${inputCls} font-mono text-xs`}
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-                placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
-                rows={4}
-                required
-              />
+                  pickrandom — round-robin A
+                </option>
+                <option value={`A "ifportup(443, {'10.0.0.1','10.0.0.2'})"`}>
+                  ifportup — failover by TCP probe
+                </option>
+                <option
+                  value={`A "ifurlup('https://example.com/health', {'10.0.0.1','10.0.0.2'})"`}
+                >
+                  ifurlup — failover by HTTP(S) probe
+                </option>
+                <option
+                  value={`CNAME "createReverse('%5%.%4%.%3%.%2%.in-addr.arpa.')"`}
+                >
+                  createReverse — generated PTR
+                </option>
+                <option
+                  value={`A "pickwhashed({{1, '10.0.0.1'}, {3, '10.0.0.2'}})"`}
+                >
+                  pickwhashed — sticky weighted
+                </option>
+                <option value={`A "pickclosest({'10.0.0.1','192.168.1.1'})"`}>
+                  pickclosest — geo / latency
+                </option>
+              </select>
+              <span className="text-[11px] text-muted-foreground">
+                Templates are starting points — edit to fit your zone.
+              </span>
             </div>
+          )}
+          {type === "LUA" ? (
+            <textarea
+              className={`${inputCls} font-mono text-xs`}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
+              rows={4}
+              required
+            />
           ) : (
             <input
               className={inputCls}
@@ -6685,6 +6673,20 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </button>
       </div>
 
+      {hasBind && (
+        <DnsMemoryBanner
+          groupId={group.id}
+          refreshKey={JSON.stringify([
+            views.map((v) => v.id),
+            blocklists.map((b) => [
+              b.id,
+              b.applied_group_ids,
+              b.applied_view_ids,
+            ]),
+          ])}
+        />
+      )}
+
       {servers.length > 0 && !hasBind && (
         <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           <strong>This group runs no BIND9 server.</strong> Views and
@@ -8410,23 +8412,23 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         {forwardersEnabled && (
           <>
             <Field label="Use a well-known resolver">
-              <div className="space-y-2">
-                <select
-                  className={selCls}
-                  value=""
-                  onChange={(e) => applyResolverPreset(e.target.value)}
-                >
-                  <option value="">Choose a preset…</option>
-                  {presetsByProvider.map(([provider, items]) => (
-                    <optgroup key={provider} label={provider}>
-                      {items.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} — {p.filtering}
-                        </option>
-                      ))}
-                    </optgroup>
-                  ))}
-                </select>
+              <select
+                className={selCls}
+                value=""
+                onChange={(e) => applyResolverPreset(e.target.value)}
+              >
+                <option value="">Choose a preset…</option>
+                {presetsByProvider.map(([provider, items]) => (
+                  <optgroup key={provider} label={provider}>
+                    {items.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} — {p.filtering}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              <div className="space-y-2 pt-1">
                 <label className="flex items-center gap-2 text-xs text-muted-foreground">
                   <input
                     type="checkbox"
@@ -8444,24 +8446,22 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </div>
             </Field>
             <Field label="Upstream resolvers (one per line)">
-              <div className="space-y-1">
-                <textarea
-                  value={forwarders}
-                  onChange={(e) => {
-                    setForwarders(e.target.value);
-                    setDirty(true);
-                  }}
-                  className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
-                  placeholder={"1.1.1.1\n8.8.8.8"}
-                />
-                {/* The presets fill this box; they never police it. Say so,
-                    so nobody reads the picker above as a required choice. */}
-                <p className="text-xs text-muted-foreground">
-                  {appliedPreset
-                    ? `Recognised as ${appliedPreset.name}. Edit freely — any resolver address works, including your own.`
-                    : "Type any resolver address, or pick a preset above to fill this in. Addresses may pin a port as ip@port."}
-                </p>
-              </div>
+              <textarea
+                value={forwarders}
+                onChange={(e) => {
+                  setForwarders(e.target.value);
+                  setDirty(true);
+                }}
+                className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
+                placeholder={"1.1.1.1\n8.8.8.8"}
+              />
+              {/* The presets fill this box; they never police it. Say so,
+                  so nobody reads the picker above as a required choice. */}
+              <p className="text-xs text-muted-foreground">
+                {appliedPreset
+                  ? `Recognised as ${appliedPreset.name}. Edit freely — any resolver address works, including your own.`
+                  : "Type any resolver address, or pick a preset above to fill this in. Addresses may pin a port as ip@port."}
+              </p>
             </Field>
             {presetAdvisories.map((advisory) => (
               <p
@@ -10410,24 +10410,6 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
-/** Rules the last adblock refresh could not enforce (#2123); 0 when the
- *  counts were never recorded. */
-function feedSkippedTotal(l: DNSBlockList): number {
-  const s = l.feed_parse_skipped;
-  return s ? s.regex + s.modifier + s.badfilter + s.malformed : 0;
-}
-
-function feedSkippedTitle(l: DNSBlockList): string {
-  const s = l.feed_parse_skipped;
-  if (!s) return "";
-  return (
-    `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +
-    `enforce: ${s.regex} regex, ${s.modifier} with unsupported modifiers ` +
-    `($domain=, $third-party, …), ${s.badfilter} $badfilter, ` +
-    `${s.malformed} not a plain ||name^ rule.`
-  );
-}
-
 function BlocklistScopeModal({
   list,
   group,
@@ -10896,6 +10878,17 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           </button>
         </div>
       </div>
+      <DnsMemoryBanner
+        groupId={group.id}
+        refreshKey={JSON.stringify(
+          lists.map((b) => [
+            b.id,
+            b.applied_group_ids,
+            b.applied_view_ids,
+            b.entry_count,
+          ]),
+        )}
+      />
       {showCatalog && (
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}

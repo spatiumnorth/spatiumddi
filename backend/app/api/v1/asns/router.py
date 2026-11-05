@@ -494,7 +494,16 @@ async def refresh_asn_rpki(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> Refr
             source = candidate
 
     now = _dt.now(UTC)
-    summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+    from app.services.rpki_roa import RoaFetchError  # noqa: PLC0415
+
+    try:
+        summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+    except RoaFetchError as exc:
+        # The source could not be read: stored ROAs are untouched.
+        raise HTTPException(
+            status_code=502,
+            detail=f"RPKI refresh failed, stored ROAs kept: {exc}",
+        ) from exc
 
     write_audit(
         db,

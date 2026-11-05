@@ -9,6 +9,7 @@ Per docs/deployment/DNS_AGENT.md §6:
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,6 +36,10 @@ def mint_agent_token(
         "fingerprint": fingerprint,
         "typ": "dns_agent",
         "exp": expire,
+        # A unique id per mint: exp is whole seconds, so two tokens minted for
+        # one server in the same second would otherwise be byte-identical, and
+        # the stored hash could not tell the displaced one from its replacement.
+        "jti": uuid.uuid4().hex,
     }
     token = jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
     return token, expire
