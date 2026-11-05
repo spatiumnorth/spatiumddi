@@ -127,6 +127,9 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     # #2121 — the forward-zone transport helper is duplicated, whole, in the
     # agent; covered by the agent/dns/spatium_dns_agent/ carve-out.
     "test_zone_forward_transport.py": ("agent/dns/spatium_dns_agent/drivers/_forwarders.py"),
+    # #3518 — the served-apex rule is duplicated in the agent's BIND9 driver.
+    "test_zone_apex_parity_3518.py": ("agent/dns/spatium_dns_agent/drivers/bind9.py"),
+    "test_zone_apex_bundle_parity_3518.py": ("agent/dns/spatium_dns_agent/drivers/bind9.py"),
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs
     # its own nginx location block in BOTH shipped templates or it falls
