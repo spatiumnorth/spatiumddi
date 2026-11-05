@@ -19,7 +19,10 @@ opposite against the BIND we ship, and that validation keeps working:
 
 * the blocked signed name is rewritten for DO=1 and for DO=0 clients;
 * an unblocked signed name validates (AD bit);
-* a bogus-signed name answers SERVFAIL.
+* a bogus-signed name answers SERVFAIL;
+* a SafeSearch-style ``redirect`` entry (#878) — an RPZ CNAME rewrite of a
+  signed name onto another signed name — answers the redirect target, with
+  the target's address, for DO=1 and DO=0 clients.
 
 A negative control re-runs the resolver with ``break-dnssec no``, where a
 DO=1 query for the blocked name must get the real (signed) answer — which
@@ -47,6 +50,11 @@ _GOOD = "good.example.com."
 _BOGUS = "bogus.example.com."
 _BOGUS_SIGNED_ADDR = "192.0.2.66"
 _BOGUS_SERVED_ADDR = "192.0.2.99"
+# SafeSearch shape (#878): a redirect of one signed name onto another.
+_SEARCH = "search.example.com."
+_SEARCH_REAL_ADDR = "192.0.2.30"
+_SAFE = "safe.example.com."
+_SAFE_ADDR = "192.0.2.40"
 
 _FAILURES: list[str] = []
 
@@ -99,6 +107,8 @@ ns1      A   127.0.0.1
 good     A   192.0.2.20
 blocked  A   192.0.2.10
 bogus    A   {_BOGUS_SIGNED_ADDR}
+search   A   {_SEARCH_REAL_ADDR}
+safe     A   {_SAFE_ADDR}
 """
     zone = dns.zone.from_text(text, origin=_ZONE, relativize=False)
     with zone.writer() as txn:
@@ -180,7 +190,12 @@ def _bundle(ksk_b64: str, views: bool = False) -> dict:
                         "domain": _BLOCKED.rstrip("."),
                         "action": "block",
                         "block_mode": "nxdomain",
-                    }
+                    },
+                    {
+                        "domain": _SEARCH.rstrip("."),
+                        "action": "redirect",
+                        "target": _SAFE.rstrip("."),
+                    },
                 ],
                 "exceptions": [],
                 "view_name": None,
@@ -250,6 +265,17 @@ def _summary(resp) -> tuple[str, bool, list[str]]:
 
     addrs = [r.to_text() for rrset in resp.answer if rrset.rdtype == dns.rdatatype.A for r in rrset]
     return dns.rcode.to_text(resp.rcode()), bool(resp.flags & dns.flags.AD), addrs
+
+
+def _cname_targets(resp) -> list[str]:
+    import dns.rdatatype
+
+    return [
+        r.target.to_text()
+        for rrset in resp.answer
+        if rrset.rdtype == dns.rdatatype.CNAME
+        for r in rrset
+    ]
 
 
 def _run_resolver(
@@ -344,6 +370,17 @@ def main() -> int:
                     check(f"{tag}: unblocked signed name validates (AD)", ad, f"AD={ad}")
             for do in (True, False):
                 tag = "DO=1" if do else "DO=0"
+                _dig(_SEARCH, do)
+                resp = _query(_SEARCH, do)
+                rcode, _ad, addrs = _summary(resp)
+                cnames = _cname_targets(resp)
+                check(
+                    f"{tag}: SafeSearch-style redirect of a signed name answers the target",
+                    rcode == "NOERROR" and cnames == [_SAFE] and addrs == [_SAFE_ADDR],
+                    f"{rcode} CNAME={cnames} {addrs}",
+                )
+            for do in (True, False):
+                tag = "DO=1" if do else "DO=0"
                 _dig(_BOGUS, do)
                 rcode, _ad, addrs = _summary(_query(_BOGUS, do))
                 check(
@@ -375,6 +412,14 @@ def main() -> int:
                 "control (break-dnssec no): DO=1 blocked name gets the real, "
                 "validated answer — so the DO=1 checks above hit a signed name",
                 rcode == "NOERROR" and addrs == ["192.0.2.10"] and ad,
+                f"{rcode} {addrs} AD={ad}",
+            )
+            _dig(_SEARCH, True)
+            rcode, ad, addrs = _summary(_query(_SEARCH, True))
+            check(
+                "control (break-dnssec no): DO=1 redirected name gets the real, "
+                "validated answer — so the DO=1 redirect check above hit a signed name",
+                rcode == "NOERROR" and addrs == [_SEARCH_REAL_ADDR] and ad,
                 f"{rcode} {addrs} AD={ad}",
             )
 

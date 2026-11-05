@@ -1440,6 +1440,10 @@ letting one silently win.
   Before [#3563](https://github.com/spatiumnorth/spatiumddi/issues/3563)
   the agent forced `dnssec-validation no` on any group with a blocklist,
   silently, while Settings still showed validation on.
+  A consequence on upgrade: a filtered group that forwards to resolvers
+  which strip DNSSEC records now answers SERVFAIL for signed names, as an
+  unfiltered group with the same forwarders always has. Use DNSSEC-clean
+  forwarders, or set the group's validation to `no` explicitly.
 
 #### How often are feeds refreshed?
 

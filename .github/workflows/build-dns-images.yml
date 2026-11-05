@@ -117,8 +117,10 @@ jobs:
       # Issue #3563 — a blocklist must not switch DNSSEC validation off. Signs
       # example.com. locally, serves it from a second named, and asserts that
       # the agent-rendered resolver rewrites a blocked signed name for DO=1
-      # and DO=0 clients, sets AD on an unblocked one, and SERVFAILs a
-      # bogus-signed one (global and per-view response-policy).
+      # and DO=0 clients, answers a SafeSearch-style redirect (#878) of a
+      # signed name with its target, sets AD on an unblocked one, and
+      # SERVFAILs a bogus-signed one (global and per-view response-policy).
+      # Exits non-zero on any failed expectation; never skips.
       - name: RPZ + DNSSEC validation check (bind9)
         if: matrix.flavor == 'bind9'
         run: |
