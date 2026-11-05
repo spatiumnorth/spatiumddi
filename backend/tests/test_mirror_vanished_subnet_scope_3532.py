@@ -16,6 +16,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +47,7 @@ from tests.test_kubernetes_reconcile import _FakeClient as _K8sClient
 from tests.test_kubernetes_reconcile import _make_cluster
 from tests.test_kubernetes_reconcile import _patch_client as _k8s_patch
 from tests.test_subnet_trash_retracts_dns_1906 import _dns
+from tests.test_tailscale_token_expiry_2138 import _headers
 
 _INC = {"include_deleted": True}
 
@@ -592,3 +594,77 @@ async def test_wrapper_with_a_child_block_is_not_deleted_into_it(
     db_session.expire_all()
     assert await _exists(db_session, IPBlock, child_id)
     assert await _exists(db_session, IPBlock, wrapper_id)
+
+
+async def _dashboard_warnings(
+    client: AsyncClient, db: AsyncSession, kind: str, target_id, network: str
+) -> None:
+    """The kept subnet's warning reaches the Integrations dashboard (#3532):
+    the recent-warnings list names the subnet and the reason, and the
+    target's own row carries it as its sync warning."""
+    h = await _headers(db)
+    await db.commit()
+    r = await client.get("/api/v1/dashboards/integrations/summary", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    mine = [w for w in body["recent_warnings"] if w["target_id"] == str(target_id)]
+    assert len(mine) == 1, body["recent_warnings"]
+    assert network in mine[0]["error_detail"]
+    assert "operator content" in mine[0]["error_detail"]
+    assert "dhcp_scope" in mine[0]["error_detail"]
+    panel = next(p for p in body["panels"] if p["kind"] == kind)
+    row = next(t for t in panel["targets"] if t["id"] == str(target_id))
+    assert network in (row["last_sync_warning"] or "")
+    assert row["last_sync_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_docker_kept_subnet_warning_reaches_the_dashboard(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    space, host, subnets = await _mirror(db_session, ["198.19.219.0/24"])
+    await _scope(db_session, subnets["198.19.219.0/24"], "198.19.219", trashed=False)
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        assert (await reconcile_host(db_session, host)).ok
+    await _dashboard_warnings(client, db_session, "docker", host.id, "198.19.219.0/24")
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_kept_subnet_warning_reaches_the_dashboard(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    space = await _make_space(db_session)
+    cluster = await _make_cluster(db_session, space)
+    await db_session.commit()
+    with _k8s_patch(_K8sClient()):
+        assert (await reconcile_cluster(db_session, cluster)).error is None
+    sid = await db_session.scalar(select(Subnet.id).where(Subnet.network == "10.96.0.0/12"))
+    await _scope(db_session, sid, "10.96.0", trashed=False)
+    await db_session.refresh(cluster)
+    cluster.service_cidr = ""
+    await db_session.commit()
+    with _k8s_patch(_K8sClient()):
+        assert (await reconcile_cluster(db_session, cluster)).error is None
+    await _dashboard_warnings(client, db_session, "kubernetes", cluster.id, "10.96.0.0/12")
+
+
+@pytest.mark.asyncio
+async def test_firewall_kept_subnet_warning_reaches_the_dashboard(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    space = await _make_space(db_session)
+    fw = await _make_fw(db_session, space, mirror_interfaces=True)
+    await db_session.commit()
+    ifaces = [
+        _FortiInterface(name="port1", cidr="10.31.0.0/24", address="10.31.0.1", zone="lan"),
+        _FortiInterface(name="port2", cidr="10.31.1.0/24", address="10.31.1.1", zone="lan"),
+    ]
+    with _forti_patch(_FortiClient(interfaces=ifaces)):
+        assert (await reconcile_firewall(db_session, fw)).ok
+    sid = await db_session.scalar(select(Subnet.id).where(Subnet.network == "10.31.1.0/24"))
+    await _scope(db_session, sid, "10.31.1", trashed=False)
+    await db_session.refresh(fw)
+    with _forti_patch(_FortiClient(interfaces=ifaces[:1])):
+        assert (await reconcile_firewall(db_session, fw)).ok
+    await _dashboard_warnings(client, db_session, "fortinet", fw.id, "10.31.1.0/24")

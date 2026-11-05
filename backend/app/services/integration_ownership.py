@@ -67,8 +67,9 @@ INTEGRATION_OWNERSHIP: dict[str, str] = {
 INTEGRATION_OWNERSHIP_FKS: frozenset[str] = frozenset(INTEGRATION_OWNERSHIP)
 
 # #2577 — the audit action of the row ``release_outside_space`` writes for each
-# release, one per target per sync that released anything. The Integrations
-# dashboard lists these as reconciler warnings.
+# release, one per target per sync that released anything. #3532: also the row
+# ``retire_vanished_subnet`` writes when it keeps a subnet whose source network
+# is gone. The Integrations dashboard lists these as reconciler warnings.
 RELEASE_AUDIT_ACTION = "integration.release_outside_space"
 
 # #2577 — the sync error of a target whose IP space is in Trash. The sync
@@ -403,11 +404,38 @@ async def retire_vanished_subnet(
                 result="success",
             ),
         )
+        message = (
+            f"subnet {subnet.network} left {integration} but was kept and released "
+            f"for its operator content ({', '.join(reasons)}) (#3532)"
+        )
         if warnings is not None:
-            warnings.append(
-                f"subnet {subnet.network} left {integration} but was kept and released "
-                f"for its operator content ({', '.join(reasons)}) (#3532)"
-            )
+            warnings.append(message)
+        # ``summary.warnings`` is read by no surface for most mirrors, so the
+        # operator would never see it. The Integrations dashboard lists these
+        # rows as reconciler warnings (and as the target's sync warning), the
+        # same as a release outside the target's IP space.
+        target_model = ownership_target_model(own_fk)
+        target_name = (
+            await db.execute(select(target_model.name).where(target_model.id == target_id))
+        ).scalar_one_or_none()
+        _defer_audit(
+            db,
+            AuditLog(
+                user_display_name="system",
+                auth_source="system",
+                action=RELEASE_AUDIT_ACTION,
+                resource_type=ownership_resource_type(own_fk),
+                resource_id=str(target_id),
+                resource_display=str(target_name) if target_name is not None else str(target_id),
+                result="success",
+                new_value={
+                    "subnet_id": str(subnet.id),
+                    "network": str(subnet.network),
+                    "kept_for": reasons,
+                    "message": message,
+                },
+            ),
+        )
         return True
     await retract_address_dns(db, subnet_ids=[subnet.id])
     _defer_audit(
