@@ -59,7 +59,7 @@ from uuid import UUID
 import structlog
 from fastapi import HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, not_, select
+from sqlalchemy import String, and_, cast, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -89,13 +89,15 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
 
     Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, plus
     the reverse zones a subnet, block or space delete then retires into that
-    batch, chosen by the apply's own rule, so the preview reflects exactly what
-    would be soft-deleted right now. Counts are grouped by resource type and
-    rendered in a fixed order so the string is deterministic for a given set of
-    rows (the approve-time drift compare is a plain string equality, so ordering
-    must not jitter). The root row itself is excluded from the cascade counts
-    (it's the target, not collateral)."""
+    batch, chosen by the apply's own rule, and the records of the batch's
+    addresses it retracts into the batch from zones that stay, so the preview
+    reflects exactly what would be soft-deleted right now. Counts are grouped
+    by resource type and rendered in a fixed order so the string is
+    deterministic for a given set of rows (the approve-time drift compare is a
+    plain string equality, so ordering must not jitter). The root row itself is
+    excluded from the cascade counts (it's the target, not collateral)."""
     # Local import — keep the soft_delete dependency off module load.
+    from app.services.dns.record_ops import count_records_to_retract  # noqa: PLC0415
     from app.services.dns.reverse_zone import add_retiring_reverse_zones  # noqa: PLC0415
     from app.services.soft_delete import (  # noqa: PLC0415
         _resource_type,
@@ -112,6 +114,12 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     counts = batch.counts()
     root_rt = _resource_type(root)
     counts[root_rt] = counts.get(root_rt, 0) - 1
+    # The apply then retracts into the batch the records of its subnets'
+    # addresses in zones that stay (#1906); counted with the batch's records,
+    # as the trash holds them (#3536).
+    retracted = await count_records_to_retract(db, batch, not_(_mirrors_torn_down_first(root)))
+    if retracted:
+        counts["dns_record"] = counts.get("dns_record", 0) + retracted
     labels = {
         "ip_block": "child block",
         "subnet": "subnet",
@@ -144,6 +152,44 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     if not parts:
         return "cascades nothing (empty)"
     return "cascades " + ", ".join(parts)
+
+
+def _mirrors_torn_down_first(root: Any) -> Any:
+    """The addresses a soft delete of ``root`` deletes before its stamp, as a
+    condition on ``IPAddress``: the lease and reservation mirrors of each live
+    scope on their subnet, which the batch holds
+    (``_purge_leases_for_scope_batch``), and for a subnet its every lease
+    mirror (``_revoke_subnet_lease_mirrors``). Their records go with them, so
+    the retraction never sees them, and neither does the preview's count of it
+    (spatiumddi#3536)."""
+    from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+
+    own_scope = and_(DHCPScope.subnet_id == IPAddress.subnet_id, DHCPScope.deleted_at.is_(None))
+    # The column tests first: they spare every other address the subqueries.
+    torn = [
+        and_(
+            IPAddress.auto_from_lease.is_(True),
+            select(DHCPLease.id)
+            .join(DHCPScope, DHCPScope.id == DHCPLease.scope_id)
+            .where(own_scope, DHCPLease.ip_address == IPAddress.address)
+            .exists(),
+        ),
+        and_(
+            IPAddress.static_assignment_id.is_not(None),
+            # Trashed reservations too, as ``remove_ipam_for_scope_statics`` reads them.
+            select(DHCPStaticAssignment.id)
+            .join(DHCPScope, DHCPScope.id == DHCPStaticAssignment.scope_id)
+            .where(
+                own_scope, cast(DHCPStaticAssignment.id, String) == IPAddress.static_assignment_id
+            )
+            .execution_options(include_deleted=True)
+            .exists(),
+        ),
+    ]
+    if isinstance(root, Subnet):
+        torn.insert(0, and_(IPAddress.subnet_id == root.id, IPAddress.auto_from_lease.is_(True)))
+    return or_(*torn)
 
 
 async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUID]:
