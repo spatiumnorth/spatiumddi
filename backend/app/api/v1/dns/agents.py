@@ -2065,7 +2065,8 @@ async def agent_query_log_entries(
     rpz_cutoff = now - timedelta(days=RPZ_HIT_RETENTION_DAYS)
     inserted = 0
     expired = 0
-    no_partition = 0
+    no_query_partition = 0
+    no_rpz_partition = 0
     rpz_inserted = 0
     responses_matched = 0
     # Query rows added in THIS batch, keyed for the response line that
@@ -2097,7 +2098,7 @@ async def agent_query_log_entries(
                     expired += 1
                     continue
                 if rpz_storable is not None and not rpz_storable.contains(rpz.ts):
-                    no_partition += 1
+                    no_rpz_partition += 1
                     continue
                 db.add(
                     DNSRPZHit(
@@ -2139,7 +2140,7 @@ async def agent_query_log_entries(
             expired += 1
             continue
         if not query_storable.contains(parsed.ts):
-            no_partition += 1
+            no_query_partition += 1
             continue
         entry = DNSQueryLogEntry(
             server_id=server.id,
@@ -2164,14 +2165,18 @@ async def agent_query_log_entries(
 
     deferred_matched = await _stamp_deferred_responses(db, server.id, deferred)
     await db.commit()
-    if no_partition:
-        logger.warning(
-            "log_lines_without_partition",
-            stream="dns.query_log",
-            server_id=str(server.id),
-            lines=no_partition,
-            covered_until=query_storable.upper.isoformat() if query_storable.upper else None,
-        )
+    for stream, lines, covered in (
+        ("dns.query_log", no_query_partition, query_storable),
+        ("dns.rpz_hit", no_rpz_partition, rpz_storable),
+    ):
+        if lines:
+            logger.warning(
+                "log_lines_without_partition",
+                stream=stream,
+                server_id=str(server.id),
+                lines=lines,
+                covered_until=covered.upper.isoformat() if covered and covered.upper else None,
+            )
     return {
         "status": "ok",
         "inserted": inserted,
@@ -2183,7 +2188,7 @@ async def agent_query_log_entries(
         "responses_unmatched": len(deferred) - deferred_matched,
         "dropped": dropped,
         "expired": expired,
-        "no_partition": no_partition,
+        "no_partition": no_query_partition + no_rpz_partition,
     }
 
 

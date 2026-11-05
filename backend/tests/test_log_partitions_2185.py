@@ -11,6 +11,8 @@ lifecycle tests start from none, at a fixed clock, and put them back after.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 
@@ -19,7 +21,9 @@ import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from structlog.testing import capture_logs
 
+from app.api.v1.admin.postgres import postgres_table_sizes
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.feature_module import FeatureModule
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
@@ -34,6 +38,7 @@ from app.services.logs.partitions import (
     list_partitions,
     maintain,
 )
+from app.services.support_bundle.collect import collect_table_sizes
 from tests.conftest import _test_engine, create_test_log_partitions
 from tests.test_agent_spool_ingest import (
     _bind_line,
@@ -414,22 +419,29 @@ async def test_ingest_sorts_rpz_hits_the_same_way(
     now = datetime.now(UTC)
     stamp = "%d-%b-%Y %H:%M:%S.000"
 
-    r = await _post(
-        client,
-        "dns",
-        dns,
-        "query-log-entries",
-        {
-            "lines": [
-                _RPZ.format(ts=now.strftime(stamp)),
-                _RPZ.format(ts=(now + timedelta(days=30)).strftime(stamp)),
-                _RPZ.format(ts=(now - timedelta(days=40)).strftime(stamp)),
-            ]
-        },
-    )
+    with capture_logs() as logs:
+        r = await _post(
+            client,
+            "dns",
+            dns,
+            "query-log-entries",
+            {
+                "lines": [
+                    _RPZ.format(ts=now.strftime(stamp)),
+                    _RPZ.format(ts=(now + timedelta(days=30)).strftime(stamp)),
+                    _RPZ.format(ts=(now - timedelta(days=40)).strftime(stamp)),
+                ]
+            },
+        )
 
     assert _counts(r, "rpz_inserted", "expired", "no_partition") == (1, 1, 1)
     assert await db_session.scalar(select(func.count()).select_from(DNSRPZHit)) == 1
+    # The warning names the table that had no room, with that table's coverage.
+    db_session.expire_all()
+    [warning] = [e for e in logs if e["event"] == "log_lines_without_partition"]
+    assert warning["stream"] == "dns.rpz_hit"
+    assert warning["lines"] == 1
+    assert warning["covered_until"] == (await coverage(db_session, DNS_RPZ_HIT)).upper.isoformat()
 
 
 # ── the table behaves as the one it replaced ──────────────────────────────
@@ -457,7 +469,10 @@ async def test_an_insert_that_names_no_id_gets_the_next_one(db_session: AsyncSes
     assert len(ids) == 2 and ids[0] < ids[1]
 
 
-async def test_a_servers_log_rows_go_when_the_server_does(db_session: AsyncSession) -> None:
+async def test_a_deleted_servers_log_rows_wait_for_the_retention_window(
+    db_session: AsyncSession,
+) -> None:
+    """There is no foreign key: see ``app.models.logs``."""
     dns = await _dns_server(db_session)
     db_session.add(DNSQueryLogEntry(server_id=dns.id, ts=datetime.now(UTC), qname="a", raw=""))
     await db_session.commit()
@@ -465,7 +480,67 @@ async def test_a_servers_log_rows_go_when_the_server_does(db_session: AsyncSessi
     await db_session.execute(text("DELETE FROM dns_server WHERE id = :i"), {"i": dns.id})
     await db_session.commit()
 
-    assert await db_session.scalar(select(func.count()).select_from(DNSQueryLogEntry)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(DNSQueryLogEntry)) == 1
+
+
+async def test_maintenance_runs_behind_the_agents_long_polls(bare: AsyncConnection) -> None:
+    """A connected agent's session sits idle in a transaction holding a read on
+    its server table, nearly all the time (#2185). Creating, retiring and
+    sweeping an orphan need nothing from that table, so none of them waits."""
+    async with _test_engine.connect() as poll:
+        await poll.execute(text("SELECT count(*) FROM dns_server"))
+        await poll.execute(text("SELECT count(*) FROM dhcp_server"))
+        for table in LOG_TABLES:
+            created = await maintain(bare, table, 24, now=NOW)
+            assert (created.created > 0, created.failed) == (True, 0), table.name
+            await bare.exec_driver_sql(f'CREATE TABLE "{table.name}_p20260101" (LIKE {table.name})')
+
+            later = await maintain(bare, table, 24, now=NOW + timedelta(days=40))
+
+            assert later.failed == 0, (table.name, later.errors)
+            assert later.dropped > 0 and later.orphans_dropped == 1, table.name
+        await poll.rollback()
+
+
+async def test_the_parent_is_analyzed_once_a_day(
+    bare: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Autovacuum never analyzes a partitioned table."""
+    monkeypatch.setattr(lp, "ANALYZE_EVERY", timedelta(0))
+    assert (await maintain(bare, DHCP_LOG, 24, now=NOW)).analyzed
+    assert (
+        await bare.scalar(
+            text("SELECT last_analyze FROM pg_stat_all_tables WHERE relname = 'dhcp_log_entry'")
+        )
+        is not None
+    )
+
+    monkeypatch.setattr(lp, "ANALYZE_EVERY", timedelta(days=1))
+    assert not (await maintain(bare, DHCP_LOG, 24, now=NOW)).analyzed
+
+
+async def test_sizes_add_a_partitioned_table_up_to_one_row(db_session: AsyncSession) -> None:
+    """The Admin → Postgres page and the support bundle exist to answer "how big
+    is the query log", which dozens of partition rows do not."""
+    await db_session.execute(
+        text("INSERT INTO dhcp_log_entry (server_id, ts, raw) VALUES (:s, now(), '')"),
+        {"s": "00000000-0000-0000-0000-000000000001"},
+    )
+    await db_session.commit()
+
+    page = (await postgres_table_sizes(db_session, None, limit=500)).rows
+    bundle = json.loads(await collect_table_sizes(db_session))["tables"]
+
+    pattern = lp.partition_name_pattern("dhcp_log_entry")
+    assert not [r for r in page if re.fullmatch(pattern, r.table_name)]
+    assert not [t for t in bundle if re.fullmatch(pattern, t["table"])]
+    [row] = [r for r in page if r.table_name == "dhcp_log_entry"]
+    assert row.total_bytes > 0
+    assert row.index_bytes > 0
+    [entry] = [t for t in bundle if t["table"] == "dhcp_log_entry"]
+    assert entry["total_bytes"] == row.total_bytes
+    # Tables that are not partitioned still report what they always did.
+    assert [r.table_name for r in page].count("dns_server") == 1
 
 
 # ── reading the catalog ───────────────────────────────────────────────────
@@ -573,6 +648,50 @@ async def test_health_says_when_current_lines_have_nowhere_to_go(
     assert "dns_query_log_entry" in detail
 
 
+async def test_health_warns_when_retention_falls_behind(
+    bare: AsyncConnection, db_session: AsyncSession
+) -> None:
+    """A detach or a drop that keeps failing leaves rows past what the setting
+    promises, and nothing else says so."""
+    now = datetime.now(UTC)
+    for table in LOG_TABLES:
+        await maintain(bare, table, 24, now=now)
+    start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async def attach(lower: datetime) -> str:
+        name = f"dhcp_log_entry_p{lower:%Y%m%d}"
+        await bare.exec_driver_sql(
+            f"CREATE TABLE {name} PARTITION OF dhcp_log_entry "
+            f"FOR VALUES FROM ('{lower.isoformat()}') TO ('{(lower + timedelta(days=1)).isoformat()}')"
+        )
+        return name
+
+    # Past the window by less than its own length: the next tick's to drop.
+    await attach(start - timedelta(days=1))
+    assert (await lp.partition_health(db_session, now=now))[0] == "ok"
+
+    stuck = await attach(start - timedelta(days=3))
+    status, detail = await lp.partition_health(db_session, now=now)
+    assert status == "warn"
+    assert stuck in detail
+
+    await bare.exec_driver_sql(f"DROP TABLE {stuck}")
+    # Left behind by a crash, with no bounds in the catalog; its name dates it.
+    await bare.exec_driver_sql(
+        f"CREATE TABLE dhcp_log_entry_p{start - timedelta(days=3):%Y%m%d} (LIKE dhcp_log_entry)"
+    )
+    status, detail = await lp.partition_health(db_session, now=now)
+    assert status == "warn"
+    assert stuck in detail
+
+    # A crash can also leave one that was about to be attached, ahead of now.
+    await bare.exec_driver_sql(f"DROP TABLE {stuck}")
+    await bare.exec_driver_sql(
+        f"CREATE TABLE dhcp_log_entry_p{now + timedelta(days=9):%Y%m%d} (LIKE dhcp_log_entry)"
+    )
+    assert (await lp.partition_health(db_session, now=now))[0] == "ok"
+
+
 async def test_platform_health_lists_the_log_partitions(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -587,4 +706,5 @@ async def test_platform_health_lists_the_log_partitions(
 
     assert r.status_code == 200, r.text
     component = next(c for c in r.json()["components"] if c["name"] == "log-partitions")
-    assert component["status"] == "ok", component
+    # The suite's partitions reach back past the window on purpose.
+    assert component["status"] in ("ok", "warn"), component

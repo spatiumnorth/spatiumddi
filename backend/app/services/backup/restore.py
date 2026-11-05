@@ -570,6 +570,12 @@ async def _replay_clean(
         raise BackupRestoreError(
             f"replay failed (psql exit {psql.returncode}): {err}; nothing was applied"
         )
+    for line in (await psql_stderr).decode(errors="replace").splitlines():
+        if _RESTORE_DROPPED_ROWS in line:
+            logger.warning(
+                "backup_restore_rows_outside_partitions",
+                detail=line.split(_RESTORE_DROPPED_ROWS + ": ", 1)[-1],
+            )
 
 
 async def _run_psql(script: bytes | Path, db_url: str) -> None:
@@ -836,6 +842,21 @@ async def _route_partition_copies(chunks, parents: dict[str, str]):
         yield pending
 
 
+#: A temporary default partition is about to be dropped with whatever rows it
+#: caught. psql prints the warning on stderr, and :func:`_replay_clean` logs it.
+_RESTORE_DROPPED_ROWS = "spatium_restore_dropped_rows"
+_COUNT_RESTORE_DEFAULT_SQL = f"""\
+DO $count$
+DECLARE n bigint;
+BEGIN
+  SELECT count(*) INTO n FROM "public"."{{default}}";
+  IF n > 0 THEN
+    RAISE WARNING '{_RESTORE_DROPPED_ROWS}: table={{table}} rows=%', n;
+  END IF;
+END $count$;
+"""
+
+
 def _selective_prelude(tables: list[str], partitioned: list[str] | None = None) -> str:
     """What a selective replay runs before the archive's rows, in the same
     transaction: take the locks the way the full restore's clearing does,
@@ -894,7 +915,9 @@ def _selective_postlude(tables: list[str], partitioned: list[str] | None = None)
     (:data:`_PUT_SEQUENCES_PAST_THEIR_ROWS_SQL`)."""
     return (
         "".join(
-            f'DROP TABLE "public"."{_restore_default_partition(t)}";\n' for t in partitioned or ()
+            _COUNT_RESTORE_DEFAULT_SQL.format(table=t, default=_restore_default_partition(t))
+            + f'DROP TABLE "public"."{_restore_default_partition(t)}";\n'
+            for t in partitioned or ()
         )
         + _PUT_BACK_FOREIGN_KEYS_SQL
         + _PUT_SEQUENCES_PAST_THEIR_ROWS_SQL.format(tables=_sql_text_array(tables))

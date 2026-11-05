@@ -1116,8 +1116,8 @@ class SettingsUpdate(BaseModel):
     # revoked-appliance hard-delete off (keep forever), as each task
     # already reads it. pcap / metric / log windows have no "off": a
     # capture holds plaintext credentials, and the other two are
-    # high-volume tables. ``log_retention_hours`` is capped at 168 until
-    # #2185 replaces the single unbatched DELETE with partition drops.
+    # high-volume tables. ``log_retention_hours`` is capped at 168; longer
+    # history belongs in Loki or a SIEM.
     soft_delete_purge_days: int | None = Field(default=None, ge=0, le=365)
     dhcp_lease_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
     pcap_retention_days: int | None = Field(default=None, ge=1, le=90)

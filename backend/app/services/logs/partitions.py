@@ -11,10 +11,6 @@ the control plane's own reads and writes.
 * **create ahead** — a partition is created as a plain table and then
   ``ATTACH``ed, which takes ``SHARE UPDATE EXCLUSIVE`` on the parent, so it
   neither waits for a long reader nor queues the agents' inserts behind it.
-  (Attaching also takes ``SHARE ROW EXCLUSIVE`` on ``dns_server`` /
-  ``dhcp_server`` for the foreign key, and dropping a retired partition
-  ``ACCESS EXCLUSIVE``, both for milliseconds and under a short
-  ``lock_timeout``: see :data:`LOCK_TIMEOUT_MS`.)
   Partitions are created from the end of the last one, so the ranges never
   overlap and a few skipped ticks change nothing.
 * **retire** — a partition whose whole range is older than the retention
@@ -24,6 +20,11 @@ the control plane's own reads and writes.
   ``DETACH ... FINALIZE``.
 * **orphans** — a table left by a crash between the two statements of either
   step is dropped on the next tick.
+* **statistics** — autovacuum never analyzes a partitioned table, so the
+  parent is analyzed here once per :data:`ANALYZE_EVERY`.
+
+Maintenance never touches ``dns_server`` / ``dhcp_server``: the log tables have
+no foreign key into them (see ``app.models.logs``).
 
 There is deliberately no ``DEFAULT`` partition. Ingest drops lines outside
 what the partitions cover (:func:`coverage`), counted with the lines that
@@ -93,13 +94,12 @@ MAX_CREATES_PER_TICK = 400
 LOCK_NAMESPACE = 0x4C4F4750  # "LOGP"
 #: Every DDL statement here waits at most this long for its lock; a timeout is
 #: retried by the next tick, and partitions are created a day or more ahead,
-#: so a missed tick costs nothing. Kept short because of the foreign key:
-#: attaching or detaching a partition takes ``SHARE ROW EXCLUSIVE`` on
-#: ``dns_server`` / ``dhcp_server``, and dropping a retired one takes ``ACCESS
-#: EXCLUSIVE`` there. Normally that is held for milliseconds; this bounds how
-#: long the server table's writers (and, for the drop, its readers) can queue
-#: behind a statement that is itself waiting.
+#: so a missed tick costs nothing. Kept short because a statement waiting for
+#: a lock holds up everything that queues behind it.
 LOCK_TIMEOUT_MS = 500
+
+#: How often a partitioned table's own planner statistics are refreshed.
+ANALYZE_EVERY = DAY
 
 #: How long a process trusts what it read of a table's partitions.
 COVERAGE_TTL_S = 30.0
@@ -150,6 +150,7 @@ class MaintenanceResult:
     dropped: int = 0
     finalized: int = 0
     orphans_dropped: int = 0
+    analyzed: bool = False
     failed: int = 0
     skipped_locked: bool = False
     errors: list[str] = field(default_factory=list)
@@ -160,6 +161,7 @@ class MaintenanceResult:
             "dropped": self.dropped,
             "finalized": self.finalized,
             "orphans_dropped": self.orphans_dropped,
+            "analyzed": self.analyzed,
             "failed": self.failed,
             "skipped_locked": self.skipped_locked,
         }
@@ -281,7 +283,7 @@ async def _lock(conn: AsyncConnection, table: str, *, acquire: bool) -> bool:
     return bool(row.scalar())
 
 
-async def _drop_orphans(conn: AsyncConnection, table: str, result: MaintenanceResult) -> None:
+async def _list_orphans(conn: AsyncConnection | AsyncSession, table: str) -> list[str]:
     rows = await conn.execute(
         text(
             "SELECT c.relname FROM pg_class c "
@@ -290,7 +292,11 @@ async def _drop_orphans(conn: AsyncConnection, table: str, result: MaintenanceRe
         ),
         {"pattern": _orphan_pattern(table)},
     )
-    for (name,) in rows.fetchall():
+    return [name for (name,) in rows.fetchall()]
+
+
+async def _drop_orphans(conn: AsyncConnection, table: str, result: MaintenanceResult) -> None:
+    for name in await _list_orphans(conn, table):
         try:
             await conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{name}"')
         except DBAPIError as exc:
@@ -393,6 +399,29 @@ async def _retire(
         result.dropped += 1
 
 
+async def _analyze(conn: AsyncConnection, table: LogTable, result: MaintenanceResult) -> None:
+    # Judged by the database's clock, the one ``last_analyze`` is written with.
+    due = (
+        await conn.execute(
+            text(
+                "SELECT coalesce(max(last_analyze) < now() - make_interval(secs => :age), true) "
+                "FROM pg_stat_all_tables WHERE relid = to_regclass(:t)"
+            ),
+            {"t": table.name, "age": ANALYZE_EVERY.total_seconds()},
+        )
+    ).scalar()
+    if not due:
+        return
+    try:
+        await conn.exec_driver_sql(f'ANALYZE "{table.name}"')
+    except DBAPIError as exc:
+        result.failed += 1
+        result.errors.append(f"analyze {table.name}: {exc.orig!r}")
+        logger.warning("log_partition_analyze_failed", table=table.name, error=repr(exc.orig))
+        return
+    result.analyzed = True
+
+
 async def maintain(
     conn: AsyncConnection,
     table: LogTable,
@@ -420,6 +449,7 @@ async def maintain(
         await _drop_orphans(conn, table.name, result)
         await _create_ahead(conn, table, window, now, result)
         await _retire(conn, table, window, now, result)
+        await _analyze(conn, table, result)
     finally:
         # The connection may go back to a pool: leave it as it came.
         await conn.execute(
@@ -465,23 +495,50 @@ async def maintain_all(sessions: async_sessionmaker[AsyncSession]) -> dict[str, 
     return out
 
 
+def _orphan_bounds(table: str, name: str) -> tuple[datetime, datetime]:
+    """The range a partition's name says it had: the catalog forgot it when it
+    was detached, and a table that was never attached has none."""
+    stamp = name.removeprefix(f"{table}_p")
+    if len(stamp) == len("YYYYMMDD"):
+        lower = datetime.strptime(stamp, "%Y%m%d").replace(tzinfo=UTC)
+        return lower, lower + DAY
+    lower = datetime.strptime(stamp, "%Y%m%d%H").replace(tzinfo=UTC)
+    return lower, lower + HOUR
+
+
+async def _overdue(db: AsyncSession, table: LogTable, cutoff: datetime) -> list[str]:
+    """Partitions of ``table`` retention should have dropped by now: more than
+    one partition's length past ``cutoff``, the margin a normal tick needs."""
+    ranges = [
+        (p.name, p.lower, p.upper)
+        for p in await list_partitions(db, table.name)
+        if p.lower is not None and p.upper is not None
+    ] + [(name, *_orphan_bounds(table.name, name)) for name in await _list_orphans(db, table.name)]
+    return sorted(name for name, lower, upper in ranges if cutoff - upper > upper - lower)
+
+
 async def partition_health(db: AsyncSession, *, now: datetime | None = None) -> tuple[str, str]:
     """``ok`` / ``warn`` / ``error`` and a one-line detail, for the platform health rollup.
 
     ``error`` when no partition covers the present for a table: its current
     lines are being dropped at ingest. ``warn`` when what is covered ahead has
-    shrunk below half of what maintenance keeps, which takes many missed ticks.
+    shrunk below half of what maintenance keeps, which takes many missed ticks,
+    or when retention is behind: a partition, attached or left detached, more
+    than its own length past the window, so a detach or a drop keeps failing
+    and rows outlive what the setting promises.
     """
     now = now or datetime.now(UTC)
     hours = await log_retention_hours(db)
     behind: list[str] = []
     short: list[str] = []
+    overdue: list[str] = []
     for table in LOG_TABLES:
         covered = await coverage(db, table)
         if covered.upper is None or not covered.contains(now):
             behind.append(table.name)
         elif covered.upper - now < table.lead(table.window(hours)) / 2:
             short.append(table.name)
+        overdue += await _overdue(db, table, now - table.window(hours))
     if behind:
         return "error", (
             f"no partition covers the present for {', '.join(behind)}: "
@@ -492,4 +549,9 @@ async def partition_health(db: AsyncSession, *, now: datetime | None = None) -> 
             f"partitions run out soon for {', '.join(short)}: "
             "maintain_log_partitions has missed many runs"
         )
-    return "ok", "partitions cover the present and the time ahead"
+    if overdue:
+        return "warn", (
+            f"retention is behind, past the window and not dropped: {', '.join(overdue[:5])}"
+            + (f" and {len(overdue) - 5} more" if len(overdue) > 5 else "")
+        )
+    return "ok", "partitions cover the present and the time ahead, and none is past the window"

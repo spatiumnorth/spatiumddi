@@ -22,6 +22,7 @@ import asyncpg
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
+from structlog.testing import capture_logs
 
 from app.models.base import Base
 from app.models.dhcp import DHCPServer
@@ -115,10 +116,11 @@ async def appliance_db() -> AsyncIterator[tuple[str, bytes, uuid.UUID]]:
             server_id = server.id
         # A partition for 20 days ago exists for as long as it takes to put a
         # row in it, and is gone by the time of the restore.
+        gone = f"dns_rpz_hit_p{NOW - timedelta(days=20):%Y%m%d}"
         async with engine.begin() as conn:
             await conn.exec_driver_sql(f"DROP TABLE dns_rpz_hit_p{_OLDEST:%Y%m%d}")
             await conn.exec_driver_sql(
-                "CREATE TABLE dns_rpz_hit_old PARTITION OF dns_rpz_hit FOR VALUES FROM "
+                f"CREATE TABLE {gone} PARTITION OF dns_rpz_hit FOR VALUES FROM "
                 f"('{(NOW - timedelta(days=20)).strftime('%Y-%m-%d')} 00:00+00') TO "
                 f"('{(NOW - timedelta(days=19)).strftime('%Y-%m-%d')} 00:00+00')"
             )
@@ -135,7 +137,7 @@ async def appliance_db() -> AsyncIterator[tuple[str, bytes, uuid.UUID]]:
             await db.commit()
         archive = _archive(await _pg_dump(url))
         async with engine.begin() as conn:
-            await conn.exec_driver_sql("DROP TABLE dns_rpz_hit_old")
+            await conn.exec_driver_sql(f"DROP TABLE {gone}")
         yield url, archive, server_id
     finally:
         await engine.dispose()
@@ -171,13 +173,17 @@ async def test_dns_threat_restore_brings_the_rpz_hits_back(
     finally:
         await conn.close()
 
-    outcome: Any = await _restore(url, archive, monkeypatch, sections=("dns_threat",))
+    with capture_logs() as logs:
+        outcome: Any = await _restore(url, archive, monkeypatch, sections=("dns_threat",))
 
     assert "dns_threat" in outcome.restored_sections
     # The two the archive holds inside the partitions that still exist. The one
     # from a partition that is gone has nowhere to live, and would be past its
-    # window soon enough: it is dropped, and the restore does not fail on it.
+    # window soon enough: it is dropped and counted, and the restore does not
+    # fail on it.
     assert await _qnames(url, "dns_rpz_hit") == ["recent.example", "yesterday.example"]
+    [dropped] = [e for e in logs if e["event"] == "backup_restore_rows_outside_partitions"]
+    assert dropped["detail"] == "table=dns_rpz_hit rows=1"
     conn = await asyncpg.connect(_dsn(url))
     try:
         leftovers = await conn.fetch(
@@ -376,19 +382,15 @@ async def migrated_db() -> AsyncIterator[tuple[str, bytes]]:
 async def test_dns_and_dhcp_restore_on_an_upgraded_install(
     migrated_db: tuple[str, bytes], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The DNS and DHCP sections reach the log tables through the server tables'
-    foreign keys. After the upgrade nothing else may hold one: a leftover table
-    with such a key makes the restore refuse to run."""
+    """The log tables hold no foreign key into the server tables any more, and
+    nothing the upgrade left behind does either: the restore runs, and it leaves
+    the log rows of the servers it reloads alone."""
     url, archive = migrated_db
-    conn = await asyncpg.connect(_dsn(url))
-    try:
-        await conn.execute("TRUNCATE dns_query_log_entry, dhcp_log_entry")
-    finally:
-        await conn.close()
 
     for section in ("dns", "dhcp"):
         outcome: Any = await _restore(url, archive, monkeypatch, sections=(section,))
         assert section in outcome.restored_sections
+        assert "dns_query_log_entry" not in outcome.cascade_widened_tables
 
     assert await _qnames(url, "dns_query_log_entry") == ["q.example"]
     conn = await asyncpg.connect(_dsn(url))

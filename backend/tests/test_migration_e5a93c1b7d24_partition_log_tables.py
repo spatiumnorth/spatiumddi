@@ -1,10 +1,11 @@
-"""``e5a93c1b7d24`` (#2185) — the log tables become time-partitioned.
+"""#2185 — the log tables lose their foreign keys and become time-partitioned
+(``a8d2f6c04b71``, ``b6e1c94f3a02``, ``e5a93c1b7d24``).
 
-Most of these run the migration on its own connection inside one transaction
+Most of these run the migrations on their own connection inside one transaction
 that is rolled back, against the three tables as the previous release had
-them. The ones that need a second session (a long reader the swap must not
-queue behind, the previous release's prepared statements) use a scratch
-database instead.
+them. The ones that need a second session (the agents' long polls, a long reader
+the swap must not queue behind, the previous release's prepared statements) use
+a scratch database instead.
 """
 
 from __future__ import annotations
@@ -20,10 +21,12 @@ from types import ModuleType
 from typing import Any
 
 import asyncpg
+import pytest
 import pytest_asyncio
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -35,9 +38,10 @@ from tests.test_agent_spool_ingest import _dhcp_server, _dns_server
 from tests.test_selective_restore_app_role_1693 import _admin, _dsn, _url_for
 
 _NAMES = [t.name for t in LOG_TABLES]
-_PATH = next(
-    (pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions").glob("e5a93c1b7d24_*.py")
-)
+_VERSIONS = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions"
+_DROP_DNS_FKS, _DROP_DHCP_FK, _SWAP = "a8d2f6c04b71", "b6e1c94f3a02", "e5a93c1b7d24"
+#: In upgrade order.
+_REVISIONS = (_DROP_DNS_FKS, _DROP_DHCP_FK, _SWAP)
 
 #: The three tables as the previous release had them.
 LEGACY_DDL = (
@@ -76,20 +80,25 @@ _RPZ_AGES = {
 }
 
 
-def migration() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("e5a93c1b7d24", _PATH)
+def _migration(revision: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        revision, next(_VERSIONS.glob(f"{revision}_*.py"))
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def run(sync_conn: object, direction: str, **settings: Any) -> None:
-    module = migration()
-    for name, value in settings.items():
-        setattr(module, name, value)
-    with Operations.context(MigrationContext.configure(connection=sync_conn)):
-        getattr(module, direction)()
+def run(
+    sync_conn: object, direction: str, *, revisions: tuple[str, ...] = _REVISIONS, **settings: Any
+) -> None:
+    for revision in revisions if direction == "upgrade" else reversed(revisions):
+        module = _migration(revision)
+        for name, value in settings.items():
+            setattr(module, name, value)
+        with Operations.context(MigrationContext.configure(connection=sync_conn)):
+            getattr(module, direction)()
 
 
 async def make_legacy_tables(conn: AsyncConnection) -> None:
@@ -141,26 +150,36 @@ async def legacy() -> AsyncGenerator[tuple[AsyncConnection, uuid.UUID], None]:
             await trans.rollback()
 
 
+async def _foreign_keys(conn: AsyncConnection) -> list[str]:
+    return await _column(
+        conn,
+        "SELECT conrelid::regclass::text || ' ' || pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE contype = 'f' AND conrelid::regclass::text IN "
+        "('dns_query_log_entry', 'dhcp_log_entry', 'dns_rpz_hit') ORDER BY 1",
+    )
+
+
 async def test_the_swap_keeps_the_rpz_hits_inside_the_window_and_starts_the_logs_empty(
-    legacy: tuple[AsyncConnection, uuid.UUID],
+    legacy: tuple[AsyncConnection, uuid.UUID], caplog: pytest.LogCaptureFixture
 ) -> None:
     conn, dns = legacy
     before = await _scalar(conn, "SELECT max(id) FROM dns_rpz_hit")
 
-    await conn.run_sync(run, "upgrade")
+    with caplog.at_level("WARNING", logger="alembic.runtime.migration"):
+        await conn.run_sync(run, "upgrade")
 
     for table in _NAMES:
         assert (
             await _scalar(conn, f"SELECT relkind::text FROM pg_class WHERE relname = '{table}'")
             == "p"
         )
-    # Nothing of the old tables is left behind: no rows past their window,
-    # and no foreign key into dns_server / dhcp_server the models don't know.
+    # Nothing of the old tables is left behind: no rows past their window.
     assert await _column(conn, "SELECT relname FROM pg_class WHERE relname LIKE '%\\_old%'") == []
     assert sorted(await _column(conn, "SELECT qname FROM dns_rpz_hit")) == [
         "last-month.example",
         "recent.example",
     ]
+    assert "1 past the window, 1 dated after tomorrow" in caplog.text
     assert await _scalar(conn, "SELECT count(*) FROM dns_query_log_entry") == 0
     assert await _scalar(conn, "SELECT count(*) FROM dhcp_log_entry") == 0
     for table in _NAMES:
@@ -176,12 +195,7 @@ async def test_the_swap_keeps_the_rpz_hits_inside_the_window_and_starts_the_logs
             f"WHERE indrelid = '{table}'::regclass ORDER BY 1",
         )
         assert f"{table}_pkey" in names
-    fk = await _scalar(
-        conn,
-        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-        "WHERE conrelid = 'dns_rpz_hit'::regclass AND contype = 'f'",
-    )
-    assert fk == "FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE CASCADE"
+    assert await _foreign_keys(conn) == []
     # The previous release's pods insert without an id; the ids carry on.
     await conn.execute(
         text(
@@ -230,6 +244,14 @@ async def test_downgrade_brings_back_the_old_tables_with_the_rpz_hits(
         ),
         {"s": dns},
     )
+    # A hit from a server deleted while there was no key to take it along.
+    await conn.execute(
+        text(
+            "INSERT INTO dns_rpz_hit (server_id, ts, qname, trigger, policy) "
+            "VALUES (:s, now(), 'orphan.example', 'QNAME', 'NXDOMAIN')"
+        ),
+        {"s": uuid.uuid4()},
+    )
 
     await conn.run_sync(run, "downgrade")
 
@@ -252,6 +274,11 @@ async def test_downgrade_brings_back_the_old_tables_with_the_rpz_hits(
     assert sorted(await _column(conn, "SELECT qname FROM dns_rpz_hit")) == [
         "last-month.example",
         "recent.example",
+    ]
+    assert await _foreign_keys(conn) == [
+        "dhcp_log_entry FOREIGN KEY (server_id) REFERENCES dhcp_server(id) ON DELETE CASCADE",
+        "dns_query_log_entry FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE CASCADE",
+        "dns_rpz_hit FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE CASCADE",
     ]
     assert await _scalar(conn, "SELECT count(*) FROM dns_query_log_entry") == 0
     await conn.execute(
@@ -301,6 +328,85 @@ async def scratch() -> AsyncGenerator[tuple[str, uuid.UUID], None]:
             await admin.close()
 
 
+async def _long_poll(url: str, stop: asyncio.Event, seconds: float, waits: list[float]) -> None:
+    """An agent's config long poll: it reads its server row, then sits idle in
+    the transaction until the wake or the timeout, and straight away polls again."""
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        while not stop.is_set():
+            started = time.perf_counter()
+            transaction = conn.transaction()
+            await transaction.start()
+            await conn.fetchval("SELECT count(*) FROM dns_server")
+            waits.append(time.perf_counter() - started)
+            await asyncio.sleep(seconds)
+            await transaction.commit()
+    finally:
+        await conn.close()
+
+
+async def test_the_foreign_keys_go_behind_the_agents_long_polls(
+    scratch: tuple[str, uuid.UUID],
+) -> None:
+    """Long polls overlap, so one always holds the server table. A short lock
+    timeout never finds a gap; waiting longer than a poll lasts gets through,
+    and the polls queued behind it wait for no longer than that."""
+    url, _dns = scratch
+    stop = asyncio.Event()
+    waits: list[float] = []
+    polls = []
+    for _ in range(3):
+        polls.append(asyncio.create_task(_long_poll(url, stop, 1.0, waits)))
+        await asyncio.sleep(0.3)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        with pytest.raises(DBAPIError, match="lock timeout"):
+            async with engine.begin() as conn:
+                await conn.run_sync(
+                    run, "upgrade", revisions=(_DROP_DNS_FKS,), _LOCK_TIMEOUT="200ms", _ATTEMPTS=1
+                )
+        waits.clear()
+
+        async with engine.begin() as conn:
+            await conn.run_sync(run, "upgrade", revisions=(_DROP_DNS_FKS,), _LOCK_TIMEOUT="5s")
+        await asyncio.sleep(1.2)
+
+        async with engine.connect() as conn:
+            assert await _foreign_keys(conn) == [
+                "dhcp_log_entry FOREIGN KEY (server_id) "
+                "REFERENCES dhcp_server(id) ON DELETE CASCADE",
+            ]
+    finally:
+        stop.set()
+        await asyncio.gather(*polls)
+        await engine.dispose()
+    assert max(waits) < 2.0, f"a poll waited {max(waits):.2f} s"
+
+
+async def test_the_swap_does_not_wait_for_the_agents_long_polls(
+    scratch: tuple[str, uuid.UUID],
+) -> None:
+    """Once the keys are gone a long poll holds nothing the swap needs."""
+    url, _dns = scratch
+    engine = create_async_engine(url, poolclass=NullPool)
+    async with engine.begin() as conn:
+        await conn.run_sync(run, "upgrade", revisions=(_DROP_DNS_FKS, _DROP_DHCP_FK))
+    poll = await asyncpg.connect(_dsn(url))
+    transaction = poll.transaction()
+    await transaction.start()
+    await poll.fetchval("SELECT count(*) FROM dns_server")
+    await poll.fetchval("SELECT count(*) FROM dhcp_server")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                run, "upgrade", revisions=(_SWAP,), _LOCK_TIMEOUT="200ms", _ATTEMPTS=1
+            )
+    finally:
+        await transaction.rollback()
+        await poll.close()
+        await engine.dispose()
+
+
 async def test_a_long_reader_makes_the_swap_retry_instead_of_queueing_the_inserts(
     scratch: tuple[str, uuid.UUID],
 ) -> None:
@@ -309,6 +415,9 @@ async def test_a_long_reader_makes_the_swap_retry_instead_of_queueing_the_insert
     swap gives up its place in the lock queue every 200 ms instead of making
     every insert wait behind it."""
     url, dns = scratch
+    engine = create_async_engine(url, poolclass=NullPool)
+    async with engine.begin() as conn:
+        await conn.run_sync(run, "upgrade", revisions=(_DROP_DNS_FKS, _DROP_DHCP_FK))
     reader = await asyncpg.connect(_dsn(url))
     writer = await asyncpg.connect(_dsn(url))
     insert = await writer.prepare(
@@ -329,7 +438,6 @@ async def test_a_long_reader_makes_the_swap_retry_instead_of_queueing_the_insert
             await asyncio.sleep(0.01)
         return written
 
-    engine = create_async_engine(url, poolclass=NullPool)
     try:
         writing = asyncio.create_task(write())
         reading = reader.transaction()
@@ -338,7 +446,9 @@ async def test_a_long_reader_makes_the_swap_retry_instead_of_queueing_the_insert
 
         async def migrate() -> None:
             async with engine.begin() as conn:
-                await conn.run_sync(run, "upgrade", _LOCK_TIMEOUT_MS=200, _ATTEMPTS=50)
+                await conn.run_sync(
+                    run, "upgrade", revisions=(_SWAP,), _LOCK_TIMEOUT="200ms", _ATTEMPTS=50
+                )
 
         migrating = asyncio.create_task(migrate())
         await asyncio.sleep(1.5)
