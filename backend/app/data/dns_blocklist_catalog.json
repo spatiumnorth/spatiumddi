@@ -170,7 +170,7 @@
     {
       "id": "urlhaus",
       "name": "URLhaus (abuse.ch)",
-      "description": "Malware-distribution domains from the abuse.ch URLhaus database, compiled by AdGuard's HostlistsRegistry (abuse.ch no longer serves an anonymous download).",
+      "description": "Malware-distribution domains from the abuse.ch URLhaus database, as built by the malware-filter project (gitlab.com/malware-filter/urlhaus-filter) and republished by AdGuard's HostlistsRegistry. abuse.ch no longer serves an anonymous download.",
       "category": "malware",
       "feed_url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt",
       "feed_format": "adblock",
