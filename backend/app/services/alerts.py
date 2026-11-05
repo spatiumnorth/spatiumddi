@@ -1040,6 +1040,9 @@ def _pct_resolve_floor(threshold: float) -> float:
 # and appends it to the stored message, so the event says it is held and the
 # figure it resolves under. A pass that no longer holds the subject drops it.
 _HELD_MARK = "\ue002"
+_HELD_NOTE_RE = re.compile(
+    r"held open: under the rule's threshold but not yet below [0-9.e+-]+%; resolves below that"
+)
 
 
 def _held_note(floor: float) -> str:
@@ -1047,6 +1050,17 @@ def _held_note(floor: float) -> str:
         f"{_HELD_MARK}held open: under the rule's threshold but not yet below "
         f"{floor:g}%; resolves below that"
     )
+
+
+def _split_held(marked: str) -> tuple[str, str]:
+    """``(message, held note)`` of a matcher's message; the note is ``""``
+    when the subject is not held. Only a trailing, exact ``_held_note`` is
+    split off, so a marker character inside operator- or device-supplied
+    text (a subnet name, a lease hostname) never truncates the message."""
+    head, sep, tail = marked.rpartition(_HELD_MARK)
+    if sep and _HELD_NOTE_RE.fullmatch(tail):
+        return head, tail
+    return marked, ""
 
 
 async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
@@ -8751,7 +8765,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             # Open new events for unseen matches; escalate existing ones.
             for subject_id, display, marked, severity_override in matches:
-                marked, _, held = marked.partition(_HELD_MARK)
+                marked, held = _split_held(marked)
                 message, threshold_idx = _unmark_thresholds(marked)
                 existing = open_by_subject.get(subject_id)
                 if existing is None and subject_id in suppressed_ids:
@@ -8770,7 +8784,9 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     new_severity = severity_override or rule.severity
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
-                        existing.message = message
+                        # The peak stays clean; the stored (and delivered)
+                        # message still says the subject is held (#3542).
+                        existing.message = f"{message} — {held}" if held else message
                         existing.last_observed_value = {
                             **(existing.last_observed_value or {}),
                             "peak_message": message,
