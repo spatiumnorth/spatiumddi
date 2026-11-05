@@ -54,6 +54,7 @@ from app.services.dhcp.stats import (
     STATS_WINDOW_SECONDS,
     active_lease_count,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 router = APIRouter(
     prefix="/servers",
@@ -1257,7 +1258,10 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
                 "poll. Nudged the agent to re-poll now."
             ),
         )
-    result = await pull_leases_from_server(db, s, apply=True)
+    # Recounted below, just before commit: the recount holds the audit-chain
+    # lock and subnet / block row locks until commit, and the MAC-block
+    # reconcile that follows is another WinRM call (#3345, #3354).
+    result = await pull_leases_from_server(db, s, apply=True, recount=False)
     if result.busy:
         # #2262 — the scheduled pull (or another Sync) is reconciling this
         # server right now; two at once used to insert the same lease twice.
@@ -1335,6 +1339,7 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "warnings": result.warnings[:20],
         },
     )
+    await recount_subnets_and_blocks(db, result.touched_subnet_ids)
     await db.commit()
     return SyncLeasesResponse(
         server_leases=result.server_leases,

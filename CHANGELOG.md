@@ -27,7 +27,7 @@ the formatter handles the rest.
 
 ## 1.0.0-beta.4 — 2026-11-04
 
-**The fourth 1.0.0 beta.** 114 commits since 1.0.0-beta.3, almost all
+**The fourth 1.0.0 beta.** 132 commits since 1.0.0-beta.3, almost all
 of them fixes, most found by the QA proving ground and the beta
 installs. Like the earlier betas it is a GitHub pre-release: no
 install is offered it in-product, and `:latest` stays where it is
@@ -39,10 +39,20 @@ give two addresses the same generated name (#3364); the zone Drift
 report no longer calls a server `ok` that is behind the zone or
 missing records (#3198); renaming a zone that holds records is refused
 instead of stranding every record and PTR on the old name (#3265); a
-DHCP pool can no longer be left restricted to a PXE or phone class Kea
-never receives (#3388), and editing a PXE boot rule no longer renames
-the class a pool matches (#3374); deleting a DNS server group clears
-its id from the IPAM rows that named it (#3433); edit dialogs across
+DHCP pool restricted to a PXE boot rule's class serves that rule's
+clients again, where since #2731 it handed out nothing (#3404), a pool
+can no longer be left restricted to a PXE or phone class Kea never
+receives (#3388), and editing a PXE boot rule no longer renames the
+class a pool matches (#3374); a DNSSEC key lifetime BIND refuses is a
+422 at save instead of quarantining every later change on the server
+group (#3411); deleting a DNS server group or purging a DNS zone
+clears its id from the IPAM rows that named it (#3433, #3443);
+changing a zone's settings while records are created on it no longer
+deadlocks into a 500 (#3389); a block move takes the subnets in the
+Trash with it and no longer counts trashed blocks at the destination
+(#3436, #3418), and a nested block can be grown with Resize (#3382);
+subnet and block utilization follows DHCP lease mirrors instead of
+staying stale until the hourly recount (#3354); edit dialogs across
 DNS, DHCP and IPAM no longer undo a change saved elsewhere since their
 list loaded (#3269, #3365, #3379), and a zone's dynamic-updates ACL
 save refuses a concurrent change (#3381); Mark as Orphan no longer
@@ -57,15 +67,17 @@ moving or growing a subnet needs `write` on the target or parent block
 creates (#3243); waking a host needs subnet write on every path
 (#3461); and pages across the console stop offering controls the
 server refuses, and say a refused read is refused instead of drawing
-it as empty or all-clear (#3148, #3234, #3337, #3449). **Also:** the
-support and diagnostics bundles no longer stall every other request
-while they build (#3310), a read-only account or `read` token can use
-the POST routes that only read (#3223, #3302), and CI's Trivy scans
-run again after their installer's host went away (#3464).
+it as empty or all-clear (#3148, #3234, #3337, #3384, #3409, #3449).
+**Also:** the support and diagnostics bundles no longer stall every
+other request while they build (#3310), a read-only account or `read`
+token can use the POST routes that only read (#3223, #3302), three
+Copilot write tools that shipped off can now actually be switched on
+(#3390, #3415), and CI's Trivy scans run again after their installer's
+host went away (#3464).
 
-**Before you upgrade:** this release adds 1 database migration (listed
-under Migrations), a data-only cleanup whose downgrade is a no-op;
-take a database backup first anyway, and do not go back to
+**Before you upgrade:** this release adds 2 database migrations
+(listed under Migrations), both data-only cleanups whose downgrades
+are no-ops; take a database backup first anyway, and do not go back to
 1.0.0-beta.3 afterwards without restoring it. **API tokens:** a token
 whose scope does not cover a request now gets 403 instead of 401
 (#3223). A `read` token is refused the GET routes that reach another
@@ -80,12 +92,24 @@ parent block (#3425, #3439), and blocking a MAC from New Devices needs
 write on DHCP MAC blocks (#3302). **API:** renaming a zone that holds
 records answers 409 (#3265); a request-portal submit whose arguments
 do not validate answers 422 with field errors, not 400 (#3246);
-`GET /dns/groups/{id}/options` no longer creates the row on first read
-and returns a null `id` until the options are saved (#3302). **DDNS:**
+`GET /dns/groups/{id}/options` no longer creates the row on first
+read and returns a null `id` until the options are saved (#3302). **DDNS:**
 generated names take the whole address (`dhcp-10-1-20-5`), and records
 already published move to the new name at their next renewal (#3364);
 a client asking for a name another record holds is published under its
 `dhcp-<ip>` name instead, with a `ddns_name_conflict` warning (#3362).
+**DNS:** a DNSSEC policy KSK or ZSK lifetime BIND refuses (negative,
+past 49710 days, or a KSK under 2 days / ZSK under 11) is a 422 on
+create and edit; a policy already stored that way renders with the
+nearest lifetime BIND takes, with a warning (#3411). Creating or
+editing an IP space, block, subnet, address, subnet template or subnet
+plan with a DNS zone id that names no zone is a 422 (#3443). **DHCP:**
+each PXE boot rule now renders as a selector class plus a boot class,
+so the agent's Kea config and the config preview change shape (#3404).
+**Copilot:** the maintenance-mode tool is renamed
+`propose_set_maintenance_mode` and now stages a proposal you Apply
+(#3415); a Tool Catalog save that enables a name it cannot keep
+answers 422 naming it, not 200 (#3415).
 
 ### Changed
 
@@ -591,6 +615,189 @@ a client asking for a name another record holds is published under its
 
 - A backup destination's "Restore from archive" window now reads the chosen archive's database dump format before it offers Selective restore. A plain-SQL archive (for example one copied into the destination by hand) shows Selective disabled with the reason, instead of being refused only after Apply. The new read-only `GET /api/v1/backup/targets/{id}/archives/{filename}/manifest-preview` gives the same answer as the manual-restore preview, for the one archive picked rather than the whole listing.
 
+- The Dashboard's Integrations tab now names the enabled integrations your role cannot read instead of dropping them, no longer says "No integrations are enabled yet" when some are enabled but unreadable, and qualifies its reconciler error and warning all-clears; the Compliance tab shows a refused alert rule or alert event read as refused rather than "No compliance_change rules yet" / "No compliance-change events", the Overview's open alerts and the DHCP tab's pool occupancy say a refused read is refused rather than "Could not load", and the Compliance, Security, Overview and DHCP panels stop re-asking reads the server refused (#3456).
+
+- A DHCP phone profile no longer lists a scope that is in the Trash: its scopes, the profile list's count and the copilot's count leave the deleted scope out, and saving back the scopes a profile lists no longer answers 422 "Scopes not found in this group". The scope stays attached while it is in the Trash and comes back attached when it is restored (#3448).
+
+- Purging a DNS zone (from the Trash, by permanent delete, by the scheduled Trash purge, by deleting its server group or the Tailscale tenant or NetBird instance that owns it, or by a DNS factory reset) now removes its id from every IP space, block, subnet, address, subnet template and unapplied subnet plan that named it, Trash rows included, so edit dialogs and effective DNS no longer point at a zone that is gone. A migration clears ids already stranded, and creating or editing any of those (or validating a plan) now refuses a DNS zone id that names no zone with a 422. (#3443)
+
+- **Refused DHCP deletes say why: option templates, MAC blocks, phone
+  profiles (#3441).** When the server refuses Delete Option Template,
+  Unblock MAC or Delete Phone Profile, the dialog now shows its reason
+  and stays open, instead of staying open with nothing said: a row
+  deleted elsewhere (404) and a role without delete (403) alike, as
+  Delete Client Class already does. Closing the dialog clears the
+  reason, so the next row's dialog opens clean.
+
+- **A block move takes the subnets in the Trash with it (#3436).** A
+  subnet in the Trash under the moved block, or under a block in the
+  Trash inside it, kept the old space while its block moved to the new
+  one. Restored, it came back live in the old space under a block in
+  the new space, and the restore checked it against the old space's
+  subnets only, so it could come back beside a live subnet of the same
+  CIDR under the same block. A move now takes every subnet under the
+  block to the new space, the Trash included: a restore brings it back
+  beside its block, and is refused if a live subnet there already holds
+  its CIDR. The move's counts and its integration check still cover the
+  live subnets only, as before.
+
+- Six DNS and DHCP reads, and the DNS Pools page, no longer draw a refused or failed read as an empty list: a zone's Pools tab read "Pools (0)" and "No pools yet. Click New Pool to create one.", and the DNS Pools page "No DNS pools yet.", to a role that reads DNS zones but not pools (the built-in Auditor and Compliance Editor), and a server group's TSIG Keys ("0 TSIG keys"), ACLs and Views tabs, a blocking list's entries and exceptions ("0 entries · 0 exceptions") and the DHCP page's server group tree ("0" beside each group, "No servers in this group.") did the same when their read failed. Each now says the read was refused or could not be loaded, draws its count only once its list has loaded, and still says a list that loaded empty is empty (#3426).
+
+- **The LLDP, NTP, DNS resolver, Syslog and SNMP settings say why a
+  save was refused (#3424).** A save the server refused showed only
+  "Failed to save: Request failed with status code 422" (or 403), so
+  an operator who typed one bad value was not told which one. Each
+  section now shows the server's reason, for example "Failed to save:
+  ntp_allow_client_networks: invalid CIDR: '10.0.0.0/33' (...)", or
+  the demo-mode refusal's sentence, as the APT and SSH settings
+  already did.
+
+- **The IPAM address search no longer offers Bulk edit to a holder the
+  server refuses (#3423).** Like the Delete beside it, Bulk edit stays
+  visible and disabled with its reason unless the caller holds what
+  `POST /ipam/addresses/bulk-edit` asks: write on subnets, or a write
+  grant on an address set (#103). A read-only user (the built-in Viewer)
+  who ticked a match could open the dialog, and the server refused the
+  edit. The API gate is unchanged.
+
+- **A Proxmox endpoint's Discovery button is named "Discovery"
+  (#3422).** The icon-only button took its name from its tooltip, so
+  until the endpoint had synced once a screen reader announced it as
+  "Sync at least once to populate discovery", an instruction rather
+  than the control, and after that as the whole tooltip. It is named
+  for its action in either state now, and the tooltip still says why
+  it is unavailable before the first sync.
+
+- DNS: inside a zone, a record's right-click Edit and Delete now show why they are disabled for a user who may not write or delete DNS records ("Requires write permission on DNS records", "Requires delete permission on DNS records"), as the row's own Edit and Delete buttons and the IPAM tree's right-click items already do. (#3421)
+
+- **The Appliance page asks for the appliance's own details only when the
+  user may read them (#3420).** A user who opens the page for the
+  certificate store alone (the built-in DNS Editor, or any role with the
+  store and nothing on the appliance) was refused `GET /appliance/info` on
+  every load, and each refusal was written to the audit log as a denied
+  read under their name. The page now asks only a user with read on the
+  appliance; the certificate store works as before, and a user who may
+  read the appliance still sees its version, hostname and host tabs.
+
+- **A pending certificate's Paste signed cert dims when it is disabled
+  (#3419).** On Appliance, Certificates, a user who may not write the
+  certificate store saw a CSR-pending row's Paste signed cert disabled but
+  drawn in full colour, so it looked usable. It now dims like the Delete
+  beside it.
+
+- **A block move no longer counts blocks in the Trash at the
+  destination (#3418).** The move's overlap check read the target
+  level's blocks without leaving out the trashed ones. A trashed block
+  refused a move of its own CIDR, or of a block inside it, with a 409,
+  though creating the same block there was allowed (#490). A trashed
+  block inside the moved block's range was re-parented under it: the
+  Trash row changed, its restore was then refused while the moved
+  block sat in the Trash, and purging the moved block deleted it for
+  good. A move now counts live blocks only and leaves rows in the
+  Trash as they were. A live block in the way still refuses the move,
+  or is re-parented under the moved block, as before.
+
+- **The Copilot's maintenance-mode tool can be switched on (#3415).**
+  It shipped off for the operator to opt in, but it wrote directly,
+  and the Tool Catalog's save drops every tool that does: its toggle
+  snapped back off with no message. It is now
+  `propose_set_maintenance_mode`. The Copilot stages the change as a
+  proposal, and maintenance mode flips only when you click Apply, like
+  every other Copilot write. It still ships off, superadmin only, and
+  its toggle now holds. A Tool Catalog save that asks to enable a name
+  it cannot keep now answers 422 naming it, instead of dropping it
+  with a 200.
+
+- **A DNSSEC policy's key lifetime that BIND refuses is refused at save
+  (#3411).** A KSK or ZSK lifetime that is negative, past 49710 days, or
+  shorter than a rollover of that key takes (a KSK under 2 days, a ZSK
+  under 11) is now a 422 that gives the range BIND takes, on create and
+  on edit. Before, it was stored, and once a zone was signed with the
+  policy `named-checkconf` refused the whole config, so every later
+  change on the server group was quarantined until the zone was
+  unsigned. A policy already saved that way renders with the nearest
+  lifetime BIND takes (a negative one as unlimited), with a warning.
+
+- IPAM: an address's Delete (the row button, the right-click item and the detail pane's button) is now offered only with the `delete` permission the server asks for, instead of to any role that can write. Without it the row button and the right-click item are disabled and say why, and the detail pane shows no Delete. A `delete` grant on any address set is enough, as it is for the server, while Clean Orphans now needs `delete` on subnets, which is what its route checks.
+
+- **A DHCP pool restricted to a PXE boot rule's class serves that
+  rule's clients again (#3404).** Since #2731 each PXE rule's class
+  was one that Kea evaluates only after it has picked the pool, so a
+  pool restricted to it never handed out an address: the PXE clients
+  it was meant for got one from another pool of the scope, or none.
+  Each rule now renders as a selector class, which pools match, and a
+  boot class that carries the boot server and file and still reaches
+  only the scopes bound to the profile. Both the agent's Kea config
+  and the config preview change.
+
+- **A refused Delete PXE profile says why (#3396).** When the server
+  refuses to delete a PXE profile, the dialog now shows its reason and
+  stays open, instead of staying open with nothing said. The routine
+  refusal is a pool whose class restriction still names the class one of
+  the profile's boot rules generates (409, #3374); a role without delete
+  (403) and a profile deleted elsewhere (404) are shown the same way.
+  Closing the dialog clears the reason.
+
+- **The Copilot can offer `propose_set_zone_update_acl` and
+  `propose_allowlist_bgp_origin` once an operator enables them
+  (#3390).** Both ship off and say an operator may switch them on,
+  but they were the only `propose_*` tools registered as tools that
+  write, and the Tool Catalog's save, the effective tool set and the
+  chat's tool list keep only tools that do not. The Tool Catalog
+  dropped them on save, so neither could ever be enabled. They are now
+  registered like every other `propose_*` tool: the tool only prepares
+  a proposal, and nothing changes until the operator clicks Apply.
+  Both still ship off, and MCP still never offers a `propose_*` tool.
+
+- **Changing a zone's settings while records are being created on it
+  no longer deadlocks into a 500 (#3389).** Saving the Dynamic Updates
+  dialog with the "Accept dynamic updates" flag changed, editing the
+  zone (PUT on the zone), and `apply-record` wrote the zone row only in
+  their commit, after taking the audit log's chain lock, while a record
+  create on the same zone holds the zone row from its serial bump and
+  takes the chain lock at its own commit. PostgreSQL aborted one of the
+  two and it answered 500. Those three now write the zone row before
+  the chain lock, the order every record write already takes.
+
+- A DNS list that was refused, failed to load or has not loaded yet no longer has a count over it: a server group's Zones tab read "0 zones" over "You don't have permission to see this group's zones", and a zone's record list, its Records tab label, a group's Records tab and its Blocking Lists tab drew "0" the same way, while the group's Servers tab said "Zone serials: no zones". Each count is drawn once its list has loaded, and a list that loaded empty still says so (#3385).
+
+- **A block's and a space's subnet selection no longer offer Bulk Edit,
+  Split… and Merge… to a holder the server refuses (#3384).** Like the
+  subnet view's own Split… and Merge… since #1155, each stays visible and
+  disabled with its reason, asking what its routes ask: write on subnets
+  at the type level. A read-only user (the built-in Viewer) who ticked
+  subnet rows could open all three dialogs, and the server refused each.
+  The API gates are unchanged.
+- **The Bulk edit subnets dialog says the server's reason (#3384).** A
+  refused edit read "Request failed with status code 403"; it now carries
+  the server's own words, as the Split and Merge dialogs do.
+
+- **A block inside another block can be grown with Resize (#3382).**
+  The resize overlap check counted the block's own parent, and every
+  block above it, as blocks in the way, so a nested block could never
+  grow: the API answered 409 naming the parent, and the Resize dialog's
+  preview listed the parent as a conflict and kept its button disabled.
+  A block's ancestors are no longer counted. Growth past the parent's
+  edge is still refused, now with "does not fit inside the parent
+  block", and siblings, cousins and the subnets of the parent still
+  block a growth that would overlap them.
+
+- **The IPAM block panel and the DHCP server group panel show a saved change (#3369).**
+  After the tree's Edit… on a block, or Edit Server Group, the panel header
+  kept the old name and description until you selected another item and came
+  back. Both panels now follow the refreshed list.
+
+- **Edit DHCP Server reopened right after a Save shows what was saved (#3366).**
+  The server's page kept its copy of the server until its next 30 second
+  refresh, so reopening Edit straight after a Save showed the old values, and
+  saving that wrote them back over your change. The Save now updates the page's
+  copy and the cached server lists at once.
+
+- Freeing a DHCP reservation's IPAM row outside a request (the hourly orphan-mirror sweep, the trash purge, scope removal, and the Windows reservation poll) now recounts the subnet's and its blocks' allocated-address figures straight away, instead of leaving them stale until the hourly recount ([#3354](https://github.com/spatiumnorth/spatiumddi/issues/3354)).
+
+- Subnet and block utilization now follows DHCP lease mirrors. Kea lease events, the Windows DHCP lease pull (including its absence-delete), the lease expiry sweep, the orphaned-mirror sweep, single-lease and scope or server lease deletes all recount the touched subnets and their block chains once per batch, instead of leaving the figures stale until the next full recount.
+- Concurrent utilization recounts (both peers of a Kea HA pair, the lease sweeps, address edits and the hourly recount) now take their locks in one fixed order, after the audit log's and without blocking on new rows being added beneath a subnet or block, so two of them touching the same block tree, or several subnets created at once under one block, wait for each other instead of deadlocking. A lease renewal that changes no address status skips the recount entirely.
+
 ### Security
 
 - **A DHCP client can no longer publish a name another record holds
@@ -612,6 +819,8 @@ a client asking for a name another record holds is published under its
   keeps the client's own hostname; the IPAM row shows the name that
   was published.
 
+- Audited the eleven open CodeQL ReDoS findings (the BIND query / response / RPZ log parser, DNS record target extraction, the support-bundle PEM scrubber and a CI lint script). Each pattern measured linear on hostile input up to 180 KB, so none was reachable as a slowdown and no matching behaviour changed. Timing regression tests now pin that property.
+
 ### Migrations
 
 - `b3d7e19a5c40` — #3433, removes from `ip_space`, `ip_block` and
@@ -619,6 +828,14 @@ a client asking for a name another record holds is published under its
   a DNS server group that no longer exists, keeping a live group's id
   in any spelling an older build stored and the order of the entries
   kept. Data-only; the downgrade is a no-op.
+- `c4e8a2d6b917` — #3443, clears every DNS zone id that names a zone
+  which no longer exists from `ip_space`, `ip_block`, `subnet`,
+  `ipam_template` and `ip_address` (`dns_zone_id`,
+  `dns_additional_zone_ids`, `extra_zone_ids`) and from unapplied subnet
+  plans' trees, comparing ids by their hex digits so a live zone in any
+  older spelling is kept, and keeping the order of list entries. A zone
+  in the Trash still counts as live. Data-only; the downgrade is a
+  no-op.
 
 ## 1.0.0-beta.3 — 2026-11-01
 
