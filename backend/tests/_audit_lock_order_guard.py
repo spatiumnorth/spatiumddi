@@ -49,14 +49,7 @@ LOCKED_BEFORE_AUDIT_TABLES = frozenset({"dns_zone"})
 #: Entry points known to take the chain lock before a zone row, NOT fixed here,
 #: each with why. A violation under one of these is not recorded. Keep it short:
 #: every entry is a deadlock waiting for its interleaving.
-KNOWN_UNFIXED: dict[str, str] = {
-    # The approval is audited (``mark_approved``) before the approved
-    # operation's ``apply()`` runs in the same transaction, so any operation
-    # that writes a zone (create_ip_address with DNS, ...) takes the chain lock
-    # first. Reordering moves the approval's audit row after the change it
-    # approves, a governance decision for its own issue.
-    "approve_change_request": "approval audited before apply() (#3503 follow-up)",
-}
+KNOWN_UNFIXED: dict[str, str] = {}
 
 #: One entry per offending flush, read and cleared by the conftest fixture.
 violations: list[str] = []
