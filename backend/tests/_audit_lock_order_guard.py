@@ -156,6 +156,8 @@ def _do_orm_execute(state: Any) -> Any:
     ):
         state.session.info[_LOCKED] = True
         state.session.info[_BY] = "lock_audit_chain"
+    # None tells SQLAlchemy to run the statement normally.
+    return None
 
 
 def _after_transaction_end(session: Session, transaction: SessionTransaction) -> None:
