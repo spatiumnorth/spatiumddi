@@ -237,7 +237,7 @@ async def list_sightings(
     base = (
         select(IpMacHistory, IPAddress, Subnet)
         .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-        .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
         .where(and_(*conds))
     )
     total = (
@@ -285,7 +285,7 @@ async def _load_sighting_out(db: DB, sighting_id: uuid.UUID) -> SightingOut:
         await db.execute(
             select(IpMacHistory, IPAddress, Subnet)
             .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-            .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(IpMacHistory.id == sighting_id)
         )
     ).first()
