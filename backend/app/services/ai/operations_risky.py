@@ -87,19 +87,26 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     """Render the soft-delete cascade blast radius for ``root`` as a stable,
     count-bearing string (#3a).
 
-    Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, so
-    the preview reflects exactly what would be soft-deleted right now. Counts
-    are grouped by resource type and rendered in a fixed order so the string is
-    deterministic for a given set of rows (the approve-time drift compare is a
-    plain string equality, so ordering must not jitter). The root row itself is
-    excluded from the cascade counts (it's the target, not collateral)."""
+    Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, plus
+    the reverse zones a subnet, block or space delete then retires into that
+    batch, chosen by the apply's own rule, so the preview reflects exactly what
+    would be soft-deleted right now. Counts are grouped by resource type and
+    rendered in a fixed order so the string is deterministic for a given set of
+    rows (the approve-time drift compare is a plain string equality, so ordering
+    must not jitter). The root row itself is excluded from the cascade counts
+    (it's the target, not collateral)."""
     # Local import — keep the soft_delete dependency off module load.
+    from app.services.dns.reverse_zone import add_retiring_reverse_zones  # noqa: PLC0415
     from app.services.soft_delete import (  # noqa: PLC0415
         _resource_type,
         collect_soft_delete_batch,
     )
 
     batch = await collect_soft_delete_batch(db, root)
+    # The apply adds the reverse zones the batch's subnets auto-created, with
+    # their records (#1066, #2734); counted here as it will trash them (#3511).
+    # A batch with no subnet in it (a zone's, a scope's) gains nothing.
+    await add_retiring_reverse_zones(db, batch)
     # ``counts()`` includes the set-based children (a zone's records, #1231),
     # which are never loaded as rows. The root is the target, not collateral.
     counts = batch.counts()
@@ -111,6 +118,7 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
         "dhcp_scope": "DHCP scope",
         "dhcp_pool": "DHCP pool",
         "dhcp_static_assignment": "DHCP reservation",
+        "dns_zone": "DNS zone",
         "dns_record": "DNS record",
     }
     order = [
@@ -119,6 +127,7 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
         "dhcp_scope",
         "dhcp_pool",
         "dhcp_static_assignment",
+        "dns_zone",
         "dns_record",
     ]
     parts = []
