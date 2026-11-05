@@ -184,3 +184,39 @@ async def test_existing_yes_row_renders_auto_and_is_reported(
     assert server is not None
     bundle = await build_config_bundle(db_session, server)
     assert bundle["options"]["dnssec_validation"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_existing_yes_row_still_saves_other_options(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The Options tab re-sends every field on save, ``dnssec_validation``
+    included; a group stored at ``yes`` before the refusal must still be able
+    to change anything else (the check is on the transition to ``yes``)."""
+    headers = await _superadmin(db_session)
+    group, _ = await _group(db_session, "bind9")
+    db_session.add(DNSServerOptions(group_id=group.id, dnssec_validation="yes"))
+    await db_session.commit()
+    r = await client.put(
+        _url(group),
+        json={"dnssec_validation": "yes", "minimal_responses": True},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["minimal_responses"] is True
+
+
+@pytest.mark.asyncio
+async def test_driver_bundle_also_renders_auto_for_existing_yes_row(
+    db_session: AsyncSession,
+) -> None:
+    """The dataclass ``ConfigBundle`` (control-plane BIND9 driver) applies the
+    same fallback as the agent wire bundle, so the two cannot disagree."""
+    from app.services.dns.config_bundle import build_config_bundle as build_dataclass_bundle
+
+    group, server = await _group(db_session, "bind9")
+    db_session.add(DNSServerOptions(group_id=group.id, dnssec_validation="yes"))
+    await db_session.commit()
+    assert server is not None
+    bundle = await build_dataclass_bundle(db_session, server)
+    assert bundle.options.dnssec_validation == "auto"
