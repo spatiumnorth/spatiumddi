@@ -920,18 +920,6 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         return {"zone_id": str(args.zone_id), "mode": "soft_delete"}
 
     await _push_zone_to_agentless_servers(db, zone, "delete")
-    db.add(
-        AuditLog(
-            user_id=user.id,
-            user_display_name=user.display_name,
-            auth_source=user.auth_source,
-            action="delete",
-            resource_type="dns_zone",
-            resource_id=str(zone.id),
-            resource_display=zone.name,
-            result="success",
-        )
-    )
     collect_wake(dns_group_channel(args.group_id))
     # Set-based first, ORM second. ``db.delete(zone)`` alone cascades through
     # the ORM: every record row is loaded, tracked and DELETEd one by one
@@ -955,6 +943,21 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     await db.delete(zone)
     # IPAM names zones in text / JSONB columns with no foreign key (#3443).
     await prune_zone_ids(db, [zone.id])
+    # #3503: audited after the zone row is deleted. The audit row's flush
+    # takes the audit-chain lock; deleting the zone after it waited for a
+    # record create holding the zone row, which waits for that lock.
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="delete",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+        )
+    )
     await db.commit()
     return {"zone_id": str(args.zone_id), "mode": "delete"}
 

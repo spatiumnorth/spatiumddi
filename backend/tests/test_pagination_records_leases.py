@@ -86,7 +86,9 @@ async def test_zone_records_paginate_and_filter(
     r = await client.get(base, headers=h, params={"page_size": 10})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert set(body) == {"items", "total", "page", "page_size"}
+    # The page envelope, plus the zone's served apex beside it (#3518), which
+    # is neither an item nor counted in ``total``.
+    assert set(body) == {"items", "total", "page", "page_size", "served_apex"}
     assert body["total"] == 30
     assert body["page"] == 1
     assert body["page_size"] == 10

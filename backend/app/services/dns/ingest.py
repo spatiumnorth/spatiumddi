@@ -76,6 +76,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import is_agentless
 from app.models.dns import DNSIngestSnapshot, DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.services.dns.zone_apex import compute_served_apex
 
 logger = structlog.get_logger(__name__)
 
@@ -161,23 +162,22 @@ _PLACEHOLDER_ADDRESS = "127.0.0.1"
 def _placeholder_glue_in_use(zone: DNSZone, managed: list[DNSRecord]) -> bool:
     """True when the agent's renderer falls back to ``ns1.<zone>`` + glue.
 
-    Mirrors ``_zone_apex`` in the agent's BIND9 driver: no managed NS record
-    at the apex, and no usable ``primary_ns`` (empty, or inside the zone
-    with no managed address of its own). ``managed`` is every live row that
-    is not an external mirror, since only those reach the agent's bundle.
+    The rule is ``compute_served_apex``, the control plane's copy of the
+    agent's ``_zone_apex``. ``managed`` is every live row that is not an
+    external mirror. Mirrors do reach the agent's bundle (#2850), but a mirror
+    an earlier build made of the glue itself must not count as the address
+    that makes the glue unnecessary, or it would never be swept. A zone whose
+    own NS record names ``ns1.<zone>`` also gets the glue, but that is the
+    operator's name server and its loopback A is theirs to keep, so only the
+    fallback counts.
     """
-    if any(r.record_type.upper() == "NS" and r.name in ("@", "") for r in managed):
-        return False
-    origin = zone.name.rstrip(".").lower()
-    primary = (zone.primary_ns or "").strip().rstrip(".").lower()
-    if not primary:
-        return True
-    if not primary.endswith("." + origin):
-        return False  # resolves wherever it lives; no placeholder
-    label = primary[: -(len(origin) + 1)]
-    return not any(
-        r.record_type.upper() in ("A", "AAAA") and r.name.lower() == label for r in managed
+    apex = compute_served_apex(
+        zone.name,
+        zone.primary_ns,
+        zone.admin_email,
+        ((r.name, r.record_type, r.value) for r in managed),
     )
+    return apex.source == "placeholder" and apex.placeholder_glue
 
 
 def _is_placeholder_glue(name: str, rtype: str, value: str) -> bool:
