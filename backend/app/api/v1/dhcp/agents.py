@@ -1421,6 +1421,27 @@ async def agent_lease_events(
         for ip in ips
     }
 
+    # #3480: every batch writes its rows in one order: (subnet, address).
+    # The two agents of a group report the same leases, each in its own order
+    # and cut into batches at its own points. A new lease row and a new
+    # mirror row each hold their unique key until the batch commits, so two
+    # batches inserting shared keys in different orders could each hold one
+    # the other was about to insert: Postgres broke the wait with 40P01 and
+    # one batch answered 500. In one order, the second batch waits for the
+    # first and then finds its rows. The sort is stable, so one address's
+    # events keep their order (a grant then its release, #2391's replays).
+    def _write_order(ev: Any) -> tuple[str, int, int, str]:
+        subnet = subnet_for_ip.get(ev.ip_address)
+        subnet_key = str(subnet.id) if subnet is not None else ""
+        ip = norm_ip(ev.ip_address)
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return (subnet_key, 0, 0, ip)
+        return (subnet_key, addr.version, int(addr), ip)
+
+    events = sorted(events, key=_write_order)
+
     def _scope_for_ip(ip: str) -> Any:
         subnet = subnet_for_ip.get(ip)
         return scope_cache.get(subnet.id) if subnet is not None else None
@@ -1626,6 +1647,52 @@ async def agent_lease_events(
     # batch; recounted ONCE after the pass (#3345), never per lease.
     recount_ids: set[Any] = set()
 
+    def _new_mirror_row(subnet: Any, ev: Any, lease: Any) -> IPAddress:
+        return IPAddress(
+            subnet_id=subnet.id,
+            address=ev.ip_address,
+            hostname=("" if subnet.id in no_hostname_subnets else (ev.hostname or "")[:253]),
+            mac_address=ev.mac_address,
+            status="dhcp",
+            auto_from_lease=True,
+            dhcp_lease_id=str(lease.id) if lease.id else None,
+            last_seen_at=now,
+            last_seen_method="dhcp",
+        )
+
+    # #3480: the batch's new mirror rows first, in the order above, before
+    # any lease's DDNS. A publish bumps its zone's serial, which holds the
+    # zone row until the batch commits: a batch that held a zone row and then
+    # waited for another batch's new row deadlocked with that batch waiting
+    # to publish, whatever the two orders. Only for an address whose first
+    # event in the pass is a grant: one that starts with a release still
+    # meets no row there, and is inserted in the pass as before.
+    created_for: dict[int, IPAddress] = {}
+    visited: set[tuple[Any, str]] = set()
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx in stale or subnet is None:
+            continue  # the pass skips these too
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
+        if ev.state == "active" and lease.state != "active":
+            continue  # the pass skips these too
+        key = (subnet.id, norm_ip(ev.ip_address))
+        if key in visited:
+            continue
+        visited.add(key)
+        if ev.state != "active" or key in ipam_by_key:
+            continue
+        # #564: a concurrent Sync-DHCP / static-reservation writer may have
+        # already committed this (subnet_id, address) pair. Insert inside a
+        # savepoint so a unique-violation self-heals into the incumbent row
+        # (the pass below then treats it as a row it found) instead of
+        # 500-ing on uq_ip_address_subnet_address.
+        ipam_row, created = await insert_ipam_mirror_row(db, _new_mirror_row(subnet, ev, lease))
+        ipam_by_key[key] = ipam_row
+        if created:
+            recount_ids.add(subnet.id)
+            created_for[idx] = ipam_row
+
     # ── IPAM mirror pass ────────────────────────────────────────────────
     for idx, ev in enumerate(events):
         if idx in stale:
@@ -1643,26 +1710,14 @@ async def agent_lease_events(
         if is_active and lease.state != "active":
             continue
         if is_active:
-            if ipam_row is None:
-                candidate = IPAddress(
-                    subnet_id=subnet.id,
-                    address=ev.ip_address,
-                    hostname=(
-                        "" if subnet.id in no_hostname_subnets else (ev.hostname or "")[:253]
-                    ),
-                    mac_address=ev.mac_address,
-                    status="dhcp",
-                    auto_from_lease=True,
-                    dhcp_lease_id=str(lease.id) if lease.id else None,
-                    last_seen_at=now,
-                    last_seen_method="dhcp",
+            if ipam_row is not None and created_for.get(idx) is ipam_row:
+                pass  # created for this grant above, already carrying its fields
+            elif ipam_row is None:
+                # Only an address whose first event was a release, or a row
+                # this batch already deleted (see the #3480 note above).
+                ipam_row, created = await insert_ipam_mirror_row(
+                    db, _new_mirror_row(subnet, ev, lease)
                 )
-                # #564 — a concurrent Sync-DHCP / static-reservation
-                # writer may have already committed this
-                # (subnet_id, address) pair. Insert inside a savepoint
-                # so a unique-violation self-heals into the incumbent
-                # row instead of 500-ing on uq_ip_address_subnet_address.
-                ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 ipam_by_key[(subnet.id, norm_ip(ev.ip_address))] = ipam_row
                 if created:
                     recount_ids.add(subnet.id)
