@@ -117,6 +117,7 @@ import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import {
+  type UtilizationThresholds,
   useUtilizationThresholds,
   utilizationBand,
 } from "@/hooks/useUtilizationThresholds";
@@ -230,10 +231,12 @@ function agentNeedsAttention(s: {
   );
 }
 
-function UtilColor(percent: number): string {
-  if (percent >= 95) return "bg-red-500";
-  if (percent >= 85) return "bg-red-400";
-  if (percent >= 70) return "bg-amber-400";
+function UtilColor(percent: number, t: UtilizationThresholds): string {
+  // Amber and red sit at Settings' Warning / Critical Threshold (#3539), the
+  // same lines the IPAM tree and the page's counts use; below the warning
+  // line only the green shade steps with fill.
+  if (percent >= t.critical) return "bg-red-500";
+  if (percent >= t.warn) return "bg-amber-400";
   if (percent >= 50) return "bg-emerald-500";
   if (percent >= 25) return "bg-emerald-400";
   if (percent > 0) return "bg-emerald-300";
@@ -306,7 +309,7 @@ function capacityLabel(subnet: {
   return `${subnet.allocated_ips.toLocaleString()} / ${subnet.total_ips.toLocaleString()}`;
 }
 
-function UtilizationBar({
+export function UtilizationBar({
   percent,
   network,
 }: {
@@ -315,6 +318,7 @@ function UtilizationBar({
    *  true, useless, and indistinguishable from an empty v4 subnet. */
   network?: string;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (network && isV6(network)) {
     return (
       <div className="flex items-center gap-2">
@@ -334,7 +338,7 @@ function UtilizationBar({
         <div
           className={cn(
             "h-full rounded-full transition-all",
-            UtilColor(percent),
+            UtilColor(percent, thresholds),
           )}
           style={{ width: `${Math.min(percent, 100)}%` }}
         />
@@ -354,7 +358,7 @@ function UtilizationBar({
  * end. Cells stay square at every breakpoint via aspect-square +
  * grid-cols-autofill.
  */
-function SubnetHeatmap({
+export function SubnetHeatmap({
   subnets,
   unreadable = null,
 }: {
@@ -363,6 +367,7 @@ function SubnetHeatmap({
    *  says so rather than "No subnets yet". */
   unreadable?: string | null;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (unreadable) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center">
@@ -393,7 +398,9 @@ function SubnetHeatmap({
     .sort((a, b) => a - b);
   const p95Index = Math.max(0, Math.floor(sorted.length * 0.95) - 1);
   const p95 = sorted.length > 0 ? sorted[p95Index] : 0;
-  const hot = active.filter((s) => s.utilization_percent >= 85).length;
+  const hot = active.filter(
+    (s) => s.utilization_percent >= thresholds.critical,
+  ).length;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -422,15 +429,11 @@ function SubnetHeatmap({
           </div>
           <div className="flex items-center gap-1">
             <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400" />
-            <span className="text-muted-foreground">70</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-400" />
-            <span className="text-muted-foreground">85</span>
+            <span className="text-muted-foreground">{thresholds.warn}</span>
           </div>
           <div className="flex items-center gap-1">
             <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-500" />
-            <span className="text-muted-foreground">100%</span>
+            <span className="text-muted-foreground">{thresholds.critical}</span>
           </div>
         </div>
       </div>
@@ -452,7 +455,7 @@ function SubnetHeatmap({
               }`}
               className={cn(
                 "aspect-square rounded transition-all hover:scale-110 hover:ring-2 hover:ring-primary/40",
-                UtilColor(s.utilization_percent),
+                UtilColor(s.utilization_percent, thresholds),
               )}
             />
           ))}
