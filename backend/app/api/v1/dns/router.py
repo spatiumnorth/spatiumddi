@@ -9423,11 +9423,17 @@ async def delete_record(
         # the soft and permanent paths retract identically (#632).
         if zone is not None:
             target_serial = bump_zone_serial(zone)
+            # #3503: the zone row before the audit-chain lock, which the audit
+            # rows added after this take at their flush (see
+            # ``_replace_update_acl_rows``).
+            await db.flush()
             await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, record)
         await apply_soft_delete(db, batch, current_user.id)
+        await _check_render()
+        await _push_delete()
         for row in batch.rows:
             db.add(
                 AuditLog(
@@ -9442,13 +9448,14 @@ async def delete_record(
                     result="success",
                 )
             )
-        await _check_render()
-        await _push_delete()
         await db.commit()
         return
 
     ensure_superadmin(current_user)
 
+    await db.delete(record)
+    await _check_render()
+    await _push_delete()
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -9461,9 +9468,6 @@ async def delete_record(
             result="success",
         )
     )
-    await db.delete(record)
-    await _check_render()
-    await _push_delete()
     await db.commit()
 
 
