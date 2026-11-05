@@ -156,6 +156,31 @@ describe("withheld Network panels (#3449)", () => {
     expect(text).not.toContain("Service catalog clean");
   });
 
+  it("with no ROAs tracked the expired tile and panel are not an all-clear (#3540)", async () => {
+    calls["dashboardsApi.networkSummary"] = () => Promise.resolve(summary({}));
+    const text = await show();
+    expect(kpi("RPKI expired")).toContain("—");
+    expect(kpi("RPKI expired")).toContain("no ROAs tracked");
+    expect(text).not.toContain("No ROAs are expiring");
+    expect(text).toContain("No RPKI ROAs are tracked yet.");
+  });
+
+  it("with ROAs tracked a zero expired count is still good (#3540)", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(
+        summary(
+          {},
+          {
+            rpki_total_count: 5,
+            rpki_last_checked_at: new Date().toISOString(),
+          },
+        ),
+      );
+    const text = await show();
+    expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
+    expect(text).toContain("No ROAs are expiring");
+  });
+
   it("nothing withheld keeps the all-clear wording", async () => {
     calls["dashboardsApi.networkSummary"] = () => Promise.resolve(summary({}));
     const text = await show();
