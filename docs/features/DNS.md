@@ -655,19 +655,7 @@ so there is no private-key custody.
 
 ### 3.4 GSS-TSIG
 
-GSS-TSIG enables Kerberos-based authentication for secure DNS updates, used primarily with Active Directory / Windows DNS integration.
-
-```
-DNSServerOptions.gss_tsig_enabled: bool        -- default false
-DNSServerOptions.gss_tsig_keytab_path: str     -- path to keytab on DNS server host
-DNSServerOptions.gss_tsig_realm: str           -- e.g. "CORP.EXAMPLE.COM"
-DNSServerOptions.gss_tsig_principal: str       -- e.g. "DNS/ns1.corp.example.com@CORP.EXAMPLE.COM"
-```
-
-- **BIND9:** `tkey-gssapi-keytab "/etc/bind/dns.keytab";` + `tkey-domain "CORP.EXAMPLE.COM";`
-- When enabled, DDNS updates from Windows clients use Kerberos tickets rather than HMAC-TSIG keys
-- The keytab file is deployed to the DNS server host by the SpatiumDDI agent; the path is stored (not the keytab content itself)
-- Required for seamless AD/DNS integration and Windows Secure Dynamic Update
+**Not supported yet.** GSS-TSIG (Kerberos-signed RFC 2136 updates, which AD-integrated zones set to "Secure only" require) is not implemented, so SpatiumDDI cannot accept or send such updates. The `gss_tsig_*` server options that used to appear here were stored but never rendered, and were removed in #3561. Real support is tracked in [#1128](https://github.com/spatiumnorth/spatiumddi/issues/1128) (Kerberos transport) and [#444](https://github.com/spatiumnorth/spatiumddi/issues/444); it will use `tkey-gssapi-keytab` with a mounted keytab and `krb5-*` / `ms-*` update-policy rules. `tkey-domain` is obsolete (no effect since BIND 9.20, removed in 9.21.15) and must not be configured.
 
 ### 3.5 Notify
 
@@ -2164,10 +2152,9 @@ unrelated edit.
   line and are refused. `query_log_print_category` / `_print_severity`
   are honoured; `query_log_print_time` must stay on (the shipper reads the
   timestamp).
-- **Paths.** `gss_tsig_keytab_path` must be a file under `/etc/` or
-  `/var/lib/`. It must be
-  absolute, with no `.` or `..` segment, using only letters, digits, `.`,
-  `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
+- **Paths.** `query_log_file` must be absolute, with no `.` or `..`
+  segment, using only letters, digits, `.`, `_`, `-` and `/`: the path sits
+  inside `"…"` in `named.conf`.
 
 A zone's own `allow_query`, `allow_transfer`, `also_notify` and
 `notify_enabled` go through the same checks on zone create and update (#1316),
