@@ -743,7 +743,7 @@ View override  (per-view recursion, allow-query, allow-query-cache)
 Server default (DNSServerOptions — applies to all views/zones on that server)
 ```
 
-Forwarders are **group-level only**: a view has no forwarder fields and the agent's view block renders only `match-clients`, recursion, `allow-query` and `allow-query-cache`, so every view inherits the group's `forwarders`. Per-view forwarders are tracked in [#3523](https://github.com/spatiumnorth/spatiumddi/issues/3523).
+Forwarders are **group-level only**: a view has no forwarder fields and the only view-level options the agent renders are `match-clients`, `match-destinations`, recursion, `allow-query` and `allow-query-cache`, so every view inherits the group's `forwarders`. Per-view forwarders are tracked in [#3523](https://github.com/spatiumnorth/spatiumddi/issues/3523).
 
 The driver is responsible for generating the correct BIND9 config that reflects this layered precedence. Service-layer code must not hard-code driver specifics.
 
