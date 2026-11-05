@@ -308,64 +308,46 @@ async def subnet_operator_state(db: AsyncSession, subnet: Subnet, own_fk: str) -
 async def drop_wrapper_block(
     db: AsyncSession, wrapper: IPBlock, own_fk: str, *, warnings: list[str] | None = None
 ) -> bool:
-    """Remove an integration's wrapper block that backs no mirrored subnet (#3556).
+    """Delete an integration's wrapper block that backs no mirrored subnet (#3556).
 
     Every mirror's wrapper-block pass calls this in place of its own
     soft-delete-filtered "any subnet left?" check. That check misses a subnet
     in the Trash, and the block delete then fails on the ``subnet.block_id``
-    ``RESTRICT`` foreign key, failing the whole sync on every tick. Returns
-    True when the block was deleted (the caller counts it).
+    ``RESTRICT`` foreign key, failing the whole sync on every tick. A child
+    block (live or trashed) is counted too: ``ip_block.parent_block_id`` is
+    ``CASCADE``, so the delete would destroy it with the wrapper (#3492's
+    rule, as :func:`release_outside_space` applies it). Returns True when the
+    block was deleted (the caller counts it).
 
-    * a live subnet still under it: kept as is (pathological; not ours to
-      move), False;
-    * only a trashed subnet: the block is released (the caller's FK cleared,
-      the block kept so the subnet restores into it) with one system audit
-      row, False;
-    * nothing: deleted, True.
+    Anything still under it keeps the block, still owned by the caller, and
+    changes nothing. Kept owned rather than released, so a network that
+    reappears is mirrored back into this same wrapper (it is the caller's
+    wrapper at that CIDR), and the block goes on the first tick after the
+    Trash entry is purged, instead of being left behind as an orphaned
+    "Auto-created for …" block nothing will ever remove. A subnet in the Trash
+    still restores into it. ``warnings`` gets a line while a trashed subnet is
+    what holds it, which the Trash's own retention bounds.
     """
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
-    live = await db.scalar(
-        select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
-    )
-    if live:
-        return False
-    trashed = await db.scalar(
-        select(func.count())
-        .select_from(Subnet)
-        .where(Subnet.block_id == wrapper.id)
-        .execution_options(include_deleted=True)
-    )
-    if not trashed:
+    child = aliased(IPBlock)
+    any_subnet, any_child = (
+        await db.execute(
+            select(
+                exists_including_deleted(Subnet.block_id == wrapper.id),
+                exists_including_deleted(child.parent_block_id == wrapper.id),
+            )
+        )
+    ).one()
+    if not (any_subnet or any_child):
         await db.delete(wrapper)
         return True
-    target_id = getattr(wrapper, own_fk)
-    integration = INTEGRATION_OWNERSHIP[own_fk]
-    setattr(wrapper, own_fk, None)
-    _defer_audit(
-        db,
-        AuditLog(
-            user_display_name="system",
-            auth_source="system",
-            action="update",
-            resource_type="ip_block",
-            resource_id=str(wrapper.id),
-            resource_display=str(wrapper.network),
-            changed_fields=[own_fk],
-            old_value={own_fk: str(target_id) if target_id is not None else None},
-            new_value={
-                "integration": integration,
-                own_fk: None,
-                "outcome": "released",
-                "kept_for": ["trashed_subnet"],
-                "reason": "no mirrored subnet left",
-            },
-            result="success",
-        ),
+    live_subnet = await db.scalar(
+        select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
     )
-    if warnings is not None:
+    if any_subnet and not live_subnet and warnings is not None:
         warnings.append(
-            f"wrapper block {wrapper.network} of {integration} was kept and released: "
+            f"wrapper block {wrapper.network} of {INTEGRATION_OWNERSHIP[own_fk]} was kept: "
             "a subnet in the Trash still sits under it (#3556)"
         )
     return False
