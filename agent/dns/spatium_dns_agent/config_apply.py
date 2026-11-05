@@ -144,6 +144,11 @@ class ApplyStatus:
     #: operator whether the daemon was ever disturbed.
     phase: str | None = None
     error: str | None = None
+    #: Why, when the agent knows (#3552): ``"oom"`` when the previous process
+    #: died to the container's OOM killer. ``None`` = unknown, never "not OOM".
+    reason: str | None = None
+    #: ``memory.max`` in bytes at that time; only meaningful with ``reason``.
+    memory_limit_bytes: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         # Nothing applied yet (#2258): the default ``ok`` with no etag is a
@@ -152,13 +157,19 @@ class ApplyStatus:
         # unknown, #882) untouched, instead of a fabricated ``ok``.
         if self.status == STATUS_OK and self.etag is None:
             return {}
-        return {
+        out: dict[str, Any] = {
             "status": self.status,
             "etag": self.etag,
             "failed_etag": self.failed_etag,
             "phase": self.phase,
             "error": self.error,
         }
+        # Only when set, so the wire is unchanged for every other verdict.
+        if self.reason:
+            out["reason"] = self.reason
+            if self.memory_limit_bytes:
+                out["memory_limit_bytes"] = self.memory_limit_bytes
+        return out
 
     @property
     def healthy(self) -> bool:

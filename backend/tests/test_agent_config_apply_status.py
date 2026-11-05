@@ -250,3 +250,64 @@ def test_failed_statuses_excludes_ok() -> None:
     the alert fire on every healthy server in the fleet."""
     assert STATUS_OK not in FAILED_STATUSES
     assert FAILED_STATUSES == {STATUS_REVERTED, STATUS_REVERT_FAILED, STATUS_NO_PREVIOUS}
+
+
+# ── OOM-killed apply (#3552) ──────────────────────────────────────────────
+
+
+def test_oom_reason_is_stored_as_a_readable_error_with_the_limit() -> None:
+    row = _row()
+    _report(
+        row,
+        {
+            "status": STATUS_NO_PREVIOUS,
+            "failed_etag": "bad",
+            "error": "the DNS daemon died once while this bundle was being applied",
+            "reason": "oom",
+            "memory_limit_bytes": 512 << 20,
+        },
+    )
+    assert row.config_apply_status == STATUS_NO_PREVIOUS
+    assert (row.config_apply_error or "").startswith(
+        "out of memory while applying config (limit 512 MiB): the DNS daemon died"
+    )
+
+
+def test_oom_reason_without_a_limit_still_says_out_of_memory() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_NO_PREVIOUS, "failed_etag": "b", "reason": "oom"})
+    assert row.config_apply_error == "out of memory while applying config"
+
+
+def test_an_older_agent_report_is_stored_unchanged() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_NO_PREVIOUS, "failed_etag": "b", "error": "boom"})
+    assert row.config_apply_error == "boom"
+
+
+def test_an_unknown_reason_is_ignored() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_REVERTED, "error": "boom", "reason": "meteor"})
+    assert row.config_apply_error == "boom"
+
+
+async def test_the_alert_text_carries_the_oom_reason(db_session: AsyncSession) -> None:
+    row = await _dns_server(
+        db_session,
+        "ns-oom",
+        config_apply_status=STATUS_NO_PREVIOUS,
+        config_failed_etag="sha256:bad",
+    )
+    _report(
+        row,
+        {
+            "status": STATUS_NO_PREVIOUS,
+            "failed_etag": "sha256:bad",
+            "reason": "oom",
+            "memory_limit_bytes": 1 << 30,
+        },
+    )
+    await db_session.flush()
+
+    matches = await _matching_agent_config_rejected_subjects(db_session, _RULE)
+    assert "out of memory while applying config (limit 1 GiB)" in matches[0][2]

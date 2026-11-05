@@ -64,6 +64,25 @@ _MAX_ETAG = 128
 _MAX_STATUS = 20
 
 
+#: ``reason`` an agent sends when the previous process died to the container's
+#: OOM killer while applying (#3552). Anything else is ignored: NULL / absent
+#: means the agent does not know, never "not out of memory".
+REASON_OOM = "oom"
+
+
+def format_oom_error(limit_bytes: int | None, detail: str | None) -> str:
+    """The operator-facing text for an OOM-killed apply, with the agent's own
+    detail appended. Stored in ``config_apply_error`` so the chip, banner,
+    alert and MCP tool all say it without a column per surface."""
+    if limit_bytes and limit_bytes > 0:
+        gib = limit_bytes / (1 << 30)
+        limit = f"{gib:g} GiB" if gib >= 1 else f"{limit_bytes // (1 << 20)} MiB"
+        head = f"out of memory while applying config (limit {limit})"
+    else:
+        head = "out of memory while applying config"
+    return f"{head}: {detail}" if detail else head
+
+
 class _HasConfigApplyColumns(Protocol):
     config_apply_status: str | None
     config_apply_error: str | None
@@ -135,7 +154,16 @@ def apply_reported_status(
         server.config_apply_error = None
         server.config_failed_etag = None
     else:
-        server.config_apply_error = _clip(reported.get("error"), _MAX_ERROR)
+        error = _clip(reported.get("error"), _MAX_ERROR)
+        if _clip(reported.get("reason"), 16) == REASON_OOM:
+            raw_limit = reported.get("memory_limit_bytes")
+            limit = (
+                raw_limit
+                if isinstance(raw_limit, int) and not isinstance(raw_limit, bool)
+                else None
+            )
+            error = _clip(format_oom_error(limit, error), _MAX_ERROR)
+        server.config_apply_error = error
         server.config_failed_etag = _clip(reported.get("failed_etag"), _MAX_ETAG)
     server.config_apply_at = datetime.now(UTC)
 

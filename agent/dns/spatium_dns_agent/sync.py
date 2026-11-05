@@ -494,7 +494,7 @@ class SyncLoop:
         if watched:
             seen = f" (the agent saw it exit {'once' if watched == 1 else f'{watched} times'})"
         oom = ""
-        if self.oom_watch is not None and self.oom_watch.record:
+        if self._guard.died_oom_killed or (self.oom_watch is not None and self.oom_watch.record):
             oom = (
                 " (the container's OOM killer: the daemon ran out of memory under "
                 "its limit; large RPZ blocklists are the usual cause, see "
@@ -532,6 +532,10 @@ class SyncLoop:
                 etag=None,
                 failed_etag=etag,
                 phase=PHASE_RELOAD,
+                reason="oom" if self._guard.died_oom_killed else None,
+                memory_limit_bytes=(
+                    self._guard.oom_limit_bytes if self._guard.died_oom_killed else None
+                ),
                 error=truncate_error(
                     f"{reason}; held back at startup, so the server is not serving "
                     "until the control plane sends a bundle"

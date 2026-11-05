@@ -48,6 +48,15 @@ kubelet's ``memory.oom.group`` kills the agent with named (#2018), so there the
 guard stops at sync-first: the crash loop on a bundle the control plane still
 serves is the kubelet's to back off, and the operator's fix is fetched on the
 next start, which is what #2019 needed.
+
+Naming an OOM kill (#3552): the guard persists the cgroup's ``oom_kill`` counter
+at every arm, and :meth:`ApplyGuard.startup` compares it with the counter at the
+next start. A rise means the kernel killed something in this cgroup during the
+apply window, and the verdict then carries ``reason="oom"`` plus ``memory.max``.
+That needs the counter to survive the restart, i.e. the same cgroup (an agent
+restarted inside its container, or Docker's restart of a surviving cgroup); a
+brand-new container cgroup starts at zero and reads as unknown, which the
+kubelet's ``OOMKilled`` path (``container_oom``) covers instead.
 """
 
 from __future__ import annotations
@@ -59,6 +68,8 @@ import time
 from pathlib import Path
 
 import structlog
+
+from .oom_watch import OOM_EVENT_FILES, cgroup_memory_limit_bytes, read_oom_kill_count
 
 log = structlog.get_logger(__name__)
 
@@ -122,8 +133,17 @@ _MAX_TRACKED = 4
 class ApplyGuard:
     """The persisted death-during-apply marker plus per-bundle death counts."""
 
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, oom_files: tuple[str, ...] = OOM_EVENT_FILES):
         self._path = state_dir / "config" / "apply_guard.json"
+        self._oom_files = oom_files
+        #: The cgroup ``oom_kill`` counter as last seen, persisted so a rise
+        #: across a restart is detectable (#3552). ``None``: not readable.
+        self.oom_count: int | None = None
+        #: Set by :meth:`startup`: the death it counted coincided with the
+        #: cgroup's OOM killer firing (counter rose since the last record).
+        self.died_oom_killed = False
+        #: ``memory.max`` at that startup, bytes, ``None`` when unlimited.
+        self.oom_limit_bytes: int | None = None
         self._lock = threading.Lock()
         #: etag being applied or settling; ``None`` when nothing is pending.
         self.armed: str | None = None
@@ -165,11 +185,13 @@ class ApplyGuard:
                         into[str(etag)] = int(n)
                 except (TypeError, ValueError):
                     continue
+        oom = data.get("oom_count")
+        self.oom_count = oom if isinstance(oom, int) and oom >= 0 else None
         stamp = data.get("last_death_at")
         self.last_death_at = float(stamp) if isinstance(stamp, (int, float)) else None
 
     def _save(self) -> None:
-        if not self.armed and not self.deaths and not self.observed:
+        if not self.armed and not self.deaths and not self.observed and self.oom_count is None:
             try:
                 self._path.unlink(missing_ok=True)
             except OSError:
@@ -185,6 +207,7 @@ class ApplyGuard:
                         "deaths": self.deaths,
                         "observed": self.observed,
                         "last_death_at": self.last_death_at,
+                        "oom_count": self.oom_count,
                     }
                 )
             )
@@ -203,6 +226,18 @@ class ApplyGuard:
         is applied."""
         with self._lock:
             died = self.armed
+            # #3552: was the death the cgroup's OOM killer? Compare the counter
+            # now with the one persisted by the previous process (refreshed at
+            # every arm, so a kill during the apply window shows as a rise).
+            # Always re-record, so the next start compares against this one.
+            now_count = read_oom_kill_count(self._oom_files)
+            if died is not None and now_count is not None and self.oom_count is not None:
+                self.died_oom_killed = now_count > self.oom_count
+                if self.died_oom_killed:
+                    self.oom_limit_bytes = cgroup_memory_limit_bytes()
+            if now_count is not None and now_count != self.oom_count:
+                self.oom_count = now_count
+                self._save()
             if died is None:
                 return None
             self.deaths[died] = self.deaths.get(died, 0) + 1
@@ -222,6 +257,7 @@ class ApplyGuard:
             etag=died,
             deaths=count,
             watched=watched,
+            oom_killed=self.died_oom_killed,
             note="the previous process exited while this bundle was being applied "
             f"or within {int(SETTLE_SECONDS)} s of it",
         )
@@ -264,6 +300,10 @@ class ApplyGuard:
         with self._lock:
             self.armed = etag
             self._applied_at = None
+            # The baseline for #3552's "did the OOM killer fire since?".
+            count = read_oom_kill_count(self._oom_files)
+            if count is not None:
+                self.oom_count = count
             self._save()
 
     def applied(self) -> None:
