@@ -30,7 +30,7 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
@@ -40,6 +40,7 @@ from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
+    drop_wrapper_block,
     owned_addresses_in_space,
     retire_vanished_subnet,
 )
@@ -536,11 +537,7 @@ async def apply_subnets(
     for cidr, wrapper in fw_wrappers.items():
         if cidr in used_wrapper_cidrs:
             continue
-        refs = await db.scalar(
-            select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
-        )
-        if not refs:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(db, wrapper, owner.fk_attr, warnings=summary.warnings):
             summary.blocks_deleted += 1
 
 

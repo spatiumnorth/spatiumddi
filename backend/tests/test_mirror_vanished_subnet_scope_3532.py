@@ -367,3 +367,121 @@ async def test_retired_subnet_audit_does_not_take_the_chain_lock_before_a_zone_w
         ),
     )
     assert audit.action == "delete"
+
+
+@pytest.mark.asyncio
+async def test_release_outside_space_audit_does_not_take_the_chain_lock_before_a_zone_write(
+    db_session: AsyncSession,
+) -> None:
+    """#3556: ``release_outside_space`` runs mid-sync. Its audit row must not
+    be flushed (taking the audit-chain lock) before the same sync's address
+    absence-delete bumps a zone serial. The conftest lock-order guard fails
+    this test if it is."""
+    net_a = _DockerNetwork(
+        id="na",
+        name="a",
+        driver="bridge",
+        scope="local",
+        subnets=[("172.31.0.0/24", "172.31.0.1")],
+    )
+    web = _DockerContainer(
+        id="c1",
+        name="web",
+        image="nginx",
+        state="running",
+        status="Up",
+        ip_bindings=[("a", "172.31.0.5")],
+    )
+    _grp, _server, zone = await _dns(db_session)
+    space = await _make_space(db_session)
+    old = await _make_space(db_session)
+    await _make_block(db_session, space, "172.16.0.0/12")
+    host = await _make_host(db_session, space, mirror_containers=True)
+    await db_session.commit()
+    with _patch_client(_FakeClient(networks=[net_a], containers=[web])):
+        assert (await reconcile_host(db_session, host)).ok
+    addr_id = await db_session.scalar(
+        select(IPAddress.id).where(
+            IPAddress.docker_host_id == host.id, IPAddress.address == "172.31.0.5"
+        )
+    )
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="web",
+            fqdn=f"web.{zone.name}",
+            record_type="A",
+            value="172.31.0.5",
+            auto_generated=True,
+            ip_address_id=addr_id,
+        )
+    )
+    # A pure mirror subnet left behind in a space the host no longer targets.
+    block = IPBlock(space_id=old.id, network="10.77.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    db_session.add(
+        Subnet(
+            space_id=old.id,
+            block_id=block.id,
+            network="10.77.1.0/24",
+            name="stray",
+            docker_host_id=host.id,
+        )
+    )
+    await db_session.commit()
+
+    # The container goes: its address is absence-deleted, its record retracted.
+    await db_session.refresh(host)
+    with _patch_client(_FakeClient(networks=[net_a], containers=[])):
+        summary = await reconcile_host(db_session, host)
+    assert summary.ok, summary.error
+    assert summary.released.subnets_deleted == 1
+    assert summary.addresses_deleted == 1
+    db_session.expire_all()
+    assert (
+        await db_session.scalar(
+            select(AuditLog.id).where(AuditLog.action == "integration.release_outside_space")
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrapper_block_holding_only_a_trashed_subnet_is_released_not_deleted(
+    db_session: AsyncSession,
+) -> None:
+    """#3556: the wrapper-block pass saw no live subnet and deleted the block,
+    which the trashed subnet's RESTRICT FK refused: every sync tick failed."""
+    space, host, subnets = await _mirror(db_session, ["203.0.113.0/24"])
+    sid = subnets["203.0.113.0/24"]
+    subnet = await db_session.get(Subnet, sid)
+    wrapper_id = subnet.block_id
+    wrapper = await db_session.get(IPBlock, wrapper_id)
+    assert wrapper.docker_host_id == host.id
+    subnet.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        summary = await reconcile_host(db_session, host)
+    assert summary.ok, summary.error
+    assert summary.blocks_deleted == 0
+    assert any("Trash" in w for w in summary.warnings)
+    db_session.expire_all()
+    block = await db_session.get(IPBlock, wrapper_id)
+    assert block is not None and block.docker_host_id is None
+    assert await db_session.scalar(
+        select(Subnet.id).where(Subnet.id == sid).execution_options(**_INC)
+    )
+    audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.resource_type == "ip_block", AuditLog.resource_id == str(wrapper_id)
+        )
+    )
+    assert audit is not None and audit.new_value["outcome"] == "released"
+
+    # Idempotent: the next tick is clean.
+    await db_session.refresh(host)
+    with _patch_client(_engine([], [])):
+        assert (await reconcile_host(db_session, host)).ok

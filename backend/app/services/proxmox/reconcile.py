@@ -47,6 +47,7 @@ from app.services.integration_ownership import (
     SpaceRelease,
     address_taken,
     addresses_in_space,
+    drop_wrapper_block,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
@@ -685,9 +686,7 @@ async def _apply_blocks_and_subnets(
     for net_str, wrapper in node_owned_wrappers.items():
         if net_str in used_wrapper_cidrs:
             continue
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == wrapper.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(db, wrapper, "proxmox_node_id", warnings=summary.warnings):
             summary.blocks_deleted += 1
 
 
