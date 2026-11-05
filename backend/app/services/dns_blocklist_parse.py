@@ -137,6 +137,17 @@ class ParsedFeed:
     format_mismatch: str | None = None
 
 
+def looks_like_html(content: str) -> bool:
+    """True when a body starts like an HTML document (#3607).
+
+    A captive portal, login page, or a 404 page served with status 200
+    parses as a feed with zero (or a few junk) rules; the caller refuses it
+    rather than emptying the list.
+    """
+    head = content.lstrip("\ufeff \t\r\n")[:64].lower()
+    return head.startswith(("<!doctype html", "<html"))
+
+
 def parse_feed(content: str, feed_format: str) -> list[str]:
     """Parse raw feed text into a deduped list of domains.
 
