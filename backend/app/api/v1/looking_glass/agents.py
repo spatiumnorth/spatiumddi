@@ -307,7 +307,7 @@ async def agent_config_longpoll(
         # authoritative either way).
         while True:
             # #2040 — this session lives for the whole wait (expire_on_commit=
-            # False, no commit in the loop). A re-query hands back the peer
+            # False: no commit in the loop expires anything). A re-query hands back the peer
             # rows already in the identity map without overwriting them, and
             # the collector row was never re-read at all, so a woken pass
             # rebuilt the bundle from the state the poll parked on: a peer
@@ -355,6 +355,11 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
+            # #3479: end this pass's read transaction before the wait, so the
+            # bundle's reads hold no lock through it (the DNS and DHCP polls
+            # made a factory reset's TRUNCATE wait out whole holds). Nothing is
+            # pending here, and the next pass expires and re-reads everything.
+            await db.commit()
             if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
                 # #3015 — this api process is stopping: end the hold now so the
                 # next pass makes one last ETag check and answers 304, and the

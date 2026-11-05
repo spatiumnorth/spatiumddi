@@ -49,7 +49,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_permission, require_resource_permission
-from app.models.ipam import IPAddress, IPSpace
+from app.models.ipam import IPSpace
 from app.models.multicast import (
     MEMBERSHIP_ROLES,
     MEMBERSHIP_SOURCES,
@@ -63,6 +63,7 @@ from app.models.multicast import (
 from app.models.network import NetworkDevice
 from app.models.vrf import VRF
 from app.services.api_token_scopes import read_only_post
+from app.services.ipam.live_address import get_live_address
 from app.services.multicast.auto_block import ensure_enclosing_block
 from app.services.tags import apply_tag_filter
 
@@ -899,7 +900,7 @@ async def add_membership(
     user: CurrentUser,
 ) -> MulticastMembershipRead:
     group = await _get_group(db, group_id)
-    if (await db.get(IPAddress, body.ip_address_id)) is None:
+    if (await get_live_address(db, body.ip_address_id)) is None:
         raise HTTPException(status_code=422, detail="ip_address_id not found")
 
     # Catch the unique-triplet violation with a clean 409 instead of

@@ -142,6 +142,19 @@ def test_skip_share_rising_is_flagged(chk, parser) -> None:
     assert ("skipped", "ab") not in _kinds(_run(chk, parser, [_src("ab", "adblock")], {"ab": ok}))
 
 
+def test_skipped_counts_each_rule_once(chk, parser) -> None:
+    # #3519: ``as_dict()`` carries ``malformed`` AND the reasons it is the sum
+    # of, so summing its values would count every malformed rule twice.
+    rules = [f"||ok{i}.example.com^" for i in range(1000)] + [
+        "/re/",
+        "||a.*.example.com^",
+        "-tracker.example.net^",
+        "||countly-",
+    ]
+    rep = _run(chk, parser, [_src("ab", "adblock")], {"ab": "\n".join(rules)})
+    assert rep.measured["ab"].skipped == 4
+
+
 def test_upstream_diff(chk, parser) -> None:
     registry = {
         "filters": [
