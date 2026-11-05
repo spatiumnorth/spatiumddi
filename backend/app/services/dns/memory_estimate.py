@@ -194,27 +194,57 @@ def warning_message(est: GroupMemoryEstimate) -> str:
 
 
 async def _rpz_entry_count(
-    db: AsyncSession, lists: list[DNSBlockList], exceptions: Iterable[str]
+    db: AsyncSession,
+    lists: list[DNSBlockList],
+    exceptions: Iterable[str],
+    memo: dict[Any, int] | None = None,
 ) -> int:
     """Owner names the RPZ zone for ``lists`` holds: each domain once across
     every enabled list (the #878 first-writer-wins dedup), plus the
     exception domains, which render as passthru owners in place of any entry
-    they cancel."""
-    ids = [bl.id for bl in lists if bl.enabled]
+    they cancel.
+
+    ``memo`` keeps one count per set of lists and exceptions: under views
+    every view folds the same group lists into a zone of its own, and the
+    deduplicated count over a million-entry feed takes seconds."""
+    ids = sorted({bl.id for bl in lists if bl.enabled})
     if not ids:
         return 0
+    exc = sorted({e.lower() for e in exceptions})
+    key = (tuple(ids), tuple(exc))
+    if memo is not None and key in memo:
+        return memo[key]
+    if len(ids) == 1 and not exc:
+        # One list holds each domain once (``uq_dns_blocklist_entry_list_domain``)
+        # and every writer stores it lowercased, so there is nothing to
+        # deduplicate: a plain count over the list's index.
+        n = int(
+            await db.scalar(
+                select(func.count())
+                .select_from(DNSBlockListEntry)
+                .where(DNSBlockListEntry.list_id == ids[0])
+            )
+            or 0
+        )
+        if memo is not None:
+            memo[key] = n
+        return n
     parts: list[Any] = [
         select(func.lower(DNSBlockListEntry.domain).label("d")).where(
             DNSBlockListEntry.list_id.in_(ids)
         )
     ]
-    exc = sorted({e.lower() for e in exceptions})
     if exc:
         # One array parameter, not a SELECT per domain: a feed's exceptions
         # can number in the thousands.
         parts.append(select(func.unnest(bindparam("exc", exc, type_=ARRAY(Text))).label("d")))
-    sub = union(*parts).subquery()
-    return int(await db.scalar(select(func.count()).select_from(sub)) or 0)
+    # ``union`` of one SELECT renders as that SELECT alone, with no DISTINCT:
+    # without exceptions a domain two lists share would count twice.
+    sub = (union(*parts) if len(parts) > 1 else parts[0].distinct()).subquery()
+    n = int(await db.scalar(select(func.count()).select_from(sub)) or 0)
+    if memo is not None:
+        memo[key] = n
+    return n
 
 
 async def _rpz_loads(
@@ -235,17 +265,18 @@ async def _rpz_loads(
 
     loads: list[RpzLoad] = []
     own: set[str] = set()
+    memo: dict[Any, int] = {}
     for v in operator_views:
         lists = await effective_lists_for_view(db, v.id) or []
         if lists and await has_entries(db, lists):
-            n = await _rpz_entry_count(db, lists, await exception_domains(db, lists))
+            n = await _rpz_entry_count(db, lists, await exception_domains(db, lists), memo)
             loads.append(RpzLoad(f"spatium-blocklist-{v.name}.rpz.", (v.name,), n))
             own.add(v.name)
     if operator_views and len(own) == len(operator_views):
         return loads
     lists = await effective_lists_for_group(db, group_id) or []
     if lists and await has_entries(db, lists):
-        n = await _rpz_entry_count(db, lists, await exception_domains(db, lists))
+        n = await _rpz_entry_count(db, lists, await exception_domains(db, lists), memo)
         loads.append(
             RpzLoad("spatium-blocklist.rpz.", tuple(v for v in view_names if v not in own), n)
         )

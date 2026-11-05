@@ -199,6 +199,24 @@ async def test_entries_are_counted_after_dedup_and_exceptions(db_session: AsyncS
 
 
 @pytest.mark.asyncio
+async def test_entries_shared_by_two_lists_count_once_without_exceptions(
+    db_session: AsyncSession,
+) -> None:
+    """The dedup holds with no exception in play: overlapping feeds (the
+    Family filter's Hagezi lists share domains) load each owner once."""
+    group, _ = await _group(db_session, [], [None])
+    a = await _list(db_session, _domains(30))
+    b = await _list(db_session, [d.upper() for d in _domains(20)] + _domains(5, "x"))
+    await _on_group(db_session, a, group)
+    await _on_group(db_session, b, group)
+    await db_session.flush()
+
+    est = await group_memory_estimate(db_session, group.id)
+    assert est is not None
+    assert [(r.views, r.entries) for r in est.rpz] == [((), 35)]
+
+
+@pytest.mark.asyncio
 async def test_a_views_own_list_is_folded_into_that_views_zone_only(
     db_session: AsyncSession,
 ) -> None:
