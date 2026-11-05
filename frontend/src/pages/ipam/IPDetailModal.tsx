@@ -52,11 +52,7 @@ import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
-import {
-  PERMISSIONS_UNREADABLE,
-  permissionGate,
-  usePermissions,
-} from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 
@@ -753,10 +749,9 @@ export function ReputationSection({ address }: { address: string }) {
         <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
           {q.error ? (
             <ListReadError error={q.error} what="this IP's blocklist status" />
-          ) : dnsblPerms.isError ? (
-            PERMISSIONS_UNREADABLE
           ) : (
-            "You don't have permission to see this IP's blocklist status."
+            (dnsblPerms.unanswered ??
+            "You don't have permission to see this IP's blocklist status.")
           )}
         </div>
       ) : entries.length === 0 ? (
@@ -1230,9 +1225,8 @@ function DeviceProfileSection({
   const scanPerms = usePermissions();
   const canReadScans = scanPerms.can("read", "manage_nmap_scans") && nmapOn;
   const scansUnavailable = nmapOn
-    ? scanPerms.isError
-      ? PERMISSIONS_UNREADABLE
-      : "You don't have permission to see this IP's profile scan."
+    ? (scanPerms.unanswered ??
+      "You don't have permission to see this IP's profile scan.")
     : "Nmap scanning is turned off, so this IP's profile scan is not shown.";
   const [error, setError] = useState<string | null>(null);
   const [showRawSig, setShowRawSig] = useState(false);
@@ -1511,9 +1505,8 @@ function DeviceProfileSection({
               No active profile yet.{" "}
               {!canReadScans
                 ? nmapOn
-                  ? scanPerms.isError
-                    ? PERMISSIONS_UNREADABLE
-                    : "You don't have permission to run or see profile scans."
+                  ? (scanPerms.unanswered ??
+                    "You don't have permission to run or see profile scans.")
                   : "Nmap scanning is turned off."
                 : dhcpOn
                   ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`

@@ -1313,7 +1313,7 @@ export function SettingsPage() {
   // only the fields the API lists in `delegate_writable_fields` (its
   // SETTINGS_DELEGATE_WRITABLE, served rather than copied here so the two
   // cannot drift); every other control stays superadmin-only.
-  const { can, isError: permsFailed } = usePermissions();
+  const { can, isError: permsFailed, unanswered } = usePermissions();
   const canWrite = isSuperadmin || can("write", "settings");
 
   const { data, isLoading } = useQuery({
@@ -1515,7 +1515,9 @@ export function SettingsPage() {
                 ? "You can edit the settings delegated to your role; the rest need a superadmin."
                 : permsFailed
                   ? `View-only — ${PERMISSIONS_UNREADABLE}`
-                  : "View-only — you need write access on settings to edit."}
+                  : unanswered
+                    ? unanswered
+                    : "View-only — you need write access on settings to edit."}
           </p>
         </div>
         <div className="border-b p-3">

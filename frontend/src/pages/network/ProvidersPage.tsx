@@ -15,11 +15,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
-import {
-  PERMISSIONS_UNREADABLE,
-  permissionGate,
-  usePermissions,
-} from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -188,9 +184,8 @@ function ProviderEditorModal({
               title={
                 canReadAsns
                   ? undefined
-                  : asnPerms.isError
-                    ? PERMISSIONS_UNREADABLE
-                    : "You may not read ASNs (manage_asns)"
+                  : (asnPerms.unanswered ??
+                    "You may not read ASNs (manage_asns)")
               }
             >
               <option value="">— none —</option>
@@ -198,7 +193,9 @@ function ProviderEditorModal({
                 <option value={defaultAsnId}>
                   {asnPerms.isError
                     ? "set — could not be read"
-                    : "set — you may not read ASNs"}
+                    : asnPerms.unanswered
+                      ? "set — kept as is"
+                      : "set — you may not read ASNs"}
                 </option>
               )}
               {(asnsQuery.data?.items ?? []).map((a) => (
@@ -514,9 +511,8 @@ export function ProvidersPage() {
                       ) : p.default_asn_id && !canReadAsns ? (
                         <span
                           title={
-                            asnPerms.isError
-                              ? PERMISSIONS_UNREADABLE
-                              : "You may not read ASNs (manage_asns)"
+                            asnPerms.unanswered ??
+                            "You may not read ASNs (manage_asns)"
                           }
                         >
                           set, hidden

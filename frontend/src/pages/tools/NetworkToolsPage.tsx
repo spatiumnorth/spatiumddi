@@ -1270,7 +1270,7 @@ function RunButton({
   const perms = usePermissions();
   const gate = permissionGate(
     perms.can("read", TOOLS_PERMISSION),
-    perms.isError ? PERMISSIONS_UNREADABLE : TOOLS_DENIED_REASON,
+    TOOLS_DENIED_REASON,
   );
   return (
     <div className="flex justify-end">

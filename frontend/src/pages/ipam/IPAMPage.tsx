@@ -99,7 +99,6 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
-  PERMISSIONS_UNREADABLE,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -10293,10 +10292,8 @@ function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
       <p className="px-6 py-4 text-sm text-muted-foreground">
         {error ? (
           <ListReadError error={error} what="BGP routes" />
-        ) : perms.isError ? (
-          PERMISSIONS_UNREADABLE
         ) : (
-          "You don't have permission to see BGP routes."
+          (perms.unanswered ?? "You don't have permission to see BGP routes.")
         )}
       </p>
     );
@@ -12334,9 +12331,8 @@ export function SpaceVrfBadges({
         <span
           className="rounded border px-1.5 py-0.5"
           title={
-            vrfPerms.isError
-              ? PERMISSIONS_UNREADABLE
-              : "This space is linked to a VRF you may not read (vrf)"
+            vrfPerms.unanswered ??
+            "This space is linked to a VRF you may not read (vrf)"
           }
         >
           VRF: linked, not shown
@@ -12385,9 +12381,8 @@ function SpaceAsnBadge({ asnId }: { asnId: string }) {
       <span
         className="rounded border px-1.5 py-0.5"
         title={
-          perms.isError
-            ? PERMISSIONS_UNREADABLE
-            : "This space names an ASN you may not read (manage_asns)"
+          perms.unanswered ??
+          "This space names an ASN you may not read (manage_asns)"
         }
       >
         ASN: linked, not shown

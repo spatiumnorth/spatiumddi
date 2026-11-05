@@ -84,7 +84,6 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
-  PERMISSIONS_UNREADABLE,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -3406,11 +3405,13 @@ function ZoneModalForm({
             blank.
             {!canReadDomainPerm && domainPerms.isError
               ? " Your permissions could not be read, so the domain list was not requested and the link cannot be changed here. Reload to try again."
-              : !canReadDomainPerm
-                ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
-                : domainModulesReady && !domainsModuleOn
-                  ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
-                  : ""}
+              : !canReadDomainPerm && domainPerms.unanswered
+                ? ` ${domainPerms.unanswered}`
+                : !canReadDomainPerm
+                  ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
+                  : domainModulesReady && !domainsModuleOn
+                    ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
+                    : ""}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -5122,9 +5123,8 @@ export function ZoneDetailView({
                     />
                   ) : (
                     <span className="text-muted-foreground">
-                      {certPerms.isError
-                        ? PERMISSIONS_UNREADABLE
-                        : "You don't have permission to see this zone's TLS certificates."}
+                      {certPerms.unanswered ??
+                        "You don't have permission to see this zone's TLS certificates."}
                     </span>
                   )}
                 </p>

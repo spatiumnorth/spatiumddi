@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
-import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
+import { usePermissions } from "@/hooks/usePermissions";
 import { vrfsApi, type VRF } from "@/lib/api";
 
 interface VrfPickerProps {
@@ -30,18 +30,29 @@ export function VrfPicker({
   const vrfs = data ?? [];
 
   if (!canRead) {
-    // A failed permissions read is not a role without the grant (#3546):
-    // say so, still disabled so the unchanged id is sent back.
-    if (perms.isError) {
+    // Permissions not read yet, or the read failed, is not a role without
+    // the grant (#3546): say so, still disabled so the unchanged id is sent
+    // back.
+    if (perms.unanswered) {
       return (
         <select
           className={className}
           value={value ? "linked" : ""}
           disabled
-          title={PERMISSIONS_UNREADABLE}
+          title={perms.unanswered}
         >
-          <option value="">— permissions could not be read —</option>
-          {value && <option value="linked">Linked (could not be read)</option>}
+          <option value="">
+            {perms.isError
+              ? "— permissions could not be read —"
+              : "— checking permissions —"}
+          </option>
+          {value && (
+            <option value="linked">
+              {perms.isError
+                ? "Linked (could not be read)"
+                : "Linked (kept as is)"}
+            </option>
+          )}
         </select>
       );
     }
