@@ -4,8 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.drivers.dns._txt import quote_txt
 from app.models.dns import DNSRecord, DNSZone
+from app.services.dns.zone_apex import (
+    PLACEHOLDER_NS_ADDRESS,
+    PLACEHOLDER_NS_LABEL,
+    ServedApex,
+    compute_served_apex,
+    served_apex_for_zones,
+)
 
 
 def _fqdn(name: str) -> str:
@@ -47,21 +56,45 @@ def _format_record(zone_name: str, r: DNSRecord) -> str:
     return f"{label}\t{ttl_part}IN\t{rtype}\t{rdata}"
 
 
-def write_zone_file(zone: DNSZone, records: Iterable[DNSRecord]) -> str:
-    """Return the zone as a BIND-style RFC 1035 zone file."""
+def write_zone_file(
+    zone: DNSZone, records: Iterable[DNSRecord], apex: ServedApex | None = None
+) -> str:
+    """Return the zone as a BIND-style RFC 1035 zone file.
+
+    The SOA is the one the zone is served with (#3533), not a second guess at
+    it: ``apex`` is :func:`served_apex_for_zones`'s answer (what the agent
+    renders), or, when the caller has none, the same rule applied to the
+    records being written. The served apex NS set, when the zone declares none
+    of its own, is noted in a comment rather than written as records.
+    """
+    records = list(records)
     origin = _fqdn(zone.name)
-    primary = _fqdn(zone.primary_ns) if zone.primary_ns else origin
-    admin = zone.admin_email or f"hostmaster.{origin}"
-    admin = _fqdn(admin)
+    if apex is None:
+        apex = compute_served_apex(
+            zone.name,
+            zone.primary_ns,
+            zone.admin_email,
+            ((r.name, r.record_type, r.value) for r in records),
+        )
     serial = zone.last_serial or 1
 
     lines: list[str] = []
     lines.append(f"$ORIGIN {origin}")
     lines.append(f"$TTL {zone.ttl}")
     lines.append(
-        f"@\tIN\tSOA\t{primary} {admin} ("
+        f"@\tIN\tSOA\t{apex.soa_mname} {apex.soa_rname} ("
         f" {serial} {zone.refresh} {zone.retry} {zone.expire} {zone.minimum} )"
     )
+    if apex.source != "declared":
+        # The served NS set is not a stored record. Written as one it would
+        # re-import as a created record (and break "an export re-imports as no
+        # change", #2187), so it is only noted for whoever restores the file.
+        lines.append(f"; apex NS served from zone settings: {' '.join(apex.ns)}")
+        if apex.placeholder_glue:
+            lines.append(
+                f"; {PLACEHOLDER_NS_LABEL} is served glued to {PLACEHOLDER_NS_ADDRESS}"
+                " by the BIND9 agent; declare your own NS before relying on it"
+            )
 
     # Group by name for readability.
     sorted_records = sorted(
@@ -75,3 +108,11 @@ def write_zone_file(zone: DNSZone, records: Iterable[DNSRecord]) -> str:
         lines.append(_format_record(zone.name, r))
 
     return "\n".join(lines) + "\n"
+
+
+async def write_zone_file_served(
+    db: AsyncSession, zone: DNSZone, records: Iterable[DNSRecord]
+) -> str:
+    """:func:`write_zone_file` with the apex the zone's group actually serves."""
+    view = (await served_apex_for_zones(db, [zone])).get(zone.id)
+    return write_zone_file(zone, records, view.apex if view is not None else None)

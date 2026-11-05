@@ -20,7 +20,7 @@ from app.services.dns_io.parser import (
     ZoneParseError,
     parse_zone_file,
 )
-from app.services.dns_io.writer import write_zone_file
+from app.services.dns_io.writer import write_zone_file, write_zone_file_served
 
 __all__ = [
     "ParsedRecord",
@@ -31,4 +31,5 @@ __all__ = [
     "diff_records",
     "apply_cname_rule",
     "write_zone_file",
+    "write_zone_file_served",
 ]
