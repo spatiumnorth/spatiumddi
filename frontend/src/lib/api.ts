@@ -10882,6 +10882,8 @@ export interface ApiToken {
   /** False when the owner is disabled: the token is refused (403) whatever
    *  its own flag says (#3431). Set by the list endpoint. */
   owner_is_active?: boolean | null;
+  /** True when the owner is a service account (#2144). */
+  owner_is_service_account?: boolean | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -10940,6 +10942,55 @@ export const apiTokensApi = {
   update: (id: string, body: ApiTokenUpdate) =>
     api.patch<ApiToken>(`/api-tokens/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/api-tokens/${id}`),
+};
+
+// ── Service accounts (#2144) ────────────────────────────────────────────────
+// Non-interactive API principals for external systems (Home Assistant,
+// Ansible, monitoring). No password, no sign-in; groups like a user; tokens
+// minted by a superadmin. Every route is superadmin-only.
+
+export interface ServiceAccount {
+  id: string;
+  username: string;
+  /** What the account is for, e.g. "Home Assistant on ha.lan". */
+  display_name: string;
+  is_active: boolean;
+  groups: { id: string; name: string }[];
+  /** Tokens that would authenticate now: active and unexpired. */
+  active_token_count: number;
+  last_used_at: string | null;
+  next_token_expiry: string | null;
+  created_at: string;
+}
+
+export interface ServiceAccountCreate {
+  username: string;
+  display_name?: string;
+  group_ids?: string[];
+}
+
+export interface ServiceAccountUpdate {
+  display_name?: string;
+  is_active?: boolean;
+  group_ids?: string[];
+}
+
+export const serviceAccountsApi = {
+  list: () =>
+    api.get<ServiceAccount[]>("/service-accounts").then((r) => r.data),
+  create: (body: ServiceAccountCreate) =>
+    api.post<ServiceAccount>("/service-accounts", body).then((r) => r.data),
+  update: (id: string, body: ServiceAccountUpdate) =>
+    api
+      .patch<ServiceAccount>(`/service-accounts/${id}`, body)
+      .then((r) => r.data),
+  delete: (id: string) => api.delete(`/service-accounts/${id}`),
+  listTokens: (id: string) =>
+    api.get<ApiToken[]>(`/service-accounts/${id}/tokens`).then((r) => r.data),
+  createToken: (id: string, body: ApiTokenCreate) =>
+    api
+      .post<ApiTokenCreated>(`/service-accounts/${id}/tokens`, body)
+      .then((r) => r.data),
 };
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────

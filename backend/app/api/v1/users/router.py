@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
@@ -16,7 +16,7 @@ from app.core.permissions import refuse_and_audit
 from app.core.security import hash_password
 from app.core.session_rotation import revoke_live_sessions
 from app.models.audit import AuditLog
-from app.models.auth import APIToken, User, UserSession
+from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, User, UserSession
 from app.models.auth_provider import AuthProvider
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
@@ -25,6 +25,7 @@ from app.services.account_lockout import (
 from app.services.account_lockout import (
     unlock as unlock_user,
 )
+from app.services.api_token_revocation import revoke_owner_tokens
 from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
@@ -252,6 +253,29 @@ def _audit(actor: User, action: str, resource_id: str, summary: str) -> AuditLog
     )
 
 
+async def _load_person(db: DB, user_id: uuid.UUID) -> User:
+    """The user ``user_id`` for a write through this router, or 404.
+
+    A service account (#2144) is refused with 409: it has no password to
+    reset, no sign-in to unlock or link to a provider, and must never be made
+    a superadmin, so its one management surface is ``/service-accounts``,
+    which applies those rules. Reading it here stays allowed (an audit row
+    names it by id).
+    """
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if user.is_service_account:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{user.username}' is a service account; manage it under "
+                "Administration → Service accounts (/api/v1/service-accounts)."
+            ),
+        )
+    return user
+
+
 async def _refuse_last_superadmin(
     db: DB, actor: User, request: Request, target: User, action: str
 ) -> None:
@@ -277,7 +301,11 @@ async def _refuse_last_superadmin(
 
 @router.get("", response_model=list[UserResponse])
 async def list_users(current_user: SuperAdmin, db: DB) -> list[User]:
-    result = await db.execute(select(User).order_by(User.username))
+    # People only: service accounts (#2144) are listed and managed under
+    # ``/service-accounts``.
+    result = await db.execute(
+        select(User).where(User.auth_source != SERVICE_ACCOUNT_AUTH_SOURCE).order_by(User.username)
+    )
     return list(result.scalars().all())
 
 
@@ -418,9 +446,7 @@ async def update_user(
     current_user: SuperAdmin,
     db: DB,
 ) -> User:
-    user = await db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user = await _load_person(db, user_id)
 
     # Prevent removing superadmin from own account
     if user.id == current_user.id and body.is_superadmin is False:
@@ -497,48 +523,14 @@ async def update_user(
         # sessions, a re-enable revokes too, so a token an account held when
         # it was disabled before this change does not come back with it;
         # none can be in honest use while the account is disabled. The owner
-        # or an admin mints new ones.
-        #
-        # The account row is locked first: ``create_token`` re-reads the
-        # owner's ``is_active`` under a share lock, so a mint racing a disable
-        # either commits before the SELECT below (and is revoked by it) or
-        # waits for this commit and is refused.
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-        live = (
-            await db.execute(
-                select(APIToken.id, APIToken.name).where(
-                    APIToken.user_id == user.id, APIToken.is_active.is_(True)
-                )
-            )
-        ).all()
-        if live:
-            await db.execute(
-                update(APIToken)
-                .where(APIToken.id.in_([tid for tid, _ in live]))
-                .values(is_active=False)
-            )
-        # One row per token as well, shaped like the token's own revoke
-        # (PATCH ``is_active: false``), so a token's history says why it
-        # went inactive.
-        for tid, name in live:
-            db.add(
-                AuditLog(
-                    user_id=current_user.id,
-                    user_display_name=current_user.display_name,
-                    auth_source=current_user.auth_source,
-                    action="update",
-                    resource_type="api_token",
-                    resource_id=str(tid),
-                    resource_display=name,
-                    result="success",
-                    changed_fields=["is_active"],
-                    new_value={
-                        "is_active": False,
-                        "reason": "owner_enabled" if body.is_active else "owner_disabled",
-                    },
-                )
-            )
-        changes["api_tokens_revoked"] = len(live)
+        # or an admin mints new ones. Shared with the service-account admin
+        # (#2144), which locks the row and audits each token the same way.
+        changes["api_tokens_revoked"] = await revoke_owner_tokens(
+            db,
+            user.id,
+            actor=current_user,
+            reason="owner_enabled" if body.is_active else "owner_disabled",
+        )
         user.is_active = body.is_active
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin
@@ -562,9 +554,7 @@ async def reset_password(
     db: DB,
 ) -> None:
     forbid_in_demo_mode("Admin password reset is disabled")
-    user = await db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user = await _load_person(db, user_id)
     if user.auth_source != "local":
         # #1242 — a local password on an external account is never used to
         # sign in (login goes to the provider), and the reset also sets
@@ -641,9 +631,7 @@ async def unlock_account(
     """Clear an account's failed-login counter + locked-until (issue
     #71). Idempotent: if the user wasn't locked, returns 204 without
     writing an audit row."""
-    user = await db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user = await _load_person(db, user_id)
     changed = unlock_user(user)
     if changed:
         db.add(
@@ -687,9 +675,7 @@ async def link_provider(
     would hand it to whoever holds that username at the provider, which is
     the takeover #1235 closes.
     """
-    user = await db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user = await _load_person(db, user_id)
     provider = await db.get(AuthProvider, body.auth_provider_id)
     if provider is None:
         raise HTTPException(
@@ -749,9 +735,7 @@ async def link_provider(
 async def delete_user(
     user_id: uuid.UUID, request: Request, current_user: SuperAdmin, db: DB
 ) -> None:
-    user = await db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user = await _load_person(db, user_id)
 
     if user.id == current_user.id:
         raise HTTPException(

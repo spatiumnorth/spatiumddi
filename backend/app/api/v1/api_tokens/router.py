@@ -9,7 +9,10 @@ live elsewhere — this module is the HTTP surface.
 permissions of its owning ``User`` via the normal RBAC path — we
 don't expose ``allowed_paths`` or the per-token ``permissions``
 overrides on create / update yet. Both columns exist on the model so
-we can add them later without a migration.
+we can add them later without a migration. ``POST`` here mints a
+token for the caller; a superadmin mints one for a service account
+(#2144) through ``POST /service-accounts/{id}/tokens``, which shares
+:func:`mint_api_token`. Either kind is listed, revoked and deleted here.
 
 **Security shape.**
 - Raw token is shown in the ``POST`` response body once. Never
@@ -48,7 +51,7 @@ from app.core.permissions import (
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
-from app.models.auth import APIToken, User
+from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
 from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
@@ -121,6 +124,10 @@ class ApiTokenResponse(BaseModel):
     # an ownerless token, so a client can read None as "no owner", never as
     # "not looked up".
     owner_is_active: bool | None = None
+    # True when the owner is a service account (#2144), so a superadmin's
+    # list can tell an external system's token from a person's. None only
+    # for an ownerless token.
+    owner_is_service_account: bool | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
     is_active: bool
@@ -176,11 +183,18 @@ class ApiTokenUpdate(BaseModel):
 _GRANT_RESOURCE_MODELS = {"subnet": Subnet, "dns_zone": DNSZone}
 
 
-async def _validate_resource_grants(db: DB, current_user: CurrentUser, grants: list[dict]) -> None:
+async def _validate_resource_grants(
+    db: DB, current_user: User, grants: list[dict], *, owner: User | None = None
+) -> None:
     """Issue #374 create-time checks beyond the shape validator: every grant's
     ``resource_id`` must exist, and the issuing user must already hold the
     grant (you cannot mint a token more powerful than yourself). Raises 422 /
     403 respectively.
+
+    ``owner`` is the account the token will authenticate as when that is not
+    the issuer (a service account, #2144). It must hold the grant too: a
+    token's grants only ever narrow its owner's RBAC, so one the owner lacks
+    would be accepted here and then refused on every use.
     """
     import uuid as _uuid  # noqa: PLC0415
 
@@ -203,6 +217,14 @@ async def _validate_resource_grants(db: DB, current_user: CurrentUser, grants: l
                 detail=(
                     f"You don't hold '{g['action']}' on {rtype} {rid}; a token "
                     "cannot grant more than its creator."
+                ),
+            )
+        if owner is not None and not user_has_permission(owner, g["action"], rtype, rid):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"'{owner.username}' doesn't hold '{g['action']}' on {rtype} {rid}; "
+                    "a token cannot grant more than its owner."
                 ),
             )
 
@@ -270,18 +292,21 @@ async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenRespons
     """List tokens owned by the caller. Superadmin sees everyone's, each
     row naming its owner."""
     stmt = (
-        select(APIToken, User.username, User.display_name, User.is_active)
+        select(APIToken, User.username, User.display_name, User.is_active, User.auth_source)
         .outerjoin(User, User.id == APIToken.user_id)
         .order_by(APIToken.created_at.desc())
     )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
     out: list[ApiTokenResponse] = []
-    for token, username, display_name, owner_active in (await db.execute(stmt)).all():
+    for token, username, display_name, owner_active, owner_source in (await db.execute(stmt)).all():
         row = ApiTokenResponse.model_validate(token)
         row.owner_username = username
         row.owner_display_name = display_name or None
         row.owner_is_active = owner_active
+        row.owner_is_service_account = (
+            None if owner_source is None else owner_source == SERVICE_ACCOUNT_AUTH_SOURCE
+        )
         out.append(row)
     return out
 
@@ -302,6 +327,28 @@ async def create_token(
         resource_id="?",
         resource_display=body.name,
     )
+    return await mint_api_token(
+        db, body, owner=current_user, actor=current_user, stepup_method=method
+    )
+
+
+async def mint_api_token(
+    db: DB,
+    body: ApiTokenCreate,
+    *,
+    owner: User,
+    actor: User,
+    stepup_method: str,
+    audit_extra: dict | None = None,
+) -> dict:
+    """Mint a token for ``owner``, audited as ``actor``, and return the
+    create response carrying the raw token once.
+
+    ``actor`` has already passed the step-up (``stepup_method``). Shared by
+    ``POST /api-tokens`` (owner = actor) and the service-account admin
+    (``POST /service-accounts/{id}/tokens``, #2144), so expiry, resource-grant
+    and disabled-owner rules cannot drift between the two.
+    """
     raw, prefix_, token_hash = generate_api_token()
     # ``prefix`` on the model is 10 chars — ``sddi_`` is 5, so we record
     # ``sddi_`` + the first 5 chars of the random body, giving operators a
@@ -315,7 +362,9 @@ async def create_token(
             detail="expires_at must be in the future",
         )
     # Resource grants (#374): existence + "can't exceed yourself" checks.
-    await _validate_resource_grants(db, current_user, body.resource_grants)
+    await _validate_resource_grants(
+        db, actor, body.resource_grants, owner=owner if owner.id != actor.id else None
+    )
     # #3432 — disabling an account revokes its tokens under a lock on the
     # account row. Re-read ``is_active`` under a share lock here: the caller
     # was authenticated before that disable may have committed, and a token
@@ -323,7 +372,7 @@ async def create_token(
     # and work again once the account is re-enabled.
     owner_active = (
         await db.execute(
-            select(User.is_active).where(User.id == current_user.id).with_for_update(read=True)
+            select(User.is_active).where(User.id == owner.id).with_for_update(read=True)
         )
     ).scalar_one_or_none()
     if not owner_active:
@@ -338,8 +387,8 @@ async def create_token(
         scope="user",
         scopes=body.scopes,
         resource_grants=body.resource_grants or None,
-        user_id=current_user.id,
-        created_by_user_id=current_user.id,
+        user_id=owner.id,
+        created_by_user_id=actor.id,
         expires_at=expires_at,
         is_active=True,
     )
@@ -347,9 +396,9 @@ async def create_token(
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
+            user_id=actor.id,
+            user_display_name=actor.display_name,
+            auth_source=actor.auth_source,
             action="create",
             resource_type="api_token",
             resource_id=str(token.id),
@@ -361,7 +410,8 @@ async def create_token(
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "scopes": body.scopes,
                 "resource_grants": body.resource_grants,
-                "stepup_method": method,
+                "stepup_method": stepup_method,
+                **(audit_extra or {}),
             },
         )
     )
@@ -380,9 +430,10 @@ async def create_token(
         "last_used_at": token.last_used_at,
         "is_active": token.is_active,
         "created_at": token.created_at,
-        "owner_username": current_user.username,
-        "owner_display_name": current_user.display_name or None,
+        "owner_username": owner.username,
+        "owner_display_name": owner.display_name or None,
         "owner_is_active": True,
+        "owner_is_service_account": owner.is_service_account,
         "token": raw,
     }
 
@@ -465,7 +516,7 @@ async def get_token(
     current_user: CurrentUser,
 ) -> ApiTokenResponse:
     token = await _require_owned(token_id, db, current_user)
-    return await _with_owner(db, token)
+    return await with_owner(db, token)
 
 
 @router.patch("/{token_id}", response_model=ApiTokenResponse)
@@ -559,7 +610,7 @@ async def update_token(
     )
     await db.commit()
     await db.refresh(token)
-    return await _with_owner(db, token)
+    return await with_owner(db, token)
 
 
 @router.delete("/{token_id}", status_code=204)
@@ -586,14 +637,14 @@ async def delete_token(
     await db.commit()
 
 
-async def _with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
+async def with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
     """The single-token response with the owner fields the list fills, so a
     GET or PATCH does not read as "owner state unknown" (#3431)."""
     row = ApiTokenResponse.model_validate(token)
     if token.user_id is not None:
         owner = (
             await db.execute(
-                select(User.username, User.display_name, User.is_active).where(
+                select(User.username, User.display_name, User.is_active, User.auth_source).where(
                     User.id == token.user_id
                 )
             )
@@ -602,6 +653,7 @@ async def _with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
             row.owner_username = owner.username
             row.owner_display_name = owner.display_name or None
             row.owner_is_active = owner.is_active
+            row.owner_is_service_account = owner.auth_source == SERVICE_ACCOUNT_AUTH_SOURCE
     return row
 
 

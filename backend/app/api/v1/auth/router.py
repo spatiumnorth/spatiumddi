@@ -339,6 +339,18 @@ async def live_refresh_session(db: AsyncSession, raw_refresh: str) -> UserSessio
 
 async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) -> TokenResponse:
     """Issue access + refresh tokens, create session, write success audit."""
+    # A service account (#2144) never signs in: it authenticates only with
+    # the API tokens minted for it. Every sign-in path (local password, the
+    # MFA step, LDAP / RADIUS / TACACS+, OIDC, SAML) ends here, so this is the
+    # one refusal that covers them all. Each path already fails earlier for
+    # one (it has no password, and no provider subject resolves to it); this
+    # holds even if one of them stops doing so. Same 401 as a wrong password,
+    # so the answer reveals nothing about the account.
+    if user.is_service_account:
+        await _audit_login_failure(
+            db, request, user.username, reason="service_account", auth_source=auth_source, user=user
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     # Reset lockout state on every successful login (issue #71). No-op
     # for users who weren't accumulating failures.
     register_success(user)
@@ -958,7 +970,9 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
         )
 
     user = await db.get(User, session.user_id)
-    if user is None or not user.is_active:
+    # A service account (#2144) can hold no session; one that somehow did
+    # must not be able to renew it.
+    if user is None or not user.is_active or user.is_service_account:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
         )

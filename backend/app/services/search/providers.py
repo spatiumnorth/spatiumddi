@@ -880,7 +880,8 @@ async def search_users(db: AsyncSession, s: QueryShape, limit: int) -> list[Sear
                 name=u.display_name or None,
                 status="active" if u.is_active else "disabled",
                 context=" · ".join(x for x in (u.email, u.auth_source) if x) or None,
-                route="/admin/users",
+                # A service account (#2144) is managed on its own page.
+                route="/admin/service-accounts" if u.is_service_account else "/admin/users",
             ),
             *pick_match(
                 s.raw,

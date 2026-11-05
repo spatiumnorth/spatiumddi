@@ -51,6 +51,26 @@ _FORCE_PW_CHANGE_ALLOWLIST: tuple[str, ...] = (
 )
 
 
+# A service account (#2144) authenticates with an API token and never with a
+# session, so the account-holder endpoints under ``/auth/`` (change password,
+# logout, MFA enrolment and step-up re-auth) mean nothing for it, and MFA
+# enrolment would be actively dangerous: an authenticator on the account is
+# what every operator step-up accepts from an account with no password, so a
+# leaked service-account token could enrol one and mint itself further
+# tokens. Only these two reads stay open to it.
+_SERVICE_ACCOUNT_AUTH_ALLOWLIST: tuple[str, ...] = ("/auth/me", "/auth/me/permissions")
+_AUTH_AREA = "/api/v1/auth/"
+
+
+def _service_account_may_use(path: str) -> bool:
+    """False for a path under ``/api/v1/auth/`` other than the allowlisted
+    reads. Every other route is the RBAC check's to decide. Matched anywhere
+    in the path, so a reverse proxy's mount prefix does not move it."""
+    if _AUTH_AREA not in path:
+        return True
+    return path.rstrip("/").endswith(_SERVICE_ACCOUNT_AUTH_ALLOWLIST)
+
+
 def _path_in_recovery_allowlist(path: str) -> bool:
     """True when ``path`` ends with one of the password-recovery endpoints
     a ``force_password_change`` user is still allowed to reach. Suffix match
@@ -170,9 +190,9 @@ async def _resolve_api_token(
     # token (#3302); a session never sets it, so it keeps every tool.
     request.state.api_token_scopes = scopes
     if token.user_id is None:
-        # Scope "global" isn't wired through permissions yet — reject
-        # until we add a synthetic service-account path. Today's UI
-        # only issues user-scoped tokens so this is defensive.
+        # Scope "global" (an ownerless token) isn't wired through permissions
+        # and nothing issues one; a machine principal is a service account
+        # (#2144), whose tokens are ordinary user-scoped ones. Defensive.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Global-scope API tokens are not yet supported",
@@ -191,6 +211,11 @@ async def _resolve_api_token(
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
+    if user.is_service_account and not _service_account_may_use(request.url.path):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A service account cannot use this endpoint",
         )
     # SECURITY (#400 / M4): the must-change-password gate applies to API
     # tokens too — a token minted for an account that later gets a forced
@@ -340,7 +365,9 @@ async def authenticate_bearer(
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
 
-    if user is None:
+    # A service account (#2144) never holds a session, so a JWT naming one
+    # is refused as if it named nobody.
+    if user is None or user.is_service_account:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     if not user.is_active:
