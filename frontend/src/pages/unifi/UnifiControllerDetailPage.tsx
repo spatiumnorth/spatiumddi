@@ -12,6 +12,10 @@ import {
 } from "lucide-react";
 
 import { formatApiError, unifiApi, type UnifiTestResult } from "@/lib/api";
+import {
+  useUtilizationThresholds,
+  utilizationColor,
+} from "@/hooks/useUtilizationThresholds";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ModalTabs } from "@/components/ui/modal";
 import {
@@ -380,13 +384,10 @@ function SubnetsTab({
   );
 }
 
-function UtilBar({ percent }: { percent: number }) {
-  const tone =
-    percent >= 95
-      ? "bg-red-500"
-      : percent >= 80
-        ? "bg-amber-500"
-        : "bg-emerald-500";
+export function UtilBar({ percent }: { percent: number }) {
+  // Settings' Warning / Critical Threshold, as the IPAM tree draws the same
+  // subnet (#3539).
+  const tone = utilizationColor(percent, useUtilizationThresholds());
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 w-20 rounded-full bg-muted">
