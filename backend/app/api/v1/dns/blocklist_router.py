@@ -284,6 +284,8 @@ class FeedParseSkipped(BaseModel):
     bare_star: int = 0
     dotless: int = 0
     other: int = 0
+    # hosts / domains feeds: tokens that are not DNS names (#3531).
+    invalid_name: int = 0
 
 
 class BlockListResponse(BaseModel):

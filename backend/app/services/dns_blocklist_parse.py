@@ -51,6 +51,11 @@ class FeedSkipCounts:
       * ``dotless`` — ``||countly-``; a single label, not a hostname.
       * ``other`` — anything that fits none of the above (a path such as
         ``||host/ads``, a character a hostname cannot carry).
+
+    * ``invalid_name`` — hosts / domains feeds only (#3531): a token that is
+      not a DNS name (an adblock rule such as ``||ads.example.com^``, an IP
+      literal, a path). Counted separately from ``malformed``, which is
+      adblock's.
     """
 
     regex: int = 0
@@ -63,6 +68,8 @@ class FeedSkipCounts:
     bare_star: int = 0
     dotless: int = 0
     other: int = 0
+    # hosts / domains feeds only (#3531): a token that is not a DNS name.
+    invalid_name: int = 0
 
     @property
     def malformed(self) -> int:
@@ -79,10 +86,10 @@ class FeedSkipCounts:
     @property
     def total(self) -> int:
         """Every rule skipped, each counted once."""
-        return self.regex + self.modifier + self.badfilter + self.malformed
+        return self.regex + self.modifier + self.badfilter + self.malformed + self.invalid_name
 
     def as_dict(self) -> dict[str, int]:
-        return {
+        out = {
             "regex": self.regex,
             "modifier": self.modifier,
             "badfilter": self.badfilter,
@@ -95,6 +102,10 @@ class FeedSkipCounts:
             "dotless": self.dotless,
             "other": self.other,
         }
+        # Only hosts / domains feeds can set it; an adblock row keeps its shape.
+        if self.invalid_name:
+            out["invalid_name"] = self.invalid_name
+        return out
 
 
 @dataclass(frozen=True)
@@ -110,14 +121,19 @@ class ParsedFeed:
 
     ``exceptions`` are the feed's own allow rules (adblock ``@@||name^``,
     #2123), stored as the list's exceptions. ``skipped`` counts the rules
-    an adblock feed carried that became neither; it is None for the other
-    formats, which have no rule syntax to lose.
+    a feed carried that became neither: adblock rules DNS cannot express, or
+    (hosts / domains, #3531) tokens that are not DNS names; None for a
+    hosts / domains feed with none.
     """
 
     domains: list[str]
     wildcard_count: int
     exceptions: list[str] = field(default_factory=list)
     skipped: FeedSkipCounts | None = None
+    #: Set when the content looks like a different format than the one asked
+    #: for (#3531), e.g. ``"adblock"`` for an adblock file read as hosts. The
+    #: caller should refuse the refresh rather than store the result.
+    format_mismatch: str | None = None
 
 
 def parse_feed(content: str, feed_format: str) -> list[str]:
@@ -132,6 +148,36 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
 #: A hostname as an adblock ``||`` rule may name it: labels of letters,
 #: digits, ``-`` and ``_``, at least two of them, optionally ``*.``-led.
 _ADBLOCK_HOST_RE = re.compile(r"^(?:\*\.)?[a-z0-9_-]+(?:\.[a-z0-9_-]+)+\.?$")
+
+#: A DNS name as a hosts / domains feed may carry it: LDH + ``_`` labels of at
+#: most 63 characters, at least two labels, a non-numeric last label (so an IP
+#: literal is not a name). Total length is checked separately.
+_FEED_NAME_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9_-]{2,63}$")
+
+#: An adblock rule line: ``||name^`` or ``@@||name^`` (with optional modifiers).
+_ADBLOCK_LINE_RE = re.compile(r"^(?:@@)?\|\|[^\s]*\^")
+
+
+def _is_feed_name(name: str) -> bool:
+    """True when ``name`` is a plausible DNS name (no IP literals)."""
+    if len(name) > 253 or not _FEED_NAME_RE.match(name):
+        return False
+    # The last label must not be all digits: ``1.2.3.4`` is an address.
+    return not name.rsplit(".", 1)[1].isdigit()
+
+
+def _looks_like_adblock(content: str) -> bool:
+    """True when most rule lines are adblock ``||name^`` / ``@@||name^`` rules."""
+    total = adblock = 0
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "!", "[")):
+            continue
+        total += 1
+        if _ADBLOCK_LINE_RE.match(line):
+            adblock += 1
+    return adblock > 0 and adblock * 2 > total
+
 
 #: Modifiers that leave a rule's DNS meaning intact. ``important`` only
 #: raises a rule's precedence over exceptions in the same engine.
@@ -295,9 +341,15 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
     if feed_format == "adblock":
         return _parse_adblock(content)
 
+    if _looks_like_adblock(content):
+        # Hosts / domains parsers would store every ``||name^`` rule as a
+        # "name" that never matches anything (#3531). Report it instead.
+        return ParsedFeed(domains=[], wildcard_count=0, format_mismatch="adblock")
+
     out: list[str] = []
     seen: set[str] = set()
     wildcard_count = 0
+    invalid = 0
 
     for raw in content.splitlines():
         line = raw.strip()
@@ -333,12 +385,19 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
             wildcard_count += 1
         if not domain or "." not in domain:
             continue
+        if not _is_feed_name(domain):
+            invalid += 1
+            continue
         if domain in seen:
             continue
         seen.add(domain)
         out.append(domain)
 
-    return ParsedFeed(domains=out, wildcard_count=wildcard_count)
+    return ParsedFeed(
+        domains=out,
+        wildcard_count=wildcard_count,
+        skipped=FeedSkipCounts(invalid_name=invalid) if invalid else None,
+    )
 
 
 def dedupe_domains(domains: list[str]) -> list[str]:
