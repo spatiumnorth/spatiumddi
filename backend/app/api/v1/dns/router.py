@@ -248,6 +248,7 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
+from app.services.dns.zone_apex import served_apex_for_zones
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -1893,6 +1894,43 @@ class RecordResponse(BaseModel):
     provider_warning: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ServedApexSoa(BaseModel):
+    mname: str
+    rname: str
+
+
+class ServedApex(BaseModel):
+    """The SOA and apex NS a primary zone serves from its settings (#3518).
+
+    Read-only and never a ``DNSRecord``: nothing here can be edited, exported,
+    imported or counted as a record. Present only on a primary zone; every
+    field but ``driver_applies`` is meaningful only when that is true.
+    """
+
+    # False when the group runs a driver that does not render the zone apex by
+    # the BIND9 agent's rule (PowerDNS, Technitium, Windows, cloud, mixed
+    # groups). The rest then describes what BIND9 *would* serve, so the UI
+    # shows it only as a note.
+    driver_applies: bool
+    soa: ServedApexSoa
+    # The NS set the zone serves at its apex, absolute names.
+    ns: list[str]
+    # ``declared``: the zone's own apex NS records are the set (nothing is
+    # synthesised); ``primary_ns``: Edit Zone's Primary NS; ``placeholder``:
+    # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
+    source: Literal["declared", "primary_ns", "placeholder"]
+    # The placeholder NS is glued to 127.0.0.1: every resolver that follows
+    # the zone's NS set is sent to its own loopback.
+    placeholder_glue_loopback: bool
+
+
+class RecordPage(Page[RecordResponse]):
+    """A page of records plus the apex the zone serves beside them (#3518).
+    ``total`` and ``items`` count stored records only."""
+
+    served_apex: ServedApex | None = None
 
 
 def _agentless_op_warning(op: Any) -> str | None:
@@ -8934,7 +8972,7 @@ async def list_group_records(
 
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/records",
-    response_model=Page[RecordResponse],
+    response_model=RecordPage,
 )
 async def list_records(
     group_id: uuid.UUID,
@@ -8946,15 +8984,19 @@ async def list_records(
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-) -> Page[RecordResponse]:
+) -> RecordPage:
     """Records in a zone, server-side paginated (#455).
 
     A large zone (the perf seed reaches 20k+ records) used to return its whole
     record set on every poll. ``search`` matches name / fqdn / value / type so
     a row is findable without paging; ``record_type`` is an exact filter for
     the type dropdown.
+
+    ``served_apex`` (#3518) carries the SOA and apex NS the zone serves from
+    its settings, which no stored record holds. It is not part of ``items`` or
+    ``total``.
     """
-    await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(_, zone_id)
     stmt = select(DNSRecord).where(DNSRecord.zone_id == zone_id)
     if record_type:
@@ -8972,11 +9014,27 @@ async def list_records(
     stmt = apply_tag_filter(stmt, DNSRecord.tags, tag)
     stmt = stmt.order_by(DNSRecord.name, DNSRecord.record_type)
     rows, total = await paginate(db, stmt, page=page, page_size=page_size)
-    return Page[RecordResponse](
+    return RecordPage(
         items=[RecordResponse.model_validate(r) for r in rows],
         total=total,
         page=page,
         page_size=page_size,
+        served_apex=await _served_apex(db, zone),
+    )
+
+
+async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
+    """The apex a primary zone is served with (#3518), or None for a zone that
+    is not primary (a secondary, stub or forward zone has no apex of ours)."""
+    view = (await served_apex_for_zones(db, [zone])).get(zone.id)
+    if view is None:
+        return None
+    return ServedApex(
+        driver_applies=view.driver_applies,
+        soa=ServedApexSoa(mname=view.apex.soa_mname, rname=view.apex.soa_rname),
+        ns=list(view.apex.ns),
+        source=view.apex.source,
+        placeholder_glue_loopback=view.apex.placeholder_glue,
     )
 
 

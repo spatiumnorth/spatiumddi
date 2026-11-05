@@ -6237,6 +6237,22 @@ export interface DNSRecord {
   modified_at: string;
 }
 
+// #3518 — the SOA and apex NS a primary zone serves from its settings. Not
+// records: nothing here is editable, exportable or counted.
+export interface ServedApex {
+  // False when the group's driver does not render the apex by the BIND9
+  // agent's rule; the rest is then only what BIND9 would serve.
+  driver_applies: boolean;
+  soa: { mname: string; rname: string };
+  ns: string[];
+  source: "declared" | "primary_ns" | "placeholder";
+  placeholder_glue_loopback: boolean;
+}
+
+export interface DNSRecordPage extends Page<DNSRecord> {
+  served_apex: ServedApex | null;
+}
+
 export interface DNSGroupRecord {
   id: string;
   zone_id: string;
@@ -6801,7 +6817,7 @@ export const dnsApi = {
     },
   ) =>
     api
-      .get<Page<DNSRecord>>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
+      .get<DNSRecordPage>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
         params,
       })
       .then((r) => r.data),

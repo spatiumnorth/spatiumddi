@@ -36,6 +36,7 @@ from app.services.dns.agent_instance import duplicate_active as duplicate_agent_
 from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
+from app.services.dns.zone_apex import served_apex_for_zones
 
 _ZONE_NAME_SCOPES = frozenset({"public", "reserved", "undelegated", "reverse"})
 
@@ -145,6 +146,7 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
     rows = list((await db.execute(stmt)).scalars().all())
 
     tlds = (await effective_registry(db)).tlds
+    apexes = await served_apex_for_zones(db, rows)
     out: list[dict[str, Any]] = []
     for z in rows:
         scope = classify_zone_name(z.name, tlds=tlds)
@@ -161,6 +163,17 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
             "name_scope": scope.scope,
             "name_scope_reason": scope.reason,
         }
+        if (view := apexes.get(z.id)) is not None:
+            # #3518 — the SOA and apex NS the zone serves from its settings,
+            # which no stored record holds. Not a record, not counted as one.
+            row["served_apex"] = {
+                "driver_applies": view.driver_applies,
+                "soa_mname": view.apex.soa_mname,
+                "soa_rname": view.apex.soa_rname,
+                "ns": list(view.apex.ns),
+                "source": view.apex.source,
+                "placeholder_glue_loopback": view.apex.placeholder_glue,
+            }
         if z.zone_type == "forward":
             # #2121 — the zone's OWN upstream transport, independent of the
             # group's forward_transport (which covers the group's resolver
