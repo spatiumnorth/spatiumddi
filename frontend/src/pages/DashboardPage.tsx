@@ -115,8 +115,10 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import {
+  type UtilizationThresholds,
   useUtilizationThresholds,
   utilizationBand,
 } from "@/hooks/useUtilizationThresholds";
@@ -230,14 +232,43 @@ function agentNeedsAttention(s: {
   );
 }
 
-function UtilColor(percent: number): string {
-  if (percent >= 95) return "bg-red-500";
-  if (percent >= 85) return "bg-red-400";
-  if (percent >= 70) return "bg-amber-400";
+function UtilColor(percent: number, t: UtilizationThresholds): string {
+  // Amber and red sit at Settings' Warning / Critical Threshold (#3539), the
+  // same lines the IPAM tree and the page's counts use; below the warning
+  // line only the green shade steps with fill.
+  if (percent >= t.critical) return "bg-red-500";
+  if (percent >= t.warn) return "bg-amber-400";
   if (percent >= 50) return "bg-emerald-500";
   if (percent >= 25) return "bg-emerald-400";
   if (percent > 0) return "bg-emerald-300";
   return "bg-muted/60 dark:bg-muted/40";
+}
+
+/** The heatmap legend: each swatch labelled with the percentage its colour
+ *  starts at, matching ``UtilColor``. A green step at or above the warning
+ *  line, and an amber step when warning is not below critical, are never
+ *  drawn, so they are left out rather than listed out of order (#3539). */
+function heatmapLegend(
+  t: UtilizationThresholds,
+): { cls: string; label: string }[] {
+  const entries: { cls: string; label: string }[] = [];
+  if (t.warn > 0 && t.critical > 0) {
+    entries.push({ cls: "bg-muted/60", label: "0%" });
+    entries.push({ cls: "bg-emerald-300", label: ">0" });
+  }
+  for (const [start, cls] of [
+    [25, "bg-emerald-400"],
+    [50, "bg-emerald-500"],
+  ] as const) {
+    if (start < t.warn && start < t.critical) {
+      entries.push({ cls, label: String(start) });
+    }
+  }
+  if (t.warn < t.critical) {
+    entries.push({ cls: "bg-amber-400", label: String(t.warn) });
+  }
+  entries.push({ cls: "bg-red-500", label: String(t.critical) });
+  return entries;
 }
 
 /** One entry in the Overview inventory strip (#942) — a value, its unit,
@@ -306,15 +337,20 @@ function capacityLabel(subnet: {
   return `${subnet.allocated_ips.toLocaleString()} / ${subnet.total_ips.toLocaleString()}`;
 }
 
-function UtilizationBar({
+export function UtilizationBar({
   percent,
   network,
+  tone,
 }: {
   percent: number;
   /** When this is a v6 prefix the bar renders n/a: "0%" of a /64 is
    *  true, useless, and indistinguishable from an empty v4 subnet. */
   network?: string;
+  /** Fill class for a bar that is not subnet utilization (a DHCP pool's
+   *  occupancy), which Settings' IPAM thresholds do not govern. */
+  tone?: string;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (network && isV6(network)) {
     return (
       <div className="flex items-center gap-2">
@@ -334,7 +370,7 @@ function UtilizationBar({
         <div
           className={cn(
             "h-full rounded-full transition-all",
-            UtilColor(percent),
+            tone ?? UtilColor(percent, thresholds),
           )}
           style={{ width: `${Math.min(percent, 100)}%` }}
         />
@@ -354,7 +390,7 @@ function UtilizationBar({
  * end. Cells stay square at every breakpoint via aspect-square +
  * grid-cols-autofill.
  */
-function SubnetHeatmap({
+export function SubnetHeatmap({
   subnets,
   unreadable = null,
 }: {
@@ -363,6 +399,7 @@ function SubnetHeatmap({
    *  says so rather than "No subnets yet". */
   unreadable?: string | null;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (unreadable) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center">
@@ -393,7 +430,9 @@ function SubnetHeatmap({
     .sort((a, b) => a - b);
   const p95Index = Math.max(0, Math.floor(sorted.length * 0.95) - 1);
   const p95 = sorted.length > 0 ? sorted[p95Index] : 0;
-  const hot = active.filter((s) => s.utilization_percent >= 85).length;
+  const hot = active.filter(
+    (s) => s.utilization_percent >= thresholds.critical,
+  ).length;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -408,30 +447,14 @@ function SubnetHeatmap({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px]">
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted/60" />
-            <span className="text-muted-foreground">0%</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-300" />
-            <span className="text-muted-foreground">25</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" />
-            <span className="text-muted-foreground">50</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400" />
-            <span className="text-muted-foreground">70</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-400" />
-            <span className="text-muted-foreground">85</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-500" />
-            <span className="text-muted-foreground">100%</span>
-          </div>
+          {heatmapLegend(thresholds).map((e) => (
+            <div key={e.cls} className="flex items-center gap-1">
+              <span
+                className={cn("inline-block h-2.5 w-2.5 rounded-sm", e.cls)}
+              />
+              <span className="text-muted-foreground">{e.label}</span>
+            </div>
+          ))}
         </div>
       </div>
       <div className="p-4">
@@ -452,7 +475,7 @@ function SubnetHeatmap({
               }`}
               className={cn(
                 "aspect-square rounded transition-all hover:scale-110 hover:ring-2 hover:ring-primary/40",
-                UtilColor(s.utilization_percent),
+                UtilColor(s.utilization_percent, thresholds),
               )}
             />
           ))}
@@ -1605,7 +1628,11 @@ export function DashboardPage() {
   // The route takes read on `audit_log`: a user without it is not asked at
   // all (each refusal writes a `denied` audit row), and the card says so
   // rather than "No recent activity" (#2702). A refusal also ends the poll.
-  const { can: canRead, isLoading: permsLoading } = usePermissions();
+  const {
+    can: canRead,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadAudit = canRead("read", "audit_log");
   const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
@@ -2584,6 +2611,10 @@ export function DashboardPage() {
                           error={recentError}
                           what="the audit log"
                         />
+                      ) : permsFailed ? (
+                        // A failed permissions read is not a missing grant
+                        // (#3541): ``can`` is false for everyone then.
+                        "Your permissions could not be read, so the audit log was not requested. Reload to try again."
                       ) : (
                         "You don't have permission to see the audit log."
                       )}
@@ -3252,7 +3283,7 @@ function ServerRow({
  * offered to a client and a reserved one is *supposed* to fill up, so
  * either would render as a red exhaustion bar for behaving correctly.
  */
-function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
+export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
@@ -3388,7 +3419,10 @@ function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
                   />
                 )}
                 <div className="flex-1">
-                  <UtilizationBar percent={p.percent} />
+                  <UtilizationBar
+                    percent={p.percent}
+                    tone={poolOccupancyTone(p.percent)}
+                  />
                 </div>
                 <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
                   {p.assigned.toLocaleString()} / {p.total.toLocaleString()}
@@ -4440,7 +4474,11 @@ function CertsExpiringKpi() {
 
   // The route takes read on `tls_cert`; a user without it is not asked, and
   // the card says it is withheld rather than "0 of 0 monitored" (#2702).
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadCerts = can("read", "tls_cert");
   const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
@@ -4478,7 +4516,9 @@ function CertsExpiringKpi() {
         {withheld
           ? error && !isRefused(error)
             ? "couldn't load certificates"
-            : "you may not read certificates"
+            : !error && permsFailed
+              ? "couldn't read your permissions"
+              : "you may not read certificates"
           : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
@@ -4893,6 +4933,11 @@ function NetworkPanel() {
   const w = data.withheld ?? {};
   const NV = "not visible to your role";
 
+  // Nothing pulled: a zero here is not an all-clear (#3540). A withheld
+  // grant zeroes the total too, so it is excluded: that tile says "not
+  // visible to your role", never "nothing pulled". A missing total (an
+  // older API) is unknown, not zero, and keeps the plain count.
+  const rpkiUntracked = !w.asn && data.rpki_total_count === 0;
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
@@ -4917,11 +4962,20 @@ function NetworkPanel() {
         )}
         <NetworkKpi
           label="RPKI expired"
-          value={w.asn ? "—" : data.rpki_expired_count}
+          value={w.asn || rpkiUntracked ? "—" : data.rpki_expired_count}
           tone={
-            w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
+            w.asn || rpkiUntracked
+              ? "default"
+              : data.rpki_expired_count > 0
+                ? "bad"
+                : "good"
           }
-          hint={w.asn ? NV : undefined}
+          hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
+          title={
+            rpkiUntracked
+              ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+              : undefined
+          }
           to="/network/asns"
         />
         <NetworkKpi
@@ -5007,7 +5061,11 @@ function NetworkPanel() {
           title="RPKI ROAs expiring soon"
           withheld={w.asn}
           withheldHint="Not visible to your role."
-          emptyHint="No ROAs are expiring in the next 30 days."
+          emptyHint={
+            rpkiUntracked
+              ? "No RPKI ROAs are tracked yet."
+              : "No ROAs are expiring in the next 30 days."
+          }
         >
           {data.rpki_expiring.map((row) => (
             <Link
@@ -5541,7 +5599,11 @@ export function DNSThreatCard() {
   // The route needs read on servers (#3450): a user without it was refused
   // every 60 s, each a 403 and a denied audit row. ``can`` is false while
   // the grants load, so the query waits for them as well.
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const mayRead = can("read", "server");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
@@ -5563,8 +5625,9 @@ export function DNSThreatCard() {
       <div className="rounded-lg border bg-card p-4">
         <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Not shown: the DNS tunneling rollup needs read on servers (the server
-          logs permission), which your role does not have.
+          {permsFailed
+            ? "Not shown: your permissions could not be read, so the DNS tunneling rollup was not requested. Reload to try again."
+            : "Not shown: the DNS tunneling rollup needs read on servers (the server logs permission), which your role does not have."}
         </p>
       </div>
     );
