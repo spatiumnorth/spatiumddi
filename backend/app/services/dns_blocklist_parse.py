@@ -35,15 +35,50 @@ class FeedSkipCounts:
       precedence, so the rule is kept as a plain block.
     * ``badfilter`` — ``$badfilter`` rules. Each disables the rule it
       names, which is dropped with it; neither becomes an entry.
-    * ``malformed`` — anything else this parser cannot turn into a name:
-      a path (``||host/ads``), a ``*`` inside a name, a ``|`` anchor, a
-      bare word.
+    * ``malformed`` — anything else this parser cannot turn into a name. It
+      is the SUM of the reason buckets below (#3519), so a reader that only
+      knows the four original keys still adds up; it is derived, never set:
+
+      * ``star_in_name`` — ``||reachableads-av.*.amazonaws.com^``; RPZ
+        has no mid-name wildcard.
+      * ``no_anchor`` — ``-tracker.example.net^``; no ``||``, so adblock
+        reads it as a substring match, which a name cannot say.
+      * ``trailing_dot`` — ``||adserver1.``; a prefix match on a label.
+      * ``start_anchor`` — ``|piwik.``, ``|a.example.com^``; a single ``|``
+        anchors the start of the URL, not a domain.
+      * ``bare_star`` — ``*ad.example.net^``; a leading ``*`` with no ``||``.
+      * ``dotless`` — ``||countly-``; a single label, not a hostname.
+      * ``other`` — anything that fits none of the above (a path such as
+        ``||host/ads``, a character a hostname cannot carry).
     """
 
     regex: int = 0
     modifier: int = 0
     badfilter: int = 0
-    malformed: int = 0
+    star_in_name: int = 0
+    no_anchor: int = 0
+    trailing_dot: int = 0
+    start_anchor: int = 0
+    bare_star: int = 0
+    dotless: int = 0
+    other: int = 0
+
+    @property
+    def malformed(self) -> int:
+        return (
+            self.star_in_name
+            + self.no_anchor
+            + self.trailing_dot
+            + self.start_anchor
+            + self.bare_star
+            + self.dotless
+            + self.other
+        )
+
+    @property
+    def total(self) -> int:
+        """Every rule skipped, each counted once."""
+        return self.regex + self.modifier + self.badfilter + self.malformed
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -51,6 +86,13 @@ class FeedSkipCounts:
             "modifier": self.modifier,
             "badfilter": self.badfilter,
             "malformed": self.malformed,
+            "star_in_name": self.star_in_name,
+            "no_anchor": self.no_anchor,
+            "trailing_dot": self.trailing_dot,
+            "start_anchor": self.start_anchor,
+            "bare_star": self.bare_star,
+            "dotless": self.dotless,
+            "other": self.other,
         }
 
 
@@ -104,6 +146,30 @@ _ADBLOCK_COSMETIC_MARKERS = ("##", "#@#", "#?#", "#$#", "#%#", "#@$#", "#@%#", "
 _RuleKey = tuple[bool, str, frozenset[str]]
 
 
+def _malformed_reason(pattern: str, host: str | None) -> str:
+    """Why a rule that is not a plain ``||name^`` was skipped (#3519).
+
+    ``pattern`` is the lowercased rule body without ``@@`` / modifiers;
+    ``host`` is the part after ``||`` with its ``|`` / ``^`` terminators
+    removed, or None when the rule has no ``||`` anchor.
+    """
+    if host is None:
+        if pattern.startswith("|"):
+            return "start_anchor"
+        if pattern.startswith("*"):
+            return "bare_star"
+        return "no_anchor"
+    if "/" in host:
+        return "other"
+    if "*" in host:
+        return "star_in_name"
+    if host.endswith("."):
+        return "trailing_dot"
+    if "." not in host:
+        return "dotless"
+    return "other"
+
+
 def _parse_adblock(content: str) -> ParsedFeed:
     """The ``adblock`` branch of :func:`parse_feed_detailed` (#2123).
 
@@ -118,7 +184,8 @@ def _parse_adblock(content: str) -> ParsedFeed:
     blocks: list[tuple[_RuleKey, str]] = []
     allows: list[tuple[_RuleKey, str]] = []
     cancelled: set[_RuleKey] = set()
-    regex = modifier = badfilter = malformed = 0
+    regex = modifier = badfilter = 0
+    malformed: dict[str, int] = {}
     wildcard_count = 0
 
     for raw in content.splitlines():
@@ -150,7 +217,8 @@ def _parse_adblock(content: str) -> ParsedFeed:
             continue
 
         if not pattern.startswith("||"):
-            malformed += 1
+            reason = _malformed_reason(pattern, None)
+            malformed[reason] = malformed.get(reason, 0) + 1
             continue
         host = pattern[2:]
         if host.endswith("|"):
@@ -158,7 +226,8 @@ def _parse_adblock(content: str) -> ParsedFeed:
         if host.endswith("^"):
             host = host[:-1]
         if not _ADBLOCK_HOST_RE.match(host):
-            malformed += 1
+            reason = _malformed_reason(pattern, host)
+            malformed[reason] = malformed.get(reason, 0) + 1
             continue
         host = host.strip(".")
         if host.startswith("*."):
@@ -203,9 +272,7 @@ def _parse_adblock(content: str) -> ParsedFeed:
         domains=domains,
         wildcard_count=wildcard_count,
         exceptions=exceptions,
-        skipped=FeedSkipCounts(
-            regex=regex, modifier=modifier, badfilter=badfilter, malformed=malformed
-        ),
+        skipped=FeedSkipCounts(regex=regex, modifier=modifier, badfilter=badfilter, **malformed),
     )
 
 
