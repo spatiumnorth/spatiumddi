@@ -20,7 +20,12 @@ source address (127.0.0.2 lands in ``restricted``, anything else in
   reload path, which reloads the defining view's file;
 * a zone moves from shared to per-view copies and back on a running named;
 * the control plane's signed transfer selects the REFERENCING view with its
-  #920 key and is answered from the shared zone.
+  #920 key and is answered from the shared zone;
+* RFC 2136 records a third party wrote are never dropped by sharing: copies
+  that differ on named (the upgrade from per-view copies) keep their own,
+  and a view that takes its own copy back from a shared zone carries the
+  shared zone's records;
+* an identical inline-signed zone shares and signs once.
 
 Exits non-zero on the first failed expectation. Never skips.
 """
@@ -327,6 +332,169 @@ def shared(state: Path) -> None:
     _stop(driver)
 
 
+def _dynamic_bundle(
+    records: list[tuple[str, str]],
+    default_extra: list[tuple[str, str]] | None = None,
+    dnssec: bool = False,
+) -> dict:
+    """``_bundle`` with ``example.com.`` open to RFC 2136 from loopback, the
+    way an operator opens a zone to DHCP or AD clients (#641)."""
+    b = _bundle({"restricted": records, "default": [*records, *(default_extra or [])]})
+    for z in b["zones"]:
+        if z["name"] != _SHARED:
+            continue
+        z["dynamic_update_enabled"] = not dnssec
+        z["update_acl"] = (
+            []
+            if dnssec
+            else [{"action": "grant", "match_kind": "ip", "ip_cidr": "127.0.0.0/8"}]
+        )
+        if dnssec:
+            z["dnssec_enabled"] = True
+            z["dnssec_policy_name"] = "default"
+    return b
+
+
+def _third_party_update(source: str, name: str, address: str) -> str:
+    """An unsigned RFC 2136 add from ``source``: a client of that view."""
+    import dns.query
+    import dns.rcode
+    import dns.update
+
+    upd = dns.update.Update(_SHARED)
+    upd.add(name, 300, "A", address)
+    try:
+        r = dns.query.tcp(upd, "127.0.0.1", timeout=5, source=source)
+    except Exception as exc:  # noqa: BLE001 — every failure is a result here
+        return f"error {type(exc).__name__}"
+    return dns.rcode.to_text(r.rcode())
+
+
+def dynamic_upgrade(state: Path) -> None:
+    """The first render after the upgrade must not drop RFC 2136 records a
+    third party wrote into a later view's own copy (#2850)."""
+    from spatium_dns_agent.drivers import bind9
+
+    print("\n=== upgrade: a later view's copy holds a third party's record ===")
+    sharing = bind9._view_share_key
+    bind9._view_share_key = lambda zone, view: None  # the render before #3551
+    try:
+        driver = bind9.Bind9Driver(state_dir=state)
+        driver.apply_config(_dynamic_bundle([("www", "192.0.2.10")]))
+        rc = _third_party_update(_DEFAULT_SRC, "client", "198.51.100.77")
+        check("a default-view client's update is taken", rc == "NOERROR", rc)
+    finally:
+        bind9._view_share_key = sharing
+    pid = driver.daemon_pid
+    driver.apply_config(_dynamic_bundle([("www", "192.0.2.10"), ("w2", "192.0.2.12")]))
+    conf = (state / "rendered" / "named.conf").read_text()
+    check(
+        "copies that differ on named are not shared",
+        f'zone "{_SHARED}" {{ in-view' not in conf,
+    )
+    check(
+        "the third party's record survives the upgrade, in its own view only",
+        _both(f"client.{_SHARED}") == ("NXDOMAIN", "198.51.100.77"),
+        str(_both(f"client.{_SHARED}")),
+    )
+    check(
+        "the render's change lands in both views",
+        _both(f"w2.{_SHARED}") == ("192.0.2.12",) * 2,
+        str(_both(f"w2.{_SHARED}")),
+    )
+    check(
+        "named was NOT restarted", driver.daemon_pid == pid, f"pid {driver.daemon_pid}"
+    )
+    _stop(driver)
+
+
+def dynamic_split(state: Path) -> None:
+    """A shared dynamic zone's RFC 2136 records stay in every view that served
+    them when one view takes its own copy again."""
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    print("\n=== a shared dynamic zone splits with a third party's record in it ===")
+    driver = Bind9Driver(state_dir=state)
+    base = [("www", "192.0.2.10")]
+    driver.apply_config(_dynamic_bundle(base))
+    conf = (state / "rendered" / "named.conf").read_text()
+    check(
+        "a dynamic zone with nothing beyond the render shares",
+        f'zone "{_SHARED}" {{ in-view "restricted"; }};' in conf,
+    )
+    rc = _third_party_update(_DEFAULT_SRC, "client", "198.51.100.78")
+    check("a default-view client's update is taken", rc == "NOERROR", rc)
+    check(
+        "it lands in the shared zone: both views serve it",
+        _both(f"client.{_SHARED}") == ("198.51.100.78",) * 2,
+        str(_both(f"client.{_SHARED}")),
+    )
+    driver.apply_config(_dynamic_bundle([*base, ("w3", "192.0.2.13")]))
+    conf = (state / "rendered" / "named.conf").read_text()
+    check(
+        "an already-shared zone keeps sharing",
+        f'zone "{_SHARED}" {{ in-view "restricted"; }};' in conf,
+    )
+    check(
+        "the record is carried across the re-render",
+        _both(f"client.{_SHARED}") == ("198.51.100.78",) * 2,
+        str(_both(f"client.{_SHARED}")),
+    )
+    driver.apply_config(
+        _dynamic_bundle([*base, ("w3", "192.0.2.13")], [("only", "198.51.100.5")])
+    )
+    check(
+        "after the split both views still serve the third party's record",
+        _both(f"client.{_SHARED}") == ("198.51.100.78",) * 2,
+        str(_both(f"client.{_SHARED}")),
+    )
+    check(
+        "and the view-specific record answers in its view only",
+        _both(f"only.{_SHARED}") == ("NXDOMAIN", "198.51.100.5"),
+        str(_both(f"only.{_SHARED}")),
+    )
+    _stop(driver)
+
+
+def dnssec_shared(state: Path) -> None:
+    """An identical inline-signed zone shares, and signs, once."""
+    import dns.message
+    import dns.query
+
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    print("\n=== an identical inline-signed zone ===")
+    keys = Path("/var/cache/bind/keys")
+    keys.mkdir(parents=True, exist_ok=True)  # the image entrypoint's job
+    driver = Bind9Driver(state_dir=state)
+    driver.apply_config(_dynamic_bundle([("www", "192.0.2.10")], dnssec=True))
+    conf = (state / "rendered" / "named.conf").read_text()
+    check(
+        "the signed zone is shared",
+        f'zone "{_SHARED}" {{ in-view "restricted"; }};' in conf,
+    )
+    check(
+        "rndc addresses it in its defining view only",
+        driver._zone_rndc_scopes(_SHARED) == [[_SHARED, "IN", "restricted"]],
+        str(driver._zone_rndc_scopes(_SHARED)),
+    )
+    signed: dict[str, bool] = {}
+    deadline = time.time() + 20
+    while time.time() < deadline and not all(
+        signed.get(s) for s in (_RESTRICTED_SRC, _DEFAULT_SRC)
+    ):
+        for src in (_RESTRICTED_SRC, _DEFAULT_SRC):
+            q = dns.message.make_query(f"www.{_SHARED}", "A", want_dnssec=True)
+            try:
+                r = dns.query.udp(q, "127.0.0.1", timeout=3, source=src)
+                signed[src] = any(rr.rdtype == 46 for rr in r.answer)
+            except Exception:  # noqa: BLE001 — retried until the deadline
+                signed[src] = False
+        time.sleep(0.5)
+    check("both views serve signed answers", all(signed.values()), str(signed))
+    _stop(driver)
+
+
 def main() -> int:
     for tool in ("named", "rndc", "rndc-confgen"):
         if not shutil.which(tool):
@@ -334,12 +502,13 @@ def main() -> int:
                 f"FAIL: `{tool}` not on PATH — this must run inside the bind9 agent image"
             )
             return 1
-    state = Path(tempfile.mkdtemp(prefix="views-share-check-"))
-    _rndc_keys(state)
-    try:
-        shared(state)
-    finally:
-        shutil.rmtree(state, ignore_errors=True)
+    for case in (shared, dynamic_upgrade, dynamic_split, dnssec_shared):
+        state = Path(tempfile.mkdtemp(prefix="views-share-check-"))
+        _rndc_keys(state)
+        try:
+            case(state)
+        finally:
+            shutil.rmtree(state, ignore_errors=True)
     if _FAILURES:
         print(f"\n{len(_FAILURES)} expectation(s) failed: {', '.join(_FAILURES)}")
         return 1

@@ -300,3 +300,91 @@ def test_the_group_list_in_two_views_renders_valid_config(tmp_path: Path) -> Non
         )
         assert (root / "zones" / view / "spatium-blocklist.rpz.db").exists()
     _checkconf(root / "named.conf")
+
+
+# ── RFC 2136 records named holds are never dropped by sharing (#2850) ──────
+
+
+def _promote(tmp_path: Path) -> Path:
+    """Make the last render the live tree, as a swap would."""
+    live = tmp_path / "rendered"
+    if live.exists():
+        shutil.rmtree(live)
+    (tmp_path / "rendered.new").rename(live)
+    return live
+
+
+def _dynamic(records: list[dict]) -> list[dict]:
+    return _both(
+        "example.com.",
+        records,
+        dynamic_update_enabled=True,
+        update_acl=[{"action": "grant", "match_kind": "ip", "ip_cidr": "192.0.2.0/24"}],
+    )
+
+
+def test_a_copy_holding_third_party_records_is_not_shared(tmp_path: Path) -> None:
+    """The upgrade from per-view copies: the later view's copy took an RFC
+    2136 update (its journal). Sharing would drop it with the file."""
+    from spatium_dns_agent.drivers.bind9 import _owned_sidecar
+
+    Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
+    live = _promote(tmp_path)
+    # The tree a pre-#3551 agent left: no in-view, a journal on default.
+    conf = (live / "named.conf").read_text()
+    (live / "named.conf").write_text(
+        conf.replace(
+            'zone "example.com." { in-view "restricted"; };',
+            'zone "example.com." { type master; file "x"; };',
+        )
+    )
+    default_copy = live / "zones" / "default" / "example.com.db"
+    default_copy.parent.mkdir(exist_ok=True)
+    shutil.copyfile(live / "zones" / "restricted" / "example.com.db", default_copy)
+    shutil.copyfile(
+        _owned_sidecar(live / "zones" / "restricted" / "example.com.db"),
+        _owned_sidecar(default_copy),
+    )
+    default_copy.with_name(default_copy.name + ".jnl").write_bytes(b"journal")
+
+    conf, root = _render(tmp_path, _bundle(_dynamic([_A])))
+
+    assert "in-view" not in _view_block(conf, "default")
+    assert (root / "zones" / "default" / "example.com.db").is_file()
+
+
+def test_a_copy_already_shared_keeps_sharing(tmp_path: Path) -> None:
+    """Once shared, the defining copy's own updates are both views' data: a
+    journal on it is no reason to split."""
+    Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
+    live = _promote(tmp_path)
+    jnl = live / "zones" / "restricted" / "example.com.db.jnl"
+    jnl.write_bytes(b"journal")
+
+    conf, _root = _render(tmp_path, _bundle(_dynamic([_A])))
+
+    assert 'zone "example.com." { in-view "restricted"; };' in _view_block(
+        conf, "default"
+    )
+
+
+def test_a_new_copy_of_a_shared_zone_carries_from_the_defining_copy(
+    tmp_path: Path,
+) -> None:
+    """A view that takes its own copy back from a shared zone served the
+    defining view's zone, so that is where its RFC 2136 records are."""
+    from spatium_dns_agent.drivers.bind9 import _view_carry_sources
+
+    Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
+    live = _promote(tmp_path)
+    (live / "zones" / "restricted" / "example.com.db.jnl").write_bytes(b"journal")
+    split = _dynamic([_A])
+    split[1]["records"].append(_rec("only", "198.51.100.5"))
+    driver = Bind9Driver(state_dir=tmp_path)
+    driver.render(_bundle(split))
+    new_dir = tmp_path / "rendered.new"
+
+    assert _view_carry_sources(new_dir, live) == {
+        ("example.com", "default"): ("example.com", "restricted")
+    }
+    assert ("example.com", "default") in driver._carry_candidates(new_dir, live)
