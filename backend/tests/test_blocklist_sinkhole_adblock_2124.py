@@ -599,6 +599,10 @@ def test_malformed_adblock_rules_are_split_by_reason_3519() -> None:
         "|piwik.\n"
         "|a.klaviyo.com^\n"
         "*ad.durasite.net^\n"
+        # A ``*`` without ``||`` is bare_star wherever it sits, not only when
+        # it leads (the AdGuard DNS Filter's 13, not 1).
+        "-adx-*.rayjump.com^\n"
+        "://*.a-akamaihd.com^\n"
         "||countly-\n"
         "||host.example/ads\n"
         "||ok.example^\n",
@@ -611,12 +615,12 @@ def test_malformed_adblock_rules_are_split_by_reason_3519() -> None:
     assert d["no_anchor"] == 2
     assert d["trailing_dot"] == 1
     assert d["start_anchor"] == 2
-    assert d["bare_star"] == 1
+    assert d["bare_star"] == 3
     assert d["dotless"] == 1
     assert d["other"] == 1
     assert (
         d["malformed"]
-        == 9
+        == 11
         == sum(
             d[k]
             for k in (
@@ -630,4 +634,4 @@ def test_malformed_adblock_rules_are_split_by_reason_3519() -> None:
             )
         )
     )
-    assert p.skipped.total == 9
+    assert p.skipped.total == 11

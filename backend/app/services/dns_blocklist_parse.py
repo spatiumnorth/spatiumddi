@@ -41,12 +41,13 @@ class FeedSkipCounts:
 
       * ``star_in_name`` — ``||reachableads-av.*.amazonaws.com^``; RPZ
         has no mid-name wildcard.
-      * ``no_anchor`` — ``-tracker.example.net^``; no ``||``, so adblock
-        reads it as a substring match, which a name cannot say.
+      * ``no_anchor`` — ``-tracker.example.net^``; no ``||`` (and no ``*``),
+        so adblock reads it as a substring match, which a name cannot say.
       * ``trailing_dot`` — ``||adserver1.``; a prefix match on a label.
       * ``start_anchor`` — ``|piwik.``, ``|a.example.com^``; a single ``|``
         anchors the start of the URL, not a domain.
-      * ``bare_star`` — ``*ad.example.net^``; a leading ``*`` with no ``||``.
+      * ``bare_star`` — ``*ad.example.net^``, ``-adx-*.example.com^``; a
+        ``*`` anywhere in a rule with no ``||``.
       * ``dotless`` — ``||countly-``; a single label, not a hostname.
       * ``other`` — anything that fits none of the above (a path such as
         ``||host/ads``, a character a hostname cannot carry).
@@ -156,7 +157,10 @@ def _malformed_reason(pattern: str, host: str | None) -> str:
     if host is None:
         if pattern.startswith("|"):
             return "start_anchor"
-        if pattern.startswith("*"):
+        # Any ``*`` without ``||``, not only a leading one: ``-adx-*.x.com^``
+        # is a wildcard rule first and a substring rule second, and the
+        # AdGuard DNS Filter counts in #3519 file it here.
+        if "*" in pattern:
             return "bare_star"
         return "no_anchor"
     if "/" in host:

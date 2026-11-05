@@ -12,7 +12,7 @@ const MALFORMED_REASONS: [keyof DNSBlockListFeedSkipped, string][] = [
   ["no_anchor", "with no || anchor (substring match)"],
   ["trailing_dot", "ending in a dot (prefix match)"],
   ["start_anchor", "with a | start anchor"],
-  ["bare_star", "starting with * and no ||"],
+  ["bare_star", "with a * and no || anchor"],
   ["dotless", "naming a single label"],
   ["other", "of some other shape"],
 ];
