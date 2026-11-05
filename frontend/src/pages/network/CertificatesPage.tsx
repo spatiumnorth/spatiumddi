@@ -960,10 +960,24 @@ export function CertificatesPage() {
                   title="View certificate details"
                 >
                   <td className="px-3 py-2 align-top break-words">
-                    <div className="font-medium">
+                    <button
+                      type="button"
+                      // Two targets may share host:port and differ only by
+                      // SNI (the dedupe key is host + port + server_name),
+                      // so the SNI is part of the name or the rows collide.
+                      aria-label={`View certificate details for ${t.host}:${t.port}${
+                        t.server_name ? ` (SNI ${t.server_name})` : ""
+                      }`}
+                      title="View certificate details"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDetail(t);
+                      }}
+                      className="rounded text-left font-medium hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                    >
                       {t.host}
                       <span className="text-muted-foreground">:{t.port}</span>
-                    </div>
+                    </button>
                     {t.display_name && (
                       <div className="text-[11px] text-muted-foreground">
                         {t.display_name}

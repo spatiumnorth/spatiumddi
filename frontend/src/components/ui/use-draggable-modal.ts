@@ -323,6 +323,14 @@ export function useFocusTrap<T extends HTMLElement>() {
       const target = returnTargets?.find(
         (el) => el !== document.body && el.isConnected,
       );
+      // A dialog's card is a target only as the place to land inside a dialog
+      // that is still open; it takes focus the way the trap gives it on open.
+      if (
+        target?.getAttribute("role") === "dialog" &&
+        !target.hasAttribute("tabindex")
+      ) {
+        target.setAttribute("tabindex", "-1");
+      }
       target?.focus?.();
     };
   }, [seq]);
@@ -357,6 +365,22 @@ function captureFocusReturnTargets(): FocusReturnTargets {
       (el.getAttribute("aria-controls") ?? "").split(/\s+/).includes(menu.id),
     );
     if (trigger) targets.push(trigger);
+  }
+  // Focus is on a control inside a dialog (Enter in a form field submits it
+  // and the next dialog opens with focus still there, or a Tab moved it off
+  // the card). The control can leave before this dialog closes, two ways:
+  // - the enclosing dialog stays open and only the control goes (a row
+  //   removed by what this dialog did): focus belongs on that dialog's card,
+  //   never on its opener in the page behind it;
+  // - the enclosing dialog is replaced and the control goes with it: return
+  //   to what that dialog would have returned to (#3483).
+  // Both after the control itself and after a menu's trigger, so a dialog
+  // opened from a menu inside another dialog still lands on that trigger.
+  const card = active.closest<HTMLElement>('[role="dialog"]');
+  if (card && card !== active) {
+    targets.push(card);
+    const enclosing = cardReturnTargets.get(card);
+    if (enclosing) targets.push(...enclosing);
   }
   return targets;
 }
