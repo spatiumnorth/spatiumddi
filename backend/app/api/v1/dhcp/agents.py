@@ -744,7 +744,7 @@ async def agent_config_longpoll(
         # degrades to the old LONGPOLL_POLL_INTERVAL sleep (see the DNS agent).
         while True:
             # #2040 — this session lives for the whole wait, and the sessionmaker
-            # sets expire_on_commit=False with no commit inside the loop. A
+            # sets expire_on_commit=False, so no commit in the loop expires anything. A
             # re-query hands back the instances already in the identity map
             # WITHOUT overwriting their loaded attributes, so on every pass
             # after the first the bundle was rebuilt from the group, its
@@ -1188,6 +1188,13 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
+            # #3479: end this pass's read transaction before the wait, so the
+            # bundle's reads (the op queue's among them) hold no lock through
+            # it: a factory reset's TRUNCATE waited out whole holds, with every
+            # reader after it queued behind the TRUNCATE. Nothing is pending
+            # here (every write above commits on its own or answers), and the
+            # next pass expires and re-reads everything anyway.
+            await db.commit()
             if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
                 # #3015 — this api process is stopping: end the hold now so the
                 # next pass makes one last ETag check and answers 304, and the
