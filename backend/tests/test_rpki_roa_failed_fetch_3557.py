@@ -18,12 +18,12 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.tasks.rpki_roa_refresh as task_mod
 from app.core.security import create_access_token, hash_password
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.services import rpki_roa
-from app.tasks.rpki_roa_refresh import _refresh_one_asn
 
 pytestmark = pytest.mark.asyncio
 
@@ -82,7 +82,7 @@ async def test_failed_fetch_keeps_stored_roas_and_raises(
     asn = await _asn_with_roa(db_session)
     monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(None, fail=fail))
     with pytest.raises(rpki_roa.RoaFetchError):
-        await _refresh_one_asn(db_session, asn, "ripe", 4, datetime.now(UTC))
+        await task_mod._refresh_one_asn(db_session, asn, "ripe", 4, datetime.now(UTC))
     await db_session.flush()
     assert await _roa_count(db_session, asn) == 1
 
@@ -93,7 +93,7 @@ async def test_successful_empty_answer_deletes(
     asn = await _asn_with_roa(db_session)
     doc = {"roas": [{"asn": "AS64999", "prefix": "198.51.100.0/24", "maxLength": 24, "ta": "ripe"}]}
     monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(doc))
-    summary = await _refresh_one_asn(db_session, asn, "ripe", 4, datetime.now(UTC))
+    summary = await task_mod._refresh_one_asn(db_session, asn, "ripe", 4, datetime.now(UTC))
     await db_session.flush()
     assert summary["removed"] == 1
     assert await _roa_count(db_session, asn) == 0
@@ -103,8 +103,6 @@ async def test_sweep_reports_failure_and_keeps_roas(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from contextlib import asynccontextmanager
-
-    import app.tasks.rpki_roa_refresh as task_mod
 
     asn = await _asn_with_roa(db_session)
     await db_session.commit()
@@ -170,7 +168,7 @@ async def test_a_200_far_smaller_than_a_full_index_keeps_stored_roas(
     asn = await _asn_with_roa(db_session)
     monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(doc))
     with pytest.raises(rpki_roa.RoaFetchError, match="fewer than the 10"):
-        await _refresh_one_asn(db_session, asn, "cloudflare", 4, datetime.now(UTC))
+        await task_mod._refresh_one_asn(db_session, asn, "cloudflare", 4, datetime.now(UTC))
     await db_session.flush()
     assert await _roa_count(db_session, asn) == 1
 
@@ -181,7 +179,7 @@ async def test_a_full_size_index_without_the_asn_still_deletes(
     monkeypatch.setattr(rpki_roa, "_MIN_INDEX_ENTRIES", 10)
     asn = await _asn_with_roa(db_session)
     monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(_doc(10)))
-    summary = await _refresh_one_asn(db_session, asn, "cloudflare", 4, datetime.now(UTC))
+    summary = await task_mod._refresh_one_asn(db_session, asn, "cloudflare", 4, datetime.now(UTC))
     assert summary["removed"] == 1
 
 
