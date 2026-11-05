@@ -1,0 +1,114 @@
+name: Blocklist catalog
+
+# Monthly: are the feeds in the DNS blocklist catalog (#3522) still alive, still
+# parseable and still the size they were? The check is
+# scripts/check_blocklist_catalog.py -- every feed_url is fetched and parsed
+# with the product's own parser, and AdGuard's HostlistsRegistry is diffed
+# against the catalog. If it finds anything, open ONE "Blocklist catalog"
+# issue (or refresh the open one); when a run comes back clean, close it.
+# It never edits the catalog: adding a third-party source is a judgment call.
+#
+# It never gates anything and never runs on a PR. This is CI's outbound
+# traffic, not the product's, so docs/PRIVACY.md does not apply.
+#
+# The entry counts of each run ride a workflow artifact (not the repo, so it
+# does not churn, and not the issue body, which a clean run closes). The next
+# run downloads the last successful run's artifact as its baseline.
+#
+# The script exits 0 whether or not it found anything and 2 when it could not
+# evaluate. On 2 the job goes red and the issue is left exactly as it is, since
+# "we could not tell" must not close an issue that is still true.
+
+on:
+  schedule:
+    # The 3rd of each month, 06:41 UTC. Off the top of the hour.
+    - cron: "41 6 3 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  # Read the previous run's artifact (gh run download).
+  actions: read
+
+concurrency:
+  group: blocklist-catalog-scheduled
+  cancel-in-progress: false
+
+jobs:
+  catalog:
+    name: Catalog feeds
+    # Forks inherit scheduled workflows; only the canonical repo files issues.
+    if: github.repository_owner == 'spatiumnorth'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the previous run's baseline
+        # Best effort: no earlier run, or an expired artifact, means the first
+        # run compares against the floor only.
+        run: |
+          mkdir -p "$RUNNER_TEMP/prev"
+          prev="$(gh run list --repo "$REPO" --workflow blocklist-catalog-scheduled.yml \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+          if [ -n "$prev" ]; then
+            gh run download "$prev" --repo "$REPO" --name blocklist-baseline \
+              --dir "$RUNNER_TEMP/prev" || echo "no baseline artifact on run ${prev}"
+          fi
+
+      - name: Check the catalog
+        id: check
+        run: |
+          python3 scripts/check_blocklist_catalog.py \
+            --baseline "$RUNNER_TEMP/prev/baseline.json" \
+            --write-baseline "$RUNNER_TEMP/baseline.json" \
+            --status-out "$RUNNER_TEMP/status" \
+            > "$RUNNER_TEMP/blocklist-catalog.md"
+          echo "status=$(cat "$RUNNER_TEMP/status")" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/blocklist-catalog.md"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blocklist-baseline
+          path: ${{ runner.temp }}/baseline.json
+          retention-days: 90
+
+      - name: Open, refresh or close the tracking issue
+        run: |
+          TITLE="Blocklist catalog"
+          MARKER="<!-- blocklist-catalog -->"
+          # Same mechanism as docs-drift-scheduled.yml: search by title, then
+          # confirm the exact title AND the marker the script writes as the
+          # body's first line, so a human-filed issue is never ours to close.
+          existing="$(gh issue list --repo "$REPO" --state open --limit 20 \
+            --search "\"${TITLE}\" in:title" \
+            --json number,title,body \
+            --jq "[.[] | select(.title == \"${TITLE}\" and (.body | startswith(\"${MARKER}\")))] | .[0].number // empty")"
+
+          if [ "${{ steps.check.outputs.status }}" = "findings" ]; then
+            {
+              cat "$RUNNER_TEMP/blocklist-catalog.md"
+              echo
+              echo "_Last checked: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}_"
+            } > "$RUNNER_TEMP/body.md"
+            # GitHub caps an issue body at 65536 characters.
+            head -c 60000 "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/body-capped.md"
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --repo "$REPO" --body-file "$RUNNER_TEMP/body-capped.md"
+            else
+              gh issue create --repo "$REPO" --title "$TITLE" \
+                --body-file "$RUNNER_TEMP/body-capped.md" \
+                --label "area:ops" --label "theme:ops-tooling"
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "The monthly blocklist catalog check came back clean; closing."
+          fi

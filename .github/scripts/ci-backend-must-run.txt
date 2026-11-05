@@ -78,6 +78,12 @@ scripts/lint_versions.py
 # real diagrams, which are known to carry drift while #3413 fixes them.
 scripts/lint_docs_drift.py
 
+# test_check_blocklist_catalog.py (#3522) loads the monthly blocklist-catalog
+# feed check (and, through it, backend/app/services/dns_blocklist.py's parser)
+# and pins one finding per failure shape -- dead URL, HTML page, shrunken,
+# reformatted, skip share, upstream diff -- over fixtures, with no network.
+scripts/check_blocklist_catalog.py
+
 # test_lint_workflow_shell.py (#1036) loads the workflow shell-status guard
 # and pins it against the real pre-fix trivy-scheduled.yml body, plus the
 # false-positive case that made the first draft unusable (a `set -e` inside a
