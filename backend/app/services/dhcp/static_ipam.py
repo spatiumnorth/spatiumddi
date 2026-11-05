@@ -56,6 +56,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -599,7 +600,12 @@ async def remirror_available_rows_with_live_leases(
     return handovers
 
 
-async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> int:
+async def remove_ipam_for_static(
+    db: AsyncSession,
+    st: DHCPStaticAssignment,
+    *,
+    touched_subnets: set[uuid.UUID] | None = None,
+) -> int:
     """DELETE the IPAM mirror row(s) for a reservation (not just free them).
 
     ``detach_ipam_for_static`` sets ``status="available"`` and keeps the row.
@@ -612,11 +618,16 @@ async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> 
 
     Tears down the forward/reverse DNS first (same as the detach path). Used by
     the wholesale reservation-removal paths (scope / group / import / purge).
-    Returns the number of rows removed.
+
+    Does not recount: a caller freeing many mirrors passes ``touched_subnets``,
+    collects every removed row's subnet, and recounts them once with
+    ``recount_subnets_and_blocks`` (#3354). Returns the number of rows removed.
     """
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     removed = 0
     for row in res.scalars().all():
+        if touched_subnets is not None:
+            touched_subnets.add(row.subnet_id)
         await _delete_mirror_row(db, row, st)
         removed += 1
     return removed
@@ -682,6 +693,10 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
     hold it, the operator's columns are snapshotted onto it first, so the
     restore stays lossless.
 
+    Ends by recounting the freed rows' subnets and their blocks (#3354), which
+    holds the audit-chain lock and those rows until commit: the caller commits
+    before taking any other subnet or block lock.
+
     Returns the number of mirror rows freed.
     """
     # Two indexed queries rather than one correlated NOT EXISTS. The obvious
@@ -735,11 +750,16 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
         }
 
     freed = 0
+    touched: list[uuid.UUID] = []
     for row, static_id in parsed:
         if static_id is not None and static_id in live:
             continue
+        touched.append(row.subnet_id)
         await _delete_mirror_row(db, row, await _load_reservation_any(db, row.static_assignment_id))
         freed += 1
+    # Freed rows leave the subnet's and its blocks' cached counters stale until
+    # the hourly recount; settle them once for the whole run (#3354).
+    await recount_subnets_and_blocks(db, touched)
     return freed
 
 
@@ -773,7 +793,12 @@ async def _load_reservation_any(
     ).scalar_one_or_none()
 
 
-async def remove_ipam_for_scope_statics(db: AsyncSession, scope_id: uuid.UUID) -> int:
+async def remove_ipam_for_scope_statics(
+    db: AsyncSession,
+    scope_id: uuid.UUID,
+    *,
+    touched_subnets: set[uuid.UUID] | None = None,
+) -> int:
     """DELETE the IPAM mirror of every reservation under ``scope_id``.
 
     The delete-the-row, scope-wide counterpart to ``remove_ipam_for_static``
@@ -781,15 +806,24 @@ async def remove_ipam_for_scope_statics(db: AsyncSession, scope_id: uuid.UUID) -
     ``include_deleted`` because the reservations may already be soft-deleted as
     part of their scope's batch by the time this runs. Returns the number of
     mirror rows removed.
+
+    The freed rows move their subnet's and its blocks' cached counters (#3354).
+    A caller looping over several scopes passes ``touched_subnets`` and recounts
+    once itself with ``recount_subnets_and_blocks``, so the subnets and blocks
+    are locked in one id-ordered pass rather than scope by scope; with none,
+    this recounts what it freed before returning.
     """
     res = await db.execute(
         select(DHCPStaticAssignment)
         .where(DHCPStaticAssignment.scope_id == scope_id)
         .execution_options(include_deleted=True)
     )
+    touched: set[uuid.UUID] = set() if touched_subnets is None else touched_subnets
     removed = 0
     for st in res.scalars().all():
-        removed += await remove_ipam_for_static(db, st)
+        removed += await remove_ipam_for_static(db, st, touched_subnets=touched)
+    if touched_subnets is None:
+        await recount_subnets_and_blocks(db, touched)
     return removed
 
 

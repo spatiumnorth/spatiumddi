@@ -445,7 +445,7 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
 def _pxe_class(p: dict[str, Any], *, additional: bool = False) -> dict[str, Any]:
     """Render a PXE / iPXE client class (#51) — Dhcp4 only.
 
-    Mirrors ``_render_pxe_class`` in ``backend/app/drivers/dhcp/kea.py``.
+    The class that carries the boot fields; ``_pxe_classes`` adds its selector.
     ``next-server`` + ``boot-file-name`` on the class win over scope-level
     defaults when Kea matches the packet, which is what lets one scope serve
     a different boot binary per architecture. An empty ``match_expression``
@@ -481,6 +481,59 @@ def _pxe_class(p: dict[str, Any], *, additional: bool = False) -> dict[str, Any]
     if additional:
         out["only-in-additional-list"] = True
     return out
+
+
+# #3404: the suffix of the class that carries a PXE rule's boot fields once the
+# classes are scoped. Mirrors ``PXE_BOOT_CLASS_SUFFIX`` in
+# ``backend/app/drivers/dhcp/kea.py``.
+PXE_BOOT_CLASS_SUFFIX = "-boot"
+
+
+def pxe_boot_class_name(name: str) -> str:
+    """The name of the class that carries PXE rule ``name``'s boot fields (#3404)."""
+    return f"{name}{PXE_BOOT_CLASS_SUFFIX}"
+
+
+def _pxe_classes(p: dict[str, Any], *, additional: bool = False) -> list[dict[str, Any]]:
+    """Render one PXE / iPXE rule as its Kea client classes (Dhcp4 only).
+
+    Mirrors ``_render_pxe_classes`` in ``backend/app/drivers/dhcp/kea.py``.
+    Without ``additional`` (a control plane older than #2731) the rule is one
+    global class carrying its test and its boot fields, as it always was.
+
+    With ``additional``, two classes (#3404):
+
+    - The selector keeps the rule's name and its test, and carries no boot
+      fields. It is an ordinary class, which Kea evaluates for every packet
+      before it picks a pool, so a pool restricted to it (``class_restriction``,
+      the pool's ``client-class``) serves the clients the rule matches. Kea
+      evaluates an ``only-in-additional-list`` class only after it has picked
+      the pool and the lease, so a pool restricted to such a class served
+      nobody. Evaluated everywhere, the selector still boots no one.
+    - The boot class (``pxe_boot_class_name``) carries the boot fields, tests
+      ``member('<selector>')`` and is ``only-in-additional-list``. Only the
+      subnets of the scopes bound to the rule's profile list it
+      (``_scope_to_subnet``), so the boot fields reach those scopes' clients
+      and no other (#2731). It is declared after its selector, because Kea
+      refuses a ``member()`` of a class not yet defined.
+
+    A rule with no test matches every client. Kea never assigns an ordinary
+    class that has no test, so that rule's selector tests ``member('ALL')``
+    (every packet is in Kea's built-in ``ALL``), and its boot class keeps no
+    test, which Kea adds for every client of a subnet that lists it.
+    """
+    boot = _pxe_class(p, additional=additional)
+    if not additional:
+        return [boot]
+    name = p["name"]
+    selector: dict[str, Any] = {
+        "name": name,
+        "test": p.get("match_expression") or "member('ALL')",
+    }
+    boot["name"] = pxe_boot_class_name(name)
+    if p.get("match_expression"):
+        boot["test"] = f"member('{name}')"
+    return [selector, boot]
 
 
 def _phone_class(c: dict[str, Any]) -> dict[str, Any]:
@@ -937,9 +990,11 @@ def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
     # control plane sent them. Rendered ``only-in-additional-list`` (see
     # ``render``), they are evaluated for the subnets that list them and no
     # other, so one scope's profile no longer boots every scope's clients.
+    # #3404: the subnet lists each rule's boot class; the rule's own name is
+    # its selector, an ordinary class that pools can be restricted to.
     pxe = scope.get("pxe_class_names")
     if pxe:
-        out["evaluate-additional-classes"] = list(pxe)
+        out["evaluate-additional-classes"] = [pxe_boot_class_name(n) for n in pxe]
     return out
 
 
@@ -1443,9 +1498,14 @@ def render(
     # those subnets lists it (``_scope_to_subnet``) and Kea evaluates it there
     # and nowhere else. A bundle from a control plane older than #2731 lists
     # no scope's classes, and they stay global, as they always were.
+    # #3404: scoped, each rule renders as a selector (an ordinary class, which
+    # pools can be restricted to) and a boot class that the subnets list; see
+    # ``_pxe_classes``.
     pxe_scoped = any("pxe_class_names" in s for s in v4_scopes)
     rendered_classes += [
-        _pxe_class(p, additional=pxe_scoped) for p in (bundle.get("pxe_classes") or [])
+        cls
+        for p in (bundle.get("pxe_classes") or [])
+        for cls in _pxe_classes(p, additional=pxe_scoped)
     ]
     rendered_classes += [_phone_class(c) for c in (bundle.get("phone_classes") or [])]
     # #700 — device policies last, matching the backend driver's order, so an

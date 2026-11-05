@@ -240,6 +240,10 @@ def compute_audit_hashes(session: Session) -> None:
     # verify_chain reported a false ``prev_hash_mismatch``.
 
     # Transaction-scoped advisory lock; auto-released at COMMIT/ROLLBACK.
+    # Taken before this flush's own statements: a row that other writers lock
+    # BEFORE their audit row (a zone's row, which every record writer holds
+    # from its serial-bump flush on) must go out in an earlier flush, or the
+    # two writers deadlock (#3389).
     session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY})
 
     # Fetch the most-recent persisted row's hash. Empty table → None.
