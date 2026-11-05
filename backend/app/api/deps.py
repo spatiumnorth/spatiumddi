@@ -25,6 +25,7 @@ from app.services.api_token_scopes import (
     is_token_outbound,
     scope_matches_request,
 )
+from app.services.audit_chain import note_service_account_actor
 
 logger = structlog.get_logger(__name__)
 
@@ -60,12 +61,26 @@ _FORCE_PW_CHANGE_ALLOWLIST: tuple[str, ...] = (
 # tokens. Only these two reads stay open to it.
 _SERVICE_ACCOUNT_AUTH_ALLOWLIST: tuple[str, ...] = ("/auth/me", "/auth/me/permissions")
 _AUTH_AREA = "/api/v1/auth/"
+# The same rule by handler, for a request that carries its matched route.
+_AUTH_MODULE = "app.api.v1.auth.router"
+_SERVICE_ACCOUNT_AUTH_HANDLERS = frozenset({"get_me", "get_my_permissions"})
 
 
-def _service_account_may_use(path: str) -> bool:
-    """False for a path under ``/api/v1/auth/`` other than the allowlisted
-    reads. Every other route is the RBAC check's to decide. Matched anywhere
-    in the path, so a reverse proxy's mount prefix does not move it."""
+def _service_account_may_use(request: Request) -> bool:
+    """False for an ``/auth/`` endpoint other than the two allowlisted reads.
+    Every other route is the RBAC check's to decide.
+
+    Decided on the handler the request was routed to, not on the URL, so no
+    spelling of the URL (encoded separators, dot segments, a reverse proxy's
+    mount prefix) can move the answer: the handler that will run is the one
+    checked. A request with no matched route (a test calling the dependency
+    directly) falls back to the URL path."""
+    endpoint = getattr(request.scope.get("route"), "endpoint", None)
+    if endpoint is not None:
+        if getattr(endpoint, "__module__", None) != _AUTH_MODULE:
+            return True
+        return getattr(endpoint, "__name__", None) in _SERVICE_ACCOUNT_AUTH_HANDLERS
+    path = request.url.path
     if _AUTH_AREA not in path:
         return True
     return path.rstrip("/").endswith(_SERVICE_ACCOUNT_AUTH_ALLOWLIST)
@@ -212,11 +227,15 @@ async def _resolve_api_token(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
         )
-    if user.is_service_account and not _service_account_may_use(request.url.path):
+    if user.is_service_account and not _service_account_may_use(request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="A service account cannot use this endpoint",
         )
+    if user.is_service_account:
+        # Audit rows this request writes say ``auth_source=service`` even from
+        # a session the account is not loaded into (#2144).
+        note_service_account_actor(user.id)
     # SECURITY (#400 / M4): the must-change-password gate applies to API
     # tokens too — a token minted for an account that later gets a forced
     # reset (or whose password expires) must not be a bypass around the

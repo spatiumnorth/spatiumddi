@@ -971,8 +971,11 @@ marks its rows `owner_is_service_account: true`.
 
 **Data model.** A `user` row with `auth_source = "service"`, `hashed_password`
 NULL and an empty email — not a table of its own, so every permission check,
-token binding and audit `user_id` works unchanged, and no migration was
-needed. Its name shares the user namespace, so a person can never sign in as
+token binding and audit `user_id` works unchanged. The one migration
+(`e3a9c5f17b26`) makes a token's creator nullable with `ON DELETE SET NULL`:
+the superadmin who mints a service account's token is not its owner, and
+deleting them must not be refused while the token lives (the audit log still
+names who minted it). Its name shares the user namespace, so a person can never sign in as
 it. `auth_source` is also what keeps it out of everything that means a
 person, since each of those paths already keys on `local` or on a provider
 type.
@@ -987,7 +990,12 @@ delegated group admin can still add a service account to a group through
 `/groups`, under the usual ceiling (only permissions they hold themselves).
 
 **Never a superadmin.** A group whose roles grant `*` on `*` is refused at
-create / edit (`422`, audited `superadmin_group`), and
+create / edit (`422`, audited `superadmin_group`). Every other way in is
+refused too, for a superadmin who passes the step-up as well: adding the
+account to such a group through `/groups`, widening a role one of its groups
+holds to `*` / `*`, or a `*` / `*` time-bound grant to one of its groups (`422`,
+audited `service_account_superadmin`). Should one end up in such a group
+anyway (a role edited in the database),
 `is_effective_superadmin` answers False for a service account whatever its
 roles say, so a role widened later still cannot hand it a superadmin-only
 route. It does not count as a remaining superadmin either. In practice: no

@@ -316,8 +316,11 @@ class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=True, index=True
     )
-    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("user.id", ondelete="RESTRICT"), nullable=False
+    # Who minted it. A superadmin mints a service account's tokens (#2144),
+    # so this can differ from ``user_id``; deleting that superadmin keeps the
+    # token and clears this (the audit log still names them).
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
 
     # Optional restriction: list of allowed API path prefixes

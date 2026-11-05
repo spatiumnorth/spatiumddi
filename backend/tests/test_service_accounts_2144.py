@@ -752,3 +752,238 @@ async def test_find_service_accounts_tool(client: AsyncClient, db_session: Async
 
     people = await list_users(db_session, admin, ListUsersArgs())
     assert created["username"] not in {p["username"] for p in people}
+
+
+# ── Validation findings ─────────────────────────────────────────────────────
+
+
+async def _in_wildcard_group(db: AsyncSession, account_id: str) -> Group:
+    """Put the account in a ``*`` / ``*`` group directly, past every API
+    refusal, as a role widened by hand or a pre-existing grant would."""
+    star = await _group(db, [{"action": "*", "resource_type": "*"}])
+    account = await _account(db, account_id)
+    await db.refresh(account, ["groups"])
+    account.groups = [*account.groups, star]
+    await db.commit()
+    return star
+
+
+async def test_a_wildcard_group_does_not_let_its_token_manage_sessions(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``/sessions`` had its own superadmin test (the flag or ``*`` / ``*``),
+    which a service account in a wildcard group passed: it could list every
+    session and sign any administrator out."""
+    await _settings(db_session)
+    admin, h = await _person(db_session, superadmin=True)
+    created = await _create(client, h)
+    await _in_wildcard_group(db_session, created["id"])
+    own = _bearer((await _mint(client, h, created["id"]))["token"])
+    now = datetime.now(UTC)
+    session = UserSession(
+        user_id=admin.id,
+        refresh_token_hash="x" * 64,
+        created_at=now,
+        last_seen_at=now,
+        expires_at=now + timedelta(days=1),
+    )
+    db_session.add(session)
+    await db_session.commit()
+    session_id = session.id
+
+    assert (await client.get("/api/v1/sessions", headers=own)).status_code == 403
+    r = await client.delete(f"/api/v1/sessions/{session_id}", headers=own)
+    assert r.status_code == 403, r.text
+    db_session.expire_all()
+    row = await db_session.get(UserSession, session_id)
+    assert row is not None and row.revoked is False
+
+
+async def test_no_group_role_or_grant_edit_makes_it_a_superadmin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The service-account admin refuses a wildcard group at assignment; the
+    group, role and time-bound-grant editors are the other ways in, and each
+    refuses too, even for a superadmin who passes the step-up."""
+    await _settings(db_session)
+    _, h = await _person(db_session, superadmin=True)
+    plain = await _group(db_session, [{"action": "read", "resource_type": "ip_space"}])
+    star = await _group(db_session, [{"action": "*", "resource_type": "*"}])
+    await db_session.commit()
+    created = await _create(client, h, group_ids=[str(plain.id)])
+    star_id, plain_id, role_id = star.id, plain.id, plain.roles[0].id
+
+    async def _wildcard_members() -> set[uuid.UUID]:
+        db_session.expire_all()
+        account = await _account(db_session, created["id"])
+        await db_session.refresh(account, ["groups"])
+        return {g.id for g in account.groups if g.id == star_id}
+
+    r = await client.put(
+        f"/api/v1/groups/{star_id}",
+        json={"user_ids": [created["id"]], "stepup_password": _PW},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    r = await client.post(
+        "/api/v1/groups",
+        json={
+            "name": f"g-{uuid.uuid4().hex[:6]}",
+            "role_ids": [str(star.roles[0].id)],
+            "user_ids": [created["id"]],
+            "stepup_password": _PW,
+        },
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    r = await client.put(
+        f"/api/v1/roles/{role_id}",
+        json={"permissions": [{"action": "*", "resource_type": "*"}], "stepup_password": _PW},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    r = await client.post(
+        "/api/v1/groups/time-bound-grants",
+        json={
+            "group_id": str(plain_id),
+            "action": "*",
+            "resource_type": "*",
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "stepup_password": _PW,
+        },
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+
+    assert await _wildcard_members() == set()
+    db_session.expire_all()
+    role = await db_session.get(Role, role_id)
+    assert role is not None and role.permissions == [
+        {"action": "read", "resource_type": "ip_space"}
+    ]
+    denied = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.result == "denied",
+                    AuditLog.error_detail == "service_account_superadmin",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(denied) == 4
+
+
+async def test_deleting_the_superadmin_who_minted_its_token_keeps_the_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A token's creator used to be ``ON DELETE RESTRICT``. Before service
+    accounts every creator was the owner, whose delete took the token with
+    it; now a superadmin mints for an account, and deleting that superadmin
+    was refused for as long as the token lived."""
+    await _settings(db_session)
+    _, h = await _person(db_session, superadmin=True)
+    minter, minter_h = await _person(db_session, superadmin=True)
+    created = await _create(client, h)
+    minted = await _mint(client, minter_h, created["id"])
+
+    r = await client.delete(f"/api/v1/users/{minter.id}", headers=h)
+    assert r.status_code == 204, r.text
+    db_session.expire_all()
+    token = await db_session.get(APIToken, uuid.UUID(minted["id"]))
+    assert token is not None and token.is_active is True
+    assert token.created_by_user_id is None
+    r = await client.get("/api/v1/auth/me", headers=_bearer(minted["token"]))
+    assert r.status_code == 200, r.text
+
+
+async def test_a_row_written_outside_the_accounts_session_still_names_it(
+    db_session: AsyncSession,
+) -> None:
+    """The identity map only knows the account in the session that loaded it.
+    A row a handler writes in a side session is labelled from the request's
+    principal instead, and only for that principal's id."""
+    from app.services.audit_chain import _SERVICE_ACCOUNT_ACTOR, note_service_account_actor
+
+    tag = uuid.uuid4().hex[:6]
+    account = User(username=f"svc-{tag}", email="", display_name="svc", auth_source="service")
+    person = User(username=f"p-{tag}", email="", display_name="p", auth_source="local")
+    db_session.add_all([account, person])
+    await db_session.commit()
+    ids = (account.id, person.id)
+    db_session.expunge_all()
+
+    token = _SERVICE_ACCOUNT_ACTOR.set(None)
+    try:
+        note_service_account_actor(ids[0])
+        for uid in ids:
+            db_session.add(
+                AuditLog(
+                    user_id=uid,
+                    user_display_name="x",
+                    action="update",
+                    resource_type="thing",
+                    resource_id="1",
+                    resource_display="thing",
+                )
+            )
+        await db_session.commit()
+    finally:
+        _SERVICE_ACCOUNT_ACTOR.reset(token)
+    rows = {
+        r.user_id: r.auth_source for r in (await db_session.execute(select(AuditLog))).scalars()
+    }
+    assert rows[ids[0]] == "service"
+    assert rows[ids[1]] == "local"
+
+
+async def test_the_auth_gate_holds_for_every_spelling_of_a_blocked_path(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _settings(db_session)
+    _, h = await _person(db_session, superadmin=True)
+    created = await _create(client, h)
+    own = _bearer((await _mint(client, h, created["id"]))["token"])
+    for path in (
+        "/api/v1/auth%2Fmfa%2Fstatus",
+        "/api/v1/auth/me/../mfa/status",
+        "/api/v1/auth/mfa/status?next=/api/v1/auth/me",
+    ):
+        r = await client.get(path, headers=own)
+        assert r.status_code in (403, 404), (path, r.status_code, r.text)
+        assert r.status_code != 200
+
+
+async def test_a_group_admin_cannot_raise_it_above_their_own_permissions(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A delegated group admin may put a service account in a group only
+    under the usual ceiling: one whose roles they hold themselves."""
+    await _settings(db_session)
+    _, h = await _person(db_session, superadmin=True)
+    _, delegate_h = await _person(
+        db_session,
+        perms=[
+            {"action": "admin", "resource_type": "group"},
+            {"action": "read", "resource_type": "ip_space"},
+        ],
+    )
+    above = await _group(db_session, [{"action": "write", "resource_type": "dns_zone"}])
+    within = await _group(db_session, [{"action": "read", "resource_type": "ip_space"}])
+    await db_session.commit()
+    above_id, within_id = above.id, within.id
+    created = await _create(client, h)
+
+    r = await client.put(
+        f"/api/v1/groups/{above_id}", json={"user_ids": [created["id"]]}, headers=delegate_h
+    )
+    assert r.status_code == 403, r.text
+    r = await client.put(
+        f"/api/v1/groups/{within_id}", json={"user_ids": [created["id"]]}, headers=delegate_h
+    )
+    assert r.status_code == 200, r.text
+    account = await _account(db_session, created["id"])
+    await db_session.refresh(account, ["groups"])
+    assert {g.id for g in account.groups} == {within_id}

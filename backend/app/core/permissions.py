@@ -276,8 +276,10 @@ def is_effective_superadmin(user: User) -> bool:
     # but not the superadmin-only surfaces: user, group-of-last-resort and
     # service-account administration, sessions, platform settings. A token
     # held by an external system must not be able to administer principals,
-    # itself included. The service-account admin also refuses a group that
-    # grants ``*`` / ``*``; this holds if a role is widened later.
+    # itself included. Every edit that would put one in a group granting
+    # ``*`` / ``*`` is refused (``app.api.stepup``); this holds if one gets
+    # there anyway. Local superadmin checks must call this, not test the
+    # wildcard themselves (``sessions/router.py`` did, #2144).
     if getattr(user, "is_service_account", False):
         return False
     # A resource-scoped token (issue #374) is never a superadmin, even when

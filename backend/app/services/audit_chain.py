@@ -34,6 +34,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -164,20 +165,38 @@ def hash_row(prev_hash: str | None, canonical: str) -> str:
     return h.hexdigest()
 
 
-def _service_account_actor(session: Session, user_id: object) -> bool:
-    """Whether ``user_id`` is a service account loaded in this session.
+# The service account (#2144) the current request authenticated as, set by
+# the auth dependency. Lets the hook below label a row the account caused even
+# when it is written in a session the account was never loaded into (a
+# handler's side session). Compared by id, so a value that outlives its
+# request can only ever label that same account's rows.
+_SERVICE_ACCOUNT_ACTOR: ContextVar[uuid.UUID | None] = ContextVar(
+    "audit_service_account_actor", default=None
+)
 
-    Read from the identity map only, never queried: a request's audit rows
-    name the caller, whom the auth dependency has already loaded into the
-    same session, so the map answers for every row that matters at no cost.
+
+def note_service_account_actor(user_id: uuid.UUID) -> None:
+    """Record that this request is acting as service account ``user_id``."""
+    _SERVICE_ACCOUNT_ACTOR.set(user_id)
+
+
+def _service_account_actor(session: Session, user_id: object) -> bool:
+    """Whether ``user_id`` is a service account.
+
+    Answered from the request's principal (:func:`note_service_account_actor`)
+    or the session's identity map, never by a query: a request's audit rows
+    name the caller, whom the auth dependency has already identified, so the
+    two answer for every row that matters at no cost.
     """
     if user_id is None:
         return False
     try:
-        key = identity_key(User, uuid.UUID(str(user_id)))
+        uid = uuid.UUID(str(user_id))
     except (ValueError, TypeError):
         return False
-    actor = session.identity_map.get(key)
+    if _SERVICE_ACCOUNT_ACTOR.get() == uid:
+        return True
+    actor = session.identity_map.get(identity_key(User, uid))
     return actor is not None and getattr(actor, "is_service_account", False)
 
 
