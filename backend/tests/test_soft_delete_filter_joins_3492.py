@@ -357,3 +357,156 @@ async def test_release_keeps_a_block_or_subnet_a_trashed_child_hangs_off(
         )
     ).scalar_one_or_none()
     assert kept == scope_id
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_a_block_a_trashed_child_block_hangs_off(
+    db_session: AsyncSession,
+) -> None:
+    """The child-block half of the purity check: a block whose only child
+    block is in the Trash is not empty. ``ip_block.parent_block_id`` is
+    ``ON DELETE CASCADE``, so deleting the parent would destroy the Trash
+    entry with it."""
+    from app.models.docker import DockerHost
+    from app.services.integration_ownership import release_outside_space
+
+    old = IPSpace(name=f"old-{uuid.uuid4().hex[:6]}")
+    new = IPSpace(name=f"new-{uuid.uuid4().hex[:6]}")
+    db_session.add_all([old, new])
+    await db_session.flush()
+    host = DockerHost(
+        name=f"d-{uuid.uuid4().hex[:6]}",
+        connection_type="tcp",
+        endpoint=f"{uuid.uuid4().hex[:6]}.example.test:2376",
+        ipam_space_id=old.id,
+        client_key_encrypted=b"",
+    )
+    db_session.add(host)
+    await db_session.flush()
+    parent = IPBlock(
+        space_id=old.id, network="10.95.0.0/16", name="mirror-p", docker_host_id=host.id
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    child = IPBlock(
+        space_id=old.id,
+        parent_block_id=parent.id,
+        network="10.95.1.0/24",
+        name="trashed-child",
+        deleted_at=datetime.now(UTC),
+    )
+    db_session.add(child)
+    await db_session.commit()
+    parent_id, child_id = parent.id, child.id
+
+    out = await release_outside_space(db_session, "docker_host_id", host.id, [new.id])
+    await db_session.commit()
+
+    assert out.blocks_deleted == 0 and out.blocks_unclaimed == 1
+    db_session.expire_all()
+    assert await db_session.get(IPBlock, parent_id) is not None
+    kept = (
+        await db_session.execute(
+            select(IPBlock.id).where(IPBlock.id == child_id).execution_options(include_deleted=True)
+        )
+    ).scalar_one_or_none()
+    assert kept == child_id
+
+
+@pytest.mark.asyncio
+async def test_address_operator_ref_counts_a_trashed_record(db_session: AsyncSession) -> None:
+    """``address_operator_ref`` is used both in a SELECT (which the hook
+    filters) and in an UPDATE (which it does not) by the same release; a
+    record in the Trash must count in both or the count and the update
+    disagree, and a deleted address would null the record's link for good."""
+    from app.services.integration_ownership import address_operator_ref
+
+    live, _gone = await _seed(db_session)
+    addr = (
+        await db_session.execute(select(IPAddress).where(IPAddress.subnet_id == live.id))
+    ).scalar_one()
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(grp)
+    await db_session.flush()
+    zone = DNSZone(
+        group_id=grp.id,
+        name="ref.example.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.ref.example.",
+        admin_email="admin.ref.example.",
+    )
+    db_session.add(zone)
+    await db_session.flush()
+    assert not await db_session.scalar(select(address_operator_ref(addr.id)))
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="host",
+            fqdn="host.ref.example.",
+            record_type="A",
+            value=str(addr.address),
+            ip_address_id=addr.id,
+            deleted_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+    assert await db_session.scalar(select(address_operator_ref(addr.id)))
+
+
+# ── Semantics the WHERE pass must keep ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_anti_joins_treat_a_trashed_child_as_absent_both_ways(
+    db_session: AsyncSession,
+) -> None:
+    """A block whose only subnet is trashed reads as empty through NOT EXISTS
+    and through a LEFT JOIN … IS NULL alike — the filter goes in the
+    subquery's WHERE and in the join's ON clause, never in the outer WHERE,
+    so neither anti-join inverts. The predicate the WHERE pass adds to the
+    correlated outer table is redundant: a block with a live subnet is still
+    excluded, an empty block still included. ``include_deleted`` on the
+    outer statement switches every level off at once."""
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}")
+    db_session.add(space)
+    await db_session.flush()
+    blocks = {
+        n: IPBlock(space_id=space.id, network=f"10.96.{i}.0/24", name=n)
+        for i, n in enumerate(("live-child", "trashed-child", "empty"))
+    }
+    db_session.add_all(blocks.values())
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Subnet(
+                space_id=space.id,
+                block_id=blocks["live-child"].id,
+                network="10.96.0.0/25",
+                name="s",
+            ),
+            Subnet(
+                space_id=space.id,
+                block_id=blocks["trashed-child"].id,
+                network="10.96.1.0/25",
+                name="t",
+                deleted_at=datetime.now(UTC),
+            ),
+        ]
+    )
+    await db_session.flush()
+    not_exists = (
+        select(IPBlock.name)
+        .where(IPBlock.space_id == space.id, ~exists().where(Subnet.block_id == IPBlock.id))
+        .order_by(IPBlock.name)
+    )
+    left_anti = (
+        select(IPBlock.name)
+        .outerjoin(Subnet, Subnet.block_id == IPBlock.id)
+        .where(IPBlock.space_id == space.id, Subnet.id.is_(None))
+        .order_by(IPBlock.name)
+    )
+    for stmt in (not_exists, left_anti):
+        assert list((await db_session.execute(stmt)).scalars()) == ["empty", "trashed-child"]
+        everything = stmt.execution_options(include_deleted=True)
+        assert list((await db_session.execute(everything)).scalars()) == ["empty"]
