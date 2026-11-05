@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronLeft,
@@ -85,6 +85,17 @@ function ConfirmRestoreModal({
     display: string;
   } | null>(null);
 
+  // What a "Restore {parent} first" left in the Trash (#3505): a parent's own
+  // restore can hold rows back exactly as this row's can (#3188), and its
+  // answer is otherwise never read. Shown as soon as it lands and kept for the
+  // life of the dialog, so a retry of this row that fails, or that is refused
+  // by a further trashed ancestor, still says it, while leaving the retry
+  // buttons in place. Several parents restored in turn accumulate. The ref is
+  // what the retry's callbacks read, since they were bound before the state
+  // update re-rendered; the dialog unmounts on close, which resets both.
+  const [parentLeft, setParentLeft] = useState<string[]>([]);
+  const parentLeftRef = useRef<string[]>([]);
+
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["trash"] });
     qc.invalidateQueries({ queryKey: ["ipam"] });
@@ -140,7 +151,7 @@ function ConfirmRestoreModal({
     onSuccess: (res) => {
       invalidate();
       const left = [...(res.skipped ?? []), ...(res.held_back ?? [])];
-      if (left.length === 0) {
+      if (left.length === 0 && parentLeftRef.current.length === 0) {
         onClose();
         return;
       }
@@ -157,10 +168,17 @@ function ConfirmRestoreModal({
   const parentMut = useMutation({
     mutationFn: (p: { type: TrashEntryType; id: string }) =>
       trashApi.restore(p.type, p.id),
-    onSuccess: () => {
+    onSuccess: (res) => {
       invalidate();
       setError(null);
       setBlocker(null);
+      const left = [...(res.skipped ?? []), ...(res.held_back ?? [])].map(
+        (c) => `${c.display} — ${c.reason}`,
+      );
+      if (left.length > 0) {
+        parentLeftRef.current = [...parentLeftRef.current, ...left];
+        setParentLeft(parentLeftRef.current);
+      }
       mut.mutate(false);
     },
     onError: showError,
@@ -184,7 +202,7 @@ function ConfirmRestoreModal({
             {error}
           </p>
         )}
-        {leftBehind && (
+        {(leftBehind || parentLeft.length > 0) && (
           <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
             {/* No row count: one held-back entry stands for all of a
                 subnet's records ("2 IPAM records of …"), so counting entries
@@ -193,8 +211,8 @@ function ConfirmRestoreModal({
               Restored, but these were left in the Trash:
             </p>
             <ul className="mt-1 list-disc pl-4">
-              {leftBehind.map((l) => (
-                <li key={l}>{l}</li>
+              {[...parentLeft, ...(leftBehind ?? [])].map((l, i) => (
+                <li key={`${i}-${l}`}>{l}</li>
               ))}
             </ul>
           </div>
@@ -569,6 +587,9 @@ export function TrashPage() {
 
         {pendingRestore && (
           <ConfirmRestoreModal
+            // Keyed by row, so nothing one row's dialog learnt (an error, a
+            // parent's leftovers) can carry into another's (#3505).
+            key={`${pendingRestore.type}:${pendingRestore.id}`}
             entry={pendingRestore}
             onClose={() => setPendingRestore(null)}
           />
