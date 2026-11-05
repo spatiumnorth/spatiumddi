@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import { MissingCustomerOption } from "@/components/ownership/pickers";
+import { missingCustomerLabel } from "@/components/ownership/missingCustomer";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -66,7 +68,7 @@ function RoleBadge({ role }: { role: string }) {
 
 type EditorTab = "general" | "ports" | "memberships";
 
-function MulticastGroupModal({
+export function MulticastGroupModal({
   existing,
   spaces,
   onClose,
@@ -231,6 +233,10 @@ function MulticastGroupModal({
               onChange={(e) => setCustomerId(e.target.value || null)}
             >
               <option value="">— None —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
@@ -1125,6 +1131,7 @@ export function MulticastGroupsPage() {
             customers={customersQ.data?.items ?? []}
             spaceNames={spaceNames}
             customerNames={customerNames}
+            missingCustomer={(id) => missingCustomerLabel(id, customersQ)}
             selectedIds={selectedIds}
             allChecked={allChecked}
             toggleAll={toggleAll}
@@ -1205,6 +1212,7 @@ type GroupsTabBodyProps = {
   customers: { id: string; name: string }[];
   spaceNames: Map<string, string>;
   customerNames: Map<string, string>;
+  missingCustomer: (id: string) => string | null;
   selectedIds: Set<string>;
   allChecked: boolean;
   toggleAll: () => void;
@@ -1229,6 +1237,7 @@ function GroupsTabBody({
   customers,
   spaceNames,
   customerNames,
+  missingCustomer,
   selectedIds,
   allChecked,
   toggleAll,
@@ -1408,6 +1417,7 @@ function GroupsTabBody({
                 <td className="px-3 py-1.5 text-muted-foreground">
                   {g.customer_id
                     ? (customerNames.get(g.customer_id) ??
+                      missingCustomer(g.customer_id) ??
                       g.customer_id.slice(0, 8))
                     : "—"}
                 </td>
