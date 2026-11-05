@@ -410,6 +410,7 @@ async def _name_or_generated(
     eff: EffectiveDDNS,
     *,
     client_hostname: str | None,
+    audit_rows: list[Any],
 ) -> str | None:
     """RFC 4703 - a client publishes a name only when nobody else holds it.
 
@@ -419,6 +420,11 @@ async def _name_or_generated(
     The zones checked are the ones the sync would write the forward record
     into: the DDNS override zone or the subnet's, plus the address's extra
     zones.
+
+    A conflict worth auditing is appended to ``audit_rows`` for the caller to
+    add once its DNS writes are done (#3503): added here, the next query's
+    autoflush would take the audit-chain lock before the sync bumps the
+    zone's serial, which deadlocks against a record create on that zone.
     """
     from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415
     from app.services.dns.sync_check import forward_zone_ids_in_order  # noqa: PLC0415
@@ -469,7 +475,7 @@ async def _name_or_generated(
             else "reserved for the address it encodes"
         )
         outcome = f"published {published!r} instead" if published else "published nothing"
-        db.add(
+        audit_rows.append(
             AuditLog(
                 user_display_name="system",
                 auth_source="system",
@@ -525,9 +531,31 @@ async def apply_ddns_for_lease(
         return False
 
     # #3362 — a name another record holds is not the client's to publish.
+    audit_rows: list[Any] = []
     published_name = await _name_or_generated(
-        db, subnet, ipam_row, hostname, eff, client_hostname=client_hostname
+        db,
+        subnet,
+        ipam_row,
+        hostname,
+        eff,
+        client_hostname=client_hostname,
+        audit_rows=audit_rows,
     )
+    try:
+        return await _publish_ddns_name(db, subnet, ipam_row, published_name, eff)
+    finally:
+        # #3503: after the DNS writes above, so they take the zone row first.
+        db.add_all(audit_rows)
+
+
+async def _publish_ddns_name(
+    db: AsyncSession,
+    subnet: Subnet,
+    ipam_row: IPAddress,
+    published_name: str | None,
+    eff: EffectiveDDNS,
+) -> bool:
+    """The rest of :func:`apply_ddns_for_lease`, once the name is decided."""
     if published_name is None:
         # Nothing may be published: the row must not keep the client's name
         # either, or Sync DNS and the auto-sync backstop (which publish a

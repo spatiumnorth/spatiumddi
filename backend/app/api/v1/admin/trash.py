@@ -695,6 +695,10 @@ async def restore_row(
     # would be N serial bumps and, on an agentless driver, N WinRM round trips
     # inside one request — the cost the bulk-delete route exists to avoid.
     records_by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+    # #3503: the audit rows are added last, after every serial bump below. Their
+    # flush takes the audit-chain lock, and a zone row written after that waits
+    # for a record create on the zone that holds the row and waits for the lock.
+    audit_rows: list[AuditLog] = []
     for obj in restored:
         if isinstance(obj, DHCPScope):
             await push_scope_restore(db, obj)
@@ -706,7 +710,7 @@ async def restore_row(
             await remirror_scope_statics(db, obj)
         elif isinstance(obj, DNSRecord) and obj.zone_id not in restored_zone_ids:
             records_by_zone.setdefault(obj.zone_id, []).append(obj)
-        db.add(
+        audit_rows.append(
             AuditLog(
                 user_id=current_user.id,
                 user_display_name=current_user.display_name,
@@ -721,6 +725,14 @@ async def restore_row(
                 result="success",
             )
         )
+
+    # Before the recounts below too: they take the audit-chain lock (#3345).
+    restore_wake_groups: set[uuid.UUID] = set()
+    for zone_id, recs in records_by_zone.items():
+        await push_records_restore(db, zone_id, recs)
+        zone_row = await db.get(DNSZone, zone_id)
+        if zone_row is not None:
+            restore_wake_groups.add(zone_row.group_id)
 
     # A restored subnet / block is back in its parent chain's rollup (#2412).
     from app.api.v1.ipam.router import (  # noqa: PLC0415
@@ -738,13 +750,7 @@ async def restore_row(
     }:
         await _update_block_utilization(db, bid)
 
-    restore_wake_groups: set[uuid.UUID] = set()
-    for zone_id, recs in records_by_zone.items():
-        await push_records_restore(db, zone_id, recs)
-        zone_row = await db.get(DNSZone, zone_id)
-        if zone_row is not None:
-            restore_wake_groups.add(zone_row.group_id)
-
+    db.add_all(audit_rows)
     await db.commit()
     # This router carries no wake_publishing dependency (see the purge below),
     # so the create ops queued above are announced here, after the commit.
