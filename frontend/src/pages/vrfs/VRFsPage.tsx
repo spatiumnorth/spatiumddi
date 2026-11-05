@@ -17,6 +17,7 @@ import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
+import { Field } from "@/pages/dhcp/_shared";
 import {
   asnsApi,
   vrfsApi,
@@ -40,28 +41,6 @@ const RD_RT_RE = /^(\d+|(\d+\.){3}\d+):\d+$/;
 
 function isValidRdRt(v: string): boolean {
   return RD_RT_RE.test(v.trim());
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && (
-        <div className="text-[11px] text-muted-foreground/80">{hint}</div>
-      )}
-    </div>
-  );
 }
 
 function RtBadgeCount({ values, label }: { values: string[]; label: string }) {
@@ -206,8 +185,9 @@ export function VRFEditorModal({
     importInvalid.length === 0 &&
     exportInvalid.length === 0;
 
+  // A span, not a div: the shared Field draws its hint inside a <p>.
   const rdHint = (
-    <div className="flex items-center gap-1.5">
+    <span className="flex items-center gap-1.5">
       {rd.trim() === "" ? (
         <span className="text-muted-foreground/80">
           Optional. Format: <code>ASN:N</code> (e.g. <code>65000:100</code>) or{" "}
@@ -228,7 +208,7 @@ export function VRFEditorModal({
           </span>
         </>
       )}
-    </div>
+    </span>
   );
 
   return (
