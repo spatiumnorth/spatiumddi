@@ -130,7 +130,7 @@ async def test_inventory_and_copilot_do_not_list_a_trashed_address(
     from app.services.ai.tools.ipam import FindIPArgs, find_ip
 
     h = await _headers(db_session)
-    _space_id, _subnet_id, _ip_id = await _trashed_address(client, db_session, h)
+    await _trashed_address(client, db_session, h)
 
     inv = await client.get("/api/v1/ansible/inventory", headers=h)
     assert inv.status_code == 200, inv.text
