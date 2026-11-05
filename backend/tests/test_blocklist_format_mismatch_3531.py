@@ -212,3 +212,73 @@ async def test_first_refresh_of_a_wrong_format_list_says_why(
     assert bl.last_sync_status == "error"
     assert "hosts format" in (bl.last_sync_error or "")
     assert "Change the list's feed format to hosts" in (bl.last_sync_error or "")
+
+
+# --- #3597: the reverse direction, an adblock-format list fed hosts / domains ---
+
+HOSTS = "# hosts\n127.0.0.1 localhost\n0.0.0.0 ads.example.com\n0.0.0.0 t.example.net\n"
+DOMAINS = "# domains\nads.example.com\n*.t.example.net\nx.example.org # c\n"
+
+
+@pytest.mark.parametrize(("content", "detected"), [(HOSTS, "hosts"), (DOMAINS, "domains")])
+def test_hosts_or_domains_content_in_an_adblock_list_is_reported(
+    content: str, detected: str
+) -> None:
+    parsed = parse_feed_detailed(content, "adblock")
+    assert parsed.format_mismatch == detected
+    assert parsed.domains == []
+
+
+def test_adblock_feed_with_some_plain_lines_is_not_a_mismatch() -> None:
+    content = "! t\n||a.example.com^\n||b.example.com^\n||c.example.com^\nplain.example.com\n"
+    parsed = parse_feed_detailed(content, "adblock")
+    assert parsed.format_mismatch is None
+    assert parsed.domains == ["a.example.com", "b.example.com", "c.example.com"]
+
+
+@pytest.mark.parametrize(("content", "detected"), [(HOSTS, "hosts"), (DOMAINS, "domains")])
+async def test_refresh_of_adblock_list_refuses_hosts_or_domains_and_keeps_entries(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, content: str, detected: str
+) -> None:
+    monkeypatch.setattr(
+        safe_fetch,
+        "GuardedTransport",
+        lambda **kw: httpx.MockTransport(lambda r: httpx.Response(200, text=content)),
+    )
+    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+
+    @contextlib.asynccontextmanager
+    async def _cm():  # type: ignore[no-untyped-def]
+        yield db_session
+
+    monkeypatch.setattr(dns_tasks, "async_sessionmaker", lambda *a, **kw: _cm)
+    monkeypatch.setattr(dns_tasks, "publish_wake", _noop_publish)
+
+    bl = DNSBlockList(
+        name="rev", source_type="url", feed_url=f"https://{PUBLIC_IP}/l", feed_format="adblock"
+    )
+    db_session.add(bl)
+    await db_session.flush()
+    db_session.add(
+        DNSBlockListEntry(
+            list_id=bl.id, domain="keep.example.com", entry_type="block", source="feed"
+        )
+    )
+    await db_session.commit()
+
+    out = await dns_tasks._refresh_blocklist_feed_async(str(bl.id))
+
+    assert out["status"] == "error"
+    await db_session.refresh(bl)
+    assert bl.last_sync_status == "error"
+    assert f"Change the list's feed format to {detected}" in (bl.last_sync_error or "")
+    domains = (
+        (
+            await db_session.execute(
+                select(DNSBlockListEntry.domain).where(DNSBlockListEntry.list_id == bl.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert domains == ["keep.example.com"]

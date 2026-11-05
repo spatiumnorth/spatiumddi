@@ -207,6 +207,22 @@ def _looks_like_adblock(content: str) -> bool:
     return adblock > 0 and adblock * 2 > len(lines)
 
 
+def _looks_like_domains(content: str) -> bool:
+    """True when most rule lines are one bare domain each (``*.`` allowed)."""
+    lines = _rule_lines(content)
+    names = 0
+    for line in lines:
+        parts = line.split("#", 1)[0].split()
+        if len(parts) != 1:
+            continue
+        name = parts[0].lower().strip(".")
+        if name.startswith("*."):
+            name = name[2:]
+        if "." in name and not _is_ip_literal(name) and _is_feed_name(name):
+            names += 1
+    return names > 0 and names * 2 > len(lines)
+
+
 #: Modifiers that leave a rule's DNS meaning intact. ``important`` only
 #: raises a rule's precedence over exceptions in the same engine.
 _ADBLOCK_HARMLESS_MODIFIERS = frozenset({"important"})
@@ -367,6 +383,15 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
     stripped rather than kept — see the comment at the strip site.
     """
     if feed_format == "adblock":
+        # The reverse of the check below (#3597): a hosts or domains file
+        # matches no ``||name^`` rule, so the adblock parser would count
+        # every line malformed, return no domains, and the refresh would
+        # empty the list. A real adblock feed with a few plain-name lines
+        # stays below the majority threshold and parses as before.
+        if _looks_like_hosts(content):
+            return ParsedFeed(domains=[], wildcard_count=0, format_mismatch="hosts")
+        if _looks_like_domains(content):
+            return ParsedFeed(domains=[], wildcard_count=0, format_mismatch="domains")
         return _parse_adblock(content)
 
     if _looks_like_adblock(content):
