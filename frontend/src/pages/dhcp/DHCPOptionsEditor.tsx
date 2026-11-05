@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
 import { dhcpApi, type DHCPOption, type DHCPOptionCodeDef } from "@/lib/api";
@@ -118,6 +118,7 @@ function CustomOptionRow({
   );
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const listId = useId();
   // Reflect changes to the row's code into the box (a catalogue pick, a
   // typed code committed on blur / Enter, a template apply). The box never
   // writes the code per keystroke (#1685): doing so let this effect rewrite
@@ -204,10 +205,24 @@ function CustomOptionRow({
               setOpen(false),
             )
           }
+          // Focus leaving the search and its list (Tab / Shift+Tab) closes
+          // the list; a move into the list itself keeps it open (#3486).
+          // Otherwise the next Esc, now outside the wrapper, closes the
+          // dialog with the list still showing. A mouse press inside the
+          // list never moves focus (its onMouseDown below), so a click on
+          // a suggestion still lands before anything here closes the list.
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+              setOpen(false);
+          }}
         >
           <input
             className={inputCls}
             placeholder="Search code or name…"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={open && matches.length > 0}
+            aria-controls={open && matches.length > 0 ? listId : undefined}
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -232,7 +247,15 @@ function CustomOptionRow({
             }}
           />
           {open && matches.length > 0 && (
-            <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md">
+            <div
+              id={listId}
+              className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md"
+              // A press anywhere in the list, not only on a suggestion,
+              // keeps focus where it is: a press on its border would
+              // otherwise blur the search with no related target and close
+              // the list before the click (#3486).
+              onMouseDown={(e) => e.preventDefault()}
+            >
               {matches.map((def) => (
                 <button
                   key={def.code}

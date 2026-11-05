@@ -14,17 +14,19 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const list = vi.fn();
 const update = vi.fn();
+const create = vi.fn();
 const myPermissions = vi.fn();
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    apiTokensApi: { ...actual.apiTokensApi, list, update },
+    apiTokensApi: { ...actual.apiTokensApi, list, update, create },
     authApi: { ...actual.authApi, myPermissions },
   };
 });
@@ -162,5 +164,61 @@ describe("API token of a disabled owner (#3431)", () => {
       /owner account is disabled/,
     ) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
+  });
+});
+
+describe("New token dialog focus (#3483)", () => {
+  it("returns focus to New Token after Enter creates the token and the reveal closes", async () => {
+    await show(true);
+    create.mockResolvedValue({
+      ...token("t-new", "ci-token", true),
+      token: "sddi_secret",
+    });
+    const opener = screen.getByRole("button", { name: /New Token/ });
+    opener.focus();
+    fireEvent.click(opener);
+    fireEvent.change(screen.getByPlaceholderText(/ansible-automation/), {
+      target: { value: "ci-token" },
+    });
+    const pw = screen.getByLabelText(/Password/);
+    fireEvent.change(pw, { target: { value: "pw" } });
+    // Enter in the step-up field submits the form while the field keeps focus.
+    pw.focus();
+    fireEvent.submit(pw.closest("form") as HTMLFormElement);
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText("New API Token")).toBeNull());
+    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Close without copying" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("returns focus to New Token when the keyboard does it all: Enter in the password field, Esc, Close without copying", async () => {
+    const user = userEvent.setup();
+    await show(true);
+    create.mockResolvedValue({
+      ...token("t-new", "ci-token", true),
+      token: "sddi_secret",
+    });
+    const opener = screen.getByRole("button", { name: /New Token/ });
+    opener.focus();
+    await user.keyboard("{Enter}");
+    await user.type(
+      screen.getByPlaceholderText(/ansible-automation/),
+      "ci-token",
+    );
+    await user.type(screen.getByLabelText(/Password/), "pw{Enter}");
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText("New API Token")).toBeNull());
+    await user.keyboard("{Escape}");
+    const discard = await screen.findByRole("button", {
+      name: "Close without copying",
+    });
+    discard.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(opener);
   });
 });
