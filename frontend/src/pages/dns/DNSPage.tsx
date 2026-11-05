@@ -120,6 +120,7 @@ import {
   type DNSView,
   type DNSAcl,
   type DNSRecord,
+  type ServedApex,
   type DNSGroupRecord,
   type DNSImportPreview,
   type DNSRecordChange,
@@ -4592,6 +4593,16 @@ export function ZoneDetailView({
 
   const recordTypes = [...new Set(records.map((r) => r.record_type))].sort();
   const hasRecFilter = Object.values(recFilter).some(Boolean);
+  // #3518 — the SOA and apex NS the zone serves from its settings. They are
+  // read-only rows on the first, unfiltered page: a filter or a later page is
+  // looking for stored records, and these are not.
+  const servedApex = recordsPage?.served_apex ?? null;
+  const showServedApex =
+    !!servedApex &&
+    servedApex.driver_applies &&
+    recordPage === 1 &&
+    !recordSearch.trim() &&
+    !hasRecFilter;
   const filtered = records.filter((r) => {
     if (
       recFilter.name &&
@@ -5227,7 +5238,16 @@ export function ZoneDetailView({
               </p>
             </div>
           )}
-          {(filtered.length > 0 || showRecFilters) && (
+          {servedApex && !servedApex.driver_applies && (
+            <p
+              className="px-5 py-2 text-xs text-muted-foreground"
+              data-testid="served-apex-driver-note"
+            >
+              This group's DNS driver builds the zone's SOA and apex NS itself,
+              by a rule SpatiumDDI does not mirror, so they are not listed here.
+            </p>
+          )}
+          {(filtered.length > 0 || showRecFilters || showServedApex) && (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[720px] text-sm">
                 <thead className="sticky top-0 bg-card">
@@ -5370,6 +5390,29 @@ export function ZoneDetailView({
                   )}
                 </thead>
                 <tbody className={zebraBodyCls}>
+                  {showServedApex &&
+                    servedApex &&
+                    // Under split-horizon each view renders its own apex;
+                    // when they differ, one set of rows per view.
+                    (servedApex.by_view?.length
+                      ? servedApex.by_view
+                      : [{ ...servedApex, view: undefined }]
+                    ).map((a) => (
+                      <ServedApexRows
+                        key={a.view ?? ""}
+                        apex={a}
+                        viewName={a.view}
+                        zoneName={zone.name}
+                        onEditZone={() => setShowEditZone(true)}
+                        editDisabledReason={
+                          zone.tailscale_tenant_id
+                            ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
+                            : can("write", "dns_zone")
+                              ? undefined
+                              : NEEDS_ZONE_WRITE
+                        }
+                      />
+                    ))}
                   {filtered.map((r) => (
                     <ContextMenu key={r.id}>
                       <ContextMenuTrigger asChild>
@@ -6046,6 +6089,146 @@ function Stat({
         </div>
       )}
     </div>
+  );
+}
+
+const SERVED_BADGE_CLS =
+  "inline-flex items-center rounded border border-sky-300/60 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:border-sky-700/40 dark:bg-sky-900/20 dark:text-sky-300";
+
+/** The SOA and apex NS a zone serves from its settings (#3518). Rows only:
+ * no checkbox, no edit link, no row actions, so nothing can select or write
+ * them. The way to change them is Edit Zone (SOA, Primary NS) or an NS
+ * record. */
+function ServedApexRows({
+  apex,
+  viewName,
+  zoneName,
+  onEditZone,
+  editDisabledReason,
+}: {
+  apex: Pick<ServedApex, "soa" | "ns" | "source" | "placeholder_glue_loopback">;
+  viewName?: string;
+  zoneName: string;
+  onEditZone: () => void;
+  editDisabledReason: string | undefined;
+}) {
+  const editButton = (
+    <button
+      type="button"
+      onClick={onEditZone}
+      disabled={!!editDisabledReason}
+      title={editDisabledReason ?? "Change this in Edit Zone"}
+      className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      Edit Zone
+    </button>
+  );
+  const badge = (
+    <span
+      className={SERVED_BADGE_CLS}
+      title={`Served by the zone's settings, not a stored record, so ${zoneName} has no row to edit`}
+    >
+      from zone settings
+    </span>
+  );
+  const typeBadge = (t: string) => (
+    <span
+      className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${RECORD_TYPE_BADGE[t] ?? RECORD_TYPE_BADGE_FALLBACK}`}
+    >
+      {t}
+    </span>
+  );
+  const showNs = apex.source !== "declared";
+  // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
+  // holds its own address for ns1), or ``invalid.`` for a zone whose name is
+  // not a host name, which never resolves.
+  const warning = apex.placeholder_glue_loopback
+    ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
+    : apex.source === "placeholder" && apex.ns.includes("invalid.")
+      ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
+      : apex.source === "placeholder"
+        ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
+        : null;
+  const nameCell = (
+    <td className="py-1.5 pl-5 font-mono text-xs font-medium">
+      <span className="inline-flex items-center gap-1.5">
+        @
+        {viewName && (
+          <span
+            className="rounded border px-1 py-0.5 font-sans text-[10px] text-muted-foreground"
+            title={`Served in view ${viewName}; the zone's views serve different apexes`}
+            data-testid="served-apex-view"
+          >
+            view {viewName}
+          </span>
+        )}
+      </span>
+    </td>
+  );
+  return (
+    <>
+      <tr
+        className="border-b bg-muted/20"
+        data-testid="served-apex-soa"
+        aria-label="SOA served from zone settings"
+      >
+        <td className="w-8 py-1.5 pl-3" />
+        {nameCell}
+        <td className="py-1.5">
+          <span className="inline-flex items-center gap-1.5">
+            {typeBadge("SOA")}
+          </span>
+        </td>
+        <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
+          {apex.soa.mname} {apex.soa.rname}
+        </td>
+        <td className="py-1.5 text-xs text-muted-foreground">—</td>
+        <td className="py-1.5 text-xs text-muted-foreground">—</td>
+        <td className="py-1.5 pr-3">
+          <div className="flex items-center justify-end gap-1.5">
+            {badge}
+            {editButton}
+          </div>
+        </td>
+      </tr>
+      {showNs &&
+        apex.ns.map((ns) => (
+          <tr
+            key={ns}
+            className="border-b bg-muted/20"
+            data-testid="served-apex-ns"
+            aria-label="NS served from zone settings"
+          >
+            <td className="w-8 py-1.5 pl-3" />
+            {nameCell}
+            <td className="py-1.5">
+              <span className="inline-flex items-center gap-1.5">
+                {typeBadge("NS")}
+              </span>
+            </td>
+            <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs">
+              <div className="truncate">{ns}</div>
+              {warning && (
+                <div
+                  role="alert"
+                  className="mt-1 whitespace-normal font-sans text-amber-700 dark:text-amber-400"
+                  data-testid="served-apex-warning"
+                >
+                  {warning}
+                </div>
+              )}
+            </td>
+            <td className="py-1.5 text-xs text-muted-foreground">—</td>
+            <td className="py-1.5 text-xs text-muted-foreground">—</td>
+            <td className="py-1.5 pr-3">
+              <div className="flex items-center justify-end gap-1.5">
+                {badge}
+                {editButton}
+              </div>
+            </td>
+          </tr>
+        ))}
+    </>
   );
 }
 

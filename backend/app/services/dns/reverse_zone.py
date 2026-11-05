@@ -246,6 +246,19 @@ async def ensure_reverse_zones_for_subnet(
         .all()
     )
     by_name = {z.name: z for z in found}
+    if found and any(n not in by_name for n in names):
+        # #3503 — a zone created below is audited, and that audit row's flush
+        # takes the audit-chain lock. The caller's PTR may then go into one of
+        # the zones that ALREADY exist (a /23 with one /24 zone in place), and
+        # bumping its serial after that lock deadlocks against a record create
+        # holding the row. Take those rows first, in id order. Only on this
+        # path: with nothing to create there is no audit row and no lock.
+        await db.execute(
+            select(DNSZone.id)
+            .where(DNSZone.id.in_(sorted(z.id for z in found)))
+            .order_by(DNSZone.id)
+            .with_for_update(key_share=True)
+        )
     # #1932 — a cloud group that has not opted in gets no NEW reverse zone.
     # Ones it already holds are still returned, as they were.
     optout_driver = (

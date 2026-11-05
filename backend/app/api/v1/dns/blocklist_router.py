@@ -762,8 +762,8 @@ def _build_from_source(
         # "block this domain and everything under it" list, so none set it
         # — the key exists for a host-specific feed (a threat-intel drop of
         # individual C2 FQDNs), where blocking the parent domain would be
-        # over-blocking. Left absent rather than stamped `true` on all 19
-        # entries, which would be noise carrying no information.
+        # over-blocking. Left absent rather than stamped `true` on every
+        # entry, which would be noise carrying no information.
         feed_entries_are_wildcard=bool(src.get("entries_are_wildcard", True)),
         enabled=enabled,
     )
