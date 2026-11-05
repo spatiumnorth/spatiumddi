@@ -367,7 +367,66 @@ async def test_the_guard_flags_a_zone_write_after_the_chain_lock_and_only_that()
         z.last_serial += 1  # the row is already this transaction's
         await s.flush()
 
+    async def row_locked_then_audit_then_zone(s: AsyncSession, z: DNSZone) -> None:
+        # A SELECT ... FOR NO KEY UPDATE takes the row as surely as a write.
+        await s.execute(
+            select(DNSZone.id).where(DNSZone.id == zone_id).with_for_update(key_share=True)
+        )
+        s.add(audit())
+        await s.flush()
+        z.last_serial = (z.last_serial or 0) + 1
+        await s.flush()
+
     assert len(await run(audit_then_zone)) == 1
+    assert await run(row_locked_then_audit_then_zone) == []
     assert len(await run(explicit_lock_then_zone)) == 1
     assert await run(both_in_one_flush) == []
     assert await run(zone_audit_zone) == []
+
+
+async def test_subnet_create_spanning_an_existing_reverse_zone_takes_it_first(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A /23 whose first /24 already has a reverse zone: the subnet create
+    makes the second zone (audited, so its flush takes the audit-chain lock)
+    and the gateway's PTR then goes into the EXISTING one. That zone row must
+    be this transaction's before the lock, or it is the #3503 order again."""
+    from tests import _audit_lock_order_guard as guard
+
+    _, headers = await _superadmin(db_session)
+    group, forward, _ = await _bind9_group_zone_key(db_session)
+    existing = DNSZone(
+        group_id=group.id, name="22.87.10.in-addr.arpa.", zone_type="primary", kind="reverse"
+    )
+    space = IPSpace(name=f"sp3503b-{uuid.uuid4().hex[:8]}", description="")
+    db_session.add_all([existing, space])
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.87.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.commit()
+    existing_id = existing.id
+
+    guard.violations.clear()
+    resp = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "block_id": str(block.id),
+            "network": "10.87.22.0/23",
+            "dns_group_id": str(group.id),
+            "dns_zone_id": str(forward.id),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    found = list(guard.violations)
+    guard.violations.clear()
+    assert found == []
+    assert await _live_fqdns(existing_id) == ["1.22.87.10.in-addr.arpa."]
+    async with _TestSessionLocal() as check:
+        names = set(
+            (await check.execute(select(DNSZone.name).where(DNSZone.group_id == group.id)))
+            .scalars()
+            .all()
+        )
+    assert "23.87.10.in-addr.arpa." in names

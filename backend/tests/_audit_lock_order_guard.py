@@ -18,16 +18,25 @@ transaction ends, which is when Postgres releases the locks.
 
 from __future__ import annotations
 
+import os
 import traceback
 from typing import Any
 
 import greenlet
-from sqlalchemy import event
+from sqlalchemy import Select, event
 from sqlalchemy.orm import Session, SessionTransaction
 from sqlalchemy.sql.elements import TextClause
 
+import app
 from app.models.audit import AuditLog
 from app.services.audit_chain import _AUDIT_CHAIN_LOCK_KEY
+
+#: The backend checkout, wherever it is: ``/app`` in the dev container, the
+#: runner's workspace in CI. Frames outside ``app/`` and ``tests/`` are library
+#: code. (A hardcoded ``/app/`` matched nothing in CI, so KNOWN_UNFIXED never
+#: matched there either.)
+_BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(app.__file__)))
+_OWN_DIRS = (os.path.join(_BACKEND, "app") + os.sep, os.path.join(_BACKEND, "tests") + os.sep)
 
 _LOCKED = "_audit_lock_guard_locked"
 _HELD = "_audit_lock_guard_held"
@@ -69,13 +78,13 @@ def _caller_frames() -> list[traceback.FrameSummary]:
     return [
         f
         for f in traceback.extract_stack(frame)
-        if ("/app/app/" in f.filename or "/app/tests/" in f.filename)
+        if f.filename.startswith(_OWN_DIRS)
         and not f.filename.endswith("_audit_lock_order_guard.py")
     ]
 
 
 def _app_stack(frames: list[traceback.FrameSummary]) -> str:
-    names = [f"{f.filename.split('/app/', 1)[-1]}:{f.lineno} {f.name}" for f in frames]
+    names = [f"{f.filename[len(_BACKEND) + 1 :]}:{f.lineno} {f.name}" for f in frames]
     return " <- ".join(reversed(names[-8:]))
 
 
@@ -115,9 +124,30 @@ def _after_flush(session: Session, _ctx: Any) -> None:
         session.info.setdefault(_HELD, set()).add((name, obj.id))
 
 
-def _do_orm_execute(state: Any) -> None:
-    # ``lock_audit_chain`` takes the lock outside a flush.
+def _locked_select_table(stmt: Any) -> str | None:
+    """The table of a ``SELECT <table>.id ... FOR [NO KEY] UPDATE`` on one of
+    :data:`LOCKED_BEFORE_AUDIT_TABLES`, or None. That is how a writer takes a
+    zone row ahead of the chain lock without writing it yet."""
+    if not isinstance(stmt, Select) or stmt._for_update_arg is None:
+        return None
+    cols = list(stmt.selected_columns)
+    if len(cols) != 1 or getattr(cols[0], "key", None) != "id":
+        return None
+    table = getattr(cols[0], "table", None)
+    name = getattr(table, "name", None)
+    return name if name in LOCKED_BEFORE_AUDIT_TABLES else None
+
+
+def _do_orm_execute(state: Any) -> Any:
     stmt = state.statement
+    locked_table = _locked_select_table(stmt)
+    if locked_table is not None:
+        # Every row it returns is now this transaction's until it ends.
+        frozen = state.invoke_statement().freeze()
+        held = state.session.info.setdefault(_HELD, set())
+        held.update((locked_table, row[0]) for row in frozen().all())
+        return frozen()
+    # ``lock_audit_chain`` takes the lock outside a flush.
     if (
         isinstance(stmt, TextClause)
         and "pg_advisory_xact_lock" in stmt.text
