@@ -256,6 +256,7 @@ class _Idle:
         self.daemon_status: dict[str, Any] = {}
         self.orderly_exits = 0
         self.daemon_deaths = 0
+        self.oom_deaths = 0
 
     def run(self) -> None:
         self._stop.wait()
@@ -264,9 +265,11 @@ class _Idle:
         # SyncLoop's (#2019): the exit was the agent's choice, not a death.
         self.orderly_exits += 1
 
-    def note_daemon_death(self) -> None:
-        # SyncLoop's (#2019): the agent watched the daemon die.
+    def note_daemon_death(self, oom_killed: bool = False) -> None:
+        # SyncLoop's (#2019): the agent watched the daemon die. ``oom_killed``:
+        # the cgroup's OOM killer did it (#3552).
         self.daemon_deaths += 1
+        self.oom_deaths += int(oom_killed)
 
     def stop(self) -> None:
         self._stop.set()
@@ -476,6 +479,22 @@ def test_a_daemon_that_was_running_at_boot_still_exits_on_death(supervised) -> N
     assert sv.ticks[-1] == 2
     assert "dns_daemon_start_deferred_waiting" not in sv.spy.events
     assert sv.spy.events[-1] == "dns_daemon_exited"
+
+
+def test_a_death_to_the_oom_killer_is_handed_to_the_sync_loop(supervised, monkeypatch) -> None:
+    """#3552 — the watched death carries "the OOM killer did it" to the apply
+    guard, which outlives the container restart where the cgroup counter does
+    not (Compose)."""
+    monkeypatch.setattr(supervisor.OomWatch, "fired", lambda self, consume=False: True)
+    monkeypatch.setattr(supervisor.OomWatch, "note_daemon_killed", lambda self, now=None: None)
+    sv = supervised
+    sv.drv.launch()
+
+    rc = sv.run({2: sv.drv.die})
+
+    assert rc == 2
+    sync = sv.idles[1]
+    assert (sync.daemon_deaths, sync.oom_deaths) == (1, 1)
 
 
 def test_a_driver_that_does_not_manage_a_daemon_is_never_checked(supervised, agent_cfg) -> None:

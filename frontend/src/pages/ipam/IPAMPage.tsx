@@ -1218,10 +1218,17 @@ function DnsSettingsSection({
   // #1068 — mirror of the DHCP gate below; DNS can be switched off too.
   const { enabled: dnsFeature, ready: dnsFeatureReady } = useFeatureModules();
   const dnsOn = dnsFeatureReady && dnsFeature("core.dns");
+  // The group list takes read on "dns_group" and a group's zone list read on
+  // "dns_zone"; the IPAM Editor holds neither. Without them neither is asked
+  // (#3466), and a stored group or zone reads as linked, never as "No groups
+  // configured." or a raw id.
+  const { can } = usePermissions();
+  const canReadGroups = can("read", "dns_group");
+  const canReadZones = can("read", "dns_zone");
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
-    enabled: dnsOn,
+    enabled: dnsOn && canReadGroups,
     staleTime: 60_000,
   });
 
@@ -1256,7 +1263,7 @@ function DnsSettingsSection({
       // Needs its own gate, unlike the dashboard's: these ids come from
       // the inherited block/space settings, not from the dns-groups query
       // that the module gate empties.
-      enabled: dnsOn,
+      enabled: dnsOn && canReadZones,
     })),
   });
   const allAvailableZones: DNSZone[] = zoneQueries.flatMap(
@@ -1305,7 +1312,7 @@ function DnsSettingsSection({
         <p className="text-xs text-muted-foreground italic">
           {effectiveDns &&
           (effectiveDns.dns_group_ids.length > 0 || effectiveDns.dns_zone_id)
-            ? `Inheriting from ${inheritedFrom ?? "parent"}: ${effectiveDns.dns_group_ids.length} group(s), zone: ${effectiveDns.dns_zone_id ? (availableZones.find((z) => z.id === effectiveDns.dns_zone_id)?.name ?? effectiveDns.dns_zone_id) : "none"}`
+            ? `Inheriting from ${inheritedFrom ?? "parent"}: ${effectiveDns.dns_group_ids.length} group(s), zone: ${effectiveDns.dns_zone_id ? (availableZones.find((z) => z.id === effectiveDns.dns_zone_id)?.name ?? (canReadZones ? effectiveDns.dns_zone_id : "linked, not shown")) : "none"}`
             : "No DNS settings configured in parent chain."}
         </p>
       )}
@@ -1316,7 +1323,22 @@ function DnsSettingsSection({
             compatibility; we round-trip through a single-element array. */}
         <div>
           <p className="text-xs text-muted-foreground mb-1">DNS Server Group</p>
-          {allGroups.length === 0 ? (
+          {!canReadGroups ? (
+            // Disabled, so the form keeps the stored group (never a clear).
+            <select
+              value={displayGroupIds[0] ? "linked" : ""}
+              disabled
+              title="Your role cannot read DNS server groups, so this cannot be changed here."
+              className={`${inputCls} w-full`}
+            >
+              <option value="">{"\u2014 None \u2014"}</option>
+              {displayGroupIds[0] && (
+                <option value="linked">
+                  Linked (not visible to your role)
+                </option>
+              )}
+            </select>
+          ) : allGroups.length === 0 ? (
             <p className="text-xs text-muted-foreground italic">
               No groups configured.
             </p>
@@ -1343,6 +1365,30 @@ function DnsSettingsSection({
             </select>
           )}
         </div>
+
+        {/* A stored zone the user may not read: said, not dropped. */}
+        {!canReadZones && displayZoneId && (
+          <div>
+            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <select
+              value="linked"
+              disabled
+              title="Your role cannot read DNS zones, so this cannot be changed here."
+              className={`${inputCls} w-full`}
+            >
+              <option value="linked">Linked (not visible to your role)</option>
+            </select>
+          </div>
+        )}
+        {!canReadZones && !inherit && displayAdditionalIds.length > 0 && (
+          <p
+            className="text-xs text-muted-foreground"
+            title="Your role cannot read DNS zones, so these cannot be changed here."
+          >
+            Additional Zones: {displayAdditionalIds.length} linked (not visible
+            to your role)
+          </p>
+        )}
 
         {/* Primary Zone */}
         {availableZones.length > 0 && (
@@ -1438,11 +1484,15 @@ function DhcpSettingsSection({
   // reload before the real state is known.
   const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
   const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
+  // The server group list takes read on "dhcp_server", which the IPAM Editor
+  // lacks: not asked without it (#3466), and a stored group reads as linked,
+  // never as "No DHCP server groups configured.".
+  const canReadGroups = usePermissions().can("read", "dhcp_server");
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 60_000,
-    enabled: dhcpOn,
+    enabled: dhcpOn && canReadGroups,
   });
 
   const { data: blockDhcp } = useQuery({
@@ -1493,7 +1543,9 @@ function DhcpSettingsSection({
       {inherit && (
         <p className="text-xs text-muted-foreground italic">
           {effectiveDhcp?.dhcp_server_group_id
-            ? `Inheriting from ${inheritedFrom ?? "parent"}: group "${displayGroup?.name ?? "unknown"}".`
+            ? canReadGroups
+              ? `Inheriting from ${inheritedFrom ?? "parent"}: group "${displayGroup?.name ?? "unknown"}".`
+              : `Inheriting from ${inheritedFrom ?? "parent"}: a group not visible to your role.`
             : "No DHCP group configured in parent chain."}
         </p>
       )}
@@ -1503,7 +1555,22 @@ function DhcpSettingsSection({
           <p className="text-xs text-muted-foreground mb-1">
             DHCP Server Group
           </p>
-          {allGroups.length === 0 ? (
+          {!canReadGroups ? (
+            // Disabled, so the form keeps the stored group (never a clear).
+            <select
+              value={displayGroupId ? "linked" : ""}
+              disabled
+              title="Your role cannot read DHCP server groups, so this cannot be changed here."
+              className={`${inputCls} w-full`}
+            >
+              <option value="">{"\u2014 None \u2014"}</option>
+              {displayGroupId && (
+                <option value="linked">
+                  Linked (not visible to your role)
+                </option>
+              )}
+            </select>
+          ) : allGroups.length === 0 ? (
             <p className="text-xs text-muted-foreground italic">
               No DHCP server groups configured.
             </p>
@@ -5252,10 +5319,14 @@ export function SubnetDetail({
     if (dhcpFeatureReady && !dnsOn && activeSubnetTab === "aliases")
       setActiveSubnetTab("addresses");
   }, [dhcpFeatureReady, dnsOn, activeSubnetTab]);
+  // The scope list takes read on "dhcp_scope", which the IPAM Editor lacks:
+  // not asked of a user without it (#3466), whom it would refuse on every
+  // opening of the subnet (and so of every IP detail opened from it).
+  const canReadScopes = perms.can("read", "dhcp_scope");
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnet.id],
     queryFn: () => dhcpApi.listScopesBySubnet(subnet.id),
-    enabled: dhcpOn,
+    enabled: dhcpOn && canReadScopes,
   });
   const allPoolQueries = useQueries({
     queries: dhcpScopes.map((sc) => ({

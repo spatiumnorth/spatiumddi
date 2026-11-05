@@ -154,6 +154,7 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.drift import zone_state_in_sync
+from app.services.dns.memory_estimate import GroupMemoryEstimate, group_memory_estimate
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.name_targets import (
     absolute_target_error,
@@ -272,7 +273,7 @@ from app.services.dns_io import (
     apply_cname_rule,
     diff_records,
     parse_zone_file,
-    write_zone_file,
+    write_zone_file_served,
 )
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
@@ -351,6 +352,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "PUT /groups/{group_id}/tsig-keys/{key_id}": _G,
     "POST /groups/{group_id}/tsig-keys/{key_id}/rotate": _G,
     "DELETE /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "GET /groups/{group_id}/memory-estimate": _G,
     "GET /groups/{group_id}/views": _G,
     "POST /groups/{group_id}/views": _G,
     "PUT /groups/{group_id}/views/{view_id}": _G,
@@ -593,6 +595,69 @@ class ServerGroupUpdate(BaseModel):
         return v
 
 
+class DNSMemoryRpzLoad(BaseModel):
+    """One blocklist (RPZ) zone as named loads it (#3551)."""
+
+    zone: str
+    views: list[str]
+    entries: int
+    estimated_bytes: int
+
+
+class DNSMemoryEstimateResponse(BaseModel):
+    """A BIND9 group's estimated named memory against its agents' limit (#3551).
+
+    Advisory: under split-horizon each view that applies a blocklist loads its
+    own copy of it (BIND cannot share an RPZ zone between views), so adding a
+    view can push named over the container limit. ``warn`` is set at 80 % of
+    the limit. ``limit_source`` is ``agent`` when a BIND9 agent of the group
+    reported its container limit (the smallest is used), ``default`` when none
+    did and the shipped 2 GiB DNS pod limit is assumed.
+    """
+
+    group_id: uuid.UUID
+    estimated_bytes: int
+    limit_bytes: int
+    limit_source: Literal["agent", "default"]
+    limit_server: str | None = None
+    unknown_limit_servers: list[str] = []
+    percent: float
+    warn: bool
+    message: str | None = None
+    baseline_bytes: int
+    zone_records_loaded: int
+    zone_bytes: int
+    rpz_bytes: int
+    rpz: list[DNSMemoryRpzLoad] = []
+    views: list[str] = []
+
+    @classmethod
+    def from_estimate(cls, est: GroupMemoryEstimate) -> DNSMemoryEstimateResponse:
+        a = est.assessment
+        return cls(
+            group_id=est.group_id,
+            estimated_bytes=a.estimated_bytes,
+            limit_bytes=a.limit_bytes,
+            limit_source=a.limit_source,
+            limit_server=est.limit_server,
+            unknown_limit_servers=list(est.unknown_limit_servers),
+            percent=a.percent,
+            warn=a.warn,
+            message=est.message,
+            baseline_bytes=est.baseline_bytes,
+            zone_records_loaded=est.zone_records_loaded,
+            zone_bytes=est.zone_bytes,
+            rpz_bytes=est.rpz_bytes,
+            rpz=[
+                DNSMemoryRpzLoad(
+                    zone=r.zone, views=list(r.views), entries=r.entries, estimated_bytes=r.bytes
+                )
+                for r in est.rpz
+            ],
+            views=list(est.views),
+        )
+
+
 class ServerGroupResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -620,6 +685,11 @@ class ServerGroupResponse(BaseModel):
     # server, and says where an already-existing group falls outside the
     # supported scope (second server, pools). Empty for every other group.
     scope_warnings: list[str] = []
+    # #3551 — the group's estimated named memory against its agents' limit.
+    # Filled by ``GET /groups/{id}`` only (counting the RPZ entries each view
+    # loads is too heavy for the list); null there and for non-BIND9 groups.
+    # ``GET /groups/{id}/memory-estimate`` returns the same object.
+    memory_estimate: DNSMemoryEstimateResponse | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1345,6 +1415,10 @@ class ViewResponse(BaseModel):
     order: int
     allow_query: list[str] | None = None
     allow_query_cache: list[str] | None = None
+    # #3551 — set on ``GET /groups/{id}/views`` when the group's estimated
+    # named memory is at 80 % or more of its agents' limit: each view that
+    # applies a blocklist loads its own copy of it.
+    memory_warning: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2201,7 +2275,26 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    out = ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    est = await group_memory_estimate(db, group.id)
+    if est is not None:
+        out.memory_estimate = DNSMemoryEstimateResponse.from_estimate(est)
+    return out
+
+
+@router.get(
+    "/groups/{group_id}/memory-estimate",
+    response_model=DNSMemoryEstimateResponse | None,
+)
+async def get_group_memory_estimate(
+    group_id: uuid.UUID, db: DB, _: CurrentUser
+) -> DNSMemoryEstimateResponse | None:
+    """#3551 — estimated named memory for a BIND9 group against the memory
+    limit its agents report, with a warning at 80 %. Null for a group with no
+    BIND9 server."""
+    await _require_group(group_id, db)
+    est = await group_memory_estimate(db, group_id)
+    return DNSMemoryEstimateResponse.from_estimate(est) if est is not None else None
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
@@ -5477,12 +5570,18 @@ async def delete_tsig_key(
 
 
 @router.get("/groups/{group_id}/views", response_model=list[ViewResponse])
-async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSView]:
+async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ViewResponse]:
     await _require_group(group_id, db)
     result = await db.execute(
         select(DNSView).where(DNSView.group_id == group_id).order_by(DNSView.order, DNSView.name)
     )
-    return list(result.scalars().all())
+    views = [ViewResponse.model_validate(v) for v in result.scalars().all()]
+    if views:
+        est = await group_memory_estimate(db, group_id)
+        if est is not None and est.assessment.warn:
+            for v in views:
+                v.memory_warning = est.message
+    return views
 
 
 async def _validated_view_fields(
@@ -6017,7 +6116,7 @@ async def export_all_zones(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for zone in zones:
             records = await _load_zone_records(zone.id, db)
-            text = write_zone_file(zone, records)
+            text = await write_zone_file_served(db, zone, records)
             zf.writestr(zone.name.rstrip(".") + ".zone", text)
     buf.seek(0)
 
@@ -10729,7 +10828,7 @@ async def export_zone(
         rows = await sheet_io.zone_record_rows(db, zone)
         return _sheet_response(rows, format, _sheet_filename(zone, format))
     records = await _load_zone_records(zone_id, db)
-    text = write_zone_file(zone, records)
+    text = await write_zone_file_served(db, zone, records)
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     filename = f"{zone.name.rstrip('.')}-{ts}.zone"
     return Response(

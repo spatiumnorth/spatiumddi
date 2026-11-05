@@ -50,7 +50,7 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owning_integration,
     refuse_sync_into_trashed_space,
-    subnet_has_surviving_addresses,
+    retire_vanished_subnet,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
@@ -377,25 +377,20 @@ async def _apply_blocks_and_subnets(
     used_wrapper_cidrs: set[str] = set()
 
     # Delete router-owned subnets that disappeared upstream — but only
-    # when no non-OPNsense IPAddress rows still live in them. IPAddress
-    # → Subnet is ON DELETE CASCADE with no soft-delete, so a blind
-    # delete here would also sweep operator-created rows and the rows
-    # _apply_addresses deliberately un-claimed (opnsense_router_id=None).
-    # If any such survivor exists we un-claim the subnet (leave it as a
+    # when nothing operator-made hangs off them. IPAddress and DHCPScope
+    # → Subnet are ON DELETE CASCADE, so a blind delete here would also
+    # sweep operator-created addresses, the rows _apply_addresses
+    # deliberately un-claimed (opnsense_router_id=None), and any DHCP
+    # scope on the subnet, live or in Trash (#3532). When any such
+    # content exists we un-claim the subnet (leave it as a
     # manually-managed entry) instead, mirroring the wrapper-block guard
     # below and the address-level un-claim in _apply_addresses.
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
             continue
-        surviving_foreign = await subnet_has_surviving_addresses(db, row.id, "opnsense_router_id")
-        if surviving_foreign:
-            # Operator / other-owned addresses still depend on this
-            # subnet — don't cascade-delete them. Hand the subnet back.
-            row.opnsense_router_id = None
+        if await retire_vanished_subnet(db, row, "opnsense_router_id", warnings=summary.warnings):
             summary.subnets_updated += 1
         else:
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
             summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
