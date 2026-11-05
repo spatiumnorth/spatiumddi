@@ -6,7 +6,7 @@ prefork child that ran one ASN refresh grew by ~380 MB and kept it, and the
 worker was OOMKilled on a 6 GB node. These tests pin the replacement: the
 incremental parser yields ROA objects one at a time from a streamed body in
 any chunking, only the ASNs asked for are indexed and cached, a sweep primes
-the cache once, and a failed fetch keeps the previous slice.
+the cache once, and a failed fetch raises instead of answering empty.
 """
 
 from __future__ import annotations
@@ -195,33 +195,56 @@ async def test_prime_roas_makes_one_fetch_for_a_whole_sweep(monkeypatch) -> None
     assert mirror.fetches == 1
 
 
-async def test_a_failed_fetch_keeps_the_stale_slice_and_answers_empty_when_there_is_none(
-    monkeypatch,
-) -> None:
+async def test_a_failed_fetch_raises_and_is_never_an_empty_answer(monkeypatch) -> None:
     good = _Mirror(_cloudflare_doc(9))
     monkeypatch.setattr(rpki_roa, "_stream_dump", good)
-    first = await rpki_roa.fetch_roas_for_asn(13335, "cloudflare")
-    assert len(first) == 3
-    # Expire the cache and make the mirror fail: the stale slice is what comes back.
+    assert len(await rpki_roa.fetch_roas_for_asn(13335, "cloudflare")) == 3
+    # Expire the cache and make the mirror fail: that is a failure, not "no ROAs".
     fetched_at, indexed, index = rpki_roa._cache["cloudflare"]
     rpki_roa._cache["cloudflare"] = (fetched_at - 10_000, indexed, index)
     bad = _Mirror(None, fail="transport")
     monkeypatch.setattr(rpki_roa, "_stream_dump", bad)
-    assert await rpki_roa.fetch_roas_for_asn(13335, "cloudflare") == first
+    with pytest.raises(rpki_roa.RoaFetchError):
+        await rpki_roa.fetch_roas_for_asn(13335, "cloudflare")
     assert bad.fetches == 1
-    # A brand-new AS with nothing cached and a failing mirror is an empty list.
+    assert "transport" in (rpki_roa.last_fetch_error("cloudflare") or "")
     rpki_roa._clear_cache_for_test()
-    assert await rpki_roa.fetch_roas_for_asn(13335, "cloudflare") == []
     monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(None, fail="status"))
-    assert await rpki_roa.fetch_roas_for_asn(13335, "cloudflare") == []
+    with pytest.raises(rpki_roa.RoaFetchError, match="http 503"):
+        await rpki_roa.fetch_roas_for_asn(13335, "cloudflare")
     assert await rpki_roa.prime_roas([1], "cloudflare") is False
 
 
-async def test_unknown_source_answers_empty_without_a_fetch(monkeypatch) -> None:
+async def test_an_asn_the_source_answered_for_with_no_roas_is_an_empty_list(monkeypatch) -> None:
+    monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(_cloudflare_doc(9)))
+    assert await rpki_roa.fetch_roas_for_asn(64999, "cloudflare") == []
+    assert rpki_roa.last_fetch_error("cloudflare") is None
+
+
+async def test_unknown_source_raises_without_a_fetch(monkeypatch) -> None:
     mirror = _Mirror(_cloudflare_doc(3))
     monkeypatch.setattr(rpki_roa, "_stream_dump", mirror)
-    assert await rpki_roa.fetch_roas_for_asn(13335, "nowhere") == []
+    with pytest.raises(rpki_roa.RoaFetchError):
+        await rpki_roa.fetch_roas_for_asn(13335, "nowhere")
     assert mirror.fetches == 0
+
+
+async def test_ripe_source_uses_the_live_export_endpoint() -> None:
+    assert rpki_roa._SOURCE_URLS["ripe"] == "https://rpki-validator.ripe.net/api/export.json"
+
+
+async def test_ripe_export_shape_parses(monkeypatch) -> None:
+    doc = {
+        "metadata": {"generated": 1793884163},
+        "roas": [
+            {"asn": "AS13335", "prefix": "1.0.0.0/24", "maxLength": 24, "ta": "apnic"},
+            {"asn": "AS18144", "prefix": "1.0.64.0/18", "maxLength": 18, "ta": "apnic"},
+        ],
+    }
+    monkeypatch.setattr(rpki_roa, "_stream_dump", _Mirror(doc))
+    out = await rpki_roa.fetch_roas_for_asn(13335, "ripe")
+    assert [e["prefix"] for e in out] == ["1.0.0.0/24"]
+    assert out[0]["trust_anchor"] == "apnic"
 
 
 async def test_malformed_rows_are_dropped_and_ripe_windows_are_mapped(monkeypatch) -> None:

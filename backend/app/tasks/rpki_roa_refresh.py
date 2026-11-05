@@ -107,7 +107,13 @@ async def _refresh_one_asn(
     now: datetime,
 ) -> dict[str, Any]:
     """Reconcile ROAs for one AS. Returns a per-AS summary used by
-    the caller's audit log + counters."""
+    the caller's audit log + counters.
+
+    Raises :class:`app.services.rpki_roa.RoaFetchError` when the source
+    cannot be read; nothing is touched in that case. An empty fetch result
+    means the source answered and the AS has no ROAs, and only then are
+    stored rows deleted.
+    """
     from app.services.rpki_roa import fetch_roas_for_asn  # noqa: PLC0415
 
     fetched = await fetch_roas_for_asn(int(asn_row.number), source)
@@ -349,11 +355,30 @@ async def _run_refresh() -> dict[str, Any]:
         # One streamed fetch for the whole due set (spatiumddi#1054): the
         # source layer indexes only these ASNs' ROAs, so the per-AS calls
         # below are cache hits and the global dump is never held in memory.
-        # A failed prime is not an error here — each per-AS call retries it
-        # and, failing that, reports "no ROAs this tick" exactly as before.
-        from app.services.rpki_roa import prime_roas  # noqa: PLC0415
+        # A failed prime means the source could not be read: leave every
+        # stored ROA alone and report the failure (spatiumddi#3557). Retrying
+        # per AS would re-stream the dump once per row for nothing.
+        from app.services.rpki_roa import last_fetch_error, prime_roas  # noqa: PLC0415
 
-        await prime_roas({int(r.number) for r in rows}, source)
+        if not await prime_roas({int(r.number) for r in rows}, source):
+            reason = last_fetch_error(source) or "ROA source unreachable"
+            logger.warning(
+                "rpki_roa_refresh_source_failed",
+                source=source,
+                asns=len(rows),
+                error=reason,
+            )
+            return {
+                "status": "failed",
+                "source": source,
+                "error": reason,
+                "asns_scanned": 0,
+                "added": 0,
+                "updated": 0,
+                "removed": 0,
+                "transitions": 0,
+                "errors": len(rows),
+            }
 
         for asn_row in rows:
             try:

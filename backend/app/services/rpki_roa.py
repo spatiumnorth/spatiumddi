@@ -11,12 +11,20 @@ Two source backends today:
   ship ``valid_from``; we leave it NULL. The dump itself is refreshed
   roughly every 20 minutes.
 * **RIPE NCC RPKI Validator 3** —
-  ``https://rpki-validator.ripe.net/api/objects/validated.json``.
-  Same triple shape (``asn`` / ``prefix`` / ``maxLength`` / ``ta``)
-  under a different envelope (``roas`` at the top or under ``data``).
-  ``notBefore`` / ``notAfter`` are surfaced as ISO 8601 strings on the
-  underlying validated objects; we map them to ``valid_from`` /
-  ``valid_to``.
+  ``https://rpki-validator.ripe.net/api/export.json`` (the old
+  ``/api/objects/validated.json`` answers 404 since RIPE retired it,
+  spatiumddi#3557; the export was verified live on 2026-11-05). Same
+  triple shape (``asn`` as ``"AS13335"`` / ``prefix`` / ``maxLength`` /
+  ``ta``) with ``roas`` at the top level. The export carries no validity
+  window, so ``valid_from`` / ``valid_to`` stay NULL for it; the parser
+  still maps ``notBefore`` / ``notAfter`` should a payload carry them.
+
+A failed fetch is NOT an empty answer (spatiumddi#3557). "The source
+answered and this ASN has no ROAs" is an empty list; "we could not get an
+answer" (transport error, non-200, malformed or truncated body, unknown
+source) raises :class:`RoaFetchError`. The refresh reconcile deletes ROA rows
+that are absent from what it is given, so conflating the two wiped every
+stored ROA the first time a mirror moved its URL, while reporting success.
 
 Why the dump is STREAMED and never held whole (spatiumddi#1054). The global
 dump is ~100 MB of JSON and a million entries (2026-09-15: 104,582,576
@@ -70,8 +78,16 @@ _CACHE_TTL_SECONDS = 300
 
 _SOURCE_URLS = {
     "cloudflare": "https://rpki.cloudflare.com/rpki.json",
-    "ripe": "https://rpki-validator.ripe.net/api/objects/validated.json",
+    "ripe": "https://rpki-validator.ripe.net/api/export.json",
 }
+
+
+class RoaFetchError(Exception):
+    """The ROA source could not be read (transport error, non-200, malformed
+    body, unknown source). Distinct from an empty answer: callers must keep
+    what they have stored and report the failure, never treat it as "this AS
+    has no ROAs"."""
+
 
 _VALID_TRUST_ANCHORS = {"arin", "ripe", "apnic", "lacnic", "afrinic"}
 
@@ -81,6 +97,9 @@ _CHUNK_BYTES = 256 * 1024
 # Consumed text is dropped from the parse buffer once this much has been
 # walked, so the buffer never grows past ~one chunk plus one JSON value.
 _TRIM_AT = 64 * 1024
+
+# Last failure reason per source, cleared by the next successful fetch.
+_last_error: dict[str, str] = {}
 
 # Module-level cache: { source: (fetched_at_epoch, asns indexed, {asn: [roa, ...]}) }
 _cache: dict[str, tuple[float, frozenset[int], dict[int, list[dict[str, Any]]]]] = {}
@@ -358,18 +377,17 @@ async def _stream_dump(url: str) -> AsyncIterator[bytes]:
                 yield chunk
 
 
-async def _fetch_index(source: str, asns: frozenset[int]) -> dict[int, list[dict[str, Any]]] | None:
+async def _fetch_index(source: str, asns: frozenset[int]) -> dict[int, list[dict[str, Any]]]:
     """Stream the dump from ``source`` and index the ROAs of ``asns``.
 
-    Returns ``None`` on transport failure / non-200 / malformed JSON so the
-    caller can keep a stale index (or return an empty list) and the per-row
-    task just leaves the ROAs alone for this tick. Every ASN asked for is a
-    key of the result, an empty list meaning "no ROAs for it in this dump".
+    Raises :class:`RoaFetchError` on transport failure / non-200 / malformed
+    JSON / unknown source. Every ASN asked for is a key of the result, an
+    empty list meaning "the dump was read and has no ROAs for it".
     """
     url = _SOURCE_URLS.get(source)
     if url is None:
         logger.warning("rpki_roa_unknown_source", source=source)
-        return None
+        raise RoaFetchError(f"unknown ROA source {source!r}")
     index: dict[int, list[dict[str, Any]]] = {n: [] for n in asns}
     seen = 0
     try:
@@ -382,14 +400,16 @@ async def _fetch_index(source: str, asns: frozenset[int]) -> dict[int, list[dict
             if norm is not None:
                 index[n].append(norm[1])
     except httpx.HTTPError as exc:
-        logger.info("rpki_roa_fetch_failed", source=source, error=f"transport: {exc}")
-        return None
+        reason = f"transport: {exc}"
     except ValueError as exc:
-        logger.info("rpki_roa_fetch_failed", source=source, error=str(exc))
-        return None
+        reason = str(exc)
     except Exception as exc:  # noqa: BLE001 — never block the worker on a bad mirror
-        logger.info("rpki_roa_fetch_failed", source=source, error=f"unexpected: {exc}")
-        return None
+        reason = f"unexpected: {exc}"
+    else:
+        reason = ""
+    if reason:
+        logger.info("rpki_roa_fetch_failed", source=source, error=reason)
+        raise RoaFetchError(f"{source} ROA source: {reason}")
     logger.info("rpki_roa_dump_indexed", source=source, entries=seen, asns=len(asns))
     return index
 
@@ -401,24 +421,38 @@ def _fresh(source: str) -> tuple[frozenset[int], dict[int, list[dict[str, Any]]]
     return None
 
 
+async def _prime(wanted: frozenset[int], source: str) -> None:
+    """Index ``wanted`` (plus whatever a still-fresh cache already indexes);
+    raises :class:`RoaFetchError` when the source cannot be read."""
+    fresh = _fresh(source)
+    if fresh is not None and wanted <= fresh[0]:
+        return
+    if fresh is not None:
+        wanted = wanted | fresh[0]
+    try:
+        index = await _fetch_index(source, wanted)
+    except RoaFetchError as exc:
+        _last_error[source] = str(exc)
+        raise
+    _last_error.pop(source, None)
+    _cache[source] = (time.monotonic(), wanted, index)
+
+
 async def prime_roas(asns: Iterable[int], source: str) -> bool:
     """Make one streamed fetch that indexes ``asns`` (plus whatever a still-
     fresh cache already indexes, so a sweep never narrows what the one-shot
-    path just fetched). ``True`` when the index was refreshed; ``False`` when
-    the fetch failed and the previous index, if any, was kept."""
-    wanted = frozenset(int(n) for n in asns if n)
-    fresh = _fresh(source)
-    if fresh is not None and wanted <= fresh[0]:
-        return True
-    if fresh is not None:
-        wanted = wanted | fresh[0]
-    index = await _fetch_index(source, wanted)
-    if index is None:
-        # Keep the stale index around if we have one — better stale
-        # than empty when the mirror flakes for a tick.
+    path just fetched). ``True`` when the index is usable; ``False`` when the
+    fetch failed — the reason is in :func:`last_fetch_error`."""
+    try:
+        await _prime(frozenset(int(n) for n in asns if n), source)
+    except RoaFetchError:
         return False
-    _cache[source] = (time.monotonic(), wanted, index)
     return True
+
+
+def last_fetch_error(source: str) -> str | None:
+    """Reason the most recent fetch from ``source`` failed, or ``None``."""
+    return _last_error.get(source)
 
 
 async def fetch_roas_for_asn(asn_number: int, source: str) -> list[dict[str, Any]]:
@@ -431,28 +465,37 @@ async def fetch_roas_for_asn(asn_number: int, source: str) -> list[dict[str, Any
         {
             "prefix": "1.1.1.0/24",
             "max_length": 24,
-            "valid_from": datetime | None,  # ``notBefore`` (RIPE only)
-            "valid_to": datetime | None,    # ``expires`` (CF) or ``notAfter`` (RIPE)
+            "valid_from": datetime | None,  # ``notBefore`` when the source has it
+            "valid_to": datetime | None,    # ``expires`` (CF) or ``notAfter``
             "trust_anchor": "apnic",        # may be None on malformed rows
         }
 
-    Returns an empty list on fetch failure so the caller's reconcile
-    pass treats the AS as "no ROAs this tick" rather than wiping the
-    existing rows. The next successful tick re-syncs.
+    An empty list means the source WAS read and has no ROAs for this AS.
+    When the source cannot be read this raises :class:`RoaFetchError`, so the
+    caller's reconcile never mistakes an outage for "no ROAs" and deletes the
+    stored rows (spatiumddi#3557).
     """
     n = int(asn_number)
     fresh = _fresh(source)
     if fresh is None or n not in fresh[0]:
-        await prime_roas([n], source)
+        await _prime(frozenset({n}), source)
     cached = _cache.get(source)
     if cached is None or n not in cached[1]:
-        return []
+        raise RoaFetchError(f"{source} ROA source: no index for AS{n}")
     return list(cached[2].get(n, []))
 
 
 def _clear_cache_for_test() -> None:
     """Reset the module-level cache. Test-only; never call in prod."""
     _cache.clear()
+    _last_error.clear()
 
 
-__all__ = ["fetch_roas_for_asn", "iter_roas", "prime_roas", "_clear_cache_for_test"]
+__all__ = [
+    "RoaFetchError",
+    "fetch_roas_for_asn",
+    "iter_roas",
+    "last_fetch_error",
+    "prime_roas",
+    "_clear_cache_for_test",
+]
