@@ -119,3 +119,53 @@ async def test_a_parked_pcap_poll_holds_no_lock(
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["capture_id"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("url", "module", "func"),
+    [
+        (
+            "/api/v1/appliance/supervisor/k8s-proxy/poll",
+            "app.services.appliance.k8s_proxy",
+            "pop_request",
+        ),
+        (
+            "/api/v1/appliance/supervisor/nettool/poll",
+            "app.services.appliance.agent_cmd",
+            "pop_command",
+        ),
+        (
+            "/api/v1/appliance/supervisor/storage/poll",
+            "app.services.appliance.agent_cmd",
+            "pop_command",
+        ),
+    ],
+)
+async def test_a_parked_proxy_poll_holds_no_lock(
+    db_session: AsyncSession,
+    fresh_session_per_request: None,
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+    module: str,
+    func: str,
+) -> None:
+    import importlib  # noqa: PLC0415
+
+    row, _token = await _approved(db_session)
+    park = _Park()
+
+    async def _auth(_request: Any, db: AsyncSession) -> Appliance:
+        found = await db.get(Appliance, row.id)
+        assert found is not None
+        return found
+
+    async def _pop(*_a: Any, **_kw: Any) -> None:
+        await park.wait(20)
+
+    monkeypatch.setattr(supervisor_api, "_require_cert_auth", _auth)
+    monkeypatch.setattr(importlib.import_module(module), func, _pop)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        resp = await _run(ac.post(url), park, "appliance")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["request_id"] == ""
