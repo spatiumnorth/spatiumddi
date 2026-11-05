@@ -1,0 +1,3 @@
+### Fixed
+
+- Adding a DNS view to a BIND9 group no longer loads every zone again in the new view. A zone whose copy is identical across views (no view-scoped records, the same options and the same view `allow-query`) is now loaded once and referenced from the other views with BIND's `in-view`, so named's memory grows with distinct zone data rather than with views × data. Blocklists are the exception: BIND cannot share a response-policy zone between views, so each view that applies a list still loads its own copy, at about 1.4 kB per entry. The DNS and topology docs now give the per-view cost so the pod limit can be sized for it (#3551).

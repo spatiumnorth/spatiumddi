@@ -1883,6 +1883,39 @@ def _zone_rel(zname: str, view: str | None) -> str:
     return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
 
 
+def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
+    """What a view's copy of ``zone`` must match to share an earlier view's
+    copy through ``in-view`` (#3551), or None when it can never share.
+
+    Under split-horizon every zone used to load once per view, so memory
+    scaled with views × data. A copy that would render identically is now
+    loaded once and referenced from the later views. The zone stanza and
+    file are a pure function of the bundle copy (plus render-wide state such
+    as the group key), so two copies equal apart from ``view_name`` render
+    the same bytes: same records (a ``view_id`` record makes the copies
+    differ, #24), same ``allow-update`` / ``allow-transfer`` / notify /
+    DNSSEC options.
+
+    The view's own ``allow-query`` is part of the key too. A shared zone
+    takes its query ACL from the view that DEFINES it, so referencing it
+    from a view with a wider ``allow-query`` would refuse that view's
+    clients (verified against BIND 9.20: REFUSED).
+
+    Forward zones never share: BIND refuses ``in-view`` of one (they are
+    resolver configuration, not zone data, and cost nothing to repeat).
+    """
+    if not zone.get("name") or zone.get("type", "primary") == "forward":
+        return None
+    body = {k: v for k, v in zone.items() if k != "view_name"}
+    return hashlib.sha256(
+        json.dumps(
+            [body, [str(c) for c in (view.get("allow_query") or [])]],
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _zone_label(zname: str, view: str | None) -> str:
     return f"{zname} (view {view})" if view else zname
 
@@ -3106,8 +3139,23 @@ class Bind9Driver(DriverBase):
             # zone of its own (#1706). Files are namespaced per view (zones/<view>/...) so
             # identical zone names across views don't collide. Views are
             # already ordered low→high by the control plane for first-match
-            # precedence.
+            # precedence, and that order is never changed here: it is what
+            # decides which view a client lands in.
+            #
+            # #3551 — a zone whose copy in this view would render exactly as
+            # in an EARLIER view is loaded once, in that earlier view, and
+            # referenced here with ``in-view``. BIND needs the defining view
+            # above the referencing one, which picking the first view to hold
+            # the copy guarantees without reordering anything. Only the
+            # defining view gets a file, so everything that walks the rendered
+            # tree (freeze/thaw, reload, serial reads, held zones) addresses
+            # the one zone named actually holds. RPZ zones are NOT shared:
+            # BIND refuses a response-policy zone defined by ``in-view``
+            # ("is not a primary or secondary zone"), so each view using a
+            # list still loads its own copy.
             global_bls = [bl for bl in blocklists if bl.get("view_name") is None]
+            # zone name -> {share key: defining view}
+            defined_in: dict[str, dict[str, str]] = {}
             for view in views:
                 vname = view.get("name") or ""
                 if not vname:
@@ -3132,7 +3180,19 @@ class Bind9Driver(DriverBase):
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
-                    body += _zone_stanza(zone, f"{vname}/")
+                    share = _view_share_key(zone, view)
+                    zname = zone.get("name") or ""
+                    if share is not None:
+                        owner = defined_in.get(zname, {}).get(share)
+                        if owner is not None:
+                            body += f'zone "{zname}" {{ in-view "{owner}"; }};\n'
+                            continue
+                    stanza = _zone_stanza(zone, f"{vname}/")
+                    # A copy that rendered nothing (a secondary with no
+                    # masters) defines nothing a later view could reference.
+                    if share is not None and stanza:
+                        defined_in.setdefault(zname, {})[share] = vname
+                    body += stanza
                 for bl in view_bls:
                     body += _rpz_stanza(bl, f"{vname}/")
                 md = [str(m) for m in (view.get("match_destinations") or [])]
@@ -5979,10 +6039,12 @@ class Bind9Driver(DriverBase):
         key_tag = rec.get("key_tag")
         if not shutil.which("rndc"):
             raise RuntimeError("rndc not available — cannot roll DNSSEC key")
-        # #1946 — under split-horizon the zone is loaded once per view that
-        # holds it, and a bare ``rndc dnssec … <zone>`` then fails with "zone
-        # was found in multiple views". Roll it in every view that holds it
-        # (BIND 9.20: each view's copy rolls; the key files are shared).
+        # #1946 — under split-horizon a zone whose copies differ per view is
+        # loaded once per view, and a bare ``rndc dnssec … <zone>`` then
+        # fails with "zone was found in multiple views". Roll it in every view
+        # that holds a copy (BIND 9.20: each view's copy rolls; the key files
+        # are shared). A copy shared through ``in-view`` (#3551) is one zone,
+        # addressed in its defining view only.
         failures: list[str] = []
         for scope in self._zone_rndc_scopes(zone):
             cmd = [
