@@ -701,46 +701,70 @@ chart's Secret. `PROMETHEUS_METRICS_REQUIRE_AUTH=false` serves `/metrics`
 to anyone again; it isn't recommended for any deployment whose web port
 or API port is reachable.
 
-> **Implemented today:** only the **API-request family** below, defined
-> and emitted in `backend/app/metrics.py` via a Starlette middleware on
-> every request. The IPAM / DHCP / DNS / Celery / Database families that
-> follow are **planned, not emitted** — no collector or exporter
-> populates them, and scraping `/metrics` returns the request family
-> (plus the default `prometheus_client` process / GC metrics) only. The
-> two `spatiumddi_auth_*` counters are *declared* in `metrics.py` but
-> not yet incremented by any call site, so they read zero. For the
-> shipped, agent-driven dashboard metrics path, see
-> **Built-in Dashboard Time-Series** below — that one is real.
+> **Implemented today:** the **API-request family** below, defined and
+> emitted in `backend/app/metrics.py` via a Starlette middleware on every
+> request, plus the **DNS / DHCP / IPAM business families** (#2146) in the
+> next section. The `spatiumddi_auth_*` counters are *declared* in
+> `metrics.py` but not yet incremented by any call site, so they read zero,
+> and the families under "planned" further down are not emitted. For the
+> agent-driven dashboard metrics path, see **Built-in Dashboard
+> Time-Series** below.
 
-### IPAM / DHCP business metrics (implemented, #2146)
+### DNS / DHCP / IPAM business metrics (implemented, #2146)
 
-Computed at scrape time from the collectors the InfluxDB push (#889) uses
-(`services/influxdb/collect.py`), so both exporters report the same
-numbers: utilization is the stored `allocated_ips` / `total_ips` counters,
-and the lease gauge counts **distinct addresses**, so a Kea HA pair's
-mirrored lease is counted once. The block is cached for 15 s and costs
-a small constant number of queries per scrape (no per-subnet queries).
+Rendered at scrape time by `backend/app/services/business_metrics.py`,
+cached for 15 s, and a constant number of queries per scrape however large
+the estate. The subnet and scope families come from the collectors the
+InfluxDB push (#889) uses (`services/influxdb/collect.py`), so both
+exporters report the same numbers: utilization is the stored
+`allocated_ips` / `total_ips` counters, and the lease gauge counts
+**distinct addresses**, so a Kea HA pair's mirrored lease is counted once.
+Pool occupancy is `services/dhcp/pool_occupancy.py`, the source of the
+`dhcp_pool_exhaustion` alert. Server state, the DNS query rate and the RPZ
+count use the definitions `GET /summary` uses (#2143). Items in the Trash
+are not reported.
 
-```
-spatiumddi_subnet_allocated_ips{subnet_id, subnet, space}
-spatiumddi_subnet_total_ips{subnet_id, subnet, space}
-spatiumddi_subnet_utilization_percent{subnet_id, subnet, space}
-spatiumddi_dhcp_scope_active_leases{scope_id, scope, group, subnet}
-spatiumddi_dhcp_scope_active{scope_id, scope, group, subnet}   # 1 enabled / 0 disabled
-spatiumddi_business_metrics_truncated                            # 1 if a family hit the cap
-```
+| Series | Labels | Value | Read permission |
+|---|---|---|---|
+| `spatiumddi_subnet_allocated_ips` / `_total_ips` / `_utilization_percent` | `subnet_id, subnet, space` | per live subnet | `ip_space` + `subnet` |
+| `spatiumddi_dhcp_scope_active_leases` | `scope_id, scope, group, subnet` | distinct leased addresses | `dhcp_server` + `dhcp_scope` |
+| `spatiumddi_dhcp_scope_active` | same | 1 enabled, 0 disabled | `dhcp_server` + `dhcp_scope` |
+| `spatiumddi_dhcp_pool_occupancy_ratio` | `pool_id, pool, scope_id, scope, group` | 0..1, dynamic pools only | + `dhcp_pool` |
+| `spatiumddi_dhcp_server_up` | `server_id, server, group` | 1 when the health sweep says `active` | `dhcp_server` |
+| `spatiumddi_dhcp_server_config_apply_ok` | same | 1 `ok`, 0 reverted / failed; absent when never reported (#882) | `dhcp_server` |
+| `spatiumddi_dhcp_packets_dropped_5m` | same | kernel socket drops in the last 5 min; absent when unmeasured (#980) | `dhcp_server` |
+| `spatiumddi_dns_server_up` | `server_id, server, group` | 1 when the health sweep says `active` | `dns_group` |
+| `spatiumddi_dns_server_config_apply_ok` | same | as for DHCP | `dns_group` |
+| `spatiumddi_dns_queries_per_second` | `server_id, server, group, rcode` | 5-min average; `rcode` is `all`, `nxdomain` or `servfail` | `dns_group` |
+| `spatiumddi_dns_rpz_blocked_24h` | `group` | RPZ rewrites in the last 24 h, PASSTHRU excluded | `dns_group` + `server` |
+| `spatiumddi_alerts_open` | `severity` | unresolved alert events | `alert` |
+| `spatiumddi_business_metrics_truncated` | | 1 when a family in this scrape hit the cap | |
 
-**Cardinality:** one series per live subnet in each of the first three
-families and one per live DHCP scope in the next two, capped at 10,000
+**Traffic is a windowed gauge, not a counter.** The source is the agents'
+60 s bucket deltas, kept for `metric_retention_days`; cumulating them into a
+`_total` counter would make one that goes backwards when old buckets are
+pruned and resets on every api restart. Graph the series directly; `rate()`
+on them is wrong.
+
+**Cardinality:** one series per live subnet, scope, dynamic pool or server
+per family (three per DNS server for the query rate), capped at 10,000
 series per family. There are never per-IP, per-lease or per-client labels.
 
-**Exposure:** the labels carry subnet CIDRs and space / group / scope
-names, so these series are served **only on an authenticated scrape**. With
-`PROMETHEUS_METRICS_REQUIRE_AUTH=false` they are omitted entirely. Set
-`PROMETHEUS_BUSINESS_METRICS_ENABLED=false` to drop them on an
-authenticated endpoint too. The DNS / DHCP traffic deltas the InfluxDB
-export carries are not republished here: they are time-bucketed deltas
-with a retention window, not monotonic counters.
+**Who sees what.** The labels carry subnet CIDRs and space, group, scope,
+pool and server names, so:
+
+- the series are served **only on an authenticated scrape**: with
+  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` they are omitted entirely;
+- **the scrape token** reads every family: it is the operator's grant to a
+  monitoring system;
+- **an API token** reads only the families its owner holds a type-wide read
+  grant for (the "Read permission" column), the way `GET /summary` gates its
+  sections. A role scoped to one subnet or one DNS group is not type-wide.
+  The process metrics stay readable by any valid token. A token bound to
+  specific resources is refused at `/metrics`, as before.
+
+Set `PROMETHEUS_BUSINESS_METRICS_ENABLED=false` to drop the business series
+altogether.
 
 ### API Service Metrics (implemented)
 
@@ -766,32 +790,20 @@ spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oi
 spatiumddi_auth_token_usage_total{scope}       # planned
 ```
 
-### IPAM Metrics (planned — not emitted)
+### IPAM / DHCP / DNS Metrics (planned — not emitted)
+
+The business families above cover utilization, leases, pool occupancy and
+server state. These remain planned:
 
 ```
-spatiumddi_subnet_utilization_percent{subnet_id, subnet_network, space_id}
 spatiumddi_ip_addresses_total{subnet_id, status}
 spatiumddi_subnets_total{space_id, status}
-```
-
-### DHCP Metrics (planned — not emitted)
-
-```
-spatiumddi_dhcp_leases_active{server_id, scope_id}
-spatiumddi_dhcp_pool_utilization_percent{server_id, scope_id, pool_id}
 spatiumddi_dhcp_sync_last_success_timestamp{server_id}
 spatiumddi_dhcp_sync_duration_seconds{server_id}
-spatiumddi_dhcp_server_status{server_id}   # 1=online, 0=offline
-```
-
-### DNS Metrics (planned — not emitted)
-
-```
 spatiumddi_dns_sync_last_success_timestamp{server_id}
 spatiumddi_dns_records_total{server_id, zone_id, record_type}
 spatiumddi_dns_zones_total{server_id, view_id}
 spatiumddi_dns_blocklist_entries_total{list_id}
-spatiumddi_dns_server_status{server_id}
 ```
 
 ### Built-in Dashboard Time-Series (agent-driven) — shipped

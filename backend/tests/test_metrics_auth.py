@@ -38,10 +38,13 @@ def _app() -> FastAPI:
 
 @pytest.fixture(autouse=True)
 def _no_business_series(monkeypatch: pytest.MonkeyPatch) -> None:
-    """These cases are about who may scrape. The business series (#2146) open
-    a pooled DB session from the app's global engine, which a TestClient's
-    short-lived event loop would leave bound to a closed loop for the next
-    test; they have their own tests in test_business_metrics.py."""
+    """These cases are about who may scrape. The business series (#2146) read
+    the database through the app's pooled engine, and the sync ``TestClient``
+    cases run on a throwaway event loop of their own, which would leave a
+    pooled connection bound to a closed loop for the next test (the reason
+    the test engine is a NullPool, see conftest). Production runs one loop
+    per worker. Which sections each caller reads is tested end to end, on
+    the test session's loop, in test_business_metrics.py."""
     monkeypatch.setattr(settings, "prometheus_business_metrics_enabled", False)
 
 

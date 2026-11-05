@@ -170,44 +170,58 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
             REQUEST_DURATION.labels(method=method, path_template=path_label).observe(duration)
 
 
-async def _scrape_authorized(request: Request) -> bool:
-    """#1159 — may this request read /metrics?
+async def _scrape_sections(request: Request) -> frozenset[str] | None:
+    """#1159 — may this request read /metrics, and which business sections?
 
-    Only with ``Authorization: Bearer <token>``, where the token is the
-    configured scrape token (``PROMETHEUS_METRICS_TOKEN``) or any valid API
-    token. An API token goes through the same checks as on every other route:
-    revoked, expired, out of scope, owner disabled or owner forced to change
-    their password all refuse it, and its use is recorded.
+    ``None`` refuses the scrape. Only ``Authorization: Bearer <token>`` is
+    accepted, where the token is the configured scrape token
+    (``PROMETHEUS_METRICS_TOKEN``) or any valid API token. An API token goes
+    through the same checks as on every other route: revoked, expired, out of
+    scope, owner disabled or owner forced to change their password all refuse
+    it, and its use is recorded.
+
+    #2146 — the answer also says which business sections the caller may read.
+    The scrape token is the operator's grant to a monitoring system and reads
+    all of them; an API token reads only the sections its owner holds a
+    type-wide read grant for (``business_metrics.sections_for_user``), since
+    the series carry subnet CIDRs and space / group / scope / server names
+    the owner may not be allowed to list through the API. The process
+    metrics stay readable by any valid token, as before.
     """
     scheme, _, credential = request.headers.get("authorization", "").partition(" ")
     credential = credential.strip()
     if scheme.lower() != "bearer" or not credential:
-        return False
+        return None
+    # Imported here: the business sections and the API-token path need the
+    # models and the database, which this module, imported for the middleware
+    # alone, otherwise doesn't.
+    from app.services.business_metrics import ALL_SECTIONS, sections_for_user
+
     configured = settings.prometheus_metrics_token.strip()
     if configured and hmac.compare_digest(credential.encode(), configured.encode()):
-        return True
-    # Imported here: the API-token path needs the models and the database,
-    # which this module, imported for the middleware alone, otherwise doesn't.
+        return ALL_SECTIONS
     from fastapi import HTTPException
 
     from app.api.deps import _API_TOKEN_PREFIX, _resolve_api_token
     from app.db import AsyncSessionLocal
 
     if not credential.startswith(_API_TOKEN_PREFIX):
-        return False
+        return None
     async with AsyncSessionLocal() as db:
         try:
-            await _resolve_api_token(db, credential, request)
+            user = await _resolve_api_token(db, credential, request)
         except HTTPException:
-            return False
-    return True
+            return None
+        # Decided inside the session: the owner's groups and roles are
+        # loaded with it.
+        return sections_for_user(user)
 
 
 async def metrics_endpoint(request: Request) -> Response:
     """Prometheus scrape endpoint at /metrics.
 
     #1159 — refused with 401 unless the request carries the scrape token or
-    an API token (see :func:`_scrape_authorized`), unless
+    an API token (see :func:`_scrape_sections`), unless
     ``PROMETHEUS_METRICS_REQUIRE_AUTH`` is false.
 
     #1051 — rendered in a worker thread, not on the event loop.
@@ -221,31 +235,37 @@ async def metrics_endpoint(request: Request) -> Response:
     probes and the requests between GIL slices instead of going dark for the
     duration.
     """
-    if settings.prometheus_metrics_require_auth and not await _scrape_authorized(request):
-        return Response(
-            content="/metrics requires a bearer token: the scrape token or an API token\n",
-            status_code=401,
-            media_type="text/plain",
-            headers={"WWW-Authenticate": 'Bearer realm="metrics"'},
-        )
+    sections: frozenset[str] = frozenset()
+    if settings.prometheus_metrics_require_auth:
+        granted = await _scrape_sections(request)
+        if granted is None:
+            return Response(
+                content="/metrics requires a bearer token: the scrape token or an API token\n",
+                status_code=401,
+                media_type="text/plain",
+                headers={"WWW-Authenticate": 'Bearer realm="metrics"'},
+            )
+        sections = granted
     data = await run_in_threadpool(generate_latest)
-    # #2146 — business series carry subnet CIDRs and space / group / scope
-    # names, so they are served only to an authenticated scrape: with
+    # #2146 — business series carry subnet CIDRs and space / group / scope /
+    # server names, so they are served only to an authenticated scrape, and
+    # only the sections the caller may read: with
     # PROMETHEUS_METRICS_REQUIRE_AUTH=false they are left out entirely.
-    if settings.prometheus_metrics_require_auth and settings.prometheus_business_metrics_enabled:
-        data += await _business_block()
+    if sections and settings.prometheus_business_metrics_enabled:
+        data += await _business_block(sections)
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
-async def _business_block() -> bytes:
-    """The IPAM / DHCP business series, or nothing if they cannot be computed
-    (a database blip must not fail the scrape of the process metrics)."""
+async def _business_block(sections: frozenset[str]) -> bytes:
+    """The business series for ``sections``, or nothing if they cannot be
+    computed (a database blip must not fail the scrape of the process
+    metrics)."""
     from app.db import AsyncSessionLocal
     from app.services.business_metrics import business_metrics_text
 
     try:
         async with AsyncSessionLocal() as db:
-            return (await business_metrics_text(db)).encode()
+            return (await business_metrics_text(db, sections)).encode()
     except Exception:  # noqa: BLE001 — degrade to the process metrics only
         logger.warning("business_metrics_failed", exc_info=True)
         return b""

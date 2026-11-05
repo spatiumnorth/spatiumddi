@@ -46,7 +46,7 @@ infrastructure rather than application surface:
 | `/health/startup` | Same logic as `/health/ready`, for slow-start k8s containers | none |
 | `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard. Anonymous callers get the rollup `status` only; the component list needs a signed-in caller (#2935) | optional |
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |
-| `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
+| `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`); the DNS / DHCP / IPAM business families (#2146) are served to an API token only where its owner may read them | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
 
 `/api/v1` is the only API version, and from 1.0.0 it is stable. Within
 1.x it only grows: a release may add routes, optional parameters and

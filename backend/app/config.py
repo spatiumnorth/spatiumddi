@@ -200,9 +200,10 @@ class Settings(BaseSettings):
     prometheus_metrics_token: str = ""
     # False restores anonymous scraping. Not recommended: see above.
     prometheus_metrics_require_auth: bool = True
-    # #2146 — IPAM / DHCP business series on /metrics (subnet utilization,
-    # per-scope active leases). Served only on an authenticated scrape: the
-    # labels carry subnet CIDRs and space / group / scope names.
+    # #2146 — DNS / DHCP / IPAM business series on /metrics (see
+    # app.services.business_metrics). Served only on an authenticated
+    # scrape, and to an API token only the families its owner may read: the
+    # labels carry subnet CIDRs and space / group / scope / server names.
     prometheus_business_metrics_enabled: bool = True
 
     # DNS agent
