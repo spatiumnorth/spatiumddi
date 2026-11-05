@@ -667,6 +667,8 @@ def _control_app(db: AsyncSession) -> FastAPI:
         try:
             s.connect(("192.0.2.1", 9))
         except OSError:
+            # The guard records the attempt before the connect fails; the
+            # failure itself (refused, timed out) is not what is under test.
             pass
         finally:
             s.close()
@@ -678,6 +680,7 @@ def _control_app(db: AsyncSession) -> FastAPI:
         try:
             s.sendto(b"x", ("192.0.2.1", 9))
         except OSError:
+            # As above: the guard has already recorded the send attempt.
             pass
         finally:
             s.close()
