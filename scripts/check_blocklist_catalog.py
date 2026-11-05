@@ -361,7 +361,11 @@ def check_source(
         if alt != fmt
     }
     best_alt, best_n = max(alternatives.items(), key=lambda kv: kv[1])
+    # A feed already reported as unparseable is not also reported as shrunken:
+    # the count is wrong because the format is, not because the list shrank.
+    unparseable = False
     if entries == 0 and best_n == 0:
+        unparseable = True
         findings.append(
             Finding(
                 "unparseable",
@@ -371,6 +375,7 @@ def check_source(
             )
         )
     elif best_n >= GLOBAL_FLOOR and entries < best_n * FORMAT_MISMATCH_RATIO:
+        unparseable = True
         findings.append(
             Finding(
                 "unparseable",
@@ -384,7 +389,7 @@ def check_source(
     prev = baseline.get(sid)
     if not isinstance(prev, dict):
         prev = None
-    if entries < floor and not (entries == 0 and findings):
+    if entries < floor and not unparseable:
         findings.append(
             Finding(
                 "shrunken", sid, f"{entries:,} entries, below the floor of {floor:,}"

@@ -39,6 +39,23 @@ from app.services.dns_blocklist_parse import (  # noqa: F401
     parse_feed_detailed,
 )
 
+__all__ = [
+    "EffectiveBlocklist",
+    "EffectiveEntry",
+    "FeedSkipCounts",
+    "ParsedFeed",
+    "build_effective_for_group",
+    "build_effective_for_view",
+    "dedupe_domains",
+    "effective_lists_for_group",
+    "effective_lists_for_view",
+    "exception_domains",
+    "has_entries",
+    "parse_feed",
+    "parse_feed_detailed",
+    "stream_entries",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class EffectiveEntry:
