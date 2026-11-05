@@ -65,6 +65,7 @@ import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
+import { DnsMemoryBanner } from "./DnsMemoryBanner";
 import { DelegationModal } from "./DelegationModal";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
@@ -6685,6 +6686,20 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </button>
       </div>
 
+      {hasBind && (
+        <DnsMemoryBanner
+          groupId={group.id}
+          refreshKey={JSON.stringify([
+            views.map((v) => v.id),
+            blocklists.map((b) => [
+              b.id,
+              b.applied_group_ids,
+              b.applied_view_ids,
+            ]),
+          ])}
+        />
+      )}
+
       {servers.length > 0 && !hasBind && (
         <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           <strong>This group runs no BIND9 server.</strong> Views and
@@ -10896,6 +10911,17 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           </button>
         </div>
       </div>
+      <DnsMemoryBanner
+        groupId={group.id}
+        refreshKey={JSON.stringify(
+          lists.map((b) => [
+            b.id,
+            b.applied_group_ids,
+            b.applied_view_ids,
+            b.entry_count,
+          ]),
+        )}
+      />
       {showCatalog && (
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}

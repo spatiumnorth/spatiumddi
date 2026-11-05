@@ -246,6 +246,13 @@ RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 # warning.
 RULE_TYPE_AGENT_SPOOL_TRIMMED = "agent_spool_trimmed"
 
+# Issue #3551 — a BIND9 group's estimated named memory has reached 80 % of the
+# memory limit its agents report. Under split-horizon each view that applies a
+# blocklist loads its own copy of it (BIND cannot share an RPZ zone between
+# views), so adding a view can OOM-loop every agent in the group. Subject =
+# the dns_server_group. Warning from 80 %, critical from 100 %.
+RULE_TYPE_DNS_MEMORY_PRESSURE = "dns_memory_pressure"
+
 # Issue #1067 — an agent that is heartbeating reports that its DAEMON is not
 # serving, and has been saying so for longer than a bundle normally takes to
 # arrive. Subject = the dns_server / dhcp_server row.
@@ -776,6 +783,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_AGENT_SPOOL_TRIMMED,
+        RULE_TYPE_DNS_MEMORY_PRESSURE,
         RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
         RULE_TYPE_DNS_RECORD_OP_FAILED,
@@ -4172,6 +4180,45 @@ async def _matching_agent_spool_trimmed_subjects(
     return matches
 
 
+async def _matching_dns_memory_pressure_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_memory_pressure`` — every BIND9 group whose estimated named
+    memory is at 80 % or more of the smallest limit its agents report (#3551).
+
+    The estimate is ``services/dns/memory_estimate``'s, the one the group,
+    view and blocklist responses carry, so the alarm and the banner agree.
+    Critical once the estimate reaches the limit itself.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.memory_estimate import group_memory_estimate  # noqa: PLC0415
+
+    groups = (
+        await db.execute(
+            select(DNSServerGroup.id, DNSServerGroup.name)
+            .where(
+                DNSServerGroup.id.in_(select(DNSServer.group_id).where(DNSServer.driver == "bind9"))
+            )
+            .order_by(DNSServerGroup.name)
+        )
+    ).all()
+    matches: list[tuple[str, str, str, str | None]] = []
+    for gid, name in groups:
+        est = await group_memory_estimate(db, gid)
+        if est is None or not est.assessment.warn:
+            continue
+        matches.append(
+            (
+                str(gid),
+                name,
+                f"DNS server group '{name}': {est.message}",
+                "critical" if est.assessment.percent >= 100 else "warning",
+            )
+        )
+    return matches
+
+
 async def _matching_dns_record_op_failed_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -6472,6 +6519,48 @@ async def seed_agent_spool_trimmed_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_MEMORY_PRESSURE_RULE_NAME = "DNS group near its memory limit"
+
+
+async def seed_dns_memory_pressure_alert_rule() -> None:
+    """Seed the #3551 rule, ENABLED by default.
+
+    Silent on every group whose zones and blocklists fit comfortably in its
+    agents' memory limit. It speaks when a supported change (a second view, a
+    larger list) would put named over the limit, where the next symptom is
+    every agent of the group OOM-killed in a loop. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_MEMORY_PRESSURE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_MEMORY_PRESSURE_RULE_NAME,
+                description=(
+                    "Fires when a BIND9 server group's estimated named memory "
+                    "reaches 80% of the memory limit its agents report (or the "
+                    "2 GiB default when none has). Each DNS view that applies a "
+                    "blocklist loads its own copy of it, so adding a view can "
+                    "OOM-kill every agent in the group. Critical at 100%."
+                ),
+                rule_type=RULE_TYPE_DNS_MEMORY_PRESSURE,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNSSEC_MULTI_SIGNER_RULE_NAME = "DNSSEC zone signed by several servers"
 
 
@@ -8518,6 +8607,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]
                 # Same prefixed "<table>:<id>" subject as agent_config_rejected.
                 subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_DNS_MEMORY_PRESSURE:
+                pressure = await _matching_dns_memory_pressure_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in pressure]
+                subject_type = "dns_server_group"
             elif rule.rule_type == RULE_TYPE_AGENT_DAEMON_DEGRADED:
                 dark = await _matching_agent_daemon_degraded_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in dark]

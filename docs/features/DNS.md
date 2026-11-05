@@ -483,8 +483,9 @@ view that references it.
 **Blocklists are not shared, and are usually the larger cost.** BIND
 refuses a response-policy zone defined with `in-view` ("is not a primary or
 secondary zone"), so each view that applies a list loads its own copy of its
-RPZ zone. A group-level list (§8) is loaded into each view that has no list
-of its own (#1706), so with two such views it is loaded twice. Measured on
+RPZ zone. Under views every view gets an RPZ zone of its own
+(`spatium-blocklist-<view>.rpz.`) with the group's lists folded in (#1706),
+so a group-level list on a group with two views is loaded twice. Measured on
 BIND 9.20.29:
 
 | Data | Resident, per copy |
@@ -498,6 +499,36 @@ about 260 MiB per view that applies it. If a view exists only to give some
 clients a different blocklist, size the DNS pod for one copy of every list
 per view (§8.0); if two views would apply the same lists, consider whether
 they need to be separate views at all.
+
+**The memory warning.** The control plane estimates what named will hold
+for each BIND9 group and compares it with the memory limit the group's
+agents run under. It warns; it never refuses a change.
+
+- *The estimate*: 400 MiB for named and the agent at idle, plus about
+  0.45 kB per record of each zone copy named loads (a copy shared through
+  `in-view` counts once), plus about 1.4 kB per RPZ owner name per view that
+  loads it. RPZ owners are counted as the bundle builds each view's zone:
+  every domain once across the lists it draws on (the §8 first-writer dedup),
+  plus exception domains, which render as passthru owners. Records of a
+  secondary zone arrive by transfer and are not counted.
+- *The limit*: each BIND9 agent reports its container's cgroup `memory.max`
+  on the heartbeat (`dns_server.memory_limit_bytes`), and the smallest one in
+  the group is used, since every server renders the same config. When no
+  agent has reported one (an older agent, or a container with no limit), the
+  shipped 2 GiB DNS pod limit is assumed and the warning says so.
+- *The threshold*: 80 % of the limit. At or above it, the warning appears:
+  - as `memory_estimate` on `GET /dns/groups/{id}` and the whole estimate
+    on `GET /dns/groups/{id}/memory-estimate`;
+  - as `memory_warning` on each view of `GET /dns/groups/{id}/views` and on
+    each blocking list applied to the group;
+  - as a banner on the group's Views and Blocking Lists tabs, with the
+    numbers and the fix;
+  - as the default-on `dns_memory_pressure` alert (warning from 80 %,
+    critical from 100 %);
+  - in the Copilot's `get_dns_group_memory_estimate` tool.
+
+  The fix is one of two things: fewer views drawing on the same lists, or a
+  larger memory limit for the DNS pod (§8.0 says where to raise it).
 
 ---
 

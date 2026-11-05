@@ -16,6 +16,7 @@ from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
 from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
+from .oom_watch import cgroup_memory_limit_bytes
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -63,6 +64,9 @@ class HeartbeatClient:
         # against an old control plane into a stale server. Mirrors the DHCP
         # agent's fallback.
         self._spool_field_unsupported = False
+        # #3551 — same fallback for the memory limit, which a control plane
+        # older than #3551 also refuses (extra="forbid").
+        self._memory_field_unsupported = False
 
     # A failing probe must not be retried forever. Unlike the DHCP agent's
     # ``_kea_version``, which polls a control socket that is legitimately down
@@ -152,6 +156,11 @@ class HeartbeatClient:
                 body["spool"] = self.spool_manager.status()
             except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
                 log.warning("heartbeat_spool_status_failed", error=str(exc))
+        # #3551 — the container's memory limit (None = no limit), which named
+        # and this agent share. The control plane compares its estimate of
+        # the group's named memory against it and warns before an OOM loop.
+        if not self._memory_field_unsupported:
+            body["memory_limit_bytes"] = cgroup_memory_limit_bytes()
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
         # supervisor's heartbeat (one producer instead of three).
@@ -165,15 +174,29 @@ class HeartbeatClient:
                     json=body,
                     headers=self._auth_headers(),
                 )
-                if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
-                    log.warning("heartbeat_spool_field_unsupported")
-                    self._spool_field_unsupported = True
-                    body.pop("spool")
-                    resp = c.post(
-                        "/api/v1/dns/agents/heartbeat",
-                        json=body,
-                        headers=self._auth_headers(),
-                    )
+                # An older control plane refuses each newer optional field
+                # by name; drop the ones it names and retry once.
+                if resp.status_code == 422:
+                    dropped = False
+                    if "spool" in body and "spool" in resp.text:
+                        log.warning("heartbeat_spool_field_unsupported")
+                        self._spool_field_unsupported = True
+                        body.pop("spool")
+                        dropped = True
+                    if (
+                        "memory_limit_bytes" in body
+                        and "memory_limit_bytes" in resp.text
+                    ):
+                        log.warning("heartbeat_memory_field_unsupported")
+                        self._memory_field_unsupported = True
+                        body.pop("memory_limit_bytes")
+                        dropped = True
+                    if dropped:
+                        resp = c.post(
+                            "/api/v1/dns/agents/heartbeat",
+                            json=body,
+                            headers=self._auth_headers(),
+                        )
             if resp.status_code == 200:
                 data = resp.json()
                 del self.pending_acks[: len(acks)]

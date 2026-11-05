@@ -476,6 +476,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_SPOOL_TRIMMED, "Agent spool trimmed", "Infrastructure", []),
+    (a.RULE_TYPE_DNS_MEMORY_PRESSURE, "DNS group near its memory limit", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_DAEMON_DEGRADED, "Agent daemon degraded", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED, "Agent bundle render failed", "Infrastructure", []),
     (a.RULE_TYPE_AUDIT_CHAIN_BROKEN, "Audit chain broken", "Infrastructure", []),
