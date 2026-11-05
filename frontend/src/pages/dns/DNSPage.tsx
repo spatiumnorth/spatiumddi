@@ -5394,9 +5394,10 @@ export function ZoneDetailView({
                         editDisabledReason={
                           zone.tailscale_tenant_id
                             ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
-                            : can("write", "dns_zone")
-                              ? undefined
-                              : NEEDS_ZONE_WRITE
+                            : permissionGate(
+                                can("write", "dns_zone"),
+                                NEEDS_ZONE_WRITE,
+                              ).title
                         }
                       />
                     ))}
@@ -11743,9 +11744,11 @@ export function BlocklistDetail({
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."
-                          : !can("write", "dns_blocklist")
-                            ? NEEDS_BLOCKLIST_WRITE
-                            : "Also block *.<domain>. Saves immediately."
+                          : (permissionGate(
+                              can("write", "dns_blocklist"),
+                              NEEDS_BLOCKLIST_WRITE,
+                            ).title ??
+                            "Also block *.<domain>. Saves immediately.")
                       }
                     />
                   </td>

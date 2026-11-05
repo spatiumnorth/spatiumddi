@@ -14598,7 +14598,7 @@ export function BlockDetailView({
               directSubnets={directSubnets}
               childBlocks={directChildBlocks}
               createDisabledReason={
-                canWriteSubnets ? undefined : NEEDS_SUBNET_WRITE
+                permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE).title
               }
               onSelectFree={(range) => {
                 setFreeRangePreset(range);
