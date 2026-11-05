@@ -675,9 +675,11 @@ class FleetPoolOccupancyResponse(BaseModel):
     pools: list[FleetPoolOccupancyRow]
 
 
-#: Occupancy bands for the fleet rollup. Same numbers the subnet
-#: utilization heatmap uses, so "amber" means the same thing wherever an
-#: operator sees it on this dashboard.
+#: Occupancy bands for the fleet rollup. The pool bars on the Dashboard
+#: and the DHCP page band at these same lines (``poolOccupancyTone`` in
+#: frontend/src/lib/pool-occupancy-tone.ts), so a bar is never amber beside
+#: a "Pools >= 80%" card that reads 0. Subnet utilization follows Settings'
+#: thresholds instead (#3539); pools have no such setting.
 _POOL_WARNING_PERCENT = 80.0
 _POOL_CRITICAL_PERCENT = 95.0
 
