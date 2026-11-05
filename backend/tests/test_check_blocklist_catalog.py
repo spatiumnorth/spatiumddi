@@ -61,9 +61,7 @@ def _src(sid: str, fmt: str = "hosts") -> dict:
 def _run(chk, parser, sources, pages, baseline=None, registry=None):
     def fetch(url: str):
         if url == chk.REGISTRY_URL:
-            return chk.Fetched(
-                text=json.dumps(registry or {"filters": [{"filterKey": "x"}]})
-            )
+            return chk.Fetched(text=json.dumps(registry or {"filters": [{"filterKey": "x"}]}))
         page = pages[url.rsplit("/", 1)[1]]
         if isinstance(page, str):
             return chk.Fetched(text=page, content_type="text/plain")
@@ -136,18 +134,12 @@ def test_garbage_that_parses_in_no_format(chk, parser) -> None:
 
 
 def test_skip_share_rising_is_flagged(chk, parser) -> None:
-    rules = [f"||ok{i}.example.com^" for i in range(1000)] + [
-        f"/re{i}/" for i in range(600)
-    ]
+    rules = [f"||ok{i}.example.com^" for i in range(1000)] + [f"/re{i}/" for i in range(600)]
     page = "\n".join(rules)
-    assert ("skipped", "ab") in _kinds(
-        _run(chk, parser, [_src("ab", "adblock")], {"ab": page})
-    )
+    assert ("skipped", "ab") in _kinds(_run(chk, parser, [_src("ab", "adblock")], {"ab": page}))
     # A healthy adblock feed (no skips) is not flagged.
     ok = "\n".join(f"||ok{i}.example.com^" for i in range(1000))
-    assert ("skipped", "ab") not in _kinds(
-        _run(chk, parser, [_src("ab", "adblock")], {"ab": ok})
-    )
+    assert ("skipped", "ab") not in _kinds(_run(chk, parser, [_src("ab", "adblock")], {"ab": ok}))
 
 
 def test_upstream_diff(chk, parser) -> None:
@@ -238,9 +230,7 @@ def test_shared_homepage_does_not_hide_new_lists(chk, parser) -> None:
     assert ("upstream_new", "912 hz_b") in _kinds(rep)
 
 
-def test_covered_mapping_counts_only_when_the_source_exists(
-    chk, parser, monkeypatch
-) -> None:
+def test_covered_mapping_counts_only_when_the_source_exists(chk, parser, monkeypatch) -> None:
     monkeypatch.setattr(chk, "COVERED_UPSTREAM", {921: "mapped", 922: "not-in-catalog"})
     registry = {
         "filters": [
@@ -259,9 +249,7 @@ def test_covered_mapping_counts_only_when_the_source_exists(
             },
         ]
     }
-    rep = _run(
-        chk, parser, [_src("mapped")], {"mapped": _hosts(1000)}, registry=registry
-    )
+    rep = _run(chk, parser, [_src("mapped")], {"mapped": _hosts(1000)}, registry=registry)
     kinds = _kinds(rep)
     assert ("upstream_retired", "mapped") in kinds  # deprecation follows the mapping
     assert (
@@ -299,9 +287,7 @@ def test_registry_text_cannot_mention_or_format(chk, parser) -> None:
             },
         ]
     }
-    md = chk.render_markdown(
-        _run(chk, parser, [_src("a")], {"a": _hosts(1000)}, registry=registry)
-    )
+    md = chk.render_markdown(_run(chk, parser, [_src("a")], {"a": _hosts(1000)}, registry=registry))
     line = next(ln for ln in md.splitlines() if "someone" in ln)
     # The name sits inside one code span, so GitHub renders it literally.
     assert "`@someone '**bold**'`" in line
@@ -309,9 +295,7 @@ def test_registry_text_cannot_mention_or_format(chk, parser) -> None:
 
 def test_report_is_bounded_with_a_note(chk) -> None:
     rep = chk.Report(checked=1)
-    rep.findings = [
-        chk.Finding("upstream_new", f"{i} key{i}", "x" * 300) for i in range(2000)
-    ]
+    rep.findings = [chk.Finding("upstream_new", f"{i} key{i}", "x" * 300) for i in range(2000)]
     rep.measured = {f"s{i}": chk.Measured(1000) for i in range(500)}
     md = chk.render_markdown(rep)
     assert len(md.encode()) <= chk.MAX_REPORT_BYTES
@@ -386,9 +370,7 @@ def test_unloadable_parser_exits_2(chk, tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(chk, "http_fetch", no_network)
     assert chk.main(["--status-out", str(tmp_path / "s")]) == 2
     assert "could not run" in capsys.readouterr().err
-    assert not (
-        tmp_path / "s"
-    ).exists()  # no status: the workflow leaves the issue alone
+    assert not (tmp_path / "s").exists()  # no status: the workflow leaves the issue alone
 
 
 def test_registry_failure_is_noted_not_fatal(chk, parser) -> None:
@@ -404,9 +386,7 @@ def test_registry_failure_is_noted_not_fatal(chk, parser) -> None:
 
 def test_total_network_failure_is_a_script_error(chk, parser) -> None:
     with pytest.raises(RuntimeError):
-        chk.run_check(
-            {"sources": [_src("a")]}, parser, lambda url: chk.Fetched(error="timed out")
-        )
+        chk.run_check({"sources": [_src("a")]}, parser, lambda url: chk.Fetched(error="timed out"))
 
 
 def test_empty_catalog_is_a_script_error(chk, parser) -> None:

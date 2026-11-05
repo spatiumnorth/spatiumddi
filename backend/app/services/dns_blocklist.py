@@ -191,9 +191,7 @@ async def effective_lists_for_group(
     return _stable_list_order(list(group.blocklists))
 
 
-async def build_effective_for_view(
-    db: AsyncSession, view_id: uuid.UUID
-) -> EffectiveBlocklist:
+async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
     """Compute the effective blocklist for a DNS view.
 
     Combines:
@@ -214,9 +212,7 @@ async def build_effective_for_view(
     )
 
 
-async def build_effective_for_group(
-    db: AsyncSession, group_id: uuid.UUID
-) -> EffectiveBlocklist:
+async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> EffectiveBlocklist:
     """Compute the effective blocklist for a DNS server group (all views)."""
     lists = await effective_lists_for_group(db, group_id)
     if lists is None:
@@ -254,9 +250,7 @@ async def has_entries(db: AsyncSession, lists: list[DNSBlockList]) -> bool:
     ids = [bl.id for bl in _enabled(lists)]
     if not ids:
         return False
-    return bool(
-        await db.scalar(select(exists().where(DNSBlockListEntry.list_id.in_(ids))))
-    )
+    return bool(await db.scalar(select(exists().where(DNSBlockListEntry.list_id.in_(ids)))))
 
 
 def _ancestors(name: str) -> list[str]:
@@ -332,11 +326,7 @@ async def _pooled_feed_exceptions(
             exact.add(d.lower())
             if is_wild:
                 wild.add(d.lower())
-        safe = {
-            n
-            for n in names
-            if n not in exact and not any(a in wild for a in _ancestors(n))
-        }
+        safe = {n for n in names if n not in exact and not any(a in wild for a in _ancestors(n))}
         if not safe:
             continue
         # A name UNDER a carve-out, blocked by another list. One pass over
