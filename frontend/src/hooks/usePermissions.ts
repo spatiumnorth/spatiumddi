@@ -64,6 +64,12 @@ export function usePermissions(): {
   hasAnyGrantFor: (action: string, resourceType: string) => boolean;
   isSuperadmin: boolean;
   isLoading: boolean;
+  /** The permissions read failed and there are no grants to answer from:
+   *  ``can`` answers false for everyone then, the superadmin included,
+   *  which is not the same as a role lacking the grant (#3541). A failed
+   *  background refetch over grants already read is not this: ``can``
+   *  still answers from those. */
+  isError: boolean;
 } {
   const query = useQuery({
     queryKey: ["my-permissions"],
@@ -99,7 +105,13 @@ export function usePermissions(): {
     );
   }
 
-  return { can, hasAnyGrantFor, isSuperadmin, isLoading: query.isLoading };
+  return {
+    can,
+    hasAnyGrantFor,
+    isSuperadmin,
+    isLoading: query.isLoading,
+    isError: query.isError && !query.data,
+  };
 }
 
 /** Props for a write control whose permission check failed (#1155): it
