@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { MissingCustomerOption } from "@/components/ownership/pickers";
-import { missingCustomerLabel } from "@/components/ownership/missingCustomer";
+import {
+  missingCustomerLabel,
+  useReadsEveryCustomer,
+} from "@/components/ownership/missingCustomer";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -1007,6 +1010,7 @@ export function MulticastGroupsPage() {
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
   });
+  const readsEveryCustomer = useReadsEveryCustomer();
 
   const query = useQuery({
     queryKey: ["multicast-groups", search, spaceFilter, customerFilter],
@@ -1131,7 +1135,12 @@ export function MulticastGroupsPage() {
             customers={customersQ.data?.items ?? []}
             spaceNames={spaceNames}
             customerNames={customerNames}
-            missingCustomer={(id) => missingCustomerLabel(id, customersQ)}
+            missingCustomer={(id) =>
+              missingCustomerLabel(id, customersQ, readsEveryCustomer) ===
+              "(customer in Trash)"
+                ? "(customer in Trash)"
+                : null
+            }
             selectedIds={selectedIds}
             allChecked={allChecked}
             toggleAll={toggleAll}
