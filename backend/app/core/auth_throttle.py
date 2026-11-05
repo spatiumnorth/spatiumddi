@@ -387,7 +387,8 @@ async def e911_lookup_log_rate_limited(actor: str, budget: int) -> bool:
     ``POST /held`` is a read-scoped route that still writes one
     ``e911_resolution_log`` row per call, so without a bound a read token
     grows that table as fast as it can call. Past the budget the lookup is
-    still ANSWERED; only the trail row is skipped.
+    still ANSWERED; it is counted in a per-caller per-minute counter row
+    instead of getting a row of its own.
 
     **Fails OPEN**, the opposite of the self-query throttle: this guards
     the log, not the answer, and an outage must not cost the audit trail.

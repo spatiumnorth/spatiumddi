@@ -659,6 +659,9 @@ backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:64
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:65
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:66
 backend/alembic/versions/e2a6f3b8c1d4_add_auto_from_lease_to_ipaddress.py:drop_column:33
+backend/alembic/versions/e2a9c5d71f30_e911_trail_counter_rows.py:drop_column:53
+backend/alembic/versions/e2a9c5d71f30_e911_trail_counter_rows.py:drop_column:54
+backend/alembic/versions/e2a9c5d71f30_e911_trail_counter_rows.py:drop_column:55
 backend/alembic/versions/e2b6f81d4a37_dhcp_server_last_sync_error.py:drop_column:27
 backend/alembic/versions/e2b6f81d4a37_dhcp_server_last_sync_error.py:drop_column:28
 backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102

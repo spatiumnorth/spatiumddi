@@ -590,7 +590,7 @@ const RETENTION_ROWS: {
     key: "e911_lookup_log_budget_per_minute",
     label: "E911 HELD lookups logged per caller",
     description:
-      "Per API token or user, per minute. 1–6000. Past it, a HELD lookup is still answered but not added to the trail (a warning is logged), so a read-only token cannot grow the table without bound.",
+      "Per API token or user, per minute. 1–6000. Past it, a HELD lookup is still answered, and is counted in one trail row per caller per minute (N lookups not individually logged) instead of getting a row of its own, so a read-only token cannot grow the table without bound.",
     unit: "lookups / min",
     min: 1,
     max: 6000,

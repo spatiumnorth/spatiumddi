@@ -98,3 +98,20 @@ async def test_budget_setting_round_trips_and_is_bounded(
     db_session.expire_all()
     row = await db_session.get(PlatformSettings, 1)
     assert row is not None and row.e911_lookup_log_budget_per_minute == 30
+
+
+async def test_sweep_covers_counter_rows(db_session: AsyncSession) -> None:
+    """#3514: a counter row ages out like any other trail row."""
+    old = _row(DEFAULT_RETENTION_DAYS + 5)
+    old.caller_key = "token-a"
+    old.window_start = old.queried_at.replace(second=0, microsecond=0)
+    old.suppressed_count = 40
+    fresh = _row(1)
+    fresh.caller_key = "token-a"
+    fresh.window_start = fresh.queried_at.replace(second=0, microsecond=0)
+    fresh.suppressed_count = 3
+    db_session.add_all([old, fresh])
+    await db_session.commit()
+    assert await _sweep() == 1
+    rest = (await db_session.execute(select(E911ResolutionLog))).scalars().all()
+    assert [r.suppressed_count for r in rest] == [3]

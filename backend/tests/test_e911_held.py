@@ -652,34 +652,109 @@ def test_an_unknown_client_address_is_a_400_not_a_429(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_held_over_the_log_budget_answers_without_a_trail_row(client, db_session) -> None:
-    """#3514: past the per-caller budget the lookup is answered, not logged."""
+async def test_held_over_the_log_budget_counts_lookups_in_one_row_per_window(
+    client, db_session
+) -> None:
+    """#3514: past the per-caller budget the lookup is answered and COUNTED.
+    Every over-budget lookup in a minute lands in one counter row, which
+    names the last identity looked up and the answer it got."""
     from unittest.mock import patch
 
-    from sqlalchemy import func, select
+    from sqlalchemy import select
 
     from app.models.e911 import E911ResolutionLog
     from tests.test_network_api import _make_admin
 
     _user, token = await _make_admin(db_session)
     ip, _room = await _estate_with_location(db_session)
-
-    async def count() -> int:
-        return (
-            await db_session.execute(select(func.count()).select_from(E911ResolutionLog))
-        ).scalar_one()
-
-    before = await count()
-    body = _req(f"<locationType>civic</locationType><device><ip>{ip}</ip></device>")
     hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
-    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=True):
-        res = await client.post("/held", content=body, headers=hdr)
-    assert res.status_code == 200, res.text
-    assert await count() == before
+
+    async def rows() -> list[E911ResolutionLog]:
+        db_session.expire_all()
+        res = await db_session.execute(
+            select(E911ResolutionLog).order_by(E911ResolutionLog.queried_at)
+        )
+        return list(res.scalars().all())
+
+    def held(addr: str) -> bytes:
+        return _req(f"<locationType>civic</locationType><device><ip>{addr}</ip></device>")
+
     with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=False):
-        res = await client.post("/held", content=body, headers=hdr)
-    assert res.status_code == 200
-    assert await count() == before + 1
+        res = await client.post("/held", content=held(ip), headers=hdr)
+    assert res.status_code == 200, res.text
+    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=True):
+        for _ in range(3):
+            res = await client.post("/held", content=held(ip), headers=hdr)
+            assert res.status_code == 200, res.text
+        # The last one asks about an address with no location: still counted.
+        res = await client.post("/held", content=held("192.0.2.9"), headers=hdr)
+        assert res.status_code == 404, res.text
+
+    got = await rows()
+    individual = [r for r in got if r.suppressed_count is None]
+    counters = [r for r in got if r.suppressed_count is not None]
+    assert len(individual) == 1 and individual[0].identity_value == ip
+    # Same caller, same minute: one row, four lookups. (A minute boundary
+    # between the calls would split it in two; the total still holds.)
+    assert sum(r.suppressed_count for r in counters) == 4
+    assert len(counters) in (1, 2)
+    last = counters[-1]
+    assert last.identity_value == "192.0.2.9"
+    assert last.erl_id is None and last.confidence != ""
+    assert last.actor_kind == "user" and last.actor_id is not None
+    assert last.caller_key == str(last.actor_id)
+    assert last.window_start is not None and last.window_start.second == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_over_budget_lookups_share_one_counter_row(db_session) -> None:
+    """#3514: the counter is one atomic upsert, so concurrent lookups from
+    one caller neither create two rows nor lose an increment."""
+    import asyncio
+    import uuid as _uuid
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    from sqlalchemy import func, select
+
+    from app.api.v1.e911.router import count_suppressed_resolution
+    from app.db import AsyncSessionLocal
+    from app.models.e911 import E911ResolutionLog
+    from app.services.e911.resolver import resolve_location
+
+    ip, _room = await _estate_with_location(db_session)
+    resolution = await resolve_location(db_session, ip=ip)
+    actor = _uuid.uuid4()
+    fixed = datetime(2026, 11, 5, 12, 30, 15, tzinfo=UTC)
+
+    async def one() -> None:
+        async with AsyncSessionLocal() as db:
+            await count_suppressed_resolution(
+                db,
+                resolution,
+                caller_key=str(actor),
+                user_id=None,
+                api_token_id=actor,
+                source_ip="10.0.0.1",
+                actor_kind="api_token",
+            )
+            await db.commit()
+
+    class _FixedDT(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def, override]
+            return fixed
+
+    with patch("app.api.v1.e911.router.datetime", _FixedDT):
+        await asyncio.gather(*(one() for _ in range(8)))
+
+    res = await db_session.execute(
+        select(func.count(), func.sum(E911ResolutionLog.suppressed_count)).where(
+            E911ResolutionLog.caller_key == str(actor)
+        )
+    )
+    n, total = res.one()
+    assert (n, total) == (1, 8)
 
 
 @pytest.mark.asyncio
