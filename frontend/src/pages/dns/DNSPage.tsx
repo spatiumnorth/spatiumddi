@@ -84,6 +84,7 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
+  PERMISSIONS_UNREADABLE,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -2980,7 +2981,8 @@ function ZoneModalForm({
   // install with the module off, is not asked (#2926): the select says the
   // list is not available. ``ready`` waits for the real module state, since
   // ``enabled`` answers true while it loads.
-  const canReadDomainPerm = usePermissions().can("read", "manage_domains");
+  const domainPerms = usePermissions();
+  const canReadDomainPerm = domainPerms.can("read", "manage_domains");
   const { enabled: domainModuleEnabled, ready: domainModulesReady } =
     useFeatureModules();
   const domainsModuleOn =
@@ -3402,11 +3404,13 @@ function ZoneModalForm({
             Pin to a tracked domain registration so the Domain detail page
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
-            {!canReadDomainPerm
-              ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
-              : domainModulesReady && !domainsModuleOn
-                ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
-                : ""}
+            {!canReadDomainPerm && domainPerms.isError
+              ? " Your permissions could not be read, so the domain list was not requested and the link cannot be changed here. Reload to try again."
+              : !canReadDomainPerm
+                ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
+                : domainModulesReady && !domainsModuleOn
+                  ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
+                  : ""}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -4379,7 +4383,8 @@ export function ZoneDetailView({
   const tlsCertsOn = moduleEnabled("security.tls_certs");
   // The route takes read on 'tls_cert': a user without it is not asked, and
   // the tab says so instead of "Certificates (0)" (#2704).
-  const canReadCerts = usePermissions().can("read", "tls_cert");
+  const certPerms = usePermissions();
+  const canReadCerts = certPerms.can("read", "tls_cert");
   const {
     data: tlsCerts,
     isLoading: tlsCertsLoading,
@@ -5117,8 +5122,9 @@ export function ZoneDetailView({
                     />
                   ) : (
                     <span className="text-muted-foreground">
-                      You don't have permission to see this zone's TLS
-                      certificates.
+                      {certPerms.isError
+                        ? PERMISSIONS_UNREADABLE
+                        : "You don't have permission to see this zone's TLS certificates."}
                     </span>
                   )}
                 </p>

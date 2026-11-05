@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
-import { usePermissions } from "@/hooks/usePermissions";
+import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
 import { asnsApi } from "@/lib/api";
 
 interface AsnPickerProps {
@@ -19,7 +19,8 @@ export function AsnPicker({
 }: AsnPickerProps) {
   // The list route needs read on "manage_asns"; without it the list is never
   // asked (#3451) and the picker says why instead of offering only "None".
-  const canRead = usePermissions().can("read", "manage_asns");
+  const perms = usePermissions();
+  const canRead = perms.can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
@@ -29,6 +30,21 @@ export function AsnPicker({
   const asns = data?.items ?? [];
 
   if (!canRead) {
+    // A failed permissions read is not a role without the grant (#3546):
+    // say so, still disabled so the unchanged id is sent back.
+    if (perms.isError) {
+      return (
+        <select
+          className={className}
+          value={value ? "linked" : ""}
+          disabled
+          title={PERMISSIONS_UNREADABLE}
+        >
+          <option value="">— permissions could not be read —</option>
+          {value && <option value="linked">Linked (could not be read)</option>}
+        </select>
+      );
+    }
     // Disabled, so the form still sends the unchanged id (never a clear).
     return (
       <select

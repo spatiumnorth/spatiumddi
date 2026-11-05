@@ -114,6 +114,12 @@ export function usePermissions(): {
   };
 }
 
+/** What to say where a gate read ``can`` while the permissions read had
+ *  failed (``isError``): it is false for everyone then, so role wording
+ *  would be wrong (#3546). */
+export const PERMISSIONS_UNREADABLE =
+  "Your permissions could not be read. Reload to try again.";
+
 /** Props for a write control whose permission check failed (#1155): it
  *  stays where it is, disabled, with the reason as its tooltip, instead of
  *  opening a form that ends in "Permission denied". Spread it after the

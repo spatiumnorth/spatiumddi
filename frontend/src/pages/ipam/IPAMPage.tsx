@@ -99,6 +99,7 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
+  PERMISSIONS_UNREADABLE,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -10273,7 +10274,8 @@ function NatRowsTable({
 
 function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
   // Looking Glass routes take read on 'bgp_lg_peer' (#2704).
-  const canRead = usePermissions().can("read", "bgp_lg_peer");
+  const perms = usePermissions();
+  const canRead = perms.can("read", "bgp_lg_peer");
   const { data, isLoading, error } = useQuery({
     queryKey: ["bgp-lg-routes-by-subnet", subnetId],
     queryFn: () =>
@@ -10291,6 +10293,8 @@ function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
       <p className="px-6 py-4 text-sm text-muted-foreground">
         {error ? (
           <ListReadError error={error} what="BGP routes" />
+        ) : perms.isError ? (
+          PERMISSIONS_UNREADABLE
         ) : (
           "You don't have permission to see BGP routes."
         )}
@@ -12278,7 +12282,8 @@ export function SpaceVrfBadges({
   // The VRF routes take read on 'vrf'. Without it the list is not asked,
   // and a space linked to a VRF says so rather than "not configured"
   // (#2704).
-  const canReadVrf = usePermissions().can("read", "vrf");
+  const vrfPerms = usePermissions();
+  const canReadVrf = vrfPerms.can("read", "vrf");
   const { data: vrfs } = useQuery({
     queryKey: ["vrfs-picker"],
     queryFn: () => vrfsApi.list(),
@@ -12328,7 +12333,11 @@ export function SpaceVrfBadges({
       {vrfHidden && !vrfName && (
         <span
           className="rounded border px-1.5 py-0.5"
-          title="This space is linked to a VRF you may not read (vrf)"
+          title={
+            vrfPerms.isError
+              ? PERMISSIONS_UNREADABLE
+              : "This space is linked to a VRF you may not read (vrf)"
+          }
         >
           VRF: linked, not shown
         </span>
@@ -12363,7 +12372,8 @@ export function SpaceVrfBadges({
 }
 
 function SpaceAsnBadge({ asnId }: { asnId: string }) {
-  const canRead = usePermissions().can("read", "manage_asns");
+  const perms = usePermissions();
+  const canRead = perms.can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
@@ -12374,7 +12384,11 @@ function SpaceAsnBadge({ asnId }: { asnId: string }) {
     return (
       <span
         className="rounded border px-1.5 py-0.5"
-        title="This space names an ASN you may not read (manage_asns)"
+        title={
+          perms.isError
+            ? PERMISSIONS_UNREADABLE
+            : "This space names an ASN you may not read (manage_asns)"
+        }
       >
         ASN: linked, not shown
       </span>
