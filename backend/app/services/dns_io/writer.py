@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,9 +13,12 @@ from app.services.dns.zone_apex import (
     PLACEHOLDER_NS_ADDRESS,
     PLACEHOLDER_NS_LABEL,
     ServedApex,
+    ZoneApexView,
     compute_served_apex,
     served_apex_for_zones,
 )
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _fqdn(name: str) -> str:
@@ -56,26 +60,71 @@ def _format_record(zone_name: str, r: DNSRecord) -> str:
     return f"{label}\t{ttl_part}IN\t{rtype}\t{rdata}"
 
 
+def _comment_safe(text: str) -> str:
+    """``text`` on one comment line: a control character would end the comment
+    and start a record line."""
+    return _CONTROL_RE.sub("?", text)
+
+
+def _apex_notes(apex: ServedApex) -> list[str]:
+    if apex.source == "declared":
+        return []
+    # The served NS set is not a stored record. Written as one it would
+    # re-import as a created record (and break "an export re-imports as no
+    # change", #2187), so it is only noted for whoever restores the file.
+    notes = [f"; apex NS served from zone settings: {' '.join(apex.ns)}"]
+    if apex.placeholder_glue:
+        notes.append(
+            f"; {PLACEHOLDER_NS_LABEL} is served glued to {PLACEHOLDER_NS_ADDRESS}"
+            " by the BIND9 agent; declare your own NS before relying on it"
+        )
+    return notes
+
+
 def write_zone_file(
-    zone: DNSZone, records: Iterable[DNSRecord], apex: ServedApex | None = None
+    zone: DNSZone, records: Iterable[DNSRecord], served: ZoneApexView | None = None
 ) -> str:
     """Return the zone as a BIND-style RFC 1035 zone file.
 
     The SOA is the one the zone is served with (#3533), not a second guess at
-    it: ``apex`` is :func:`served_apex_for_zones`'s answer (what the agent
-    renders), or, when the caller has none, the same rule applied to the
-    records being written. The served apex NS set, when the zone declares none
-    of its own, is noted in a comment rather than written as records.
+    it: ``served`` is :func:`served_apex_for_zones`'s answer (what the agent
+    renders). A caller with none (a zone that is not primary, or no database)
+    gets the same rule applied to the records being written, and no notes.
+
+    The served apex NS set, when the zone declares none of its own, is noted in
+    a comment rather than written as records, and so is each split-horizon
+    view's apex when the views disagree (the SOA line is then the worst of
+    them, as the records list shows it). A group whose driver does not follow
+    the BIND9 rule gets a note saying the SOA is that rule's, not a claim.
     """
     records = list(records)
     origin = _fqdn(zone.name)
-    if apex is None:
+    notes: list[str] = []
+    if served is None:
         apex = compute_served_apex(
             zone.name,
             zone.primary_ns,
             zone.admin_email,
             ((r.name, r.record_type, r.value) for r in records),
         )
+    else:
+        apex = served.apex
+        if not served.driver_applies:
+            notes.append(
+                "; SOA by the BIND9 agent's rule; this group's driver serves"
+                " its own apex, so check it against the server"
+            )
+        elif served.by_view:
+            for view_name, a in served.by_view:
+                ns = " ".join(a.ns)
+                notes.append(
+                    _comment_safe(
+                        f"; view {view_name}: SOA {a.soa_mname} {a.soa_rname}, apex NS {ns}"
+                    )
+                )
+            notes.extend(_apex_notes(apex))
+        else:
+            notes.extend(_apex_notes(apex))
     serial = zone.last_serial or 1
 
     lines: list[str] = []
@@ -85,16 +134,7 @@ def write_zone_file(
         f"@\tIN\tSOA\t{apex.soa_mname} {apex.soa_rname} ("
         f" {serial} {zone.refresh} {zone.retry} {zone.expire} {zone.minimum} )"
     )
-    if apex.source != "declared":
-        # The served NS set is not a stored record. Written as one it would
-        # re-import as a created record (and break "an export re-imports as no
-        # change", #2187), so it is only noted for whoever restores the file.
-        lines.append(f"; apex NS served from zone settings: {' '.join(apex.ns)}")
-        if apex.placeholder_glue:
-            lines.append(
-                f"; {PLACEHOLDER_NS_LABEL} is served glued to {PLACEHOLDER_NS_ADDRESS}"
-                " by the BIND9 agent; declare your own NS before relying on it"
-            )
+    lines.extend(notes)
 
     # Group by name for readability.
     sorted_records = sorted(
@@ -115,4 +155,4 @@ async def write_zone_file_served(
 ) -> str:
     """:func:`write_zone_file` with the apex the zone's group actually serves."""
     view = (await served_apex_for_zones(db, [zone])).get(zone.id)
-    return write_zone_file(zone, records, view.apex if view is not None else None)
+    return write_zone_file(zone, records, view)

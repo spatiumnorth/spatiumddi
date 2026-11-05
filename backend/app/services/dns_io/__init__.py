@@ -6,7 +6,7 @@ code does not leak into the API layer (see CLAUDE.md non-negotiable #10).
 Public API:
     parse_zone_file(text, zone_name) -> list[ParsedRecord]
     diff_records(parsed, existing) -> ZoneDiff
-    write_zone_file(zone, records) -> str
+    write_zone_file(zone, records, served=None) -> str
 """
 
 from app.services.dns_io.diff import (
