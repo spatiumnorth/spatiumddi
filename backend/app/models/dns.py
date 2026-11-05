@@ -366,6 +366,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #3551 — the agent container's own memory limit in bytes (its cgroup
+    # ``memory.max``), as last reported on the heartbeat. named and the agent
+    # share it, so it is what a group's RPZ and zone data must fit inside.
+    # NULL means UNKNOWN: an agent too old to report, an agentless driver, or
+    # a container with no limit at all. Only overwritten when a heartbeat
+    # carries the field. Read by ``services/dns/memory_estimate``.
+    memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # ── #1067 daemon state ──
     #
