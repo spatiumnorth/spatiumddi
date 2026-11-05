@@ -8541,6 +8541,14 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
             return PcapPollResponse(**cmd)
         if _asyncio.get_running_loop().time() >= deadline:
             return PcapPollResponse()
+        # #3606: end this pass's read transaction before the sleep, so the
+        # empty claim query does not hold its ACCESS SHARE lock on
+        # packet_capture through it (a restore or an ALTER would wait out the
+        # whole poll). Nothing is pending: cert auth only reads, and
+        # claim_next commits or rolls back whatever it writes. The loop
+        # re-reads the queue every pass and the appliance row is not used
+        # again after the auth.
+        await db.commit()
         if await sleep_or_shutdown(2.0):
             # #3015 — this api process is stopping: the next pass makes one
             # last claim check and answers the empty shape, so the supervisor
