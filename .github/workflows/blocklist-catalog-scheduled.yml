@@ -45,6 +45,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
+      # A scheduled run's event payload carries no repository object.
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -54,11 +56,15 @@ jobs:
 
       - name: Fetch the previous run's baseline
         # Best effort: no earlier run, or an expired artifact, means the first
-        # run compares against the floor only.
+        # run compares against the floor only. Only runs on the default branch
+        # count, so a dispatch from a feature branch never becomes the baseline.
+        # A run with findings still exits 0, so "success" includes it; a run
+        # that could not evaluate (exit 2) uploads nothing and is skipped.
         run: |
           mkdir -p "$RUNNER_TEMP/prev"
           prev="$(gh run list --repo "$REPO" --workflow blocklist-catalog-scheduled.yml \
-            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+            --branch "$DEFAULT_BRANCH" --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty' || true)"
           if [ -n "$prev" ]; then
             gh run download "$prev" --repo "$REPO" --name blocklist-baseline \
               --dir "$RUNNER_TEMP/prev" || echo "no baseline artifact on run ${prev}"
@@ -66,6 +72,8 @@ jobs:
 
       - name: Check the catalog
         id: check
+        # stdout is the issue body, bounded to fit; the unbounded report goes
+        # to stderr, i.e. this step's log.
         run: |
           python3 scripts/check_blocklist_catalog.py \
             --baseline "$RUNNER_TEMP/prev/baseline.json" \
@@ -73,7 +81,6 @@ jobs:
             --status-out "$RUNNER_TEMP/status" \
             > "$RUNNER_TEMP/blocklist-catalog.md"
           echo "status=$(cat "$RUNNER_TEMP/status")" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/blocklist-catalog.md"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -82,6 +89,8 @@ jobs:
           retention-days: 90
 
       - name: Open, refresh or close the tracking issue
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
         run: |
           TITLE="Blocklist catalog"
           MARKER="<!-- blocklist-catalog -->"
@@ -93,14 +102,15 @@ jobs:
             --json number,title,body \
             --jq "[.[] | select(.title == \"${TITLE}\" and (.body | startswith(\"${MARKER}\")))] | .[0].number // empty")"
 
-          if [ "${{ steps.check.outputs.status }}" = "findings" ]; then
+          if [ "$STATUS" = "findings" ]; then
             {
               cat "$RUNNER_TEMP/blocklist-catalog.md"
               echo
               echo "_Last checked: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}_"
             } > "$RUNNER_TEMP/body.md"
-            # GitHub caps an issue body at 65536 characters.
-            head -c 60000 "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/body-capped.md"
+            # GitHub caps an issue body at 65536 characters. The script already
+            # bounds its report (with a note on what it cut); this is a backstop.
+            head -c 65000 "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/body-capped.md"
             if [ -n "$existing" ]; then
               gh issue edit "$existing" --repo "$REPO" --body-file "$RUNNER_TEMP/body-capped.md"
             else
