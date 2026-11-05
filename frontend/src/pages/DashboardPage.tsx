@@ -1605,7 +1605,11 @@ export function DashboardPage() {
   // The route takes read on `audit_log`: a user without it is not asked at
   // all (each refusal writes a `denied` audit row), and the card says so
   // rather than "No recent activity" (#2702). A refusal also ends the poll.
-  const { can: canRead, isLoading: permsLoading } = usePermissions();
+  const {
+    can: canRead,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadAudit = canRead("read", "audit_log");
   const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
@@ -2584,6 +2588,10 @@ export function DashboardPage() {
                           error={recentError}
                           what="the audit log"
                         />
+                      ) : permsFailed ? (
+                        // A failed permissions read is not a missing grant
+                        // (#3541): ``can`` is false for everyone then.
+                        "Your permissions could not be read, so the audit log was not requested. Reload to try again."
                       ) : (
                         "You don't have permission to see the audit log."
                       )}
@@ -4440,7 +4448,11 @@ function CertsExpiringKpi() {
 
   // The route takes read on `tls_cert`; a user without it is not asked, and
   // the card says it is withheld rather than "0 of 0 monitored" (#2702).
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadCerts = can("read", "tls_cert");
   const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
@@ -4478,7 +4490,9 @@ function CertsExpiringKpi() {
         {withheld
           ? error && !isRefused(error)
             ? "couldn't load certificates"
-            : "you may not read certificates"
+            : !error && permsFailed
+              ? "couldn't read your permissions"
+              : "you may not read certificates"
           : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
@@ -4893,6 +4907,11 @@ function NetworkPanel() {
   const w = data.withheld ?? {};
   const NV = "not visible to your role";
 
+  // Nothing pulled: a zero here is not an all-clear (#3540). A withheld
+  // grant zeroes the total too, so it is excluded: that tile says "not
+  // visible to your role", never "nothing pulled". A missing total (an
+  // older API) is unknown, not zero, and keeps the plain count.
+  const rpkiUntracked = !w.asn && data.rpki_total_count === 0;
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
@@ -4915,7 +4934,7 @@ function NetworkPanel() {
         ) : (
           <RpkiExpiringKpi data={data} />
         )}
-        {!w.asn && rpkiExpiryUnmeasured(data) ? (
+        {!w.asn && !rpkiUntracked && rpkiExpiryUnmeasured(data) ? (
           <NetworkKpi
             label="RPKI expired"
             value="n/a"
@@ -4927,11 +4946,20 @@ function NetworkPanel() {
         ) : (
           <NetworkKpi
             label="RPKI expired"
-            value={w.asn ? "—" : data.rpki_expired_count}
+            value={w.asn || rpkiUntracked ? "—" : data.rpki_expired_count}
             tone={
-              w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
+              w.asn || rpkiUntracked
+                ? "default"
+                : data.rpki_expired_count > 0
+                  ? "bad"
+                  : "good"
             }
-            hint={w.asn ? NV : undefined}
+            hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
+            title={
+              rpkiUntracked
+                ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+                : undefined
+            }
             to="/network/asns"
           />
         )}
@@ -5019,9 +5047,11 @@ function NetworkPanel() {
           withheld={w.asn}
           withheldHint="Not visible to your role."
           emptyHint={
-            rpkiExpiryUnmeasured(data)
-              ? "Not measured: the ROA source ships no per-ROA lifetime."
-              : "No ROAs are expiring in the next 30 days."
+            rpkiUntracked
+              ? "No RPKI ROAs are tracked yet."
+              : rpkiExpiryUnmeasured(data)
+                ? "Not measured: the ROA source ships no per-ROA lifetime."
+                : "No ROAs are expiring in the next 30 days."
           }
         >
           {data.rpki_expiring.map((row) => (
@@ -5582,7 +5612,11 @@ export function DNSThreatCard() {
   // The route needs read on servers (#3450): a user without it was refused
   // every 60 s, each a 403 and a denied audit row. ``can`` is false while
   // the grants load, so the query waits for them as well.
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const mayRead = can("read", "server");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
@@ -5604,8 +5638,9 @@ export function DNSThreatCard() {
       <div className="rounded-lg border bg-card p-4">
         <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Not shown: the DNS tunneling rollup needs read on servers (the server
-          logs permission), which your role does not have.
+          {permsFailed
+            ? "Not shown: your permissions could not be read, so the DNS tunneling rollup was not requested. Reload to try again."
+            : "Not shown: the DNS tunneling rollup needs read on servers (the server logs permission), which your role does not have."}
         </p>
       </div>
     );
