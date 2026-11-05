@@ -63,6 +63,7 @@ from app.services.dns.blocklist_templates import (
     template_entries,
     template_for,
 )
+from app.services.dns.memory_estimate import warnings_by_group as memory_warnings_by_group
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -275,7 +276,15 @@ class FeedParseSkipped(BaseModel):
     regex: int = 0
     modifier: int = 0
     badfilter: int = 0
+    # Total of the reason buckets below; kept so older readers still add up (#3519).
     malformed: int = 0
+    star_in_name: int = 0
+    no_anchor: int = 0
+    trailing_dot: int = 0
+    start_anchor: int = 0
+    bare_star: int = 0
+    dotless: int = 0
+    other: int = 0
 
 
 class BlockListResponse(BaseModel):
@@ -306,6 +315,10 @@ class BlockListResponse(BaseModel):
     modified_at: datetime
     applied_group_ids: list[uuid.UUID] = []
     applied_view_ids: list[uuid.UUID] = []
+    # #3551 — set when a BIND9 group this list is applied to (directly or
+    # through a view) is estimated at 80 % or more of its agents' memory
+    # limit. Each view that applies a list loads its own copy of it.
+    memory_warning: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -484,6 +497,24 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         applied_group_ids=[g.id for g in bl.server_groups],
         applied_view_ids=[v.id for v in bl.views],
     )
+
+
+async def _with_memory_warnings(db: DB, lists: list[DNSBlockList]) -> list[BlockListResponse]:
+    """Responses for ``lists``, each carrying its groups' memory warning
+    (#3551). One estimate per affected group, however many lists share it."""
+    out = [_to_response(bl) for bl in lists]
+    warns = await memory_warnings_by_group(
+        db, [gid for bl in lists for gid in sorted(_blocklist_group_ids(bl))]
+    )
+    for resp, bl in zip(out, lists, strict=True):
+        hit = next((warns[g] for g in sorted(_blocklist_group_ids(bl)) if g in warns), None)
+        if hit is not None:
+            resp.memory_warning = hit.message
+    return out
+
+
+async def _respond(db: DB, bl: DNSBlockList) -> BlockListResponse:
+    return (await _with_memory_warnings(db, [bl]))[0]
 
 
 def _blocklist_group_ids(bl: DNSBlockList) -> set[uuid.UUID]:
@@ -726,7 +757,7 @@ async def subscribe_from_catalog(
         list_id=str(bl.id),
         source_id=body.source_id,
     )
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 # ── Built-in templates + profiles (issue #878) ──────────────────────────────
@@ -917,7 +948,7 @@ async def create_from_template(
         template_id=template.id,
         entries=reloaded.entry_count,
     )
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 class ApplyProfileRequest(BaseModel):
@@ -1111,7 +1142,7 @@ async def list_blocklists(db: DB, _: CurrentUser) -> list[BlockListResponse]:
         )
         .order_by(DNSBlockList.name)
     )
-    return [_to_response(bl) for bl in result.scalars().all()]
+    return await _with_memory_warnings(db, list(result.scalars().all()))
 
 
 @router.post(
@@ -1144,13 +1175,13 @@ async def create_blocklist(
     reloaded = await _require_list(bl.id, db)
     _wake_blocklist_groups(reloaded)
     logger.info("dns_blocklist_created", list_id=str(bl.id), name=bl.name)
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 @router.get("/blocklists/{list_id}", response_model=BlockListResponse)
 async def get_blocklist(list_id: uuid.UUID, db: DB, _: CurrentUser) -> BlockListResponse:
     bl = await _require_list(list_id, db)
-    return _to_response(bl)
+    return await _respond(db, bl)
 
 
 @router.put("/blocklists/{list_id}", response_model=BlockListResponse)
@@ -1238,7 +1269,7 @@ async def update_blocklist(
     await db.commit()
     reloaded = await _require_list(list_id, db)
     _wake_blocklist_groups(reloaded)
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 @router.delete("/blocklists/{list_id}", status_code=204)
@@ -1318,7 +1349,7 @@ async def update_assignments(
     # Wake BOTH the old and new group sets so de-assigned groups re-render too.
     for gid in old_group_ids | _blocklist_group_ids(reloaded):
         collect_wake(dns_group_channel(gid))
-    return _to_response(reloaded)
+    return await _respond(db, reloaded)
 
 
 # ── Entries ────────────────────────────────────────────────────────────────

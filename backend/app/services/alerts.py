@@ -246,6 +246,13 @@ RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 # warning.
 RULE_TYPE_AGENT_SPOOL_TRIMMED = "agent_spool_trimmed"
 
+# Issue #3551 — a BIND9 group's estimated named memory has reached 80 % of the
+# memory limit its agents report. Under split-horizon each view that applies a
+# blocklist loads its own copy of it (BIND cannot share an RPZ zone between
+# views), so adding a view can OOM-loop every agent in the group. Subject =
+# the dns_server_group. Warning from 80 %, critical from 100 %.
+RULE_TYPE_DNS_MEMORY_PRESSURE = "dns_memory_pressure"
+
 # Issue #1067 — an agent that is heartbeating reports that its DAEMON is not
 # serving, and has been saying so for longer than a bundle normally takes to
 # arrive. Subject = the dns_server / dhcp_server row.
@@ -776,6 +783,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_AGENT_SPOOL_TRIMMED,
+        RULE_TYPE_DNS_MEMORY_PRESSURE,
         RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
         RULE_TYPE_DNS_RECORD_OP_FAILED,
@@ -1034,6 +1042,35 @@ def _pct_resolve_floor(threshold: float) -> float:
     return threshold - _PCT_RESOLVE_MARGIN
 
 
+# #3542 — a matcher that keeps an open subject only because of the margin
+# appends ``_HELD_MARK`` + a note to its message. ``evaluate_all`` splits it
+# off before the peak/current composition (the note is state, not a reading)
+# and appends it to the stored message, so the event says it is held and the
+# figure it resolves under. A pass that no longer holds the subject drops it.
+_HELD_MARK = "\ue002"
+_HELD_NOTE_RE = re.compile(
+    r"held open: under the rule's threshold but not yet below [0-9.e+-]+%; resolves below that"
+)
+
+
+def _held_note(floor: float) -> str:
+    return (
+        f"{_HELD_MARK}held open: under the rule's threshold but not yet below "
+        f"{floor:g}%; resolves below that"
+    )
+
+
+def _split_held(marked: str) -> tuple[str, str]:
+    """``(message, held note)`` of a matcher's message; the note is ``""``
+    when the subject is not held. Only a trailing, exact ``_held_note`` is
+    split off, so a marker character inside operator- or device-supplied
+    text (a subnet name, a lease hostname) never truncates the message."""
+    head, sep, tail = marked.rpartition(_HELD_MARK)
+    if sep and _HELD_NOTE_RE.fullmatch(tail):
+        return head, tail
+    return marked, ""
+
+
 async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
     """``subject_id`` of every unresolved event of ``rule`` (conformity
     events excluded, as ``evaluate_all`` ignores them)."""
@@ -1075,6 +1112,8 @@ async def _matching_subnet_subjects(
             f"Subnet {display} utilisation {pct:.1f}% (threshold {_thr(threshold)}%) — "
             f"{s.allocated_ips}/{s.total_ips} IPs allocated"
         )
+        if pct < threshold:
+            message += _held_note(floor)
         matches.append((str(s.id), display, message))
     return matches
 
@@ -1173,11 +1212,14 @@ async def _matching_dhcp_pool_exhaustion_subjects(
         occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
-        over_pct = pct_threshold is not None and (
-            occ.percent >= pct_threshold
+        held_pct = (
+            pct_threshold is not None
+            and occ.percent < pct_threshold
             # Open event: hold until the margin below the threshold (#2778).
-            or (str(pool.id) in open_ids and occ.percent >= _pct_resolve_floor(pct_threshold))
+            and str(pool.id) in open_ids
+            and occ.percent >= _pct_resolve_floor(pct_threshold)
         )
+        over_pct = pct_threshold is not None and (occ.percent >= pct_threshold or held_pct)
         under_free = min_free is not None and occ.free < min_free
         if not (over_pct or under_free):
             continue
@@ -1193,6 +1235,8 @@ async def _matching_dhcp_pool_exhaustion_subjects(
             f"DHCP pool {display} — {', '.join(reasons)}; "
             f"{occ.assigned}/{occ.total} addresses leased"
         )
+        if held_pct and not under_free and pct_threshold is not None:
+            message += _held_note(_pct_resolve_floor(pct_threshold))
         matches.append((str(pool.id), display, message))
     return matches
 
@@ -4175,6 +4219,45 @@ async def _matching_agent_spool_trimmed_subjects(
     return matches
 
 
+async def _matching_dns_memory_pressure_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_memory_pressure`` — every BIND9 group whose estimated named
+    memory is at 80 % or more of the smallest limit its agents report (#3551).
+
+    The estimate is ``services/dns/memory_estimate``'s, the one the group,
+    view and blocklist responses carry, so the alarm and the banner agree.
+    Critical once the estimate reaches the limit itself.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.memory_estimate import group_memory_estimate  # noqa: PLC0415
+
+    groups = (
+        await db.execute(
+            select(DNSServerGroup.id, DNSServerGroup.name)
+            .where(
+                DNSServerGroup.id.in_(select(DNSServer.group_id).where(DNSServer.driver == "bind9"))
+            )
+            .order_by(DNSServerGroup.name)
+        )
+    ).all()
+    matches: list[tuple[str, str, str, str | None]] = []
+    for gid, name in groups:
+        est = await group_memory_estimate(db, gid)
+        if est is None or not est.assessment.warn:
+            continue
+        matches.append(
+            (
+                str(gid),
+                name,
+                f"DNS server group '{name}': {est.message}",
+                "critical" if est.assessment.percent >= 100 else "warning",
+            )
+        )
+    return matches
+
+
 async def _matching_dns_record_op_failed_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -6475,6 +6558,48 @@ async def seed_agent_spool_trimmed_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_MEMORY_PRESSURE_RULE_NAME = "DNS group near its memory limit"
+
+
+async def seed_dns_memory_pressure_alert_rule() -> None:
+    """Seed the #3551 rule, ENABLED by default.
+
+    Silent on every group whose zones and blocklists fit comfortably in its
+    agents' memory limit. It speaks when a supported change (a second view, a
+    larger list) would put named over the limit, where the next symptom is
+    every agent of the group OOM-killed in a loop. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_MEMORY_PRESSURE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_MEMORY_PRESSURE_RULE_NAME,
+                description=(
+                    "Fires when a BIND9 server group's estimated named memory "
+                    "reaches 80% of the memory limit its agents report (or the "
+                    "2 GiB default when none has). Each DNS view that applies a "
+                    "blocklist loads its own copy of it, so adding a view can "
+                    "OOM-kill every agent in the group. Critical at 100%."
+                ),
+                rule_type=RULE_TYPE_DNS_MEMORY_PRESSURE,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNSSEC_MULTI_SIGNER_RULE_NAME = "DNSSEC zone signed by several servers"
 
 
@@ -8521,6 +8646,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]
                 # Same prefixed "<table>:<id>" subject as agent_config_rejected.
                 subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_DNS_MEMORY_PRESSURE:
+                pressure = await _matching_dns_memory_pressure_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in pressure]
+                subject_type = "dns_server_group"
             elif rule.rule_type == RULE_TYPE_AGENT_DAEMON_DEGRADED:
                 dark = await _matching_agent_daemon_degraded_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in dark]
@@ -8732,6 +8861,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             # Open new events for unseen matches; escalate existing ones.
             for subject_id, display, marked, severity_override in matches:
+                marked, held = _split_held(marked)
                 message, threshold_idx = _unmark_thresholds(marked)
                 existing = open_by_subject.get(subject_id)
                 if existing is None and subject_id in suppressed_ids:
@@ -8750,7 +8880,9 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     new_severity = severity_override or rule.severity
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
-                        existing.message = message
+                        # The peak stays clean; the stored (and delivered)
+                        # message still says the subject is held (#3542).
+                        existing.message = f"{message} — {held}" if held else message
                         existing.last_observed_value = {
                             **(existing.last_observed_value or {}),
                             "peak_message": message,
@@ -8781,6 +8913,8 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         # so restate the threshold in the peak first.
                         peak = _restate_edited_thresholds(peak, message, threshold_idx)
                         composed = _compose_peak_and_now(peak, message)
+                        if held:
+                            composed = f"{composed} — {held}"
                         if composed != existing.message or lov.get("peak_message") != peak:
                             existing.message = composed
                             existing.last_observed_value = {**lov, "peak_message": peak}
