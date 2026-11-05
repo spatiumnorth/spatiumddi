@@ -4915,15 +4915,26 @@ function NetworkPanel() {
         ) : (
           <RpkiExpiringKpi data={data} />
         )}
-        <NetworkKpi
-          label="RPKI expired"
-          value={w.asn ? "—" : data.rpki_expired_count}
-          tone={
-            w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
-          }
-          hint={w.asn ? NV : undefined}
-          to="/network/asns"
-        />
+        {!w.asn && rpkiExpiryUnmeasured(data) ? (
+          <NetworkKpi
+            label="RPKI expired"
+            value="n/a"
+            tone="default"
+            to="/network/asns"
+            hint={RPKI_NO_LIFETIME_HINT}
+            title={RPKI_NO_LIFETIME_TITLE}
+          />
+        ) : (
+          <NetworkKpi
+            label="RPKI expired"
+            value={w.asn ? "—" : data.rpki_expired_count}
+            tone={
+              w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
+            }
+            hint={w.asn ? NV : undefined}
+            to="/network/asns"
+          />
+        )}
         <NetworkKpi
           label="Circuit alerts"
           value={
@@ -5007,7 +5018,11 @@ function NetworkPanel() {
           title="RPKI ROAs expiring soon"
           withheld={w.asn}
           withheldHint="Not visible to your role."
-          emptyHint="No ROAs are expiring in the next 30 days."
+          emptyHint={
+            rpkiExpiryUnmeasured(data)
+              ? "Not measured: the ROA source ships no per-ROA lifetime."
+              : "No ROAs are expiring in the next 30 days."
+          }
         >
           {data.rpki_expiring.map((row) => (
             <Link
@@ -5145,6 +5160,20 @@ function NetworkPanel() {
  * ticks hourly) — six missed cycles, generous enough not to flap on a
  * slow sweep and short enough to notice a dead task the same day.
  */
+/**
+ * True when ROAs are tracked but none carries a known certificate lifetime
+ * (#3557). Neither Cloudflare's dump nor RIPE's export ships one, so the
+ * expiring / expired counts are then always 0 by construction, and a green
+ * 0 would read as an all-clear that nothing measured.
+ */
+function rpkiExpiryUnmeasured(data: NetworkDashboardSummary): boolean {
+  return data.rpki_total_count > 0 && data.rpki_expiry_known_count === 0;
+}
+
+const RPKI_NO_LIFETIME_HINT = "source has no ROA lifetimes";
+const RPKI_NO_LIFETIME_TITLE =
+  "The configured ROA source does not publish each ROA's certificate lifetime, so expiry is not measured. This is not an all-clear.";
+
 function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
   const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
   const checkedAt = data.rpki_last_checked_at;
@@ -5172,6 +5201,18 @@ function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
         to="/network/asns"
         hint={checkedAt ? `checked ${humanTime(checkedAt)}` : "never checked"}
         title={`The ROA refresh has not run recently, so any count here would be fiction. ${data.rpki_total_count} ROAs tracked.`}
+      />
+    );
+  }
+  if (rpkiExpiryUnmeasured(data)) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="n/a"
+        tone="default"
+        to="/network/asns"
+        hint={`${RPKI_NO_LIFETIME_HINT} · ${data.rpki_total_count.toLocaleString()} tracked`}
+        title={RPKI_NO_LIFETIME_TITLE}
       />
     );
   }

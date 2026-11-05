@@ -147,6 +147,9 @@ class _Mirror:
 
 @pytest.fixture(autouse=True)
 def _fresh_cache(monkeypatch: pytest.MonkeyPatch):
+    # The fixtures here are a handful of ROAs, not a full index; the
+    # full-index floor has its own tests in test_rpki_roa_failed_fetch_3557.
+    monkeypatch.setattr(rpki_roa, "_MIN_INDEX_ENTRIES", 0)
     rpki_roa._clear_cache_for_test()
     yield
     rpki_roa._clear_cache_for_test()

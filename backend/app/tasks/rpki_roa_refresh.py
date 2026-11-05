@@ -368,6 +368,27 @@ async def _run_refresh() -> dict[str, Any]:
                 asns=len(rows),
                 error=reason,
             )
+            # The log line alone is invisible to an operator; the audit row is
+            # where the other refresh sweeps report a failed run, and alert
+            # forwarding can match it. One per tick while the source is down.
+            db.add(
+                AuditLog(
+                    user_display_name="<system>",
+                    auth_source="system",
+                    action="rpki-roa-refresh",
+                    resource_type="platform",
+                    resource_id=str(_SINGLETON_ID),
+                    resource_display="auto-refresh",
+                    result="error",
+                    new_value={
+                        "source": source,
+                        "error": reason[:500],
+                        "asns_due": len(rows),
+                        "roas_kept": True,
+                    },
+                )
+            )
+            await db.commit()
             return {
                 "status": "failed",
                 "source": source,

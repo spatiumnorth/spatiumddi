@@ -21,8 +21,8 @@ Two source backends today:
 
 A failed fetch is NOT an empty answer (spatiumddi#3557). "The source
 answered and this ASN has no ROAs" is an empty list; "we could not get an
-answer" (transport error, non-200, malformed or truncated body, unknown
-source) raises :class:`RoaFetchError`. The refresh reconcile deletes ROA rows
+answer" (transport error, non-200, malformed or truncated body, a 200 whose
+document is far smaller than a full index, unknown source) raises :class:`RoaFetchError`. The refresh reconcile deletes ROA rows
 that are absent from what it is given, so conflating the two wiped every
 stored ROA the first time a mirror moved its URL, while reporting success.
 
@@ -97,6 +97,14 @@ _CHUNK_BYTES = 256 * 1024
 # Consumed text is dropped from the parse buffer once this much has been
 # walked, so the buffer never grows past ~one chunk plus one JSON value.
 _TRIM_AT = 64 * 1024
+
+# A full-index source carries ~1M ROAs (2026-11-05: Cloudflare 1,031,225,
+# RIPE's export 1,031,269). A 200 whose document parses but holds far fewer is
+# an upstream outage or a truncated export, not the state of the world, and
+# reading it as one would delete every stored ROA of every AS it no longer
+# lists (spatiumddi#3557, the #986 TLD-download guard's reasoning). Well under
+# a tenth of today's size so organic churn never trips it.
+_MIN_INDEX_ENTRIES = 100_000
 
 # Last failure reason per source, cleared by the next successful fetch.
 _last_error: dict[str, str] = {}
@@ -381,7 +389,8 @@ async def _fetch_index(source: str, asns: frozenset[int]) -> dict[int, list[dict
     """Stream the dump from ``source`` and index the ROAs of ``asns``.
 
     Raises :class:`RoaFetchError` on transport failure / non-200 / malformed
-    JSON / unknown source. Every ASN asked for is a key of the result, an
+    JSON / unknown source, and on a document listing fewer than
+    ``_MIN_INDEX_ENTRIES`` ROAs (a 200 that is not a full index). Every ASN asked for is a key of the result, an
     empty list meaning "the dump was read and has no ROAs for it".
     """
     url = _SOURCE_URLS.get(source)
@@ -407,6 +416,11 @@ async def _fetch_index(source: str, asns: frozenset[int]) -> dict[int, list[dict
         reason = f"unexpected: {exc}"
     else:
         reason = ""
+        if seen < _MIN_INDEX_ENTRIES:
+            reason = (
+                f"the document lists only {seen} ROAs, fewer than the "
+                f"{_MIN_INDEX_ENTRIES} a full index carries; treated as an outage"
+            )
     if reason:
         logger.info("rpki_roa_fetch_failed", source=source, error=reason)
         raise RoaFetchError(f"{source} ROA source: {reason}")
