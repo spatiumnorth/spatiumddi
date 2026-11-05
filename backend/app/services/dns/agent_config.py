@@ -60,6 +60,7 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
+from app.services.dns.dnssec_trust import effective_dnssec_validation
 from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
@@ -1589,7 +1590,15 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": opts_recursion_enabled and group_is_recursive,
-        "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
+        "dnssec_validation": (
+            effective_dnssec_validation(
+                getattr(opts, "dnssec_validation", "auto"),
+                server.driver,
+                len(opts.trust_anchors or ()),
+            )
+            if opts
+            else "auto"
+        ),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
         # NOTIFY behaviour (#1523). Settable in the UI / API, validated

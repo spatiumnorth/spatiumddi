@@ -153,6 +153,11 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.dnssec_trust import (
+    NEEDS_ANCHOR_MESSAGE,
+    count_anchors,
+    stored_validation,
+)
 from app.services.dns.drift import zone_state_in_sync
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.name_targets import (
@@ -4115,9 +4120,9 @@ async def _options_response(
     drivers = await _group_driver_names(db, group_id)
     if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
         out.dnssec_warnings.append(
-            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
-            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
-            "validate against BIND's built-in root anchor."
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND 9.20 "
+            "refuses that config, so it is rendered as 'auto' (BIND's built-in root key) "
+            "until you add a trust anchor or set 'auto' here."
         )
     if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
@@ -4529,6 +4534,15 @@ async def update_options(
     for k, v in changes.items():
         setattr(opts, k, v)
 
+    # #3560: BIND9 refuses ``dnssec-validation yes`` with no trust anchor.
+    # Transition-only, so a row stored before this check still saves other options.
+    if (
+        changes.get("dnssec_validation") == "yes"
+        and before.get("dnssec_validation") != "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id)
+    ):
+        raise HTTPException(status_code=422, detail=NEEDS_ANCHOR_MESSAGE)
     _refuse_plain_port_forwarders_on_encrypted(opts, forwarders_before, transport_before)
     await _assert_encrypted_transport_sane(opts, db)
     if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
@@ -4670,6 +4684,22 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    # #3560: removing the last anchor under ``yes`` would leave BIND9 with a
+    # config it refuses to load.
+    if (
+        await stored_validation(db, group_id) == "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id, exclude_id=anchor.id)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This is the group's last trust anchor and dnssec_validation is 'yes', "
+                "which BIND9 refuses to load without one. Set dnssec_validation to 'auto' "
+                "first (BIND's built-in root key), or add another trust anchor before "
+                "removing this one."
+            ),
+        )
     db.add(
         AuditLog(
             user_id=current_user.id,

@@ -139,25 +139,17 @@ async def test_values_that_would_break_named_conf_are_refused(
 
 
 @pytest.mark.asyncio
-async def test_yes_without_anchors_warns_and_anchor_clears_it(
+async def test_yes_with_an_anchor_is_accepted(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     headers = await _superadmin(db_session)
     group, _ = await _group(db_session, "bind9")
     await db_session.commit()
     url = f"/api/v1/dns/groups/{group.id}/options"
-
-    r = await client.put(url, json={"dnssec_validation": "auto"}, headers=headers)
-    assert r.status_code == 200, r.text
-    assert r.json()["dnssec_warnings"] == []
-
-    r = await client.put(url, json={"dnssec_validation": "yes"}, headers=headers)
-    assert r.status_code == 200, r.text
-    assert any("no trust anchor" in w for w in r.json()["dnssec_warnings"])
-
     r = await client.post(f"{url}/trust-anchors", json=_anchor(), headers=headers)
     assert r.status_code == 201
-    r = await client.get(url, headers=headers)
+    r = await client.put(url, json={"dnssec_validation": "yes"}, headers=headers)
+    assert r.status_code == 200, r.text
     assert r.json()["dnssec_warnings"] == []
 
 
