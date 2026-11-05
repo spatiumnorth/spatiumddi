@@ -1,6 +1,6 @@
 import type { DNSBlockList, DNSBlockListFeedSkipped } from "@/lib/api";
 
-/** Rules the last adblock refresh could not enforce (#2123); 0 when the
+/** Rules the last refresh could not enforce (#2123, #3531); 0 when the
  *  counts were never recorded. */
 export function feedSkippedTotal(l: DNSBlockList): number {
   const s = l.feed_parse_skipped;
@@ -35,7 +35,7 @@ export function feedSkippedTitle(l: DNSBlockList): string {
   if (!s.regex && !s.modifier && !s.badfilter && !s.malformed && s.invalid_name)
     return (
       `The last refresh skipped ${s.invalid_name} feed line(s) that are not ` +
-      "valid DNS names (adblock rules, IP addresses or paths)."
+      "valid DNS names (adblock rules, paths or other characters a name cannot carry)."
     );
   return (
     `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +

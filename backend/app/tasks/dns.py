@@ -152,7 +152,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 bl.last_sync_status = "error"
                 bl.last_sync_error = (
                     f"Feed appears to be {parsed.format_mismatch} format but the list is "
-                    f"set to {bl.feed_format}; refresh refused, existing entries kept. "
+                    f"set to {bl.feed_format}; refresh refused, the list's entries left as they were. "
                     f"Change the list's feed format to {parsed.format_mismatch}."
                 )
                 bl.last_synced_at = datetime.now(UTC)
