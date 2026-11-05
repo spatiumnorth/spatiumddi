@@ -17,10 +17,12 @@ What the tests pin:
 
 from __future__ import annotations
 
+import pathlib
 import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -523,3 +525,72 @@ async def test_gss_tsig_fields_are_gone_and_a_stale_client_is_ignored(
     assert r.status_code == 200, r.text
     assert not [k for k in r.json() if "gss" in k]
     assert not [c.name for c in DNSServerOptions.__table__.columns if "gss" in c.name]
+
+
+_GSS_COLUMNS = ("gss_tsig_enabled", "gss_tsig_keytab_path", "gss_tsig_realm", "gss_tsig_principal")
+
+
+def test_gss_tsig_columns_are_not_dropped_in_the_release_that_unmaps_them():
+    """#3561 is the expand half: an old api pod still maps these columns until
+    the rolling upgrade replaces it, and /health/ready takes it out of service
+    the moment one is gone (#2777). So no migration may drop them in the same
+    release that stops mapping them. Delete this test with the contract
+    migration that drops them, one release later."""
+    versions = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    dropping = [
+        path.name
+        for path in sorted(versions.glob("*.py"))
+        if "drop_column" in (body := path.read_text())
+        and any(col in body for col in _GSS_COLUMNS)
+        and not path.name.startswith("4c9e1f82a3b7")  # created them; drops only in downgrade
+    ]
+    assert not dropping, dropping
+
+
+@pytest.mark.asyncio
+async def test_options_save_while_the_unmapped_gss_tsig_columns_are_still_in_the_db(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """The columns stay in the database for a release (above). The model no
+    longer writes them, so the NOT NULL ``gss_tsig_enabled`` must be filled by
+    its server default, or creating a group's options would 500 on every
+    upgraded install. The test schema comes from the models, so the columns are
+    added here with their shape from ``4c9e1f82a3b7`` and removed afterwards."""
+    await db_session.execute(
+        text(
+            "ALTER TABLE dns_server_options "
+            "ADD COLUMN gss_tsig_enabled boolean NOT NULL DEFAULT false, "
+            "ADD COLUMN gss_tsig_keytab_path varchar(500), "
+            "ADD COLUMN gss_tsig_realm varchar(255), "
+            "ADD COLUMN gss_tsig_principal varchar(500)"
+        )
+    )
+    await db_session.commit()
+    try:
+        headers = await _superadmin(db_session)
+        group = await _group(db_session)
+        await db_session.commit()
+        url = f"/api/v1/dns/groups/{group.id}/options"
+
+        r = await client.put(url, json={"allow_query": ["any"]}, headers=headers)
+        assert r.status_code == 200, r.text
+        r = await client.get(url, headers=headers)
+        assert r.status_code == 200, r.text
+        assert not [k for k in r.json() if "gss" in k]
+
+        enabled = (
+            await db_session.execute(
+                text("SELECT gss_tsig_enabled FROM dns_server_options WHERE group_id = :g"),
+                {"g": group.id},
+            )
+        ).scalar_one()
+        assert enabled is False
+    finally:
+        await db_session.rollback()
+        await db_session.execute(
+            text(
+                "ALTER TABLE dns_server_options "
+                + ", ".join(f"DROP COLUMN IF EXISTS {c}" for c in _GSS_COLUMNS)
+            )
+        )
+        await db_session.commit()
