@@ -7217,7 +7217,16 @@ export interface DNSBlockListFeedSkipped {
   regex: number;
   modifier: number;
   badfilter: number;
+  /** Total of the reason buckets below (#3519). */
   malformed: number;
+  /** Absent on rows written before #3519, which carry only the total. */
+  star_in_name?: number;
+  no_anchor?: number;
+  trailing_dot?: number;
+  start_anchor?: number;
+  bare_star?: number;
+  dotless?: number;
+  other?: number;
 }
 
 export interface DNSBlockListEntry {
@@ -11398,6 +11407,10 @@ export interface NetworkDashboardSummary {
    *  panel tell a real all-clear from stale or absent data (#942). */
   rpki_total_count: number;
   rpki_last_checked_at: string | null;
+  /** ROAs whose certificate lifetime is known (#3557). 0 with ROAs tracked
+   *  means the source ships no per-ROA lifetime, so the expiring / expired
+   *  counts are not measured — never an all-clear. */
+  rpki_expiry_known_count: number;
   circuit_term_expiring_count: number;
   circuit_status_changed_count: number;
   service_orphan_count: number;

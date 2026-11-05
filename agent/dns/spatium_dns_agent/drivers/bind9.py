@@ -681,7 +681,7 @@ def sinkhole_rdatas(sinkhole_ip: Any) -> tuple[tuple[str, ...], bool]:
 # node each. So the caches get an explicit ceiling: a quarter of the cgroup
 # memory limit in total, split across the recursive views.
 # ``NAMED_MAX_CACHE_SIZE`` overrides it (a BIND size, e.g. ``512m``; per view,
-# as BIND applies it).
+# as BIND applies it; ``unlimited`` and ``0`` are ignored with a warning).
 _CACHE_SHARE_OF_LIMIT = 0.25
 _CACHE_MIN_MIB = 32
 
@@ -699,9 +699,18 @@ def _render_max_cache_size(
     env = os.environ if environ is None else environ
     override = (env.get("NAMED_MAX_CACHE_SIZE") or "").strip()
     if override:
-        if re.fullmatch(r"(?:\d+[kKmMgG]?|unlimited|default)", override):
+        # ``unlimited`` and ``0`` are refused: BIND 9.21.21+ no longer honours
+        # them and falls back to its default, 90 % of PHYSICAL memory, the very
+        # ceiling this override exists to defeat (#3565). An existing install
+        # that still sets one must not fail to start, so it is ignored with a
+        # warning and the cgroup-derived ceiling below applies.
+        if re.fullmatch(r"(?:0*[1-9]\d*[kKmMgG]?|default)", override):
             return f"    max-cache-size {override};\n"
-        log.warning("bind9_max_cache_size_ignored", value=override)
+        log.warning(
+            "bind9_max_cache_size_ignored",
+            value=override,
+            hint="use an explicit size such as 512m; BIND 9.21.21+ ignores unlimited and 0",
+        )
     if limit_bytes is None:
         limit_bytes = _cgroup_memory_limit_bytes()
     if limit_bytes is None:

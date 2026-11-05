@@ -327,3 +327,100 @@ async def test_a_kea_oom_does_not_mark_the_dns_row(
     await _supervisor_hb(client, appliance, token, rh)
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_OK
+
+
+# ── #3552: the death-during-apply verdict names the kubelet's OOM kill ──────
+
+
+async def _agent_hb_config(
+    client: AsyncClient, headers: dict[str, str], config: dict[str, Any]
+) -> None:
+    r = await client.post(
+        "/api/v1/dns/agents/heartbeat",
+        headers=headers,
+        json={"daemon": {"status": "ok"}, "config": config},
+    )
+    assert r.status_code == 200, r.text
+
+
+_DIED = {
+    "status": "no_previous",
+    "failed_etag": "sha256:big",
+    "phase": "reload",
+    "error": "the DNS daemon died once while this bundle was being applied",
+    "reason": "daemon_died",
+}
+
+
+async def test_a_death_during_apply_reads_out_of_memory_when_the_kubelet_saw_it(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The issue's OOM loop: the group kill took the agent with named, so the
+    restarted agent only knows the previous process died during the apply.
+    The kubelet's ``OOMKilled`` for the container is that death."""
+    appliance, _token = await _appliance(db_session, "ddi-oom-3552a")
+    server, headers = await _agent_server(
+        db_session, host="ddi-oom-3552a", appliance_id=appliance.id
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    appliance.role_health = _role_health(
+        killed_at=now - timedelta(seconds=40), running_since=now - timedelta(seconds=30)
+    )
+    await db_session.commit()
+
+    await _agent_hb_config(client, headers, _DIED)
+
+    row = await _reload(db_session, server.id)
+    assert row.config_apply_status == "no_previous"
+    assert (row.config_apply_error or "").startswith(
+        "out of memory while applying config (limit 2Gi): the DNS daemon died once"
+    )
+
+
+async def test_a_death_during_apply_after_another_termination_is_not_oom(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    appliance, _token = await _appliance(db_session, "ddi-oom-3552b")
+    server, headers = await _agent_server(
+        db_session, host="ddi-oom-3552b", appliance_id=appliance.id
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    appliance.role_health = _role_health(
+        killed_at=now - timedelta(seconds=40),
+        running_since=now - timedelta(seconds=30),
+        reason="Error",
+    )
+    await db_session.commit()
+
+    await _agent_hb_config(client, headers, _DIED)
+
+    row = await _reload(db_session, server.id)
+    assert row.config_apply_error == _DIED["error"]
+
+
+async def test_a_config_rejection_is_not_relabelled_by_a_current_oom_kill(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Only a death verdict is named OOM: a named-checkconf rejection on a
+    container that was OOM-killed a minute ago is still a rejection."""
+    appliance, _token = await _appliance(db_session, "ddi-oom-3552c")
+    server, headers = await _agent_server(
+        db_session, host="ddi-oom-3552c", appliance_id=appliance.id
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    appliance.role_health = _role_health(
+        killed_at=now - timedelta(seconds=40), running_since=now - timedelta(seconds=30)
+    )
+    await db_session.commit()
+
+    rejected = {
+        "status": "reverted",
+        "etag": "sha256:good",
+        "failed_etag": "sha256:bad",
+        "phase": "validate",
+        "error": "named-checkconf failed: undefined acl 'trusted'",
+    }
+    await _agent_hb_config(client, headers, rejected)
+
+    row = await _reload(db_session, server.id)
+    assert row.config_apply_error == rejected["error"]

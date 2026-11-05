@@ -1042,6 +1042,35 @@ def _pct_resolve_floor(threshold: float) -> float:
     return threshold - _PCT_RESOLVE_MARGIN
 
 
+# #3542 — a matcher that keeps an open subject only because of the margin
+# appends ``_HELD_MARK`` + a note to its message. ``evaluate_all`` splits it
+# off before the peak/current composition (the note is state, not a reading)
+# and appends it to the stored message, so the event says it is held and the
+# figure it resolves under. A pass that no longer holds the subject drops it.
+_HELD_MARK = "\ue002"
+_HELD_NOTE_RE = re.compile(
+    r"held open: under the rule's threshold but not yet below [0-9.e+-]+%; resolves below that"
+)
+
+
+def _held_note(floor: float) -> str:
+    return (
+        f"{_HELD_MARK}held open: under the rule's threshold but not yet below "
+        f"{floor:g}%; resolves below that"
+    )
+
+
+def _split_held(marked: str) -> tuple[str, str]:
+    """``(message, held note)`` of a matcher's message; the note is ``""``
+    when the subject is not held. Only a trailing, exact ``_held_note`` is
+    split off, so a marker character inside operator- or device-supplied
+    text (a subnet name, a lease hostname) never truncates the message."""
+    head, sep, tail = marked.rpartition(_HELD_MARK)
+    if sep and _HELD_NOTE_RE.fullmatch(tail):
+        return head, tail
+    return marked, ""
+
+
 async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
     """``subject_id`` of every unresolved event of ``rule`` (conformity
     events excluded, as ``evaluate_all`` ignores them)."""
@@ -1083,6 +1112,8 @@ async def _matching_subnet_subjects(
             f"Subnet {display} utilisation {pct:.1f}% (threshold {_thr(threshold)}%) — "
             f"{s.allocated_ips}/{s.total_ips} IPs allocated"
         )
+        if pct < threshold:
+            message += _held_note(floor)
         matches.append((str(s.id), display, message))
     return matches
 
@@ -1181,11 +1212,14 @@ async def _matching_dhcp_pool_exhaustion_subjects(
         occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
-        over_pct = pct_threshold is not None and (
-            occ.percent >= pct_threshold
+        held_pct = (
+            pct_threshold is not None
+            and occ.percent < pct_threshold
             # Open event: hold until the margin below the threshold (#2778).
-            or (str(pool.id) in open_ids and occ.percent >= _pct_resolve_floor(pct_threshold))
+            and str(pool.id) in open_ids
+            and occ.percent >= _pct_resolve_floor(pct_threshold)
         )
+        over_pct = pct_threshold is not None and (occ.percent >= pct_threshold or held_pct)
         under_free = min_free is not None and occ.free < min_free
         if not (over_pct or under_free):
             continue
@@ -1201,6 +1235,8 @@ async def _matching_dhcp_pool_exhaustion_subjects(
             f"DHCP pool {display} — {', '.join(reasons)}; "
             f"{occ.assigned}/{occ.total} addresses leased"
         )
+        if held_pct and not under_free and pct_threshold is not None:
+            message += _held_note(_pct_resolve_floor(pct_threshold))
         matches.append((str(pool.id), display, message))
     return matches
 
@@ -1343,6 +1379,7 @@ async def _matching_unknown_mac_in_static_range_subjects(
         await db.execute(
             select(IPAddress, IpMacHistory.mac_address, IpMacHistory.last_seen)
             .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)  # trashed subnet drops out (#3492)
             .where(
                 IPAddress.status.in_(("reserved", "static_dhcp")),
                 IPAddress.mac_address.is_not(None),
@@ -2063,6 +2100,8 @@ async def _matching_new_mac_seen_subjects(
                 IPAddress, IpMacHistory.mac_address, IpMacHistory.first_seen, IpMacHistory.source
             )
             .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            # Inner join so a subnet in the Trash drops its addresses (#3492).
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(*conds)
             .order_by(IpMacHistory.first_seen.desc())
             .limit(_IP_HYGIENE_MAX_EVENTS)
@@ -8822,6 +8861,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             # Open new events for unseen matches; escalate existing ones.
             for subject_id, display, marked, severity_override in matches:
+                marked, held = _split_held(marked)
                 message, threshold_idx = _unmark_thresholds(marked)
                 existing = open_by_subject.get(subject_id)
                 if existing is None and subject_id in suppressed_ids:
@@ -8840,7 +8880,9 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     new_severity = severity_override or rule.severity
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
-                        existing.message = message
+                        # The peak stays clean; the stored (and delivered)
+                        # message still says the subject is held (#3542).
+                        existing.message = f"{message} — {held}" if held else message
                         existing.last_observed_value = {
                             **(existing.last_observed_value or {}),
                             "peak_message": message,
@@ -8871,6 +8913,8 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         # so restate the threshold in the peak first.
                         peak = _restate_edited_thresholds(peak, message, threshold_idx)
                         composed = _compose_peak_and_now(peak, message)
+                        if held:
+                            composed = f"{composed} — {held}"
                         if composed != existing.message or lov.get("peak_message") != peak:
                             existing.message = composed
                             existing.last_observed_value = {**lov, "peak_message": peak}

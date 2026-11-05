@@ -552,7 +552,7 @@ DNSServerOptions.forward_policy: enum(
 )
 ```
 
-- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` or per-view
+- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` (group-level; per-view forwarders are not implemented, see #3523)
 - Per-zone forward overrides (stub/forward zone type) take precedence over global forwarders
 
 ### 3.2 Recursion
@@ -822,10 +822,12 @@ Settings can be defined at three levels and are evaluated from most-specific to 
 ```
 Zone override  (per-zone notify, allow-transfer, also-notify)
     ↓
-View override  (per-view recursion, allow-query, allow-query-cache, forwarders)
+View override  (per-view recursion, allow-query, allow-query-cache)
     ↓
 Server default (DNSServerOptions — applies to all views/zones on that server)
 ```
+
+Forwarders are **group-level only**: a view has no forwarder fields and the only view-level options the agent renders are `match-clients`, `match-destinations`, recursion, `allow-query` and `allow-query-cache`, so every view inherits the group's `forwarders`. Per-view forwarders are tracked in [#3523](https://github.com/spatiumnorth/spatiumddi/issues/3523).
 
 The driver is responsible for generating the correct BIND9 config that reflects this layered precedence. Service-layer code must not hard-code driver specifics.
 
@@ -1135,7 +1137,7 @@ lists to `nxdomain`, which changes nothing they answer.
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
 - Block list entries are written as RPZ zone records
 - Updating the RPZ zone uses `rndc reload <rpz-zone>` (no full restart)
-- Multiple RPZ zones can be chained (per-list)
+- Every list a scope draws on is folded into ONE RPZ zone per view (plus one group zone), so BIND's limit of 64 zones per `response-policy` statement can never be reached by assigning lists; there is deliberately no assignment-time cap (#3564)
 
 ### UI Features
 - Dashboard showing blocked query stats (pulled from DNS server logs)
@@ -1432,7 +1434,10 @@ container's memory limit, split across the views that recurse (at least
 32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
 recursive views. With no limit it writes nothing and BIND keeps its default.
 Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
-BIND does) on the agent to override it.
+BIND does) on the agent to override it. `unlimited` and `0` are not accepted:
+BIND 9.21.21+ stops honouring them and falls back to 90 % of physical memory,
+so the agent ignores them (logging `bind9_max_cache_size_ignored`) and keeps
+the derived ceiling. Use an explicit size.
 
 ### 8.1 Content filtering / family filter (issue #878)
 

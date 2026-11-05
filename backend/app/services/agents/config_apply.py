@@ -18,6 +18,8 @@ from typing import Any, Protocol
 
 import structlog
 
+from app.services.agents.container_oom import ContainerOomKill
+
 logger = structlog.get_logger(__name__)
 
 STATUS_OK = "ok"
@@ -64,6 +66,34 @@ _MAX_ETAG = 128
 _MAX_STATUS = 20
 
 
+#: ``reason`` values a DNS agent sends on a verdict about a death during an
+#: apply (#3552), mirrored from the agent's ``config_apply``. ``oom``: the agent
+#: has evidence the container's OOM killer did it. ``daemon_died``: it does not
+#: know what did, and the kubelet may (a group kill took the agent with the
+#: daemon, so the agent saw nothing). Absent: not a death verdict, or an older
+#: agent. None of them means "not out of memory".
+REASON_OOM = "oom"
+REASON_DAEMON_DIED = "daemon_died"
+
+
+def format_oom_error(limit: int | str | None, detail: str | None) -> str:
+    """The operator-facing text for an OOM-killed apply, with the agent's own
+    detail appended. Stored in ``config_apply_error`` so the chip, banner,
+    alert and MCP tool all say it without a column per surface. ``limit`` is
+    bytes from the agent's cgroup, or the kubelet's own spelling (``"2Gi"``)."""
+    text: str | None = None
+    if isinstance(limit, str):
+        text = limit.strip()[:32] or None
+    elif isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        gib = limit / (1 << 30)
+        text = f"{gib:g} GiB" if gib >= 1 else f"{limit // (1 << 20)} MiB"
+    if text:
+        head = f"out of memory while applying config (limit {text})"
+    else:
+        head = "out of memory while applying config"
+    return f"{head}: {detail}" if detail else head
+
+
 class _HasConfigApplyColumns(Protocol):
     config_apply_status: str | None
     config_apply_error: str | None
@@ -86,8 +116,14 @@ def apply_reported_status(
     *,
     agent_kind: str,
     server_id: str,
+    container_oom: ContainerOomKill | None = None,
 ) -> None:
     """Persist ``reported`` onto ``server``'s config-apply columns.
+
+    ``container_oom``: the kubelet's current OOM kill of the server's
+    container (#3552), when there is one. It names a ``daemon_died`` verdict
+    out of memory: that verdict is about the previous process's end, and the
+    container's last termination IS that end.
 
     ``reported`` is the heartbeat's ``config`` field. Three shapes matter
     and are handled differently:
@@ -135,7 +171,19 @@ def apply_reported_status(
         server.config_apply_error = None
         server.config_failed_etag = None
     else:
-        server.config_apply_error = _clip(reported.get("error"), _MAX_ERROR)
+        error = _clip(reported.get("error"), _MAX_ERROR)
+        reason = _clip(reported.get("reason"), 16)
+        if reason == REASON_OOM:
+            raw_limit = reported.get("memory_limit_bytes")
+            limit = (
+                raw_limit
+                if isinstance(raw_limit, int) and not isinstance(raw_limit, bool)
+                else None
+            )
+            error = _clip(format_oom_error(limit, error), _MAX_ERROR)
+        elif reason == REASON_DAEMON_DIED and container_oom is not None:
+            error = _clip(format_oom_error(container_oom.memory_limit, error), _MAX_ERROR)
+        server.config_apply_error = error
         server.config_failed_etag = _clip(reported.get("failed_etag"), _MAX_ETAG)
     server.config_apply_at = datetime.now(UTC)
 

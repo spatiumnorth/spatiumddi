@@ -312,8 +312,12 @@ def run(cfg: AgentConfig) -> int:
                     # #2019 — the agent outlived the daemon: a watched death,
                     # the evidence a bundle needs before it is quarantined
                     # (an unexplained end of the whole process is not).
-                    syncer.note_daemon_death()
-                    if oom.fired():
+                    # #3552 — and whether the OOM killer did it, so the
+                    # restarted agent names it on the apply verdict too (the
+                    # cgroup counter does not survive the container restart).
+                    oom_killed = oom.fired()
+                    syncer.note_daemon_death(oom_killed=oom_killed)
+                    if oom_killed:
                         # Persisted before the exit, so the restarted agent
                         # reports it (#1725).
                         oom.note_daemon_killed()

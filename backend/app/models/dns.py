@@ -1772,7 +1772,10 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Rules the last adblock-format refresh could not enforce, by category
-    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count.
+    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count, where
+    # ``malformed`` is the total of the reason buckets (#3519: ``star_in_name``,
+    # ``no_anchor``, ``trailing_dot``, ``start_anchor``, ``bare_star``,
+    # ``dotless``, ``other``); rows written before #3519 carry only the total.
     # NULL = no adblock refresh yet, or a format with no rule syntax to lose.
     feed_parse_skipped: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
 

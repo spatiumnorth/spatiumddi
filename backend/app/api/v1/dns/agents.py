@@ -59,7 +59,11 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
-from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
+from app.services.agents.container_oom import (
+    container_oom_kill,
+    effective_daemon_report,
+    fresh_role_health,
+)
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -1020,7 +1024,7 @@ async def agent_config_longpoll(
             # The server row carries the dirty sequence and the watermark of
             # the newest stored bundle; refresh it so a change committed on
             # any replica, or the worker's store, is seen here
-            # (expire_on_commit=False, no in-loop commit).
+            # (expire_on_commit=False: no commit in the loop expires it).
             await refresh_agent_server(db, server)
             if instance is not None and server.agent_instance not in (None, instance):
                 # #2044 — another agent process took the server over while this
@@ -1108,6 +1112,16 @@ async def agent_config_longpoll(
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
                 AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
                 return Response(status_code=304, headers=headers)
+            # #3479: end this pass's read transaction before the wait. Held
+            # through it, the reads' locks (the op queue's among them) made any
+            # ACCESS EXCLUSIVE lock wait out the whole hold: a factory reset's
+            # TRUNCATE queued behind them, every reader after it queued behind
+            # the TRUNCATE, and the minute's alert evaluation closed a deadlock
+            # in that queue. Nothing is pending here (a page with ops was
+            # answered above; return_ops_dispatched_elsewhere commits its own),
+            # and expire_on_commit=False keeps ``server`` and ``bundle`` loaded
+            # for the next pass and the 304.
+            await db.commit()
             if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
                 # #3015 — this api process is stopping: end the hold now so the
                 # next pass makes one last ETag check and answers 304, and the
@@ -1219,7 +1233,21 @@ async def agent_heartbeat(
         # #882 — the config-apply verdict. ``body.config`` has been declared on
         # this model since it was written and read by nothing; a server could be
         # reachable, healthy and serving a config the operator never approved.
-        apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
+        # #2018 — on the appliance the kubelet kills the whole container when
+        # named hits its memory limit, the agent with it, so the agent never
+        # records the kill and its restarted self reports ``ok``. The supervisor
+        # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
+        # is current it is the daemon state, whatever the agent says. #3552 —
+        # and it names a death-during-apply verdict out of memory.
+        appliance = await owning_appliance_for_dns_server(db, server)
+        role_health = fresh_role_health(appliance, now)
+        apply_reported_status(
+            server,
+            body.config,
+            agent_kind="dns",
+            server_id=str(server.id),
+            container_oom=container_oom_kill(role_health, server.driver, now),
+        )
         # #1077 — spool state. Only written when the heartbeat carries it.
         apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
         # #3551 — the container's memory limit, for the group memory estimate.
@@ -1229,15 +1257,9 @@ async def agent_heartbeat(
         # since it was written and read by nothing: an agent whose ``named`` never
         # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
         # indistinguishable from a healthy one.
-        # #2018 — on the appliance the kubelet kills the whole container when
-        # named hits its memory limit, the agent with it, so the agent never
-        # records the kill and its restarted self reports ``ok``. The supervisor
-        # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
-        # is current it is the daemon state, whatever the agent says.
-        appliance = await owning_appliance_for_dns_server(db, server)
         daemon_report, daemon_stamp = effective_daemon_report(
             body.daemon,
-            fresh_role_health(appliance, now),
+            role_health,
             server.driver,
             now,
         )
