@@ -25,20 +25,23 @@ is never reached by accident.
 
 Every answer writes an ``e911_resolution_log`` row, exactly as the JSON
 lookup does. The protocol is different; the fact that somebody asked where
-a person sits is not.
+a person sits is not. The trail is bounded (#3514): past a per-caller budget
+the lookup is answered without a row, and ``prune_e911_resolution_log``
+drops rows past the retention window.
 """
 
 from __future__ import annotations
 
 import uuid
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.e911.router import log_resolution
 from app.config import settings
-from app.core.auth_throttle import e911_self_query_rate_limited
+from app.core.auth_throttle import e911_lookup_log_rate_limited, e911_self_query_rate_limited
 from app.core.body_limit import read_body_capped
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
@@ -59,6 +62,8 @@ from app.services.e911.held import (
 )
 from app.services.e911.pidf_lo import render_pidf_lo
 from app.services.e911.resolver import resolve_location
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["e911"])
 
@@ -125,15 +130,21 @@ async def _answer(
     )
 
     source_ip = request.client.host if request.client else None
-    log_resolution(
-        db,
-        resolution,
-        user_id=user.id if user else None,
-        api_token_id=api_token_id,
-        source_ip=source_ip,
-        actor_kind=actor_kind,
-    )
-    await db.commit()
+    # Bounded (#3514): a read-scoped token must not grow the trail without
+    # limit. Past the per-caller budget the lookup is answered but not logged.
+    actor = str(api_token_id or (user.id if user else None) or source_ip)
+    if await e911_lookup_log_rate_limited(actor):
+        logger.warning("e911_lookup_trail_skipped", actor_kind=actor_kind, actor=actor)
+    else:
+        log_resolution(
+            db,
+            resolution,
+            user_id=user.id if user else None,
+            api_token_id=api_token_id,
+            source_ip=source_ip,
+            actor_kind=actor_kind,
+        )
+        await db.commit()
 
     if resolution.erl is None:
         # 404 with locationUnknown, which is what RFC 5985 §6.3 says and what

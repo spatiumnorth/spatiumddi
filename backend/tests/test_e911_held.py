@@ -649,3 +649,34 @@ def test_an_unknown_client_address_is_a_400_not_a_429(monkeypatch) -> None:
     unknown = src.index("could not determine the requesting address")
     throttled = src.index("e911_self_query_rate_limited")
     assert unknown < throttled, "the throttle still runs before the address check"
+
+
+@pytest.mark.asyncio
+async def test_held_over_the_log_budget_answers_without_a_trail_row(client, db_session) -> None:
+    """#3514: past the per-caller budget the lookup is answered, not logged."""
+    from unittest.mock import patch
+
+    from sqlalchemy import func, select
+
+    from app.models.e911 import E911ResolutionLog
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, _room = await _estate_with_location(db_session)
+
+    async def count() -> int:
+        return (
+            await db_session.execute(select(func.count()).select_from(E911ResolutionLog))
+        ).scalar_one()
+
+    before = await count()
+    body = _req(f"<locationType>civic</locationType><device><ip>{ip}</ip></device>")
+    hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
+    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=True):
+        res = await client.post("/held", content=body, headers=hdr)
+    assert res.status_code == 200, res.text
+    assert await count() == before
+    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=False):
+        res = await client.post("/held", content=body, headers=hdr)
+    assert res.status_code == 200
+    assert await count() == before + 1
