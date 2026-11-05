@@ -59,7 +59,11 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
-from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
+from app.services.agents.container_oom import (
+    container_oom_kill,
+    effective_daemon_report,
+    fresh_role_health,
+)
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -1225,22 +1229,30 @@ async def agent_heartbeat(
         # #882 — the config-apply verdict. ``body.config`` has been declared on
         # this model since it was written and read by nothing; a server could be
         # reachable, healthy and serving a config the operator never approved.
-        apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
+        # #2018 — on the appliance the kubelet kills the whole container when
+        # named hits its memory limit, the agent with it, so the agent never
+        # records the kill and its restarted self reports ``ok``. The supervisor
+        # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
+        # is current it is the daemon state, whatever the agent says. #3552 —
+        # and it names a death-during-apply verdict out of memory.
+        appliance = await owning_appliance_for_dns_server(db, server)
+        role_health = fresh_role_health(appliance, now)
+        apply_reported_status(
+            server,
+            body.config,
+            agent_kind="dns",
+            server_id=str(server.id),
+            container_oom=container_oom_kill(role_health, server.driver, now),
+        )
         # #1077 — spool state. Only written when the heartbeat carries it.
         apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
         # #1067 — the daemon state. ``body.daemon`` has been declared on this model
         # since it was written and read by nothing: an agent whose ``named`` never
         # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
         # indistinguishable from a healthy one.
-        # #2018 — on the appliance the kubelet kills the whole container when
-        # named hits its memory limit, the agent with it, so the agent never
-        # records the kill and its restarted self reports ``ok``. The supervisor
-        # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
-        # is current it is the daemon state, whatever the agent says.
-        appliance = await owning_appliance_for_dns_server(db, server)
         daemon_report, daemon_stamp = effective_daemon_report(
             body.daemon,
-            fresh_role_health(appliance, now),
+            role_health,
             server.driver,
             now,
         )
