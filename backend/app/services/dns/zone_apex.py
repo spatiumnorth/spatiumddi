@@ -8,7 +8,9 @@ placeholder ``ns1.<zone>`` glued to 127.0.0.1. This module is the control
 plane's one copy of that rule, so the records list, the ingest mirror and the
 copilot cannot disagree with what is served. The agent image cannot import
 ``app``, so the rule is duplicated there; ``tests/test_zone_apex_parity_3518.py``
-feeds both the same zones and fails when they drift. Keep the two in step.
+feeds both the same zones and ``tests/test_zone_apex_bundle_parity_3518.py``
+runs the agent's copy on a real config bundle; both fail when they drift.
+Keep the two in step.
 """
 
 from __future__ import annotations
@@ -17,13 +19,19 @@ import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import admin_email_error, primary_ns_error
-from app.models.dns import DNSRecord, DNSServer, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSView, DNSZone
+from app.services.dns.pool_geo import (
+    build_geo_steering,
+    build_view_descriptors,
+    records_for_view,
+    views_rendering_zone,
+)
 
 ApexSource = Literal["declared", "primary_ns", "placeholder"]
 
@@ -155,35 +163,97 @@ def compute_served_apex(
 @dataclass(frozen=True)
 class ZoneApexView:
     """A primary zone's :class:`ServedApex` plus whether the BIND9 rule is the
-    one its group's driver follows."""
+    one its group's driver follows.
+
+    Under split-horizon the agent renders the apex once per view, from that
+    view's records, so a zone whose apex NS is declared in one view only is
+    served the placeholder in the others. ``by_view`` then lists every view's
+    apex in render order, and ``apex`` is the worst of them (the loopback glue
+    first, then any placeholder), so a summary never hides it. ``by_view`` is
+    empty when every view serves the same apex, or the group has no views.
+    """
 
     apex: ServedApex
     driver_applies: bool
+    by_view: tuple[tuple[str, ServedApex], ...] = ()
+
+
+def _address_candidates(zone: DNSZone) -> set[str]:
+    """Lowercased stored owner spellings whose A/AAAA can change ``zone``'s
+    apex: the placeholder and an in-zone Primary NS, each relative or
+    absolute. A superset is harmless: other owners never decide the apex."""
+    raw = str(zone.name or "")
+    origin = raw if raw.endswith(".") else raw + "."
+    targets = {f"{PLACEHOLDER_NS_LABEL}.{origin}".lower()}
+    if (primary := _absolute_name(zone.primary_ns)) is not None:
+        targets.add(primary.lower())
+    out: set[str] = set()
+    for t in targets:
+        if not _inside(t, origin):
+            continue
+        out.add(t)
+        if t == origin.lower():
+            out.update({"@", ""})
+        else:
+            out.add(t[: -(len(origin) + 1)])
+    return out
+
+
+def _worst(apexes: list[ServedApex]) -> ServedApex:
+    for a in apexes:
+        if a.placeholder_glue:
+            return a
+    for a in apexes:
+        if a.source == "placeholder":
+            return a
+    return apexes[0]
 
 
 async def served_apex_for_zones(
     db: AsyncSession, zones: Iterable[DNSZone]
 ) -> dict[uuid.UUID, ZoneApexView]:
-    """:class:`ZoneApexView` for each primary zone of ``zones``, in two queries
-    however many zones there are. Other zone types are absent from the result:
-    a secondary, stub or forward zone has no apex of ours."""
-    # Lazy: ``app.services.dns.ingest`` imports this module.
-    from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE  # noqa: PLC0415
+    """:class:`ZoneApexView` for each primary zone of ``zones``. Other zone
+    types are absent from the result: a secondary, stub or forward zone has
+    no apex of ours.
 
+    The inputs are the ones the agent's bundle carries (``agent_config``):
+    every live record, ingest mirrors included (#2850), in the bundle's order,
+    split per view by the bundle's own ``views_rendering_zone`` /
+    ``records_for_view``. Only the rows that can decide an apex are read
+    (apex-candidate NS rows and the A/AAAA of the placeholder and the Primary
+    NS), so a zone's size does not set the cost of a records-list page.
+    """
     primaries = [z for z in zones if z.zone_type == "primary"]
     if not primaries:
         return {}
-    by_zone: dict[uuid.UUID, list[tuple[str, str, str]]] = {z.id: [] for z in primaries}
+    by_zone: dict[uuid.UUID, list[Any]] = {z.id: [] for z in primaries}
+    addr_names: set[str] = set()
+    for z in primaries:
+        addr_names |= _address_candidates(z)
+    rtype = func.upper(DNSRecord.record_type)
     rows = await db.execute(
-        select(DNSRecord.zone_id, DNSRecord.name, DNSRecord.record_type, DNSRecord.value).where(
+        select(
+            DNSRecord.zone_id,
+            DNSRecord.name,
+            DNSRecord.record_type,
+            DNSRecord.value,
+            DNSRecord.view_id,
+            DNSRecord.pool_member_id,
+        ).where(
             DNSRecord.zone_id.in_(list(by_zone)),
             DNSRecord.deleted_at.is_(None),
-            # ddns_external mirrors never reach the agent's bundle.
-            DNSRecord.import_source.is_distinct_from(EXTERNAL_IMPORT_SOURCE),
+            or_(
+                rtype == "NS",
+                and_(rtype.in_(("A", "AAAA")), func.lower(DNSRecord.name).in_(addr_names)),
+            ),
         )
+        # The bundle's record order (``_records_query``): the first declared
+        # NS is the SOA MNAME when no Primary NS is set.
+        .order_by(DNSRecord.zone_id, DNSRecord.name, DNSRecord.record_type, DNSRecord.value)
     )
-    for zone_id, name, rtype, value in rows.all():
-        by_zone[zone_id].append((name, rtype, value))
+    for row in rows.all():
+        by_zone[row.zone_id].append(row)
+
     group_ids = {z.group_id for z in primaries}
     drivers: dict[uuid.UUID, set[str]] = {g: set() for g in group_ids}
     for group_id, driver in (
@@ -192,12 +262,72 @@ async def served_apex_for_zones(
         )
     ).all():
         drivers[group_id].add(driver)
+    views_by_group: dict[uuid.UUID, list[DNSView]] = {g: [] for g in group_ids}
+    for v in (
+        (await db.execute(select(DNSView).where(DNSView.group_id.in_(group_ids)))).scalars().all()
+    ):
+        views_by_group[v.group_id].append(v)
+    geo_by_group = {g: await build_geo_steering(db, g) for g in group_ids}
+    descs_by_group = {
+        g: (
+            build_view_descriptors(
+                sorted(views_by_group[g], key=lambda v: (v.order, v.name)), geo_by_group[g]
+            )
+            if views_by_group[g] or geo_by_group[g].active
+            else []
+        )
+        for g in group_ids
+    }
+    # Which views a zone lands in turns on every view-scoped record it holds,
+    # not only the apex rows read above.
+    viewed = [z.id for z in primaries if descs_by_group[z.group_id]]
+    scoped_views: dict[uuid.UUID, set[uuid.UUID]] = {zid: set() for zid in viewed}
+    if viewed:
+        for zone_id, view_id in (
+            await db.execute(
+                select(DNSRecord.zone_id, DNSRecord.view_id)
+                .where(
+                    DNSRecord.zone_id.in_(viewed),
+                    DNSRecord.deleted_at.is_(None),
+                    DNSRecord.view_id.is_not(None),
+                )
+                .distinct()
+            )
+        ).all():
+            scoped_views[zone_id].add(view_id)
+
+    def _apex(z: DNSZone, recs: list[Any]) -> ServedApex:
+        return compute_served_apex(
+            z.name, z.primary_ns, z.admin_email, ((r.name, r.record_type, r.value) for r in recs)
+        )
+
     out: dict[uuid.UUID, ZoneApexView] = {}
     for z in primaries:
         # A group with no servers yet defaults to bind9, the flagship driver.
         names = drivers[z.group_id] or {"bind9"}
-        out[z.id] = ZoneApexView(
-            compute_served_apex(z.name, z.primary_ns, z.admin_email, by_zone[z.id]),
-            names == {"bind9"},
-        )
+        applies = names == {"bind9"}
+        geo = geo_by_group[z.group_id]
+        recs = by_zone[z.id]
+        descs = descs_by_group[z.group_id]
+        if not descs:
+            flat = [
+                r
+                for r in recs
+                if r.pool_member_id is None or str(r.pool_member_id) not in geo.unreachable_members
+            ]
+            out[z.id] = ZoneApexView(_apex(z, flat), applies)
+            continue
+        per_view = [
+            (vd["name"], _apex(z, records_for_view(recs, vd, geo)))
+            for vd in views_rendering_zone(descs, z.view_id, scoped_views[z.id])
+        ]
+        if not per_view:
+            # Rendered in no view, so served nowhere; describe the shared rows.
+            out[z.id] = ZoneApexView(_apex(z, [r for r in recs if r.view_id is None]), applies)
+            continue
+        apexes = [a for _, a in per_view]
+        if all(a == apexes[0] for a in apexes):
+            out[z.id] = ZoneApexView(apexes[0], applies)
+        else:
+            out[z.id] = ZoneApexView(_worst(apexes), applies, tuple(per_view))
     return out

@@ -173,6 +173,19 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
                 "ns": list(view.apex.ns),
                 "source": view.apex.source,
                 "placeholder_glue_loopback": view.apex.placeholder_glue,
+                # Split-horizon views that serve different apexes; empty when
+                # they agree. The fields above are then the worst view's.
+                "by_view": [
+                    {
+                        "view": name,
+                        "soa_mname": a.soa_mname,
+                        "soa_rname": a.soa_rname,
+                        "ns": list(a.ns),
+                        "source": a.source,
+                        "placeholder_glue_loopback": a.placeholder_glue,
+                    }
+                    for name, a in view.by_view
+                ],
             }
         if z.zone_type == "forward":
             # #2121 — the zone's OWN upstream transport, independent of the

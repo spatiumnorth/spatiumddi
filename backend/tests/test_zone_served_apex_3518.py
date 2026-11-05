@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.auth import Group, Role, User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
 from app.services.ai.tools.dns import ListZonesArgs, list_dns_zones
 from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
 
@@ -79,8 +79,16 @@ async def _zone(
     return zone
 
 
-def _rec(zone: DNSZone, name: str, rtype: str, value: str, source: str | None = None) -> DNSRecord:
+def _rec(
+    zone: DNSZone,
+    name: str,
+    rtype: str,
+    value: str,
+    source: str | None = None,
+    view: DNSView | None = None,
+) -> DNSRecord:
     return DNSRecord(
+        view_id=view.id if view is not None else None,
         zone_id=zone.id,
         name=name,
         fqdn=zone.name.rstrip(".") if name == "@" else f"{name}.{zone.name.rstrip('.')}",
@@ -107,6 +115,7 @@ async def test_the_placeholder_case(client: AsyncClient, db_session: AsyncSessio
         "ns": ["ns1.apex.example.com."],
         "source": "placeholder",
         "placeholder_glue_loopback": True,
+        "by_view": [],
     }
     # Not records: the list and its counts are untouched.
     assert body["items"] == [] and body["total"] == 0
@@ -144,19 +153,26 @@ async def test_a_declared_ns_set_is_the_whole_set(
     assert apex["placeholder_glue_loopback"] is False
 
 
-async def test_a_mirrored_or_deleted_ns_is_not_declared(
+async def test_a_deleted_ns_is_not_declared_and_a_mirrored_one_is(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Only rows that reach the agent's bundle decide the NS set."""
+    """Only rows that reach the agent's bundle decide the NS set. A deleted row
+    does not; an ingest mirror of an NS a third party added by RFC 2136 does
+    (#2850), and the agent serves it as the zone's NS set."""
     from datetime import UTC, datetime
 
     h = _h(await _user(db_session, None))
     zone = await _zone(db_session)
     gone = _rec(zone, "@", "NS", "ns-gone.example.net.")
     gone.deleted_at = datetime.now(UTC)
-    db_session.add_all([_rec(zone, "@", "NS", "ns-m.example.net.", EXTERNAL_IMPORT_SOURCE), gone])
+    db_session.add(gone)
     await db_session.commit()
     assert (await _get(client, zone, h)).json()["served_apex"]["source"] == "placeholder"
+    db_session.add(_rec(zone, "@", "NS", "ns-m.example.net.", EXTERNAL_IMPORT_SOURCE))
+    await db_session.commit()
+    apex = (await _get(client, zone, h)).json()["served_apex"]
+    assert apex["source"] == "declared"
+    assert apex["ns"] == ["ns-m.example.net."]
 
 
 async def test_the_non_host_name_zone_has_no_loopback_glue(
@@ -250,3 +266,48 @@ async def test_the_copilot_zone_read_carries_it(db_session: AsyncSession) -> Non
         for r in await list_dns_zones(db_session, user, ListZonesArgs(group_id=str(sec.group_id)))
     }
     assert "served_apex" not in rows2["b.example.com."]
+
+
+async def test_split_horizon_reports_each_view(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An apex NS declared in one view only leaves every other view on the
+    placeholder glued to loopback, so the summary is that view's, and each
+    view's apex is listed."""
+    h = _h(await _user(db_session, None))
+    zone = await _zone(db_session)
+    internal = DNSView(group_id=zone.group_id, name="internal", match_clients=["10/8"], order=0)
+    external = DNSView(group_id=zone.group_id, name="external", match_clients=["any"], order=1)
+    db_session.add_all([internal, external])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            _rec(zone, "@", "NS", "ns-int.example.com.", view=internal),
+            # A record scoped to ``external`` puts the zone in that view too.
+            _rec(zone, "www", "A", "192.0.2.1", view=external),
+        ]
+    )
+    await db_session.commit()
+    apex = (await _get(client, zone, h)).json()["served_apex"]
+    assert apex["source"] == "placeholder"
+    assert apex["placeholder_glue_loopback"] is True
+    assert [(v["view"], v["source"], v["ns"]) for v in apex["by_view"]] == [
+        ("internal", "declared", ["ns-int.example.com."]),
+        ("external", "placeholder", ["ns1.apex.example.com."]),
+    ]
+
+
+async def test_views_that_agree_are_summarised_once(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = _h(await _user(db_session, None))
+    zone = await _zone(db_session, primary_ns="ns.provider.net.")
+    db_session.add_all(
+        [
+            DNSView(group_id=zone.group_id, name="a", match_clients=["10/8"], order=0),
+            DNSView(group_id=zone.group_id, name="b", match_clients=["any"], order=1),
+        ]
+    )
+    await db_session.commit()
+    apex = (await _get(client, zone, h)).json()["served_apex"]
+    assert apex["source"] == "primary_ns" and apex["by_view"] == []

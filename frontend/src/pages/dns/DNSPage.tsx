@@ -5384,20 +5384,29 @@ export function ZoneDetailView({
                   )}
                 </thead>
                 <tbody className={zebraBodyCls}>
-                  {showServedApex && servedApex && (
-                    <ServedApexRows
-                      apex={servedApex}
-                      zoneName={zone.name}
-                      onEditZone={() => setShowEditZone(true)}
-                      editDisabledReason={
-                        zone.tailscale_tenant_id
-                          ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
-                          : can("write", "dns_zone")
-                            ? undefined
-                            : NEEDS_ZONE_WRITE
-                      }
-                    />
-                  )}
+                  {showServedApex &&
+                    servedApex &&
+                    // Under split-horizon each view renders its own apex;
+                    // when they differ, one set of rows per view.
+                    (servedApex.by_view?.length
+                      ? servedApex.by_view
+                      : [{ ...servedApex, view: undefined }]
+                    ).map((a) => (
+                      <ServedApexRows
+                        key={a.view ?? ""}
+                        apex={a}
+                        viewName={a.view}
+                        zoneName={zone.name}
+                        onEditZone={() => setShowEditZone(true)}
+                        editDisabledReason={
+                          zone.tailscale_tenant_id
+                            ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
+                            : can("write", "dns_zone")
+                              ? undefined
+                              : NEEDS_ZONE_WRITE
+                        }
+                      />
+                    ))}
                   {filtered.map((r) => (
                     <ContextMenu key={r.id}>
                       <ContextMenuTrigger asChild>
@@ -6086,11 +6095,13 @@ const SERVED_BADGE_CLS =
  * record. */
 function ServedApexRows({
   apex,
+  viewName,
   zoneName,
   onEditZone,
   editDisabledReason,
 }: {
-  apex: ServedApex;
+  apex: Pick<ServedApex, "soa" | "ns" | "source" | "placeholder_glue_loopback">;
+  viewName?: string;
   zoneName: string;
   onEditZone: () => void;
   editDisabledReason: string | undefined;
@@ -6122,11 +6133,32 @@ function ServedApexRows({
     </span>
   );
   const showNs = apex.source !== "declared";
+  // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
+  // holds its own address for ns1), or ``invalid.`` for a zone whose name is
+  // not a host name, which never resolves.
   const warning = apex.placeholder_glue_loopback
     ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-    : apex.source === "placeholder"
+    : apex.source === "placeholder" && apex.ns.includes("invalid.")
       ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-      : null;
+      : apex.source === "placeholder"
+        ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
+        : null;
+  const nameCell = (
+    <td className="py-1.5 pl-5 font-mono text-xs font-medium">
+      <span className="inline-flex items-center gap-1.5">
+        @
+        {viewName && (
+          <span
+            className="rounded border px-1 py-0.5 font-sans text-[10px] text-muted-foreground"
+            title={`Served in view ${viewName}; the zone's views serve different apexes`}
+            data-testid="served-apex-view"
+          >
+            view {viewName}
+          </span>
+        )}
+      </span>
+    </td>
+  );
   return (
     <>
       <tr
@@ -6135,7 +6167,7 @@ function ServedApexRows({
         aria-label="SOA served from zone settings"
       >
         <td className="w-8 py-1.5 pl-3" />
-        <td className="py-1.5 pl-5 font-mono text-xs font-medium">@</td>
+        {nameCell}
         <td className="py-1.5">
           <span className="inline-flex items-center gap-1.5">
             {typeBadge("SOA")}
@@ -6162,7 +6194,7 @@ function ServedApexRows({
             aria-label="NS served from zone settings"
           >
             <td className="w-8 py-1.5 pl-3" />
-            <td className="py-1.5 pl-5 font-mono text-xs font-medium">@</td>
+            {nameCell}
             <td className="py-1.5">
               <span className="inline-flex items-center gap-1.5">
                 {typeBadge("NS")}

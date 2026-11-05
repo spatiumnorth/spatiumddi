@@ -1901,6 +1901,16 @@ class ServedApexSoa(BaseModel):
     rname: str
 
 
+class ServedApexInView(BaseModel):
+    """One split-horizon view's apex, when the views do not all agree."""
+
+    view: str
+    soa: ServedApexSoa
+    ns: list[str]
+    source: Literal["declared", "primary_ns", "placeholder"]
+    placeholder_glue_loopback: bool
+
+
 class ServedApex(BaseModel):
     """The SOA and apex NS a primary zone serves from its settings (#3518).
 
@@ -1924,6 +1934,11 @@ class ServedApex(BaseModel):
     # The placeholder NS is glued to 127.0.0.1: every resolver that follows
     # the zone's NS set is sent to its own loopback.
     placeholder_glue_loopback: bool
+    # Under split-horizon the apex is rendered per view, from that view's
+    # records. Empty when every view serves the same apex (or there are no
+    # views); otherwise each view's apex in render order, and the fields above
+    # are the worst of them, so the loopback glue is never summarised away.
+    by_view: list[ServedApexInView] = []
 
 
 class RecordPage(Page[RecordResponse]):
@@ -9035,6 +9050,16 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
         ns=list(view.apex.ns),
         source=view.apex.source,
         placeholder_glue_loopback=view.apex.placeholder_glue,
+        by_view=[
+            ServedApexInView(
+                view=name,
+                soa=ServedApexSoa(mname=a.soa_mname, rname=a.soa_rname),
+                ns=list(a.ns),
+                source=a.source,
+                placeholder_glue_loopback=a.placeholder_glue,
+            )
+            for name, a in view.by_view
+        ],
     )
 
 

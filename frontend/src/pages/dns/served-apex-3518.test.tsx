@@ -113,6 +113,7 @@ const apex = (over: Record<string, unknown> = {}) => ({
   ns: ["ns1.example.com."],
   source: "placeholder",
   placeholder_glue_loopback: true,
+  by_view: [],
   ...over,
 });
 
@@ -212,6 +213,63 @@ describe("the SOA and apex NS a zone serves (#3518)", () => {
     expect(screen.queryByTestId("served-apex-soa")).toBeNull();
     expect(screen.queryByTestId("served-apex-ns")).toBeNull();
     expect(screen.getByTestId("served-apex-driver-note")).toBeTruthy();
+  });
+
+  it("lists each view's apex when split-horizon views disagree", async () => {
+    await openZone(
+      apex({
+        by_view: [
+          {
+            view: "internal",
+            soa: { mname: "ns-int.example.com.", rname: "admin.example.com." },
+            ns: ["ns-int.example.com."],
+            source: "declared",
+            placeholder_glue_loopback: false,
+          },
+          {
+            view: "external",
+            soa: { mname: "ns1.example.com.", rname: "admin.example.com." },
+            ns: ["ns1.example.com."],
+            source: "placeholder",
+            placeholder_glue_loopback: true,
+          },
+        ],
+      }),
+    );
+    const soas = screen.getAllByTestId("served-apex-soa");
+    expect(soas.map((r) => r.textContent)).toEqual([
+      expect.stringContaining("view internal"),
+      expect.stringContaining("view external"),
+    ]);
+    expect(soas[0].textContent).toContain("ns-int.example.com.");
+    // Only the external view serves NS from the zone's settings, and it is
+    // the one glued to loopback.
+    const ns = screen.getAllByTestId("served-apex-ns");
+    expect(ns).toHaveLength(1);
+    expect(ns[0].textContent).toContain("view external");
+    expect(screen.getByTestId("served-apex-warning").textContent).toContain(
+      "127.0.0.1",
+    );
+  });
+
+  it("does not call an addressed placeholder unresolvable", async () => {
+    await openZone(apex({ placeholder_glue_loopback: false }));
+    const warning = screen.getByTestId("served-apex-warning").textContent;
+    expect(warning).not.toContain("never resolves");
+    expect(warning).not.toContain("127.0.0.1");
+  });
+
+  it("calls invalid. unresolvable", async () => {
+    await openZone(
+      apex({
+        ns: ["invalid."],
+        soa: { mname: "invalid.", rname: "invalid." },
+        placeholder_glue_loopback: false,
+      }),
+    );
+    expect(screen.getByTestId("served-apex-warning").textContent).toContain(
+      "never resolves",
+    );
   });
 
   it("shows nothing when the response carries no apex", async () => {

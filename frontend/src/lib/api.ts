@@ -6247,6 +6247,17 @@ export interface ServedApex {
   ns: string[];
   source: "declared" | "primary_ns" | "placeholder";
   placeholder_glue_loopback: boolean;
+  // Split-horizon views that serve different apexes, in render order; empty
+  // when they agree. The fields above are then the worst view's.
+  by_view: ServedApexInView[];
+}
+
+export interface ServedApexInView {
+  view: string;
+  soa: { mname: string; rname: string };
+  ns: string[];
+  source: "declared" | "primary_ns" | "placeholder";
+  placeholder_glue_loopback: boolean;
 }
 
 export interface DNSRecordPage extends Page<DNSRecord> {

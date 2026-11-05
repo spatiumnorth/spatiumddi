@@ -164,7 +164,9 @@ def _placeholder_glue_in_use(zone: DNSZone, managed: list[DNSRecord]) -> bool:
 
     The rule is ``compute_served_apex``, the control plane's copy of the
     agent's ``_zone_apex``. ``managed`` is every live row that is not an
-    external mirror, since only those reach the agent's bundle. A zone whose
+    external mirror. Mirrors do reach the agent's bundle (#2850), but a mirror
+    an earlier build made of the glue itself must not count as the address
+    that makes the glue unnecessary, or it would never be swept. A zone whose
     own NS record names ``ns1.<zone>`` also gets the glue, but that is the
     operator's name server and its loopback A is theirs to keep, so only the
     fallback counts.
