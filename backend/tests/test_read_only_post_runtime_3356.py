@@ -576,14 +576,16 @@ CASES: dict[str, Callable[[Seed], Req]] = {
 # Routes that cannot be driven here, with why. Empty today: every route runs.
 EXEMPT: dict[str, str] = {}
 
-# Writes a read-only route is explicitly ALLOWED to make: path -> (reason, substring a
-# violation must contain to be waived). Everything else is still a violation.
-ALLOWED_WRITES: dict[str, tuple[str, str]] = {
+# Writes a read-only route is explicitly ALLOWED to make: path -> (reason, the exact
+# violation prefixes waived). Only an INSERT into the named table (and the ORM flush of
+# a NEW row of its model) is waived; an UPDATE or DELETE of it, or a write to any other
+# table, is still a violation.
+ALLOWED_WRITES: dict[str, tuple[str, tuple[str, ...]]] = {
     "/held": (
         "#3514: POST /held writes the e911_resolution_log lookup trail, kept on purpose. "
         "Bounded by a per-caller logging budget (past it the lookup is answered without a "
-        "row) and the daily prune_e911_resolution_log retention sweep.",
-        "e911_resolution_log",
+        "row) and the daily prune_e911_resolution_log retention sweep, both settings.",
+        ("DML: INSERT INTO e911_resolution_log ", "DML: flush new E911ResolutionLog"),
     ),
 }
 # Routes the harness caught breaking the read-only claim and that are not yet fixed
@@ -626,11 +628,16 @@ async def test_read_only_post_writes_nothing_and_calls_nothing(
         guard.armed = True
         resp = await _call(client, req, seed.raw_token)
         guard.armed = False
-    waiver = ALLOWED_WRITES.get(path)
-    # The waiver names the table; the ORM flush entry names the model class.
-    waived = ("e911_resolution_log", "E911ResolutionLog") if waiver else ()
-    violations = [v for v in guard.violations if not any(w in v for w in waived)]
+    waived = ALLOWED_WRITES[path][1] if path in ALLOWED_WRITES else ()
+    violations = [v for v in guard.violations if not v.startswith(waived)]
     assert not violations, f"{path} broke the read-only claim: {violations}"
+    if waived:
+        # An allowlist entry that waives nothing hides the day the write stops (or moves
+        # to another table): the waiver must match what the route actually does.
+        assert any(v.startswith(waived) for v in guard.violations), (
+            f"{path} is in ALLOWED_WRITES but made none of the waived writes: "
+            f"{guard.violations}"
+        )
     # The route must actually have run: a 401 / 403 / 404 / 422 means the body or the seed
     # was wrong and the guard watched nothing.
     assert resp.status_code == 200, f"{path} -> {resp.status_code} {resp.text[:300]}"
