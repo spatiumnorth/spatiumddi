@@ -211,6 +211,8 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "soft_delete_purge_days",
     "pcap_retention_days",
     "appliance_revoked_retention_days",
+    "e911_resolution_log_retention_days",
+    "e911_lookup_log_budget_per_minute",
   ],
   dns: [
     "dns_default_ttl",
@@ -501,13 +503,15 @@ type RetentionKey =
   | "pcap_retention_days"
   | "appliance_revoked_retention_days"
   | "metric_retention_days"
-  | "log_retention_hours";
+  | "log_retention_hours"
+  | "e911_resolution_log_retention_days"
+  | "e911_lookup_log_budget_per_minute";
 
 const RETENTION_ROWS: {
   key: RetentionKey;
   label: string;
   description: string;
-  unit: "days" | "hours";
+  unit: "days" | "hours" | "lookups / min";
   min: number;
   max: number;
   fallback: number;
@@ -571,6 +575,26 @@ const RETENTION_ROWS: {
     min: 0,
     max: 365,
     fallback: 30,
+  },
+  {
+    key: "e911_resolution_log_retention_days",
+    label: "E911 location-lookup trail",
+    description:
+      "Who asked where a device is, and what they were told (/location and HELD). 7–3650 days. No keep-forever option: a read-only API token can add rows.",
+    unit: "days",
+    min: 7,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "e911_lookup_log_budget_per_minute",
+    label: "E911 HELD lookups logged per caller",
+    description:
+      "Per API token or user, per minute. 1–6000. Past it, a HELD lookup is still answered but not added to the trail (a warning is logged), so a read-only token cannot grow the table without bound.",
+    unit: "lookups / min",
+    min: 1,
+    max: 6000,
+    fallback: 120,
   },
 ];
 

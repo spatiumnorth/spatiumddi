@@ -680,3 +680,31 @@ async def test_held_over_the_log_budget_answers_without_a_trail_row(client, db_s
         res = await client.post("/held", content=body, headers=hdr)
     assert res.status_code == 200
     assert await count() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_held_reads_the_log_budget_setting_live(client, db_session) -> None:
+    """#3514: the budget is ``PlatformSettings.e911_lookup_log_budget_per_minute``,
+    read on every call, not a constant."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.models.settings import PlatformSettings
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, _room = await _estate_with_location(db_session)
+    row = await db_session.get(PlatformSettings, 1)
+    if row is None:
+        row = PlatformSettings(id=1)
+        db_session.add(row)
+    row.e911_lookup_log_budget_per_minute = 7
+    await db_session.commit()
+
+    body = _req(f"<locationType>civic</locationType><device><ip>{ip}</ip></device>")
+    hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
+    limiter = AsyncMock(return_value=False)
+    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", limiter):
+        res = await client.post("/held", content=body, headers=hdr)
+    assert res.status_code == 200, res.text
+    assert limiter.await_args is not None
+    assert limiter.await_args.args[1] == 7
