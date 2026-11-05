@@ -468,7 +468,7 @@ DNSServerOptions.forward_policy: enum(
 )
 ```
 
-- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` or per-view
+- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` (group-level; per-view forwarders are not implemented, see #3523)
 - Per-zone forward overrides (stub/forward zone type) take precedence over global forwarders
 
 ### 3.2 Recursion
@@ -738,10 +738,12 @@ Settings can be defined at three levels and are evaluated from most-specific to 
 ```
 Zone override  (per-zone notify, allow-transfer, also-notify)
     ↓
-View override  (per-view recursion, allow-query, allow-query-cache, forwarders)
+View override  (per-view recursion, allow-query, allow-query-cache)
     ↓
 Server default (DNSServerOptions — applies to all views/zones on that server)
 ```
+
+Forwarders are **group-level only**: a view has no forwarder fields and the agent's view block renders only `match-clients`, recursion, `allow-query` and `allow-query-cache`, so every view inherits the group's `forwarders`. Per-view forwarders are tracked in [#3523](https://github.com/spatiumnorth/spatiumddi/issues/3523).
 
 The driver is responsible for generating the correct BIND9 config that reflects this layered precedence. Service-layer code must not hard-code driver specifics.
 
