@@ -155,7 +155,10 @@ from app.services.dns.delegation import (
 )
 from app.services.dns.dnssec_trust import (
     NEEDS_ANCHOR_MESSAGE,
+    STATIC_ROOT_ANCHOR_MESSAGE,
     count_anchors,
+    has_static_root_anchor,
+    is_root_zone,
     stored_validation,
 )
 from app.services.dns.drift import zone_state_in_sync
@@ -1272,8 +1275,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored group forwarders that cannot work with the group's transport,
     # saved before the #2128 refusal. Advisory: the save is not refused.
     forwarder_warnings: list[str] = Field(default_factory=list)
-    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
-    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    # DNSSEC config stored before the API refused it, and what is rendered
+    # instead: ``yes`` with no trust anchor on a BIND9 group renders as
+    # ``auto`` (#3560), a static root anchor as initial-key (#3609).
     dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
@@ -4124,6 +4128,13 @@ async def _options_response(
             "refuses that config, so it is rendered as 'auto' (BIND's built-in root key) "
             "until you add a trust anchor or set 'auto' here."
         )
+    if "bind9" in drivers and has_static_root_anchor(opts.trust_anchors or ()):
+        out.dnssec_warnings.append(
+            "The root ('.') trust anchor is stored as static, which BIND refuses beside "
+            "'auto' and which fails at the next root key rollover in any mode, so it is "
+            "rendered as initial-key (RFC 5011). Re-add it as an initial-key anchor to "
+            "make the stored row match (#3609)."
+        )
     if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
         out.technitium_warnings = technitium_stored_warnings(opts, acls)
@@ -4621,6 +4632,10 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # #3609: a static root anchor is never right — BIND refuses it under
+    # ``auto`` and it breaks at the next root key rollover under ``yes``.
+    if is_root_zone(body.zone_name) and not body.is_initial_key:
+        raise HTTPException(status_code=422, detail=STATIC_ROOT_ANCHOR_MESSAGE)
     # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
     # group another driver serves would be accepted and ignored.
     others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")

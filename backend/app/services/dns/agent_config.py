@@ -60,7 +60,10 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
-from app.services.dns.dnssec_trust import effective_dnssec_validation
+from app.services.dns.dnssec_trust import (
+    effective_dnssec_validation,
+    render_as_initial_key,
+)
 from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
@@ -1712,7 +1715,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                     "algorithm": ta.algorithm,
                     "key_tag": ta.key_tag,
                     "public_key": ta.public_key,
-                    "is_initial_key": bool(ta.is_initial_key),
+                    # A static root anchor is rendered as initial-key (#3609).
+                    "is_initial_key": render_as_initial_key(ta.zone_name, ta.is_initial_key),
                 }
                 for ta in opts.trust_anchors
             ),

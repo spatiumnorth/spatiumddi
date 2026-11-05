@@ -61,7 +61,8 @@ def _anchor(**over: object) -> dict[str, object]:
         "algorithm": 8,
         "key_tag": 20326,
         "public_key": KEY,
-        "is_initial_key": False,
+        # A static root anchor is refused since #3609.
+        "is_initial_key": True,
     }
     body.update(over)
     return body
@@ -94,7 +95,7 @@ async def test_anchor_is_shipped_and_shifts_the_etag(
             "algorithm": 8,
             "key_tag": 20326,
             "public_key": KEY,
-            "is_initial_key": False,
+            "is_initial_key": True,
         }
     ]
     assert after["etag"] != before["etag"]

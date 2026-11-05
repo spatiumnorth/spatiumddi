@@ -10,11 +10,23 @@ Only BIND9 has the rule. Technitium has a boolean validation switch and
 no anchor concept, PowerDNS authoritative does not validate; both accept
 ``yes`` as before, so the check is scoped to groups holding a BIND9
 server (an empty group reads as BIND9, like every other driver gate).
+
+A root (``.``) anchor must be ``initial-key`` (#3609). BIND refuses a
+``static-key`` root anchor beside ``dnssec-validation auto`` ("static trust
+anchor for root zone cannot be used with 'dnssec-validation auto'") and, in
+any mode, warns that it "WILL FAIL after key rollover": a static key is never
+updated, so validation of everything breaks at the next root KSK roll. There
+is no mode in which a static root anchor is right, so it is refused on
+create whatever the validation mode. A row stored before that refusal is
+rendered as ``initial-key`` (RFC 5011 tracking from the same key), which
+loads under every mode, and the options response says so.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +38,32 @@ NEEDS_ANCHOR_MESSAGE = (
     "refuse to load the config otherwise). Either set dnssec_validation to 'auto' to "
     "validate against BIND's built-in root key, or add a trust anchor first."
 )
+
+STATIC_ROOT_ANCHOR_MESSAGE = (
+    "A static (is_initial_key: false) trust anchor for the root zone '.' is refused: BIND "
+    "will not load it beside dnssec_validation 'auto', and in any mode a static root key "
+    "stops validating everything at the next root key rollover. Add it as an initial-key "
+    "anchor (is_initial_key: true, the default), which BIND keeps current by RFC 5011; "
+    "it loads under both 'auto' and 'yes'."
+)
+
+
+def is_root_zone(zone_name: str) -> bool:
+    return zone_name.strip().rstrip(".") == ""
+
+
+def render_as_initial_key(zone_name: str, is_initial_key: bool) -> bool:
+    """Whether to render an anchor as ``initial-key``.
+
+    A static root anchor stored before #3609 refused it is rendered as
+    ``initial-key`` so the group's config loads (BIND refuses it under
+    ``auto``) and survives the next root key rollover.
+    """
+    return bool(is_initial_key) or is_root_zone(zone_name)
+
+
+def has_static_root_anchor(anchors: Iterable[Any]) -> bool:
+    return any(is_root_zone(a.zone_name) and not a.is_initial_key for a in anchors)
 
 
 async def count_anchors(

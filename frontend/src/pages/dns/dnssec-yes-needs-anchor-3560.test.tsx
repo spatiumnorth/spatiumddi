@@ -112,6 +112,26 @@ describe("dnssec_validation yes needs a trust anchor (#3560)", () => {
     expect(await screen.findByText(/needs a trust anchor first/)).toBeTruthy();
   });
 
+  it("explains that a root anchor must be initial-key (#3609)", async () => {
+    state.servers = [{ driver: "bind9" }];
+    renderTab();
+    const hint = await screen.findByText(/needs a trust anchor first/);
+    expect(hint.textContent).toMatch(
+      /root \("\."\) anchor must be initial-key/,
+    );
+    expect(hint.textContent).toMatch(/static root anchor is refused/);
+  });
+
+  it("shows the server's warning for a stored static root anchor (#3609)", async () => {
+    state.servers = [{ driver: "bind9" }];
+    state.anchors = [{ id: "a1", zone_name: ".", is_initial_key: false }];
+    state.warnings = [
+      "The root ('.') trust anchor is stored as static, which BIND refuses beside 'auto' and which fails at the next root key rollover in any mode, so it is rendered as initial-key (RFC 5011).",
+    ];
+    renderTab();
+    expect(await screen.findByText(/rendered as initial-key/)).toBeTruthy();
+  });
+
   it("treats an empty group as BIND9", async () => {
     renderTab();
     expect((await yesOption()).disabled).toBe(true);

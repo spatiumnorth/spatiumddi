@@ -8617,7 +8617,11 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             &quot;yes&quot; needs a trust anchor first: BIND 9.20 will not load
             it without one. Add an anchor with POST
             /dns/groups/&#123;id&#125;/options/trust-anchors, or use
-            &quot;auto&quot; (BIND&apos;s built-in root key).
+            &quot;auto&quot; (BIND&apos;s built-in root key). A root
+            (&quot;.&quot;) anchor must be initial-key (is_initial_key: true,
+            the default): a static root anchor is refused, because BIND will not
+            load it beside &quot;auto&quot; and it stops validating at the next
+            root key rollover.
           </p>
         )}
         {(opts?.dnssec_warnings?.length ?? 0) > 0 && (

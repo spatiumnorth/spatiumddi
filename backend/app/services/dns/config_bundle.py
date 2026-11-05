@@ -41,7 +41,10 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
-from app.services.dns.dnssec_trust import effective_dnssec_validation
+from app.services.dns.dnssec_trust import (
+    effective_dnssec_validation,
+    render_as_initial_key,
+)
 from app.services.dns.named_conf_validation import (
     effective_key_lifetime_days,
     effective_nsec3_iterations,
@@ -156,7 +159,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                     algorithm=ta.algorithm,
                     key_tag=ta.key_tag,
                     public_key=ta.public_key,
-                    is_initial_key=ta.is_initial_key,
+                    # A static root anchor is rendered as initial-key (#3609).
+                    is_initial_key=render_as_initial_key(ta.zone_name, ta.is_initial_key),
                 )
                 for ta in (opts_row.trust_anchors or ())
             ),
