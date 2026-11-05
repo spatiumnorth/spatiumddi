@@ -24,6 +24,7 @@ import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import {
   CustomerChip,
+  MissingCustomerOption,
   ProviderChip,
   SiteChip,
 } from "@/components/ownership/pickers";
@@ -324,6 +325,10 @@ export function CircuitEditorModal({
               onChange={(e) => setCustomerId(e.target.value || null)}
             >
               <option value="">— None —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}

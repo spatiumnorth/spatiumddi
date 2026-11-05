@@ -3118,18 +3118,6 @@ async def _sync_dns_record(
         # no-primary so the cleanup path still runs against extras.
         effective_zone_id = None
 
-    # Backfill the reverse zone if missing. Subnets created before DNS was
-    # assigned won't have had `ensure_reverse_zones_for_subnet` run at create
-    # time, so every IP allocation is an opportunity to catch up.
-    if backfill_reverse_zone:
-        try:
-            from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
-
-            # Honours the subnet's stored skip_reverse_zone opt-out (#2735).
-            await ensure_reverse_zones_for_subnet(db, subnet, None)
-        except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
-            pass
-
     zone_domain = zone.name.rstrip(".") if zone else ""
     # #2072 — ``<hostname>.<zone>`` past 253 characters is no DNS name, and
     # BIND refuses the zone holding it and the reverse zone whose PTR names
@@ -3563,6 +3551,21 @@ async def _sync_dns_record(
                         existing.ttl,
                     )
             forward_published = True
+
+    # Backfill the reverse zone if missing. Subnets created before DNS was
+    # assigned won't have had `ensure_reverse_zones_for_subnet` run at create
+    # time, so every IP allocation is an opportunity to catch up. After the
+    # forward records (#3503): a zone it creates is audited, and that audit
+    # row's flush takes the audit-chain lock, after which bumping the forward
+    # zone's serial would deadlock against a record create holding that zone.
+    if backfill_reverse_zone:
+        try:
+            from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
+
+            # Honours the subnet's stored skip_reverse_zone opt-out (#2735).
+            await ensure_reverse_zones_for_subnet(db, subnet, None)
+        except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
+            pass
 
     # ── Reverse PTR ─────────────────────────────────────────────────────────
     # A PTR points AT the forward FQDN. With no effective primary forward zone
@@ -6784,26 +6787,6 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             created_by_user_id=current_user.id,
         )
 
-    db.add(
-        _audit(
-            current_user,
-            "create",
-            "subnet",
-            str(subnet.id),
-            f"{canonical} ({body.name})",
-            new_value={**body.model_dump(mode="json"), "network": canonical},
-        )
-    )
-    await db.flush()
-
-    if auto_created:
-        await _update_utilization(db, subnet.id)
-        # The block rollup sums subnet.allocated_ips in SQL: flush the new
-        # count first or it reads the row as inserted (0) (#2532).
-        await db.flush()
-
-    await _update_block_utilization(db, subnet.block_id)
-
     # Auto-create the matching reverse zone once the subnet has an effective
     # DNS group or zone — the binding in the body, or the one it inherits from
     # its block or space (spatiumddi#1149): the console sends no DNS fields at
@@ -6829,7 +6812,35 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # hostname specially: no forward A, PTR only. No reverse-zone catch-up
     # inside it — the step above just ran, or skip_reverse_zone said not to.
     if gw_row is not None:
+        # The placeholder rows are plain db.add()s: flush them first, or the
+        # gateway row has no id yet and the sync's lookup of the records it
+        # owns (``ip_address_id == ip.id``) matches every unowned record.
+        await db.flush()
         await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
+
+    # #3503: the audit row and the recounts come after the PTR above. Both take
+    # the audit-chain lock (the recount explicitly, #3345), and the PTR bumps
+    # the reverse zone's serial: a zone row written after that lock waits for
+    # a record create on the zone that holds the row and waits for the lock.
+    db.add(
+        _audit(
+            current_user,
+            "create",
+            "subnet",
+            str(subnet.id),
+            f"{canonical} ({body.name})",
+            new_value={**body.model_dump(mode="json"), "network": canonical},
+        )
+    )
+    await db.flush()
+
+    if auto_created:
+        await _update_utilization(db, subnet.id)
+        # The block rollup sums subnet.allocated_ips in SQL: flush the new
+        # count first or it reads the row as inserted (0) (#2532).
+        await db.flush()
+
+    await _update_block_utilization(db, subnet.block_id)
 
     await db.commit()
     await db.refresh(subnet)
@@ -13078,6 +13089,10 @@ async def bulk_edit_addresses(
     touched_subnets: set[uuid.UUID] = set()
     # Addresses whose DNS records a zone clear removed (#2172).
     dns_cleared: list[uuid.UUID] = []
+    # #3503: added after the loop. A row's audit flushed before the next row's
+    # DNS sync takes the audit-chain lock ahead of that row's zone, which
+    # deadlocks against a record create holding the zone.
+    audit_rows: list[AuditLog] = []
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
@@ -13226,7 +13241,7 @@ async def bulk_edit_addresses(
                             db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
                         )
 
-            db.add(
+            audit_rows.append(
                 _audit(
                     current_user,
                     "update",
@@ -13257,6 +13272,7 @@ async def bulk_edit_addresses(
                 )
             updated += 1
 
+    db.add_all(audit_rows)
     # Recompute utilization for every subnet whose status mix changed, plus
     # the block rollups above them (#509).
     for sid in touched_subnets:

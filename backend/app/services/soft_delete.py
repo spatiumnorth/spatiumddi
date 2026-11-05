@@ -130,6 +130,9 @@ class SoftDeleteBatch:
     batch_id: uuid.UUID
     rows: list[SoftDeleteRow] = field(default_factory=list)
     bulk: list[BulkChild] = field(default_factory=list)
+    # ``(resource_type, id)`` of every row in ``rows``, kept by ``add_to_batch``
+    # so an object reached twice joins the batch once (#3491).
+    row_keys: set[tuple[str, Any]] = field(default_factory=set, init=False, repr=False)
 
     def counts(self) -> dict[str, int]:
         """Rows per resource type, set-based children included."""
@@ -212,6 +215,11 @@ async def _collect_descendants(db: AsyncSession, root: Any) -> list[Any]:
     can stamp them in any order; restore reverses to root-first if it
     matters. Recursion is bounded by the tree depth, which in practice
     stays under a handful of levels.
+
+    For a space the list can name an object more than once: the walk takes
+    every block of the space and the subtree of each, so a nested block's
+    subtree comes once per level above it. ``add_to_batch`` keeps one row per
+    object (#3491).
     """
 
     out: list[Any] = []
@@ -295,14 +303,29 @@ async def add_to_batch(db: AsyncSession, batch: SoftDeleteBatch, root: Any) -> N
     For a row that must ride ANOTHER root's deletion: a subnet's auto-created
     reverse zone goes into the subnet's batch (spatiumddi#1066) so the trash
     shows one deletion and one restore brings both back, records included.
+
+    Each object joins the batch once (#3491). A space's walk reaches a nested
+    block's subtree once per level above it, and a root can be added to a
+    batch that already holds it. The batch is stamped, audited and counted
+    per row, so a second row for one object is a second ``soft_delete`` audit
+    entry and a second count in the approval preview. The first occurrence is
+    kept, which keeps the walk's order: descendants before their parent.
     """
 
-    objs = [*await _collect_descendants(db, root), root]
-    for obj in objs:
+    added: list[Any] = []
+    for obj in [*await _collect_descendants(db, root), root]:
+        resource_type = _resource_type(obj)
+        key = (resource_type, obj.id)
+        if key in batch.row_keys:
+            continue
+        batch.row_keys.add(key)
         batch.rows.append(
-            SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
+            SoftDeleteRow(obj=obj, resource_type=resource_type, display=_row_display(obj))
         )
-    await _attach_bulk(db, batch, objs)
+        added.append(obj)
+    # Only the rows added here: a zone the batch already holds keeps its one
+    # set-based child, and its records are counted once.
+    await _attach_bulk(db, batch, added)
 
 
 async def apply_soft_delete(

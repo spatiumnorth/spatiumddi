@@ -9,7 +9,9 @@ trashed zone row must go through here — otherwise the row is gone and the zone
 is still served, with no DB trace left to find it by.
 
 Callers: the 30-day ``trash_purge`` sweep and the Trash page's per-row
-permanent delete (``DELETE /admin/trash/dns_zone/{id}``). ``DELETE …?permanent=true``
+permanent delete (``DELETE /admin/trash/dns_zone/{id}``), each of which first
+keeps a shared auto reverse zone away from here while another trashed subnet's
+records still sit in it (handed over, #3190, or refused, #3504). ``DELETE …?permanent=true``
 and the reverse-zone retirement push the same way before deleting a live zone.
 """
 

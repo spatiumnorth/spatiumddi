@@ -202,6 +202,68 @@ describe("a restore that leaves nothing behind", () => {
   });
 });
 
+const heldBack = {
+  batch_id: "b",
+  restored: 1,
+  skipped: [],
+  held_back: [
+    {
+      type: "subnet",
+      id: "s-1",
+      display: "2 IPAM records of 10.198.136.0/24 (name)",
+      reason: "subnet is in the Trash",
+    },
+  ],
+};
+
+function parentConflict(type: string, id: string, display: string) {
+  return {
+    response: {
+      status: 409,
+      data: {
+        detail: {
+          skip_conflicts_allowed: false,
+          conflicts: [
+            {
+              type: "dns_record",
+              id: "r-1",
+              display: "ya.example.test. A",
+              reason: `its parent ${display} is in the Trash`,
+              parent_type: type,
+              parent_id: id,
+              parent_display: display,
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+// Opens the row's dialog and presses Restore, which is refused for a parent in
+// the Trash; leaves the dialog offering "Restore {display} first".
+async function openParentFirst(
+  type = "dns_zone",
+  id = "z-9",
+  display = "example.test.",
+) {
+  list.mockResolvedValue({ items: [entry(1)], total: 1 });
+  restore.mockRejectedValueOnce(parentConflict(type, id, display));
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <TrashPage />
+    </QueryClientProvider>,
+  );
+  fireEvent.click(await screen.findByText("Restore"));
+  const buttons = await screen.findAllByRole("button", { name: "Restore" });
+  fireEvent.click(buttons[buttons.length - 1]);
+  await screen.findByText(`Restore ${display} first`);
+}
+
 describe("a parent still in the Trash (#1957)", () => {
   it("offers to restore the parent first, then restores this row", async () => {
     list.mockResolvedValue({ items: [entry(1)], total: 1 });
@@ -249,6 +311,149 @@ describe("a parent still in the Trash (#1957)", () => {
       "r-1",
       { skipConflicts: false },
     ]);
+  });
+
+  it("keeps the dialog open and lists what the parent's restore left behind (#3505)", async () => {
+    list.mockResolvedValue({ items: [entry(1)], total: 1 });
+    restore.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            skip_conflicts_allowed: true,
+            conflicts: [
+              {
+                type: "dns_record",
+                id: "r-1",
+                display: "ya.example.test. A",
+                reason: "its zone example.test. is in the Trash",
+                parent_type: "dns_zone",
+                parent_id: "z-9",
+                parent_display: "example.test.",
+              },
+            ],
+          },
+        },
+      },
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    const first = await screen.findByText("Restore example.test. first");
+    restore.mockResolvedValueOnce({
+      batch_id: "b",
+      restored: 1,
+      skipped: [],
+      held_back: [
+        {
+          type: "subnet",
+          id: "s-1",
+          display: "2 IPAM records of 10.198.136.0/24 (name)",
+          reason: "subnet is in the Trash",
+        },
+      ],
+    });
+    restore.mockResolvedValueOnce({ batch_id: "b", restored: 1, skipped: [] });
+    fireEvent.click(first);
+    await screen.findByText(/left in the Trash/);
+    expect(
+      screen.getByText(/2 IPAM records of 10\.198\.136\.0\/24 \(name\) — /),
+    ).toBeTruthy();
+    expect(restore).toHaveBeenCalledTimes(3);
+  });
+
+  it("still lists the parent's leftovers when the row's retry then fails (#3505)", async () => {
+    await openParentFirst();
+    restore.mockResolvedValueOnce(heldBack);
+    restore.mockRejectedValueOnce(conflict(false));
+    fireEvent.click(screen.getByText("Restore example.test. first"));
+    await screen.findByText(/An active zone 'example\.test\.' already exists/);
+    expect(screen.getByText(/left in the Trash/)).toBeTruthy();
+    expect(
+      screen.getByText(/2 IPAM records of 10\.198\.136\.0\/24/),
+    ).toBeTruthy();
+    // The row was not restored, so the dialog still offers to retry it.
+    // (The table's own row button is named Restore too, hence two.)
+    expect(screen.getAllByRole("button", { name: "Restore" })).toHaveLength(2);
+  });
+
+  it("keeps offering a further trashed ancestor after one left rows behind (#3505)", async () => {
+    // subnet -> block -> space: the block's restore is refused for its space,
+    // the space comes back holding a row back, the subnet's retry is refused
+    // for the block, and the block must still be offered.
+    await openParentFirst("ip_block", "blk-1", "10.0.0.0/8");
+    restore.mockRejectedValueOnce(
+      parentConflict("ip_space", "sp-1", "Lab space"),
+    );
+    fireEvent.click(screen.getByText("Restore 10.0.0.0/8 first"));
+    const space = await screen.findByText("Restore Lab space first");
+    restore.mockResolvedValueOnce(heldBack);
+    restore.mockRejectedValueOnce(
+      parentConflict("ip_block", "blk-1", "10.0.0.0/8"),
+    );
+    fireEvent.click(space);
+    const block = await screen.findByText("Restore 10.0.0.0/8 first");
+    expect(
+      screen.getByText(/2 IPAM records of 10\.198\.136\.0\/24/),
+    ).toBeTruthy();
+    restore.mockResolvedValueOnce({ batch_id: "b", restored: 1, skipped: [] });
+    restore.mockResolvedValueOnce({ batch_id: "b", restored: 1, skipped: [] });
+    fireEvent.click(block);
+    await screen.findByRole("button", { name: "Close" });
+    expect(
+      screen.getByText(/2 IPAM records of 10\.198\.136\.0\/24/),
+    ).toBeTruthy();
+    // row, block, space, row, block, row.
+    expect(restore).toHaveBeenCalledTimes(6);
+    expect(restore.mock.calls.map((c) => c[0])).toEqual([
+      "dns_record",
+      "ip_block",
+      "ip_space",
+      "dns_record",
+      "ip_block",
+      "dns_record",
+    ]);
+  });
+
+  it("shows the parent's own failure and does not retry the row (#3505)", async () => {
+    await openParentFirst();
+    restore.mockRejectedValueOnce({
+      response: { status: 422, data: { detail: "zone restore refused" } },
+    });
+    fireEvent.click(screen.getByText("Restore example.test. first"));
+    await screen.findByText("zone restore refused");
+    expect(restore).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/left in the Trash/)).toBeNull();
+  });
+
+  it("does not carry one dialog's parent leftovers into the next (#3505)", async () => {
+    await openParentFirst();
+    restore.mockResolvedValueOnce(heldBack);
+    restore.mockResolvedValueOnce({ batch_id: "b", restored: 1, skipped: [] });
+    fireEvent.click(screen.getByText("Restore example.test. first"));
+    await screen.findByText(/left in the Trash/);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() =>
+      expect(screen.queryByText("Restore from trash?")).toBeNull(),
+    );
+    // Reopen and restore cleanly: nothing was left this time, so it closes.
+    restore.mockResolvedValueOnce({ batch_id: "b", restored: 1, skipped: [] });
+    fireEvent.click(screen.getByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() =>
+      expect(screen.queryByText("Restore from trash?")).toBeNull(),
+    );
+    expect(screen.queryByText(/left in the Trash/)).toBeNull();
   });
 
   it("is not offered when the clash is not a trashed parent", async () => {
@@ -406,6 +611,12 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
   it("names a zone's records and pools", async () => {
     const t = await openDelete("dns_zone", 3);
     expect(t).toMatch(/All of its DNS records and its DNS pools/);
+    // #3504 — a shared reverse zone's purge would take another batch's PTRs.
+    expect(t).toMatch(/another trashed subnet's records cannot be purged/);
+    // Restoring those subnets is refused while the zone is trashed (#1957), so
+    // the dialog must not offer it; the zone's own subnet is the way out.
+    expect(t).not.toMatch(/restore those subnets/);
+    expect(t).toMatch(/purge or restore the subnet the zone was deleted with/);
     expect(t).not.toMatch(/other row/);
   });
 

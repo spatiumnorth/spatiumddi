@@ -97,6 +97,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_docs_drift.py": "scripts/lint_docs_drift.py",
+    "test_check_blocklist_catalog.py": "scripts/check_blocklist_catalog.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
