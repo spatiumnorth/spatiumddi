@@ -430,3 +430,107 @@ async def test_subnet_create_spanning_an_existing_reverse_zone_takes_it_first(
             .all()
         )
     assert "23.87.10.in-addr.arpa." in names
+
+
+async def _guarded(run: Callable[[], Awaitable[Any]]) -> tuple[Any, list[str]]:
+    """``run``'s result and the guard's violations for it alone."""
+    from tests import _audit_lock_order_guard as guard
+
+    guard.violations.clear()
+    result = await run()
+    found = list(guard.violations)
+    guard.violations.clear()
+    return result, found
+
+
+async def test_address_import_writes_a_later_rows_zone_before_the_audit_rows(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The first row publishes nothing, so its audit row, flushed with the
+    second row's insert, took the chain lock before the second row's sync
+    bumped the zone. The audit rows are now added after the loop."""
+    from tests.test_dns_sync_address_zone_2104 import _setup
+
+    env = await _setup(client, db_session)
+    zone_id = env.zone.id
+
+    async def commit() -> Response:
+        return await client.post(
+            "/api/v1/ipam/import/addresses/commit",
+            headers=env.headers,
+            files={
+                "file": (
+                    "a.csv",
+                    b"address,hostname\n10.104.5.40,\n10.104.5.41,h41\n",
+                    "text/csv",
+                )
+            },
+            data={"subnet_id": env.sid, "strategy": "skip"},
+        )
+
+    resp, found = await _guarded(commit)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["errors"] == [], resp.text
+    assert found == []
+    assert f"h41.{env.zone.name.rstrip('.')}" in await _live_fqdns(zone_id)
+    async with _TestSessionLocal() as check:
+        audited = set(
+            (
+                await check.execute(
+                    select(AuditLog.resource_display).where(
+                        AuditLog.resource_type == "ip_address", AuditLog.action == "create"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(d.split(" ")[0] for d in audited if d.startswith("10.104.5.4")) == [
+        "10.104.5.40",
+        "10.104.5.41",
+    ]
+
+
+async def test_permanent_zone_delete_through_the_copilot_audits_after_the_delete(
+    db_session: AsyncSession,
+) -> None:
+    """``_apply_delete_zone``: its audit row went out with the set-based record
+    delete's autoflush, taking the chain lock before ``db.delete(zone)``."""
+    from app.services.ai.operations_risky import DeleteZoneArgs, _apply_delete_zone
+
+    user, _ = await _superadmin(db_session)
+    group, zone, _ = await _bind9_group_zone_key(db_session)
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id, name="www", fqdn=f"www.{zone.name}", record_type="A", value="192.0.2.7"
+        )
+    )
+    await db_session.commit()
+    group_id, zone_id = group.id, zone.id
+
+    async def delete() -> Any:
+        return await _apply_delete_zone(
+            db_session, user, DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=True)
+        )
+
+    result, found = await _guarded(delete)
+    assert result == {"zone_id": str(zone_id), "mode": "delete"}
+    assert found == []
+    async with _TestSessionLocal() as check:
+        gone = (
+            await check.execute(
+                select(DNSZone.id)
+                .where(DNSZone.id == zone_id)
+                .execution_options(include_deleted=True)
+            )
+        ).first() is None
+        audited = (
+            await check.execute(
+                select(AuditLog.id).where(
+                    AuditLog.resource_type == "dns_zone",
+                    AuditLog.action == "delete",
+                    AuditLog.resource_id == str(zone_id),
+                )
+            )
+        ).first() is not None
+    assert gone and audited
