@@ -38,6 +38,23 @@ def test_env_override_wins_and_is_validated() -> None:
     )
 
 
+@pytest.mark.parametrize("value", ["unlimited", "UNLIMITED", "0", "0m", "00"])
+def test_unlimited_and_zero_overrides_are_ignored(value: str) -> None:
+    """BIND 9.21.21+ treats ``unlimited`` / ``0`` as the default (90 % of host
+    RAM), so they fall back to the derived ceiling instead of reaching named.conf
+    (#3565). The install still starts."""
+    assert _render_max_cache_size({"NAMED_MAX_CACHE_SIZE": value}, 2 * GIB) == (
+        "    max-cache-size 512m;\n"
+    )
+
+
+def test_default_and_nonzero_sizes_still_pass() -> None:
+    for v in ("default", "1", "512m", "2G"):
+        assert _render_max_cache_size({"NAMED_MAX_CACHE_SIZE": v}, 2 * GIB) == (
+            f"    max-cache-size {v};\n"
+        )
+
+
 @pytest.mark.parametrize(
     "content,expected",
     [

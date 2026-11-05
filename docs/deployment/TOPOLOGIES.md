@@ -40,7 +40,16 @@ agent peaked at 480 MB while taking a bundle, so a group that size fits
 the default only while its resolver cache stays small, and wants 3Gi if it
 also recurses for clients. A cold start at that size spends tens of minutes
 checking zones before named listens, which the containers' 60-minute
-startup probe allows for. See
+startup probe allows for. **Views multiply blocklist memory, not zone
+memory:** an authoritative zone identical across views loads once (#3551),
+but each view that applies a blocklist loads its own copy of it, at about
+1.4 kB per entry, so a 190,000-entry list on two views costs about 520 MiB
+of named's memory rather than 260 MiB. Size the limit for one copy of every
+list per view. The control plane warns at 80 % of the limit the agents
+report (a banner on the group's Views and Blocking Lists tabs, and the
+`dns_memory_pressure` alert); see
+[`DNS.md` §2](../features/DNS.md#what-a-view-costs-in-memory-3551) for what
+shares and what does not, and
 [`DNS.md` §8.0](../features/DNS.md#80-memory-sizing-for-large-blocklists-issue-1725)
 for the measurements and where to raise each limit.
 

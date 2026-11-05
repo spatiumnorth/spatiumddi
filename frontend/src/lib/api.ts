@@ -5299,8 +5299,43 @@ export interface DNSServerGroup {
    *  driver; says where an existing group falls outside its supported scope
    *  (second server, pools). Empty for every other group. */
   scope_warnings?: string[];
+  /** #3551 — estimated named memory against the agents' limit. Filled by
+   *  `getGroup` only (null on the list, and for a group with no BIND9
+   *  server); `getMemoryEstimate` returns the same object. */
+  memory_estimate?: DNSMemoryEstimate | null;
   created_at: string;
   modified_at: string;
+}
+
+/** #3551 — one blocklist (RPZ) zone as named loads it. */
+export interface DNSMemoryRpzLoad {
+  zone: string;
+  views: string[];
+  entries: number;
+  estimated_bytes: number;
+}
+
+/** #3551 — a BIND9 group's estimated named memory against the memory limit
+ *  its agents report. Each view that applies a blocklist loads its own copy
+ *  of it (BIND cannot share one between views), so `warn` is set at 80 % of
+ *  the limit. `limit_source` is `default` when no agent has reported a limit
+ *  and the shipped 2 GiB DNS pod limit is assumed. */
+export interface DNSMemoryEstimate {
+  group_id: string;
+  estimated_bytes: number;
+  limit_bytes: number;
+  limit_source: "agent" | "default";
+  limit_server: string | null;
+  unknown_limit_servers: string[];
+  percent: number;
+  warn: boolean;
+  message: string | null;
+  baseline_bytes: number;
+  zone_records_loaded: number;
+  zone_bytes: number;
+  rpz_bytes: number;
+  rpz: DNSMemoryRpzLoad[];
+  views: string[];
 }
 
 /** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
@@ -5869,6 +5904,9 @@ export interface DNSView {
   order: number;
   allow_query: string[] | null;
   allow_query_cache: string[] | null;
+  /** #3551 — set on the list when the group's estimated named memory is at
+   *  80 % or more of its agents' limit. */
+  memory_warning?: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -6362,6 +6400,11 @@ export const dnsApi = {
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
   getGroup: (id: string) =>
     api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
+  // #3551 — estimated named memory against the agents' limit.
+  getMemoryEstimate: (groupId: string) =>
+    api
+      .get<DNSMemoryEstimate | null>(`/dns/groups/${groupId}/memory-estimate`)
+      .then((r) => r.data),
   // Multi-resolver propagation check
   checkPropagation: (body: {
     name: string;
@@ -7165,13 +7208,25 @@ export interface DNSBlockList {
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+  /** #3551 — set when a BIND9 group this list is applied to is estimated at
+   *  80 % or more of its agents' memory limit. */
+  memory_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
   regex: number;
   modifier: number;
   badfilter: number;
+  /** Total of the reason buckets below (#3519). */
   malformed: number;
+  /** Absent on rows written before #3519, which carry only the total. */
+  star_in_name?: number;
+  no_anchor?: number;
+  trailing_dot?: number;
+  start_anchor?: number;
+  bare_star?: number;
+  dotless?: number;
+  other?: number;
 }
 
 export interface DNSBlockListEntry {
@@ -11352,6 +11407,10 @@ export interface NetworkDashboardSummary {
    *  panel tell a real all-clear from stale or absent data (#942). */
   rpki_total_count: number;
   rpki_last_checked_at: string | null;
+  /** ROAs whose certificate lifetime is known (#3557). 0 with ROAs tracked
+   *  means the source ships no per-ROA lifetime, so the expiring / expired
+   *  counts are not measured — never an all-clear. */
+  rpki_expiry_known_count: number;
   circuit_term_expiring_count: number;
   circuit_status_changed_count: number;
   service_orphan_count: number;

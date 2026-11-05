@@ -55,6 +55,7 @@ const summary = (
   rpki_expired_count: 0,
   rpki_total_count: 0,
   rpki_last_checked_at: null,
+  rpki_expiry_known_count: 0,
   circuit_term_expiring_count: 0,
   circuit_status_changed_count: 0,
   service_orphan_count: 0,
@@ -119,6 +120,16 @@ describe("withheld Network panels (#3449)", () => {
     }
     expect(text).not.toContain("No ASNs in drift state");
     expect(text).not.toContain("No ROAs are expiring");
+    // The server zeroes the total for a withheld grant: the tile must not
+    // then claim nothing was pulled (#3540).
+    expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
+    const expiredLink = Array.from(document.querySelectorAll("p"))
+      .find((e) => e.textContent === "RPKI expired")
+      ?.closest("a");
+    expect(expiredLink?.getAttribute("title") ?? "").not.toContain(
+      "have been pulled",
+    );
+    expect(text).not.toContain("No RPKI ROAs are tracked yet.");
   });
 
   it("the combined card names the withheld half when the other has rows", async () => {
@@ -156,10 +167,73 @@ describe("withheld Network panels (#3449)", () => {
     expect(text).not.toContain("Service catalog clean");
   });
 
+  it("with no ROAs tracked the expired tile and panel are not an all-clear (#3540)", async () => {
+    calls["dashboardsApi.networkSummary"] = () => Promise.resolve(summary({}));
+    const text = await show();
+    expect(kpi("RPKI expired")).toContain("—");
+    expect(kpi("RPKI expired")).toContain("no ROAs tracked");
+    expect(text).not.toContain("No ROAs are expiring");
+    expect(text).toContain("No RPKI ROAs are tracked yet.");
+  });
+
+  it("with ROAs tracked a zero expired count is still good (#3540)", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(
+        summary(
+          {},
+          {
+            rpki_total_count: 5,
+            // a source that ships lifetimes (#3557), so expiry is measured
+            rpki_expiry_known_count: 5,
+            rpki_last_checked_at: new Date().toISOString(),
+          },
+        ),
+      );
+    const text = await show();
+    expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
+    expect(text).toContain("No ROAs are expiring");
+  });
+
+  it("a summary without a ROA total is not read as none tracked (#3540)", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(summary({}, { rpki_total_count: undefined }));
+    const text = await show();
+    expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
+    expect(text).not.toContain("No RPKI ROAs are tracked yet.");
+  });
+
   it("nothing withheld keeps the all-clear wording", async () => {
     calls["dashboardsApi.networkSummary"] = () => Promise.resolve(summary({}));
     const text = await show();
     expect(text).not.toContain("not visible to your role");
     expect(text).toContain("No circuits past term");
+  });
+});
+
+describe("RPKI expiry with no ROA lifetimes (#3557)", () => {
+  const tracked = {
+    rpki_total_count: 13,
+    rpki_last_checked_at: new Date().toISOString(),
+  };
+
+  it("a source with no per-ROA lifetime is not measured, not a green zero", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(summary({}, { ...tracked, rpki_expiry_known_count: 0 }));
+    const text = await show();
+    for (const l of ["RPKI expiring", "RPKI expired"]) {
+      expect(kpi(l)).toContain("n/a");
+      expect(kpi(l)).toContain("source has no ROA lifetimes");
+    }
+    expect(text).not.toContain("No ROAs are expiring");
+    expect(text).toContain("Not measured");
+  });
+
+  it("known lifetimes keep the counts and the all-clear", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(summary({}, { ...tracked, rpki_expiry_known_count: 13 }));
+    const text = await show();
+    expect(kpi("RPKI expiring")).toContain("0");
+    expect(kpi("RPKI expired")).not.toContain("n/a");
+    expect(text).toContain("No ROAs are expiring");
   });
 });
