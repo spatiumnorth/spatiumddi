@@ -73,7 +73,7 @@ from app.services.integration_ownership import (
     owned_subnets_in_space,
     owning_integration,
     refuse_sync_into_trashed_space,
-    subnet_has_surviving_addresses,
+    retire_vanished_subnet,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 
@@ -481,16 +481,15 @@ async def _apply_blocks_and_subnets(
         for net_str, row in current_subnets.items():
             if net_str in desired_map:
                 continue
-            # #1558: don't cascade-delete operator / foreign /
-            # operator-edited addresses with the subnet — un-claim it
-            # instead when any survive, like the OPNsense reconciler.
-            if await subnet_has_surviving_addresses(db, row.id, "cloud_endpoint_id"):
-                row.cloud_endpoint_id = None
+            # #1558 / #3532: a subnet carrying operator content (addresses,
+            # a DHCP scope live or in Trash, tags, links …) is un-claimed,
+            # not cascade-deleted with it; either way it is audited.
+            if await retire_vanished_subnet(
+                db, row, "cloud_endpoint_id", warnings=summary.warnings
+            ):
                 summary.subnets_updated += 1
-                continue
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
-            summary.subnets_deleted += 1
+            else:
+                summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # An operator subnet at this exact CIDR wins — reused untouched.

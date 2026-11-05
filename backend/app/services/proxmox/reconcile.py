@@ -52,7 +52,7 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owning_integration,
     refuse_sync_into_trashed_space,
-    subnet_has_surviving_addresses,
+    retire_vanished_subnet,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.proxmox.client import (
@@ -588,17 +588,13 @@ async def _apply_blocks_and_subnets(
             if vnet_name in extant_vnet_names:
                 used_wrapper_cidrs.add(net_str)
                 continue
-        # #1558: a blind delete cascades to every address in the subnet,
-        # including operator / foreign / operator-edited rows. Hand the
-        # subnet back (un-claim) when any such survivor exists, like the
-        # OPNsense reconciler does.
-        if await subnet_has_surviving_addresses(db, row.id, "proxmox_node_id"):
-            row.proxmox_node_id = None
+        # #1558 / #3532: a blind delete cascades to every address and DHCP
+        # scope (live or in Trash) on the subnet. Hand it back (un-claim)
+        # when it carries operator content; either way it is audited.
+        if await retire_vanished_subnet(db, row, "proxmox_node_id", warnings=summary.warnings):
             summary.subnets_updated += 1
-            continue
-        await retract_address_dns(db, subnet_ids=[row.id])
-        await db.delete(row)
-        summary.subnets_deleted += 1
+        else:
+            summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # Issue #177: an operator subnet at this exact CIDR wins. We
