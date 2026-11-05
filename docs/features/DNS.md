@@ -1053,7 +1053,7 @@ lists to `nxdomain`, which changes nothing they answer.
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
 - Block list entries are written as RPZ zone records
 - Updating the RPZ zone uses `rndc reload <rpz-zone>` (no full restart)
-- Multiple RPZ zones can be chained (per-list)
+- Every list a scope draws on is folded into ONE RPZ zone per view (plus one group zone), so BIND's limit of 64 zones per `response-policy` statement can never be reached by assigning lists; there is deliberately no assignment-time cap (#3564)
 
 ### UI Features
 - Dashboard showing blocked query stats (pulled from DNS server logs)
