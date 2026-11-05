@@ -122,3 +122,54 @@ async def test_audit_order_is_the_change_then_the_approval_then_execution(
     change = [i for i, (t, _) in enumerate(seq) if t not in ("change_request",) and i > cr[0]]
     assert change, seq
     assert max(change) < cr[1], seq  # the change precedes the approval row
+
+
+@pytest.mark.asyncio
+async def test_the_approval_audit_commits_with_the_change(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """apply() commits the change and the ``approved`` stamp; the approval's
+    audit row must be in that commit, not in a later one. Here the spine fails
+    after apply() returns (its own commit, or the process, could): the change
+    and the ``approved`` row are durable, so the approval must be too."""
+    from app.services.approvals import service
+    from tests.test_approve_apply_failure_2911 import _audit_actions
+
+    req_id, token, zone_id = await _named_ip_request(client, db_session)
+
+    async def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("spine died after apply() committed")
+
+    monkeypatch.setattr(service, "mark_executed", boom)
+    with pytest.raises(RuntimeError, match="spine died"):
+        await client.post(f"/api/v1/requests/{req_id}/approve", headers=_auth(token), json={})
+
+    async with _TestSessionLocal() as check:
+        names = (
+            (await check.execute(select(DNSRecord.name).where(DNSRecord.zone_id == zone_id)))
+            .scalars()
+            .all()
+        )
+        assert "printer" in names
+        assert await _audit_actions(check, req_id) == ["requested", "approved"]
+
+
+@pytest.mark.asyncio
+async def test_an_apply_that_does_not_commit_is_audited_once(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An apply() that leaves the commit to the spine still gets exactly one
+    approval row, before the execution row."""
+    from tests.test_approve_apply_failure_2911 import _audit_actions, _patch_apply
+
+    req_id, token, _ = await _named_ip_request(client, db_session)
+
+    async def no_commit(db: AsyncSession, user: object, args: object) -> dict[str, bool]:
+        return {"ok": True}
+
+    _patch_apply(monkeypatch, "create_ip_address", no_commit)
+    resp = await client.post(f"/api/v1/requests/{req_id}/approve", headers=_auth(token), json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "executed"
+    async with _TestSessionLocal() as check:
+        assert await _audit_actions(check, req_id) == ["requested", "approved", "executed"]
