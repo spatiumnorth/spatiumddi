@@ -1347,7 +1347,10 @@ container's memory limit, split across the views that recurse (at least
 32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
 recursive views. With no limit it writes nothing and BIND keeps its default.
 Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
-BIND does) on the agent to override it.
+BIND does) on the agent to override it. `unlimited` and `0` are not accepted:
+BIND 9.21.21+ stops honouring them and falls back to 90 % of physical memory,
+so the agent ignores them (logging `bind9_max_cache_size_ignored`) and keeps
+the derived ceiling. Use an explicit size.
 
 ### 8.1 Content filtering / family filter (issue #878)
 
