@@ -275,11 +275,18 @@ async def task_session(
 # ``execution_options(include_deleted=True)``.
 #
 # Implementation note: ``with_loader_criteria(include_aliases=True)`` makes
-# the criterion apply through every JOIN / relationship load too, so we
-# don't have to thread the option through ``selectinload`` paths or
-# relationship loads. The hook is mounted on the AsyncSession's underlying
-# sync_session_class because that's where SQLAlchemy fires ORM events from
-# under the AsyncSession wrapper.
+# the criterion apply to every ORM entity the statement names — its columns,
+# ``select_from()``, ``.join()`` targets (in the ON clause, so outer joins
+# keep their meaning), ``aliased()`` copies, and the same in every ORM
+# subquery nested anywhere in it. A table a SELECT reaches only through its
+# WHERE clause (``exists().where(Subnet.id == …)``) is not an entity the ORM
+# filters, so the hook adds ``deleted_at IS NULL`` to that SELECT's WHERE
+# itself (#3492). The hook is mounted on the global ``Session`` class, which
+# is where SQLAlchemy fires ORM events from under the AsyncSession wrapper.
+#
+# NOT covered — write the predicate by hand or don't do this: a Core
+# ``Table`` or ``Table.alias()`` used as a JOIN target, ``text()`` /
+# ``literal_column()`` SQL, and raw ``connection.execute`` (no ORM event).
 
 
 def _soft_delete_models() -> tuple[type, ...]:
@@ -324,58 +331,223 @@ def _get_soft_delete_models() -> tuple[type, ...]:
 
 
 def _referenced_soft_delete_models(statement: Any, models: tuple[type, ...]) -> set[type]:
-    """Which of ``models`` the statement mentions — resolved in ONE pass.
+    """Which of ``models`` the statement mentions ANYWHERE — one walk.
 
-    This used to be called once per model, and each call did its own
-    ``statement.get_final_froms()``. That method is not a cheap accessor: it
-    resolves and compiles the FROM graph, ~1.9 ms on a modest ORM select. At
-    eight in-scope models that is ~15 ms of pure Python **on every ORM
-    SELECT in the application** — measured at 16.7 ms for a query against
-    ``vlan``, a table with no soft-delete column, versus 0.35 ms for the
-    same query with the filter skipped. It went unnoticed because it is
-    uniform: nothing looks slow relative to anything else.
+    One pass over the whole statement tree (:func:`_walk_statement`): the
+    outer entity and columns, every ``Join`` (left and right),
+    FROM-subqueries (#1933), and every subquery inside WHERE / HAVING /
+    ORDER BY / the column list — ``exists()``, ``select().exists()``,
+    ``x.in_(select(…))``, ``.subquery()`` / ``.cte()``, scalar subqueries,
+    nested to any depth. A soft-deletable model reached only through a join
+    or a subquery used to be invisible here, so it got no filter and a
+    trashed subnet's / zone's / scope's rows came back through the join
+    (#3492).
 
-    Resolving the FROM graph once and testing all eight models against it
-    is behaviour-identical and roughly eight times cheaper. Surfaced while
-    profiling global search (#879), which issues up to twenty of these per
-    keystroke and so paid the cost twenty times over.
+    A model counts as referenced when an element in the tree carries its
+    mapper as ``parententity`` (ORM entities and columns, ``aliased()``
+    included) or when its table appears as a ``Table``.
+
+    Cost: this used to call ``statement.get_final_froms()``, which resolves
+    and compiles the FROM graph — ~1.9 ms in the #879 profile, once per
+    model before that, ~15 ms on every ORM SELECT. The tree walk compiles
+    nothing: measured for #3492, a plain ``select(Subnet.id)`` went from
+    0.23 to 0.05 ms through the whole hook, a two-join list page from 8.8
+    to 0.18 ms, while seeing strictly more of the statement.
+    """
+    return _scan_statement(statement, models)[0]
+
+
+def _scan_statement(statement: Any, models: tuple[type, ...]) -> tuple[set[type], list[Any]]:
+    """``(referenced models, every Select in the tree)`` from one walk.
+
+    On any failure the answer is the conservative one — every model, no
+    selects — rather than risk leaking soft-deleted rows.
     """
     try:
-        entities = {
-            desc.get("entity") for desc in getattr(statement, "column_descriptions", None) or []
-        }
-        classes: set[Any] = set()
-        table_names: set[Any] = set()
-        froms = statement.get_final_froms() if hasattr(statement, "get_final_froms") else []
-        # A FROM that is a subquery hides the entities inside it: the
-        # ``select(count()).select_from(base.subquery())`` shape every
-        # paginated list uses for its ``total`` showed up as one anonymous
-        # name, so the count skipped the filter its page query got (#1933).
-        pending = list(froms or [])
-        seen: set[int] = set()
-        while pending:
-            fr = pending.pop()
-            if id(fr) in seen:
-                continue
-            seen.add(id(fr))
-            mapper = getattr(fr, "_annotations", {}).get("parententity")
-            if mapper is not None:
-                classes.add(getattr(mapper, "class_", None))
-            table_names.add(getattr(fr, "name", None))
-            inner = getattr(fr, "element", None)
-            if inner is not None and hasattr(inner, "get_final_froms"):
-                for d in getattr(inner, "column_descriptions", None) or []:
-                    entities.add(d.get("entity"))
-                pending.extend(inner.get_final_froms() or [])
+        classes, table_names, selects = _walk_statement(statement)
     except Exception:  # pragma: no cover — defensive, never block a query
-        # Same conservative answer the per-model version gave: assume every
-        # model is present rather than risk leaking soft-deleted rows.
-        return set(models)
-    return {
-        m
-        for m in models
-        if m in entities or m in classes or getattr(m, "__tablename__", None) in table_names
+        return set(models), []
+    referenced = {
+        m for m in models if m in classes or getattr(m, "__tablename__", None) in table_names
     }
+    return referenced, selects
+
+
+def _walk_statement(statement: Any) -> tuple[set[Any], set[str], list[Any]]:
+    """The single tree walk behind the soft-delete filter.
+
+    Returns the mapped classes and table names found anywhere in the
+    statement, plus every ``Select`` in it (the statement itself included),
+    which :func:`_implicit_soft_delete_froms` needs and which would
+    otherwise cost a second walk.
+    """
+    from sqlalchemy.sql.schema import Table
+    from sqlalchemy.sql.selectable import Select
+
+    classes: set[Any] = set()
+    table_names: set[str] = set()
+    selects: list[Any] = []
+    # ``sqlalchemy.sql.visitors.iterate``, plus one thing it cannot do:
+    # prune. A nested SELECT carrying ``include_deleted=True`` (see
+    # :func:`exists_including_deleted`) is not descended into, so nothing
+    # inside it is filtered unless the same model is also named elsewhere.
+    stack = [statement]
+    while stack:
+        el = stack.pop()
+        if isinstance(el, Select):
+            if el is not statement and el._execution_options.get("include_deleted"):
+                continue
+            selects.append(el)
+        elif isinstance(el, Table):
+            table_names.add(el.name)
+        ann = getattr(el, "_annotations", None)
+        if ann:
+            entity = ann.get("parententity")
+            if entity is not None:
+                classes.add(getattr(entity, "class_", None))
+        stack.extend(el.get_children())
+    return classes, table_names, selects
+
+
+def exists_including_deleted(*criteria: Any) -> Any:
+    """``exists().where(*criteria)`` that counts soft-deleted rows too.
+
+    For a reference check that must see the Trash: "is anything still
+    pointing at this row?" before hard-deleting it. A trashed child still
+    holds its foreign key, so ignoring it either fails the delete (a
+    ``RESTRICT`` FK) or silently destroys the Trash entry with it (a
+    ``CASCADE`` one). The SELECT names no entity — its FROMs come from
+    ``criteria`` alone — so the ORM's loader criteria never reach it either,
+    whatever else the enclosing statement names.
+    """
+    from sqlalchemy import exists, literal_column, select
+
+    return exists(
+        select(literal_column("1")).where(*criteria).execution_options(include_deleted=True)
+    )
+
+
+def _implicit_soft_delete_froms(select: Any, table_names: frozenset[str]) -> list[Any]:
+    """Soft-deletable FROMs of ``select`` that ``with_loader_criteria`` misses.
+
+    The loader criteria the hook adds are applied by the ORM to the
+    entities a SELECT *names*: its columns, ``select_from()`` and
+    ``.join()`` targets — including ``aliased()`` ones, and including those
+    of ORM selects nested anywhere in the statement. They are NOT applied
+    to a table the SELECT only reaches through its WHERE clause, which is
+    exactly what ``exists().where(Subnet.id == …)`` and
+    ``select(func.count()).where(Subnet.block_id == …)`` do: the FROM is
+    inferred from the criteria, and nothing filters it (#3492). Those are
+    returned here so the hook can add ``deleted_at IS NULL`` to that
+    SELECT's own WHERE.
+
+    Anything joined (``.join()`` targets, members of a ``Join`` passed to
+    ``select_from``) is left alone: a WHERE predicate on the inner side of
+    an outer join would turn it into an inner join. Joined ORM entities are
+    covered by the loader criteria; a joined *Core* table or
+    ``Table.alias()`` is not covered at all (see the hook's docstring).
+    """
+    from sqlalchemy.sql.schema import Table
+    from sqlalchemy.sql.selectable import Alias, Join
+
+    def is_soft(f: Any) -> bool:
+        if isinstance(f, Table):
+            return f.name in table_names
+        if isinstance(f, Alias):
+            inner = f.element
+            return isinstance(inner, Table) and inner.name in table_names
+        return False
+
+    covered: set[Any] = set()
+    joined: set[Any] = set()
+
+    def note_join(j: Any) -> None:
+        for side in (j.left, j.right):
+            if isinstance(side, Join):
+                note_join(side)
+            else:
+                joined.add(side._deannotate())
+
+    def note_explicit(f: Any) -> None:
+        if f._annotations.get("parententity") is not None:
+            covered.add(f._deannotate())
+
+    for col in select._raw_columns:
+        # The ORM filters exactly one entity per column: its
+        # ``plugin_subject`` — ``Subnet`` for ``Subnet.id``, for
+        # ``func.count(Subnet.id)`` and for ``select(Subnet)`` alike. A
+        # second table the same expression touches
+        # (``func.count(Subnet.id) + func.count(IPBlock.id)``), or a bare
+        # Core column, gets no loader criteria.
+        subject = col._propagate_attrs.get("plugin_subject")
+        subject_from = getattr(subject, "selectable", None)
+        if subject_from is not None:
+            subject_from = subject_from._deannotate()
+            for f in col._from_objects:
+                if f._deannotate() is subject_from:
+                    covered.add(subject_from)
+    for f in select._from_obj:
+        if isinstance(f, Join):
+            note_join(f)
+        else:
+            note_explicit(f)
+    for target, *_ in select._setup_joins:
+        for f in getattr(target, "_from_objects", None) or [target]:
+            joined.add(f._deannotate())
+
+    out: list[Any] = []
+    seen: set[Any] = set()
+    candidates = [f for col in select._raw_columns for f in col._from_objects]
+    candidates += [f for crit in select._where_criteria for f in crit._from_objects]
+    candidates += [f for f in select._from_obj if not isinstance(f, Join)]
+    for f in candidates:
+        key = f._deannotate()
+        if key in seen or key in covered or key in joined or not is_soft(key):
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _filter_implicit_froms(statement: Any, selects: list[Any], soft_tables: set[str]) -> Any:
+    """Add ``<from>.deleted_at IS NULL`` to every SELECT in ``statement``
+    that reaches a soft-deletable table only through its WHERE clause.
+
+    Returns ``statement`` untouched (no clone) in the common case where no
+    SELECT needs it. Otherwise rebuilds the tree once with
+    ``replacement_traverse``, rewriting innermost SELECTs first so a
+    filtered subquery nested inside another filtered one keeps its filter.
+    """
+    from sqlalchemy.sql import visitors
+
+    soft_names = frozenset(soft_tables)
+    needs: dict[int, list[Any]] = {}
+    for sel in selects:
+        froms = _implicit_soft_delete_froms(sel, soft_names)
+        if froms:
+            needs[id(sel)] = froms
+    if not needs:
+        return statement
+
+    done: dict[int, Any] = {}
+
+    def rewrite(el: Any) -> Any:
+        key = id(el)
+        if key in done:
+            return done[key]
+
+        def replace(element: Any, **_kw: Any) -> Any:
+            if element is not el and id(element) in needs:
+                return rewrite(element)
+            return None
+
+        new = visitors.replacement_traverse(el, {}, replace)
+        if key in needs:
+            new = new.where(*[f.c.deleted_at.is_(None) for f in needs[key]])
+        done[key] = new
+        return new
+
+    return rewrite(statement)
 
 
 @event.listens_for(Session, "before_flush")
@@ -402,6 +574,11 @@ def _filter_soft_deleted(execute_state: Any) -> None:
       * statements that opt out via ``include_deleted=True``
       * models that aren't referenced in the statement at all
 
+    "Referenced" means anywhere in the tree — joins and subqueries in
+    WHERE / HAVING / ORDER BY / the column list included (#3492) — so a
+    caller that deliberately reads trashed rows through a join or a
+    subquery must pass ``include_deleted=True`` like any other.
+
     Implementation note: ``propagate_to_loaders=False`` keeps the criterion
     off relationship loads. Without it, a SELECT against ``DHCPScope`` (which
     eager-joins ``pools`` / ``statics``) would require ``.unique()`` on
@@ -416,12 +593,24 @@ def _filter_soft_deleted(execute_state: Any) -> None:
         return
     if execute_state.execution_options.get("include_deleted", False):
         return
+    execute_state.statement = _apply_soft_delete_filter(execute_state.statement)
 
-    statement = execute_state.statement
+
+def _apply_soft_delete_filter(statement: Any) -> Any:
+    """The statement with ``deleted_at IS NULL`` applied to every in-scope
+    model it references; ``statement`` itself when it references none."""
     all_models = _get_soft_delete_models()
-    referenced = _referenced_soft_delete_models(statement, all_models)
+    referenced, selects = _scan_statement(statement, all_models)
     if not referenced:
-        return
+        return statement
+    if selects:
+        soft_tables = {m.__tablename__ for m in referenced if hasattr(m, "__tablename__")}
+        try:
+            statement = _filter_implicit_froms(statement, selects, soft_tables)
+        except Exception:  # pragma: no cover — defensive, never block a query
+            # The loader criteria below still apply; only the WHERE-only
+            # FROMs go unfiltered. Loud, because that is a leak.
+            _db_logger.warning("soft_delete_implicit_from_rewrite_failed", exc_info=True)
     # Iterate the canonical tuple, not the set, so the options are applied
     # in a deterministic order — a set's iteration order would vary the
     # statement's cache key between processes for no reason.
@@ -444,4 +633,4 @@ def _filter_soft_deleted(execute_state: Any) -> None:
                 propagate_to_loaders=False,
             )
         )
-    execute_state.statement = statement
+    return statement
