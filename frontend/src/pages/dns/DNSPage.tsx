@@ -132,6 +132,7 @@ import {
   type DNSGroupSyncResult,
   type ResolverPreset,
 } from "@/lib/api";
+import { feedSkippedTitle, feedSkippedTotal } from "@/lib/blocklistFeedSkipped";
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -10410,24 +10411,6 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
-/** Rules the last adblock refresh could not enforce (#2123); 0 when the
- *  counts were never recorded. */
-function feedSkippedTotal(l: DNSBlockList): number {
-  const s = l.feed_parse_skipped;
-  return s ? s.regex + s.modifier + s.badfilter + s.malformed : 0;
-}
-
-function feedSkippedTitle(l: DNSBlockList): string {
-  const s = l.feed_parse_skipped;
-  if (!s) return "";
-  return (
-    `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +
-    `enforce: ${s.regex} regex, ${s.modifier} with unsupported modifiers ` +
-    `($domain=, $third-party, …), ${s.badfilter} $badfilter, ` +
-    `${s.malformed} not a plain ||name^ rule.`
-  );
-}
-
 function BlocklistScopeModal({
   list,
   group,
