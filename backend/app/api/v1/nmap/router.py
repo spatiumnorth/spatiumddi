@@ -57,6 +57,7 @@ from app.models.ipam import (
     Subnet,
 )
 from app.models.nmap import NmapScan
+from app.services.ipam.live_address import get_live_address
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.nmap import NmapArgError, build_argv
 
@@ -185,7 +186,7 @@ async def create_scan(body: NmapScanCreate, db: DB, current_user: CurrentUser) -
     target_ip = body.target_ip.strip()
     ip_address_id = body.ip_address_id
     if ip_address_id is not None:
-        ip_row = await db.get(IPAddress, ip_address_id)
+        ip_row = await get_live_address(db, ip_address_id)
         if ip_row is None:
             raise HTTPException(status_code=422, detail="ip_address_id not found")
         # If only ip_address_id was provided (target_ip is the IPAM

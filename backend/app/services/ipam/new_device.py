@@ -38,6 +38,7 @@ from sqlalchemy.orm import aliased
 
 from app.models.auth import User
 from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist, Subnet
+from app.services.ipam.live_address import get_live_address
 from app.services.oui import _prefix_from_mac, normalize_mac_key
 
 logger = structlog.get_logger(__name__)
@@ -249,6 +250,9 @@ async def acknowledge_sighting(
     None if it doesn't exist. Idempotent. Does NOT commit."""
     row = await db.get(IpMacHistory, sighting_id)
     if row is None:
+        return None
+    # #3537: a sighting on an address whose subnet is in the Trash reads as absent.
+    if await get_live_address(db, row.ip_address_id) is None:
         return None
     row.classification = CLASSIFICATION_ACKNOWLEDGED
     row.acknowledged_at = datetime.now(UTC)

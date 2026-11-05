@@ -1020,7 +1020,7 @@ async def agent_config_longpoll(
             # The server row carries the dirty sequence and the watermark of
             # the newest stored bundle; refresh it so a change committed on
             # any replica, or the worker's store, is seen here
-            # (expire_on_commit=False, no in-loop commit).
+            # (expire_on_commit=False: no commit in the loop expires it).
             await refresh_agent_server(db, server)
             if instance is not None and server.agent_instance not in (None, instance):
                 # #2044 — another agent process took the server over while this
@@ -1108,6 +1108,16 @@ async def agent_config_longpoll(
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
                 AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
                 return Response(status_code=304, headers=headers)
+            # #3479: end this pass's read transaction before the wait. Held
+            # through it, the reads' locks (the op queue's among them) made any
+            # ACCESS EXCLUSIVE lock wait out the whole hold: a factory reset's
+            # TRUNCATE queued behind them, every reader after it queued behind
+            # the TRUNCATE, and the minute's alert evaluation closed a deadlock
+            # in that queue. Nothing is pending here (a page with ops was
+            # answered above; return_ops_dispatched_elsewhere commits its own),
+            # and expire_on_commit=False keeps ``server`` and ``bundle`` loaded
+            # for the next pass and the 304.
+            await db.commit()
             if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
                 # #3015 — this api process is stopping: end the hold now so the
                 # next pass makes one last ETag check and answers 304, and the

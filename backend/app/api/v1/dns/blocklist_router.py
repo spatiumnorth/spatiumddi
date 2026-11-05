@@ -275,7 +275,15 @@ class FeedParseSkipped(BaseModel):
     regex: int = 0
     modifier: int = 0
     badfilter: int = 0
+    # Total of the reason buckets below; kept so older readers still add up (#3519).
     malformed: int = 0
+    star_in_name: int = 0
+    no_anchor: int = 0
+    trailing_dot: int = 0
+    start_anchor: int = 0
+    bare_star: int = 0
+    dotless: int = 0
+    other: int = 0
 
 
 class BlockListResponse(BaseModel):

@@ -5648,8 +5648,13 @@ async def _preview_acknowledge_device(
     row = await db.get(IpMacHistory, args.sighting_id)
     if row is None:
         return PreviewResult(ok=False, detail=f"Sighting {args.sighting_id} not found")
-    ip = await db.get(IPAddress, row.ip_address_id)
-    where = str(ip.address) if ip else "an IP"
+    from app.services.ipam.live_address import get_live_address  # noqa: PLC0415
+
+    ip = await get_live_address(db, row.ip_address_id)
+    if ip is None:
+        # #3537: the apply refuses a sighting under a trashed subnet; say so here.
+        return PreviewResult(ok=False, detail=f"Sighting {args.sighting_id} not found")
+    where = str(ip.address)
     return PreviewResult(
         ok=True,
         detail="ready",
