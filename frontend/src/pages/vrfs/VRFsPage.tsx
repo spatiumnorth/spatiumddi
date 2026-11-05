@@ -100,16 +100,29 @@ function CountBadge({
 // stripping mid-edit.
 /** Resolves ``asn_id`` against the cached ASN list and renders
  * ``AS{number}`` instead of a UUID slice. Falls back to "—" when
- * the ASN list hasn't loaded yet or the row is missing. */
+ * the ASN list hasn't loaded yet or the row is missing. The list needs
+ * read on "manage_asns": without it the list is never asked (#3466) and a
+ * linked ASN reads "linked, not shown", as the space's ASN line does. */
 function AsnNumberCell({ asnId }: { asnId: string | null | undefined }) {
+  const canRead = usePermissions().can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
     staleTime: 60_000,
-    enabled: !!asnId,
+    enabled: !!asnId && canRead,
   });
   if (!asnId) {
     return <span className="text-muted-foreground/50">—</span>;
+  }
+  if (!canRead) {
+    return (
+      <span
+        className="text-muted-foreground"
+        title="This VRF names an ASN you may not read (manage_asns)"
+      >
+        linked, not shown
+      </span>
+    );
   }
   const asn = (data?.items ?? []).find((a) => a.id === asnId);
   if (!asn) {
@@ -164,6 +177,11 @@ export function VRFEditorModal({
   const [customerId, setCustomerId] = useState<string | null>(
     existing?.customer_id ?? null,
   );
+  // The customer list takes a read grant on "customer" (one scoped to a
+  // single customer is enough: the API narrows the list). Without any, the
+  // list is never asked (#3466) and the picker says why, as the ASN picker
+  // does, instead of showing "None" over a linked customer.
+  const canReadCustomers = usePermissions().hasAnyGrantFor("read", "customer");
   const [error, setError] = useState<string | null>(null);
 
   const rdValid = rd.trim() === "" || isValidRdRt(rd);
@@ -262,11 +280,28 @@ export function VRFEditorModal({
           <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
         </Field>
         <Field label="Customer" hint="Optional logical owner of this VRF.">
-          <CustomerPicker
-            className={inputCls}
-            value={customerId}
-            onChange={setCustomerId}
-          />
+          {canReadCustomers ? (
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          ) : (
+            // Disabled, so the form still sends the unchanged id (never a clear).
+            <select
+              className={inputCls}
+              value={customerId ? "linked" : ""}
+              disabled
+              title="Your role cannot read customers, so this cannot be changed here."
+            >
+              <option value="">{"\u2014 None \u2014"}</option>
+              {customerId && (
+                <option value="linked">
+                  Linked (not visible to your role)
+                </option>
+              )}
+            </select>
+          )}
         </Field>
         <Field label="Route distinguisher (RD)" hint={rdHint}>
           <input
@@ -455,6 +490,9 @@ export function VRFsPage() {
     perms.can("delete", "vrf"),
     "Requires delete permission on VRFs",
   );
+  // The row's customer chip reads the customer list: not asked of a user
+  // with no read grant on customers (#3466), whom it would only refuse.
+  const canReadCustomers = perms.hasAnyGrantFor("read", "customer");
   const qc = useQueryClient();
   const [editing, setEditing] = useState<VRF | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -640,7 +678,9 @@ export function VRFsPage() {
                       >
                         {v.name}
                       </Link>
-                      <CustomerChip customerId={v.customer_id} />
+                      {canReadCustomers && (
+                        <CustomerChip customerId={v.customer_id} />
+                      )}
                     </span>
                   </td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">
