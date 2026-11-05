@@ -1,15 +1,15 @@
 {
-  "version": "2026.08.21",
-  "comment": "Curated catalog of public DNS blocklist sources, plus built-in manual templates and one-click profiles. Feed snapshot derived from AdGuard's HostlistsRegistry (https://github.com/AdguardTeam/HostlistsRegistry, MIT) plus the most-cited Pi-hole defaults and Hagezi / OISD entries; each source's own license is recorded per entry. Templates are entry sets we ship inline rather than fetch \u2014 the SafeSearch rewrites come from each provider's own documentation. Move in lockstep with releases: a stale feed URL is a failing refresh, and a stale rewrite target is a search engine that stops resolving.",
+  "version": "2026.11.05",
+  "comment": "Curated catalog of public DNS blocklist sources, plus built-in manual templates and one-click profiles. Feed snapshot derived from AdGuard's HostlistsRegistry (https://github.com/AdguardTeam/HostlistsRegistry, GPL-3.0) plus the most-cited Pi-hole defaults and Hagezi / OISD entries; each source's own license is recorded per entry. Templates are entry sets we ship inline rather than fetch \u2014 the SafeSearch rewrites come from each provider's own documentation. Move in lockstep with releases: a stale feed URL is a failing refresh, and a stale rewrite target is a search engine that stops resolving.",
   "sources": [
     {
       "id": "1hosts-lite",
       "name": "1Hosts (Lite)",
       "description": "Minimalist ad / tracker list. Lower breakage than 1Hosts Pro.",
       "category": "ads",
-      "feed_url": "https://o0.pages.dev/Lite/hosts.txt",
+      "feed_url": "https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/hosts.txt",
       "feed_format": "hosts",
-      "license": "MIT",
+      "license": "MPL-2.0",
       "homepage": "https://github.com/badmojr/1Hosts",
       "recommended": false
     },
@@ -36,13 +36,35 @@
       "recommended": true
     },
     {
+      "id": "hagezi-multi-light",
+      "name": "Hagezi Light",
+      "description": "Hagezi's lowest-breakage tier \u2014 a small ads / tracking / malware list for networks where nothing may break.",
+      "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
+      "category": "ads",
+      "feed_format": "domains",
+      "license": "GPL-3.0",
+      "homepage": "https://github.com/hagezi/dns-blocklists",
+      "recommended": false
+    },
+    {
+      "id": "hagezi-multi-normal",
+      "name": "Hagezi Normal",
+      "description": "Hagezi's all-round tier between Light and Pro \u2014 ads, trackers, telemetry and malware.",
+      "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
+      "category": "ads",
+      "feed_format": "domains",
+      "license": "GPL-3.0",
+      "homepage": "https://github.com/hagezi/dns-blocklists",
+      "recommended": false
+    },
+    {
       "id": "oisd-big",
       "name": "OISD Big",
       "description": "OISD extended \u2014 broader ad / tracker / malware coverage. Higher breakage risk than OISD Small.",
       "category": "ads",
       "feed_url": "https://big.oisd.nl/domainswild",
       "feed_format": "domains",
-      "license": "free-for-personal-use",
+      "license": "GPL-3.0",
       "homepage": "https://oisd.nl/",
       "recommended": false
     },
@@ -53,7 +75,7 @@
       "category": "ads",
       "feed_url": "https://small.oisd.nl/domainswild",
       "feed_format": "domains",
-      "license": "free-for-personal-use",
+      "license": "GPL-3.0",
       "homepage": "https://oisd.nl/",
       "recommended": true
     },
@@ -86,7 +108,7 @@
       "category": "adult",
       "feed_url": "https://nsfw.oisd.nl/domainswild",
       "feed_format": "domains",
-      "license": "free-for-personal-use",
+      "license": "GPL-3.0",
       "homepage": "https://oisd.nl/",
       "recommended": false
     },
@@ -146,26 +168,26 @@
       "recommended": false
     },
     {
-      "id": "digitalside-threat-intel",
-      "name": "DigitalSide Threat-Intel",
-      "description": "OSINT-curated malware / threat-intel domain feed maintained by DigitalSide.",
-      "category": "malware",
-      "feed_url": "https://osint.digitalside.it/Threat-Intel/lists/latestdomains.txt",
-      "feed_format": "domains",
-      "license": "MIT",
-      "homepage": "https://osint.digitalside.it/",
-      "recommended": false
-    },
-    {
       "id": "urlhaus",
       "name": "URLhaus (abuse.ch)",
-      "description": "Abuse.ch URLhaus malware-distribution domain blocklist.",
+      "description": "Malware-distribution domains from the abuse.ch URLhaus database, as built by the malware-filter project (gitlab.com/malware-filter/urlhaus-filter) and republished by AdGuard's HostlistsRegistry. abuse.ch no longer serves an anonymous download.",
       "category": "malware",
-      "feed_url": "https://urlhaus.abuse.ch/downloads/hostfile/",
-      "feed_format": "hosts",
+      "feed_url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt",
+      "feed_format": "adblock",
       "license": "CC0-1.0",
       "homepage": "https://urlhaus.abuse.ch/",
       "recommended": true
+    },
+    {
+      "id": "hagezi-tif-medium",
+      "name": "Hagezi Threat Intelligence (Medium)",
+      "description": "Hagezi's threat-intelligence feed (malware, cryptojacking, scam, phishing) in its medium size. The full TIF list is ~1.7M domains and not offered here.",
+      "category": "malware",
+      "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt",
+      "feed_format": "domains",
+      "license": "GPL-3.0",
+      "homepage": "https://github.com/hagezi/dns-blocklists",
+      "recommended": false
     },
     {
       "id": "stevenblack-fakenews",

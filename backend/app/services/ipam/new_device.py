@@ -204,6 +204,11 @@ async def new_device_counts(db: AsyncSession) -> dict[str, int]:
                 .filter(IpMacHistory.classification == CLASSIFICATION_KNOWN)
                 .label("known"),
             )
+            .select_from(IpMacHistory)
+            .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
+            # Inner joins: an address always has a subnet, and a subnet in
+            # the Trash takes its sightings out of the counts (#3492).
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
         )
     ).one()
     allowlist = (await db.execute(select(func.count()).select_from(MACAllowlist))).scalar_one()
