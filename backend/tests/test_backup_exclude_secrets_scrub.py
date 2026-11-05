@@ -69,6 +69,9 @@ _NOT_SECRETS: dict[tuple[str, str], str] = {
     ("audit_chain_checkpoint", "verified_hash"): "audit chain digest at the checkpoint",
     ("audit_log", "row_hash"): "audit chain digest",
     ("audit_log", "prev_hash"): "audit chain digest",
+    ("e911_resolution_log", "caller_key"): (
+        "E911 trail budget caller: an API token id, user id or source IP, never a token value"
+    ),
     ("cutover_checklist_item", "key"): "checklist item identifier",
     ("dhcp_server_scope_state", "config_hash"): "config digest",
     ("dns_ingest_snapshot", "record_keys"): "record name, type and value as served in DNS",
