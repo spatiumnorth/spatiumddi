@@ -64,6 +64,9 @@ export function usePermissions(): {
   hasAnyGrantFor: (action: string, resourceType: string) => boolean;
   isSuperadmin: boolean;
   isLoading: boolean;
+  /** The permissions read itself failed: ``can`` answers false for
+   *  everyone then, which is not the same as a role lacking the grant. */
+  isError: boolean;
 } {
   const query = useQuery({
     queryKey: ["my-permissions"],
@@ -99,7 +102,13 @@ export function usePermissions(): {
     );
   }
 
-  return { can, hasAnyGrantFor, isSuperadmin, isLoading: query.isLoading };
+  return {
+    can,
+    hasAnyGrantFor,
+    isSuperadmin,
+    isLoading: query.isLoading,
+    isError: query.isError,
+  };
 }
 
 /** Props for a write control whose permission check failed (#1155): it

@@ -5541,7 +5541,11 @@ export function DNSThreatCard() {
   // The route needs read on servers (#3450): a user without it was refused
   // every 60 s, each a 403 and a denied audit row. ``can`` is false while
   // the grants load, so the query waits for them as well.
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const mayRead = can("read", "server");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
@@ -5563,8 +5567,9 @@ export function DNSThreatCard() {
       <div className="rounded-lg border bg-card p-4">
         <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Not shown: the DNS tunneling rollup needs read on servers (the server
-          logs permission), which your role does not have.
+          {permsFailed
+            ? "Not shown: your permissions could not be read, so the DNS tunneling rollup was not requested. Reload to try again."
+            : "Not shown: the DNS tunneling rollup needs read on servers (the server logs permission), which your role does not have."}
         </p>
       </div>
     );
