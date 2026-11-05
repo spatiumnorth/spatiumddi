@@ -161,7 +161,8 @@ class PullLeasesResult:
     # (left behind by overlapping pulls before they were serialised).
     duplicates_removed: int = 0
     # #3345 — subnets whose mirror rows this pull created or removed, for the
-    # one recount at the end (``pull_leases_from_server``, or its caller).
+    # one recount at the end (``pull_leases_from_server``, or its caller). The
+    # topology merge's reservation mirrors land here too (#3354).
     touched_subnet_ids: set[Any] = field(default_factory=set)
 
 
@@ -329,6 +330,10 @@ async def _pull_leases_core(
             await _upsert_scope(
                 db, server, wscope, subnets, result, apply=apply, snapshot_at=snapshot_at
             )
+        # The reservation mirrors' subnets are in ``touched_subnet_ids`` and
+        # recounted with the lease mirrors' after the pull, never here: the
+        # recount holds the audit-chain lock and subnet / block row locks to
+        # commit, and the lease phase below is another driver call (#3354).
 
     # Phase 2 — leases.
     try:
@@ -1089,6 +1094,7 @@ async def _merge_statics(
     re-syncs DNS, and this runs on the beat.
     """
     wire = _dedupe_wire_statics(wscope.get("statics") or [])
+    changes_before = result.statics_removed + result.statics_synced
     existing = list(
         (
             await db.execute(
@@ -1123,7 +1129,7 @@ async def _merge_statics(
             # a machine reconcile, and a persisted freed row still renders as a
             # line in the subnet table and still counts toward utilization
             # (#618). Tears the reservation's DNS records down first.
-            await remove_ipam_for_static(db, st)
+            await remove_ipam_for_static(db, st, touched_subnets=result.touched_subnet_ids)
             await db.delete(st)
             by_mac.pop(norm_mac(str(st.mac_address)), None)
             result.statics_removed += 1
@@ -1196,6 +1202,11 @@ async def _merge_statics(
         await upsert_ipam_for_static(db, scope, st, action="create")
         occupied[ip_key] = st
         result.statics_synced += 1
+
+    # Mirrors were created, moved or deleted above; the caller recounts the
+    # subnet and its blocks once, with every other scope's (#3354).
+    if result.statics_removed + result.statics_synced != changes_before:
+        result.touched_subnet_ids.add(scope.subnet_id)
 
 
 def _dedupe_wire_statics(raw: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

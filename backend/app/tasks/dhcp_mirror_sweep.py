@@ -54,6 +54,13 @@ async def _sweep() -> int:
         if not await is_module_enabled(db, "core.dhcp"):
             return 0
         freed = await sweep_orphaned_static_mirrors(db, limit=_MAX_PER_RUN)
+        # #3354 — that sweep ends by recounting the subnets it freed, which
+        # holds the audit-chain lock and their subnet / block rows to commit.
+        # Commit before the lease batches below lock theirs: one transaction
+        # recounting twice would lock a later subnet after an earlier block,
+        # out of the order every recount takes.
+        if freed:
+            await db.commit()
         # #2290 — dynamic-lease mirrors whose lease rows are gone (server delete).
         # Loop in committed batches under a time budget: a deleted server can
         # strand 100k mirrors and one batch per hour would take a week.
