@@ -4907,6 +4907,11 @@ function NetworkPanel() {
   const w = data.withheld ?? {};
   const NV = "not visible to your role";
 
+  // Nothing pulled: a zero here is not an all-clear (#3540). A withheld
+  // grant zeroes the total too, so it is excluded: that tile says "not
+  // visible to your role", never "nothing pulled". A missing total (an
+  // older API) is unknown, not zero, and keeps the plain count.
+  const rpkiUntracked = !w.asn && data.rpki_total_count === 0;
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
@@ -4931,11 +4936,20 @@ function NetworkPanel() {
         )}
         <NetworkKpi
           label="RPKI expired"
-          value={w.asn ? "—" : data.rpki_expired_count}
+          value={w.asn || rpkiUntracked ? "—" : data.rpki_expired_count}
           tone={
-            w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
+            w.asn || rpkiUntracked
+              ? "default"
+              : data.rpki_expired_count > 0
+                ? "bad"
+                : "good"
           }
-          hint={w.asn ? NV : undefined}
+          hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
+          title={
+            rpkiUntracked
+              ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+              : undefined
+          }
           to="/network/asns"
         />
         <NetworkKpi
@@ -5021,7 +5035,11 @@ function NetworkPanel() {
           title="RPKI ROAs expiring soon"
           withheld={w.asn}
           withheldHint="Not visible to your role."
-          emptyHint="No ROAs are expiring in the next 30 days."
+          emptyHint={
+            rpkiUntracked
+              ? "No RPKI ROAs are tracked yet."
+              : "No ROAs are expiring in the next 30 days."
+          }
         >
           {data.rpki_expiring.map((row) => (
             <Link
