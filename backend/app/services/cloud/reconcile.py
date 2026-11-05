@@ -352,7 +352,10 @@ def _compute_desired(
                         status="cloud-instance",
                         hostname=inst.name,
                         description=desc,
-                        mac=nic.mac,
+                        # MACADDR loads as lowercase colon form; Azure
+                        # reports ``00-0D-3A-…``, which would compare
+                        # unequal on every sync (#3596).
+                        mac=nic.mac.lower().replace("-", ":") if nic.mac else None,
                     )
                 )
             if nic.public_ip:

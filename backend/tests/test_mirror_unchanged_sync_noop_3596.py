@@ -15,18 +15,34 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.ipam import IPSpace, Subnet
+from app.models.ipam import IPAddress, IPSpace, Subnet
+from app.services.cloud.base import (
+    CloudInstance,
+    CloudInventory,
+    CloudNetwork,
+    CloudNic,
+    CloudSubnet,
+)
+from app.services.cloud.reconcile import reconcile_endpoint
 from app.services.docker.client import _DockerNetwork
 from app.services.docker.reconcile import reconcile_host
 from app.services.fortinet.client import _FortiInterface
 from app.services.fortinet.reconcile import reconcile_firewall
 from app.services.integration_ownership import gateway_changed
+from app.services.proxmox.client import _ProxmoxSDNSubnet
+from app.services.proxmox.reconcile import reconcile_node
+from tests.test_cloud_reconcile import _FakeConnector as _CloudFake
+from tests.test_cloud_reconcile import _make_endpoint as _make_cloud_endpoint
+from tests.test_cloud_reconcile import _patch_connector as _patch_cloud
 from tests.test_docker_reconcile import _FakeClient as _DockerFake
 from tests.test_docker_reconcile import _make_host as _make_docker_host
 from tests.test_docker_reconcile import _patch_client as _patch_docker
 from tests.test_fortinet_reconcile import _FakeClient as _FortiFake
 from tests.test_fortinet_reconcile import _make_fw
 from tests.test_fortinet_reconcile import _patch as _patch_forti
+from tests.test_proxmox_reconcile import _FakeClient as _PveFake
+from tests.test_proxmox_reconcile import _make_node as _make_pve_node
+from tests.test_proxmox_reconcile import _patch_client as _patch_pve
 
 _OLD = datetime(2020, 1, 1, tzinfo=UTC)
 
@@ -151,6 +167,97 @@ async def test_fortinet_gateway_change_still_updates(db_session: AsyncSession) -
     sub = await _subnet(db_session, "fortinet_firewall_id", fw.id)
     assert str(sub.gateway) == "10.0.0.2"
     assert sub.modified_at > _OLD + timedelta(days=1)
+
+
+def _pve() -> _PveFake:
+    return _PveFake(
+        sdn_subnets=[
+            _ProxmoxSDNSubnet(
+                vnet="lab",
+                zone="localnetwork",
+                cidr="10.20.30.0/24",
+                gateway="10.20.30.1",
+                snat=False,
+                alias="Lab network",
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxmox_unchanged_second_sync_is_a_noop(db_session: AsyncSession) -> None:
+    space = await _space(db_session)
+    node = await _make_pve_node(db_session, space)
+    await db_session.commit()
+    with _patch_pve(_pve()):
+        first = await reconcile_node(db_session, node)
+    assert first.ok and first.subnets_created == 1
+    await db_session.commit()
+    await _pin_old(db_session, "proxmox_node_id", node.id)
+
+    with _patch_pve(_pve()):
+        second = await reconcile_node(db_session, node)
+    assert second.ok, second.error
+    assert second.subnets_updated == 0
+    await db_session.commit()
+    sub = await _subnet(db_session, "proxmox_node_id", node.id)
+    assert str(sub.gateway) == "10.20.30.1"
+    assert sub.modified_at == _OLD
+
+
+def _azure_inventory() -> CloudInventory:
+    return CloudInventory(
+        account_id="sub-1",
+        networks=[CloudNetwork(id="vnet-1", name="vnet", cidrs=("10.9.0.0/16",), region="eastus")],
+        subnets=[
+            CloudSubnet(
+                id="sn-1", name="app", network_id="vnet-1", cidr="10.9.1.0/24", region="eastus"
+            )
+        ],
+        instances=[
+            CloudInstance(
+                id="vm-1",
+                name="web-1",
+                running=True,
+                region="eastus",
+                # Azure's spelling of a MAC.
+                nics=(CloudNic(private_ip="10.9.1.10", mac="00-0D-3A-11-22-33"),),
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_azure_style_mac_unchanged_second_sync_is_a_noop(
+    db_session: AsyncSession,
+) -> None:
+    space = await _space(db_session)
+    endpoint = await _make_cloud_endpoint(db_session, space, provider="azure")
+    await db_session.commit()
+    with _patch_cloud(_CloudFake(inventory=_azure_inventory())):
+        first = await reconcile_endpoint(db_session, endpoint)
+    assert first.ok and first.addresses_created == 1
+    await db_session.commit()
+    # Reload the row as the database stores it, as a fresh sync would see it.
+    await db_session.execute(
+        select(IPAddress)
+        .where(IPAddress.cloud_endpoint_id == endpoint.id)
+        .execution_options(populate_existing=True)
+    )
+
+    with _patch_cloud(_CloudFake(inventory=_azure_inventory())):
+        second = await reconcile_endpoint(db_session, endpoint)
+    assert second.ok, second.error
+    assert second.addresses_updated == 0
+    await db_session.commit()
+    row = (
+        await db_session.execute(
+            select(IPAddress)
+            .where(IPAddress.cloud_endpoint_id == endpoint.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert row.mac_address == "00:0d:3a:11:22:33"
 
 
 def test_gateway_changed_compares_addresses_not_spellings() -> None:

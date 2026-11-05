@@ -1278,6 +1278,7 @@ __all__ = [
     "owned_subnets_in_space",
     "ownership_target_model",
     "drop_wrapper_block",
+    "gateway_changed",
     "release_outside_space",
     "retire_vanished_subnet",
     "SpaceRelease",
