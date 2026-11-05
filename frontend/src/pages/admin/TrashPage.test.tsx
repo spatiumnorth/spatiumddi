@@ -251,6 +251,64 @@ describe("a parent still in the Trash (#1957)", () => {
     ]);
   });
 
+  it("keeps the dialog open and lists what the parent's restore left behind (#3505)", async () => {
+    list.mockResolvedValue({ items: [entry(1)], total: 1 });
+    restore.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            skip_conflicts_allowed: true,
+            conflicts: [
+              {
+                type: "dns_record",
+                id: "r-1",
+                display: "ya.example.test. A",
+                reason: "its zone example.test. is in the Trash",
+                parent_type: "dns_zone",
+                parent_id: "z-9",
+                parent_display: "example.test.",
+              },
+            ],
+          },
+        },
+      },
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    const first = await screen.findByText("Restore example.test. first");
+    restore.mockResolvedValueOnce({
+      batch_id: "b",
+      restored: 1,
+      skipped: [],
+      held_back: [
+        {
+          type: "subnet",
+          id: "s-1",
+          display: "2 IPAM records of 10.198.136.0/24 (name)",
+          reason: "subnet is in the Trash",
+        },
+      ],
+    });
+    restore.mockResolvedValueOnce({ batch_id: "b", restored: 1, skipped: [] });
+    fireEvent.click(first);
+    await screen.findByText(/left in the Trash/);
+    expect(
+      screen.getByText(/2 IPAM records of 10\.198\.136\.0\/24 \(name\) — /),
+    ).toBeTruthy();
+    expect(restore).toHaveBeenCalledTimes(3);
+  });
+
   it("is not offered when the clash is not a trashed parent", async () => {
     await clash(false);
     expect(

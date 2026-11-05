@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronLeft,
@@ -85,6 +85,10 @@ function ConfirmRestoreModal({
     display: string;
   } | null>(null);
 
+  // What the parent's own restore left in the Trash (#3505), carried across to
+  // the retry of this row so the result lists both.
+  const parentLeft = useRef<string[]>([]);
+
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["trash"] });
     qc.invalidateQueries({ queryKey: ["ipam"] });
@@ -140,16 +144,30 @@ function ConfirmRestoreModal({
     onSuccess: (res) => {
       invalidate();
       const left = [...(res.skipped ?? []), ...(res.held_back ?? [])];
-      if (left.length === 0) {
+      const carried = parentLeft.current;
+      parentLeft.current = [];
+      if (left.length === 0 && carried.length === 0) {
         onClose();
         return;
       }
       setError(null);
       setBlocker(null);
       setCanSkipConflicts(false);
-      setLeftBehind(left.map((c) => `${c.display} — ${c.reason}`));
+      setLeftBehind([
+        ...carried,
+        ...left.map((c) => `${c.display} — ${c.reason}`),
+      ]);
     },
-    onError: showError,
+    onError: (err) => {
+      // The row's own retry failed: the parent is restored regardless, so say
+      // what it left behind next to the error rather than dropping it.
+      const carried = parentLeft.current;
+      parentLeft.current = [];
+      showError(err);
+      if (carried.length > 0) {
+        setLeftBehind(carried);
+      }
+    },
   });
 
   // Restore the blocking parent, then retry this row. A parent with a trashed
@@ -157,10 +175,14 @@ function ConfirmRestoreModal({
   const parentMut = useMutation({
     mutationFn: (p: { type: TrashEntryType; id: string }) =>
       trashApi.restore(p.type, p.id),
-    onSuccess: () => {
+    onSuccess: (res) => {
       invalidate();
       setError(null);
       setBlocker(null);
+      parentLeft.current = [
+        ...(res.skipped ?? []),
+        ...(res.held_back ?? []),
+      ].map((c) => `${c.display} — ${c.reason}`);
       mut.mutate(false);
     },
     onError: showError,
