@@ -294,7 +294,12 @@ async def purge_lease(
     return mirror_removed
 
 
-async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tuple[int, int]:
+async def delete_leases_for_scope(
+    db: AsyncSession,
+    scope_id: uuid.UUID,
+    *,
+    touched_subnets: set[uuid.UUID] | None = None,
+) -> tuple[int, int]:
     """Purge every dynamic lease that belongs to ``scope_id``.
 
     Enumerates strictly by ``DHCPLease.scope_id`` (all states). A scope is
@@ -305,6 +310,13 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     ``scope_id`` still points at it; the post-delete race (a poll that nulled
     ``scope_id``) is handled by the pull-leases zero-wire floor guard.
 
+    The freed mirrors move their subnets' counters (#3345). A caller tearing
+    several scopes down in one transaction passes ``touched_subnets`` and
+    recounts once itself, last, with ``recount_subnets_and_blocks``: a recount
+    per scope would lock one scope's subnet and block chain before the next
+    scope's subnet, out of the one order every recount takes (#3354). With
+    none, this recounts what it freed before returning.
+
     Returns ``(leases_removed, mirrors_removed)`` for audit / preview.
     """
     leases = list(
@@ -313,7 +325,7 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     now = datetime.now(UTC)
     leases_removed = 0
     mirrors_removed = 0
-    touched: set[uuid.UUID] = set()
+    touched: set[uuid.UUID] = set() if touched_subnets is None else touched_subnets
     for lease in leases:
         # Every copy of every lease in the scope is going, so no copy's peer
         # outlives it — see ``purge_lease(spare_if_peer_holds=...)``.
@@ -322,7 +334,8 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
         ):
             mirrors_removed += 1
         leases_removed += 1
-    await recount_subnets_and_blocks(db, touched)  # #3345
+    if touched_subnets is None:
+        await recount_subnets_and_blocks(db, touched)  # #3345
     return leases_removed, mirrors_removed
 
 

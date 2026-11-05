@@ -45,6 +45,7 @@ from app.services.ipam.orphan_aliases import (
     refusal_reason,
     withdrawn_alias_owners,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -818,6 +819,9 @@ async def permanent_delete_from_trash(
     records_retracted = 0
     purged_extra: dict[str, int] = {}
     dns_wake_group_ids: set[uuid.UUID] = set()
+    # Subnets whose DHCP mirrors the purge frees; recounted once, last, just
+    # before the commit (#3354).
+    touched_subnets: set[uuid.UUID] = set()
     try:
         if isinstance(target, DHCPScope):
             live = await _live_children(db, [target], [], [])
@@ -827,8 +831,8 @@ async def permanent_delete_from_trash(
             # back into free gaps, and purge any dynamic leases still pointing here —
             # defense-in-depth for pre-fix strays / convergence-race leftovers (the
             # first soft-delete normally already cleaned both up).
-            await remove_ipam_for_scope_statics(db, target.id)
-            await delete_leases_for_scope(db, target.id)
+            await remove_ipam_for_scope_statics(db, target.id, touched_subnets=touched_subnets)
+            await delete_leases_for_scope(db, target.id, touched_subnets=touched_subnets)
         elif isinstance(target, Customer):
             # network_service.customer_id is RESTRICT, so a customer that still
             # has services (live or in the Trash) cannot go; say which, rather
@@ -944,6 +948,7 @@ async def permanent_delete_from_trash(
             )
         elif not isinstance(target, DNSZone):
             await db.delete(target)
+        await recount_subnets_and_blocks(db, touched_subnets)
         await db.commit()
     except IntegrityError as exc:
         # Something we did not account for still references the row. Never a 500
