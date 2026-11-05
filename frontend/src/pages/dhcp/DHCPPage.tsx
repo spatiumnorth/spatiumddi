@@ -92,6 +92,7 @@ import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { syncLabel } from "@/lib/dhcp-sync-label";
 import { scopePickerLabel } from "@/lib/dhcp-scope-label";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -1771,12 +1772,7 @@ function PoolOccupancyCell({
   if (!occ) {
     return <span className="text-xs text-muted-foreground/40">—</span>;
   }
-  const tone =
-    occ.percent >= 90
-      ? "bg-rose-500"
-      : occ.percent >= 75
-        ? "bg-amber-500"
-        : "bg-emerald-500";
+  const tone = poolOccupancyTone(occ.percent);
   return (
     <div
       className="flex min-w-[9rem] items-center gap-2"

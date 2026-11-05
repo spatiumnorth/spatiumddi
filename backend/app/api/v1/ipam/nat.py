@@ -38,6 +38,7 @@ from app.api.pagination import MAX_PAGE
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.ipam import IPAddress, NATMapping, Subnet
+from app.services.ipam.live_address import get_live_address
 
 router = APIRouter(
     prefix="/nat-mappings",
@@ -561,7 +562,7 @@ async def list_nat_mappings_for_ip(
     counted; the IP can play either role in a NAT pair.
     """
 
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
 

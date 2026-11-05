@@ -620,6 +620,7 @@ backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:57
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:58
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:59
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:60
+backend/alembic/versions/d8f3a61c2e47_dns_server_memory_limit.py:drop_column:30
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:166
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:167
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:168

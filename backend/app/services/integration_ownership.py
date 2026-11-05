@@ -42,6 +42,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction, aliased
 
+from app.db import exists_including_deleted
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
@@ -181,9 +182,11 @@ def address_operator_ref(address_id: Any) -> Any:
     from app.models.dhcp import DHCPStaticAssignment  # noqa: PLC0415
     from app.models.dns import DNSRecord  # noqa: PLC0415
 
+    # A record or reservation in the Trash still points here, and deleting the
+    # address would null its link for good; it counts (#3492).
     return or_(
-        exists().where(DNSRecord.ip_address_id == address_id),
-        exists().where(DHCPStaticAssignment.ip_address_id == address_id),
+        exists_including_deleted(DNSRecord.ip_address_id == address_id),
+        exists_including_deleted(DHCPStaticAssignment.ip_address_id == address_id),
         address_registry_ref(address_id),
     )
 
@@ -881,7 +884,9 @@ async def release_outside_space(
             Subnet.created_at >= target_created,
             not_(_operator_touched("subnet", Subnet.id)),
             not_(exists().where(IPAddress.subnet_id == Subnet.id)),
-            not_(exists().where(DHCPScope.subnet_id == Subnet.id)),
+            # A scope in the Trash counts: ``ON DELETE CASCADE`` would
+            # destroy it with the subnet (#3492).
+            not_(exists_including_deleted(DHCPScope.subnet_id == Subnet.id)),
             not_(subnet_operator_ref(Subnet.id)),
             not_(_jsonb_nonempty(Subnet.tags)),
             not_(_jsonb_nonempty(Subnet.custom_fields)),
@@ -909,8 +914,10 @@ async def release_outside_space(
         block_pure = and_(
             IPBlock.created_at >= target_created,
             not_(_operator_touched("ip_block", IPBlock.id)),
-            not_(exists().where(Subnet.block_id == IPBlock.id)),
-            not_(exists().where(child.parent_block_id == IPBlock.id)),
+            # Trashed children count: a subnet's ``RESTRICT`` FK would fail
+            # the delete, a child block's ``CASCADE`` would destroy it (#3492).
+            not_(exists_including_deleted(Subnet.block_id == IPBlock.id)),
+            not_(exists_including_deleted(child.parent_block_id == IPBlock.id)),
             not_(_jsonb_nonempty(IPBlock.tags)),
             not_(_jsonb_nonempty(IPBlock.custom_fields)),
             *_no_other_owner(IPBlock, own_fk),

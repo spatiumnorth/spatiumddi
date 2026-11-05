@@ -18,14 +18,17 @@ the *state-machine* invariants (a request only ever transitions out of
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 import structlog
 from fastapi import HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.core.agent_wake import collecting_wakes
 from app.core.permissions import is_effective_superadmin
@@ -254,6 +257,72 @@ def _require_state(cr: ChangeRequest, expected: str) -> None:
         )
 
 
+def _stamp_approved(cr: ChangeRequest, *, approver: User, note: str | None) -> None:
+    """The ``pending`` → ``approved`` field write, without its audit row."""
+    _require_state(cr, "pending")
+    cr.state = "approved"
+    cr.decided_by_user_id = approver.id
+    cr.decided_by_display = approver.display_name
+    cr.decision_note = note
+    cr.decided_at = datetime.now(UTC)
+
+
+def _audit_approved(
+    db: AsyncSession,
+    cr: ChangeRequest,
+    *,
+    approver: User,
+    request: Request | None,
+    note: str | None,
+) -> None:
+    _audit(
+        db,
+        user=approver,
+        request=request,
+        action=_ACTION_APPROVED,
+        cr=cr,
+        old_value={"state": "pending"},
+        new_value={"state": "approved", "note": note},
+    )
+
+
+@contextmanager
+def _audit_approval_at_commit(
+    db: AsyncSession,
+    cr: ChangeRequest,
+    *,
+    approver: User,
+    request: Request | None,
+    note: str | None,
+) -> Iterator[dict[str, bool]]:
+    """Audit the approval in the transaction ``apply()`` commits (#3549).
+
+    ``apply()`` runs its own ``db.commit()``. Writing the approval's audit row
+    before it took the audit-chain lock ahead of apply()'s ``dns_zone`` row
+    locks; writing it after it put the row in a second transaction, so a
+    failure between the two (the spine's own commit raising, or the process
+    dying) left a committed change and an ``approved`` row with no approval in
+    the audit log. A ``before_commit`` hook adds the row as the last write of
+    the root transaction apply() commits: after its row locks, in the same
+    commit as the change and the stamp. A savepoint release also fires
+    ``before_commit`` and is skipped. Yields ``{"written": bool}``; the caller
+    audits directly when apply() never committed."""
+    state = {"written": False}
+    sync = db.sync_session
+
+    def _before_commit(session: Session) -> None:
+        if state["written"] or session.in_nested_transaction():
+            return
+        state["written"] = True
+        _audit_approved(db, cr, approver=approver, request=request, note=note)
+
+    event.listen(sync, "before_commit", _before_commit)
+    try:
+        yield state
+    finally:
+        event.remove(sync, "before_commit", _before_commit)
+
+
 async def mark_approved(
     db: AsyncSession,
     cr: ChangeRequest,
@@ -265,22 +334,14 @@ async def mark_approved(
     """``pending`` → ``approved``. Caller must have already loaded ``cr``
     with ``for_update=True`` and enforced two-person RBAC. Records the
     approver + decision time; execution (``apply()``) is a separate
-    :func:`mark_executed` / :func:`mark_failed` call by the API layer."""
-    _require_state(cr, "pending")
-    cr.state = "approved"
-    cr.decided_by_user_id = approver.id
-    cr.decided_by_display = approver.display_name
-    cr.decision_note = note
-    cr.decided_at = datetime.now(UTC)
-    _audit(
-        db,
-        user=approver,
-        request=request,
-        action=_ACTION_APPROVED,
-        cr=cr,
-        old_value={"state": "pending"},
-        new_value={"state": "approved", "note": note},
-    )
+    :func:`mark_executed` / :func:`mark_failed` call by the API layer.
+
+    The approve spine does not call this for an operation it applies: it
+    stamps the state before ``apply()`` and audits it in apply()'s commit
+    (:func:`_audit_approval_at_commit`, #3549), so the audit-chain lock is
+    taken after the operation's row locks."""
+    _stamp_approved(cr, approver=approver, note=note)
+    _audit_approved(db, cr, approver=approver, request=request, note=note)
     return cr
 
 
@@ -624,6 +685,8 @@ async def _stamp_apply_failed(
     cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
     requester_id = cr.requested_by_user_id
     if not approval_committed:
+        # apply()'s commit carries the stamp and its audit row together
+        # (#3549), so a committed approval is already audited.
         await mark_approved(db, cr, approver=approver, request=request, note=note)
     await mark_failed(
         db, cr, approver=approver, requester_id=requester_id, request=request, error=error
@@ -928,19 +991,27 @@ async def approve_change_request(
     # submit time.
     cr.preview_text = preview.preview_text
 
-    # Record the approval transition (pending → approved, audited).
-    await mark_approved(db, cr, approver=approver, request=request, note=note)
+    # Stamp the approval (pending → approved) but do NOT add its audit row
+    # yet. apply() commits, so the stamp persists with the change and a retry
+    # cannot apply twice; the audit row joins that same commit as its last
+    # write (#3549). Adding it here took the audit-chain lock before apply()'s
+    # dns_zone / subnet row locks, the reverse of every other path (#3501,
+    # #3503), and could deadlock.
+    _stamp_approved(cr, approver=approver, note=note)
 
     # 6. Dispatch apply() under the approver's identity. apply() runs its own
-    #    mutation + audit + commit; on success mark_executed writes the
-    #    change_request.executed audit row carrying both ids.
+    #    mutation + audit + commit, which carries the approval audit row; on
+    #    success the change_request.executed row (carrying both ids) follows.
     try:
         # #2040 — neither /change-requests nor /requests mounts
         # ``wake_publishing``, so open the collector here: an approved op's
         # ``collect_wake`` publishes after apply() commits (dropped on raise)
         # instead of being a silent no-op.
-        async with collecting_wakes():
-            result = await op.apply(db, approver, args)
+        with _audit_approval_at_commit(
+            db, cr, approver=approver, request=request, note=note
+        ) as approval_audit:
+            async with collecting_wakes():
+                result = await op.apply(db, approver, args)
     except OperationPermissionError as exc:
         await _safe_rollback(db)
         raise DecisionForbidden(str(exc)) from exc
@@ -972,6 +1043,9 @@ async def approve_change_request(
             db, cr_id, approver=approver, request=request, note=note, error=str(exc)
         )
 
+    if not approval_audit["written"]:
+        # apply() did not commit; the spine's commit below carries both.
+        _audit_approved(db, cr, approver=approver, request=request, note=note)
     await mark_executed(
         db,
         cr,
