@@ -115,6 +115,7 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import {
   type UtilizationThresholds,
@@ -243,6 +244,33 @@ function UtilColor(percent: number, t: UtilizationThresholds): string {
   return "bg-muted/60 dark:bg-muted/40";
 }
 
+/** The heatmap legend: each swatch labelled with the percentage its colour
+ *  starts at, matching ``UtilColor``. A green step at or above the warning
+ *  line, and an amber step when warning is not below critical, are never
+ *  drawn, so they are left out rather than listed out of order (#3539). */
+function heatmapLegend(
+  t: UtilizationThresholds,
+): { cls: string; label: string }[] {
+  const entries: { cls: string; label: string }[] = [];
+  if (t.warn > 0 && t.critical > 0) {
+    entries.push({ cls: "bg-muted/60", label: "0%" });
+    entries.push({ cls: "bg-emerald-300", label: ">0" });
+  }
+  for (const [start, cls] of [
+    [25, "bg-emerald-400"],
+    [50, "bg-emerald-500"],
+  ] as const) {
+    if (start < t.warn && start < t.critical) {
+      entries.push({ cls, label: String(start) });
+    }
+  }
+  if (t.warn < t.critical) {
+    entries.push({ cls: "bg-amber-400", label: String(t.warn) });
+  }
+  entries.push({ cls: "bg-red-500", label: String(t.critical) });
+  return entries;
+}
+
 /** One entry in the Overview inventory strip (#942) — a value, its unit,
  *  and the same click-through the KPI card it replaced had. */
 function InventoryStat({
@@ -312,11 +340,15 @@ function capacityLabel(subnet: {
 export function UtilizationBar({
   percent,
   network,
+  tone,
 }: {
   percent: number;
   /** When this is a v6 prefix the bar renders n/a: "0%" of a /64 is
    *  true, useless, and indistinguishable from an empty v4 subnet. */
   network?: string;
+  /** Fill class for a bar that is not subnet utilization (a DHCP pool's
+   *  occupancy), which Settings' IPAM thresholds do not govern. */
+  tone?: string;
 }) {
   const thresholds = useUtilizationThresholds();
   if (network && isV6(network)) {
@@ -338,7 +370,7 @@ export function UtilizationBar({
         <div
           className={cn(
             "h-full rounded-full transition-all",
-            UtilColor(percent, thresholds),
+            tone ?? UtilColor(percent, thresholds),
           )}
           style={{ width: `${Math.min(percent, 100)}%` }}
         />
@@ -415,26 +447,14 @@ export function SubnetHeatmap({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px]">
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted/60" />
-            <span className="text-muted-foreground">0%</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-300" />
-            <span className="text-muted-foreground">25</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" />
-            <span className="text-muted-foreground">50</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400" />
-            <span className="text-muted-foreground">{thresholds.warn}</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-500" />
-            <span className="text-muted-foreground">{thresholds.critical}</span>
-          </div>
+          {heatmapLegend(thresholds).map((e) => (
+            <div key={e.cls} className="flex items-center gap-1">
+              <span
+                className={cn("inline-block h-2.5 w-2.5 rounded-sm", e.cls)}
+              />
+              <span className="text-muted-foreground">{e.label}</span>
+            </div>
+          ))}
         </div>
       </div>
       <div className="p-4">
@@ -3255,7 +3275,7 @@ function ServerRow({
  * offered to a client and a reserved one is *supposed* to fill up, so
  * either would render as a red exhaustion bar for behaving correctly.
  */
-function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
+export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
@@ -3391,7 +3411,10 @@ function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
                   />
                 )}
                 <div className="flex-1">
-                  <UtilizationBar percent={p.percent} />
+                  <UtilizationBar
+                    percent={p.percent}
+                    tone={poolOccupancyTone(p.percent)}
+                  />
                 </div>
                 <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
                   {p.assigned.toLocaleString()} / {p.total.toLocaleString()}
