@@ -1605,7 +1605,11 @@ export function DashboardPage() {
   // The route takes read on `audit_log`: a user without it is not asked at
   // all (each refusal writes a `denied` audit row), and the card says so
   // rather than "No recent activity" (#2702). A refusal also ends the poll.
-  const { can: canRead, isLoading: permsLoading } = usePermissions();
+  const {
+    can: canRead,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadAudit = canRead("read", "audit_log");
   const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
@@ -2584,6 +2588,10 @@ export function DashboardPage() {
                           error={recentError}
                           what="the audit log"
                         />
+                      ) : permsFailed ? (
+                        // A failed permissions read is not a missing grant
+                        // (#3541): ``can`` is false for everyone then.
+                        "Your permissions could not be read, so the audit log was not requested. Reload to try again."
                       ) : (
                         "You don't have permission to see the audit log."
                       )}
@@ -4440,7 +4448,11 @@ function CertsExpiringKpi() {
 
   // The route takes read on `tls_cert`; a user without it is not asked, and
   // the card says it is withheld rather than "0 of 0 monitored" (#2702).
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadCerts = can("read", "tls_cert");
   const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
@@ -4478,7 +4490,9 @@ function CertsExpiringKpi() {
         {withheld
           ? error && !isRefused(error)
             ? "couldn't load certificates"
-            : "you may not read certificates"
+            : !error && permsFailed
+              ? "couldn't read your permissions"
+              : "you may not read certificates"
           : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
