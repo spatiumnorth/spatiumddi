@@ -100,7 +100,12 @@ _MAX_ERROR = 2000
 #   now carry under ``update-policy``. Unchanged for a group without that key;
 #   for one with it the ETag moves once, so every agent re-renders at the
 #   upgrade instead of at the group's first change.
-RENDERER_REVISION = 15
+# 16 (#3560, #3609): a BIND9 group stored at ``dnssec_validation: yes`` with no
+#   trust anchor renders ``auto``, and a stored static root anchor renders as
+#   ``initial-key``. Unchanged for every other group; for one in either state
+#   the ETag moves once, so a group BIND refused before the upgrade converges at
+#   the upgrade instead of at its first change.
+RENDERER_REVISION = 16
 
 
 def _serves(revision: int | None) -> bool:
