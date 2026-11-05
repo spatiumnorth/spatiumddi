@@ -272,7 +272,7 @@ from app.services.dns_io import (
     apply_cname_rule,
     diff_records,
     parse_zone_file,
-    write_zone_file,
+    write_zone_file_served,
 )
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
@@ -6025,7 +6025,7 @@ async def export_all_zones(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for zone in zones:
             records = await _load_zone_records(zone.id, db)
-            text = write_zone_file(zone, records)
+            text = await write_zone_file_served(db, zone, records)
             zf.writestr(zone.name.rstrip(".") + ".zone", text)
     buf.seek(0)
 
@@ -10737,7 +10737,7 @@ async def export_zone(
         rows = await sheet_io.zone_record_rows(db, zone)
         return _sheet_response(rows, format, _sheet_filename(zone, format))
     records = await _load_zone_records(zone_id, db)
-    text = write_zone_file(zone, records)
+    text = await write_zone_file_served(db, zone, records)
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     filename = f"{zone.name.rstrip('.')}-{ts}.zone"
     return Response(
