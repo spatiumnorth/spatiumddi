@@ -56,8 +56,8 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owned_subnets_in_space,
     refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
     subnet_for_address,
-    subnet_has_surviving_addresses,
     unowned_subnets_at,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -343,16 +343,13 @@ async def _apply_blocks_and_subnets(
 
     for net_str, row in current_subnets.items():
         if net_str not in desired_map:
-            # #1558: don't cascade-delete operator / foreign /
-            # operator-edited addresses with the subnet — un-claim it
-            # instead when any survive, like the OPNsense reconciler.
-            if await subnet_has_surviving_addresses(db, row.id, "docker_host_id"):
-                row.docker_host_id = None
+            # #1558 / #3532: a subnet carrying operator content (addresses,
+            # a DHCP scope live or in Trash, tags, links …) is un-claimed,
+            # not cascade-deleted with it; either way it is audited.
+            if await retire_vanished_subnet(db, row, "docker_host_id", warnings=summary.warnings):
                 summary.subnets_updated += 1
-                continue
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
-            summary.subnets_deleted += 1
+            else:
+                summary.subnets_deleted += 1
 
     # #2601: an un-owned subnet at exactly a desired CIDR is reused as it
     # stands, never twinned. It is one #1558 kept when its network went

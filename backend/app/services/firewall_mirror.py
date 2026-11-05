@@ -41,7 +41,7 @@ from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
     owned_addresses_in_space,
-    subnet_has_surviving_addresses,
+    retire_vanished_subnet,
 )
 from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
 from app.services.ipam.utilization import recount_subnets_and_blocks
@@ -448,17 +448,14 @@ async def apply_subnets(
     ]
     fw_wrappers = {str(b.network): b for b in blocks if getattr(b, owner.fk_attr) == target_id}
 
-    # Delete owner-owned subnets no longer present (un-claim if foreign IPs live in).
+    # Delete owner-owned subnets no longer present (un-claim if operator
+    # content — addresses, a DHCP scope live or in Trash, … — lives on, #3532).
     for cidr, row in list(fw_subnets.items()):
         if cidr in desired:
             continue
-        surviving = await subnet_has_surviving_addresses(db, row.id, owner.fk_attr)
-        if surviving:
-            setattr(row, owner.fk_attr, None)
+        if await retire_vanished_subnet(db, row, owner.fk_attr, warnings=summary.warnings):
             summary.subnets_updated += 1
         else:
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
             summary.subnets_deleted += 1
 
     used_wrapper_cidrs: set[str] = set()
