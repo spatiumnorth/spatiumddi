@@ -68,6 +68,7 @@ from app.services.integration_ownership import (
     address_taken,
     addresses_in_space,
     drop_wrapper_block,
+    gateway_changed,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
@@ -560,7 +561,7 @@ async def _apply_blocks_and_subnets(
                 changed = True
             # Only set the gateway when we know one; never clear an
             # operator-set value back to None on a sync.
-            if d.gateway and str(existing.gateway or "") != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
