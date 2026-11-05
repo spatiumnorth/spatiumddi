@@ -11614,7 +11614,16 @@ export function BlocklistDetail({
           Last synced: {new Date(list.last_synced_at).toLocaleString()}
           {list.last_sync_status && <> — {list.last_sync_status}</>}
           {list.last_sync_error && (
-            <span className="text-destructive"> ({list.last_sync_error})</span>
+            <span
+              className={
+                list.last_sync_status === "error"
+                  ? "text-destructive"
+                  : "text-amber-600"
+              }
+            >
+              {" "}
+              ({list.last_sync_error})
+            </span>
           )}
         </p>
       )}

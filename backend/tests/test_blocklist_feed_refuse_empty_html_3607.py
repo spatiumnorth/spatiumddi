@@ -141,3 +141,26 @@ def test_looks_like_html() -> None:
     assert looks_like_html("<!doctype html>")
     assert not looks_like_html("<!-- c -->\nexample.com")
     assert not looks_like_html("example.com\n")
+
+
+async def test_manual_entries_do_not_count_as_feed_entries(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only feed rows are at stake in a refresh: a list holding manual entries
+    # and no feed entries takes an empty feed as a first refresh, and the
+    # manual entries stay.
+    _wire(monkeypatch, db_session, httpx.Response(200, text="# empty\n"))
+    bl = await _list(db_session, with_entry=False)
+    db_session.add(
+        DNSBlockListEntry(
+            list_id=bl.id, domain="manual.example.com", entry_type="block", source="manual"
+        )
+    )
+    await db_session.commit()
+
+    out = await dns_tasks._refresh_blocklist_feed_async(str(bl.id))
+
+    assert out["status"] == "success"
+    await db_session.refresh(bl)
+    assert bl.last_sync_status == "success"
+    assert await _domains(db_session, bl) == ["manual.example.com"]
