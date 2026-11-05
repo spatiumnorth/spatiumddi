@@ -11,7 +11,9 @@ hooked into the ``before_flush`` event in
    ordering.
 3. Takes a Postgres transaction-scoped advisory lock so concurrent
    transactions can't interleave their "fetch previous hash, hash my
-   row, write it" sequence.
+   row, write it" sequence. First it row-locks any ``dns_zone`` row the
+   flush is about to write: those are taken before this lock everywhere
+   else, so taking them after it deadlocks (#3389, #3503).
 4. Fetches the latest existing ``row_hash`` (where ``seq = MAX(seq)``)
    to seed ``prev_hash`` for the first new row.
 5. Walks the new rows in order, computing
@@ -162,6 +164,53 @@ def hash_row(prev_hash: str | None, canonical: str) -> str:
     return h.hexdigest()
 
 
+#: Tables whose rows a writer locks BEFORE its audit row, so they must never
+#: be locked after the audit-chain lock (#3389, #3503). A record create bumps
+#: its zone's serial and flushes at once, holding the ``dns_zone`` row from
+#: then on, and takes the chain lock only at its commit. A transaction that
+#: took the chain lock first and then wrote that row would wait for the
+#: record create while the record create waited for it: 40P01, a bare 500.
+LOCKED_BEFORE_AUDIT_TABLES: frozenset[str] = frozenset({"dns_zone"})
+
+
+def _lock_rows_written_before_audit(session: Session) -> None:
+    """Row-lock what this flush is about to write in
+    :data:`LOCKED_BEFORE_AUDIT_TABLES`, before the chain lock is taken.
+
+    The flush itself would lock them only after ``before_flush`` returns,
+    i.e. after the chain lock, which is the order that deadlocks. Locking
+    them here, in id order, keeps zone row first and chain lock second for
+    every flush that carries both, whichever path staged them. A plain
+    ``SELECT ... FOR UPDATE`` rather than a nested flush: ``before_flush``
+    must not flush. ``FOR NO KEY UPDATE`` is the lock the UPDATE takes
+    anyway, so a concurrent FK insert (a new record's ``KEY SHARE`` on its
+    zone) is not blocked by it; a DELETE needs ``FOR UPDATE``.
+    """
+    updates: dict[Any, set[Any]] = {}
+    deletes: dict[Any, set[Any]] = {}
+    for obj in session.dirty:
+        table = getattr(type(obj), "__table__", None)
+        if table is None or table.name not in LOCKED_BEFORE_AUDIT_TABLES:
+            continue
+        if session.is_modified(obj, include_collections=False):
+            updates.setdefault(table, set()).add(obj.id)
+    for obj in session.deleted:
+        table = getattr(type(obj), "__table__", None)
+        if table is not None and table.name in LOCKED_BEFORE_AUDIT_TABLES:
+            deletes.setdefault(table, set()).add(obj.id)
+    for rows, key_share in ((updates, True), (deletes, False)):
+        for table, ids in rows.items():
+            session.execute(
+                select(table.c.id)
+                .where(table.c.id.in_(sorted(ids)))
+                .order_by(table.c.id)
+                .with_for_update(key_share=key_share)
+                # The row is locked whether or not it is soft-deleted (a
+                # restore un-stamps one).
+                .execution_options(include_deleted=True)
+            )
+
+
 def compute_audit_hashes(session: Session) -> None:
     """``before_flush`` listener target. Synchronous — runs in the
     same DB session the request is using.
@@ -239,7 +288,16 @@ def compute_audit_hashes(session: Session) -> None:
     # the uuid tie-break reordered the chain away from seq order and
     # verify_chain reported a false ``prev_hash_mismatch``.
 
+    # Rows other writers lock BEFORE their audit row, taken before the chain
+    # lock below even when this same flush writes them (#3503).
+    _lock_rows_written_before_audit(session)
+
     # Transaction-scoped advisory lock; auto-released at COMMIT/ROLLBACK.
+    # Taken before this flush's own statements, so a row written by this
+    # flush that other writers lock BEFORE their audit row is locked by
+    # ``_lock_rows_written_before_audit`` above. One already written by an
+    # earlier flush is fine; one written by a LATER flush, after this lock
+    # is held, deadlocks (#3389, #3503).
     session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY})
 
     # Fetch the most-recent persisted row's hash. Empty table → None.

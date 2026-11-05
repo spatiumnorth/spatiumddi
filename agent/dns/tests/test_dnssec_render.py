@@ -128,3 +128,23 @@ def test_nonzero_nsec3_iterations_render_as_zero() -> None:
     )
     assert "nsec3param iterations 0 optout no salt-length 8;" in out
     assert "151" not in out
+
+
+def test_key_lifetimes_bind_refuses_render_in_range() -> None:
+    """named-checkconf 9.20 rejects the whole named.conf over a key lifetime
+    that is negative, past 49710 days, or shorter than a rollover takes (#3411).
+    The control plane holds a stored one to BIND's range; an older one may
+    still ship it as stored."""
+    out = _render_dnssec_policies(
+        [
+            {"name": "neg", "ksk_lifetime_days": -1, "zsk_lifetime_days": 7},
+            {"name": "big", "ksk_lifetime_days": 1, "zsk_lifetime_days": 1000000},
+        ]
+    )
+    neg, big = out.split('dnssec-policy "big"')
+    assert "ksk lifetime unlimited algorithm ecdsap256sha256;" in neg
+    assert "zsk lifetime 11d algorithm ecdsap256sha256;" in neg
+    assert "ksk lifetime 2d algorithm ecdsap256sha256;" in big
+    assert "zsk lifetime 49710d algorithm ecdsap256sha256;" in big
+    assert "-1d" not in out
+    assert "1000000d" not in out

@@ -171,6 +171,7 @@ from app.services.dns.named_conf_validation import (
     validate_acl_entries,
     validate_acl_name,
     validate_address_match_list,
+    validate_key_lifetime_days,
     validate_nsec3_iterations,
     validate_nsec3_salt_length,
     validate_server_option,
@@ -247,6 +248,7 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
+from app.services.dns.zone_apex import served_apex_for_zones
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -1892,6 +1894,58 @@ class RecordResponse(BaseModel):
     provider_warning: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ServedApexSoa(BaseModel):
+    mname: str
+    rname: str
+
+
+class ServedApexInView(BaseModel):
+    """One split-horizon view's apex, when the views do not all agree."""
+
+    view: str
+    soa: ServedApexSoa
+    ns: list[str]
+    source: Literal["declared", "primary_ns", "placeholder"]
+    placeholder_glue_loopback: bool
+
+
+class ServedApex(BaseModel):
+    """The SOA and apex NS a primary zone serves from its settings (#3518).
+
+    Read-only and never a ``DNSRecord``: nothing here can be edited, exported,
+    imported or counted as a record. Present only on a primary zone; every
+    field but ``driver_applies`` is meaningful only when that is true.
+    """
+
+    # False when the group runs a driver that does not render the zone apex by
+    # the BIND9 agent's rule (PowerDNS, Technitium, Windows, cloud, mixed
+    # groups). The rest then describes what BIND9 *would* serve, so the UI
+    # shows it only as a note.
+    driver_applies: bool
+    soa: ServedApexSoa
+    # The NS set the zone serves at its apex, absolute names.
+    ns: list[str]
+    # ``declared``: the zone's own apex NS records are the set (nothing is
+    # synthesised); ``primary_ns``: Edit Zone's Primary NS; ``placeholder``:
+    # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
+    source: Literal["declared", "primary_ns", "placeholder"]
+    # The placeholder NS is glued to 127.0.0.1: every resolver that follows
+    # the zone's NS set is sent to its own loopback.
+    placeholder_glue_loopback: bool
+    # Under split-horizon the apex is rendered per view, from that view's
+    # records. Empty when every view serves the same apex (or there are no
+    # views); otherwise each view's apex in render order, and the fields above
+    # are the worst of them, so the loopback glue is never summarised away.
+    by_view: list[ServedApexInView] = []
+
+
+class RecordPage(Page[RecordResponse]):
+    """A page of records plus the apex the zone serves beside them (#3518).
+    ``total`` and ``items`` count stored records only."""
+
+    served_apex: ServedApex | None = None
 
 
 def _agentless_op_warning(op: Any) -> str | None:
@@ -3739,6 +3793,9 @@ async def apply_record(
     now = datetime.now(UTC)
     target_serial = bump_zone_serial(zone)
     zone.last_pushed_at = now
+    # #3389: the zone row before the audit-chain lock (see
+    # ``_replace_update_acl_rows``).
+    await db.flush()
 
     db.add(
         AuditLog(
@@ -6777,6 +6834,11 @@ async def update_zone(
         await enqueue_dnssec_op(db, zone, "dnssec_sign")
     elif dnssec_flip == "dnssec_unsign":
         await _flip_dnssec_off(db, zone)
+    # #3389: write the zone row before the audit row, so this request takes
+    # the zone row before the audit-chain lock, as every record writer does.
+    # Left for the commit, this UPDATE ran after the lock and deadlocked with
+    # a record writer holding the row (see ``_replace_update_acl_rows``).
+    await db.flush()
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -7248,6 +7310,13 @@ async def _replace_update_acl_rows(
         )
     if body.dynamic_update_enabled is not None:
         zone.dynamic_update_enabled = body.dynamic_update_enabled
+        # #3389: write the zone row now, before the caller adds its audit row.
+        # The flush that carries an audit row takes the audit-chain lock first
+        # (``compute_audit_hashes`` runs in ``before_flush``), so a flag change
+        # left for the commit waited for the zone row while holding that lock,
+        # and a record writer, which holds the row from its serial-bump flush
+        # on, waited for the lock at its own commit: Postgres aborted one (500).
+        await db.flush()
     return driver_names, warnings
 
 
@@ -7346,6 +7415,16 @@ class DNSSECPolicyCreate(BaseModel):
             raise ValueError("name must be 1-64 chars of [A-Za-z0-9_-]")
         return v
 
+    @field_validator("ksk_lifetime_days")
+    @classmethod
+    def _ksk_lifetime(cls, v: int) -> int:
+        return validate_key_lifetime_days(v, key="ksk")
+
+    @field_validator("zsk_lifetime_days")
+    @classmethod
+    def _zsk_lifetime(cls, v: int) -> int:
+        return validate_key_lifetime_days(v, key="zsk")
+
     @field_validator("nsec3_iterations")
     @classmethod
     def _iterations(cls, v: int) -> int:
@@ -7373,6 +7452,16 @@ class DNSSECPolicyUpdate(BaseModel):
         if v is not None and v not in DNSSEC_ALGORITHMS:
             raise ValueError(f"algorithm must be one of {sorted(DNSSEC_ALGORITHMS)}")
         return v
+
+    @field_validator("ksk_lifetime_days")
+    @classmethod
+    def _ksk_lifetime(cls, v: int | None) -> int | None:
+        return None if v is None else validate_key_lifetime_days(v, key="ksk")
+
+    @field_validator("zsk_lifetime_days")
+    @classmethod
+    def _zsk_lifetime(cls, v: int | None) -> int | None:
+        return None if v is None else validate_key_lifetime_days(v, key="zsk")
 
     @field_validator("nsec3_iterations")
     @classmethod
@@ -8898,7 +8987,7 @@ async def list_group_records(
 
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/records",
-    response_model=Page[RecordResponse],
+    response_model=RecordPage,
 )
 async def list_records(
     group_id: uuid.UUID,
@@ -8910,15 +8999,19 @@ async def list_records(
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-) -> Page[RecordResponse]:
+) -> RecordPage:
     """Records in a zone, server-side paginated (#455).
 
     A large zone (the perf seed reaches 20k+ records) used to return its whole
     record set on every poll. ``search`` matches name / fqdn / value / type so
     a row is findable without paging; ``record_type`` is an exact filter for
     the type dropdown.
+
+    ``served_apex`` (#3518) carries the SOA and apex NS the zone serves from
+    its settings, which no stored record holds. It is not part of ``items`` or
+    ``total``.
     """
-    await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(_, zone_id)
     stmt = select(DNSRecord).where(DNSRecord.zone_id == zone_id)
     if record_type:
@@ -8936,11 +9029,37 @@ async def list_records(
     stmt = apply_tag_filter(stmt, DNSRecord.tags, tag)
     stmt = stmt.order_by(DNSRecord.name, DNSRecord.record_type)
     rows, total = await paginate(db, stmt, page=page, page_size=page_size)
-    return Page[RecordResponse](
+    return RecordPage(
         items=[RecordResponse.model_validate(r) for r in rows],
         total=total,
         page=page,
         page_size=page_size,
+        served_apex=await _served_apex(db, zone),
+    )
+
+
+async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
+    """The apex a primary zone is served with (#3518), or None for a zone that
+    is not primary (a secondary, stub or forward zone has no apex of ours)."""
+    view = (await served_apex_for_zones(db, [zone])).get(zone.id)
+    if view is None:
+        return None
+    return ServedApex(
+        driver_applies=view.driver_applies,
+        soa=ServedApexSoa(mname=view.apex.soa_mname, rname=view.apex.soa_rname),
+        ns=list(view.apex.ns),
+        source=view.apex.source,
+        placeholder_glue_loopback=view.apex.placeholder_glue,
+        by_view=[
+            ServedApexInView(
+                view=name,
+                soa=ServedApexSoa(mname=a.soa_mname, rname=a.soa_rname),
+                ns=list(a.ns),
+                source=a.source,
+                placeholder_glue_loopback=a.placeholder_glue,
+            )
+            for name, a in view.by_view
+        ],
     )
 
 
@@ -9387,11 +9506,17 @@ async def delete_record(
         # the soft and permanent paths retract identically (#632).
         if zone is not None:
             target_serial = bump_zone_serial(zone)
+            # #3503: the zone row before the audit-chain lock, which the audit
+            # rows added after this take at their flush (see
+            # ``_replace_update_acl_rows``).
+            await db.flush()
             await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, record)
         await apply_soft_delete(db, batch, current_user.id)
+        await _check_render()
+        await _push_delete()
         for row in batch.rows:
             db.add(
                 AuditLog(
@@ -9406,13 +9531,14 @@ async def delete_record(
                     result="success",
                 )
             )
-        await _check_render()
-        await _push_delete()
         await db.commit()
         return
 
     ensure_superadmin(current_user)
 
+    await db.delete(record)
+    await _check_render()
+    await _push_delete()
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -9425,9 +9551,6 @@ async def delete_record(
             result="success",
         )
     )
-    await db.delete(record)
-    await _check_render()
-    await _push_delete()
     await db.commit()
 
 

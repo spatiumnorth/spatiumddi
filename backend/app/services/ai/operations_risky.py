@@ -69,6 +69,7 @@ from app.services.ai.operations import (
     get_operation,
     register,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -169,7 +170,9 @@ async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUI
     return group_ids
 
 
-async def _purge_leases_for_scope_batch(db: AsyncSession, batch: Any) -> None:
+async def _purge_leases_for_scope_batch(
+    db: AsyncSession, batch: Any, touched_subnets: set[UUID]
+) -> None:
     """Tear down each batched scope's DHCP-derived rows before the soft-delete stamp.
 
     A scope owns two kinds of derived row that the soft-delete batch does NOT
@@ -184,6 +187,12 @@ async def _purge_leases_for_scope_batch(db: AsyncSession, batch: Any) -> None:
     global filter hides it and the lease-subnet resolver / DDNS lookups see
     nothing. Drives off ``batch.rows`` so every ancestor whose cascade reaches a
     scope — scope, subnet, block, space — is covered from one place.
+
+    Does not recount: the subnets whose mirrors it freed land in
+    ``touched_subnets``, and the caller recounts them once, last, just before
+    its commit (#3354). The recount holds the audit-chain lock and subnet /
+    block row locks to commit, so it must follow the agentless DNS retraction
+    rather than hold them through it, and one pass keeps the locks in id order.
     """
     from app.models.dhcp import DHCPScope  # noqa: PLC0415
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope  # noqa: PLC0415
@@ -191,8 +200,8 @@ async def _purge_leases_for_scope_batch(db: AsyncSession, batch: Any) -> None:
 
     for row in batch.rows:
         if isinstance(row.obj, DHCPScope):
-            await delete_leases_for_scope(db, row.obj.id)
-            await remove_ipam_for_scope_statics(db, row.obj.id)
+            await delete_leases_for_scope(db, row.obj.id, touched_subnets=touched_subnets)
+            await remove_ipam_for_scope_statics(db, row.obj.id, touched_subnets=touched_subnets)
 
 
 # ── delete_subnet ──────────────────────────────────────────────────────────
@@ -341,11 +350,10 @@ async def _apply_delete_subnet(
             db, subnet, batch=batch
         )
         wake_group_ids = await _push_agentless_scope_deletes(db, batch)
-        await _purge_leases_for_scope_batch(db, batch)
+        touched: set[UUID] = set()  # recounted last, before commit (#3354)
+        await _purge_leases_for_scope_batch(db, batch, touched)
         deleted_at = await apply_soft_delete(db, batch, user.id)
-        # The parent block's rollup must stop counting the trashed subnet (#2412).
         await db.flush()
-        await _update_block_utilization(db, subnet.block_id)
         # spatiumddi#1906 — the subnet's own A / PTR / gateway PTR in zones that
         # STAY (a reverse zone kept for a sibling, the forward zone) are
         # retracted and ride the batch; restore re-asserts them.
@@ -367,6 +375,12 @@ async def _apply_delete_subnet(
                     old_value=old_value,
                 )
             )
+        # Last, after the audit rows are staged and the agentless retraction is
+        # done, so the audit-chain and subnet / block locks are held only to
+        # commit: the scopes' freed mirrors (#3354), and the parent block's
+        # rollup, which must stop counting the trashed subnet (#2412).
+        await recount_subnets_and_blocks(db, touched, include_deleted=True)
+        await _update_block_utilization(db, subnet.block_id)
         await db.commit()
         for gid in wake_group_ids:
             collect_wake(dhcp_group_channel(gid))
@@ -389,13 +403,16 @@ async def _apply_delete_subnet(
         .all()
     )
     agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
+    # Recounted with the block below, never per scope: a recount holds its
+    # locks to commit, through the next scope's push (#3354).
+    touched: set[UUID] = set()
     for scope in scope_rows:
         await push_scope_delete(db, scope)
         # Leases have a nullable ON DELETE SET NULL backlink to the scope, so the
         # subnet cascade would leave them scopeless survivors — purge them (and
         # their mirrors + DDNS) here, before db.delete(subnet). Static mirrors go
         # with the subnet's ip_address cascade below.
-        await delete_leases_for_scope(db, scope.id)
+        await delete_leases_for_scope(db, scope.id, touched_subnets=touched)
         group_servers = (
             (
                 await db.execute(
@@ -443,6 +460,7 @@ async def _apply_delete_subnet(
     )
     await db.delete(subnet)
     await db.flush()
+    await recount_subnets_and_blocks(db, touched)
     await _update_block_utilization(db, block_id)
 
     for server in agent_servers_to_refresh.values():
@@ -598,12 +616,9 @@ async def _apply_delete_block(
 
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
-    await _purge_leases_for_scope_batch(db, batch)
+    touched: set[UUID] = set()  # recounted last, before commit (#3354)
+    await _purge_leases_for_scope_batch(db, batch, touched)
     deleted_at = await apply_soft_delete(db, batch, user.id)
-    # The ancestors' rollups stop counting the trashed subtree (#2412).
-    if block.parent_block_id is not None:
-        await db.flush()
-        await _update_block_utilization(db, block.parent_block_id)
     # spatiumddi#1906 — every trashed subnet's DNS records are retracted with it.
     from app.core.agent_wake import dns_group_channel  # noqa: PLC0415
     from app.services.dns.record_ops import retract_trashed_subnet_records  # noqa: PLC0415
@@ -623,6 +638,14 @@ async def _apply_delete_block(
                 old_value=batch.audit_old_value(row),
             )
         )
+    # Last, after the audit rows and the retraction, so the audit-chain and
+    # subnet / block locks are held only to commit (#3354): the scopes' freed
+    # mirrors, then the ancestors' rollups, which stop counting the trashed
+    # subtree (#2412).
+    await recount_subnets_and_blocks(db, touched, include_deleted=True)
+    if block.parent_block_id is not None:
+        await db.flush()
+        await _update_block_utilization(db, block.parent_block_id)
     await db.commit()
     for gid in wake_group_ids:
         collect_wake(dhcp_group_channel(gid))
@@ -756,7 +779,8 @@ async def _apply_delete_space(
 
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
-    await _purge_leases_for_scope_batch(db, batch)
+    touched: set[UUID] = set()  # recounted last, before commit (#3354)
+    await _purge_leases_for_scope_batch(db, batch, touched)
     deleted_at = await apply_soft_delete(db, batch, user.id)
     # spatiumddi#1906 — every trashed subnet's DNS records are retracted with it.
     from app.core.agent_wake import dns_group_channel  # noqa: PLC0415
@@ -777,6 +801,7 @@ async def _apply_delete_space(
                 old_value=batch.audit_old_value(row),
             )
         )
+    await recount_subnets_and_blocks(db, touched, include_deleted=True)  # last (#3354)
     await db.commit()
     for gid in wake_group_ids:
         collect_wake(dhcp_group_channel(gid))
@@ -895,18 +920,6 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         return {"zone_id": str(args.zone_id), "mode": "soft_delete"}
 
     await _push_zone_to_agentless_servers(db, zone, "delete")
-    db.add(
-        AuditLog(
-            user_id=user.id,
-            user_display_name=user.display_name,
-            auth_source=user.auth_source,
-            action="delete",
-            resource_type="dns_zone",
-            resource_id=str(zone.id),
-            resource_display=zone.name,
-            result="success",
-        )
-    )
     collect_wake(dns_group_channel(args.group_id))
     # Set-based first, ORM second. ``db.delete(zone)`` alone cascades through
     # the ORM: every record row is loaded, tracked and DELETEd one by one
@@ -930,6 +943,21 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     await db.delete(zone)
     # IPAM names zones in text / JSONB columns with no foreign key (#3443).
     await prune_zone_ids(db, [zone.id])
+    # #3503: audited after the zone row is deleted. The audit row's flush
+    # takes the audit-chain lock; deleting the zone after it waited for a
+    # record create holding the zone row, which waits for that lock.
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="delete",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+        )
+    )
     await db.commit()
     return {"zone_id": str(args.zone_id), "mode": "delete"}
 
@@ -1043,8 +1071,12 @@ async def _apply_delete_scope(
     # (re-populated from the next poll on restore), and freeing the IPs to a
     # deleted row folds them back into free gaps. Runs on BOTH paths, before the
     # stamp / CASCADE so the scope + subnet are still resolvable.
-    leases_removed, lease_mirrors = await delete_leases_for_scope(db, scope.id)
-    statics_released = await remove_ipam_for_scope_statics(db, scope.id)
+    # The freed mirrors are recounted once, last, before the commit (#3354).
+    touched: set[UUID] = set()
+    leases_removed, lease_mirrors = await delete_leases_for_scope(
+        db, scope.id, touched_subnets=touched
+    )
+    statics_released = await remove_ipam_for_scope_statics(db, scope.id, touched_subnets=touched)
     cleanup_audit = {
         "leases_removed": leases_removed,
         "lease_mirrors_removed": lease_mirrors,
@@ -1064,6 +1096,7 @@ async def _apply_delete_scope(
                 resource_display=row.display,
                 old_value={**batch.audit_old_value(row), **cleanup_audit},
             )
+        await recount_subnets_and_blocks(db, touched)
         await db.commit()
         return {"scope_id": str(args.scope_id), "mode": "soft_delete"}
 
@@ -1077,6 +1110,7 @@ async def _apply_delete_scope(
         old_value=cleanup_audit,
     )
     await db.delete(scope)
+    await recount_subnets_and_blocks(db, touched)
     await db.commit()
     return {"scope_id": str(args.scope_id), "mode": "delete"}
 
@@ -1231,9 +1265,10 @@ async def _apply_delete_group(
         .all()
     )
     released = 0
+    touched: set[UUID] = set()  # recounted once, last, before commit (#3354)
     for sc in group_scopes:
-        released += await remove_ipam_for_scope_statics(db, sc.id)
-        await delete_leases_for_scope(db, sc.id)
+        released += await remove_ipam_for_scope_statics(db, sc.id, touched_subnets=touched)
+        await delete_leases_for_scope(db, sc.id, touched_subnets=touched)
 
     # One row per scope the group takes with it (#1957's convention, as the
     # Trash purge writes for a subnet's scopes): the scope rows go by FK
@@ -1268,6 +1303,7 @@ async def _apply_delete_group(
         },
     )
     await db.delete(g)
+    await recount_subnets_and_blocks(db, touched)
     await db.commit()
     return {"group_id": str(args.group_id), "mode": "delete"}
 

@@ -246,6 +246,19 @@ async def ensure_reverse_zones_for_subnet(
         .all()
     )
     by_name = {z.name: z for z in found}
+    if found and any(n not in by_name for n in names):
+        # #3503 — a zone created below is audited, and that audit row's flush
+        # takes the audit-chain lock. The caller's PTR may then go into one of
+        # the zones that ALREADY exist (a /23 with one /24 zone in place), and
+        # bumping its serial after that lock deadlocks against a record create
+        # holding the row. Take those rows first, in id order. Only on this
+        # path: with nothing to create there is no audit row and no lock.
+        await db.execute(
+            select(DNSZone.id)
+            .where(DNSZone.id.in_(sorted(z.id for z in found)))
+            .order_by(DNSZone.id)
+            .with_for_update(key_share=True)
+        )
     # #1932 — a cloud group that has not opted in gets no NEW reverse zone.
     # Ones it already holds are still returned, as they were.
     optout_driver = (
@@ -622,6 +635,31 @@ async def _trashed_sharer(
         .execution_options(include_deleted=True)
     )
     return (await db.execute(stmt)).scalars().first()
+
+
+async def trashed_sharers(db: AsyncSession, zone: DNSZone) -> list[Subnet]:
+    """Every trashed subnet whose trashed records still sit in the trashed auto
+    reverse ``zone`` under a batch other than the zone's own (spatiumddi#3504):
+    the subnets a purge of the zone's own Trash row would take records from.
+    Empty for a live zone or one the operator made."""
+    if zone.deleted_at is None or not zone.is_auto_generated:
+        return []
+    stmt: Any = (
+        select(Subnet)
+        .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+        .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+        .where(
+            DNSRecord.zone_id == zone.id,
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.is_distinct_from(zone.deletion_batch_id),
+            Subnet.deleted_at.is_not(None),
+            Subnet.deletion_batch_id.is_not(None),
+        )
+        .distinct()
+        .order_by(Subnet.network)
+        .execution_options(include_deleted=True)
+    )
+    return list((await db.execute(stmt)).scalars().all())
 
 
 async def _hand_over(db: AsyncSession, zone: DNSZone, heir: Subnet) -> None:

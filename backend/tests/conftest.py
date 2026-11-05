@@ -230,6 +230,26 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _audit_lock_order_guard() -> Iterator[None]:
+    """#3503 — fail a test whose request wrote a ``dns_zone`` row after its
+    transaction took the audit-chain lock: that order deadlocks against a
+    concurrent record create on the same zone (#3389). See
+    ``tests/_audit_lock_order_guard.py``."""
+    from tests import _audit_lock_order_guard as guard
+
+    guard.install()
+    guard.violations.clear()
+    yield
+    found = list(guard.violations)
+    guard.violations.clear()
+    if found:
+        pytest.fail(
+            "zone row written after the audit-chain lock (#3503):\n" + "\n".join(found),
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
 def _no_bundle_render_enqueue() -> Iterator[None]:
     """#1111 — DNS writes mark agent bundles dirty and, after commit, publish
     a render request to the Celery broker. The suite has no broker, so the

@@ -35,6 +35,7 @@ from app.models.ownership import Customer
 from app.models.settings import PlatformSettings
 from app.services.dhcp.static_ipam import remove_ipam_for_static
 from app.services.ipam.orphan_aliases import is_withdrawn_alias, withdrawn_alias_owners
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -64,7 +65,7 @@ _PURGE_MODELS_LEAF_FIRST: tuple[type, ...] = (
 )
 
 
-async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
+async def _release_ipam_mirrors(db: Any, cutoff: datetime, touched_subnets: set[Any]) -> int:
     """Release the IPAM row behind every reservation this sweep is about to purge.
 
     The purge is a Core ``DELETE`` — it runs no per-row Python, so nothing would
@@ -82,6 +83,11 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
 
     ``include_deleted`` because these rows are soft-deleted by definition — the
     global filter would hide the very rows we need to clean up.
+
+    Adds every subnet a removed row sat in to ``touched_subnets`` and does not
+    recount: the sweep recounts them once, last, just before its commit
+    (#3354), because the recount holds the audit-chain lock and subnet / block
+    row locks to commit and the sweep goes on to call DNS providers.
     """
     res = await db.execute(
         select(DHCPStaticAssignment)
@@ -102,7 +108,7 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
     )
     statics = list(res.scalars().all())
     for st in statics:
-        await remove_ipam_for_static(db, st)
+        await remove_ipam_for_static(db, st, touched_subnets=touched_subnets)
     if statics:
         await db.flush()
     return len(statics)
@@ -453,7 +459,8 @@ async def _sweep() -> dict[str, Any]:
         total_removed = 0
 
         # Release IPAM mirrors before the Core DELETEs wipe the reservations.
-        ipam_released = await _release_ipam_mirrors(db, cutoff)
+        touched_subnets: set[Any] = set()
+        ipam_released = await _release_ipam_mirrors(db, cutoff, touched_subnets)
 
         # Zones about to be per-row purged — records inside them are retracted
         # by the zone teardown, so the record pre-pass skips them (#632).
@@ -551,6 +558,10 @@ async def _sweep() -> dict[str, Any]:
                     result="success",
                 )
             )
+        # #3354 — the subnets whose reservation mirrors were freed above, and
+        # their blocks. Last, after every provider call and the audit row, so
+        # the audit-chain and subnet / block locks are held only to commit.
+        await recount_subnets_and_blocks(db, touched_subnets)
         await db.commit()
         # The ops above are committed; wake the agents rather than leave the
         # withdrawal to their safety tick (a task has no request collector).
