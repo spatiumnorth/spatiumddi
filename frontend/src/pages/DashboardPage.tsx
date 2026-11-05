@@ -4893,8 +4893,11 @@ function NetworkPanel() {
   const w = data.withheld ?? {};
   const NV = "not visible to your role";
 
-  // Nothing pulled: a zero here is not an all-clear (#3540).
-  const rpkiUntracked = data.rpki_total_count === 0;
+  // Nothing pulled: a zero here is not an all-clear (#3540). A withheld
+  // grant zeroes the total too, so it is excluded: that tile says "not
+  // visible to your role", never "nothing pulled". A missing total (an
+  // older API) is unknown, not zero, and keeps the plain count.
+  const rpkiUntracked = !w.asn && data.rpki_total_count === 0;
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}

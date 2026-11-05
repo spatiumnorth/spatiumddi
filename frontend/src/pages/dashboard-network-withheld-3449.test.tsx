@@ -119,6 +119,16 @@ describe("withheld Network panels (#3449)", () => {
     }
     expect(text).not.toContain("No ASNs in drift state");
     expect(text).not.toContain("No ROAs are expiring");
+    // The server zeroes the total for a withheld grant: the tile must not
+    // then claim nothing was pulled (#3540).
+    expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
+    const expiredLink = Array.from(document.querySelectorAll("p"))
+      .find((e) => e.textContent === "RPKI expired")
+      ?.closest("a");
+    expect(expiredLink?.getAttribute("title") ?? "").not.toContain(
+      "have been pulled",
+    );
+    expect(text).not.toContain("No RPKI ROAs are tracked yet.");
   });
 
   it("the combined card names the withheld half when the other has rows", async () => {
@@ -179,6 +189,14 @@ describe("withheld Network panels (#3449)", () => {
     const text = await show();
     expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
     expect(text).toContain("No ROAs are expiring");
+  });
+
+  it("a summary without a ROA total is not read as none tracked (#3540)", async () => {
+    calls["dashboardsApi.networkSummary"] = () =>
+      Promise.resolve(summary({}, { rpki_total_count: undefined }));
+    const text = await show();
+    expect(kpi("RPKI expired")).not.toContain("no ROAs tracked");
+    expect(text).not.toContain("No RPKI ROAs are tracked yet.");
   });
 
   it("nothing withheld keeps the all-clear wording", async () => {
