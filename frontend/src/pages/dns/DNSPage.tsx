@@ -110,6 +110,7 @@ import {
   ipamApi,
   domainsApi,
   formatApiError,
+  formatDialogError,
   tlsCertsApi,
   type DNSServerGroup,
   type DNSServer,
@@ -7290,6 +7291,7 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   } | null>(null);
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [rotateError, setRotateError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteTSIGKey(group.id, id),
     onSuccess: () => {
@@ -7303,8 +7305,13 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   });
   const rotateMut = useMutation({
     mutationFn: (id: string) => dnsApi.rotateTSIGKey(group.id, id),
+    // A refused rotate (403 for a non-superadmin, 409/422) leaves the dialog
+    // open; say why in it, or nothing says the key was not rotated (#3490).
+    onError: (e: unknown) =>
+      setRotateError(formatDialogError(e, "Failed to rotate the TSIG key")),
     onSuccess: (key) => {
       qc.invalidateQueries({ queryKey: ["dns-tsig-keys", group.id] });
+      setRotateError(null);
       setConfirmRotate(null);
       if (key.secret) {
         setRevealedSecret({
@@ -7404,7 +7411,10 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                 <td className="px-3 py-1.5 text-right">
                   <div className="inline-flex items-center gap-1">
                     <button
-                      onClick={() => setConfirmRotate(k)}
+                      onClick={() => {
+                        setRotateError(null);
+                        setConfirmRotate(k);
+                      }}
                       className="rounded border px-2 py-0.5 text-xs hover:bg-muted/50 disabled:opacity-50"
                       title="Generate a fresh secret of the same algorithm and replace the stored one"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
@@ -7482,8 +7492,15 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
           warning="The old secret is replaced and stops working on the next config push."
           confirmButtonLabel="Rotate key"
           pendingLabel="Rotating…"
-          onConfirm={() => rotateMut.mutate(confirmRotate.id)}
-          onClose={() => setConfirmRotate(null)}
+          error={rotateError}
+          onConfirm={() => {
+            setRotateError(null);
+            rotateMut.mutate(confirmRotate.id);
+          }}
+          onClose={() => {
+            setRotateError(null);
+            setConfirmRotate(null);
+          }}
           isPending={rotateMut.isPending}
         />
       )}

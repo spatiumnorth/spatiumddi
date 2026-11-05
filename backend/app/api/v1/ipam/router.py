@@ -813,18 +813,22 @@ async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
         text(f"""
             WITH RECURSIVE descendants AS (
                 SELECT id FROM ip_block
-                WHERE id = CAST(:block_id AS uuid) AND deleted_at IS NULL
+                WHERE id = CAST(:block_id AS uuid)
+                  AND (deleted_at IS NULL OR deleted_at = :batch_at)
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
-                WHERE b.deleted_at IS NULL
+                WHERE b.deleted_at IS NULL OR b.deleted_at = :batch_at
             )
             SELECT COALESCE(SUM({contribution}), 0)
             FROM subnet s
             WHERE s.block_id IN (SELECT id FROM descendants)
-              AND s.deleted_at IS NULL
+              AND (s.deleted_at IS NULL OR s.deleted_at = :batch_at)
         """),  # the fragment is a constant: no request input reaches it
-        {"block_id": str(block.id)},
+        # A block trashed in this transaction counts its own batch (the rows
+        # stamped with its deleted_at), so it matches the rows it holds
+        # (#3354); a live block has no batch and counts live rows only.
+        {"block_id": str(block.id), "batch_at": block.deleted_at},
     )
     net = ipaddress.ip_network(str(block.network), strict=False)
     block_total = net.num_addresses
@@ -837,9 +841,19 @@ async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
 
 
 async def _update_subnets_utilization(
-    db: AsyncSession, subnet_ids: Iterable[uuid.UUID], *, audit_lock: bool = True
+    db: AsyncSession,
+    subnet_ids: Iterable[uuid.UUID],
+    *,
+    audit_lock: bool = True,
+    include_deleted: bool = False,
 ) -> None:
-    """``_update_utilization`` for many subnets in one grouped count (#2981)."""
+    """``_update_utilization`` for many subnets in one grouped count (#2981).
+
+    ``include_deleted`` reads the rows a soft-delete stamped earlier in this
+    transaction (#3354): the global soft-delete filter would hide them, and a
+    trashed subnet's counter would keep what it held before its scopes'
+    mirrors were freed."""
+    opts: dict[str, bool] = {"include_deleted": True} if include_deleted else {}
     ids = list(dict.fromkeys(subnet_ids))
     if not ids:
         return
@@ -854,6 +868,7 @@ async def _update_subnets_utilization(
         .where(Subnet.id.in_(ids))
         .order_by(Subnet.id)
         .with_for_update(key_share=True)
+        .execution_options(**opts)
     )
     counts: dict[uuid.UUID, int] = {
         sid: int(n)
@@ -863,10 +878,13 @@ async def _update_subnets_utilization(
                 .where(IPAddress.subnet_id.in_(ids))
                 .where(counts_toward_utilization())
                 .group_by(IPAddress.subnet_id)
+                .execution_options(**opts)
             )
         ).all()
     }
-    for subnet in (await db.execute(select(Subnet).where(Subnet.id.in_(ids)))).scalars():
+    for subnet in (
+        await db.execute(select(Subnet).where(Subnet.id.in_(ids)).execution_options(**opts))
+    ).scalars():
         allocated = counts.get(subnet.id, 0)
         subnet.allocated_ips = allocated
         subnet.utilization_percent = (

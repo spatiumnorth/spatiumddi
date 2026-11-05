@@ -1,3 +1,0 @@
-### Fixed
-
-- Six DNS and DHCP reads, and the DNS Pools page, no longer draw a refused or failed read as an empty list: a zone's Pools tab read "Pools (0)" and "No pools yet. Click New Pool to create one.", and the DNS Pools page "No DNS pools yet.", to a role that reads DNS zones but not pools (the built-in Auditor and Compliance Editor), and a server group's TSIG Keys ("0 TSIG keys"), ACLs and Views tabs, a blocking list's entries and exceptions ("0 entries · 0 exceptions") and the DHCP page's server group tree ("0" beside each group, "No servers in this group.") did the same when their read failed. Each now says the read was refused or could not be loaded, draws its count only once its list has loaded, and still says a list that loaded empty is empty (#3426).
