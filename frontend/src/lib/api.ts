@@ -7171,7 +7171,16 @@ export interface DNSBlockListFeedSkipped {
   regex: number;
   modifier: number;
   badfilter: number;
+  /** Total of the reason buckets below (#3519). */
   malformed: number;
+  /** Absent on rows written before #3519, which carry only the total. */
+  star_in_name?: number;
+  no_anchor?: number;
+  trailing_dot?: number;
+  start_anchor?: number;
+  bare_star?: number;
+  dotless?: number;
+  other?: number;
 }
 
 export interface DNSBlockListEntry {
