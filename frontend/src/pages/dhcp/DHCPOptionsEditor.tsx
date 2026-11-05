@@ -167,7 +167,28 @@ function CustomOptionRow({
     [catalog, opt.code],
   );
 
+  // A standard option (Routers, DNS Servers, ...) is set in its own field
+  // above, which keeps showing the text it was drawn with. A custom row
+  // given one of those codes left this list unseen, and a save sent the
+  // row's value over what the field showed (#3543). Such a code is refused
+  // here, with a hint naming the field; any other code clears the hint.
+  const [standardField, setStandardField] = useState<string | null>(null);
+  // The hint belongs to the row it was given for. A delete above hands this
+  // instance the next row (the effect on the row object, above), which must
+  // not show it.
+  useEffect(() => {
+    setStandardField(null);
+  }, [opt]);
+
+  function refuseStandard(code: number): boolean {
+    const std = STANDARD_OPTIONS.find((s) => s.code === code);
+    setStandardField(std ? std.label : null);
+    if (std) setOpen(false);
+    return !!std;
+  }
+
   function pick(def: DHCPOptionCodeDef) {
+    if (refuseStandard(def.code)) return;
     onChange({ ...opt, code: def.code, name: def.name });
     setQuery(`${def.code} — ${def.name}`);
     setOpen(false);
@@ -181,7 +202,7 @@ function CustomOptionRow({
     const numMatch = /^(\d+)/.exec(query.trim());
     if (numMatch) {
       const n = parseInt(numMatch[1], 10);
-      if (!Number.isNaN(n) && n !== opt.code) {
+      if (!Number.isNaN(n) && n !== opt.code && !refuseStandard(n)) {
         // The name follows the code: a stale name from the previous code
         // would otherwise travel with the new one.
         const def = catalog.find((d) => d.code === n);
@@ -306,6 +327,11 @@ function CustomOptionRow({
       {knownDef?.description && (
         <div className="ml-1 text-[11px] text-muted-foreground">
           {knownDef.description}
+        </div>
+      )}
+      {standardField && (
+        <div role="alert" className="ml-1 text-[11px] text-destructive">
+          {standardField} has its own field above. Set it there.
         </div>
       )}
     </div>
