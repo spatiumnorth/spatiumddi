@@ -85,6 +85,7 @@ from app.api.v1.requests import router as requests_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.saved_views import router as saved_views_router
 from app.api.v1.search.router import router as search_router
+from app.api.v1.service_accounts.router import router as service_accounts_router
 from app.api.v1.services import router as services_router
 from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
@@ -586,6 +587,10 @@ api_v1_router.include_router(
 )
 api_v1_router.include_router(upgrades_router, prefix="/upgrades", tags=["upgrades"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
+# #2144 — non-interactive API principals; superadmin only (see the module).
+api_v1_router.include_router(
+    service_accounts_router, prefix="/service-accounts", tags=["service-accounts"]
+)
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
 # #2895 — the About page's data sources; signed-in callers only (see the module).
 api_v1_router.include_router(about_router, prefix="/about", tags=["about"])

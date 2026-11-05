@@ -944,14 +944,117 @@ both `expires_in_days` (UX-friendly) and `expires_at` (ISO timestamp,
 for automation). Expired tokens 401 with a distinct detail message
 so clients can detect "refresh me" vs "reconfigure me".
 
+## Service accounts (issue #2144)
+
+A **service account** is the API principal for an external system: Home
+Assistant, Ansible, a monitoring poller, CI. Before it, connecting one meant
+inventing a person — a `homeassistant` "user" with a password it never
+needed, which could sign in to the UI, sat in the user list, and broke when
+someone tidied up unused accounts. A service account has **no password and no
+sign-in**, holds groups (and so roles) exactly like a user, and authenticates
+only with the API tokens a superadmin mints for it.
+
+Managed at **Administration → Service Accounts** (`/admin/service-accounts`)
+or `/api/v1/service-accounts`:
+
+| Route | Does |
+|---|---|
+| `GET /service-accounts` | List, with groups and a token summary (active count, last used, soonest expiry) |
+| `POST /service-accounts` | Create: `username`, `display_name` (the description, e.g. "Home Assistant on ha.lan"), `group_ids` |
+| `GET` / `PATCH` / `DELETE /service-accounts/{id}` | Read; rename, change groups, disable / enable; delete with its tokens |
+| `GET /service-accounts/{id}/tokens` | Its tokens |
+| `POST /service-accounts/{id}/tokens` | Mint one (body as `POST /api-tokens`); the raw token is in this response only |
+
+Revoking, re-enabling and deleting one of its tokens go through
+`/api-tokens/{id}` like any other token; a superadmin's `/api-tokens` list
+marks its rows `owner_is_service_account: true`.
+
+**Data model.** A `user` row with `auth_source = "service"`, `hashed_password`
+NULL and an empty email — not a table of its own, so every permission check,
+token binding and audit `user_id` works unchanged. The one migration
+(`e3a9c5f17b26`) makes a token's creator nullable with `ON DELETE SET NULL`:
+the superadmin who mints a service account's token is not its owner, and
+deleting them must not be refused while the token lives (the audit log still
+names who minted it). Its name shares the user namespace, so a person can never sign in as
+it. `auth_source` is also what keeps it out of everything that means a
+person, since each of those paths already keys on `local` or on a provider
+type.
+
+**Who manages them: superadmin only**, on every route, rather than a
+delegated permission. A service account's reach is its groups, and a token
+outlives the session that minted it; minting also takes the **caller's**
+step-up, as minting one's own token does (#1355). A token can only narrow its
+owner's RBAC, so a resource grant the account itself does not hold is refused
+at mint (`422`) rather than accepted and then refused on every use. A
+delegated group admin can still add a service account to a group through
+`/groups`, under the usual ceiling (only permissions they hold themselves).
+
+**Never a superadmin.** A group whose roles grant `*` on `*` is refused at
+create / edit (`422`, audited `superadmin_group`). Every other way in is
+refused too, for a superadmin who passes the step-up as well: adding the
+account to such a group through `/groups`, widening a role one of its groups
+holds to `*` / `*`, or a `*` / `*` time-bound grant to one of its groups (`422`,
+audited `service_account_superadmin`). Should one end up in such a group
+anyway (a role edited in the database),
+`is_effective_superadmin` answers False for a service account whatever its
+roles say, so a role widened later still cannot hand it a superadmin-only
+route. It does not count as a remaining superadmin either. In practice: no
+service-account token can manage users, service accounts (itself included) or
+sessions, and none can mint another token — it has neither a password nor an
+authenticator to pass the step-up with.
+
+**It cannot sign in — by any path.**
+
+- `/auth/login`: the local branch only takes `auth_source = local`, and a
+  directory (LDAP / RADIUS / TACACS+) accepting the name resolves to a
+  `username_collision`. OIDC / SAML subjects never resolve to it either.
+- Every sign-in path ends in the one session minter (`_issue_tokens`), which
+  refuses a service account outright (`401 Invalid credentials`, audited
+  `reason=service_account`), so a path that stops refusing earlier still
+  cannot sign one in.
+- `/auth/refresh` refuses to renew a session for one, and a JWT naming one is
+  refused as if it named nobody.
+- Its token reaches only `GET /auth/me` and `/auth/me/permissions` under
+  `/auth/`: change password, logout, MFA status / enrolment and the re-auth
+  step are `403`. MFA enrolment matters most — an authenticator is what every
+  operator step-up accepts from an account without a password.
+
+**Not a person.** It is absent from `/users` and the `list_users` copilot
+tool; the user writes (`PUT`, reset password, unlock, link provider, delete)
+answer `409` naming the service-account page. Lockout, the password policy,
+forced password change and MFA enrolment never apply (all key on `local`),
+and it never holds a session, so the Sessions viewer never shows it. There is
+no "disable unused accounts" sweep in SpatiumDDI to catch it.
+
+**Disabling revokes its tokens**, in both directions, exactly as disabling a
+user does (#3432, shared helper `services/api_token_revocation.py`): a
+re-enabled account starts with none. Deleting it deletes its tokens; its audit
+rows stay.
+
+**Audit names it.** Every row a service account causes carries its `user_id`
+and display name, and `auth_source = "service"` — filled in by the audit hook
+for writers that leave the field at its `local` default — so "what did Home
+Assistant change?" is `GET /audit?user_id=<id>`, and "what did any external
+system change?" is `GET /audit?auth_source=service`. Expiring service-account
+tokens feed the `secret_expiring` alert rule like any other token.
+
+**Copilot.** `find_service_accounts` (read, superadmin-only, **default on**:
+it lists principals and token metadata, never a token value). There is
+deliberately **no** `propose_*` write tool — creating principals and minting
+credentials is the broad-blast-radius shape non-negotiable #13 keeps off the
+copilot. **Not a feature module** (#14): it extends authentication rather than
+adding a top-level resource family, and an install without external systems
+simply has none.
+
 ## Open items
 
 - **SCIM provisioning** — not planned for Phase 1.
 - **Per-provider signing key rotation** — manual today; automate in a
   later wave.
-- **Global-scope / service-account tokens** — the `APIToken.scope`
-  column supports `global`, but validation rejects them today pending
-  a proper service-account user model. Token-only `allowed_paths` and
+- **Global-scope tokens** — the `APIToken.scope` column supports
+  `global` (an ownerless token), but validation rejects them: a machine
+  principal is a [service account](#service-accounts-issue-2144), whose
+  tokens are ordinary owned ones. Token-only `allowed_paths` and
   per-token permission overrides exist on the model but are reserved:
   nothing sets or enforces them.
 

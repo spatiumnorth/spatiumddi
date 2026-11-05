@@ -34,6 +34,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -43,8 +44,10 @@ import structlog
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.util import identity_key
 
 from app.models.audit import AuditLog
+from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, User
 
 logger = structlog.get_logger(__name__)
 
@@ -162,6 +165,41 @@ def hash_row(prev_hash: str | None, canonical: str) -> str:
     return h.hexdigest()
 
 
+# The service account (#2144) the current request authenticated as, set by
+# the auth dependency. Lets the hook below label a row the account caused even
+# when it is written in a session the account was never loaded into (a
+# handler's side session). Compared by id, so a value that outlives its
+# request can only ever label that same account's rows.
+_SERVICE_ACCOUNT_ACTOR: ContextVar[uuid.UUID | None] = ContextVar(
+    "audit_service_account_actor", default=None
+)
+
+
+def note_service_account_actor(user_id: uuid.UUID) -> None:
+    """Record that this request is acting as service account ``user_id``."""
+    _SERVICE_ACCOUNT_ACTOR.set(user_id)
+
+
+def _service_account_actor(session: Session, user_id: object) -> bool:
+    """Whether ``user_id`` is a service account.
+
+    Answered from the request's principal (:func:`note_service_account_actor`)
+    or the session's identity map, never by a query: a request's audit rows
+    name the caller, whom the auth dependency has already identified, so the
+    two answer for every row that matters at no cost.
+    """
+    if user_id is None:
+        return False
+    try:
+        uid = uuid.UUID(str(user_id))
+    except (ValueError, TypeError):
+        return False
+    if _SERVICE_ACCOUNT_ACTOR.get() == uid:
+        return True
+    actor = session.identity_map.get(identity_key(User, uid))
+    return actor is not None and getattr(actor, "is_service_account", False)
+
+
 def compute_audit_hashes(session: Session) -> None:
     """``before_flush`` listener target. Synchronous — runs in the
     same DB session the request is using.
@@ -198,6 +236,15 @@ def compute_audit_hashes(session: Session) -> None:
         # hashed one. An explicit value on the row wins.
         if row.request_id is None and request_id is not None:
             row.request_id = request_id
+        # #2144 — a row a service account caused says so, so "what did Home
+        # Assistant change?" is an ``auth_source=service`` filter. Many
+        # writers leave ``auth_source`` to its ``local`` default rather than
+        # copying the actor's, which for a person is the right answer and for
+        # a service account is the wrong one. Only an unset or ``local`` value
+        # is corrected: a service account is never local, and anything else
+        # was written on purpose.
+        if row.auth_source in (None, "local") and _service_account_actor(session, row.user_id):
+            row.auth_source = SERVICE_ACCOUNT_AUTH_SOURCE
         # Also materialise any Python-side *scalar* column defaults that
         # are still unset. Columns like ``auth_source`` (default "local")
         # and ``result`` (default "success") are None at before_flush time

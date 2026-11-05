@@ -25,6 +25,7 @@ from app.services.api_token_scopes import (
     is_token_outbound,
     scope_matches_request,
 )
+from app.services.audit_chain import note_service_account_actor
 
 logger = structlog.get_logger(__name__)
 
@@ -49,6 +50,40 @@ _FORCE_PW_CHANGE_ALLOWLIST: tuple[str, ...] = (
     "/auth/me",
     "/auth/password-policy",
 )
+
+
+# A service account (#2144) authenticates with an API token and never with a
+# session, so the account-holder endpoints under ``/auth/`` (change password,
+# logout, MFA enrolment and step-up re-auth) mean nothing for it, and MFA
+# enrolment would be actively dangerous: an authenticator on the account is
+# what every operator step-up accepts from an account with no password, so a
+# leaked service-account token could enrol one and mint itself further
+# tokens. Only these two reads stay open to it.
+_SERVICE_ACCOUNT_AUTH_ALLOWLIST: tuple[str, ...] = ("/auth/me", "/auth/me/permissions")
+_AUTH_AREA = "/api/v1/auth/"
+# The same rule by handler, for a request that carries its matched route.
+_AUTH_MODULE = "app.api.v1.auth.router"
+_SERVICE_ACCOUNT_AUTH_HANDLERS = frozenset({"get_me", "get_my_permissions"})
+
+
+def _service_account_may_use(request: Request) -> bool:
+    """False for an ``/auth/`` endpoint other than the two allowlisted reads.
+    Every other route is the RBAC check's to decide.
+
+    Decided on the handler the request was routed to, not on the URL, so no
+    spelling of the URL (encoded separators, dot segments, a reverse proxy's
+    mount prefix) can move the answer: the handler that will run is the one
+    checked. A request with no matched route (a test calling the dependency
+    directly) falls back to the URL path."""
+    endpoint = getattr(request.scope.get("route"), "endpoint", None)
+    if endpoint is not None:
+        if getattr(endpoint, "__module__", None) != _AUTH_MODULE:
+            return True
+        return getattr(endpoint, "__name__", None) in _SERVICE_ACCOUNT_AUTH_HANDLERS
+    path = request.url.path
+    if _AUTH_AREA not in path:
+        return True
+    return path.rstrip("/").endswith(_SERVICE_ACCOUNT_AUTH_ALLOWLIST)
 
 
 def _path_in_recovery_allowlist(path: str) -> bool:
@@ -170,9 +205,9 @@ async def _resolve_api_token(
     # token (#3302); a session never sets it, so it keeps every tool.
     request.state.api_token_scopes = scopes
     if token.user_id is None:
-        # Scope "global" isn't wired through permissions yet — reject
-        # until we add a synthetic service-account path. Today's UI
-        # only issues user-scoped tokens so this is defensive.
+        # Scope "global" (an ownerless token) isn't wired through permissions
+        # and nothing issues one; a machine principal is a service account
+        # (#2144), whose tokens are ordinary user-scoped ones. Defensive.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Global-scope API tokens are not yet supported",
@@ -192,6 +227,15 @@ async def _resolve_api_token(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
         )
+    if user.is_service_account and not _service_account_may_use(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A service account cannot use this endpoint",
+        )
+    if user.is_service_account:
+        # Audit rows this request writes say ``auth_source=service`` even from
+        # a session the account is not loaded into (#2144).
+        note_service_account_actor(user.id)
     # SECURITY (#400 / M4): the must-change-password gate applies to API
     # tokens too — a token minted for an account that later gets a forced
     # reset (or whose password expires) must not be a bypass around the
@@ -340,7 +384,9 @@ async def authenticate_bearer(
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
 
-    if user is None:
+    # A service account (#2144) never holds a session, so a JWT naming one
+    # is refused as if it named nobody.
+    if user is None or user.is_service_account:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     if not user.is_active:

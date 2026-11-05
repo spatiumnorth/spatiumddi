@@ -6,6 +6,7 @@ import {
   BellRing,
   Binoculars,
   Bird,
+  Bot,
   Boxes,
   Briefcase,
   Building2,
@@ -400,6 +401,8 @@ export const adminIdentityNav: NavEntry[] = [
   { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
   { label: "Groups", icon: UsersRound, to: "/admin/groups" },
   { label: "Roles", icon: KeyRound, to: "/admin/roles" },
+  // #2144 — API principals for external systems (Home Assistant, Ansible).
+  { label: "Service Accounts", icon: Bot, to: "/admin/service-accounts" },
   { label: "Sessions", icon: Monitor, to: "/admin/sessions" },
   { label: "Users", icon: Users, to: "/admin/users" },
 ];

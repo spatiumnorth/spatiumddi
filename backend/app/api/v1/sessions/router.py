@@ -39,7 +39,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import user_has_permission
+from app.core.permissions import is_effective_superadmin
 from app.core.session_idle import get_session_timeout_minutes, idle_cutoff
 from app.core.session_rotation import (
     request_session_jti,
@@ -113,7 +113,10 @@ async def _caller_session_id(request: Request, db: AsyncSession, now: datetime) 
 
 
 def _is_superadmin(user: User) -> bool:
-    return bool(user.is_superadmin) or user_has_permission(user, "*", "*")
+    # The shared check, not a local copy of it: a service account (#2144) in a
+    # group that carries ``*`` / ``*`` holds the wildcard but is never a
+    # superadmin, and must not list or revoke other people's sessions.
+    return is_effective_superadmin(user)
 
 
 @router.get("/me", response_model=list[SessionRow])

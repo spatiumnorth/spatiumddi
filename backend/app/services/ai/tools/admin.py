@@ -31,9 +31,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.permissions import is_effective_superadmin
-from app.models.auth import Group, Role, User
+from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, Group, Role, User
 from app.models.auth_provider import AuthProvider
 from app.services.ai.tools.base import register_tool
+from app.services.service_accounts import TokenSummary, token_summaries
 
 
 def _try_uuid(value: str) -> uuid.UUID | None:
@@ -94,7 +95,8 @@ class ListUsersArgs(BaseModel):
         "account with a null auth_provider cannot sign in until an admin "
         "links it (#1235). Use for 'who has admin', 'list locked-out "
         "accounts', 'which accounts need linking', or 'who hasn't "
-        "logged in this quarter'."
+        "logged in this quarter'. People only: service accounts (#2144) "
+        "are listed by find_service_accounts."
     ),
     args_model=ListUsersArgs,
     category="admin",
@@ -103,7 +105,11 @@ async def list_users(db: AsyncSession, user: User, args: ListUsersArgs) -> list[
     gate = _superadmin_gate(user)
     if gate:
         return [gate]
-    stmt = select(User).options(selectinload(User.groups))
+    stmt = (
+        select(User)
+        .where(User.auth_source != SERVICE_ACCOUNT_AUTH_SOURCE)
+        .options(selectinload(User.groups))
+    )
     if args.search:
         like = f"%{args.search.lower()}%"
         stmt = stmt.where(
@@ -145,6 +151,75 @@ async def list_users(db: AsyncSession, user: User, args: ListUsersArgs) -> list[
         }
         for r in rows
     ]
+
+
+# ── find_service_accounts ─────────────────────────────────────────────
+
+
+class FindServiceAccountsArgs(BaseModel):
+    search: str | None = Field(
+        default=None,
+        description="Substring match on the account name or its description.",
+    )
+    is_active: bool | None = Field(
+        default=None, description="Filter by active flag (True / False)."
+    )
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="find_service_accounts",
+    permission="superadmin",
+    description=(
+        "List service accounts (#2144, superadmin only): the non-interactive "
+        "principals external systems (Home Assistant, Ansible, monitoring, CI) "
+        "use the API through. Each row carries the name, description, "
+        "is_active, the groups it holds, and its tokens' state: how many are "
+        "active, when one was last used, and the soonest expiry. No token "
+        "values. Use for 'which systems have API access', 'which service "
+        "account tokens expire soon', or 'what does the homeassistant "
+        "account hold'."
+    ),
+    args_model=FindServiceAccountsArgs,
+    category="admin",
+)
+async def find_service_accounts(
+    db: AsyncSession, user: User, args: FindServiceAccountsArgs
+) -> list[dict[str, Any]]:
+    gate = _superadmin_gate(user)
+    if gate:
+        return [gate]
+    stmt = (
+        select(User)
+        .where(User.auth_source == SERVICE_ACCOUNT_AUTH_SOURCE)
+        .options(selectinload(User.groups))
+    )
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(func.lower(User.username).like(like), func.lower(User.display_name).like(like))
+        )
+    if args.is_active is not None:
+        stmt = stmt.where(User.is_active.is_(args.is_active))
+    stmt = stmt.order_by(User.username.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().unique().all()
+    stats = await token_summaries(db, [r.id for r in rows])
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        t = stats.get(r.id, TokenSummary())
+        out.append(
+            {
+                "id": str(r.id),
+                "name": r.username,
+                "description": r.display_name,
+                "is_active": r.is_active,
+                "groups": sorted(g.name for g in r.groups),
+                "active_token_count": t.active_count,
+                "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
+                "next_token_expiry": t.next_expiry.isoformat() if t.next_expiry else None,
+            }
+        )
+    return out
 
 
 # ── list_groups ───────────────────────────────────────────────────────

@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_throttle import (
@@ -34,7 +35,7 @@ from app.core.auth_throttle import (
     stepup_password_blocked,
 )
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, User
 from app.services.reauth import ReauthOutcome, reverify_operator, uses_local_password
 from app.services.superadmin_grant import SuperadminModel, newly_superadmin
 
@@ -215,6 +216,38 @@ async def require_stepup_if_granting_superadmin(
     newly = await newly_superadmin(db, change)
     if not newly:
         return None, 0
+    # A service account (#2144) is never a superadmin. Putting one in a group
+    # that carries ``*`` / ``*`` (a membership change, a role widened under
+    # it, a time-bound grant to its group) would hand its token every RBAC
+    # route while ``is_effective_superadmin`` still said no. Refused, not
+    # stepped up: no step-up makes it right.
+    service = sorted(
+        (
+            await db.execute(
+                select(User.username).where(
+                    User.id.in_(newly), User.auth_source == SERVICE_ACCOUNT_AUTH_SOURCE
+                )
+            )
+        ).scalars()
+    )
+    if service:
+        detail = (
+            "A service account cannot be a superadmin, and this change would give "
+            f"'*' on '*' to: {', '.join(service)}. Remove it from the group, or give "
+            "the group roles without the wildcard."
+        )
+        db.add(
+            _denied_row(
+                user,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                resource_display=resource_display,
+                reason="service_account_superadmin",
+            )
+        )
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
     method = await require_operator_stepup(
         db,
         user,

@@ -19,6 +19,7 @@ import {
   dnsApi,
   ipamApi,
   type ApiToken,
+  type ApiTokenCreate,
   type ApiTokenCreated,
   type ApiTokenResourceGrant,
   type ApiTokenScope,
@@ -62,12 +63,22 @@ function Field({
 
 // ── Create Token Modal ─────────────────────────────────────────────────────
 
-function CreateTokenModal({
+export function CreateTokenModal({
   onClose,
   onCreated,
+  create = apiTokensApi.create,
+  title = "New API Token",
+  ownerName,
 }: {
   onClose: () => void;
   onCreated: (token: ApiTokenCreated) => void;
+  /** Mints the token. Defaults to the caller's own (`POST /api-tokens`); the
+   *  service-account page (#2144) passes its account's mint instead. */
+  create?: (body: ApiTokenCreate) => Promise<ApiTokenCreated>;
+  title?: string;
+  /** Set when minting for another principal (a service account): the token
+   *  inherits ITS permissions, and the step-up is still the caller's. */
+  ownerName?: string;
 }) {
   const qc = useQueryClient();
   const [name, setName] = useState("");
@@ -123,7 +134,7 @@ function CreateTokenModal({
 
   const mut = useMutation({
     mutationFn: () =>
-      apiTokensApi.create({
+      create({
         name,
         description,
         expires_in_days: expiryMode === "never" ? null : days,
@@ -136,6 +147,7 @@ function CreateTokenModal({
       }),
     onSuccess: (token) => {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      qc.invalidateQueries({ queryKey: ["service-accounts"] });
       onCreated(token);
     },
     onError: (err: unknown) => {
@@ -144,7 +156,7 @@ function CreateTokenModal({
   });
 
   return (
-    <Modal title="New API Token" onClose={onClose}>
+    <Modal title={title} onClose={onClose}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -153,6 +165,13 @@ function CreateTokenModal({
         }}
         className="space-y-3"
       >
+        {ownerName && (
+          <p className="text-xs text-muted-foreground">
+            For service account{" "}
+            <strong className="text-foreground">{ownerName}</strong>: the token
+            carries that account's permissions, not yours.
+          </p>
+        )}
         <Field
           label="Name"
           hint="Shown in the list — pick something you'll recognise later (e.g. ‘terraform-ci’)."
@@ -838,7 +857,9 @@ export function ApiTokensPage() {
             <h1 className="text-2xl font-bold tracking-tight">API Tokens</h1>
             <p className="mt-1 text-xs text-muted-foreground">
               Long-lived bearer credentials for scripts and automation. Each
-              token inherits its owner's permissions.
+              token inherits its owner's permissions. For an external system
+              (Home Assistant, Ansible, CI), use a service account instead of a
+              person's token.
             </p>
           </div>
           <button
@@ -1101,9 +1122,12 @@ function ScopeChips({ scopes }: { scopes: string[] | undefined }) {
 /** "Display Name (username)" or the username; "" when the owner is unknown. */
 function ownerLabel(t: ApiToken): string {
   if (!t.owner_username) return "";
-  return t.owner_display_name && t.owner_display_name !== t.owner_username
-    ? `${t.owner_display_name} (${t.owner_username})`
-    : t.owner_username;
+  const name =
+    t.owner_display_name && t.owner_display_name !== t.owner_username
+      ? `${t.owner_display_name} (${t.owner_username})`
+      : t.owner_username;
+  // An external system's token, not a person's (#2144).
+  return t.owner_is_service_account ? `${name} · service account` : name;
 }
 
 function isExpired(iso: string | null | undefined): boolean {

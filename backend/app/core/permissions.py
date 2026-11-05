@@ -271,6 +271,17 @@ def is_effective_superadmin(user: User) -> bool:
     operator might need during incident triage. Per-permission checks
     still gate on ``user.is_active``.
     """
+    # A service account (#2144) is never a superadmin, whatever its groups'
+    # roles say. It passes the ``require_permission`` gates its roles grant,
+    # but not the superadmin-only surfaces: user, group-of-last-resort and
+    # service-account administration, sessions, platform settings. A token
+    # held by an external system must not be able to administer principals,
+    # itself included. Every edit that would put one in a group granting
+    # ``*`` / ``*`` is refused (``app.api.stepup``); this holds if one gets
+    # there anyway. Local superadmin checks must call this, not test the
+    # wildcard themselves (``sessions/router.py`` did, #2144).
+    if getattr(user, "is_service_account", False):
+        return False
     # A resource-scoped token (issue #374) is never a superadmin, even when
     # owned by the seeded ``admin`` — skip the legacy-flag shortcut so the
     # wildcard intersection in user_has_permission decides (a non-wildcard
