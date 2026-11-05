@@ -8,6 +8,10 @@ import {
 } from "lucide-react";
 
 import { usePermissions } from "@/hooks/usePermissions";
+import {
+  useUtilizationThresholds,
+  utilizationColor,
+} from "@/hooks/useUtilizationThresholds";
 import { reportsApi } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { humanTime } from "@/pages/network/_shared";
@@ -143,18 +147,22 @@ function ReportCard({
   );
 }
 
-function Bar({ pct }: { pct: number }) {
+/** ``tone`` overrides the fill: a subnet's utilization bar passes the
+ *  colour Settings' thresholds give it (#3539); the share-of-the-top bars
+ *  keep these fixed bands, which no setting governs. */
+function Bar({ pct, tone }: { pct: number; tone?: string }) {
   const clamped = Math.max(0, Math.min(100, pct));
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
       <div
         className={cn(
           "h-full rounded-full",
-          clamped >= 90
-            ? "bg-rose-500"
-            : clamped >= 75
-              ? "bg-amber-500"
-              : "bg-emerald-500",
+          tone ??
+            (clamped >= 90
+              ? "bg-rose-500"
+              : clamped >= 75
+                ? "bg-amber-500"
+                : "bg-emerald-500"),
         )}
         style={{ width: `${clamped}%` }}
       />
@@ -181,8 +189,9 @@ function useReportGrant(resourceType: string, what: string) {
 
 // ── Top subnets by utilization ──────────────────────────────────────
 
-function TopSubnetsCard() {
+export function TopSubnetsCard() {
   const grant = useReportGrant("subnet", "subnet utilization");
+  const thresholds = useUtilizationThresholds();
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["reports", "top-subnets"],
     queryFn: reportsApi.topSubnetsByUtilization,
@@ -216,7 +225,10 @@ function TopSubnetsCard() {
                 </span>
               </div>
               <div className="mt-1 flex items-center gap-2">
-                <Bar pct={r.utilization_percent} />
+                <Bar
+                  pct={r.utilization_percent}
+                  tone={utilizationColor(r.utilization_percent, thresholds)}
+                />
               </div>
               <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
                 {r.network} · {r.allocated_ips.toLocaleString()} /{" "}
