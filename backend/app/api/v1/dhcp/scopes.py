@@ -80,6 +80,14 @@ async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
     )
 
 
+def normalize_dhcp_options(raw: Any, *, raw_codes: str = RAW_CODES_KEA) -> dict[str, Any]:
+    """``normalize_options`` for an incoming payload: a repeated option is a 422 (#3614)."""
+    try:
+        return normalize_options(raw, raw_codes=raw_codes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 async def validate_dhcp_options(
     db: AsyncSession,
     opts: dict[str, Any],
@@ -748,7 +756,9 @@ async def create_scope(
             ),
         )
     _validate_lease_times(body.lease_time, body.min_lease_time, body.max_lease_time)
-    _create_options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
+    _create_options = normalize_dhcp_options(
+        body.options, raw_codes=await group_raw_codes(db, group_id)
+    )
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
     )
@@ -960,7 +970,7 @@ async def update_scope(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
-        normalized = normalize_options(
+        normalized = normalize_dhcp_options(
             changes["options"], raw_codes=await group_raw_codes(db, scope.group_id)
         )
         # Validate only options that CHANGED from the stored value (#597

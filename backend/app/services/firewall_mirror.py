@@ -41,6 +41,7 @@ from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
     drop_wrapper_block,
+    gateway_changed,
     owned_addresses_in_space,
     retire_vanished_subnet,
 )
@@ -524,7 +525,7 @@ async def apply_subnets(
                 existing.name, changed = ms.name, True
             if existing.description != ms.description:
                 existing.description, changed = ms.description, True
-            if ms.gateway and existing.gateway != ms.gateway:
+            if gateway_changed(existing.gateway, ms.gateway):
                 existing.gateway, changed = ms.gateway, True
             if existing.total_ips != total:
                 existing.total_ips, changed = total, True

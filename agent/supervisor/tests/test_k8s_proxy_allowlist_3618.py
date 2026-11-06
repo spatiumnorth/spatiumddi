@@ -163,6 +163,7 @@ def _run_once(
     path: str,
     headers: dict[str, str],
     body: bytes,
+    response: bytes = b'{"items": []}',
 ) -> tuple[list[tuple[str, str, bytes, dict[str, str]]], dict[str, Any]]:
     monkeypatch.setattr(appliance_state, "is_control_plane_member", lambda: False)
     monkeypatch.setattr(k8s_proxy, "load_appliance_id", lambda _d: "app-1")
@@ -172,7 +173,7 @@ def _run_once(
 
     def _kubeapi(m: str, p: str, b: bytes, h: dict[str, str]) -> tuple[int, bytes]:
         executed.append((m, p, b, h))
-        return 200, b'{"items": []}'
+        return 200, response
 
     monkeypatch.setattr(k8s_proxy, "_call_local_kubeapi", _kubeapi)
     replies: list[dict[str, Any]] = []
@@ -259,3 +260,48 @@ def test_control_plane_headers_beyond_content_negotiation_are_dropped(
         b"",
     )
     assert executed[0][3] == {"Accept": "application/json"}
+
+
+_LOG = (
+    "/api/v1/namespaces/spatium/pods/dns-bind9-abc12/log?tailLines=1200&container=agent"
+)
+
+
+@pytest.mark.parametrize("sent", ["text/plain", "application/json", "*/*"])
+def test_pod_logs_always_ask_the_kubeapi_for_any_media_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: str
+) -> None:
+    """kubeapi answers a text/plain Accept on pod logs with 406 (#3618)."""
+    executed, reply = _run_once(
+        tmp_path, monkeypatch, "GET", _LOG, {"Accept": sent}, b""
+    )
+    assert executed[0][1] == _LOG  # container= selection untouched
+    assert executed[0][3] == {"Accept": "*/*"}
+    assert reply["status"] == 200
+
+
+def test_pod_log_text_body_is_relayed_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b"line one\nnot json {\xff\xfe\n"
+    _executed, reply = _run_once(
+        tmp_path, monkeypatch, "GET", _LOG, {"Accept": "*/*"}, b"", response=raw
+    )
+    assert base64.b64decode(reply["body_b64"]) == raw
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers", "body"),
+    [case[1:] for case in ALLOWED if case[0] not in ("logs", "logs-container")],
+    ids=[case[0] for case in ALLOWED if case[0] not in ("logs", "logs-container")],
+)
+def test_other_routes_forward_accept_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> None:
+    executed, _reply = _run_once(tmp_path, monkeypatch, method, path, headers, body)
+    assert executed[0][3].get("Accept") == headers.get("Accept")

@@ -25,7 +25,11 @@ is never reached by accident.
 
 Every answer writes an ``e911_resolution_log`` row, exactly as the JSON
 lookup does. The protocol is different; the fact that somebody asked where
-a person sits is not.
+a person sits is not. The trail is bounded (#3514): past a per-caller budget
+(``PlatformSettings.e911_lookup_log_budget_per_minute``) the lookup is
+answered and counted in one row per caller per minute rather than logged
+on its own, and ``prune_e911_resolution_log`` drops rows past
+``e911_resolution_log_retention_days``.
 """
 
 from __future__ import annotations
@@ -36,14 +40,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
-from app.api.v1.e911.router import log_resolution
+from app.api.v1.e911.router import count_suppressed_resolution, log_resolution
 from app.config import settings
-from app.core.auth_throttle import e911_self_query_rate_limited
+from app.core.auth_throttle import e911_lookup_log_rate_limited, e911_self_query_rate_limited
 from app.core.body_limit import read_body_capped
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
 from app.models.auth import User
+from app.models.settings import PlatformSettings
 from app.services.api_token_scopes import read_only_post
 from app.services.e911.held import (
     ERROR_CANNOT_PROVIDE,
@@ -125,14 +130,33 @@ async def _answer(
     )
 
     source_ip = request.client.host if request.client else None
-    log_resolution(
-        db,
-        resolution,
-        user_id=user.id if user else None,
-        api_token_id=api_token_id,
-        source_ip=source_ip,
-        actor_kind=actor_kind,
-    )
+    # Bounded (#3514): a read-scoped token must not grow the trail without
+    # limit. Past the per-caller budget the lookup is still answered, and is
+    # COUNTED in one row per caller per minute instead of getting its own row,
+    # so the trail still shows that it happened. The budget is read live, so a
+    # change in Settings applies on the next call.
+    ps = await db.get(PlatformSettings, 1)
+    budget = ps.e911_lookup_log_budget_per_minute if ps is not None else 120
+    actor = str(api_token_id or (user.id if user else None) or source_ip)
+    if await e911_lookup_log_rate_limited(actor, budget):
+        await count_suppressed_resolution(
+            db,
+            resolution,
+            caller_key=actor,
+            user_id=user.id if user else None,
+            api_token_id=api_token_id,
+            source_ip=source_ip,
+            actor_kind=actor_kind,
+        )
+    else:
+        log_resolution(
+            db,
+            resolution,
+            user_id=user.id if user else None,
+            api_token_id=api_token_id,
+            source_ip=source_ip,
+            actor_kind=actor_kind,
+        )
     await db.commit()
 
     if resolution.erl is None:

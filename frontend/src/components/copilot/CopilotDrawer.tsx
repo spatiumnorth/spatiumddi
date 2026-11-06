@@ -21,7 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { copyToClipboard } from "@/lib/clipboard";
-import { usePermissions } from "@/hooks/usePermissions";
+import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -1570,12 +1570,14 @@ function NmapScanLiveResult({ scanId }: { scanId: string }) {
   if (!scan && !perms.isLoading && (!canRead || scanQ.isError)) {
     return (
       <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-[11px] text-destructive">
-        {!canRead
-          ? "The scan started, but you don't have permission to see its progress (read on nmap scans)."
-          : formatApiError(
-              scanQ.error,
-              "The scan started, but its progress could not be read",
-            )}
+        {!canRead && perms.isError
+          ? `The scan started, but its progress was not requested. ${PERMISSIONS_UNREADABLE}`
+          : !canRead
+            ? "The scan started, but you don't have permission to see its progress (read on nmap scans)."
+            : formatApiError(
+                scanQ.error,
+                "The scan started, but its progress could not be read",
+              )}
       </div>
     );
   }
