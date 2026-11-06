@@ -17,15 +17,20 @@ which is what the fixed sweep does before any DDNS work.
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, text, update
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
-from app.models.dhcp import DHCPLease
+from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer, DHCPServerGroup
+from app.models.ipam import IPAddress
 from tests.test_lease_events_insert_order_3480 import (  # noqa: F401
     _ddns_subnet,
     _lease,
@@ -106,5 +111,236 @@ async def test_sweep_and_lease_events_on_the_same_addresses_do_not_deadlock(
     ).all()
     assert {(s, st) for s, st in states if s == peer_a.id} == {(peer_a.id, "expired")}
     assert {st for s, st in states if s == peer_b.id} == {"active"}
+    # B renewed every address while the sweep waited on the mirror rows, so
+    # the mirrors are B's now: the sweep must not have deleted them (#1110).
+    mirrors = (
+        (
+            await db_session.execute(
+                select(IPAddress)
+                .where(IPAddress.subnet_id == subnet.id, IPAddress.auto_from_lease.is_(True))
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert sorted((str(m.address), m.hostname) for m in mirrors) == [
+        ("10.31.1.10", "renamed-0"),
+        ("10.31.1.20", "renamed-1"),
+    ], log
     # The sweep is idempotent: a second run finds nothing to do.
     assert await _sweep() == (0, 0)
+
+
+# ── Interleaves forced on a second, raw connection ──────────────────────────
+
+
+@pytest.fixture
+async def other_conn() -> AsyncGenerator[AsyncConnection, None]:
+    """A connection of its own, standing in for a concurrent writer."""
+    engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            yield conn
+    finally:
+        await engine.dispose()
+
+
+async def _wait_until_blocked(conn: AsyncConnection) -> None:
+    """Return once some backend waits on a lock that ``conn`` holds."""
+    pid = (await conn.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+    for _ in range(300):
+        blocked = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE :pid = ANY(pg_blocking_pids(pid))"
+                ),
+                {"pid": pid},
+            )
+        ).scalar_one()
+        if blocked:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the sweep never waited on the other connection's lock")
+
+
+async def _group_with_two_servers(db: AsyncSession) -> tuple[Any, DHCPServer, DHCPServer]:
+    from tests.test_lease_events_insert_order_3480 import _ddns_subnet as make_subnet
+
+    subnet, _block = await make_subnet(db)
+    tag = uuid.uuid4().hex[:6]
+    grp = DHCPServerGroup(name=f"g-{tag}", description="")
+    db.add(grp)
+    await db.flush()
+    a, b = (
+        DHCPServer(
+            name=f"k{n}-{tag}", driver="kea", host="127.0.0.1", port=67, server_group_id=grp.id
+        )
+        for n in range(2)
+    )
+    db.add_all([a, b])
+    scope = DHCPScope(group_id=grp.id, subnet_id=subnet.id, is_active=True)
+    db.add(scope)
+    await db.flush()
+    return subnet, a, b
+
+
+@pytest.mark.asyncio
+async def test_a_partner_renewal_while_the_sweep_waits_keeps_the_mirror(
+    db_session: AsyncSession, other_conn: AsyncConnection
+) -> None:
+    """The sweep decides "is the address still held?" after it holds the
+    mirror row, not before (#3605). A partner's renewal that commits while the
+    sweep waits for that row keeps the mirror and its DDNS."""
+    from app.tasks.dhcp_lease_cleanup import _sweep
+
+    subnet, a, b = await _group_with_two_servers(db_session)
+    past = datetime.now(UTC) - timedelta(hours=1)
+    ip = "10.31.1.40"
+    lease_a = DHCPLease(
+        server_id=a.id,
+        ip_address=ip,
+        mac_address="aa:bb:cc:36:05:01",
+        state="active",
+        expires_at=past,
+    )
+    lease_b = DHCPLease(
+        server_id=b.id,
+        ip_address=ip,
+        mac_address="aa:bb:cc:36:05:01",
+        state="expired",
+        expires_at=past,
+    )
+    mirror = IPAddress(
+        subnet_id=subnet.id, address=ip, status="dhcp", auto_from_lease=True, hostname="kept"
+    )
+    db_session.add_all([lease_a, lease_b, mirror])
+    await db_session.commit()
+
+    # The partner's lease-events batch: holds the mirror row, renews B's lease.
+    trans = await other_conn.begin()
+    await other_conn.execute(
+        text("SELECT id FROM ip_address WHERE id = :id FOR UPDATE"), {"id": mirror.id}
+    )
+    await other_conn.execute(
+        text(
+            "UPDATE dhcp_lease SET state = 'active', expires_at = now() + interval '1 hour' "
+            "WHERE id = :id"
+        ),
+        {"id": lease_b.id},
+    )
+    sweep = asyncio.create_task(_sweep())
+    await _wait_until_blocked(other_conn)
+    await trans.commit()
+    cleaned, _deleted = await asyncio.wait_for(sweep, timeout=30)
+
+    assert cleaned == 0
+    kept = (
+        await db_session.execute(select(IPAddress.hostname).where(IPAddress.id == mirror.id))
+    ).scalar_one_or_none()
+    assert kept == "kept"
+    states = dict(
+        (
+            await db_session.execute(
+                select(DHCPLease.server_id, DHCPLease.state).execution_options(
+                    populate_existing=True
+                )
+            )
+        ).all()
+    )
+    assert states == {a.id: "expired", b.id: "active"}
+
+
+@pytest.mark.asyncio
+async def test_a_batch_renewing_leases_in_id_order_never_deadlocks_with_the_sweep(
+    db_session: AsyncSession, other_conn: AsyncConnection
+) -> None:
+    """The sweep takes its lease rows in id order, as a lease-events flush
+    writes them (#3605), and leaves a lease renewed while it waited alone.
+
+    Two expired leases of one server, the lower id on the higher address. A
+    batch renewing both updates the lower id first. The sweep used to update
+    them in address order: it held the higher id, the batch the lower, and
+    each waited for the other.
+    """
+    from app.tasks.dhcp_lease_cleanup import _sweep
+
+    subnet, a, _b = await _group_with_two_servers(db_session)
+    past = datetime.now(UTC) - timedelta(hours=1)
+    leases = [
+        DHCPLease(
+            server_id=a.id,
+            ip_address=f"10.31.1.{50 + n}",
+            mac_address=f"aa:bb:cc:36:05:{0x10 + n:02x}",
+            state="active",
+            expires_at=past,
+        )
+        for n in range(2)
+    ]
+    db_session.add_all(leases)
+    await db_session.flush()
+    low, high = sorted(leases, key=lambda lease: lease.id)
+    low.ip_address, high.ip_address = "10.31.1.60", "10.31.1.50"
+    await db_session.commit()
+    low_id, high_id = low.id, high.id
+
+    renew = text("UPDATE dhcp_lease SET expires_at = now() + interval '1 hour' WHERE id = :id")
+    trans = await other_conn.begin()
+    await other_conn.execute(renew, {"id": low_id})
+    sweep = asyncio.create_task(_sweep())
+    await _wait_until_blocked(other_conn)
+    await other_conn.execute(renew, {"id": high_id})
+    await trans.commit()
+    assert await asyncio.wait_for(sweep, timeout=30) == (0, 0)
+
+    states = (
+        (
+            await db_session.execute(
+                select(DHCPLease.state)
+                .where(DHCPLease.id.in_([low_id, high_id]))
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert sorted(states) == ["active", "active"]
+
+
+@pytest.mark.asyncio
+async def test_the_mirror_lock_pass_spans_chunks(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backlog bigger than one lookup chunk still tears every mirror down
+    (the chunks keep asyncpg under its bind-parameter limit)."""
+    from app.tasks import dhcp_lease_cleanup
+
+    monkeypatch.setattr(dhcp_lease_cleanup, "_MIRROR_LOOKUP_CHUNK", 1)
+    subnet, a, _b = await _group_with_two_servers(db_session)
+    past = datetime.now(UTC) - timedelta(hours=1)
+    ips = [f"10.31.1.{70 + n}" for n in range(3)]
+    for n, ip in enumerate(ips):
+        db_session.add(
+            DHCPLease(
+                server_id=a.id,
+                ip_address=ip,
+                mac_address=f"aa:bb:cc:36:05:{0x20 + n:02x}",
+                state="active",
+                expires_at=past,
+            )
+        )
+        db_session.add(
+            IPAddress(subnet_id=subnet.id, address=ip, status="dhcp", auto_from_lease=True)
+        )
+    await db_session.commit()
+
+    assert await dhcp_lease_cleanup._sweep() == (3, 0)
+    left = (
+        await db_session.execute(
+            select(IPAddress.id).where(
+                IPAddress.subnet_id == subnet.id, IPAddress.auto_from_lease.is_(True)
+            )
+        )
+    ).all()
+    assert left == []
