@@ -397,10 +397,12 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     person as this feature gets, and duplicating it per lookup would turn
     an access log into a movement history.
 
-    Two kinds of row (#3514): an individually logged lookup
-    (``suppressed_count`` NULL), and a counter row standing for every HELD
-    lookup one caller made past its per-minute budget in one window
-    (``suppressed_count`` = N, "N lookups not individually logged").
+    Every lookup that returns a location has a row of its own
+    (``suppressed_count`` NULL). Past the per-minute budget a HELD lookup is
+    refused (#3633) and writes nothing. The ``caller_key`` / ``window_start``
+    / ``suppressed_count`` columns hold counter rows written by releases
+    before that (#3514): "N lookups not individually logged". They are kept
+    so those rows stay readable until the retention prune drops them.
     """
 
     __tablename__ = "e911_resolution_log"

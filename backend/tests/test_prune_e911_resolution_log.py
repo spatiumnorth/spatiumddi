@@ -100,6 +100,36 @@ async def test_budget_setting_round_trips_and_is_bounded(
     assert row is not None and row.e911_lookup_log_budget_per_minute == 30
 
 
+async def test_budget_change_is_audited(client: AsyncClient, db_session: AsyncSession) -> None:
+    """#3633: changing the lookup budget writes an audit_log row recording old
+    and new values."""
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+
+    headers = await _superadmin(db_session)
+    await _settings_row(db_session)
+    r = await client.put(
+        "/api/v1/settings", headers=headers, json={"e911_lookup_log_budget_per_minute": 30}
+    )
+    assert r.status_code == 200, r.text
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.changed_fields.contains(["e911_lookup_log_budget_per_minute"])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].resource_type == "platform_settings"
+    assert rows[0].old_value == {"e911_lookup_log_budget_per_minute": 120}
+    assert rows[0].new_value == {"e911_lookup_log_budget_per_minute": 30}
+
+
 async def test_sweep_covers_counter_rows(db_session: AsyncSession) -> None:
     """#3514: a counter row ages out like any other trail row."""
     old = _row(DEFAULT_RETENTION_DAYS + 5)
