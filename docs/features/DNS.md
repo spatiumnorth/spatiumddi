@@ -593,7 +593,7 @@ DNSTrustAnchor
   added_at, added_by
 ```
 
-- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). `yes` with no anchor validates nothing in BIND 9.20, so the options response carries a `dnssec_warnings` entry (advisory, never a 422); `auto` uses the built-in root anchor
+- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). BIND 9.20 refuses to load `yes` with no anchor, so on a group holding a BIND9 server (an empty group counts) setting `yes` without one, removing the last anchor while `yes`, adding a BIND9 server to such a group, and a `yes` platform default for new groups are all 422 (#3560); the message offers `auto` (the built-in root anchor) or adding an anchor. A row already stored that way is rendered as `auto` so the group keeps converging, and the options response carries a `dnssec_warnings` entry saying so, shown on the group's Options tab. The Options tab disables `yes` (with the reason) until the group has an anchor, and Settings does not offer it as a default. PowerDNS and Technitium accept `yes` unchanged. A root (`.`) anchor must be `initial-key`: a `static-key` root anchor is a 422 in every validation mode (#3609), because BIND 9.20 refuses it beside `auto` ("static trust anchor for root zone cannot be used with 'dnssec-validation auto'") and warns that it "WILL FAIL after key rollover" under `yes`. A static root anchor stored before that refusal is rendered as `initial-key` (RFC 5011 tracking from the same key, which loads under `auto`, `yes` and `no`) and the options response carries a `dnssec_warnings` entry saying so; switching such a group to `auto` and adding a BIND9 server to it therefore stay allowed. Static anchors for other zones are accepted as before
 - **PowerDNS / Technitium / agentless drivers:** have no equivalent, so adding a trust anchor to a group with such a server is a 422. Values are validated (zone name, algorithm 1-255, key tag, base64 key) because they land verbatim in `named.conf`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
 - UI shows DNSSEC chain validation status for each zone
@@ -1510,9 +1510,18 @@ letting one silently win.
   feeds in the profile are the mitigation, not a fix. Blocking outbound
   :53 and :853 to anything but your resolvers at the firewall is what
   actually closes it.
-- **Blocklists disable DNSSEC validation** on a group that has any (RPZ
-  rewriting is by definition answer tampering). The agent handles this
-  automatically; it is why a filtered group cannot also validate.
+- **Blocklists do not change DNSSEC validation.** A filtered group keeps
+  the `dnssec-validation` it is configured with. Every `response-policy`
+  is rendered with `break-dnssec yes`, so a blocked name is rewritten for
+  clients that set the DO bit as well as for those that do not, while
+  every other name is still validated (a bogus answer is still SERVFAIL).
+  Before [#3563](https://github.com/spatiumnorth/spatiumddi/issues/3563)
+  the agent forced `dnssec-validation no` on any group with a blocklist,
+  silently, while Settings still showed validation on.
+  A consequence on upgrade: a filtered group that forwards to resolvers
+  which strip DNSSEC records now answers SERVFAIL for signed names, as an
+  unfiltered group with the same forwarders always has. Use DNSSEC-clean
+  forwarders, or set the group's validation to `no` explicitly.
 
 #### How often are feeds refreshed?
 

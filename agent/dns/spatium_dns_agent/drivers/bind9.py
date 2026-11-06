@@ -2916,14 +2916,15 @@ class Bind9Driver(DriverBase):
         forwarders = opts.get("forwarders") or []
         recursion = "yes" if opts.get("recursion_enabled", True) else "no"
         allow_query = "; ".join(opts.get("allow_query") or ["any"])
+        # The group's own setting, blocklists or not (#3563). This used to be
+        # forced to ``no`` whenever a blocklist was attached, on the claim that
+        # BIND SERVFAILs a DO=1 query for a blocked signed name even with
+        # ``break-dnssec yes``. It does not: ``break-dnssec yes`` (rendered on
+        # every response-policy below) applies the rewrite regardless of DO,
+        # and the override only turned validation off for every UNblocked name
+        # while Settings still showed it on. Proven against a live named by
+        # tests/live_rpz_dnssec_check.py.
         dnssec = opts.get("dnssec_validation", "auto")
-        # RPZ rewrites break DNSSEC chain validation: even with
-        # `break-dnssec yes`, BIND9 returns SERVFAIL to clients that set the
-        # DO bit on DNSSEC-signed domains being blocked. For a blocking
-        # appliance the user intent is "block, don't validate", so silently
-        # disable validation when blocklists are present.
-        if bundle.get("blocklists"):
-            dnssec = "no"
         # Encrypted transports (issue #50). ``has_cert`` gates the listeners
         # on cert material actually being present in the bundle, not just on
         # the operator's intent flag — see _render_tls_statements.
@@ -3026,10 +3027,10 @@ class Bind9Driver(DriverBase):
             zones_list = "; ".join(
                 f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
             )
-            # break-dnssec lets RPZ rewrite responses from DNSSEC-signed zones
-            # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
-            # blocking use-case this is what you want: the user intent is to
-            # block, not to preserve validation integrity.
+            # break-dnssec lets RPZ rewrite answers for DNSSEC-signed names to
+            # clients that set DO=1 too; with ``no``, BIND serves those clients
+            # the real signed answer, so the block would not apply to them.
+            # Validation of every other name is unaffected (#3563).
             # qname-wait-recurse no (#2427): BIND's default (yes) resolves the
             # qname first and does not rewrite a failed lookup, so a blocked
             # name whose upstream is dead answered SERVFAIL after ~10 s instead

@@ -35,6 +35,7 @@ from app.services.dns_blocklist_parse import (  # noqa: F401
     FeedSkipCounts,
     ParsedFeed,
     dedupe_domains,
+    looks_like_html,
     parse_feed,
     parse_feed_detailed,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "exception_domains",
     "has_entries",
     "parse_feed",
+    "looks_like_html",
     "parse_feed_detailed",
     "stream_entries",
 ]
