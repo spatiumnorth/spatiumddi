@@ -375,6 +375,27 @@ async def _pull_leases_core(
 
     now = datetime.now(UTC)
 
+    if apply:
+        # #3624 — every lease row of this server, locked once, in id order,
+        # before the loop below takes any mirror or zone lock. The expiry sweep
+        # marks a lapsed lease ``expired`` and holds its row to commit; read
+        # unlocked, the session kept ``state='active'``, so
+        # ``existing.state = "active"`` below was no change, never written,
+        # and the renewed lease stayed ``expired``. Locked here, the wait
+        # happens before any decision and the per-address read below
+        # (``populate_existing``) sees what the sweep committed. Locked one by
+        # one in wire order instead, each lock would come after the previous
+        # address's mirror and DDNS locks: out of the dhcp_lease → ip_address
+        # → dns_zone order the sweep and the lease-events batch keep, so the
+        # pull could hold a zone the sweep wants while waiting for a lease row
+        # the sweep holds. One statement, not one per lease.
+        await db.execute(
+            select(DHCPLease.id)
+            .where(DHCPLease.server_id == server.id)
+            .order_by(DHCPLease.id)
+            .with_for_update()
+        )
+
     for lease in wire:
         ip = lease.get("ip_address")
         mac = lease.get("mac_address")
@@ -399,12 +420,9 @@ async def _pull_leases_core(
             .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
         )
         if apply:
-            # #3624 — lock the row and re-read it if the lock waited. The
-            # expiry sweep marks a lapsed lease ``expired`` and holds it to
-            # commit; a plain read here would keep ``state='active'`` in the
-            # session, so ``existing.state = "active"`` below is no change,
-            # is never written, and the renewed lease stays ``expired``.
-            lease_q = lease_q.with_for_update().execution_options(populate_existing=True)
+            # #3624 — re-read: the rows were locked above, possibly after a
+            # wait on the sweep, and must not keep a value read before it.
+            lease_q = lease_q.execution_options(populate_existing=True)
         rows = list((await db.execute(lease_q)).scalars().all())
         existing = rows[0] if rows else None
         if apply and len(rows) > 1:

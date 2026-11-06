@@ -232,3 +232,247 @@ async def test_an_agentless_pull_renewal_after_the_sweep_leaves_the_lease_active
         )
     ).scalar_one()
     assert state == "active"
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_after_the_sweep_deleted_the_lease_lands_as_a_fresh_lease(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lease lapsed past the delete grace, so the sweep's second pass
+    deletes the row while the renewal waits on it: the renewal inserts a fresh
+    active lease, and its mirror and DNS record are those of a live lease."""
+    from app.services.dns import ddns
+    from app.tasks.dhcp_lease_cleanup import _sweep
+
+    subnet, _block = await _ddns_subnet(db_session)
+    agent, _peer = await _two_agents(db_session, [subnet])
+    ip = "10.31.1.12"
+
+    async def _post(events: list[dict[str, Any]]) -> Any:
+        return await concurrent_client.post(
+            "/api/v1/dhcp/agents/lease-events",
+            headers={"x-test-server": str(agent.id)},
+            json={"leases": events},
+        )
+
+    first = await _post([_lease(ip, 2)])
+    assert first.status_code == 200, first.text
+
+    async def _lapse(hours: int) -> None:
+        await db_session.execute(
+            update(DHCPLease)
+            .where(DHCPLease.server_id == agent.id)
+            .values(expires_at=datetime.now(UTC) - timedelta(hours=hours))
+        )
+        await db_session.commit()
+
+    await _lapse(25)
+
+    parked = asyncio.Event()
+    release = asyncio.Event()
+    real_revoke = ddns.revoke_ddns_for_lease
+
+    async def _revoke(db: AsyncSession, **kw: Any) -> Any:
+        if not parked.is_set():
+            parked.set()
+            await asyncio.wait_for(release.wait(), timeout=60)
+        return await real_revoke(db, **kw)
+
+    monkeypatch.setattr(ddns, "revoke_ddns_for_lease", _revoke)
+
+    sweep = asyncio.create_task(_sweep())
+    await asyncio.wait_for(parked.wait(), timeout=30)
+    renewal = asyncio.create_task(_post([_lease(ip, 2)]))
+    await _wait_for_lock_waiter(db_session)
+    release.set()
+    cleaned, deleted = await asyncio.wait_for(sweep, timeout=60)
+    resp = await asyncio.wait_for(renewal, timeout=60)
+    assert resp.status_code == 200, resp.text
+    assert (cleaned, deleted) == (1, 1)
+
+    leases = (
+        (
+            await db_session.execute(
+                select(DHCPLease)
+                .where(DHCPLease.server_id == agent.id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(lease.state, lease.expires_at > datetime.now(UTC)) for lease in leases] == [
+        ("active", True)
+    ]
+    mirror = (
+        await db_session.execute(
+            select(IPAddress)
+            .where(IPAddress.subnet_id == subnet.id, IPAddress.auto_from_lease.is_(True))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert mirror.status == "dhcp"
+    assert mirror.dhcp_lease_id == str(leases[0].id)
+    assert await _a_records(db_session) == 1
+
+    await _lapse(1)
+    cleaned, _deleted = await _sweep()
+    assert cleaned == 1
+    assert await _a_records(db_session) == 0
+
+
+@pytest.mark.asyncio
+async def test_renewing_a_long_expired_lease_never_deadlocks_with_the_sweep(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep's second pass deletes ``expired`` rows past the delete grace.
+    It used to take those rows only at its final flush, after its DDNS revokes
+    held the zone: a batch renewing one of them held its row and then wanted
+    the zone to publish the renewal — a lock cycle, and one side failed."""
+    from app.services.dns import ddns
+    from app.tasks.dhcp_lease_cleanup import _sweep
+
+    subnet, _block = await _ddns_subnet(db_session)
+    agent, _peer = await _two_agents(db_session, [subnet])
+    lapsing, stale = "10.31.1.20", "10.31.1.21"
+
+    async def _post(events: list[dict[str, Any]]) -> Any:
+        return await concurrent_client.post(
+            "/api/v1/dhcp/agents/lease-events",
+            headers={"x-test-server": str(agent.id)},
+            json={"leases": events},
+        )
+
+    first = await _post([_lease(lapsing, 3), _lease(stale, 4)])
+    assert first.status_code == 200, first.text
+    now = datetime.now(UTC)
+    await db_session.execute(
+        update(DHCPLease)
+        .where(DHCPLease.server_id == agent.id, DHCPLease.ip_address == lapsing)
+        .values(expires_at=now - timedelta(hours=1))
+    )
+    # Long expired: only the second pass wants this row.
+    await db_session.execute(
+        update(DHCPLease)
+        .where(DHCPLease.server_id == agent.id, DHCPLease.ip_address == stale)
+        .values(state="expired", expires_at=now - timedelta(hours=25))
+    )
+    await db_session.commit()
+
+    # The batch holds the stale lease's row and is about to publish its
+    # renamed host (a zone serial bump) when the sweep starts.
+    parked = asyncio.Event()
+    release = asyncio.Event()
+    real_apply = ddns.apply_ddns_for_lease
+
+    async def _apply(db: AsyncSession, **kw: Any) -> Any:
+        if not parked.is_set():
+            parked.set()
+            await asyncio.wait_for(release.wait(), timeout=60)
+        return await real_apply(db, **kw)
+
+    monkeypatch.setattr(ddns, "apply_ddns_for_lease", _apply)
+
+    renamed = {**_lease(stale, 4), "hostname": "renamed-host"}
+    renewal = asyncio.create_task(_post([renamed]))
+    await asyncio.wait_for(parked.wait(), timeout=30)
+    sweep = asyncio.create_task(_sweep())
+    await _wait_for_lock_waiter(db_session)
+    release.set()
+    resp = await asyncio.wait_for(renewal, timeout=60)
+    cleaned, deleted = await asyncio.wait_for(sweep, timeout=60)
+    assert resp.status_code == 200, resp.text
+    assert (cleaned, deleted) == (1, 0)
+
+    state = (
+        await db_session.execute(
+            select(DHCPLease.state)
+            .where(DHCPLease.server_id == agent.id, DHCPLease.ip_address == stale)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert state == "active"
+
+
+@pytest.mark.asyncio
+async def test_a_pull_renewing_a_lease_the_sweep_holds_never_deadlocks(
+    db_session: AsyncSession, other_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pull used to lock each lease row as it reached the address, after the
+    previous addresses' mirror and DDNS locks. Holding a zone from an earlier
+    address, it waited for a lease row the sweep held, while the sweep waited
+    for that zone to revoke the lease's record: 40P01. The pull now locks its
+    server's lease rows before any mirror or zone."""
+    from app.services.dhcp import pull_leases as pl
+    from app.services.dns import ddns
+    from app.tasks.dhcp_lease_cleanup import _sweep
+    from tests.test_dhcp_pull_leases_serialised_2262 import _patch, _server
+
+    subnet, _block = await _ddns_subnet(db_session)
+    srv = await _server(db_session)
+    await db_session.commit()
+    lapsed, live = "10.31.1.30", "10.31.1.31"
+
+    def _wire(ip: str, n: int) -> dict[str, Any]:
+        return {
+            "ip_address": ip,
+            "mac_address": f"aa:bb:cc:36:24:{n:02x}",
+            "hostname": f"pull-host-{n}",
+            "expires_at": datetime.now(UTC) + timedelta(hours=1),
+        }
+
+    _patch(monkeypatch, [_wire(lapsed, 1)])
+    first = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+    assert first.errors == []
+    assert await _a_records(db_session) == 1
+    await db_session.execute(
+        update(DHCPLease)
+        .where(DHCPLease.server_id == srv.id)
+        .values(expires_at=datetime.now(UTC) - timedelta(hours=1))
+    )
+    await db_session.commit()
+
+    # The sweep holds the lapsed lease and its mirror, about to revoke.
+    parked = asyncio.Event()
+    release = asyncio.Event()
+    real_revoke = ddns.revoke_ddns_for_lease
+
+    async def _revoke(db: AsyncSession, **kw: Any) -> Any:
+        if not parked.is_set():
+            parked.set()
+            await asyncio.wait_for(release.wait(), timeout=60)
+        return await real_revoke(db, **kw)
+
+    monkeypatch.setattr(ddns, "revoke_ddns_for_lease", _revoke)
+    sweep = asyncio.create_task(_sweep())
+    await asyncio.wait_for(parked.wait(), timeout=30)
+
+    # The pull meets the new address first (a zone serial bump), then the
+    # lapsed one, which the client has renewed.
+    _patch(monkeypatch, [_wire(live, 2), _wire(lapsed, 1)])
+    pull = asyncio.create_task(pl.pull_leases_from_server(db_session, srv, apply=True))
+    await _wait_for_lock_waiter(other_conn)
+    release.set()
+    cleaned, _deleted = await asyncio.wait_for(sweep, timeout=60)
+    result = await asyncio.wait_for(pull, timeout=60)
+    await db_session.commit()
+    assert cleaned == 1
+    assert result.errors == []
+
+    states = (
+        await db_session.execute(
+            select(DHCPLease.ip_address, DHCPLease.state)
+            .where(DHCPLease.server_id == srv.id)
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    assert sorted((str(ip), state) for ip, state in states) == [
+        (lapsed, "active"),
+        (live, "active"),
+    ]
+    assert await _a_records(db_session) == 2
