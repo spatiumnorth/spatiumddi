@@ -21,7 +21,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // AV over IP (issue #540, part of #543). Two operator surfaces on one
 // page because they only make sense together: the flows are the AV
@@ -170,7 +170,10 @@ export function AVFlowsPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on AV flows"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on AV flows",
+                ).title
               }
               onClick={() => setFlowModal({ mode: "create" })}
             >
@@ -362,7 +365,10 @@ export function AVFlowsPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on AV flows"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on AV flows",
+                ).title
               }
               onClick={() => setRangeModal({ mode: "create" })}
             >
