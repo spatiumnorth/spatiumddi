@@ -42,7 +42,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import Group, Role, User
 from app.models.change_request import ChangeRequest
 from app.models.feature_module import FeatureModule
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAMTemplate, IPBlock, IPSpace, Subnet
 from app.services import feature_modules
 
 MODULE = "governance.requests"
@@ -797,3 +797,44 @@ async def test_approve_when_apply_raises_permission_error_is_403_and_pending(
     assert resp.status_code == 403, resp.text
     row = (await client.get(f"/api/v1/requests/{req_id}", headers=_auth(token))).json()
     assert row["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_request_carries_the_template_name_without_template_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3649: the template line must not need read on IPAM templates."""
+    await _enable_module(db_session)
+    block = await _block(db_session)
+    tpl = IPAMTemplate(name="Branch office", applies_to="subnet")
+    db_session.add(tpl)
+    await db_session.flush()
+    _, req_tok = await _user(db_session, name="req", permissions=REQUESTER_PERMS)
+    _, appr_tok = await _user(db_session, name="appr", permissions=APPROVER_PERMS)
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(req_tok),
+        json={
+            "kind": "subnet",
+            "args": {
+                "block_id": str(block.id),
+                "prefix_len": 26,
+                "name": "tpl-net",
+                "template_id": str(tpl.id),
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["template_name"] == "Branch office"
+    # The requester and approver hold no read on templates themselves.
+    for tok in (req_tok, appr_tok):
+        assert (
+            await client.get(f"/api/v1/ipam/templates/{tpl.id}", headers=_auth(tok))
+        ).status_code == 403
+        listing = await client.get("/api/v1/requests", headers=_auth(tok))
+        assert [r["template_name"] for r in listing.json()] == ["Branch office"]
+        one = await client.get(f"/api/v1/requests/{body['id']}", headers=_auth(tok))
+        assert one.json()["template_name"] == "Branch office"
+        # Name only: nothing of the template body rides along.
+        assert not {"template", "tags", "custom_fields"} & set(one.json())
