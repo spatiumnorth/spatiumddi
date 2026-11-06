@@ -65,6 +65,7 @@ from app.models.ot import (
     OTZone,
 )
 from app.services.api_token_scopes import read_only_post
+from app.services.ipam.live_address import get_live_address
 from app.services.ot.importer import (
     MAX_IMPORT_ROWS,
     OTImportError,
@@ -512,7 +513,7 @@ async def _load_address_for_write(
     resource-scoped API token (#374) can't attach a descriptor to an
     address outside its subnet.
     """
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=422, detail="ip_address_id not found")
     _enforce_subnet_scope(user, ip.subnet_id)
@@ -759,7 +760,7 @@ async def get_device_by_address(
     "nothing to show here", and the distinction would leak the existence
     of addresses outside a scoped token's reach.
     """
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="No OT descriptor for this address")
     _enforce_subnet_scope(user, ip.subnet_id)

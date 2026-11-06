@@ -121,6 +121,7 @@ from app.services.ipam.hygiene import (
     DEFAULT_STALE_RESERVATION_DAYS,
     build_hygiene_report,
 )
+from app.services.ipam.live_address import get_live_address, live_subnet_clause
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_boundary import boundary_addresses
@@ -7537,7 +7538,11 @@ async def deprecate_stale_ips(
         )
 
     batch_id = uuid.uuid4()
-    rows = list((await db.execute(select(IPAddress).where(IPAddress.id.in_(ids)))).scalars().all())
+    rows = list(
+        (await db.execute(select(IPAddress).where(IPAddress.id.in_(ids), live_subnet_clause())))
+        .scalars()
+        .all()
+    )
     deprecated = 0
     skipped: list[uuid.UUID] = []
     for ip in rows:
@@ -10476,7 +10481,7 @@ async def search_address_ids(
 
 @router.get("/addresses/{address_id}", response_model=IPAddressResponse)
 async def get_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) -> IPAddress:
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
@@ -10522,7 +10527,7 @@ async def list_mac_history(
     has been associated with the IP. Permission gate is the same
     ``read:ip_address`` the parent endpoint uses (router-level).
     """
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
@@ -10591,7 +10596,7 @@ async def _clear_ip_dns_zone(db: AsyncSession, ip: IPAddress, subnet: Subnet) ->
 async def update_address(
     address_id: uuid.UUID, body: IPAddressUpdate, current_user: CurrentUser, db: DB
 ) -> IPAddress:
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
@@ -10897,7 +10902,7 @@ class AliasResponse(BaseModel):
 
 @router.get("/addresses/{address_id}/aliases", response_model=list[AliasResponse])
 async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB) -> list[DNSRecord]:
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
@@ -10932,7 +10937,7 @@ async def add_alias(
     db: DB,
     response: Response,
 ) -> DNSRecord:
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     # An alias is a DNS record on this address: the same per-address write
@@ -11025,7 +11030,7 @@ async def delete_alias(
     current_user: CurrentUser,
     db: DB,
 ) -> None:
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     await _require_ip_writable(db, current_user, ip)
@@ -11122,7 +11127,7 @@ async def profile_address(
     scans; on success the runner stamps ``last_profiled_at`` +
     ``last_profile_scan_id`` back on the IP.
     """
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
@@ -11208,7 +11213,7 @@ async def get_address_dhcp_fingerprint(
     enabled (``DHCP_FINGERPRINT_ENABLED=1``) for these rows to
     populate.
     """
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
 
@@ -11232,7 +11237,7 @@ async def delete_address(
         default=False, description="Permanently delete instead of marking orphan"
     ),
 ) -> None:
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
@@ -12846,7 +12851,13 @@ async def bulk_delete_addresses(
         )
     batch_id = uuid.uuid4()
     rows = list(
-        (await db.execute(select(IPAddress).where(IPAddress.id.in_(body.ip_ids)))).scalars().all()
+        (
+            await db.execute(
+                select(IPAddress).where(IPAddress.id.in_(body.ip_ids), live_subnet_clause())
+            )
+        )
+        .scalars()
+        .all()
     )
     found_ids = {ip.id for ip in rows}
     not_found = [i for i in body.ip_ids if i not in found_ids]
@@ -13079,7 +13090,13 @@ async def bulk_edit_addresses(
 
     batch_id = uuid.uuid4()
     rows = list(
-        (await db.execute(select(IPAddress).where(IPAddress.id.in_(body.ip_ids)))).scalars().all()
+        (
+            await db.execute(
+                select(IPAddress).where(IPAddress.id.in_(body.ip_ids), live_subnet_clause())
+            )
+        )
+        .scalars()
+        .all()
     )
     found_ids = {ip.id for ip in rows}
     not_found = [i for i in body.ip_ids if i not in found_ids]
@@ -13333,7 +13350,7 @@ async def list_network_context(
     is learned across VLANs / trunked interfaces. Empty list when the
     IP has no MAC or the MAC isn't in any device's FDB.
     """
-    ip = await db.get(IPAddress, address_id)
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     if ip.mac_address is None:
