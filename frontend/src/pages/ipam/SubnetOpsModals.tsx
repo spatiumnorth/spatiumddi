@@ -25,6 +25,7 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { permissionGate } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { formatCount } from "@/lib/format-count";
 import {
@@ -329,12 +330,10 @@ export function FindFreeModal({
                               onClose();
                             }}
                             className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-                            {...(canCreate
-                              ? {}
-                              : {
-                                  disabled: true,
-                                  title: "Requires write permission on subnets",
-                                })}
+                            {...permissionGate(
+                              canCreate,
+                              "Requires write permission on subnets",
+                            )}
                           >
                             Create subnet here
                           </button>

@@ -10,6 +10,7 @@ keyfile classifier.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from spatium_dns_agent.drivers.bind9 import (
@@ -146,5 +147,5 @@ def test_key_lifetimes_bind_refuses_render_in_range() -> None:
     assert "zsk lifetime 11d algorithm ecdsap256sha256;" in neg
     assert "ksk lifetime 2d algorithm ecdsap256sha256;" in big
     assert "zsk lifetime 49710d algorithm ecdsap256sha256;" in big
-    assert "-1d" not in out
-    assert "1000000d" not in out
+    assert not re.search(r"lifetime\s+-1d", out)
+    assert not re.search(r"lifetime\s+1000000d", out)

@@ -96,6 +96,7 @@ from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.lock_order import lock_zones_for_addresses
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -1456,10 +1457,28 @@ async def agent_lease_events(
     existing_leases = (
         (
             await db.execute(
-                select(DHCPLease).where(
+                select(DHCPLease)
+                .where(
                     DHCPLease.server_id == server.id,
                     DHCPLease.ip_address.in_(ips),
                 )
+                # #3624 — locked, by id, and re-read if the lock had to wait.
+                # The expiry sweep marks a lapsed lease ``expired`` and holds
+                # its row to commit. A plain read here returns the row as it
+                # was before that, the update below then waits for the sweep,
+                # and the session still holds ``state='active'``: assigning
+                # ``active`` again is no change, so the state was never
+                # written and a renewed lease stayed ``expired`` — which the
+                # sweep's first pass (``active`` only) never takes again, so
+                # its mirror and DNS records outlived it. Locking first makes
+                # the wait happen here, ``populate_existing`` hands back what
+                # the sweep committed, and the pass below restores the state,
+                # the mirror and the DDNS from that. Id order, the first of
+                # the batch's locks (dhcp_lease → ip_address → dns_zone →
+                # audit chain), as the sweep takes its lease rows (#3605).
+                .order_by(DHCPLease.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -1699,6 +1718,23 @@ async def agent_lease_events(
         if created:
             recount_ids.add(subnet.id)
             created_for[idx] = ipam_row
+
+    # #3617: every zone the pass's DDNS may write, locked in id order before
+    # the first publish or revoke. Each one locks its own zones in order, but
+    # one address's after another's are not, and a retraction took the
+    # reverse zone before the forward zone (``app.services.lock_order``).
+    publishing: list[tuple[Any, IPAddress]] = []
+    retracting: list[IPAddress] = []
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address))) if subnet else None
+        if idx in stale or row is None or not (row.auto_from_lease or row.status == "available"):
+            continue
+        if ev.state == "active":
+            publishing.append((subnet, row))
+        else:
+            retracting.append(row)
+    await lock_zones_for_addresses(db, publishing=publishing, retracting=retracting, ddns=True)
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
     for idx, ev in enumerate(events):

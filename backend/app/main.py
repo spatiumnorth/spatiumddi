@@ -1,7 +1,7 @@
 import asyncio
 import re
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
@@ -1535,6 +1535,21 @@ def create_app() -> FastAPI:
             return [_safe_errors(v) for v in value]
         return value
 
+    # The submitted value is never echoed back (#3639): ``input`` carries
+    # whatever the client sent for the failing field - a passphrase, key or
+    # token among them - and ``ctx.error`` is the validator's exception, which
+    # can quote it. Neither is part of the documented 422 shape (``loc`` /
+    # ``msg`` / ``type`` say what is wrong and where), and no client reads them.
+    def _without_submitted_values(errors: Sequence[Any]) -> list[Any]:
+        cleaned: list[Any] = []
+        for err in errors:
+            item = {k: v for k, v in err.items() if k != "input"}
+            ctx = item.get("ctx")
+            if isinstance(ctx, dict):
+                item["ctx"] = {k: v for k, v in ctx.items() if k != "error"}
+            cleaned.append(item)
+        return cleaned
+
     @app.exception_handler(RequestValidationError)
     async def _request_validation_422(request: Request, exc: RequestValidationError) -> Response:
         from fastapi.encoders import jsonable_encoder  # noqa: PLC0415
@@ -1542,7 +1557,9 @@ def create_app() -> FastAPI:
 
         return JSONResponse(
             status_code=422,
-            content={"detail": jsonable_encoder(_safe_errors(exc.errors()))},
+            content={
+                "detail": jsonable_encoder(_safe_errors(_without_submitted_values(exc.errors())))
+            },
         )
 
     @app.exception_handler(Exception)

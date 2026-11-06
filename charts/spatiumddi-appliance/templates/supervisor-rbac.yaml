@@ -128,9 +128,18 @@ rules:
     # read is a 403, which the gate (by design) does not treat as a hold, so
     # an engine+group switch briefly ran an old-template pod in the old group.
     # Read-only.
+    # #3620 — the Fleet tab's workloads list and restart picker (#890) go
+    # through the supervisor's kubeapi proxy (#3618), which only forwards GET
+    # on deployments / daemonsets / statefulsets and a PATCH carrying nothing
+    # but the ``kubectl.kubernetes.io/restartedAt`` annotation. Without these
+    # grants kubeapi answers 403 to both. ``patch`` is what a rollout restart
+    # is; no create / update / delete, and the Role is namespaced to spatium.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "patch"]
   - apiGroups: ["apps"]
     resources: ["daemonsets"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

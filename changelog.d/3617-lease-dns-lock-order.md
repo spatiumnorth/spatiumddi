@@ -1,0 +1,3 @@
+### Fixed
+
+- Three more database deadlocks between DHCP lease, IPAM and DNS writers are gone, each of which could fail one side with a 500. Two DDNS changes on different addresses of the same forward and reverse zone (a new lease publishing while an old one is retracted) no longer deadlock: every DNS sync now locks the zones it will write in one fixed order before writing any. The Windows / agentless lease pull and a subnet delete no longer deadlock with the lease expiry sweep: both now lock lease rows first, then the IPAM addresses, then the DNS zones, the order every other lease writer already used (#3617).

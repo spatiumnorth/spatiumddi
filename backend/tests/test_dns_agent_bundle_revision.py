@@ -139,6 +139,14 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
         "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
     },
+    # #3560/#3609: only a BIND9 group stored at ``yes`` with no anchor, or one
+    # holding a static root anchor, renders differently; these fixtures are
+    # neither, so their digests are 15's. The bump re-renders the groups that
+    # are, at the upgrade.
+    16: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
 }
 
 

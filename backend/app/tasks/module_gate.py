@@ -167,6 +167,7 @@ UNGATED_BEAT_TASKS: Final[dict[str, str]] = {
     "app.tasks.prune_metrics.prune_metric_samples": "retention",
     "app.tasks.prune_internal_errors.prune_internal_errors": "retention",
     "app.tasks.prune_pairing_codes.prune_pairing_codes": "retention",
+    "app.tasks.prune_e911_resolution_log.prune_e911_resolution_log": "retention (network.e911 data)",
     "app.tasks.prune_revoked_appliances.prune_revoked_appliances": "retention",
     "app.tasks.prune_multicast_memberships.prune_stale_igmp_memberships": "retention",
     "app.tasks.pcap.prune_captures": "retention",
