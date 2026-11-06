@@ -1139,7 +1139,12 @@ export function MulticastGroupsPage() {
               missingCustomerLabel(id, customersQ, readsEveryCustomer) ===
               "(customer in Trash)"
                 ? "(customer in Trash)"
-                : null
+                : // Any other customer the list does not name (refused, narrowed
+                  // to other customers, or past its first page) is said, never
+                  // shown as a piece of its id (#3527). Nothing while loading.
+                  customersQ.isPending
+                  ? null
+                  : "linked, not shown"
             }
             selectedIds={selectedIds}
             allChecked={allChecked}
@@ -1426,8 +1431,7 @@ function GroupsTabBody({
                 <td className="px-3 py-1.5 text-muted-foreground">
                   {g.customer_id
                     ? (customerNames.get(g.customer_id) ??
-                      missingCustomer(g.customer_id) ??
-                      g.customer_id.slice(0, 8))
+                      missingCustomer(g.customer_id))
                     : "—"}
                 </td>
                 <td className="px-3 py-1.5 tabular-nums text-muted-foreground">
