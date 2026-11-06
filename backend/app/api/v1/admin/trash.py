@@ -759,6 +759,11 @@ async def restore_row(
 
     # Before the recounts below too: they take the audit-chain lock (#3345).
     restore_wake_groups: set[uuid.UUID] = set()
+    # #3617: the zones' rows in id order before the first serial bump, as
+    # every other multi-zone writer takes them (``app.services.lock_order``).
+    from app.services.lock_order import lock_zone_rows  # noqa: PLC0415
+
+    await lock_zone_rows(db, records_by_zone)
     for zone_id, recs in records_by_zone.items():
         await push_records_restore(db, zone_id, recs)
         zone_row = await db.get(DNSZone, zone_id)

@@ -3539,8 +3539,13 @@ async function _unwrapBlobError(err: unknown): Promise<Error> {
           if (typeof detail === "string") {
             return new Error(detail);
           }
-          // FastAPI 422 returns a list under ``detail``; fall back
-          // to the JSON-stringified version.
+          // FastAPI 422 returns a list under ``detail``; format it like
+          // every other error site rather than showing raw JSON.
+          if (Array.isArray(detail)) {
+            return new Error(
+              formatApiError({ response: { data: parsed } }, "Request failed"),
+            );
+          }
           return new Error(JSON.stringify(parsed));
         }
       } catch {
@@ -12001,6 +12006,9 @@ export interface ProvisioningRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  // Name of the IPAM template args.template_id names, resolved server-side so
+  // viewers without read on IPAM templates still get it (#3649).
+  template_name?: string | null;
 }
 
 export interface ProvisioningRequestListParams {

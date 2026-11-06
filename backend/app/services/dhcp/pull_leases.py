@@ -95,6 +95,7 @@ from app.services.dhcp.windows_failover import (
     record_scope_observation,
 )
 from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.lock_order import lock_lease_rows, lock_mirror_rows, lock_zones_for_addresses
 
 
 def _refresh_lease_owned_row(
@@ -375,26 +376,54 @@ async def _pull_leases_core(
 
     now = datetime.now(UTC)
 
-    if apply:
-        # #3624 — every lease row of this server, locked once, in id order,
-        # before the loop below takes any mirror or zone lock. The expiry sweep
-        # marks a lapsed lease ``expired`` and holds its row to commit; read
-        # unlocked, the session kept ``state='active'``, so
-        # ``existing.state = "active"`` below was no change, never written,
-        # and the renewed lease stayed ``expired``. Locked here, the wait
-        # happens before any decision and the per-address read below
-        # (``populate_existing``) sees what the sweep committed. Locked one by
-        # one in wire order instead, each lock would come after the previous
-        # address's mirror and DDNS locks: out of the dhcp_lease → ip_address
-        # → dns_zone order the sweep and the lease-events batch keep, so the
-        # pull could hold a zone the sweep wants while waiting for a lease row
-        # the sweep holds. One statement, not one per lease.
-        await db.execute(
-            select(DHCPLease.id)
-            .where(DHCPLease.server_id == server.id)
-            .order_by(DHCPLease.id)
-            .with_for_update()
+    # #3617: one lock order with every other lease-path writer
+    # (``app.services.lock_order``): this server's lease rows by id, then the
+    # lease mirrors this pull may write by id, then (after the per-lease pass,
+    # below) the zones its DDNS may write, by id. The pull used to take all
+    # three per lease, in wire order, so the expiry sweep (leases → mirrors →
+    # zones, #3605) or a lease batch could hold a row this pull wanted next
+    # while waiting for one it held. Locking every lease row up front also
+    # makes a renewal wait for an expiry sweep that holds the row, so the
+    # per-address read below (``populate_existing``) sees what the sweep
+    # committed rather than a stale ``state='active'`` (#3624).
+    wire_subnet = {
+        lease.get("ip_address"): _find_containing_subnet(
+            lease["ip_address"], subnets, preferred_subnet_ids=preferred_subnet_ids
         )
+        for lease in wire
+        if lease.get("ip_address")
+    }
+    wire = sorted(
+        wire,
+        key=lambda lease: _write_order(
+            wire_subnet.get(lease.get("ip_address")), lease.get("ip_address")
+        ),
+    )
+    if apply:
+        await lock_lease_rows(db, DHCPLease.server_id == server.id)
+        mirror_keys = {
+            (sn.id, norm_ip(ip)) for ip, sn in wire_subnet.items() if sn is not None and ip
+        }
+        for held in (
+            await db.execute(
+                select(DHCPLease)
+                .where(DHCPLease.server_id == server.id, DHCPLease.state == "active")
+                .execution_options(populate_existing=True)
+            )
+        ).scalars():
+            sid = scope_subnet_ids.get(held.scope_id) if held.scope_id else None
+            if sid is None:
+                held_subnet = _find_containing_subnet(
+                    str(held.ip_address), subnets, preferred_subnet_ids=preferred_subnet_ids
+                )
+                sid = held_subnet.id if held_subnet is not None else None
+            if sid is not None:
+                mirror_keys.add((sid, norm_ip(str(held.ip_address))))
+        locked_mirrors = await lock_mirror_rows(db, mirror_keys)
+    else:
+        locked_mirrors = []
+    # (subnet, mirror row, client hostname) to publish DDNS for, after the pass.
+    ddns_todo: list[tuple[Subnet, IPAddress, str | None]] = []
 
     for lease in wire:
         ip = lease.get("ip_address")
@@ -402,7 +431,7 @@ async def _pull_leases_core(
         if not ip or not mac:
             continue
 
-        containing = _find_containing_subnet(ip, subnets, preferred_subnet_ids=preferred_subnet_ids)
+        containing = wire_subnet.get(ip)
         scope_id = scope_cache.get(containing.id) if containing else None
 
         # #2262 — every row for the address, newest first. This path keeps one
@@ -550,37 +579,10 @@ async def _pull_leases_core(
             # the operator set stays put.
             continue
 
-        # Fire DDNS off the freshly-mirrored row. Gate-keeping lives
-        # inside the service (subnet.ddns_enabled, policy, static
-        # override, idempotency); we just pass through and let it
-        # decide. Any exception is logged but doesn't break the
-        # lease-pull pass — DNS will reconcile next tick either way.
+        # DDNS fires off the freshly-mirrored row once every row is written
+        # (#3617, the order above).
         if apply and ipam_row is not None:
-            try:
-                from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
-
-                fired = await apply_ddns_for_lease(
-                    db,
-                    subnet=containing,
-                    ipam_row=ipam_row,
-                    client_hostname=lease.get("hostname"),
-                )
-                # #428 — record the affected DNS group(s) so the task wakes
-                # the agent after commit (instead of waiting the safety tick).
-                if fired:
-                    from app.api.v1.ipam.router import (  # noqa: PLC0415
-                        _resolve_effective_dns,
-                    )
-
-                    group_ids, _, _ = await _resolve_effective_dns(db, containing)
-                    result.dns_wake_group_ids.update(str(g) for g in group_ids)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "dhcp_pull_leases_ddns_failed",
-                    server=str(server.id),
-                    ip=ip,
-                    error=str(exc),
-                )
+            ddns_todo.append((containing, ipam_row, lease.get("hostname")))
 
     # Absence-delete: any active lease we have for this server that did
     # NOT appear in the wire response was removed on the DHCP server
@@ -665,6 +667,8 @@ async def _pull_leases_core(
         .scalars()
         .all()
     )
+    if apply:
+        await _publish_pull_ddns(db, server, ddns_todo, stale_leases, locked_mirrors, result)
     for stale in stale_leases:
         # Scope the mirror lookup to the lease's owning subnet — the same
         # discipline as the upsert/create branch above. The unscoped
@@ -712,6 +716,64 @@ async def _pull_leases_core(
 
 
 # ── helpers ───────────────────────────────────────────────────────────
+
+
+def _write_order(subnet: Any, address: Any) -> tuple[str, int, int, str]:
+    """(subnet id, address version, int address): the lease batches' write
+    order (#3480, #3601), which the pull follows too (#3617)."""
+    key = str(subnet.id) if subnet is not None else ""
+    ip = norm_ip(str(address or ""))
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return (key, 0, 0, ip)
+    return (key, addr.version, int(addr), ip)
+
+
+async def _publish_pull_ddns(
+    db: AsyncSession,
+    server: DHCPServer,
+    todo: list[tuple[Subnet, IPAddress, str | None]],
+    stale_leases: list[DHCPLease],
+    locked_mirrors: list[IPAddress],
+    result: PullLeasesResult,
+) -> None:
+    """The pull's DDNS, after every lease and mirror row is written (#3617).
+
+    Every zone the publishes below and the absence-delete revokes after them
+    may write is locked first, in id order: one address's zones after
+    another's are not in id order, and a revoke took the reverse zone before
+    the forward one. Gate-keeping lives inside the service (subnet DDNS,
+    policy, static override, idempotency). Any exception is logged but doesn't
+    break the pull — DNS will reconcile next tick either way.
+    """
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
+    from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
+
+    stale_ips = {norm_ip(str(lease.ip_address)) for lease in stale_leases}
+    await lock_zones_for_addresses(
+        db,
+        publishing=[(subnet, row) for subnet, row, _host in todo],
+        retracting=[m for m in locked_mirrors if norm_ip(str(m.address)) in stale_ips],
+        ddns=True,
+    )
+    for subnet, row, hostname in todo:
+        try:
+            fired = await apply_ddns_for_lease(
+                db, subnet=subnet, ipam_row=row, client_hostname=hostname
+            )
+            # #428 — record the affected DNS group(s) so the task wakes the
+            # agent after commit (instead of waiting the safety tick).
+            if fired:
+                group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+                result.dns_wake_group_ids.update(str(g) for g in group_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dhcp_pull_leases_ddns_failed",
+                server=str(server.id),
+                ip=str(row.address),
+                error=str(exc),
+            )
 
 
 @dataclass
