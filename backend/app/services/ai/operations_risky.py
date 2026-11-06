@@ -926,7 +926,6 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         await db.commit()
         return {"zone_id": str(args.zone_id), "mode": "soft_delete"}
 
-    await _push_zone_to_agentless_servers(db, zone, "delete")
     collect_wake(dns_group_channel(args.group_id))
     # Set-based first, ORM second. ``db.delete(zone)`` alone cascades through
     # the ORM: every record row is loaded, tracked and DELETEd one by one
@@ -956,6 +955,11 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # write that held the row first has committed its op by now. Swept before
     # the lock, that op outlived the zone with a NULL ``zone_id``.
     await sweep_zone_ops(db, zone, zone.group_id)
+    # The agentless servers drop the zone only now, still before the rows go.
+    # Pushed before the lock, the removal reached them while a record write
+    # that held the zone row was still under way, and that write's record
+    # then went to a server that had just lost the zone.
+    await _push_zone_to_agentless_servers(db, zone, "delete")
     await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
     await db.delete(zone)
     # IPAM names zones in text / JSONB columns with no foreign key (#3443).

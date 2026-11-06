@@ -490,3 +490,53 @@ async def test_a_zone_delete_behind_a_record_write_sweeps_the_op_the_write_queue
     left = await _queued_ops(z.group_id, z.name)
     assert left == [], f"the zone delete left these ops queued (op, state, zone_id): {left}"
     assert await _ops_without_a_zone(z.group_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_zone_delete_pushes_its_removal_to_agentless_servers_once_it_holds_the_zone(
+    concurrent_client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanent delete tells the group's agentless servers to drop the zone
+    (``_push_zone_to_agentless_servers``). The request has taken the zone row
+    and waits for the audit-chain lock when the delete arrives. Pushed before
+    the delete waits at the zone row, the removal reached the servers while
+    the request was still under way, and the request's record then went to a
+    server that had just lost the zone. Nothing may be pushed until the delete
+    holds the zone row. The test records each call of the push."""
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+
+    pushed: list[str] = []
+    push = dns_router._push_zone_to_agentless_servers
+
+    async def recording_push(db: AsyncSession, zone: DNSZone, action: str, **kw: Any) -> Any:
+        pushed.append(action)
+        return await push(db, zone, action, **kw)
+
+    monkeypatch.setattr(dns_router, "_push_zone_to_agentless_servers", recording_push)
+    z = await _seed(db_session)
+    gate = _Gate()
+    try:
+        await gate.hold("SELECT pg_advisory_xact_lock(:k)", k=_AUDIT_CHAIN_LOCK_KEY)
+        write = _send(concurrent_client, z, "create")
+        gate.tasks.append(write)
+        writer = await _blocked_by(gate.probe, gate.pid, write)
+        assert writer is not None, f"the request never reached its audit: {await _answer(write)}"
+        delete = _delete_zone(concurrent_client, z, permanent=True)
+        gate.tasks.append(delete)
+        deleter = await _blocked_by(gate.probe, writer[0], delete)
+        assert (
+            deleter is not None
+        ), f"the zone delete never waited on the request: {await _answer(delete)}"
+        pushed_while_waiting = list(pushed)
+        await gate.open()
+        w = await asyncio.wait_for(write, _STEP)
+        d = await asyncio.wait_for(delete, _STEP)
+    finally:
+        await gate.close()
+    assert 200 <= w.status_code < 300, f"{_said(w)}; the zone delete {_said(d)}"
+    assert d.status_code == 204, f"the zone delete answered {_said(d)}; the request {_said(w)}"
+    assert pushed_while_waiting == [], (
+        "the zone delete pushed its removal to the agentless servers while the "
+        f"request held the zone row (it then waited in {deleter[1]!r})"
+    )
+    assert pushed == ["delete"], pushed
