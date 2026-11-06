@@ -34,6 +34,7 @@ from app.services.dns.pool_geo import (
 )
 
 ApexSource = Literal["declared", "primary_ns", "placeholder"]
+PlaceholderReason = Literal["primary_ns_has_no_address", "no_primary_ns"]
 
 PLACEHOLDER_NS_LABEL = "ns1"
 PLACEHOLDER_NS_ADDRESS = "127.0.0.1"
@@ -57,6 +58,19 @@ class ServedApex:
     source: ApexSource
     # The agent writes ``ns1 IN A 127.0.0.1`` beside the placeholder NS.
     placeholder_glue: bool
+    # The agent's ``unaddressed_primary_ns`` note: a Primary NS inside the zone
+    # with no A/AAAA record, passed over for the placeholder (#3670).
+    unaddressed_primary_ns: str | None = None
+    # The agent's ``unaddressed_ns`` note: declared apex NS inside the zone, other
+    # than the placeholder, with no A/AAAA record (BIND will not load the zone).
+    unaddressed_ns: tuple[str, ...] = ()
+
+    @property
+    def placeholder_reason(self) -> PlaceholderReason | None:
+        """Why the placeholder NS is served, None when it is not."""
+        if self.source != "placeholder":
+            return None
+        return "primary_ns_has_no_address" if self.unaddressed_primary_ns else "no_primary_ns"
 
 
 def _absolute_name(value: object) -> str | None:
@@ -140,6 +154,7 @@ def compute_served_apex(
         rname_fallback = _PLACEHOLDER_OUTSIDE_RNAME
 
     source: ApexSource
+    unaddressed_primary: str | None = None
     if declared_ns:
         source = "declared"
         ns_set = declared_ns
@@ -149,15 +164,30 @@ def compute_served_apex(
     else:
         source = "placeholder"
         ns_set = [placeholder]
+        if primary is not None:
+            unaddressed_primary = primary
 
     placeholder_glue = (
         _inside(placeholder, origin)
         and placeholder.lower() in {n.lower() for n in ns_set}
         and placeholder.lower() not in addressed
     )
+    unaddressed_ns = tuple(
+        n
+        for n in declared_ns
+        if _inside(n, origin) and n.lower() not in addressed and n.lower() != placeholder.lower()
+    )
     mname = primary or (declared_ns[0] if declared_ns else placeholder)
     rname = admin or rname_fallback
-    return ServedApex(mname, rname, tuple(ns_set), source, placeholder_glue)
+    return ServedApex(
+        mname,
+        rname,
+        tuple(ns_set),
+        source,
+        placeholder_glue,
+        unaddressed_primary,
+        unaddressed_ns,
+    )
 
 
 @dataclass(frozen=True)

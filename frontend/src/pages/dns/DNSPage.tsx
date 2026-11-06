@@ -5861,6 +5861,7 @@ type SyncResultPayload =
       imported_records: SyncRecord[];
       // push direction
       push_candidates: number;
+      push_skipped_matching?: number;
       pushed: number;
       pushed_records: SyncRecord[];
       push_errors: string[];
@@ -5911,6 +5912,7 @@ export function SyncResultModal({
     imported,
     skipped_unsupported,
     imported_records,
+    push_skipped_matching,
     pushed,
     pushed_records,
     push_errors,
@@ -5972,7 +5974,11 @@ export function SyncResultModal({
               value={push_errors.length}
               highlight={push_errors.length > 0 ? "bad" : undefined}
             />
-            <Stat label="Skipped" value={0} hint="DB already matches server" />
+            <Stat
+              label="Skipped"
+              value={push_skipped_matching ?? 0}
+              hint="DB already matches server"
+            />
           </div>
           {pushed > 0 && (
             <RecordTable
@@ -6110,7 +6116,16 @@ function ServedApexRows({
   onEditZone,
   editDisabledReason,
 }: {
-  apex: Pick<ServedApex, "soa" | "ns" | "source" | "placeholder_glue_loopback">;
+  apex: Pick<
+    ServedApex,
+    | "soa"
+    | "ns"
+    | "source"
+    | "placeholder_glue_loopback"
+    | "placeholder_reason"
+    | "unaddressed_primary_ns"
+    | "unaddressed_ns"
+  >;
   viewName?: string;
   zoneName: string;
   onEditZone: () => void;
@@ -6146,13 +6161,30 @@ function ServedApexRows({
   // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
   // holds its own address for ns1), or ``invalid.`` for a zone whose name is
   // not a host name, which never resolves.
-  const warning = apex.placeholder_glue_loopback
-    ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-    : apex.source === "placeholder" && apex.ns.includes("invalid.")
-      ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-      : apex.source === "placeholder"
-        ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
-        : null;
+  const unaddressedPrimary = apex.unaddressed_primary_ns;
+  const warning =
+    apex.placeholder_glue_loopback && unaddressedPrimary
+      ? `The Primary NS ${unaddressedPrimary} is inside the zone, but the zone holds no A or AAAA record for it, and BIND will not load a zone whose NS has no address. This placeholder name server, glued to 127.0.0.1, is served instead, so resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for ${unaddressedPrimary}.`
+      : apex.placeholder_glue_loopback && apex.source === "declared"
+        ? `The apex NS record ${apex.ns.join(", ")} has no A or AAAA record in the zone, so it is served glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for it.`
+        : apex.placeholder_glue_loopback
+          ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
+          : apex.source === "placeholder" && apex.ns.includes("invalid.")
+            ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
+            : apex.source === "placeholder"
+              ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
+              : null;
+  // A declared apex draws no NS rows of ours, so its warning gets its own row.
+  const unaddressedNs = apex.unaddressed_ns ?? [];
+  const declaredWarning =
+    apex.source === "declared"
+      ? [
+          warning,
+          unaddressedNs.length > 0
+            ? `The apex NS ${unaddressedNs.join(", ")} lies inside the zone with no A or AAAA record, and BIND will not load a zone whose NS has no address. Add the address record.`
+            : null,
+        ].filter((w): w is string => !!w)
+      : [];
   const nameCell = (
     <td className="py-1.5 pl-5 font-mono text-xs font-medium">
       <span className="inline-flex items-center gap-1.5">
@@ -6195,6 +6227,26 @@ function ServedApexRows({
           </div>
         </td>
       </tr>
+      {declaredWarning.length > 0 && (
+        <tr
+          className="border-b bg-muted/20"
+          data-testid="served-apex-declared-warning"
+        >
+          <td className="w-8 py-1.5 pl-3" />
+          <td colSpan={6} className="py-1.5 pr-3">
+            {declaredWarning.map((w) => (
+              <div
+                key={w}
+                role="alert"
+                className="text-xs text-amber-700 dark:text-amber-400"
+                data-testid="served-apex-warning"
+              >
+                {w}
+              </div>
+            ))}
+          </td>
+        </tr>
+      )}
       {showNs &&
         apex.ns.map((ns) => (
           <tr
