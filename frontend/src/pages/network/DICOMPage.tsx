@@ -34,7 +34,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // DICOM AE Title registry (issue #723, part of #543). Registry only —
 // nothing on this page opens a DICOM association, and nothing here holds
@@ -210,7 +210,10 @@ export function DICOMPage() {
               icon={Upload}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on DICOM AEs"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on DICOM AEs",
+                ).title
               }
               onClick={() => setImportOpen(true)}
             >
@@ -221,7 +224,10 @@ export function DICOMPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on DICOM AEs"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on DICOM AEs",
+                ).title
               }
               onClick={() => setModal({ mode: "create" })}
             >
@@ -450,7 +456,10 @@ export function DICOMPage() {
               disabled={!canWrite || aes.length < 2}
               title={
                 !canWrite
-                  ? "Requires write permission on DICOM AEs"
+                  ? permissionGate(
+                      canWrite,
+                      "Requires write permission on DICOM AEs",
+                    ).title
                   : aes.length < 2
                     ? "Register at least two application entities first"
                     : undefined

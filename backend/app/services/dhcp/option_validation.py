@@ -371,6 +371,11 @@ def _normalize_options_raw(raw: Any, *, raw_codes: str = "code") -> dict[str, An
     ``raw_codes`` is the spelling the group's servers read (#1347): a
     catalogue pick on a Windows group is keyed ``opt-43``, which Windows
     serves, rather than ``code:43``, which the write check would refuse.
+
+    Raises ``ValueError`` when two list entries resolve to the same key (by
+    name, by code, or one of each): keeping either would silently store a
+    value other than the one the client sent (#3614). A dict cannot repeat a
+    key, so it never raises.
     """
     if raw is None:
         return {}
@@ -379,6 +384,7 @@ def _normalize_options_raw(raw: Any, *, raw_codes: str = "code") -> dict[str, An
     if not isinstance(raw, list):
         return {}
     out: dict[str, Any] = {}
+    seen: dict[str, dict[str, Any]] = {}
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -413,8 +419,22 @@ def _normalize_options_raw(raw: Any, *, raw_codes: str = "code") -> dict[str, An
             key = name  # unknown, and validation will say so
         else:
             continue
+        if key in seen:
+            raise ValueError(
+                f"Option {key!r} is given more than once: "
+                f"{_describe_entry(seen[key])} and {_describe_entry(entry)}. "
+                "Send each option once."
+            )
+        seen[key] = entry
         out[key] = entry.get("value")
     return out
+
+
+def _describe_entry(entry: Mapping[str, Any]) -> str:
+    parts = [
+        f"{k}={entry[k]!r}" for k in ("name", "code", "value") if entry.get(k) not in (None, "")
+    ]
+    return "{" + ", ".join(parts) + "}"
 
 
 def _is_code_key(key: str) -> bool:

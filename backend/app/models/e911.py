@@ -76,6 +76,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -395,6 +396,11 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     never a subject name: the ERL's own ``nam`` element is as close to a
     person as this feature gets, and duplicating it per lookup would turn
     an access log into a movement history.
+
+    Two kinds of row (#3514): an individually logged lookup
+    (``suppressed_count`` NULL), and a counter row standing for every HELD
+    lookup one caller made past its per-minute budget in one window
+    (``suppressed_count`` = N, "N lookups not individually logged").
     """
 
     __tablename__ = "e911_resolution_log"
@@ -402,6 +408,21 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
         Index("ix_e911_res_log_queried_at", "queried_at"),
         Index("ix_e911_res_log_identity", "identity_kind", "identity_value"),
         Index("ix_e911_res_log_actor", "actor_kind", "actor_id"),
+        # One counter row per caller per minute window (#3514); the upsert's
+        # ON CONFLICT target. Partial, so individual lookups stay out of it.
+        Index(
+            "uq_e911_res_log_suppressed_window",
+            "caller_key",
+            "window_start",
+            unique=True,
+            postgresql_where=text("caller_key IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "(caller_key IS NULL AND window_start IS NULL AND suppressed_count IS NULL)"
+            " OR (caller_key IS NOT NULL AND window_start IS NOT NULL"
+            " AND suppressed_count >= 1)",
+            name="ck_e911_res_log_suppressed_shape",
+        ),
     )
 
     #: No ``index=True`` here: ``ix_e911_res_log_queried_at`` in
@@ -428,3 +449,19 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     #: Age in seconds of the evidence the answer rests on, so an
     #: after-action review can tell a fresh answer from a lucky one.
     evidence_age_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── Counter rows (#3514) ──────────────────────────────────────────
+    # Past the per-caller budget (``PlatformSettings.
+    # e911_lookup_log_budget_per_minute``) a HELD lookup is not logged as its
+    # own row; it is COUNTED, in one row per caller per minute window, so the
+    # trail still says that N more lookups happened. On such a row the
+    # columns above describe the LAST lookup counted (``queried_at`` is when
+    # it happened), and these three are set. All three are NULL on an
+    # individually logged lookup.
+    #: The budget's caller key: the API token id, else the user id, else the
+    #: source address.
+    caller_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Start of the minute the counted lookups fell in.
+    window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: How many lookups in that window were not individually logged.
+    suppressed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

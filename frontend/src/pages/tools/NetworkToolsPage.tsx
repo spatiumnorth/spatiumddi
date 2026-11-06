@@ -30,7 +30,11 @@ import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  PERMISSIONS_UNREADABLE,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // ── tool catalog ────────────────────────────────────────────────────
 
@@ -255,7 +259,7 @@ export function NetworkToolsPage() {
         </p>
         {denied && (
           <p role="alert" className="mt-2 text-xs text-muted-foreground">
-            {TOOLS_DENIED_REASON}
+            {perms.isError ? PERMISSIONS_UNREADABLE : TOOLS_DENIED_REASON}
           </p>
         )}
       </div>

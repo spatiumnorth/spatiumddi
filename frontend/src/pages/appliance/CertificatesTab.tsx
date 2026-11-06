@@ -497,7 +497,7 @@ function CertificateCard({
                 className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                 title={
                   !canActivate
-                    ? NEEDS_APPLIANCE_ADMIN
+                    ? permissionGate(false, NEEDS_APPLIANCE_ADMIN).title
                     : expiresInDays !== null && expiresInDays < 0
                       ? "Cannot activate an expired certificate"
                       : "Make this the cert nginx serves"

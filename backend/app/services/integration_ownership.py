@@ -1278,6 +1278,7 @@ __all__ = [
     "owned_subnets_in_space",
     "ownership_target_model",
     "drop_wrapper_block",
+    "gateway_changed",
     "release_outside_space",
     "retire_vanished_subnet",
     "SpaceRelease",
@@ -1293,3 +1294,23 @@ __all__ = [
     "subnet_registry_ref",
     "unowned_subnets_at",
 ]
+
+
+def gateway_changed(stored: Any, wanted: str | None) -> bool:
+    """True when a mirrored subnet's stored gateway differs from ``wanted``.
+
+    ``Subnet.gateway`` is an INET column, so the stored value loads as an
+    ``ipaddress`` object while the integration's value is a string; a bare
+    ``!=`` is then always true and every sync rewrote (and counted) every
+    subnet carrying a gateway (#3596). Compare as addresses. ``wanted`` of
+    ``None`` / empty means "the integration knows none" and never counts as a
+    change — callers do not clear a gateway on a sync.
+    """
+    if not wanted:
+        return False
+    if stored is None:
+        return True
+    try:
+        return ipaddress.ip_address(str(stored)) != ipaddress.ip_address(str(wanted))
+    except ValueError:
+        return str(stored) != str(wanted)

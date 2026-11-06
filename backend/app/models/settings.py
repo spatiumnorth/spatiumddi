@@ -467,6 +467,18 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )
 
+    # E911 lookup trail bounds (#3514). ``POST /held`` is read-scoped but
+    # writes one ``e911_resolution_log`` row per lookup, so the table is
+    # bounded twice: past this many logged lookups per caller per minute the
+    # lookup is answered without a row, and the daily
+    # ``prune_e911_resolution_log`` sweep drops rows older than the retention.
+    e911_lookup_log_budget_per_minute: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=120, server_default=sa_text("120")
+    )
+    e911_resolution_log_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default=sa_text("90")
+    )
+
     # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of
     # the device profiling feature). Fernet-encrypted at rest; null when the
     # operator hasn't configured a key. When unset, the agent still ships

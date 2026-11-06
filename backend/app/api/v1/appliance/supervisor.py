@@ -7769,6 +7769,9 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
+    # #3606: end the auth's read transaction before the 30 s wait; the queue
+    # is in memory and nothing is pending (cert auth only reads).
+    await db.commit()
     queued = await _proxy.pop_request(appliance.id, timeout=30.0)
     if queued is None:
         # No request within the timeout — return an empty shape so
@@ -7897,6 +7900,9 @@ async def nettool_poll(request: Request, db: DB) -> NetToolPollResponse:
     from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
+    # #3606: end the auth's read transaction before the 30 s wait; the queue
+    # is in memory and nothing is pending (cert auth only reads).
+    await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0)
     if queued is None:
         # No command within the timeout — empty shape so the supervisor
@@ -8009,6 +8015,9 @@ async def storage_poll(request: Request, db: DB) -> StoragePollResponse:
     from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
+    # #3606: end the auth's read transaction before the 30 s wait; the queue
+    # is in memory and nothing is pending (cert auth only reads).
+    await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0, channel=_cmd.CHANNEL_STORAGE)
     if queued is None:
         return StoragePollResponse(request_id="", params={})
@@ -8541,6 +8550,14 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
             return PcapPollResponse(**cmd)
         if _asyncio.get_running_loop().time() >= deadline:
             return PcapPollResponse()
+        # #3606: end this pass's read transaction before the sleep, so the
+        # empty claim query does not hold its ACCESS SHARE lock on
+        # packet_capture through it (a restore or an ALTER would wait out the
+        # whole poll). Nothing is pending: cert auth only reads, and
+        # claim_next commits or rolls back whatever it writes. The loop
+        # re-reads the queue every pass and the appliance row is not used
+        # again after the auth.
+        await db.commit()
         if await sleep_or_shutdown(2.0):
             # #3015 — this api process is stopping: the next pass makes one
             # last claim check and answers the empty shape, so the supervisor

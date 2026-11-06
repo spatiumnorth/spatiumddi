@@ -61,6 +61,7 @@ from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.auth import APIToken, User
 from app.models.dhcp import DHCPServerGroup
 from app.models.dns import DNSServerGroup, DNSZone
+from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
 from app.models.wol_schedule import WolSchedule
 from tests.test_token_read_only_post_3223 import EXPECTED_READ_ONLY_POSTS
@@ -285,6 +286,12 @@ async def _seed(db: AsyncSession) -> Seed:
         space_id=space.id, block_id=block3.id, network="10.50.0.0/24", name="s3", kind="unicast"
     )
     db.add_all([subnet, sibling, resize_subnet])
+    await db.flush()
+    # So POST /held answers 200 (a binding on the subnet) rather than locationUnknown.
+    erl = EmergencyResponseLocation(name="harness-erl", country="US", a1="NY", room="1")
+    db.add(erl)
+    await db.flush()
+    db.add(ERLBinding(erl_id=erl.id, rule_kind="subnet", subnet_id=subnet.id))
     await db.flush()
     for i in (5, 6):
         db.add(
@@ -554,7 +561,7 @@ CASES: dict[str, Callable[[Seed], Req]] = {
     "/api/v1/wake-scheduler/schedules/{schedule_id}/preview-targets": lambda s: _json(
         f"/api/v1/wake-scheduler/schedules/{s.schedule_id}/preview-targets"
     ),
-    # Known writer: see KNOWN_VIOLATIONS.
+    # Allowed writer: see ALLOWED_WRITES.
     "/held": lambda s: {
         "url": "/held",
         "content": (
@@ -569,16 +576,23 @@ CASES: dict[str, Callable[[Seed], Req]] = {
 # Routes that cannot be driven here, with why. Empty today: every route runs.
 EXEMPT: dict[str, str] = {}
 
-# Routes the harness caught breaking the read-only claim. Each is a finding,
-# kept xfail(strict=True) so it turns red the day the route is fixed (and the
-# entry must then be deleted).
-KNOWN_VIOLATIONS: dict[str, str] = {
+# Writes a read-only route is explicitly ALLOWED to make: path -> (reason, the exact
+# violation prefixes waived). Only an INSERT into the named table (and the ORM flush of
+# a NEW row of its model) is waived; an UPDATE or DELETE of it, or a write to any other
+# table, is still a violation.
+ALLOWED_WRITES: dict[str, tuple[str, tuple[str, ...]]] = {
     "/held": (
-        "#3514: POST /held INSERTs an e911_resolution_log row (the lookup trail) on every "
-        "request, so a read-scoped token grows a table. Deliberate and documented in "
-        "held_router.py, but it is a write behind @read_only_post."
+        "#3514: POST /held writes the e911_resolution_log lookup trail, kept on purpose. "
+        "Bounded by a per-caller logging budget (past it the lookup is counted in one "
+        "upserted row per caller per minute; see "
+        "test_held_over_budget_writes_only_the_counter_upsert) and the daily "
+        "prune_e911_resolution_log retention sweep, both settings.",
+        ("DML: INSERT INTO e911_resolution_log ", "DML: flush new E911ResolutionLog"),
     ),
 }
+# Routes the harness caught breaking the read-only claim and that are not yet fixed
+# (kept xfail(strict=True)). Empty today.
+KNOWN_VIOLATIONS: dict[str, str] = {}
 
 
 def test_every_read_only_route_has_a_case_or_a_reason() -> None:
@@ -590,6 +604,7 @@ def test_every_read_only_route_has_a_case_or_a_reason() -> None:
     )
     assert all(EXEMPT.values()), "an exemption needs a reason"
     assert set(KNOWN_VIOLATIONS) <= set(CASES)
+    assert set(ALLOWED_WRITES) <= set(CASES)
 
 
 # ── The harness ───────────────────────────────────────────────────────────
@@ -615,10 +630,49 @@ async def test_read_only_post_writes_nothing_and_calls_nothing(
         guard.armed = True
         resp = await _call(client, req, seed.raw_token)
         guard.armed = False
-    assert not guard.violations, f"{path} broke the read-only claim: {guard.violations}"
+    waived = ALLOWED_WRITES[path][1] if path in ALLOWED_WRITES else ()
+    violations = [v for v in guard.violations if not v.startswith(waived)]
+    assert not violations, f"{path} broke the read-only claim: {violations}"
+    if waived:
+        # An allowlist entry that waives nothing hides the day the write stops (or moves
+        # to another table): the waiver must match what the route actually does.
+        assert any(v.startswith(waived) for v in guard.violations), (
+            f"{path} is in ALLOWED_WRITES but made none of the waived writes: "
+            f"{guard.violations}"
+        )
     # The route must actually have run: a 401 / 403 / 404 / 422 means the body or the seed
     # was wrong and the guard watched nothing.
     assert resp.status_code == 200, f"{path} -> {resp.status_code} {resp.text[:300]}"
+
+
+async def test_held_over_budget_writes_only_the_counter_upsert(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3514: past the logging budget, the one write /held makes is the counter
+    upsert (a single ``INSERT INTO e911_resolution_log … ON CONFLICT``, no ORM
+    flush), and it leaves a counter row. Anything else is still a violation."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy import select
+
+    from app.models.e911 import E911ResolutionLog
+
+    seed = await _seed(db_session)
+    req = CASES["/held"](seed)
+    names, ips = _allowed_hosts()
+    limiter = AsyncMock(return_value=True)
+    with (
+        patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", limiter),
+        forbid_writes_and_sockets(names, ips) as guard,
+    ):
+        guard.armed = True
+        resp = await _call(client, req, seed.raw_token)
+        guard.armed = False
+    assert resp.status_code == 200, resp.text[:300]
+    assert len(guard.violations) == 1, guard.violations
+    assert guard.violations[0].startswith("DML: INSERT INTO e911_resolution_log "), guard.violations
+    rows = (await db_session.execute(select(E911ResolutionLog))).scalars().all()
+    assert [r.suppressed_count for r in rows] == [1]
 
 
 # ── Negative controls ─────────────────────────────────────────────────────

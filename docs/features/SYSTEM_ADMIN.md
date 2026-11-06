@@ -346,6 +346,7 @@ window deletes the older data on the next nightly run.
 | `soft_delete_purge_days` | Trash (soft-deleted IPAM / DNS / DHCP rows) | 30 days | 0–365 days (0 = never purge) |
 | `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
 | `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
+| `e911_resolution_log_retention_days` | The E911 location-lookup trail (`e911_resolution_log`, #3514) | 90 days | 7–3650 days |
 
 `log_retention_hours` is capped at a week because the prune is a single
 `DELETE`, and a longer window makes that one transaction larger;

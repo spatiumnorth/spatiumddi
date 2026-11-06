@@ -2967,7 +2967,8 @@ function ZoneModalForm({
   // install with the module off, is not asked (#2926): the select says the
   // list is not available. ``ready`` waits for the real module state, since
   // ``enabled`` answers true while it loads.
-  const canReadDomainPerm = usePermissions().can("read", "manage_domains");
+  const domainPerms = usePermissions();
+  const canReadDomainPerm = domainPerms.can("read", "manage_domains");
   const { enabled: domainModuleEnabled, ready: domainModulesReady } =
     useFeatureModules();
   const domainsModuleOn =
@@ -3389,11 +3390,15 @@ function ZoneModalForm({
             Pin to a tracked domain registration so the Domain detail page
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
-            {!canReadDomainPerm
-              ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
-              : domainModulesReady && !domainsModuleOn
-                ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
-                : ""}
+            {!canReadDomainPerm && domainPerms.isError
+              ? " Your permissions could not be read, so the domain list was not requested and the link cannot be changed here. Reload to try again."
+              : !canReadDomainPerm && domainPerms.unanswered
+                ? ` ${domainPerms.unanswered}`
+                : !canReadDomainPerm
+                  ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
+                  : domainModulesReady && !domainsModuleOn
+                    ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
+                    : ""}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -4368,7 +4373,8 @@ export function ZoneDetailView({
   const tlsCertsOn = moduleEnabled("security.tls_certs");
   // The route takes read on 'tls_cert': a user without it is not asked, and
   // the tab says so instead of "Certificates (0)" (#2704).
-  const canReadCerts = usePermissions().can("read", "tls_cert");
+  const certPerms = usePermissions();
+  const canReadCerts = certPerms.can("read", "tls_cert");
   const {
     data: tlsCerts,
     isLoading: tlsCertsLoading,
@@ -5116,8 +5122,8 @@ export function ZoneDetailView({
                     />
                   ) : (
                     <span className="text-muted-foreground">
-                      You don't have permission to see this zone's TLS
-                      certificates.
+                      {certPerms.unanswered ??
+                        "You don't have permission to see this zone's TLS certificates."}
                     </span>
                   )}
                 </p>
@@ -5389,9 +5395,10 @@ export function ZoneDetailView({
                         editDisabledReason={
                           zone.tailscale_tenant_id
                             ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
-                            : can("write", "dns_zone")
-                              ? undefined
-                              : NEEDS_ZONE_WRITE
+                            : permissionGate(
+                                can("write", "dns_zone"),
+                                NEEDS_ZONE_WRITE,
+                              ).title
                         }
                       />
                     ))}
@@ -8020,6 +8027,16 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     tlsVerify: techUnsupported && opts?.forward_tls_verify !== false,
     forwardFirst: techUnsupported && opts?.forward_policy !== "first",
   };
+  // #3560: BIND9 9.20 will not load ``dnssec-validation yes`` without a
+  // trust anchor, so the API refuses the change on a group that renders
+  // BIND9 (an empty group counts). Offered only once an anchor exists; a
+  // group already stored at ``yes`` keeps the option so it can be re-saved.
+  const rendersBind9 =
+    groupServers.length === 0 || groupServers.some((s) => s.driver === "bind9");
+  const dnssecYesLocked =
+    rendersBind9 &&
+    (opts?.trust_anchors?.length ?? 0) === 0 &&
+    opts?.dnssec_validation !== "yes";
   const techReason =
     "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
 
@@ -8595,13 +8612,25 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <option value="auto">
               auto — validate using built-in managed keys (recommended)
             </option>
-            <option value="yes">
+            <option value="yes" disabled={dnssecYesLocked}>
               yes — validate; only against trust anchors added via the API
               (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {dnssecYesLocked && (
+          <p className="text-xs text-muted-foreground">
+            &quot;yes&quot; needs a trust anchor first: BIND 9.20 will not load
+            it without one. Add an anchor with POST
+            /dns/groups/&#123;id&#125;/options/trust-anchors, or use
+            &quot;auto&quot; (BIND&apos;s built-in root key). A root
+            (&quot;.&quot;) anchor must be initial-key (is_initial_key: true,
+            the default): a static root anchor is refused, because BIND will not
+            load it beside &quot;auto&quot; and it stops validating at the next
+            root key rollover.
+          </p>
+        )}
         {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
           <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
             {opts?.dnssec_warnings?.map((w) => (
@@ -11624,7 +11653,16 @@ export function BlocklistDetail({
           Last synced: {new Date(list.last_synced_at).toLocaleString()}
           {list.last_sync_status && <> — {list.last_sync_status}</>}
           {list.last_sync_error && (
-            <span className="text-destructive"> ({list.last_sync_error})</span>
+            <span
+              className={
+                list.last_sync_status === "error"
+                  ? "text-destructive"
+                  : "text-amber-600"
+              }
+            >
+              {" "}
+              ({list.last_sync_error})
+            </span>
           )}
         </p>
       )}
@@ -11763,9 +11801,11 @@ export function BlocklistDetail({
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."
-                          : !can("write", "dns_blocklist")
-                            ? NEEDS_BLOCKLIST_WRITE
-                            : "Also block *.<domain>. Saves immediately."
+                          : (permissionGate(
+                              can("write", "dns_blocklist"),
+                              NEEDS_BLOCKLIST_WRITE,
+                            ).title ??
+                            "Also block *.<domain>. Saves immediately.")
                       }
                     />
                   </td>
