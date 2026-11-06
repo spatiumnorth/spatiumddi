@@ -257,7 +257,7 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
-from app.services.dns.zone_apex import served_apex_for_zones
+from app.services.dns.zone_apex import apex_name_length_error, served_apex_for_zones
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -6063,6 +6063,11 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, zone_fields, None, db)
+    if body.zone_type == "primary":
+        # #3672 — a name too long to carry the apex defaults is never served.
+        apex_err = apex_name_length_error(body.name, body.primary_ns, body.admin_email)
+        if apex_err is not None:
+            raise HTTPException(status_code=422, detail=apex_err)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -6858,6 +6863,7 @@ async def update_zone(
         mail_err = admin_email_error(changes["admin_email"])
         if mail_err is not None:
             raise HTTPException(status_code=422, detail=f"Admin Email (admin_email) {mail_err}")
+    await _enforce_apex_name_length(db, zone, changes)  # #3672
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
@@ -8510,6 +8516,16 @@ async def create_zone_from_template(
             port=checked.port,
         )
 
+    # #3672 — the template's apex NS records stand in for the placeholder.
+    apex_err = apex_name_length_error(
+        body.zone_name,
+        None,
+        None,
+        [(r["name"], r["record_type"], r["value"]) for r in record_payloads],
+    )
+    if apex_err is not None:
+        raise HTTPException(status_code=422, detail=apex_err)
+
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -9180,6 +9196,39 @@ async def list_records(
             else None
         ),
     )
+
+
+async def _enforce_apex_name_length(db: DB, zone: DNSZone, changes: dict[str, Any]) -> None:
+    """422 an edit that leaves a primary zone's apex names past 253 (#3672).
+
+    Only an edit that moves one of the inputs (the name, the type, the Primary
+    NS or the Admin Email) is checked, so a zone stored before the rule stays
+    editable by a request that re-sends what it holds. The zone's own apex NS
+    records count, as they replace the placeholder name server.
+    """
+    keys = ("name", "zone_type", "primary_ns", "admin_email")
+    if not any(k in changes and changes[k] != getattr(zone, k) for k in keys):
+        return
+    if changes.get("zone_type", zone.zone_type) != "primary":
+        return
+    ns_rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value).where(
+                DNSRecord.zone_id == zone.id,
+                DNSRecord.record_type == "NS",
+                DNSRecord.name.in_(("@", "")),
+                DNSRecord.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    err = apex_name_length_error(
+        changes.get("name", zone.name),
+        changes.get("primary_ns", zone.primary_ns),
+        changes.get("admin_email", zone.admin_email),
+        [(r.name, r.record_type, r.value) for r in ns_rows],
+    )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:

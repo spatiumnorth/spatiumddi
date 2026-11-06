@@ -2100,6 +2100,26 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   into storage. Underscore labels are allowed (`_msdcs.example.com` is a real
   zone); wildcards are not. `422` via `app.core.dns_names.validate_fqdn` at
   `backend/app/api/v1/dns/router.py:785` (create) / `:832` (update). See §18.
+- **Apex names past 253 characters (issue #3672).** A primary zone with no
+  Primary NS is served with the placeholder name server `ns1.<zone>`, and
+  with no Admin Email the mailbox `admin.<zone>`. A zone name of 250
+  characters or more without a Primary NS, or 248 or more without an Admin
+  Email, makes those longer than 253, so BIND refuses the zone. Add Zone,
+  Edit Zone (when the name, type, Primary NS or Admin Email changes), the
+  template create, the Copilot create and the importers refuse it with a
+  `422` naming the field to set, via
+  `app.services.dns.zone_apex.apex_name_length_error`.
+- **Zone names near the file-name limit (issue #3672).** The BIND9 agent
+  stores a zone as `<zone>.db`, with sidecars beside it (`.db.owned` for a
+  dynamic zone, `.db.sha256` for an RPZ zone) and named's own journal
+  (`.db.jnl`). A file name is capped at 255 bytes, so a zone of 253
+  characters cannot be stored at all, and a dynamic zone of 243 or
+  more cannot keep its ownership sidecar. Such a zone is held back on its
+  own (reported with the reason, not served), exactly as a zone
+  `named-checkzone` refuses, and every other zone in the bundle applies. An
+  RPZ zone with no room for its hash sidecar is still served, just rendered
+  on every apply. named itself cannot write a journal for a zone of 249 or
+  more characters, so RFC 2136 updates to one fail at named.
 
 ### Servers & server groups
 
