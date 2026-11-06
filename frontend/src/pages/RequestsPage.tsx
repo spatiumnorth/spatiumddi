@@ -25,7 +25,6 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   authApi,
-  ipamApi,
   requestsApi,
   type ChangeRequestState,
   type ProvisioningRequest,
@@ -520,25 +519,19 @@ function NewRequestModal({
 /**
  * The IPAM template a subnet request names (#3251). Approving stamps its
  * tags, zone binding, server groups and DDNS settings on the new subnet, so
- * the approver is shown which one before deciding. Shows the id until the
- * name arrives, and keeps it when this user cannot read the template, so the
- * line never waits on a lookup or reads "undefined".
+ * the approver is shown which one before deciding. The name rides on the
+ * request itself (#3649): the templates route needs a grant the Requester and
+ * Change Approver roles lack, so this never looks the template up. Falls back
+ * to the id only when the server resolved no name (template since deleted).
  */
 function TemplateLine({ request }: { request: ProvisioningRequest }) {
   const raw = request.args?.template_id;
   const id = typeof raw === "string" && raw ? raw : null;
-  const tpl = useQuery({
-    queryKey: ["ipam-template", id],
-    queryFn: () => ipamApi.getTemplate(id as string),
-    enabled: id !== null,
-    retry: false,
-    staleTime: 60_000,
-  });
   if (!id) return null;
   return (
     <p data-testid="request-template" className="mt-1 text-xs">
       <span className="font-medium">Template applied on approval:</span>{" "}
-      {tpl.data?.name || id}
+      {request.template_name || id}
     </p>
   );
 }

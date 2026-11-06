@@ -314,35 +314,32 @@ describe("the list shows each request once, in plain words (#3252)", () => {
   });
 });
 
-describe("the approver is shown the template (#3251)", () => {
-  it("names it on the row and in the dialog", async () => {
-    getTemplate.mockResolvedValue({ id: "t1", name: "Branch office" });
-    rows.mockResolvedValue([req({ args: { template_id: "t1" } })]);
+describe("the approver is shown the template (#3251, #3649)", () => {
+  it("names it on the row and in the dialog from the request itself", async () => {
+    rows.mockResolvedValue([
+      req({ args: { template_id: "t1" }, template_name: "Branch office" }),
+    ]);
     renderPage();
     expect(await screen.findByText("Branch office")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() =>
       expect(screen.getAllByTestId("request-template").length).toBe(2),
     );
+    for (const line of screen.getAllByTestId("request-template"))
+      expect(line.textContent).toContain("Branch office");
+    // The viewer may hold no read on templates: the page never asks (#3649).
+    expect(getTemplate).not.toHaveBeenCalled();
   });
 
-  it("shows the id when the template cannot be read, never undefined", async () => {
-    getTemplate.mockRejectedValue({ response: { status: 403 } });
-    rows.mockResolvedValue([req({ args: { template_id: "tpl-42" } })]);
+  it("shows the id when the server resolved no name, never undefined", async () => {
+    rows.mockResolvedValue([
+      req({ args: { template_id: "tpl-42" }, template_name: null }),
+    ]);
     renderPage();
     const line = await screen.findByTestId("request-template");
-    await waitFor(() => expect(getTemplate).toHaveBeenCalled());
-    await waitFor(() => expect(line.textContent).toContain("tpl-42"));
+    expect(line.textContent).toContain("tpl-42");
     expect(line.textContent).not.toMatch(/undefined|…/);
-  });
-
-  it("shows the id while the lookup is still pending", async () => {
-    getTemplate.mockReturnValue(new Promise(() => {}));
-    rows.mockResolvedValue([req({ args: { template_id: "tpl-43" } })]);
-    renderPage();
-    const line = await screen.findByTestId("request-template");
-    expect(line.textContent).toContain("tpl-43");
-    expect(line.textContent).not.toMatch(/undefined|…/);
+    expect(getTemplate).not.toHaveBeenCalled();
   });
 
   it("shows nothing when the request names no template", async () => {
