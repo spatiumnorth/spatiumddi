@@ -52,13 +52,24 @@ from tests.test_dns_server_move_render_deadlock_1703 import _STEP, _cleanup, _pr
 _QUEUE_S = 10.0
 
 _PERMANENT = {"permanent": "true"}
-# Writers of new records, and writers of a record that exists.
+# Writers of new records, and writers of a record that exists. The two imports
+# edit ``www``'s TTL: the zone-file import, and the records sheet, which
+# flushes its record edits before it bumps the zone serial.
 _CREATES = ["create", "bulk-create"]
-_EDITS = ["update", "delete", "delete-permanent", "bulk-delete", "bulk-delete-permanent"]
+_EDITS = [
+    "update",
+    "delete",
+    "delete-permanent",
+    "bulk-delete",
+    "bulk-delete-permanent",
+    "zone-file-import",
+    "sheet-import",
+]
 
 
-def _request(case: str, record_id: str) -> tuple[str, str, dict[str, Any] | None, dict[str, str]]:
+def _request(case: str, z: _Zone) -> tuple[str, str, dict[str, Any] | None, dict[str, str]]:
     """What ``case`` sends: method, path under the zone, JSON body, query."""
+    record_id = str(z.www_id)
     bulk = {"record_ids": [record_id]}
     return {
         "create": (
@@ -83,6 +94,15 @@ def _request(case: str, record_id: str) -> tuple[str, str, dict[str, Any] | None
         "delete-permanent": ("DELETE", f"records/{record_id}", None, _PERMANENT),
         "bulk-delete": ("POST", "records/bulk-delete", bulk, {}),
         "bulk-delete-permanent": ("POST", "records/bulk-delete", bulk, _PERMANENT),
+        "zone-file-import": (
+            "POST",
+            "import/commit",
+            {
+                "zone_file": f"$ORIGIN {z.name}\nwww 600 IN A 192.0.2.10\n",
+                "conflict_strategy": "merge",
+            },
+            {},
+        ),
     }[case]
 
 
@@ -137,7 +157,17 @@ async def _seed(db: AsyncSession) -> _Zone:
 
 
 def _send(client: AsyncClient, z: _Zone, case: str) -> asyncio.Task[Response]:
-    method, suffix, body, params = _request(case, str(z.www_id))
+    if case == "sheet-import":
+        sheet = f"id,name,type,value,ttl\n{z.www_id},www,A,192.0.2.10,600\n".encode()
+        return asyncio.create_task(
+            client.post(
+                f"{z.url}/import/spreadsheet/commit",
+                headers=z.headers,
+                data={"mode": "merge"},
+                files={"file": ("records.csv", sheet, "text/csv")},
+            )
+        )
+    method, suffix, body, params = _request(case, z)
     return asyncio.create_task(
         client.request(method, f"{z.url}/{suffix}", headers=z.headers, json=body, params=params)
     )
@@ -490,6 +520,68 @@ async def test_a_zone_delete_behind_a_record_write_sweeps_the_op_the_write_queue
     left = await _queued_ops(z.group_id, z.name)
     assert left == [], f"the zone delete left these ops queued (op, state, zone_id): {left}"
     assert await _ops_without_a_zone(z.group_id) == 0
+
+
+async def _queued_op(db: AsyncSession, z: _Zone) -> uuid.UUID:
+    """A pending op of ``z`` on its group's server, as an earlier write left it."""
+    server_id = (
+        await db.execute(select(DNSServer.id).where(DNSServer.group_id == z.group_id))
+    ).scalar_one()
+    op = DNSRecordOp(
+        server_id=server_id,
+        zone_id=z.zone_id,
+        zone_name=z.name,
+        op="create",
+        record={"name": "queued", "type": "A", "value": "192.0.2.30"},
+        state="pending",
+    )
+    db.add(op)
+    await db.flush()
+    op_id = op.id
+    await db.commit()
+    return op_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True], ids=["soft", "permanent"])
+@pytest.mark.parametrize("case", _CREATES + _EDITS)
+async def test_a_record_write_beside_a_zone_delete_holding_the_zone_row_never_deadlocks(
+    concurrent_client: AsyncClient, db_session: AsyncSession, case: str, permanent: bool
+) -> None:
+    """The delete holds the zone row and waits in its op sweep (a queued op of
+    the zone is held) when the request arrives. A writer that wrote a record
+    before it took the zone row held that record while it waited for the zone
+    row, and the delete then waited for the record: a deadlock. (The records
+    sheet flushes its record edits before its serial bump.) Every writer takes
+    the zone row before it writes, waits for the delete, and answers 404."""
+    z = await _seed(db_session)
+    op_id = await _queued_op(db_session, z)
+    gate = _Gate()
+    try:
+        await gate.hold("SELECT id FROM dns_record_op WHERE id = :o FOR UPDATE", o=op_id)
+        delete = _delete_zone(concurrent_client, z, permanent=permanent)
+        gate.tasks.append(delete)
+        deleter = await _blocked_by(gate.probe, gate.pid, delete)
+        assert (
+            deleter is not None
+        ), f"the zone delete never waited in its op sweep: {await _answer(delete)}"
+        write = _send(concurrent_client, z, case)
+        gate.tasks.append(write)
+        writer = await _blocked_by(gate.probe, deleter[0], write)
+        assert (
+            writer is not None
+        ), f"the request never waited on the zone delete: {await _answer(write)}"
+        await gate.open()
+        d = await asyncio.wait_for(delete, _STEP)
+        w = await asyncio.wait_for(write, _STEP)
+    finally:
+        await gate.close()
+    assert (
+        d.status_code == 204
+    ), f"the zone delete answered {_said(d)}; the request {_said(w)} (it waited in {writer[1]!r})"
+    assert w.status_code == 404, f"{_said(w)} (the request waited in {writer[1]!r})"
+    assert w.json() == {"detail": "Zone not found"}
+    assert _is_zone_row_lock(writer), f"the request waited in {writer!r}, not at the zone row"
 
 
 @pytest.mark.asyncio

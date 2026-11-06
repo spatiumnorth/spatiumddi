@@ -10481,7 +10481,11 @@ async def import_zone_commit(
     Per-record changes are encoded in the ``new_value`` JSONB payload so
     per-record history is recoverable without generating N audit rows.
     """
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3535: the zone row first, as every record writer takes it, so an import
+    # caught behind a zone delete answers 404. Its serial bump used to fail on
+    # the deleted row (a 500). With a view, its record edits went out before
+    # the bump and could deadlock with a delete that took the zone row first.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11197,7 +11201,11 @@ async def import_zone_spreadsheet_commit(
     are queued as record ops in one batch on one serial bump, like the
     zone-file import, and audited as one ``dns_zone_import`` row.
     """
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3535: the zone row first, as every record writer takes it, so an import
+    # caught behind a zone delete answers 404. Its record edits go out before
+    # its serial bump, and a delete that took the zone row between them
+    # deadlocked with it.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if mode == "replace" and (confirm_zone or "").strip().rstrip(".").lower() != (
         zone.name.rstrip(".").lower()
     ):
