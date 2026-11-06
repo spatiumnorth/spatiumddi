@@ -3539,8 +3539,13 @@ async function _unwrapBlobError(err: unknown): Promise<Error> {
           if (typeof detail === "string") {
             return new Error(detail);
           }
-          // FastAPI 422 returns a list under ``detail``; fall back
-          // to the JSON-stringified version.
+          // FastAPI 422 returns a list under ``detail``; format it like
+          // every other error site rather than showing raw JSON.
+          if (Array.isArray(detail)) {
+            return new Error(
+              formatApiError({ response: { data: parsed } }, "Request failed"),
+            );
+          }
           return new Error(JSON.stringify(parsed));
         }
       } catch {
