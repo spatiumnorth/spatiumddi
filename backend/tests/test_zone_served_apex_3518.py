@@ -311,3 +311,28 @@ async def test_views_that_agree_are_summarised_once(
     await db_session.commit()
     apex = (await _get(client, zone, h)).json()["served_apex"]
     assert apex["source"] == "primary_ns" and apex["by_view"] == []
+
+
+async def test_a_record_only_reader_gets_no_served_apex(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    rec_only = await _user(db_session, [{"action": "read", "resource_type": "dns_record"}])
+    zone_reader = await _user(
+        db_session,
+        [
+            {"action": "read", "resource_type": "dns_record"},
+            {"action": "read", "resource_type": "dns_zone"},
+        ],
+    )
+    zone = await _zone(db_session)
+    db_session.add(_rec(zone, "www", "A", "192.0.2.1"))
+    await db_session.commit()
+
+    r = await _get(client, zone, _h(rec_only))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["served_apex"] is None
+    assert body["total"] == 1
+
+    body = (await _get(client, zone, _h(zone_reader))).json()
+    assert body["served_apex"]["soa"]["mname"] == "ns1.apex.example.com."

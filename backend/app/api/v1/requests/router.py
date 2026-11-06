@@ -55,7 +55,7 @@ from app.models.auth import User
 from app.models.change_request import ChangeRequest
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSView, DNSZone
-from app.models.ipam import IPBlock, Subnet
+from app.models.ipam import IPAMTemplate, IPBlock, Subnet
 from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.service import (
     ChangeRequestStateError,
@@ -131,9 +131,46 @@ class ProvisioningRequestResponse(BaseModel):
     executed_at: datetime | None
     created_at: datetime
     modified_at: datetime
+    # Name of the IPAM template ``args.template_id`` names (#3649). Resolved
+    # server-side so a viewer without read on IPAM templates (the built-in
+    # Requester and Change Approver) still sees which template approval will
+    # stamp. Only the name is exposed, never the template body. None when the
+    # request names no template or it no longer exists.
+    template_name: str | None = None
 
 
-def _to_response(cr: ChangeRequest) -> ProvisioningRequestResponse:
+def _template_id(cr: ChangeRequest) -> uuid.UUID | None:
+    raw = (cr.args or {}).get("template_id")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
+
+
+async def _template_names(db: DB, rows: list[ChangeRequest]) -> dict[uuid.UUID, str]:
+    ids = {tid for r in rows if (tid := _template_id(r)) is not None}
+    if not ids:
+        return {}
+    res = await db.execute(
+        select(IPAMTemplate.id, IPAMTemplate.name).where(IPAMTemplate.id.in_(ids))
+    )
+    return {row[0]: row[1] for row in res.all()}
+
+
+async def _respond_all(db: DB, rows: list[ChangeRequest]) -> list[ProvisioningRequestResponse]:
+    names = await _template_names(db, rows)
+    return [_to_response(r, names.get(tid) if (tid := _template_id(r)) else None) for r in rows]
+
+
+async def _respond(db: DB, cr: ChangeRequest) -> ProvisioningRequestResponse:
+    return (await _respond_all(db, [cr]))[0]
+
+
+def _to_response(
+    cr: ChangeRequest, template_name: str | None = None
+) -> ProvisioningRequestResponse:
     return ProvisioningRequestResponse(
         id=cr.id,
         operation=cr.operation,
@@ -155,6 +192,7 @@ def _to_response(cr: ChangeRequest) -> ProvisioningRequestResponse:
         executed_at=cr.executed_at,
         created_at=cr.created_at,
         modified_at=cr.modified_at,
+        template_name=template_name,
     )
 
 
@@ -467,7 +505,7 @@ async def list_requests(
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
-    return [_to_response(r) for r in rows]
+    return await _respond_all(db, list(rows))
 
 
 @router.post("", response_model=ProvisioningRequestResponse, status_code=status.HTTP_201_CREATED)
@@ -493,7 +531,7 @@ async def create_request(
     )
     await db.commit()
     await db.refresh(cr)
-    return _to_response(cr)
+    return await _respond(db, cr)
 
 
 @router.get("/{req_id}", response_model=ProvisioningRequestResponse)
@@ -501,7 +539,7 @@ async def get_request(
     req_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> ProvisioningRequestResponse:
     _require_read(current_user)
-    return _to_response(await _load_visible(db, req_id, current_user))
+    return await _respond(db, await _load_visible(db, req_id, current_user))
 
 
 # ── Decisions (delegated to the shared #62 spine) ──────────────────────────
@@ -534,7 +572,7 @@ async def approve_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _to_response(cr)
+    return await _respond(db, cr)
 
 
 @router.post("/{req_id}/reject", response_model=ProvisioningRequestResponse)
@@ -555,7 +593,7 @@ async def reject_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _to_response(cr)
+    return await _respond(db, cr)
 
 
 @router.post("/{req_id}/cancel", response_model=ProvisioningRequestResponse)
@@ -585,7 +623,7 @@ async def cancel_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()
     await db.refresh(cr)
-    return _to_response(cr)
+    return await _respond(db, cr)
 
 
 __all__ = ["router"]
