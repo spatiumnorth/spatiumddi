@@ -99,6 +99,9 @@ _STEPUP_FAIL_WINDOW_SECONDS = 15 * 60
 # for the legitimate caller and tight for anything enumerating a VLAN.
 _E911_SELF_RL_MAX = 10
 _E911_SELF_RL_WINDOW_SECONDS = 300
+# Window for the per-caller budget of HELD lookups that get a trail row
+# (#3514). The budget itself is ``PlatformSettings.e911_lookup_log_budget_per_minute``.
+_E911_LOG_RL_WINDOW_SECONDS = 60
 
 # Failed-password ceilings on /auth/login: per submitted username and across
 # the install, over one fixed window. The counts themselves are settings
@@ -375,6 +378,33 @@ async def e911_self_query_rate_limited(ip: str | None) -> bool:
     except Exception as exc:  # noqa: BLE001 — see the fail-closed note above
         logger.warning("e911_self_query_rate_limit_redis_unavailable", error=str(exc))
         return True
+
+
+async def e911_lookup_log_rate_limited(actor: str, budget: int) -> bool:
+    """True when ``actor`` has logged more than ``budget`` lookups in the
+    current minute (#3514).
+
+    ``POST /held`` is a read-scoped route that still writes one
+    ``e911_resolution_log`` row per call, so without a bound a read token
+    grows that table as fast as it can call. Past the budget the lookup is
+    still ANSWERED; it is counted in a per-caller per-minute counter row
+    instead of getting a row of its own.
+
+    **Fails OPEN**, the opposite of the self-query throttle: this guards
+    the log, not the answer, and an outage must not cost the audit trail.
+    The retention prune (``prune_e911_resolution_log``) still bounds growth.
+    """
+    key = f"e911_log_rl:{actor}"
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            count = await incr_with_window(r, key, _E911_LOG_RL_WINDOW_SECONDS)
+            return int(count) > budget
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — fail open, see above
+        logger.warning("e911_lookup_log_rate_limit_redis_unavailable", error=str(exc))
+        return False
 
 
 async def mfa_challenge_consume(jti: str | None) -> bool:

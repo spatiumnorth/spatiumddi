@@ -329,6 +329,14 @@ class GuardedTransport(httpx.AsyncHTTPTransport):
         )
 
 
+HTML_RESPONSE_MESSAGE = "the URL answered with a web page (Content-Type text/html), not a data feed"
+
+
+def _is_html_content_type(value: str | None) -> bool:
+    media = (value or "").split(";", 1)[0].strip().lower()
+    return media in ("text/html", "application/xhtml+xml")
+
+
 async def safe_get_text(
     url: str,
     *,
@@ -336,8 +344,13 @@ async def safe_get_text(
     timeout: float = 60.0,
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
     transport: httpx.AsyncBaseTransport | None = None,
+    refuse_html: bool = False,
 ) -> str:
     """GET ``url`` through all three checks and return the body text.
+
+    With ``refuse_html`` a ``Content-Type: text/html`` (or xhtml) answer is
+    refused with :class:`FetchRefusedError` (#3607): a captive portal, login
+    page or 404 page served with status 200 is not the data feed asked for.
 
     Raises :class:`FetchRefusedError` (permanent, generic message) when a
     check refuses the URL or a redirect hop, or the hop limit is exceeded;
@@ -368,6 +381,8 @@ async def safe_get_text(
                     guard_url(current, label=label)
                     continue
                 resp.raise_for_status()
+                if refuse_html and _is_html_content_type(resp.headers.get("content-type")):
+                    raise FetchRefusedError(HTML_RESPONSE_MESSAGE)
                 return resp.text
     except SSRFBlockedError as exc:
         # Raised by the connect-time check inside the transport.
@@ -391,6 +406,7 @@ __all__ = [
     "ALLOWED_SCHEMES",
     "CREDENTIAL_MASK",
     "FetchFailedError",
+    "HTML_RESPONSE_MESSAGE",
     "FetchRefusedError",
     "GuardedNetworkBackend",
     "GuardedTransport",

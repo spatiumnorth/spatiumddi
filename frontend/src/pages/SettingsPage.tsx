@@ -31,7 +31,7 @@ import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSectio
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -211,6 +211,8 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "soft_delete_purge_days",
     "pcap_retention_days",
     "appliance_revoked_retention_days",
+    "e911_resolution_log_retention_days",
+    "e911_lookup_log_budget_per_minute",
   ],
   dns: [
     "dns_default_ttl",
@@ -501,13 +503,15 @@ type RetentionKey =
   | "pcap_retention_days"
   | "appliance_revoked_retention_days"
   | "metric_retention_days"
-  | "log_retention_hours";
+  | "log_retention_hours"
+  | "e911_resolution_log_retention_days"
+  | "e911_lookup_log_budget_per_minute";
 
 const RETENTION_ROWS: {
   key: RetentionKey;
   label: string;
   description: string;
-  unit: "days" | "hours";
+  unit: "days" | "hours" | "lookups / min";
   min: number;
   max: number;
   fallback: number;
@@ -571,6 +575,26 @@ const RETENTION_ROWS: {
     min: 0,
     max: 365,
     fallback: 30,
+  },
+  {
+    key: "e911_resolution_log_retention_days",
+    label: "E911 location-lookup trail",
+    description:
+      "Who asked where a device is, and what they were told (/location and HELD). 7–3650 days. No keep-forever option: a read-only API token can add rows.",
+    unit: "days",
+    min: 7,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "e911_lookup_log_budget_per_minute",
+    label: "E911 HELD lookups logged per caller",
+    description:
+      "Per API token or user, per minute. 1–6000. Past it, a HELD lookup is still answered, and is counted in one trail row per caller per minute (N lookups not individually logged) instead of getting a row of its own, so a read-only token cannot grow the table without bound.",
+    unit: "lookups / min",
+    min: 1,
+    max: 6000,
+    fallback: 120,
   },
 ];
 
@@ -1313,7 +1337,7 @@ export function SettingsPage() {
   // only the fields the API lists in `delegate_writable_fields` (its
   // SETTINGS_DELEGATE_WRITABLE, served rather than copied here so the two
   // cannot drift); every other control stays superadmin-only.
-  const { can } = usePermissions();
+  const { can, isError: permsFailed, unanswered } = usePermissions();
   const canWrite = isSuperadmin || can("write", "settings");
 
   const { data, isLoading } = useQuery({
@@ -1513,7 +1537,11 @@ export function SettingsPage() {
               ? "Configure SpatiumDDI."
               : canWrite
                 ? "You can edit the settings delegated to your role; the rest need a superadmin."
-                : "View-only — you need write access on settings to edit."}
+                : permsFailed
+                  ? `View-only — ${PERMISSIONS_UNREADABLE}`
+                  : unanswered
+                    ? unanswered
+                    : "View-only — you need write access on settings to edit."}
           </p>
         </div>
         <div className="border-b p-3">
@@ -1907,7 +1935,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="Default DNSSEC Validation"
-                  description="Default DNSSEC validation mode for new server groups."
+                  description="Default DNSSEC validation mode for new server groups. A new group has no trust anchor, and BIND 9.20 will not load 'yes' without one, so 'yes' is set per group once it has an anchor."
                 >
                   <select
                     value={values.dns_default_dnssec_validation ?? "auto"}
@@ -1918,7 +1946,11 @@ export function SettingsPage() {
                     className={inputCls}
                   >
                     <option value="auto">auto (recommended)</option>
-                    <option value="yes">yes — manual trust anchors</option>
+                    {/* #3560: refused by the API; kept (disabled) so a
+                        default stored before the refusal still displays. */}
+                    <option value="yes" disabled>
+                      yes — not available as a default (needs a trust anchor)
+                    </option>
                     <option value="no">no — disabled</option>
                   </select>
                 </Field>

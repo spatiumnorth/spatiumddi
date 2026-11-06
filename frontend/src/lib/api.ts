@@ -4043,6 +4043,9 @@ export interface PlatformSettings {
   appliance_revoked_retention_days: number;
   metric_retention_days: number;
   log_retention_hours: number;
+  /** E911 lookup trail bounds (#3514). Superadmin-only. */
+  e911_resolution_log_retention_days: number;
+  e911_lookup_log_budget_per_minute: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
@@ -7223,6 +7226,8 @@ export interface DNSBlockListFeedSkipped {
   bare_star?: number;
   dotless?: number;
   other?: number;
+  /** hosts / domains feeds: tokens that are not DNS names (#3531). */
+  invalid_name?: number;
 }
 
 export interface DNSBlockListEntry {

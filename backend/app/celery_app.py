@@ -157,6 +157,7 @@ celery_app = Celery(
         "app.tasks.influxdb_push",
         "app.tasks.prune_multicast_memberships",
         "app.tasks.prune_pairing_codes",
+        "app.tasks.prune_e911_resolution_log",
         "app.tasks.firewall_lint_scan",
         "app.tasks.prune_revoked_appliances",
         "app.tasks.upgrade_image_reclaim",
@@ -238,6 +239,7 @@ celery_app.conf.update(
         "app.tasks.subnet_utilization_snapshot.*": {"queue": "default"},
         "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
         "app.tasks.prune_pairing_codes.*": {"queue": "default"},
+        "app.tasks.prune_e911_resolution_log.*": {"queue": "default"},
         "app.tasks.firewall_lint_scan.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
@@ -773,6 +775,11 @@ celery_app.conf.update(
         # grace (issue #169). High-cadence vs. the nightly prunes
         # because the operator-facing list endpoint should reflect
         # the rolling-window state of recent codes without a long lag.
+        # Daily, drop E911 lookup-trail rows past retention (#3514).
+        "e911-resolution-log-prune": {
+            "task": "app.tasks.prune_e911_resolution_log.prune_e911_resolution_log",
+            "schedule": schedule(run_every=86400.0),
+        },
         "pairing-codes-prune": {
             "task": "app.tasks.prune_pairing_codes.prune_pairing_codes",
             "schedule": schedule(run_every=1800.0),
