@@ -9145,7 +9145,8 @@ async def list_records(
 
     ``served_apex`` (#3518) carries the SOA and apex NS the zone serves from
     its settings, which no stored record holds. It is not part of ``items`` or
-    ``total``.
+    ``total``. It comes from the zone's settings, so it is returned only to a
+    caller who may read the zone itself; a record-only reader gets null.
     """
     zone = await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(_, zone_id)
@@ -9170,7 +9171,11 @@ async def list_records(
         total=total,
         page=page,
         page_size=page_size,
-        served_apex=await _served_apex(db, zone),
+        served_apex=(
+            await _served_apex(db, zone)
+            if user_has_permission(_, "read", "dns_zone", zone.id)
+            else None
+        ),
     )
 
 
