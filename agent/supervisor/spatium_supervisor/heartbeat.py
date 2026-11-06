@@ -52,6 +52,7 @@ from .cert_auth import (
     build_auth_headers,
     encode_json,
     load_cert,
+    note_control_plane_signature_support,
     save_cert,
 )
 from .config import SupervisorConfig
@@ -275,6 +276,11 @@ def _capabilities_payload() -> dict[str, Any]:
         # "always compatible") — no service container needed, the
         # supervisor itself is the observer.
         "can_run_observer": True,
+        # #3631 — this supervisor sends a join-token key in its signed
+        # heartbeat and opens ``desired_k3s_join_token_sealed``. A control
+        # plane refuses to promote a node whose supervisor does not say so,
+        # since it would never be handed the join token.
+        "sealed_join_token": True,
     }
     # Every baked appliance has every service image preloaded; the
     # control plane's role-checkbox UI uses these flags to gate
@@ -1579,6 +1585,25 @@ def heartbeat_once(
     # teardown un-applied.
     held_until_now = approval_state.role_services_hold(cfg.state_dir)
     approval_state.record_success(cfg.state_dir)
+
+    # #3631 — a control plane that checks the current signature form says so
+    # on every heartbeat answer. One that does not (an older build: a remote
+    # appliance paired to a control plane not yet upgraded, or a pod not yet
+    # rolled) refused our signature, accepted this heartbeat on the session
+    # token, and would refuse every proxy request too; sign the form it
+    # checks until it advertises the current one.
+    switched = note_control_plane_signature_support(resp.headers)
+    if switched is not None:
+        log.warning(
+            "supervisor.heartbeat.signature_form",
+            signing=switched,
+            reason=(
+                "control plane does not check the current signature form; "
+                "using the older one until it is upgraded"
+                if switched == "legacy"
+                else "control plane checks the current signature form"
+            ),
+        )
 
     try:
         body_out = resp.json()

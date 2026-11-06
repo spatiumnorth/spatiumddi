@@ -17,3 +17,10 @@
   `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default); each one is
   logged as `appliance_cert_auth_legacy_signature`, and it is not handed
   a join token until it is upgraded.
+  A current supervisor talking to an older control plane (a remote
+  appliance paired to one, or any node between its slot upgrade and the
+  application roll) signs the older form after the first heartbeat answer
+  shows the control plane does not check the new one, so the kubeapi,
+  network-tool, storage and capture channels keep working through an
+  upgrade. A promote of an appliance whose supervisor is too old to receive
+  the sealed token is refused with a message saying to upgrade it first.

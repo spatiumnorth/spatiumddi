@@ -50,10 +50,11 @@ over ``f"{method} {path}\\n{timestamp}\\n{appliance_id}"``. Accepted only
 while ``settings.appliance_legacy_signature_allowed`` is set, and logged per
 appliance (``appliance_cert_auth_legacy_signature``) so the end of the
 compatibility window is observable. It is claimed once like the current
-form; having no nonce, two genuine legacy requests to the same path in the
-same second sign identically and the second is refused. No legacy caller
-sends that: the heartbeat waits at least 2 s between requests, and a refused
-proxy poll is retried after its backoff.
+form, with one allowance: having no nonce, two genuine legacy requests to the
+same path in the same second sign identically (an older supervisor's proxy
+poll, its reply, and its next poll often do), so a repeat carrying the same
+body within two seconds of the first use is accepted. Any other repeat, and
+any repeat of a streamed upload, whose body is not read here, is refused.
 
 Server-side validation (this module):
 
@@ -121,11 +122,22 @@ _SKEW_TOLERANCE_SECONDS = 300
 # The current signature form, carried in ``X-Appliance-Signature-Version``.
 SIGNATURE_VERSION = "2"
 
+# Set on every heartbeat answer to the forms this control plane checks
+# (comma-separated). A supervisor that sees no such header is talking to a
+# control plane older than #3631 and signs the legacy form for it; one that
+# has seen it never does again in that process.
+SIGNATURE_VERSIONS_HEADER = "X-Appliance-Signature-Versions"
+
 # How long an accepted signature is remembered. A timestamp is accepted from
 # ``now - skew`` to ``now + skew``, so a signature stamped at the far edge
 # stays acceptable for twice the skew; a minute on top covers clock steps
 # between api replicas.
 _REPLAY_TTL_SECONDS = 2 * _SKEW_TOLERANCE_SECONDS + 60
+
+# A legacy-form signature (no nonce) seen again with the same body this soon
+# after its first use is an older supervisor sending two identical requests
+# in one second, not a repeat; see :func:`_claim_signature`.
+_LEGACY_REPEAT_WINDOW_S = 2.0
 
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -222,15 +234,33 @@ def request_target(request: Request) -> str:
     return request.url.path + (f"?{query}" if query else "")
 
 
-async def _claim_signature(appliance_id: uuid.UUID, signature: bytes) -> bool:
+async def _claim_signature(
+    appliance_id: uuid.UUID,
+    signature: bytes,
+    *,
+    legacy_body_sha256: str | None = None,
+) -> bool:
     """Record ``signature`` as used. True on its first use; False when it
     has been accepted before. Fails open (True) with a warning when Redis
-    cannot be reached; see the module docstring for why."""
+    cannot be reached; see the module docstring for why.
+
+    ``legacy_body_sha256`` is set for a legacy-form request whose body the
+    api has read. That form has no nonce, so an older supervisor's poll, its
+    reply and its next poll can land in one second and the two polls sign
+    identically. A repeat is therefore accepted when it carries the same
+    body as the first use and arrives within
+    :data:`_LEGACY_REPEAT_WINDOW_S` of it; any other repeat is refused."""
     key = f"appliance_sig:{appliance_id}:{hashlib.sha256(signature).hexdigest()}"
+    now = time.time()
+    value = f"{legacy_body_sha256 or '-'}:{now:.3f}"
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         try:
-            return bool(await r.set(key, "1", ex=_REPLAY_TTL_SECONDS, nx=True))
+            if await r.set(key, value, ex=_REPLAY_TTL_SECONDS, nx=True):
+                return True
+            if legacy_body_sha256 is None:
+                return False
+            first = await r.get(key)
         finally:
             await r.aclose()
     except Exception as exc:  # noqa: BLE001 — never stop the fleet on a Redis blip
@@ -240,6 +270,14 @@ async def _claim_signature(appliance_id: uuid.UUID, signature: bytes) -> bool:
             error=str(exc)[:200],
         )
         return True
+    if isinstance(first, bytes):
+        first = first.decode("ascii", "replace")
+    body_hash, _, first_at = str(first or "").rpartition(":")
+    try:
+        age = now - float(first_at)
+    except ValueError:
+        return False
+    return body_hash == legacy_body_sha256 and 0 <= age <= _LEGACY_REPEAT_WINDOW_S
 
 
 def _note_legacy_use(appliance_id: uuid.UUID) -> None:
@@ -380,6 +418,7 @@ async def authenticate_cert(
     version = request.headers.get("X-Appliance-Signature-Version")
     scheme: Literal["v2", "legacy"]
     content_sha256: str | None = None
+    legacy_body_sha256: str | None = None
     if version is not None:
         # The header names the form, so a current supervisor's request can
         # never be checked as the legacy one.
@@ -409,6 +448,8 @@ async def authenticate_cert(
     else:
         if not settings.appliance_legacy_signature_allowed:
             raise CertAuthFailed("legacy signature form not accepted")
+        if not body_streamed:
+            legacy_body_sha256 = hashlib.sha256(await request.body()).hexdigest()
         payload = _canonical_payload(
             request.method,
             request.url.path,
@@ -422,7 +463,7 @@ async def authenticate_cert(
         raise CertAuthFailed(f"signature: {exc}") from exc
 
     # ── 8. Single use. ────────────────────────────────────────────
-    if not await _claim_signature(appliance_id, signature):
+    if not await _claim_signature(appliance_id, signature, legacy_body_sha256=legacy_body_sha256):
         raise CertAuthReplayed()
     if scheme == "legacy":
         _note_legacy_use(appliance_id)
@@ -432,6 +473,7 @@ async def authenticate_cert(
 
 __all__ = [
     "SIGNATURE_VERSION",
+    "SIGNATURE_VERSIONS_HEADER",
     "CertAuthFailed",
     "CertAuthPrincipal",
     "CertAuthReplayed",

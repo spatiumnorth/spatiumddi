@@ -60,6 +60,10 @@ class _FakeRedis:
         self.store[key] = (value, ex)
         return True
 
+    async def get(self, key: str) -> Any:
+        entry = self.store.get(key)
+        return None if entry is None else entry[0]
+
     async def aclose(self) -> None:
         return None
 
@@ -341,6 +345,56 @@ async def test_legacy_form_is_accepted_only_while_allowed(
     assert r.status_code == 403, r.text
 
 
+async def test_heartbeat_answer_advertises_the_signature_form(
+    client: AsyncClient, db_session: AsyncSession, redis_store: dict[str, Any]
+) -> None:
+    """A supervisor learns from this header that the control plane checks the
+    current form; with no header it signs the legacy form, which is what an
+    older control plane checks."""
+    sup = await _supervisor(db_session)
+    body = _hb_body(sup)
+    r = await client.post(HEARTBEAT, content=body, headers=sup.headers(HEARTBEAT, body))
+    assert r.status_code == 200, r.text
+    assert r.headers.get("X-Appliance-Signature-Versions") == "2"
+    # Also on a heartbeat accepted on the session token (the cert not
+    # validating), so a current supervisor is never moved to the older form.
+    body = _hb_body(sup, session_token=sup.session_token)
+    r = await client.post(HEARTBEAT, content=body, headers={"Content-Type": "application/json"})
+    assert r.status_code == 200, r.text
+    assert r.headers.get("X-Appliance-Signature-Versions") == "2"
+
+
+async def test_identical_legacy_requests_in_one_second_are_both_accepted(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    redis_store: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older supervisor's poll, reply and next poll often land in the same
+    second, and with no nonce the two polls sign identically. The second must
+    not be refused as a repeat, or every follow-up request of a burst waits out
+    the proxy backoff. A repeat with a different body still is."""
+    monkeypatch.setattr(settings, "appliance_legacy_signature_allowed", True)
+    sup = await _supervisor(db_session)
+    body = _hb_body(sup)
+    headers = {**sup.legacy_headers(HEARTBEAT), "Content-Type": "application/json"}
+    r = await client.post(HEARTBEAT, content=body, headers=headers)
+    assert r.status_code == 200, r.text
+    r = await client.post(HEARTBEAT, content=body, headers=headers)
+    assert r.status_code == 200, r.text
+
+    forged = _hb_body(sup, installed_appliance_version="2099.01.01-1")
+    r = await client.post(HEARTBEAT, content=forged, headers=headers)
+    assert r.status_code == 401, r.text
+    await db_session.refresh(sup.row)
+    assert sup.row.installed_appliance_version != "2099.01.01-1"
+
+    # Past the allowance, even the identical request is a repeat.
+    monkeypatch.setattr(cert_auth, "_LEGACY_REPEAT_WINDOW_S", -1.0)
+    r = await client.post(HEARTBEAT, content=body, headers=headers)
+    assert r.status_code == 401, r.text
+
+
 async def test_a_versioned_request_is_never_checked_as_legacy(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -434,3 +488,68 @@ def test_seal_refuses_a_key_that_is_not_x25519() -> None:
     with pytest.raises(sealed_token.SealError):
         # The identity point: a low-order key whose shared secret is all zeros.
         sealed_token.seal("x", base64.b64encode(bytes(32)).decode(), uuid.uuid4())
+
+
+async def test_promote_refuses_a_supervisor_too_old_for_a_sealed_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An older supervisor is never handed the join token (it sends no key),
+    so promoting it would leave the join waiting with nothing to say why.
+    The promote is refused, naming the fix."""
+    import os  # noqa: PLC0415
+
+    from app.core.security import create_access_token, hash_password  # noqa: PLC0415
+    from app.models.appliance import CLUSTER_ROLE_PRIMARY  # noqa: PLC0415
+    from app.models.auth import User  # noqa: PLC0415
+
+    user = User(
+        username="cp3631",
+        email="cp3631@example.com",
+        display_name="cp3631",
+        hashed_password=hash_password("password123"),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    auth = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+    def _row(hostname: str, **kw: Any) -> Appliance:
+        der = os.urandom(32)
+        row = Appliance(
+            id=uuid.uuid4(),
+            hostname=hostname,
+            public_key_der=der,
+            public_key_fingerprint=hashlib.sha256(der).hexdigest(),
+            state=APPLIANCE_STATE_APPROVED,
+            deployment_kind="appliance",
+            **kw,
+        )
+        db_session.add(row)
+        return row
+
+    _row(
+        "seed",
+        appliance_variant="control-plane",
+        cluster_role=CLUSTER_ROLE_PRIMARY,
+        node_ip="10.0.0.1",
+        k3s_join_token_encrypted=encrypt_str("K10::servertoken"),
+    )
+    old = _row(
+        "old1",
+        appliance_variant="appliance",
+        capabilities={"supervisor_version": "1.0.0-beta.4"},
+    )
+    new = _row(
+        "new1",
+        appliance_variant="appliance",
+        capabilities={"supervisor_version": "1.0.0-beta.5", "sealed_join_token": True},
+    )
+    await db_session.commit()
+
+    promote = "/api/v1/appliance/fleet/control-plane/promote"
+    r = await client.post(promote, json={"appliance_ids": [str(old.id), str(new.id)]}, headers=auth)
+    assert r.status_code == 422, r.text
+    assert "too old" in r.text and "old1" in r.text
+    await db_session.refresh(old)
+    assert old.desired_cluster_role is None

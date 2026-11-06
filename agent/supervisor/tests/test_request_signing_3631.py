@@ -277,3 +277,102 @@ def test_heartbeat_reads_the_sealed_join_token(fixed_key: None) -> None:
         "desired_k3s_join_token": "plain",
     }
     assert hb._join_token(bad, APPLIANCE_ID, log) is None  # type: ignore[arg-type]
+
+
+# --- mixed versions: a control plane older than the supervisor ------------------
+
+
+def _legacy_verify(request: httpx.Request, public_key: Ed25519PublicKey) -> None:
+    """Check a request the way a control plane older than #3631 does: the
+    method, the bare path, the timestamp and the appliance id."""
+    h = request.headers
+    assert "X-Appliance-Signature-Version" not in h
+    payload = (
+        f"{request.method} {request.url.path}\n"
+        f"{h['X-Appliance-Timestamp']}\n{APPLIANCE_ID}"
+    ).encode()
+    public_key.verify(base64.b64decode(h["X-Appliance-Signature"]), payload)
+
+
+def _heartbeat_answered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identity: Any,
+    response_headers: dict[str, str],
+) -> None:
+    """One heartbeat, answered 200 with ``response_headers``."""
+    _quiet_heartbeat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, headers=response_headers)
+
+    cfg = types.SimpleNamespace(heartbeat_interval_seconds=30, state_dir=tmp_path)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        try:
+            hb.heartbeat_once(
+                cfg, APPLIANCE_ID, "tok", identity, client, structlog.get_logger()  # type: ignore[arg-type]
+            )
+        except Exception:  # noqa: BLE001 — only the signing form matters here
+            pass
+
+
+def _progress_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, identity: Any
+) -> httpx.Request:
+    cfg = _pcap_cfg(monkeypatch, tmp_path)
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"cancel": False})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        pcap_proxy._finalize_error(
+            cfg, identity, client, str(APPLIANCE_ID), "cid-1", "no such device"
+        )
+    (request,) = sent
+    return request
+
+
+def test_supervisor_signs_the_legacy_form_for_an_older_control_plane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An older control plane checks only the legacy form and sets no
+    ``X-Appliance-Signature-Versions``. Its heartbeat answer (accepted on the
+    session token) moves the supervisor to the form it checks, so the proxy
+    channels keep working against it instead of answering 403."""
+    identity, _ = load_or_generate(tmp_path)
+    pub = identity.private_key.public_key()
+    # Until a heartbeat has been answered, the current form.
+    request = _progress_request(monkeypatch, tmp_path, identity)
+    _verify(request, pub, _sent_target(request))
+
+    _heartbeat_answered(monkeypatch, tmp_path, identity, {})
+    assert cert_auth.signing_mode() == "legacy"
+    request = _progress_request(monkeypatch, tmp_path, identity)
+    # The query still goes out; the older control plane signs the bare path.
+    assert "?error=" in _sent_target(request)
+    _legacy_verify(request, pub)
+
+    # Once the control plane is upgraded, back to the current form.
+    _heartbeat_answered(
+        monkeypatch, tmp_path, identity, {cert_auth.SIGNATURE_VERSIONS_HEADER: "2"}
+    )
+    request = _progress_request(monkeypatch, tmp_path, identity)
+    _verify(request, pub, _sent_target(request))
+
+
+def test_an_answer_without_the_header_never_downgrades_after_v2_was_seen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A control plane that has advertised the current form is trusted to keep
+    checking it: a later answer with the header missing (stripped on a plain
+    hop) does not move this process back to the weaker form."""
+    identity, _ = load_or_generate(tmp_path)
+    _heartbeat_answered(
+        monkeypatch, tmp_path, identity, {cert_auth.SIGNATURE_VERSIONS_HEADER: "2"}
+    )
+    _heartbeat_answered(monkeypatch, tmp_path, identity, {})
+    assert cert_auth.signing_mode() == "v2"
+    request = _progress_request(monkeypatch, tmp_path, identity)
+    _verify(request, identity.private_key.public_key(), _sent_target(request))

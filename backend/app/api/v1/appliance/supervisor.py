@@ -68,7 +68,7 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
     load_der_public_key,
 )
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select, update
@@ -529,6 +529,11 @@ class SupervisorCapabilities(BaseModel):
     # repeats, so the column kept its first value through every upgrade.
     # No max_length here: a bad value must not 422 the whole heartbeat.
     supervisor_version: str | None = None
+    # #3631 — the supervisor opens a join token sealed to the key it sends in
+    # its signed heartbeat. One that does not report this is never handed a
+    # join token, so a promote of it is refused up front rather than left to
+    # wait for a token that will not come.
+    sealed_join_token: bool = False
 
 
 class SupervisorRoleRestore(BaseModel):
@@ -2338,6 +2343,7 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
 async def supervisor_heartbeat(
     body: SupervisorHeartbeatRequest,
     request: Request,
+    response: Response,
     db: DB,
 ) -> SupervisorHeartbeatResponse:
     """Persist supervisor-reported appliance-host state + return the
@@ -2370,6 +2376,15 @@ async def supervisor_heartbeat(
     A deliberate refusal (revoked row, or no row the credential opens) is a
     403 carrying ``REVOCATION_HEADER``; see its comment.
     """
+    # #3631 — tell the supervisor which signature forms this control plane
+    # checks. A supervisor that gets an answer without this header is
+    # talking to an older control plane and signs the legacy form for it.
+    from app.services.appliance.cert_auth import (  # noqa: PLC0415
+        SIGNATURE_VERSION,
+        SIGNATURE_VERSIONS_HEADER,
+    )
+
+    response.headers[SIGNATURE_VERSIONS_HEADER] = SIGNATURE_VERSION
     try:
         return await _supervisor_heartbeat(body, request, db)
     except Exception as exc:
@@ -5611,6 +5626,17 @@ async def promote_control_plane(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"Appliance {row.hostname!r} (deployment_kind={row.deployment_kind!r}) can't join "
                 "a k3s control-plane cluster — only OS-appliance nodes can.",
+            )
+        # #3631 — the join token is only ever sent sealed to a key from the
+        # supervisor's signed heartbeat. A supervisor that has reported its
+        # capabilities (they always carry its version) without saying it can
+        # open one is too old to receive it, and the join would wait for ever.
+        caps = row.capabilities or {}
+        if caps.get("supervisor_version") and not caps.get("sealed_join_token"):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} runs a supervisor too old to receive the "
+                "cluster join token. Upgrade the appliance, then promote it.",
             )
         targets.append(row)
 

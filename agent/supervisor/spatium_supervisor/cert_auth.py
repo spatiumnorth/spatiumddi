@@ -29,6 +29,7 @@ import base64
 import hashlib
 import json
 import secrets
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +43,24 @@ SIGNATURE_VERSION = "2"
 
 # Headers for a JSON body sent as pre-encoded bytes.
 JSON_CONTENT_TYPE = {"Content-Type": "application/json"}
+
+# The response header a control plane that checks version 2 sets on every
+# heartbeat answer. An older control plane sets nothing, ignores
+# ``X-Appliance-Signature-Version`` and checks only the legacy form, so every
+# version-2 request to it would be refused: its heartbeat would fall back to
+# the session token, and every proxy channel (k8s, nettool, storage, pcap)
+# would answer 403 until the control plane is upgraded.
+SIGNATURE_VERSIONS_HEADER = "X-Appliance-Signature-Versions"
+
+# What this process signs with: ``"v2"`` until a heartbeat answer shows the
+# control plane does not check it, then ``"legacy"`` (the form that control
+# plane checks). Once a heartbeat answer has advertised version 2, this
+# process never signs the legacy form again, so a later answer with the
+# header stripped cannot move it back. Shared by the heartbeat and the proxy
+# threads.
+_mode_lock = threading.Lock()
+_signing_mode = "v2"
+_v2_confirmed = False
 
 CERT_FILENAME = "cert.pem"
 CA_CHAIN_FILENAME = "ca-chain.pem"
@@ -135,6 +154,60 @@ def canonical_payload_v2(
     ).encode("utf-8")
 
 
+def note_control_plane_signature_support(headers: object) -> str | None:
+    """Record what the control plane's heartbeat answer advertises.
+
+    ``headers`` is the 200 response's headers (anything with ``.get``).
+    Returns the new signing mode when this call changed it, else ``None``,
+    so the caller can log the switch once."""
+    global _signing_mode, _v2_confirmed
+    raw = headers.get(SIGNATURE_VERSIONS_HEADER) if hasattr(headers, "get") else None
+    advertised = {v.strip() for v in str(raw or "").split(",") if v.strip()}
+    with _mode_lock:
+        before = _signing_mode
+        if SIGNATURE_VERSION in advertised:
+            _v2_confirmed = True
+            _signing_mode = "v2"
+        elif not _v2_confirmed:
+            _signing_mode = "legacy"
+        return _signing_mode if _signing_mode != before else None
+
+
+def signing_mode() -> str:
+    with _mode_lock:
+        return _signing_mode
+
+
+def _reset_signing_mode() -> None:
+    """Back to the start-of-process state (tests)."""
+    global _signing_mode, _v2_confirmed
+    with _mode_lock:
+        _signing_mode = "v2"
+        _v2_confirmed = False
+
+
+def _legacy_headers(
+    method: str,
+    target: str,
+    cert_pem: str,
+    private_key: Ed25519PrivateKey,
+    appliance_id: uuid.UUID | str,
+) -> dict[str, str]:
+    """The pre-#3631 form, for a control plane that checks nothing else: a
+    signature over the method, the bare path (that control plane drops the
+    query), the timestamp and the appliance id, and no version header."""
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+    path = target.split("?", 1)[0]
+    payload = f"{method.upper()} {path}\n{timestamp}\n{appliance_id}".encode("utf-8")
+    return {
+        "X-Appliance-Cert": base64.b64encode(cert_pem.encode("ascii")).decode("ascii"),
+        "X-Appliance-Timestamp": timestamp,
+        "X-Appliance-Signature": base64.b64encode(private_key.sign(payload)).decode(
+            "ascii"
+        ),
+    }
+
+
 def build_auth_headers(
     method: str,
     target: str,
@@ -151,7 +224,13 @@ def build_auth_headers(
     request sends it (``/api/v1/.../upload/<id>?packets=3``). ``body`` is the
     exact body bytes; a caller streaming a body it has hashed itself passes
     ``content_sha256`` instead. Build these per request, never once for a
-    retry: the control plane accepts each signature once."""
+    retry: the control plane accepts each signature once.
+
+    Against a control plane that has shown it does not check version 2
+    (:func:`note_control_plane_signature_support`), these are the legacy
+    headers that control plane does check."""
+    if signing_mode() == "legacy":
+        return _legacy_headers(method, target, cert_pem, private_key, appliance_id)
     timestamp = datetime.now(UTC).isoformat(timespec="seconds")
     nonce = secrets.token_hex(16)
     digest = content_sha256 or hashlib.sha256(body).hexdigest()
@@ -172,9 +251,12 @@ def build_auth_headers(
 __all__ = [
     "JSON_CONTENT_TYPE",
     "SIGNATURE_VERSION",
+    "SIGNATURE_VERSIONS_HEADER",
     "build_auth_headers",
     "canonical_payload_v2",
     "encode_json",
     "load_cert",
+    "note_control_plane_signature_support",
     "save_cert",
+    "signing_mode",
 ]
