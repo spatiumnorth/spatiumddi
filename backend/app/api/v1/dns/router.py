@@ -153,6 +153,14 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.dnssec_trust import (
+    NEEDS_ANCHOR_MESSAGE,
+    STATIC_ROOT_ANCHOR_MESSAGE,
+    count_anchors,
+    has_static_root_anchor,
+    is_root_zone,
+    stored_validation,
+)
 from app.services.dns.drift import zone_state_in_sync
 from app.services.dns.memory_estimate import GroupMemoryEstimate, group_memory_estimate
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
@@ -1133,10 +1141,6 @@ class ServerOptionsUpdate(BaseModel):
     recursion_enabled: bool | None = None
     allow_recursion: list[str] | None = None
     dnssec_validation: str | None = None
-    gss_tsig_enabled: bool | None = None
-    gss_tsig_keytab_path: str | None = None
-    gss_tsig_realm: str | None = None
-    gss_tsig_principal: str | None = None
     notify_enabled: str | None = None
     also_notify: list[str] | None = None
     allow_notify: list[str] | None = None
@@ -1282,10 +1286,6 @@ class ServerOptionsResponse(BaseModel):
     recursion_enabled: bool
     allow_recursion: list[str]
     dnssec_validation: str
-    gss_tsig_enabled: bool
-    gss_tsig_keytab_path: str | None
-    gss_tsig_realm: str | None
-    gss_tsig_principal: str | None
     notify_enabled: str
     also_notify: list[str]
     allow_notify: list[str]
@@ -1337,8 +1337,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored group forwarders that cannot work with the group's transport,
     # saved before the #2128 refusal. Advisory: the save is not refused.
     forwarder_warnings: list[str] = Field(default_factory=list)
-    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
-    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    # DNSSEC config stored before the API refused it, and what is rendered
+    # instead: ``yes`` with no trust anchor on a BIND9 group renders as
+    # ``auto`` (#3560), a static root anchor as initial-key (#3609).
     dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
@@ -4208,9 +4209,16 @@ async def _options_response(
     drivers = await _group_driver_names(db, group_id)
     if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
         out.dnssec_warnings.append(
-            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
-            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
-            "validate against BIND's built-in root anchor."
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND 9.20 "
+            "refuses that config, so it is rendered as 'auto' (BIND's built-in root key) "
+            "until you add a trust anchor or set 'auto' here."
+        )
+    if "bind9" in drivers and has_static_root_anchor(opts.trust_anchors or ()):
+        out.dnssec_warnings.append(
+            "The root ('.') trust anchor is stored as static, which BIND refuses beside "
+            "'auto' and which fails at the next root key rollover in any mode, so it is "
+            "rendered as initial-key (RFC 5011). Re-add it as an initial-key anchor to "
+            "make the stored row match (#3609)."
         )
     if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
@@ -4622,6 +4630,15 @@ async def update_options(
     for k, v in changes.items():
         setattr(opts, k, v)
 
+    # #3560: BIND9 refuses ``dnssec-validation yes`` with no trust anchor.
+    # Transition-only, so a row stored before this check still saves other options.
+    if (
+        changes.get("dnssec_validation") == "yes"
+        and before.get("dnssec_validation") != "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id)
+    ):
+        raise HTTPException(status_code=422, detail=NEEDS_ANCHOR_MESSAGE)
     _refuse_plain_port_forwarders_on_encrypted(opts, forwarders_before, transport_before)
     await _assert_encrypted_transport_sane(opts, db)
     if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
@@ -4700,6 +4717,10 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # #3609: a static root anchor is never right — BIND refuses it under
+    # ``auto`` and it breaks at the next root key rollover under ``yes``.
+    if is_root_zone(body.zone_name) and not body.is_initial_key:
+        raise HTTPException(status_code=422, detail=STATIC_ROOT_ANCHOR_MESSAGE)
     # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
     # group another driver serves would be accepted and ignored.
     others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")
@@ -4763,6 +4784,22 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    # #3560: removing the last anchor under ``yes`` would leave BIND9 with a
+    # config it refuses to load.
+    if (
+        await stored_validation(db, group_id) == "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id, exclude_id=anchor.id)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This is the group's last trust anchor and dnssec_validation is 'yes', "
+                "which BIND9 refuses to load without one. Set dnssec_validation to 'auto' "
+                "first (BIND's built-in root key), or add another trust anchor before "
+                "removing this one."
+            ),
+        )
     db.add(
         AuditLog(
             user_id=current_user.id,

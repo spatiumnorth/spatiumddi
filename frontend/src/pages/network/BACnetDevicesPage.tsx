@@ -19,7 +19,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // BACnet/IP device registry (issue #541, part of #543). Documentation
 // only — nothing on this page reads or writes a device object; rows come
@@ -178,9 +178,10 @@ export function BACnetDevicesPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite
-                  ? undefined
-                  : "Requires write permission on BACnet devices"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on BACnet devices",
+                ).title
               }
               onClick={() => setModal({ mode: "create" })}
             >

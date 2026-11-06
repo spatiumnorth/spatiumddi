@@ -174,7 +174,7 @@ function Bar({ pct, tone }: { pct: number; tone?: string }) {
  *  ``allowed`` gates the fetch; ``withheld`` is the card's message once the
  *  permission set has loaded and the grant is missing. */
 function useReportGrant(resourceType: string, what: string) {
-  const { can, isLoading } = usePermissions();
+  const { can, isLoading, isError } = usePermissions();
   const allowed = can("read", resourceType);
   return {
     allowed,
@@ -182,7 +182,9 @@ function useReportGrant(resourceType: string, what: string) {
     pending: isLoading,
     withheld:
       !allowed && !isLoading
-        ? `You don't have permission to see ${what} (needs read on ${resourceType}).`
+        ? isError
+          ? `Your permissions could not be read, so ${what} was not requested. Reload to try again.`
+          : `You don't have permission to see ${what} (needs read on ${resourceType}).`
         : undefined,
   };
 }

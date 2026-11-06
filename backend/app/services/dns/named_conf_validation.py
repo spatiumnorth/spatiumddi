@@ -540,10 +540,9 @@ _DEBUG_LEVEL_RE = re.compile(r"^debug\s+\d{1,3}$")
 
 #: Where each path option may point. The query log has to land in the
 #: directory the agent's entrypoint chowns to the unprivileged user (and
-#: that its shipper tails); a keytab is read-only host material.
+#: that its shipper tails).
 PATH_OPTION_PREFIXES: dict[str, tuple[str, ...]] = {
     "query_log_file": ("/var/log/named/",),
-    "gss_tsig_keytab_path": ("/etc/", "/var/lib/"),
 }
 
 # Deliberately narrow: the value sits inside ``"…"`` in named.conf, so a
@@ -737,8 +736,6 @@ def validate_server_option(
                 value=value,
             )
         return candidate
-    if field in PATH_OPTION_PREFIXES:
-        return _validate_path(str(value), field=field)
     if field == "query_log_print_time" and value is False:
         raise ViewValidationError(
             "query_log_print_time must stay on: the query-log shipper reads each "

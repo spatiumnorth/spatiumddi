@@ -31,7 +31,7 @@ import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSectio
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -1337,7 +1337,7 @@ export function SettingsPage() {
   // only the fields the API lists in `delegate_writable_fields` (its
   // SETTINGS_DELEGATE_WRITABLE, served rather than copied here so the two
   // cannot drift); every other control stays superadmin-only.
-  const { can } = usePermissions();
+  const { can, isError: permsFailed, unanswered } = usePermissions();
   const canWrite = isSuperadmin || can("write", "settings");
 
   const { data, isLoading } = useQuery({
@@ -1537,7 +1537,11 @@ export function SettingsPage() {
               ? "Configure SpatiumDDI."
               : canWrite
                 ? "You can edit the settings delegated to your role; the rest need a superadmin."
-                : "View-only — you need write access on settings to edit."}
+                : permsFailed
+                  ? `View-only — ${PERMISSIONS_UNREADABLE}`
+                  : unanswered
+                    ? unanswered
+                    : "View-only — you need write access on settings to edit."}
           </p>
         </div>
         <div className="border-b p-3">
@@ -1931,7 +1935,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="Default DNSSEC Validation"
-                  description="Default DNSSEC validation mode for new server groups."
+                  description="Default DNSSEC validation mode for new server groups. A new group has no trust anchor, and BIND 9.20 will not load 'yes' without one, so 'yes' is set per group once it has an anchor."
                 >
                   <select
                     value={values.dns_default_dnssec_validation ?? "auto"}
@@ -1942,7 +1946,11 @@ export function SettingsPage() {
                     className={inputCls}
                   >
                     <option value="auto">auto (recommended)</option>
-                    <option value="yes">yes — manual trust anchors</option>
+                    {/* #3560: refused by the API; kept (disabled) so a
+                        default stored before the refusal still displays. */}
+                    <option value="yes" disabled>
+                      yes — not available as a default (needs a trust anchor)
+                    </option>
                     <option value="no">no — disabled</option>
                   </select>
                 </Field>
