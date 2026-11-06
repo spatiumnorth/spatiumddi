@@ -306,6 +306,9 @@ class SettingsResponse(BaseModel):
     appliance_revoked_retention_days: int = 30
     metric_retention_days: int = 7
     log_retention_hours: int = 24
+    # E911 lookup trail bounds (#3514), superadmin-only.
+    e911_resolution_log_retention_days: int = 90
+    e911_lookup_log_budget_per_minute: int = 120
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -944,6 +947,7 @@ RETENTION_FIELDS: tuple[str, ...] = (
     "appliance_revoked_retention_days",
     "metric_retention_days",
     "log_retention_hours",
+    "e911_resolution_log_retention_days",
 )
 
 
@@ -1124,6 +1128,11 @@ class SettingsUpdate(BaseModel):
     appliance_revoked_retention_days: int | None = Field(default=None, ge=0, le=365)
     metric_retention_days: int | None = Field(default=None, ge=1, le=365)
     log_retention_hours: int | None = Field(default=None, ge=1, le=168)
+    # E911 lookup trail (#3514). No "keep forever" and no "unlimited": the
+    # point of both is that a read-scoped token cannot grow the table without
+    # bound. The retention floor keeps a week for an after-action review.
+    e911_resolution_log_retention_days: int | None = Field(default=None, ge=7, le=3650)
+    e911_lookup_log_budget_per_minute: int | None = Field(default=None, ge=1, le=6000)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
