@@ -27,6 +27,10 @@ A subnet delete removes all three mirrors first, so it trashes the zone with PTR
 10 and retracts host10's A. A block or space delete leaves the orphan, so it
 trashes PTR 10 and PTR 40 with the zone and retracts the A of host10 and of
 orphan40.
+
+A reservation of the scope already in the Trash, whose mirror is still there,
+changes neither: the delete removes that mirror first too, as it reads trashed
+reservations, and the preview leaves its records out.
 """
 
 from __future__ import annotations
@@ -317,6 +321,69 @@ async def test_delete_preview_counts_the_zone_records_the_delete_trashes(
 
     resp = await client.delete(_path(tree, kind), headers=headers)
     assert resp.status_code == 204, resp.text
+    await _assert_trashed_as_previewed(db_session, tree, kind, preview)
+
+
+async def _trashed_reservation_mirror(
+    db: AsyncSession, tree: dict[str, Any], host: int
+) -> uuid.UUID:
+    """A reservation of s1's scope already in the Trash, its mirror still at
+    ``.host`` with its A and PTR. Returns the mirror's id."""
+    reservation = DHCPStaticAssignment(
+        scope_id=tree["scope"].id,
+        ip_address=f"10.37.1.{host}",
+        mac_address=f"02:00:00:37:00:{host:02x}",
+        hostname=f"trashed{host}",
+        deleted_at=datetime.now(UTC),
+        deletion_batch_id=uuid.uuid4(),
+    )
+    db.add(reservation)
+    await db.flush()
+    mirror = await _address(
+        db,
+        tree,
+        host,
+        f"trashed{host}",
+        status="static_dhcp",
+        static_assignment_id=str(reservation.id),
+    )
+    await db.commit()
+    return mirror.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["subnet", "block", "space"])
+async def test_a_trashed_reservations_mirror_is_left_out_as_the_delete_removes_it(
+    client: AsyncClient, db_session: AsyncSession, kind: str
+) -> None:
+    """The delete removes the mirror of a reservation already in the Trash,
+    with its records, before its stamp (``remove_ipam_for_scope_statics``
+    reads trashed reservations), so the preview leaves those records out.
+
+    The preview reads them through a SELECT nested in its counts that asks for
+    trashed rows (``include_deleted``), which the soft-delete filter leaves
+    alone (``app.db._walk_statement``). A change that filtered it would count
+    the mirror's A and PTR, which the delete never trashes."""
+    user, headers = await _superadmin(db_session, "mr3511")
+    tree = await _tree(db_session)
+    mirror_id = await _trashed_reservation_mirror(db_session, tree, 70)
+
+    preview = await _preview(db_session, user, tree, kind)
+    resp = await client.delete(_path(tree, kind), headers=headers)
+    assert resp.status_code == 204, resp.text
+
+    mirror = (
+        await db_session.execute(select(IPAddress.id).where(IPAddress.id == mirror_id))
+    ).scalar_one_or_none()
+    assert mirror is None
+    left = (
+        await db_session.execute(
+            select(DNSRecord.name)
+            .where(DNSRecord.name.in_(["70", "trashed70"]))
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    assert left == []
     await _assert_trashed_as_previewed(db_session, tree, kind, preview)
 
 
