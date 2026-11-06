@@ -353,6 +353,24 @@ describe("the approver is shown the template (#3251)", () => {
   });
 });
 
+describe("an approver is not offered a decision on their own request (#3648)", () => {
+  it("hides Approve and Reject on own row, keeps Withdraw", async () => {
+    rows.mockResolvedValue([req({ requested_by_user_id: "u9" })]);
+    renderPage();
+    await screen.findByRole("button", { name: "Withdraw" });
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  it("offers Approve and Reject on another user's row, without Withdraw", async () => {
+    rows.mockResolvedValue([req({ requested_by_user_id: "u1" })]);
+    renderPage();
+    await screen.findByRole("button", { name: "Approve" });
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Withdraw" })).toBeNull();
+  });
+});
+
 describe("the New request form speaks in words (#3253)", () => {
   async function openForm(kindLabel: string) {
     catalog.mockResolvedValue(KINDS);

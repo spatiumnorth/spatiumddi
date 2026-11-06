@@ -821,7 +821,12 @@ export default function RequestsPage() {
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex justify-end gap-1.5">
-                      {r.state === "pending" && canApprove ? (
+                      {/* The server refuses an approver's decision on their
+                          own request, so only the requester's Withdraw is
+                          offered on it (#3648). */}
+                      {r.state === "pending" &&
+                      canApprove &&
+                      !(myUserId && r.requested_by_user_id === myUserId) ? (
                         <>
                           <HeaderButton
                             variant="primary"
