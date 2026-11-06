@@ -17,6 +17,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -66,9 +67,9 @@ function answer(api: string, method: string, fn: Answer) {
   (answers[api] ??= {})[method] = fn;
 }
 
-function open(ui: ReactNode) {
+function open(ui: ReactNode, isSuperadmin = true) {
   answer("authApi", "myPermissions", () =>
-    Promise.resolve({ is_superadmin: true, grants: [] }),
+    Promise.resolve({ is_superadmin: isSuperadmin, grants: [] }),
   );
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -202,6 +203,14 @@ describe("Add Record (#3509)", () => {
     expect(boxesNamedByNothing()).toEqual([]);
     expectLabelsSound();
 
+    // LUA is offered once the permissions answer says superadmin (#3637).
+    await waitFor(() =>
+      expect(
+        within(screen.getByLabelText("Type")).queryByRole("option", {
+          name: "LUA",
+        }),
+      ).not.toBeNull(),
+    );
     fireEvent.change(screen.getByLabelText("Type"), {
       target: { value: "LUA" },
     });
@@ -212,6 +221,26 @@ describe("Add Record (#3509)", () => {
     );
     expect(boxesNamedByNothing()).toEqual([]);
     expectLabelsSound();
+  });
+});
+
+describe("Add Record LUA type (#3637)", () => {
+  it("is not offered to a user who is not a superadmin", async () => {
+    open(
+      <RecordModal
+        groupId="grp-1"
+        zoneId="zone-1"
+        zoneName="corp.example.test."
+        onClose={() => {}}
+      />,
+      false,
+    );
+    expect((await screen.findByLabelText("Value")).tagName).toBe("INPUT");
+    const type = screen.getByLabelText("Type");
+    expect(within(type).queryByRole("option", { name: "LUA" })).toBeNull();
+    expect(
+      within(type).queryByRole("option", { name: "ALIAS" }),
+    ).not.toBeNull();
   });
 });
 

@@ -3527,6 +3527,12 @@ function RecordModalForm({
   const [port, setPort] = useState(String(record?.port ?? ""));
   const [viewId, setViewId] = useState<string>(record?.view_id ?? "");
   const [error, setError] = useState("");
+  // #3637 — a LUA snippet runs inside pdns_server, so writing one is
+  // superadmin-only on the server (create and change of its value).
+  const { isSuperadmin: canWriteLua } = usePermissions();
+  const recordTypes = canWriteLua
+    ? RECORD_TYPES
+    : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
   const nameErr = recordOwnerError(name);
 
@@ -3629,7 +3635,7 @@ function RecordModalForm({
               // shift around a Type that won't actually change (#424).
               disabled={!!record}
             >
-              {RECORD_TYPES.map((t) => (
+              {recordTypes.map((t) => (
                 <option key={t} value={t}>
                   {t}
                 </option>
@@ -3694,6 +3700,12 @@ function RecordModalForm({
               placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
               rows={4}
               required
+              readOnly={!canWriteLua}
+              title={
+                canWriteLua
+                  ? undefined
+                  : "Only a superadmin can change a LUA snippet"
+              }
             />
           ) : (
             <input
@@ -3747,14 +3759,16 @@ function RecordModalForm({
             <code className="rounded bg-violet-500/20 px-1">
               CNAME 'createReverse(...)'
             </code>
-            . The snippet executes inside <em>pdns_server</em> at query time, so
-            an untrusted snippet is a server-side code-execution risk — keep
-            this surface admin-only. The agent automatically sets{" "}
+            . The snippet executes inside <em>pdns_server</em> at query time (it
+            can probe TCP ports and fetch URLs from the DNS server), so only a
+            superadmin can create a LUA record or change its value; the API
+            answers 403 to anyone else. The PowerDNS agent enables LUA records
+            on every PowerDNS server (the{" "}
             <code className="rounded bg-violet-500/20 px-1">
-              ENABLE-LUA-RECORDS=1
+              enable-lua-records
             </code>{" "}
-            metadata on the zone the first time you save a LUA record. Zone must
-            live in a powerdns-only group; API returns 422 otherwise.
+            setting), not per zone. Zone must live in a powerdns-only group; API
+            returns 422 otherwise.
           </div>
         )}
         <div className="grid grid-cols-2 gap-3">
