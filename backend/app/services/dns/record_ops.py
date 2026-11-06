@@ -2693,6 +2693,76 @@ async def ack_op(
     await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])
 
 
+def _subnet_address_records(subnet_ids: Sequence[uuid.UUID], *address_where: Any) -> list[Any]:
+    """The WHERE of the live, auto-generated records of the addresses of
+    ``subnet_ids``, less any address ``address_where`` rules out. The
+    retraction (spatiumddi#1906) and the approval preview's counts of what a
+    delete takes (spatiumddi#3511, spatiumddi#3536) select through it alike."""
+    return [
+        DNSRecord.auto_generated.is_(True),
+        DNSRecord.deleted_at.is_(None),
+        DNSRecord.ip_address_id.in_(
+            select(IPAddress.id).where(IPAddress.subnet_id.in_(subnet_ids), *address_where)
+        ),
+    ]
+
+
+async def count_records_to_retract(db: AsyncSession, batch: Any, *address_where: Any) -> int:
+    """How many records :func:`retract_trashed_subnet_records` would retract
+    from zones that stay if ``batch`` were applied now (spatiumddi#3536).
+
+    Read before the apply, so it leaves out what the apply takes first: the
+    records of a zone the batch holds, which ``apply_soft_delete`` stamps with
+    their zone, and those of any address ``address_where`` rules out (the
+    caller's rows deleted before the stamp, with their records). It only
+    reads. The approval preview of a subnet, block or space delete counts
+    these with the batch's records, so it names them and the approve-time
+    drift check sees an address added in between.
+    """
+    return await _count_address_records(db, batch, address_where, in_held_zones=False)
+
+
+async def count_held_records_deleted_first(
+    db: AsyncSession, batch: Any, *address_where: Any
+) -> int:
+    """How many records of the zones ``batch`` holds belong to the addresses
+    ``address_where`` names, which the caller's apply deletes before its
+    stamp, with their records (the DHCP mirrors a delete tears down first,
+    spatiumddi#3536).
+
+    ``batch.counts()`` counts a held zone's records as they stand (#1231),
+    but ``apply_soft_delete`` stamps only those still live then, so these are
+    never trashed. It only reads. The approval preview of a subnet, block or
+    space delete takes them off its count, so it names what the delete
+    trashes, and a lease granted or expiring in a reverse zone the delete
+    trashes leaves the preview, and the approve-time drift check, as they
+    were (spatiumddi#3511).
+    """
+    return await _count_address_records(db, batch, address_where, in_held_zones=True)
+
+
+async def _count_address_records(
+    db: AsyncSession, batch: Any, address_where: Sequence[Any], *, in_held_zones: bool
+) -> int:
+    """How many live, auto-generated records of the addresses of ``batch``'s
+    subnets, less any address ``address_where`` rules out, are in a zone the
+    batch holds (``in_held_zones``) or in a zone that stays (otherwise)."""
+    subnet_ids = [row.obj.id for row in batch.rows if row.resource_type == "subnet"]
+    if not subnet_ids:
+        return 0
+    held = {row.obj.id for row in batch.rows if row.resource_type == "dns_zone"}
+    total = 0
+    for start in range(0, len(subnet_ids), _RETRACT_CHUNK):
+        chunk = subnet_ids[start : start + _RETRACT_CHUNK]
+        per_zone = await db.execute(
+            select(DNSRecord.zone_id, func.count())
+            .where(*_subnet_address_records(chunk, *address_where))
+            .group_by(DNSRecord.zone_id)
+        )
+        total += sum(n for zone_id, n in per_zone.all() if (zone_id in held) == in_held_zones)
+    return total
+
+
 async def retract_trashed_subnet_records(
     db: AsyncSession, batch: Any, now: datetime, user_id: uuid.UUID | None
 ) -> tuple[int, set[uuid.UUID]]:
@@ -2724,13 +2794,7 @@ async def retract_trashed_subnet_records(
             (
                 await db.execute(
                     select(DNSRecord)
-                    .where(
-                        DNSRecord.auto_generated.is_(True),
-                        DNSRecord.deleted_at.is_(None),
-                        DNSRecord.ip_address_id.in_(
-                            select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
-                        ),
-                    )
+                    .where(*_subnet_address_records(chunk))
                     .options(selectinload(DNSRecord.zone))
                 )
             )
