@@ -261,3 +261,69 @@ def test_an_rpz_zone_with_no_room_for_its_hash_sidecar_is_still_served(
 
     assert (tmp_path / "rendered.new" / "zones" / f"{rpz}.db").is_file()
     assert drv._unwritable_zones == ()
+
+
+# ── named's own files: the journal it opens on every load ────────────────────
+#
+# named opens ``<file>.jnl`` when it loads a primary zone, dynamic or not, and
+# with inline-signing ``<file>.signed.jnl``; a name past NAME_MAX is "journal
+# open failed ... not loaded due to errors" (BIND 9.20, live_long_zone_check).
+# Written anyway, such a zone passed named-checkzone and failed the reload
+# verification, and with it the whole apply.
+
+
+@pytest.mark.parametrize(
+    ("length", "signed", "held"),
+    [
+        pytest.param(248, False, False, id="248-journal-fits"),
+        pytest.param(249, False, True, id="249-journal-too-long"),
+        pytest.param(241, True, False, id="241-signed-journal-fits"),
+        pytest.param(242, True, True, id="242-signed-journal-too-long"),
+    ],
+)
+def test_a_zone_whose_journal_named_cannot_name_is_held_back_at_render(
+    tmp_path: Path, length: int, signed: bool, held: bool
+) -> None:
+    long = _long(length)
+    extra: dict[str, Any] = (
+        {"dnssec_enabled": True, "dnssec_policy_name": "default"} if signed else {}
+    )
+    drv = Bind9Driver(tmp_path)
+    drv.render(_bundle([_primary(long + ".", **extra), _primary("good.test.")]))
+    new = tmp_path / "rendered.new"
+
+    assert (new / "zones" / "good.test.db").is_file()
+    assert (new / "zones" / f"{long}.db").is_file() is not held
+    assert f'zone "{long}."' in (new / "named.conf").read_text()
+    if held:
+        assert [(h.zone, h.served) for h in drv._unwritable_zones] == [(long, False)]
+        assert "Shorten the zone name" in drv._unwritable_zones[0].reason
+    else:
+        assert drv._unwritable_zones == ()
+
+
+def test_an_rpz_zone_whose_journal_named_cannot_name_is_held_back(
+    tmp_path: Path,
+) -> None:
+    rpz = _long(249, tail="rpz")
+    bl = {
+        "rpz_zone_name": rpz + ".",
+        "entries": [],
+        "exceptions": [],
+        "view_name": None,
+    }
+    drv = Bind9Driver(tmp_path)
+    drv.render(_bundle([_primary("good.test.")], [bl]))
+
+    assert not (tmp_path / "rendered.new" / "zones" / f"{rpz}.db").exists()
+    assert [(h.zone, h.served) for h in drv._unwritable_zones] == [(rpz, False)]
+
+
+def test_the_hold_is_cleared_when_the_zone_is_gone(tmp_path: Path) -> None:
+    """``_unwritable_zones`` is per render: a zone deleted or renamed short
+    is not held by the next apply."""
+    drv = Bind9Driver(tmp_path)
+    drv.render(_bundle([_primary(_long(253) + "."), _primary("good.test.")]))
+    assert drv._unwritable_zones != ()
+    drv.render(_bundle([_primary("good.test.")]))
+    assert drv._unwritable_zones == ()

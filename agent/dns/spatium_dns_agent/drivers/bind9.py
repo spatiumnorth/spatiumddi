@@ -2172,11 +2172,31 @@ def _name_too_long(exc: OSError) -> bool:
     return exc.errno == errno.ENAMETOOLONG
 
 
+#: What named appends to a zone's file name for the files it keeps beside it
+#: (#3672). It opens the journal on every load of a primary zone, dynamic or
+#: not, and a journal name past ``NAME_MAX`` is "journal open failed: unexpected
+#: error ... not loaded due to errors", verified against BIND 9.20. Inline-
+#: signing adds the signed copy and its journal, opened the same way.
+_NAMED_JOURNAL_SUFFIX = ".jnl"
+_NAMED_SIGNED_JOURNAL_SUFFIX = ".signed.jnl"
+
+
+def _named_files_fit(path: Path, signed: bool) -> bool:
+    """Whether named can name every file it keeps beside the zone file at
+    ``path`` (#3672). A zone whose files it cannot name is one named will not
+    load: written anyway, it passes ``named-checkzone`` (which opens no
+    journal) and then fails the reload verification, and with it the whole
+    apply."""
+    suffix = _NAMED_SIGNED_JOURNAL_SUFFIX if signed else _NAMED_JOURNAL_SUFFIX
+    return len(path.name.encode()) + len(suffix) <= _NAME_MAX
+
+
 def _file_name_refusal(zname: str) -> str:
     """The held-back reason for a zone whose files cannot be named (#3672)."""
     return (
         f"the zone name is {len(zname)} characters, too long for the agent to "
-        f"store the zone: its file, or a file kept beside it, would need a name "
+        f"store the zone: its file, or a file kept beside it (such as the DNS "
+        f"server's journal, or with DNSSEC its signed copy), would need a name "
         f"longer than the file system's {_NAME_MAX} bytes. Shorten the zone name"
     )
 
@@ -3261,13 +3281,20 @@ class Bind9Driver(DriverBase):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
             self._primary_rels.add(rel_zfile)
-            try:
-                for kind, detail in self._write_zone_file(new_dir / rel_zfile, zone):
-                    apex_notes.append((zname.rstrip("."), kind, detail))
-            except OSError as exc:
-                if not _name_too_long(exc):
-                    raise
+            if not _named_files_fit(
+                new_dir / rel_zfile, bool(zone.get("dnssec_enabled"))
+            ):
                 self._hold_unwritable(new_dir / rel_zfile, zname, file_prefix)
+            else:
+                try:
+                    for kind, detail in self._write_zone_file(
+                        new_dir / rel_zfile, zone
+                    ):
+                        apex_notes.append((zname.rstrip("."), kind, detail))
+                except OSError as exc:
+                    if not _name_too_long(exc):
+                        raise
+                    self._hold_unwritable(new_dir / rel_zfile, zname, file_prefix)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"{update_clause}{allow_transfer}{dnssec_clause}"
@@ -3285,7 +3312,10 @@ class Bind9Driver(DriverBase):
             rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
             try:
-                self._place_rpz_zone_file(new_dir / rel, bl, rel)
+                if _named_files_fit(new_dir / rel, False):
+                    self._place_rpz_zone_file(new_dir / rel, bl, rel)
+                else:
+                    self._hold_unwritable(new_dir / rel, zname, file_prefix)
             except OSError as exc:
                 if not _name_too_long(exc):
                     raise
@@ -3617,9 +3647,10 @@ class Bind9Driver(DriverBase):
     def _hold_unwritable(self, path: Path, zname: str, file_prefix: str) -> None:
         """Hold back a zone whose file, or a sidecar of it, cannot be named (#3672).
 
-        Only ``ENAMETOOLONG`` comes here: it is a property of the zone's name,
-        so it fails the same way on every render and holding the zone back is
-        the whole answer. Any other write error (a full disk) still fails the
+        Only a name too long comes here (an ``ENAMETOOLONG`` from the write,
+        or a journal named could not name, :func:`_named_files_fit`): it is a
+        property of the zone's name, so it fails the same way on every render
+        and holding the zone back is the whole answer. Any other write error (a full disk) still fails the
         apply, since it is no verdict on one zone. The stanza stays in
         named.conf, as for a new zone named-checkzone refuses: named cannot
         load the missing file and answers SERVFAIL for the zone, rather than

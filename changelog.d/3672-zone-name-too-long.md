@@ -11,4 +11,7 @@
   now refuse such a zone and say which field to set. On the agent, a
   zone whose files cannot be named, or whose files cannot be cleaned up
   while it is held back, is held back on its own with the reason, and the
-  rest of the configuration applies.
+  rest of the configuration applies. That includes a zone of 249
+  characters or more (242 or more with DNSSEC) whatever its apex: BIND
+  will not load a zone whose journal file it cannot name, and such a zone
+  used to fail the whole apply after it was written.

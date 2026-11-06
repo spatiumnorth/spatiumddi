@@ -264,3 +264,70 @@ async def test_importer_fails_the_zone_and_stores_nothing(db_session: AsyncSessi
     assert "Primary NS (primary_ns)" in (res.zones[0].error or "")
     assert (await db_session.execute(select(DNSZone).where(DNSZone.group_id == grp.id))).all() == []
     assert (await db_session.execute(select(DNSRecord))).all() == []
+
+
+# ── the template create and the Copilot create ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_template_create_refuses_and_stores_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The template request carries no Primary NS or Admin Email, so a name
+    past 247 characters can only ever get the placeholders."""
+    h = await _headers(db_session)
+    grp = await _group(db_session)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{grp.id}/zones/from-template"
+
+    r = await client.post(
+        url, json={"template_id": "k8s-external-dns", "zone_name": _long(248)}, headers=h
+    )
+    assert r.status_code == 422, r.text
+    assert "Admin Email (admin_email)" in r.json()["detail"]
+    stored = (await db_session.execute(select(DNSZone).where(DNSZone.group_id == grp.id))).all()
+    assert stored == []
+
+    r = await client.post(
+        url, json={"template_id": "k8s-external-dns", "zone_name": _long(247)}, headers=h
+    )
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.asyncio
+async def test_copilot_create_refuses_at_preview_and_apply(db_session: AsyncSession) -> None:
+    from app.services.ai.operations import CreateDNSZoneArgs, get_operation
+
+    user = User(
+        username=f"u3672-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="admin",
+        hashed_password=hash_password("password123"),
+        is_superadmin=True,
+    )
+    user.groups = []
+    db_session.add(user)
+    grp = await _group(db_session)
+    await db_session.commit()
+    op = get_operation("create_dns_zone")
+    assert op is not None
+
+    args = CreateDNSZoneArgs(name=_long(250), group_id=str(grp.id))
+    preview = await op.preview(db_session, user, args)
+    assert not preview.ok and "Primary NS (primary_ns)" in preview.detail
+    with pytest.raises(ValueError, match="Primary NS"):
+        await op.apply(db_session, user, args)
+    stored = (await db_session.execute(select(DNSZone).where(DNSZone.group_id == grp.id))).all()
+    assert stored == []
+
+    ok = CreateDNSZoneArgs(
+        name=_long(250),
+        group_id=str(grp.id),
+        primary_ns="ns1.example.test.",
+        admin_email="hostmaster.example.test.",
+    )
+    preview = await op.preview(db_session, user, ok)
+    assert preview.ok, preview.detail
+    await op.apply(db_session, user, ok)
+    stored = (await db_session.execute(select(DNSZone).where(DNSZone.group_id == grp.id))).all()
+    assert len(stored) == 1

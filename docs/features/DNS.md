@@ -2111,15 +2111,19 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   `app.services.dns.zone_apex.apex_name_length_error`.
 - **Zone names near the file-name limit (issue #3672).** The BIND9 agent
   stores a zone as `<zone>.db`, with sidecars beside it (`.db.owned` for a
-  dynamic zone, `.db.sha256` for an RPZ zone) and named's own journal
-  (`.db.jnl`). A file name is capped at 255 bytes, so a zone of 253
-  characters cannot be stored at all, and a dynamic zone of 243 or
-  more cannot keep its ownership sidecar. Such a zone is held back on its
-  own (reported with the reason, not served), exactly as a zone
-  `named-checkzone` refuses, and every other zone in the bundle applies. An
-  RPZ zone with no room for its hash sidecar is still served, just rendered
-  on every apply. named itself cannot write a journal for a zone of 249 or
-  more characters, so RFC 2136 updates to one fail at named.
+  dynamic zone, `.db.sha256` for an RPZ zone), and named opens its journal
+  (`.db.jnl`, and with inline-signing `.db.signed.jnl`) every time it loads
+  a primary zone, dynamic or not. A file name is capped at 255 bytes, and
+  named refuses to load a zone whose journal it cannot name. So on BIND9 a
+  primary or RPZ zone of 249 characters or more, a DNSSEC-signed zone of
+  242 or more, and a dynamic zone of 247 or more cannot be served. Such a
+  zone is held back on its own at render (reported with the reason, its
+  stanza kept so named answers SERVFAIL for it rather than recursing),
+  exactly as a zone `named-checkzone` refuses, and every other zone in the
+  bundle applies. An RPZ zone with no room for its hash sidecar (246 to
+  248 characters) is still served, just rendered on every apply. The
+  control plane does not refuse these names: PowerDNS and the agentless
+  drivers serve them.
 
 ### Servers & server groups
 
