@@ -2967,7 +2967,8 @@ function ZoneModalForm({
   // install with the module off, is not asked (#2926): the select says the
   // list is not available. ``ready`` waits for the real module state, since
   // ``enabled`` answers true while it loads.
-  const canReadDomainPerm = usePermissions().can("read", "manage_domains");
+  const domainPerms = usePermissions();
+  const canReadDomainPerm = domainPerms.can("read", "manage_domains");
   const { enabled: domainModuleEnabled, ready: domainModulesReady } =
     useFeatureModules();
   const domainsModuleOn =
@@ -3389,11 +3390,15 @@ function ZoneModalForm({
             Pin to a tracked domain registration so the Domain detail page
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
-            {!canReadDomainPerm
-              ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
-              : domainModulesReady && !domainsModuleOn
-                ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
-                : ""}
+            {!canReadDomainPerm && domainPerms.isError
+              ? " Your permissions could not be read, so the domain list was not requested and the link cannot be changed here. Reload to try again."
+              : !canReadDomainPerm && domainPerms.unanswered
+                ? ` ${domainPerms.unanswered}`
+                : !canReadDomainPerm
+                  ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
+                  : domainModulesReady && !domainsModuleOn
+                    ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
+                    : ""}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -4368,7 +4373,8 @@ export function ZoneDetailView({
   const tlsCertsOn = moduleEnabled("security.tls_certs");
   // The route takes read on 'tls_cert': a user without it is not asked, and
   // the tab says so instead of "Certificates (0)" (#2704).
-  const canReadCerts = usePermissions().can("read", "tls_cert");
+  const certPerms = usePermissions();
+  const canReadCerts = certPerms.can("read", "tls_cert");
   const {
     data: tlsCerts,
     isLoading: tlsCertsLoading,
@@ -5116,8 +5122,8 @@ export function ZoneDetailView({
                     />
                   ) : (
                     <span className="text-muted-foreground">
-                      You don't have permission to see this zone's TLS
-                      certificates.
+                      {certPerms.unanswered ??
+                        "You don't have permission to see this zone's TLS certificates."}
                     </span>
                   )}
                 </p>
@@ -5389,9 +5395,10 @@ export function ZoneDetailView({
                         editDisabledReason={
                           zone.tailscale_tenant_id
                             ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
-                            : can("write", "dns_zone")
-                              ? undefined
-                              : NEEDS_ZONE_WRITE
+                            : permissionGate(
+                                can("write", "dns_zone"),
+                                NEEDS_ZONE_WRITE,
+                              ).title
                         }
                       />
                     ))}
@@ -11794,9 +11801,11 @@ export function BlocklistDetail({
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."
-                          : !can("write", "dns_blocklist")
-                            ? NEEDS_BLOCKLIST_WRITE
-                            : "Also block *.<domain>. Saves immediately."
+                          : (permissionGate(
+                              can("write", "dns_blocklist"),
+                              NEEDS_BLOCKLIST_WRITE,
+                            ).title ??
+                            "Also block *.<domain>. Saves immediately.")
                       }
                     />
                   </td>
