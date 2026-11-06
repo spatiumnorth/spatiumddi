@@ -5169,9 +5169,11 @@ export function SubnetDetail({
   const permitsWriteIp = (address: string): boolean =>
     subnetWritable || ipInWritableSet(address);
 
-  // The same for removing the row: delete on this subnet, or a delete grant
-  // on an address set that contains the address (the server asks the same).
-  const subnetDeletable = perms.can("delete", "subnet", subnet.id);
+  // The same for removing the row: delete on subnets, or a delete grant on
+  // an address set that contains the address (the server asks the same). The
+  // subnet half is type-level: the delete routes' gate takes no grant scoped
+  // to one subnet (they are not on its instance allow-list).
+  const subnetDeletable = perms.can("delete", "subnet");
   const deletableSets = addressSets.filter((s) =>
     perms.can("delete", "address_set", s.id),
   );

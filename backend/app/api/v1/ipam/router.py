@@ -1732,6 +1732,26 @@ async def _require_ip_writable(db: AsyncSession, user: Any, ip: IPAddress) -> No
         )
 
 
+async def _require_ip_deletable(db: AsyncSession, user: Any, ip: IPAddress) -> None:
+    """403 unless ``user`` holds a ``delete`` grant covering this one address:
+    ``delete`` on its subnet, or on an address set whose range holds it.
+
+    The coarse gate of the delete routes admits any address-set delete grant
+    whatever its set, so a set-scoped grant is matched against the address
+    here (#3636)."""
+    ip_int = int(ipaddress.ip_address(str(ip.address)))
+    if not _user_can_write_ip(
+        user,
+        ip_int,
+        user_has_permission(user, "delete", "subnet", ip.subnet_id),
+        await _load_writable_set_ranges(db, user, ip.subnet_id, action="delete"),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"No delete permission on subnet or any address set covering {ip.address}",
+        )
+
+
 async def _writable_subnet_ids(db: AsyncSession, user: Any) -> set[uuid.UUID] | None:
     """Subnets on which the caller can write at least one address, or ``None``
     when they hold type-level subnet write (every subnet).
@@ -11081,6 +11101,9 @@ async def delete_alias(
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     await _require_ip_writable(db, current_user, ip)
+    # The route's ``delete`` must cover this address too (#3636), as on the
+    # address's own delete.
+    await _require_ip_deletable(db, current_user, ip)
     rec = await db.get(DNSRecord, record_id)
     if rec is None or rec.ip_address_id != ip.id:
         raise HTTPException(status_code=404, detail="Alias not found")
@@ -11314,18 +11337,8 @@ async def delete_address(
             detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
     # Removing the row takes a delete grant that covers THIS address: delete
-    # on its subnet, or on an address set containing it. The route's coarse
-    # gate admits any address-set delete grant whatever its set.
-    if not _user_can_write_ip(
-        current_user,
-        int(ipaddress.ip_address(str(ip.address))),
-        user_has_permission(current_user, "delete", "subnet", ip.subnet_id),
-        await _load_writable_set_ranges(db, current_user, ip.subnet_id, action="delete"),
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(f"No delete permission on subnet or any address set covering {ip.address}"),
-        )
+    # on its subnet, or on an address set containing it.
+    await _require_ip_deletable(db, current_user, ip)
 
     subnet = await db.get(Subnet, ip.subnet_id)
 
@@ -12893,9 +12906,9 @@ class IPAddressBulkDeleteResponse(BaseModel):
     deleted_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []  # system rows (network/broadcast) or already-orphaned
-    # Why a row in ``skipped`` was skipped, keyed by id (#1714). Only the
-    # reservation refusal is itemised today; other skips keep the generic
-    # meaning documented above.
+    # Why a row in ``skipped`` was skipped, keyed by id (#1714). The
+    # reservation refusal and a missing delete grant (#3636) are itemised;
+    # other skips keep the generic meaning documented above.
     skipped_reasons: dict[str, str] = {}
 
 
@@ -13003,6 +13016,9 @@ async def bulk_delete_addresses(
             delete_ranges,
         ):
             skipped.append(ip.id)
+            skipped_reasons[str(ip.id)] = (
+                f"No delete permission on subnet or any address set covering {ip.address}"
+            )
             continue
         row_statics = statics_by_ip.get(ip.id, [])
         refusal = _static_delete_refusal(current_user, row_statics, f"Address {ip.address}")

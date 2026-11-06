@@ -670,6 +670,19 @@ describe("an address's Delete matches the server's gate (#3409)", () => {
     expect(await detailButtons(row)).toContain("Delete");
   });
 
+  it("disables it on a delete grant scoped to this one subnet", async () => {
+    // DELETE /addresses/{id} is not on the gate's subnet instance
+    // allow-list, so a delete grant naming the subnet is refused there.
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "subnet", "sub-1"],
+    ]);
+    const row = await open();
+    await settle();
+    expect(inline(row).disabled).toBe(true);
+  });
+
   it("offers it on a delete grant scoped to an address set holding the address", async () => {
     // The gate admits any address-set delete grant; the handler then wants a
     // delete grant covering THIS address, here through the set that holds it.
