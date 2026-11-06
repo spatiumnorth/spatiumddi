@@ -31,7 +31,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // OT / industrial device registry + Purdue zoning (issue #542, part of
 // #543). Read-only identification: nothing here probes, scans, reads a
@@ -181,7 +181,10 @@ export function OTDevicesPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on OT devices"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on OT devices",
+                ).title
               }
               onClick={() => setDeviceModal({ mode: "create" })}
             >
@@ -435,7 +438,10 @@ export function OTDevicesPage() {
               icon={Plus}
               disabled={!canWrite}
               title={
-                canWrite ? undefined : "Requires write permission on OT devices"
+                permissionGate(
+                  canWrite,
+                  "Requires write permission on OT devices",
+                ).title
               }
               onClick={() => setZoneModal({ mode: "create" })}
             >
