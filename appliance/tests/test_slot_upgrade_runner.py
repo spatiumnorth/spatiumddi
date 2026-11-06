@@ -181,7 +181,7 @@ def test_ticker_keeps_stamp_fresh_then_cleans_up(tmp_path: Path) -> None:
     marker (so the supervisor never falsely reaps a live apply), then the
     ticker is reaped and the terminal state is done."""
     stub = _write_stub(
-        tmp_path, '[ "$1" = "set-next-boot" ] && exit 0; sleep 3; exit 0'
+        tmp_path, '[ "$1" = "set-next-boot" ] && exit 0; sleep 6; exit 0'
     )
     _seed_trigger(tmp_path)
     proc = subprocess.Popen(
@@ -194,9 +194,16 @@ def test_ticker_keeps_stamp_fresh_then_cleans_up(tmp_path: Path) -> None:
     while time.time() < deadline and not _state(tmp_path).startswith("in-flight"):
         time.sleep(0.1)
     s1 = _state(tmp_path)
-    time.sleep(1.3)
-    s2 = _state(tmp_path)
-    proc.wait(timeout=15)
+    # Poll rather than sleep a fixed interval (#3668): the ticker re-stamps
+    # once a second at second resolution, so a loaded runner can leave a
+    # single fixed-gap sample in the same second. The stub apply runs 6 s,
+    # so a live ticker must advance the stamp well inside this deadline.
+    s2 = s1
+    deadline = time.time() + 4.5
+    while time.time() < deadline and s2 == s1:
+        time.sleep(0.2)
+        s2 = _state(tmp_path)
+    proc.wait(timeout=20)
     # The stamp advanced while the apply ran → ticker alive.
     assert s1.startswith("in-flight") and s2.startswith("in-flight")
     assert s1 != s2
