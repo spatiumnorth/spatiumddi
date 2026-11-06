@@ -12006,6 +12006,9 @@ export interface ProvisioningRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  // Name of the IPAM template args.template_id names, resolved server-side so
+  // viewers without read on IPAM templates still get it (#3649).
+  template_name?: string | null;
 }
 
 export interface ProvisioningRequestListParams {
