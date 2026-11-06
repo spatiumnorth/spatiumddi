@@ -9,14 +9,17 @@ zone: Postgres broke the cycle with 40P01 and one side failed (#3601 fixed the
 batch's own order; this is the sweep's half).
 
 Forced rather than hoped for: the lease-events batch is held at its first DDNS
-publish (after it holds every mirror row) until the sweep has revoked its first
-address's DDNS. The hold times out when the sweep is parked on the mirror lock,
-which is what the fixed sweep does before any DDNS work.
+publish (after it holds every mirror row) until the sweep has either revoked
+its first address's DDNS (the unfixed order) or parked on one of the batch's
+locks (the fixed sweep, which locks before any DDNS work). Every hold polls
+``pg_blocking_pids`` to a generous deadline instead of waiting a fixed window,
+so a slow runner changes how long a test takes, never what it observes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import uuid
 from collections.abc import AsyncGenerator
@@ -38,7 +41,47 @@ from tests.test_lease_events_insert_order_3480 import (  # noqa: F401
     concurrent_client,
 )
 
-_HOLD_S = 3.0
+# How long to wait for the sweep to park on the other connection's lock. Far
+# longer than it takes on an idle machine; a busy CI runner can be slow to
+# schedule the sweep's connection, and the wait returns as soon as it parks.
+_PARK_DEADLINE_S = 20.0
+
+
+async def _anyone_blocked_by(conn: AsyncConnection | AsyncSession, pid: int) -> bool:
+    """Is any backend waiting on a lock that backend ``pid`` holds?
+
+    ``pg_stat_activity`` is a snapshot taken at its first read in a
+    transaction and kept to the end of it, and every poll here runs inside the
+    lock holder's open transaction. Without clearing the snapshot, a sweep
+    that connected after the first poll is never seen, however long it waits.
+    """
+    await conn.execute(text("SELECT pg_stat_clear_snapshot()"))
+    blocked = (
+        await conn.execute(
+            text("SELECT count(*) FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid))"),
+            {"pid": pid},
+        )
+    ).scalar_one()
+    return bool(blocked)
+
+
+async def _hold_for_the_sweep(db: AsyncSession, revoked: asyncio.Event) -> str:
+    """Hold the batch, mirror rows locked, until the sweep has either revoked
+    DDNS (the unfixed order, which then deadlocks) or parked on one of the
+    batch's locks (the fixed order). Polled to a generous deadline rather than
+    a fixed window, so a slow runner cannot let the batch commit before the
+    sweep has even started, which would test nothing."""
+    with db.no_autoflush:
+        pid = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PARK_DEADLINE_S
+        while loop.time() < deadline:
+            if revoked.is_set():
+                return "batch: met the sweep's revoke"
+            if await _anyone_blocked_by(db, pid):
+                return "batch: the sweep parked on its locks"
+            await asyncio.sleep(0.05)
+    return "batch: the sweep neither revoked nor parked"
 
 
 @pytest.mark.asyncio
@@ -79,11 +122,7 @@ async def test_sweep_and_lease_events_on_the_same_addresses_do_not_deadlock(
     async def _apply(db: AsyncSession, **kw: Any) -> Any:
         if not batch_locked.is_set():
             batch_locked.set()  # every mirror row of the batch is locked by now
-            try:
-                await asyncio.wait_for(revoked.wait(), timeout=_HOLD_S)
-                log.append("batch: met the sweep's revoke")
-            except TimeoutError:
-                log.append("batch: went on alone")
+            log.append(await _hold_for_the_sweep(db, revoked))
         return await real_apply(db, **kw)
 
     async def _revoke(db: AsyncSession, **kw: Any) -> Any:
@@ -102,6 +141,7 @@ async def test_sweep_and_lease_events_on_the_same_addresses_do_not_deadlock(
     )
     assert not any(isinstance(r, BaseException) for r in results), f"{results!r}; {log}"
     assert results[1].status_code == 200, f"{results[1].text}; {log}"
+    assert log == ["batch: the sweep parked on its locks"], log
 
     # The sweep expired A's leases; B's batch is committed and active.
     states = (
@@ -146,23 +186,38 @@ async def other_conn() -> AsyncGenerator[AsyncConnection, None]:
         await engine.dispose()
 
 
-async def _wait_until_blocked(conn: AsyncConnection) -> None:
-    """Return once some backend waits on a lock that ``conn`` holds."""
+async def _wait_until_blocked(conn: AsyncConnection, sweep: asyncio.Task[Any]) -> None:
+    """Return once some backend waits on a lock that ``conn`` holds.
+
+    Fails at once, with its outcome, if ``sweep`` finishes without waiting,
+    and at the deadline with what every other backend was doing.
+    """
     pid = (await conn.execute(text("SELECT pg_backend_pid()"))).scalar_one()
-    for _ in range(300):
-        blocked = (
-            await conn.execute(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE :pid = ANY(pg_blocking_pids(pid))"
-                ),
-                {"pid": pid},
-            )
-        ).scalar_one()
-        if blocked:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PARK_DEADLINE_S
+    while loop.time() < deadline:
+        if sweep.done():
+            outcome = sweep.exception() or sweep.result()
+            raise AssertionError(f"the sweep finished without waiting on the lock: {outcome!r}")
+        if await _anyone_blocked_by(conn, pid):
             return
         await asyncio.sleep(0.05)
-    raise AssertionError("the sweep never waited on the other connection's lock")
+    await conn.execute(text("SELECT pg_stat_clear_snapshot()"))
+    activity = (
+        await conn.execute(
+            text(
+                "SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid), "
+                "left(query, 120) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            )
+        )
+    ).all()
+    stack = io.StringIO()
+    sweep.print_stack(file=stack)
+    raise AssertionError(
+        f"the sweep did not wait on the lock held by pid {pid} within "
+        f"{_PARK_DEADLINE_S:.0f} s; other backends: {activity!r}; sweep at:\n{stack.getvalue()}"
+    )
 
 
 async def _group_with_two_servers(db: AsyncSession) -> tuple[Any, DHCPServer, DHCPServer]:
@@ -231,7 +286,7 @@ async def test_a_partner_renewal_while_the_sweep_waits_keeps_the_mirror(
         {"id": lease_b.id},
     )
     sweep = asyncio.create_task(_sweep())
-    await _wait_until_blocked(other_conn)
+    await _wait_until_blocked(other_conn, sweep)
     await trans.commit()
     cleaned, _deleted = await asyncio.wait_for(sweep, timeout=30)
 
@@ -289,7 +344,7 @@ async def test_a_batch_renewing_leases_in_id_order_never_deadlocks_with_the_swee
     trans = await other_conn.begin()
     await other_conn.execute(renew, {"id": low_id})
     sweep = asyncio.create_task(_sweep())
-    await _wait_until_blocked(other_conn)
+    await _wait_until_blocked(other_conn, sweep)
     await other_conn.execute(renew, {"id": high_id})
     await trans.commit()
     assert await asyncio.wait_for(sweep, timeout=30) == (0, 0)
