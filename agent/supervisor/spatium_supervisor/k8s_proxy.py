@@ -90,6 +90,17 @@ _RESTART_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
 _FORWARDED_HEADERS = ("Accept", "Content-Type")
 
 
+def _is_pod_log_route(method: str, path: str) -> bool:
+    """True for the allowlisted pod-log GET (already validated by
+    ``_refusal`` before this is consulted)."""
+    route = urlsplit(path).path
+    return (
+        method == "GET"
+        and route.startswith(_PODS_PATH + "/")
+        and route.endswith("/log")
+    )
+
+
 def _is_name(value: str) -> bool:
     return _NAME_RE.fullmatch(value) is not None
 
@@ -274,6 +285,13 @@ def _proxy_once(
         forwarded = {
             k: str(req_headers[k]) for k in _FORWARDED_HEADERS if k in req_headers
         }
+        if _is_pod_log_route(method, api_path):
+            # kubeapi answers a pod log with 406 unless Accept admits a
+            # non-JSON body: it lists only json / yaml / protobuf, so the
+            # ``text/plain`` an older control plane sends is refused. Send
+            # ``*/*`` whatever the caller asked for. The body is raw text;
+            # it is relayed as opaque bytes (base64), never parsed.
+            forwarded["Accept"] = "*/*"
         response_status, response_body = _call_local_kubeapi(
             method, api_path, req_body, forwarded
         )

@@ -9354,10 +9354,12 @@ async def k8s_get_pod_logs(
     if container:
         path += f"&container={container}"
 
+    # ``*/*``, not ``text/plain``: kubeapi answers pod logs with 406 to a
+    # text/plain Accept (it lists only json / yaml / protobuf), and the
+    # supervisor forwards this header since #3618. The direct reader in
+    # services/appliance/k8s.py sends ``*/*`` for the same reason.
     try:
-        status_code, body = await _proxy.k8s_call(
-            row.id, "GET", path, accept="text/plain", timeout=20.0
-        )
+        status_code, body = await _proxy.k8s_call(row.id, "GET", path, accept="*/*", timeout=20.0)
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
