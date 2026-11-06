@@ -314,35 +314,32 @@ describe("the list shows each request once, in plain words (#3252)", () => {
   });
 });
 
-describe("the approver is shown the template (#3251)", () => {
-  it("names it on the row and in the dialog", async () => {
-    getTemplate.mockResolvedValue({ id: "t1", name: "Branch office" });
-    rows.mockResolvedValue([req({ args: { template_id: "t1" } })]);
+describe("the approver is shown the template (#3251, #3649)", () => {
+  it("names it on the row and in the dialog from the request itself", async () => {
+    rows.mockResolvedValue([
+      req({ args: { template_id: "t1" }, template_name: "Branch office" }),
+    ]);
     renderPage();
     expect(await screen.findByText("Branch office")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() =>
       expect(screen.getAllByTestId("request-template").length).toBe(2),
     );
+    for (const line of screen.getAllByTestId("request-template"))
+      expect(line.textContent).toContain("Branch office");
+    // The viewer may hold no read on templates: the page never asks (#3649).
+    expect(getTemplate).not.toHaveBeenCalled();
   });
 
-  it("shows the id when the template cannot be read, never undefined", async () => {
-    getTemplate.mockRejectedValue({ response: { status: 403 } });
-    rows.mockResolvedValue([req({ args: { template_id: "tpl-42" } })]);
+  it("shows the id when the server resolved no name, never undefined", async () => {
+    rows.mockResolvedValue([
+      req({ args: { template_id: "tpl-42" }, template_name: null }),
+    ]);
     renderPage();
     const line = await screen.findByTestId("request-template");
-    await waitFor(() => expect(getTemplate).toHaveBeenCalled());
-    await waitFor(() => expect(line.textContent).toContain("tpl-42"));
+    expect(line.textContent).toContain("tpl-42");
     expect(line.textContent).not.toMatch(/undefined|…/);
-  });
-
-  it("shows the id while the lookup is still pending", async () => {
-    getTemplate.mockReturnValue(new Promise(() => {}));
-    rows.mockResolvedValue([req({ args: { template_id: "tpl-43" } })]);
-    renderPage();
-    const line = await screen.findByTestId("request-template");
-    expect(line.textContent).toContain("tpl-43");
-    expect(line.textContent).not.toMatch(/undefined|…/);
+    expect(getTemplate).not.toHaveBeenCalled();
   });
 
   it("shows nothing when the request names no template", async () => {
@@ -350,6 +347,24 @@ describe("the approver is shown the template (#3251)", () => {
     renderPage();
     await screen.findByText(/Carve 10.199.0.0\/28/);
     expect(screen.queryByTestId("request-template")).toBeNull();
+  });
+});
+
+describe("an approver is not offered a decision on their own request (#3648)", () => {
+  it("hides Approve and Reject on own row, keeps Withdraw", async () => {
+    rows.mockResolvedValue([req({ requested_by_user_id: "u9" })]);
+    renderPage();
+    await screen.findByRole("button", { name: "Withdraw" });
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  it("offers Approve and Reject on another user's row, without Withdraw", async () => {
+    rows.mockResolvedValue([req({ requested_by_user_id: "u1" })]);
+    renderPage();
+    await screen.findByRole("button", { name: "Approve" });
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Withdraw" })).toBeNull();
   });
 });
 

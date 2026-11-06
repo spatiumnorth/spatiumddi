@@ -57,6 +57,7 @@ from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
+from app.services.lock_order import lock_zone_rows
 
 logger = structlog.get_logger(__name__)
 
@@ -2115,6 +2116,10 @@ async def _queue_record_deletes(
             continue  # a zone in the trash is not served: nothing on the wire
         by_zone.setdefault(zone.id, (zone, []))[1].append(rec)
     wake: set[uuid.UUID] = set()
+    # #3617 — the zones' rows locked in id order before any serial bump below:
+    # bumped reverse-first, they were taken out of id order, against a DDNS
+    # publish taking the forward zone first (``app.services.lock_order``).
+    await lock_zone_rows(db, by_zone)
     # #1800 — reverse zones first, so a Technitium A/AAAA delete finds its PTR's
     # delete already queued and the re-assert queues no create that delete
     # would only undo.

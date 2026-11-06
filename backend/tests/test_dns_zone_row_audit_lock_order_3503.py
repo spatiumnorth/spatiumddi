@@ -212,7 +212,9 @@ async def test_trash_restore_waits_for_an_in_flight_record_create(
     assert resp.json()["restored"] == 1
     assert await _live_fqdns(zone_id) == ["old.api.example.com.", "r3503.api.example.com."]
     assert await _audited("dns_record", "restore")
-    assert "UPDATE dns_zone" in blocked_in, blocked_in
+    # The zone row itself: its serial bump, or the id-ordered zone pre-lock
+    # the re-push takes before it (#3617).
+    assert "UPDATE dns_zone" in blocked_in or "FOR NO KEY UPDATE" in blocked_in, blocked_in
     assert held_chain_lock is False
 
 
