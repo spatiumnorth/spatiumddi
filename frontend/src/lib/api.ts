@@ -6289,6 +6289,11 @@ export interface ServedApex {
   ns: string[];
   source: "declared" | "primary_ns" | "placeholder";
   placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
   // Split-horizon views that serve different apexes, in render order; empty
   // when they agree. The fields above are then the worst view's.
   by_view: ServedApexInView[];
@@ -6300,6 +6305,11 @@ export interface ServedApexInView {
   ns: string[];
   source: "declared" | "primary_ns" | "placeholder";
   placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
 }
 
 export interface DNSRecordPage extends Page<DNSRecord> {
@@ -7054,6 +7064,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_candidates: number;
+        push_skipped_matching: number;
         pushed: number;
         pushed_records: {
           name: string;

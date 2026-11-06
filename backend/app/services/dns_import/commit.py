@@ -39,6 +39,11 @@ from app.services.dns.record_ops import (
 )
 from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_apex import apex_name_length_error
+from app.services.dns_import.soa_mailbox import (
+    admin_email_warning,
+    importable_admin_email,
+    is_admin_email_warning,
+)
 from app.services.ipam.zone_binding import prune_zone_ids
 
 from . import cname_check
@@ -287,7 +292,8 @@ def _zone_kwargs_from_parsed(
         expire=_timer(soa.expire if soa else None, 3600000),
         minimum=_timer(soa.minimum if soa else None, 3600),
         primary_ns=primary_ns,
-        admin_email=soa.admin_email.rstrip(".") if soa and soa.admin_email else "",
+        # #3673 — held to Add Zone's rule; the preview warned if it was dropped.
+        admin_email=importable_admin_email(soa.admin_email if soa else None)[0],
         last_serial=soa.serial if soa else 0,
         forwarders=parsed.forwarders or [],
         forward_only=parsed.zone_type == "forward",
@@ -737,6 +743,15 @@ async def commit_import(
                     f"Zone {parsed.name!r}: SOA primary name {parsed.soa.primary_ns!r} "
                     "is not a fully qualified host name and was not imported; the "
                     "zone's first apex NS record is served as the SOA primary name instead"
+                )
+        if parsed.soa is not None and parsed.soa.admin_email:
+            _, mail_reason = importable_admin_email(parsed.soa.admin_email)
+            if mail_reason is not None and not any(
+                is_admin_email_warning(w, parsed.name) for w in warnings
+            ):
+                # #3673 — a plan that did not come through the preview's check.
+                warnings.append(
+                    admin_email_warning(parsed.name, parsed.soa.admin_email, mail_reason)
                 )
         if bind9_target and parsed.forwarders:
             kept, dropped = split_zone_forwarders(parsed.forwarders)
