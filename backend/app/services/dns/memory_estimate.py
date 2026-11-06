@@ -292,12 +292,13 @@ async def _zone_records_loaded(
     scoped to each view. A view's copy is keyed by the view-scoped records it
     adds, its view's ``allow-query`` (the agent shares only across equal
     ones) and, for a zone holding pool records under geo steering, the view
-    itself (geo views serve different members). Forward zones hold no data;
-    a secondary's records arrive by transfer and are not known here.
+    itself (geo views serve different members). A zone that accepts client
+    updates is never shared, so each view counts its own copy. Forward zones
+    hold no data; a secondary's records arrive by transfer and are not known here.
     """
     zones = (
         await db.execute(
-            select(DNSZone.id, DNSZone.view_id).where(
+            select(DNSZone.id, DNSZone.view_id, DNSZone.dynamic_update_enabled).where(
                 DNSZone.group_id == group_id,
                 DNSZone.deleted_at.is_(None),
                 DNSZone.zone_type == "primary",
@@ -325,7 +326,7 @@ async def _zone_records_loaded(
             pooled.add(zone_id)
 
     total = 0
-    for zone_id, zone_view_id in zones:
+    for zone_id, zone_view_id, zone_dynamic in zones:
         by_view = counts.get(zone_id, {})
         shared = by_view.get(None, 0)
         if not descs:
@@ -338,7 +339,7 @@ async def _zone_records_loaded(
             key = (
                 vd["id"] if own else None,
                 tuple(str(c) for c in (vd.get("allow_query") or [])),
-                vd["name"] if (geo_active and zone_id in pooled) else None,
+                vd["name"] if zone_dynamic or (geo_active and zone_id in pooled) else None,
             )
             per_view.append((vd["name"], key, shared + own))
         total += sum(records for _views, records in zone_copies(per_view))

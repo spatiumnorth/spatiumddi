@@ -1969,6 +1969,14 @@ def _view_carry_sources(
     return out
 
 
+def _zone_accepts_updates(zone: dict[str, Any]) -> bool:
+    """Whether the zone takes RFC 2136 updates from clients. The render adds
+    the operator's ``allow-update`` / ``update-policy`` grants (beyond the
+    control plane's own loopback key) only behind ``dynamic_update_enabled``,
+    the same switch the ``.owned`` sidecar keys on, so that is the test."""
+    return bool(zone.get("dynamic_update_enabled"))
+
+
 def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
     """What a view's copy of ``zone`` must match to share an earlier view's
     copy through ``in-view`` (#3551), or None when it can never share.
@@ -1989,8 +1997,14 @@ def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
 
     Forward zones never share: BIND refuses ``in-view`` of one (they are
     resolver configuration, not zone data, and cost nothing to repeat).
+
+    Neither does a zone that accepts client updates: one shared copy takes
+    an update sent through any view and answers every view with it, which
+    split-horizon exists to keep apart. Each view keeps its own copy.
     """
     if not zone.get("name") or zone.get("type", "primary") == "forward":
+        return None
+    if _zone_accepts_updates(zone):
         return None
     body = {k: v for k, v in zone.items() if k != "view_name"}
     return hashlib.sha256(

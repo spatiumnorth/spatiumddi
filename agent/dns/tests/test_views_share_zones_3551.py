@@ -353,19 +353,30 @@ def test_a_copy_holding_third_party_records_is_not_shared(tmp_path: Path) -> Non
     assert (root / "zones" / "default" / "example.com.db").is_file()
 
 
-def test_a_copy_already_shared_keeps_sharing(tmp_path: Path) -> None:
-    """Once shared, the defining copy's own updates are both views' data: a
-    journal on it is no reason to split."""
-    Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
-    live = _promote(tmp_path)
-    jnl = live / "zones" / "restricted" / "example.com.db.jnl"
-    jnl.write_bytes(b"journal")
+def test_a_dynamic_zone_is_never_shared_across_views(tmp_path: Path) -> None:
+    """An update sent through one view would land in the one shared copy and
+    be answered in every view, so a zone that accepts updates keeps a copy per
+    view even when its copies render identically."""
+    conf, root = _render(tmp_path, _bundle(_dynamic([_A])))
 
-    conf, _root = _render(tmp_path, _bundle(_dynamic([_A])))
+    assert "in-view" not in conf
+    assert conf.count('zone "example.com." { type master;') == 2
+    assert (root / "zones" / "restricted" / "example.com.db").is_file()
+    assert (root / "zones" / "default" / "example.com.db").is_file()
+    _checkconf(root / "named.conf")
 
-    assert 'zone "example.com." { in-view "restricted"; };' in _view_block(
+
+def test_a_static_identical_zone_still_shares_beside_a_dynamic_one(
+    tmp_path: Path,
+) -> None:
+    zones = _dynamic([_A]) + _both("static.example.com.", [_A])
+    conf, _root = _render(tmp_path, _bundle(zones))
+
+    assert 'zone "static.example.com." { in-view "restricted"; };' in _view_block(
         conf, "default"
     )
+    assert 'zone "example.com." { in-view' not in conf
+    assert conf.count('zone "example.com." { type master;') == 2
 
 
 def test_a_new_copy_of_a_shared_zone_carries_from_the_defining_copy(
@@ -375,8 +386,17 @@ def test_a_new_copy_of_a_shared_zone_carries_from_the_defining_copy(
     defining view's zone, so that is where its RFC 2136 records are."""
     from spatium_dns_agent.drivers.bind9 import _view_carry_sources
 
+    # The tree an earlier build left: the dynamic zone shared through in-view.
     Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
     live = _promote(tmp_path)
+    conf = (live / "named.conf").read_text()
+    default = _view_block(conf, "default")
+    start = default.index('zone "example.com."')
+    stanza = default[start : default.index("\n", start)]
+    (live / "named.conf").write_text(
+        conf.replace(stanza, 'zone "example.com." { in-view "restricted"; };')
+    )
+    (live / "zones" / "default" / "example.com.db").unlink()
     (live / "zones" / "restricted" / "example.com.db.jnl").write_bytes(b"journal")
     split = _dynamic([_A])
     split[1]["records"].append(_rec("only", "198.51.100.5"))
