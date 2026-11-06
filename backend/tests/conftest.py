@@ -250,6 +250,26 @@ def _audit_lock_order_guard() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _row_lock_order_guard() -> Iterator[None]:
+    """#3617 — fail a test whose transaction took ``dns_zone`` rows out of id
+    order, or a ``dhcp_lease`` row after an ``ip_address`` row: both orders
+    deadlock against the lease path's writers. See
+    ``app/services/lock_order.py`` and ``tests/_row_lock_order_guard.py``."""
+    from tests import _row_lock_order_guard as guard
+
+    guard.install()
+    guard.violations.clear()
+    yield
+    found = list(guard.violations)
+    guard.violations.clear()
+    if found:
+        pytest.fail(
+            "rows locked out of the lease → mirror → zone order (#3617):\n" + "\n".join(found),
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
 def _no_bundle_render_enqueue() -> Iterator[None]:
     """#1111 — DNS writes mark agent bundles dirty and, after commit, publish
     a render request to the Celery broker. The suite has no broker, so the
