@@ -13,4 +13,7 @@
   PTRs of DHCP lease and reservation mirrors are left out: the delete
   removes those mirrors, with their records, before it trashes the
   zone, so a lease granted or expiring in the meantime does not
-  refuse the approval.
+  refuse the approval. Upgrading changes these previews, so a subnet,
+  block or space delete still waiting for approval when you upgrade
+  can be refused at approval with "The change's scope changed since it
+  was requested"; cancel it and request the delete again.
