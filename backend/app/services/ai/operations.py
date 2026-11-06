@@ -590,6 +590,21 @@ async def _preview_create_ip_address(
         zone = await db.get(DNSZone, zone_id) if zone_id else None
         if zone is not None:
             rtype = "AAAA" if addr_obj.version == 6 else "A"
+            # #3647 — the address sync skips a forward record beside a CNAME
+            # (#1441), so promising one would be false. Refuse, as the DNS
+            # record kind does; the approve re-preview re-runs this, so a
+            # CNAME added since submit is refused the same way.
+            from app.services.dns.cname_conflict import (
+                describe_cname_conflict,
+                find_cname_conflict,
+            )
+
+            clash = await find_cname_conflict(
+                db, zone.id, view_id=None, name=args.hostname, record_type=rtype
+            )
+            if clash is not None:
+                owner = f"{args.hostname}.{zone.name.rstrip('.')}"
+                return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
             parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 

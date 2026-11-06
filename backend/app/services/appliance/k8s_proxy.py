@@ -79,6 +79,11 @@ _request_queues: dict[uuid.UUID, asyncio.Queue[K8sProxyRequest]] = defaultdict(a
 # in-flight request count — typically <10 across the whole fleet.
 _response_futures: dict[str, asyncio.Future[K8sProxyResponse]] = {}
 
+# #3618 — which appliance each in-flight request was queued for. A reply
+# is accepted only from that appliance's cert, so one approved appliance
+# cannot answer for another (feed the operator a forged pod list or log).
+_request_owner: dict[str, uuid.UUID] = {}
+
 
 async def enqueue_request(
     appliance_id: uuid.UUID,
@@ -114,6 +119,7 @@ async def enqueue_request(
 
     future: asyncio.Future[K8sProxyResponse] = asyncio.get_running_loop().create_future()
     _response_futures[request_id] = future
+    _request_owner[request_id] = appliance_id
 
     await _request_queues[appliance_id].put(request)
     logger.info(
@@ -140,6 +146,7 @@ async def enqueue_request(
         # Always evict the future map entry — late responses go to
         # ``deliver_response`` which logs + discards.
         _response_futures.pop(request_id, None)
+        _request_owner.pop(request_id, None)
 
 
 async def pop_request(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> K8sProxyRequest | None:
@@ -170,14 +177,24 @@ async def pop_request(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> K8sP
         return request
 
 
-def deliver_response(response: K8sProxyResponse) -> bool:
+def deliver_response(response: K8sProxyResponse, *, appliance_id: uuid.UUID) -> bool:
     """Hand a supervisor-returned response to the awaiting future.
 
     Returns True on successful match, False when the future has
     already been GC'd (operator timed out, future evicted from the
-    map). The supervisor's POST returns 204 either way — late
-    delivery isn't a supervisor-side error.
+    map) or when ``appliance_id`` — the appliance whose cert posted
+    the reply — is not the one the request was queued for. The
+    supervisor's POST returns 200 either way — late delivery isn't a
+    supervisor-side error.
     """
+    owner = _request_owner.get(response.request_id)
+    if owner is not None and owner != appliance_id:
+        logger.warning(
+            "appliance.k8s_proxy.reply_wrong_appliance",
+            request_id=response.request_id,
+            appliance_id=str(appliance_id),
+        )
+        return False
     future = _response_futures.get(response.request_id)
     if future is None or future.done():
         logger.info(
