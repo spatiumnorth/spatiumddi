@@ -296,17 +296,14 @@ async def lock_zones_for_addresses(
     await lock_zone_rows(db, zones)
 
 
-async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> None:
-    """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
-    write: the zones holding a record of any of their addresses (the lease
-    mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
-    and the reverse zones the subnets are linked to (retired or re-linked)."""
+async def zone_ids_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> set[Any]:
+    """The zones a write over ``subnet_ids`` may touch: the zones holding a
+    record of any of their addresses (the lease mirrors' DDNS, the subnet's own
+    A / PTR) and the reverse zones the subnets are linked to."""
     from app.models.dns import DNSRecord, DNSZone  # noqa: PLC0415
     from app.models.ipam import IPAddress  # noqa: PLC0415
 
     ids = sorted({s for s in subnet_ids if s is not None})
-    if not ids:
-        return
     zones: set[Any] = set()
     for i in range(0, len(ids), _CHUNK):
         chunk = ids[i : i + _CHUNK]
@@ -330,13 +327,22 @@ async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) ->
             .scalars()
             .all()
         )
-    await lock_zone_rows(db, zones)
+    return zones
+
+
+async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> None:
+    """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
+    write: the zones holding a record of any of their addresses (the lease
+    mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
+    and the reverse zones the subnets are linked to (retired or re-linked)."""
+    await lock_zone_rows(db, await zone_ids_for_subnets(db, subnet_ids))
 
 
 __all__ = [
     "lock_lease_rows",
     "lock_mirror_rows",
     "lock_zones_for_subnets",
+    "zone_ids_for_subnets",
     "lock_zone_rows",
     "lock_zones_for_addresses",
     "lock_zones_for_sync",

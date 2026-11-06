@@ -861,6 +861,26 @@ async def restore_batch(
     if result.conflicts and not skip_conflicts:
         return RestoreResult(conflicts=result.conflicts)
 
+    # #3627: every zone this restore will write, locked in id order BEFORE the
+    # first row is un-stamped. The un-stamp of a restored (reverse) zone and the
+    # re-push of the records of a zone that stayed otherwise take their zones
+    # in whatever order the batch yields them, against a DDNS write that takes
+    # forward then reverse by id. Zones are step 3 of the lease / mirror / zone
+    # order (``app.services.lock_order``); nothing of steps 1 and 2 is written
+    # yet, so the whole order holds.
+    from app.services.lock_order import lock_zone_rows, zone_ids_for_subnets  # noqa: PLC0415
+
+    to_lock: set[Any] = set(zone_ids)
+    to_lock.update(o.zone_id for o in result.restored if isinstance(o, DNSRecord))
+    to_lock.update(
+        await zone_ids_for_subnets(
+            db,
+            [o.id for o in result.restored if isinstance(o, Subnet)]
+            + [o.subnet_id for o in result.restored if isinstance(o, DHCPScope)],
+        )
+    )
+    await lock_zone_rows(db, to_lock)
+
     # #2732 — records whose OTHER owner, their address's subnet, is still in
     # the Trash are not restored with their zone: they move to the subnet's
     # batch before the zone's UPDATE below, which then no longer matches them.
