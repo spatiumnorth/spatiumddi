@@ -379,6 +379,41 @@ def test_a_static_identical_zone_still_shares_beside_a_dynamic_one(
     assert conf.count('zone "example.com." { type master;') == 2
 
 
+_GROUP_KEY = {
+    "name": "spatium-loop.",
+    "secret": "c2VjcmV0c2VjcmV0",
+    "algorithm": "hmac-sha256",
+    "loopback": True,
+}
+_OPERATOR_KEY = {"name": "aaa-ops.", "secret": "b3BzLXhmZXI=", "algorithm": "hmac-sha256"}
+
+
+def test_the_group_key_grant_alone_does_not_stop_sharing(tmp_path: Path) -> None:
+    """Every primary zone grants the control plane's own key; that key is
+    not a client's, so a static zone still shares."""
+    bundle = _bundle(_both("example.com.", [_A]))
+    bundle["tsig_keys"] = [_GROUP_KEY, _OPERATOR_KEY]
+    conf, _root = _render(tmp_path, bundle)
+
+    assert 'zone "example.com." { in-view "restricted"; };' in _view_block(
+        conf, "default"
+    )
+
+
+def test_a_zone_an_operator_key_may_update_is_not_shared(tmp_path: Path) -> None:
+    """With no group key, the first operator key takes the loopback grant on
+    every primary zone (#2835). Clients hold that key, so a static zone is
+    updatable by them and keeps a copy per view, like a dynamic one."""
+    bundle = _bundle(_both("example.com.", [_A]))
+    bundle["tsig_keys"] = [_OPERATOR_KEY]
+    conf, root = _render(tmp_path, bundle)
+
+    assert 'key "aaa-ops."' in conf and "allow-update" in conf
+    assert "in-view" not in conf
+    assert conf.count('zone "example.com." { type master;') == 2
+    assert (root / "zones" / "default" / "example.com.db").is_file()
+
+
 def test_a_new_copy_of_a_shared_zone_carries_from_the_defining_copy(
     tmp_path: Path,
 ) -> None:

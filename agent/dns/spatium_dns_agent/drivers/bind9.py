@@ -1969,15 +1969,29 @@ def _view_carry_sources(
     return out
 
 
-def _zone_accepts_updates(zone: dict[str, Any]) -> bool:
+def _zone_accepts_updates(zone: dict[str, Any], *, foreign_loopback: bool = False) -> bool:
     """Whether the zone takes RFC 2136 updates from clients. The render adds
     the operator's ``allow-update`` / ``update-policy`` grants (beyond the
-    control plane's own loopback key) only behind ``dynamic_update_enabled``,
-    the same switch the ``.owned`` sidecar keys on, so that is the test."""
-    return bool(zone.get("dynamic_update_enabled"))
+    loopback key) only behind ``dynamic_update_enabled``, the same switch the
+    ``.owned`` sidecar keys on.
+
+    The loopback grant, on every primary zone, is a client grant too when
+    the key standing in for it is not the control plane's own
+    (``foreign_loopback``): a group with no usable group key renders its
+    first operator key there (#2835), and clients hold that key."""
+    if zone.get("dynamic_update_enabled"):
+        return True
+    return foreign_loopback and zone.get("type", "primary") not in {
+        "forward",
+        "secondary",
+        "slave",
+        "stub",
+    }
 
 
-def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
+def _view_share_key(
+    zone: dict[str, Any], view: dict[str, Any], *, foreign_loopback: bool = False
+) -> str | None:
     """What a view's copy of ``zone`` must match to share an earlier view's
     copy through ``in-view`` (#3551), or None when it can never share.
 
@@ -2000,11 +2014,12 @@ def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
 
     Neither does a zone that accepts client updates: one shared copy takes
     an update sent through any view and answers every view with it, which
-    split-horizon exists to keep apart. Each view keeps its own copy.
+    split-horizon exists to keep apart. Each view keeps its own copy
+    (``_zone_accepts_updates``).
     """
     if not zone.get("name") or zone.get("type", "primary") == "forward":
         return None
-    if _zone_accepts_updates(zone):
+    if _zone_accepts_updates(zone, foreign_loopback=foreign_loopback):
         return None
     body = {k: v for k, v in zone.items() if k != "view_name"}
     return hashlib.sha256(
@@ -3288,7 +3303,9 @@ class Bind9Driver(DriverBase):
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
-                    share = _view_share_key(zone, view)
+                    share = _view_share_key(
+                        zone, view, foreign_loopback=bool(tsig_keys) and not loopback_owned
+                    )
                     zname = zone.get("name") or ""
                     if share is not None:
                         owner = defined_in.get(zname, {}).get(share)
