@@ -670,17 +670,53 @@ describe("an address's Delete matches the server's gate (#3409)", () => {
     expect(await detailButtons(row)).toContain("Delete");
   });
 
-  it("offers it on a delete grant scoped to any address set, as the gate admits", async () => {
-    // ``_ADDRESS_SET_ROUTES`` admits DELETE /addresses/{id} on ANY delete
-    // grant on an address set (``has_any_grant_for``); the handler then
-    // wants write on the row, here through the subnet.
+  it("offers it on a delete grant scoped to an address set holding the address", async () => {
+    // The gate admits any address-set delete grant; the handler then wants a
+    // delete grant covering THIS address, here through the set that holds it.
+    answers.addressSetsApi = {
+      list: () =>
+        Promise.resolve([
+          {
+            id: "set-here",
+            subnet_id: "sub-1",
+            range_kind: "contiguous",
+            start_address: "10.142.1.10",
+            end_address: "10.142.1.30",
+            explicit_addresses: [],
+          },
+        ]),
+    };
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "address_set", "set-here"],
+    ]);
+    const row = await open();
+    await waitFor(() => expect(inline(row).disabled).toBe(false));
+  });
+
+  it("disables it on a delete grant scoped to a set that does not hold the address", async () => {
+    answers.addressSetsApi = {
+      list: () =>
+        Promise.resolve([
+          {
+            id: "set-elsewhere",
+            subnet_id: "sub-1",
+            range_kind: "contiguous",
+            start_address: "10.142.1.200",
+            end_address: "10.142.1.220",
+            explicit_addresses: [],
+          },
+        ]),
+    };
     signInAs([
       ["read", "*"],
       ["write", "subnet"],
       ["delete", "address_set", "set-elsewhere"],
     ]);
     const row = await open();
-    expect(inline(row).disabled).toBe(false);
+    await settle();
+    expect(inline(row).disabled).toBe(true);
   });
 
   it("keeps Clean Orphans disabled on an address-set delete grant", async () => {
