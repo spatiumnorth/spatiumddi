@@ -7820,7 +7820,7 @@ async def k8s_proxy_reply(
         headers=body.headers,
         body_b64=body.body_b64,
     )
-    delivered = _proxy.deliver_response(response)
+    delivered = _proxy.deliver_response(response, appliance_id=appliance.id)
     logger.info(
         "appliance.k8s_proxy.reply",
         appliance_id=str(appliance.id),
@@ -8761,6 +8761,23 @@ class ApplianceWorkloadRow(BaseModel):
     last_restarted_at: str | None = None
 
 
+# #3618 — every operator-supplied kubeapi identifier is a DNS-1123 name
+# before it is spliced into a proxied path, so ``?`` / ``&`` / ``/`` / ``..``
+# can never change which request the supervisor is asked to run. The
+# supervisor applies its own allowlist as well; this gives the caller a
+# 422 naming the field instead of a relayed 403.
+_K8S_NAME_PATTERN = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+_K8S_LABEL_PATTERN = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+
+
+def _require_k8s_name(field: str, value: str, *, pattern: str = _K8S_NAME_PATTERN) -> None:
+    if not re.fullmatch(pattern, value):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{field}: not a valid Kubernetes name",
+        )
+
+
 class ApplianceWorkloadsResponse(BaseModel):
     workloads: list[ApplianceWorkloadRow]
     #: Per-kind failures. Reported rather than raised so a cluster with an
@@ -8798,6 +8815,7 @@ async def k8s_list_workloads(
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
     from app.services.service_control import kube as _kube  # noqa: PLC0415
 
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8855,8 +8873,10 @@ class ApplianceRestartDeploymentRequest(BaseModel):
     # workload kind the appliance runs, so restricting the restart to two
     # of the three would leave rows in the picker that error on click.
     kind: Literal["Deployment", "DaemonSet", "StatefulSet"]
-    namespace: str = Field(default="spatium", min_length=1, max_length=64)
-    name: str = Field(min_length=1, max_length=253)
+    namespace: str = Field(
+        default="spatium", min_length=1, max_length=63, pattern=_K8S_LABEL_PATTERN
+    )
+    name: str = Field(min_length=1, max_length=253, pattern=_K8S_NAME_PATTERN)
 
 
 @router.post(
@@ -9239,6 +9259,7 @@ async def k8s_list_pods(
             f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
         )
 
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
     path = f"/api/v1/namespaces/{namespace}/pods"
     try:
         status_code, body = await _proxy.k8s_call(row.id, "GET", path, timeout=15.0)
@@ -9330,10 +9351,12 @@ async def k8s_get_pod_logs(
             f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
         )
 
-    # Reject obvious path-injection on operator-supplied strings —
-    # the proxy concatenates them into the kubeapi URL.
-    if "/" in pod or "/" in namespace or (container and "/" in container):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid identifier")
+    # Reject path / query injection on operator-supplied strings —
+    # the proxy concatenates them into the kubeapi URL (#3618).
+    _require_k8s_name("pod", pod)
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    if container:
+        _require_k8s_name("container", container, pattern=_K8S_LABEL_PATTERN)
     tail = max(1, min(10_000, tail_lines))
 
     # Context before the window, so a key the window starts inside is caught
@@ -9348,10 +9371,12 @@ async def k8s_get_pod_logs(
     if container:
         path += f"&container={container}"
 
+    # ``*/*``, not ``text/plain``: kubeapi answers pod logs with 406 to a
+    # text/plain Accept (it lists only json / yaml / protobuf), and the
+    # supervisor forwards this header since #3618. The direct reader in
+    # services/appliance/k8s.py sends ``*/*`` for the same reason.
     try:
-        status_code, body = await _proxy.k8s_call(
-            row.id, "GET", path, accept="text/plain", timeout=20.0
-        )
+        status_code, body = await _proxy.k8s_call(row.id, "GET", path, accept="*/*", timeout=20.0)
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,

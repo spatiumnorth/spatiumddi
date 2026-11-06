@@ -36,7 +36,9 @@ class SupervisorConfig:
             # strip; this is belt-and-braces so the env contract is
             # operator-friendly too.
             bootstrap_pairing_code="".join(
-                ch for ch in os.environ.get("BOOTSTRAP_PAIRING_CODE", "") if ch.isdigit()
+                ch
+                for ch in os.environ.get("BOOTSTRAP_PAIRING_CODE", "")
+                if ch.isdigit()
             ),
             heartbeat_interval_seconds=int(
                 # 30s default cadence — operator feedback that 60s
@@ -49,15 +51,15 @@ class SupervisorConfig:
                 # separate cadence and doesn't change.
                 os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30")
             ),
-            # Phase 4 (#183) control-plane → kubeapi proxy. The
-            # supervisor's loop long-polls a control-plane endpoint that
-            # isn't shipped yet, so on current control planes every poll
-            # returns 404 — ~12 log lines/min per appliance. Default to
-            # disabled until the control-plane half lands; flip the env
-            # to opt in for development against a branch that has it.
-            k8s_proxy_enabled=os.environ.get("K8S_PROXY_ENABLED", "").lower() in (
-                "1", "true", "yes", "on",
-            ),
+            # Phase 4 (#183) control-plane -> kubeapi proxy. It was
+            # default-off while the control-plane half had not landed
+            # (every poll 404'd); that half has shipped, and with the
+            # loop off the Fleet pod list and pod logs always answer
+            # 504 (#3618). Default on like the nettool / storage / pcap
+            # loops; K8S_PROXY_ENABLED=false stays as the opt-out. The
+            # loop only polls on a k3s runtime, so it is dormant elsewhere.
+            k8s_proxy_enabled=os.environ.get("K8S_PROXY_ENABLED", "true").lower()
+            in ("1", "true", "yes", "on"),
             # Phase 9 (#183) firewall management. The original in-pod
             # path tried to nft-write inside the pod (broken — pod fs
             # has no /etc/nftables.conf to reload) so this was gated
@@ -70,5 +72,6 @@ class SupervisorConfig:
             # so default on; flip to off only as a panic-disable.
             in_pod_firewall_enabled=os.environ.get(
                 "IN_POD_FIREWALL_ENABLED", "true"
-            ).lower() in ("1", "true", "yes", "on"),
+            ).lower()
+            in ("1", "true", "yes", "on"),
         )
