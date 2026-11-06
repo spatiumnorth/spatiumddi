@@ -89,15 +89,19 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
 
     Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, plus
     the reverse zones a subnet, block or space delete then retires into that
-    batch, chosen by the apply's own rule, and the records of the batch's
-    addresses it retracts into the batch from zones that stay, so the preview
-    reflects exactly what would be soft-deleted right now. Counts are grouped
-    by resource type and rendered in a fixed order so the string is
-    deterministic for a given set of rows (the approve-time drift compare is a
-    plain string equality, so ordering must not jitter). The root row itself is
-    excluded from the cascade counts (it's the target, not collateral)."""
+    batch, chosen by the apply's own rule, with the records still in them when
+    it stamps the batch, and the records of the batch's addresses it retracts
+    into the batch from zones that stay, so the preview reflects exactly what
+    would be soft-deleted right now. Counts are grouped by resource type and
+    rendered in a fixed order so the string is deterministic for a given set
+    of rows (the approve-time drift compare is a plain string equality, so
+    ordering must not jitter). The root row itself is excluded from the
+    cascade counts (it's the target, not collateral)."""
     # Local import — keep the soft_delete dependency off module load.
-    from app.services.dns.record_ops import count_records_to_retract  # noqa: PLC0415
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        count_held_records_deleted_first,
+        count_records_to_retract,
+    )
     from app.services.dns.reverse_zone import add_retiring_reverse_zones  # noqa: PLC0415
     from app.services.soft_delete import (  # noqa: PLC0415
         _resource_type,
@@ -114,12 +118,19 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     counts = batch.counts()
     root_rt = _resource_type(root)
     counts[root_rt] = counts.get(root_rt, 0) - 1
-    # The apply then retracts into the batch the records of its subnets'
-    # addresses in zones that stay (#1906); counted with the batch's records,
-    # as the trash holds them (#3536).
-    retracted = await count_records_to_retract(db, batch, not_(_mirrors_torn_down_first(root)))
-    if retracted:
-        counts["dns_record"] = counts.get("dns_record", 0) + retracted
+    # Before its stamp the apply deletes the DHCP mirrors of the batch's
+    # subnets, with their records (#3536). It never trashes their records in
+    # the zones above, so they come off the zones' count, and a lease granted
+    # or expiring in between leaves the preview as it was (#3511). The apply
+    # then retracts into the batch the records of its subnets' other addresses
+    # in zones that stay (#1906), counted with the batch's records, as the
+    # trash holds them.
+    torn_down_first = _mirrors_torn_down_first(root)
+    counts["dns_record"] = (
+        counts.get("dns_record", 0)
+        - await count_held_records_deleted_first(db, batch, torn_down_first)
+        + await count_records_to_retract(db, batch, not_(torn_down_first))
+    )
     labels = {
         "ip_block": "child block",
         "subnet": "subnet",
@@ -161,7 +172,9 @@ def _mirrors_torn_down_first(root: Any) -> Any:
     (``_purge_leases_for_scope_batch``), and for a subnet its every lease
     mirror (``_revoke_subnet_lease_mirrors``). Their records go with them, so
     the retraction never sees them, and neither does the preview's count of it
-    (spatiumddi#3536)."""
+    (spatiumddi#3536); nor does the stamp of a reverse zone the delete trashes,
+    so the preview's count of that zone's records leaves them out too
+    (spatiumddi#3511)."""
     from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
 

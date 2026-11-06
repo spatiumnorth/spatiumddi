@@ -9,4 +9,8 @@
   one of those zones between the request and the approval did not
   refuse the approval. The preview now counts them ("1 DNS zone, 2 DNS
   records"), chosen by the same rule the delete uses, so a change in
-  them refuses the approval as a change in any other count does.
+  them refuses the approval as a change in any other count does. The
+  PTRs of DHCP lease and reservation mirrors are left out: the delete
+  removes those mirrors, with their records, before it trashes the
+  zone, so a lease granted or expiring in the meantime does not
+  refuse the approval.
