@@ -7054,6 +7054,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_candidates: number;
+        push_skipped_matching: number;
         pushed: number;
         pushed_records: {
           name: string;

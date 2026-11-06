@@ -10750,6 +10750,8 @@ class SyncWithServerResponse(BaseModel):
     imported_records: list[dict]
     # Push (DB → server)
     push_candidates: int
+    # #3671 — the zone's records the server already holds, so none was pushed.
+    push_skipped_matching: int = 0
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
@@ -10830,6 +10832,7 @@ async def sync_zone_with_server_endpoint(
         skipped_unsupported=result.pull.skipped_unsupported,
         imported_records=result.pull.imported_records,
         push_candidates=result.push.candidates,
+        push_skipped_matching=result.push.already_matched,
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
