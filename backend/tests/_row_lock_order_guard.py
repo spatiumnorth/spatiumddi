@@ -46,15 +46,17 @@ from tests._audit_lock_order_guard import _LOCKED as _AUDIT_LOCKED
 from tests._audit_lock_order_guard import _OWN_DIRS, _app_stack, _caller_frames
 
 _ZONES = "_row_lock_guard_zones"
+_OWN_ZONES = "_row_lock_guard_own_zones"
 _LEASES = "_row_lock_guard_leases"
 _MIRROR = "_row_lock_guard_mirror"
 
 _ZONE, _LEASE, _MIRROR_TABLE = "dns_zone", "dhcp_lease", "ip_address"
 _TABLES = {DNSZone: _ZONE, DHCPLease: _LEASE, IPAddress: _MIRROR_TABLE}
 
-#: Entry points known to take these rows out of order, NOT fixed here, each
-#: with why. A violation under one of these frames is not recorded. Keep it
-#: short: every entry is a deadlock waiting for its interleaving.
+#: Entry points known to take ``dns_zone`` rows out of id order, NOT fixed
+#: here, each with why. A zone-order violation under one of these frames is
+#: not recorded; a lease-after-mirror one still is. Keep it short: every entry
+#: is a deadlock waiting for its interleaving.
 KNOWN_UNFIXED: dict[str, str] = {
     "restore_row": (
         "a Trash restore un-stamps the restored rows (a reverse zone among "
@@ -79,18 +81,21 @@ def _next_zone_id() -> uuid.UUID:
     return uuid.UUID(int=_ZONE_ID_HIGH | next(_zone_counter))
 
 
-def _record(session: Session, what: str) -> None:
+def _record(session: Session, what: str, *, zone_order: bool = False) -> None:
     frames = _caller_frames()
     if not any(f.filename.startswith(_OWN_DIRS[0]) for f in frames):
         return  # a test arranging its own data, not an app path
-    if any(f.name in KNOWN_UNFIXED for f in frames):
+    if zone_order and any(f.name in KNOWN_UNFIXED for f in frames):
         return
     violations.append(f"{what}; at {_app_stack(frames)}")
 
 
 def _lock_zones(session: Session, ids: set[Any], how: str) -> None:
     held: set[Any] = session.info.setdefault(_ZONES, set())
-    new = {z for z in ids if z is not None and z not in held}
+    # A zone this transaction inserted: no other transaction can wait for it,
+    # so it is neither a new lock nor a held one to compare against.
+    own: set[Any] = session.info.get(_OWN_ZONES, set())
+    new = {z for z in ids if z is not None and z not in held and z not in own}
     if not new:
         return
     if held and min(new) < max(held):
@@ -98,6 +103,7 @@ def _lock_zones(session: Session, ids: set[Any], how: str) -> None:
             session,
             f"dns_zone {sorted(map(str, new))} locked ({how}) while holding the "
             f"higher-id dns_zone {max(held)}: zone rows out of id order",
+            zone_order=True,
         )
     held.update(new)
 
@@ -131,7 +137,7 @@ def _before_flush(session: Session, _ctx: Any, _instances: Any) -> None:
         if isinstance(obj, DNSZone):
             if obj.id is None:
                 obj.id = _next_zone_id()
-            session.info.setdefault(_ZONES, set()).add(obj.id)
+            session.info.setdefault(_OWN_ZONES, set()).add(obj.id)
         elif isinstance(obj, DHCPLease) and obj.id is not None:
             session.info.setdefault(_LEASES, set()).add(obj.id)
     touched = [o for o in (*session.dirty, *session.deleted) if _modified(session, o)]
@@ -204,7 +210,7 @@ def _do_orm_execute(state: Any) -> Any:
         name == _ZONE
         and state.execution_options.get("lock_order") == "zone_prelock"
         and session.info.get(_AUDIT_LOCKED)
-        and ids - session.info.get(_ZONES, set())
+        and ids - session.info.get(_ZONES, set()) - session.info.get(_OWN_ZONES, set())
     ):
         _record(session, "dns_zone pre-locked after the audit-chain lock")
     if name == _ZONE:
@@ -220,6 +226,7 @@ def _do_orm_execute(state: Any) -> Any:
 def _after_transaction_end(session: Session, transaction: SessionTransaction) -> None:
     if transaction.parent is None:
         session.info.pop(_ZONES, None)
+        session.info.pop(_OWN_ZONES, None)
         session.info.pop(_LEASES, None)
         session.info.pop(_MIRROR, None)
 

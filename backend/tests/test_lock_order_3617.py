@@ -433,3 +433,100 @@ async def test_subnet_soft_delete_and_expiry_sweep_do_not_deadlock(
         )
     ).all()
     assert mirrors == []
+
+
+# ── A permanent subnet delete with scopes in two groups ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_permanent_subnet_delete_locks_every_scope_lease_first(
+    db_session: AsyncSession,
+) -> None:
+    """A subnet served by two server groups has two scopes. The permanent
+    delete tore them down one at a time, and each teardown locks the subnet's
+    lease mirrors, so the second scope's lease rows were locked after the
+    first's mirrors: lease rows after ``ip_address`` rows, the order the
+    expiry sweep takes the other way round. The autouse row-lock guard
+    (``tests/_row_lock_order_guard.py``) fails this test on that order."""
+    from app.services.ai.operations_risky import DeleteSubnetArgs, _apply_delete_subnet
+
+    subnet = await _plain_subnet(db_session, "10.36.19.0/24")
+    kea_a, scope_a = await _server(db_session, "kea", subnet)
+    kea_b, scope_b = await _server(db_session, "kea", subnet)
+    user = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Test",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    soon = datetime.now(UTC) + timedelta(hours=1)
+    db_session.add(user)
+    for n, (srv, scope) in ((10, (kea_a, scope_a)), (20, (kea_b, scope_b))):
+        db_session.add_all(
+            [
+                DHCPLease(
+                    server_id=srv.id,
+                    scope_id=scope.id,
+                    ip_address=f"10.36.19.{n}",
+                    mac_address=f"aa:bb:cc:36:19:{n}",
+                    state="active",
+                    expires_at=soon,
+                ),
+                IPAddress(
+                    subnet_id=subnet.id,
+                    address=f"10.36.19.{n}",
+                    status="dhcp",
+                    auto_from_lease=True,
+                    hostname=f"h{n}",
+                ),
+            ]
+        )
+    await db_session.commit()
+    subnet_id = subnet.id
+
+    await _apply_delete_subnet(
+        db_session, user, DeleteSubnetArgs(subnet_id=subnet_id, force=True, permanent=True)
+    )
+
+    left = (
+        await db_session.execute(
+            select(DHCPLease.id).where(DHCPLease.scope_id.in_([scope_a.id, scope_b.id]))
+        )
+    ).all()
+    assert left == []
+    assert await db_session.get(Subnet, subnet_id, populate_existing=True) is None
+
+
+# ── The guard itself ────────────────────────────────────────────────────────
+
+
+def test_row_lock_guard_does_not_count_an_inserted_zone_as_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zone the transaction inserted cannot be waited for by another one,
+    so locking an older zone after it is no cycle. Counted as held, every
+    path that creates a zone and then writes an existing one would fail the
+    suite (in tests the new zone always has the highest id). A real out-of-
+    order pair of existing zones is still recorded."""
+    from sqlalchemy.orm import Session
+
+    from app.models.dns import DNSZone
+    from tests import _row_lock_order_guard as guard
+
+    recorded: list[str] = []
+    monkeypatch.setattr(guard, "_record", lambda _s, what, **_kw: recorded.append(what))
+    older, old_b = guard._next_zone_id(), guard._next_zone_id()
+
+    session = Session()
+    session.add(DNSZone(name="new.example.com."))
+    guard._before_flush(session, None, None)
+    guard._lock_zones(session, {older}, "flush")
+    assert recorded == []
+
+    guard._lock_zones(session, {old_b}, "flush")  # higher than ``older``: in order
+    assert recorded == []
+    other = Session()
+    guard._lock_zones(other, {old_b}, "flush")
+    guard._lock_zones(other, {older}, "flush")  # lower than one held
+    assert len(recorded) == 1 and "out of id order" in recorded[0]

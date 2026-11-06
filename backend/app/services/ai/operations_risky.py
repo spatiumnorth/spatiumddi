@@ -447,6 +447,14 @@ async def _apply_delete_subnet(
     # Recounted with the block below, never per scope: a recount holds its
     # locks to commit, through the next scope's push (#3354).
     touched: set[UUID] = set()
+    # #3617: every scope's lease rows before the first teardown. Each one
+    # locks the subnet's lease mirrors, so a subnet served by two groups had
+    # its second scope's leases locked after the first's mirrors.
+    if scope_rows:
+        from app.models.dhcp import DHCPLease  # noqa: PLC0415
+        from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+
+        await lock_lease_rows(db, DHCPLease.scope_id.in_([s.id for s in scope_rows]))
     for scope in scope_rows:
         await push_scope_delete(db, scope)
         # Leases have a nullable ON DELETE SET NULL backlink to the scope, so the
