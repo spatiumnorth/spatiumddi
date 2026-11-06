@@ -83,7 +83,8 @@ function CountBadge({
  * read on "manage_asns": without it the list is never asked (#3466) and a
  * linked ASN reads "linked, not shown", as the space's ASN line does. */
 function AsnNumberCell({ asnId }: { asnId: string | null | undefined }) {
-  const canRead = usePermissions().can("read", "manage_asns");
+  const perms = usePermissions();
+  const canRead = perms.can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
@@ -97,9 +98,14 @@ function AsnNumberCell({ asnId }: { asnId: string | null | undefined }) {
     return (
       <span
         className="text-muted-foreground"
-        title="This VRF names an ASN you may not read (manage_asns)"
+        title={
+          perms.unanswered ??
+          "This VRF names an ASN you may not read (manage_asns)"
+        }
       >
-        linked, not shown
+        {perms.unanswered
+          ? "linked, checking permissions"
+          : "linked, not shown"}
       </span>
     );
   }
@@ -160,7 +166,8 @@ export function VRFEditorModal({
   // single customer is enough: the API narrows the list). Without any, the
   // list is never asked (#3466) and the picker says why, as the ASN picker
   // does, instead of showing "None" over a linked customer.
-  const canReadCustomers = usePermissions().hasAnyGrantFor("read", "customer");
+  const customerPerms = usePermissions();
+  const canReadCustomers = customerPerms.hasAnyGrantFor("read", "customer");
   const [error, setError] = useState<string | null>(null);
 
   const rdValid = rd.trim() === "" || isValidRdRt(rd);
@@ -272,12 +279,16 @@ export function VRFEditorModal({
               className={inputCls}
               value={customerId ? "linked" : ""}
               disabled
-              title="Your role cannot read customers, so this cannot be changed here."
+              title={
+                customerPerms.unanswered ??
+                "Your role cannot read customers, so this cannot be changed here."
+              }
             >
               <option value="">{"\u2014 None \u2014"}</option>
               {customerId && (
                 <option value="linked">
-                  Linked (not visible to your role)
+                  {customerPerms.unanswered ??
+                    "Linked (not visible to your role)"}
                 </option>
               )}
             </select>

@@ -41,7 +41,10 @@ vi.mock("@/lib/api", async () => {
   };
 });
 
-vi.mock("@/hooks/usePermissions", () => ({
+vi.mock("@/hooks/usePermissions", async () => ({
+  ...(await vi.importActual<typeof import("@/hooks/usePermissions")>(
+    "@/hooks/usePermissions",
+  )),
   usePermissions: () => ({ can: () => true, isSuperadmin: true }),
 }));
 
