@@ -7948,7 +7948,7 @@ async def nettool_reply(
         result=body.result,
         error=body.error,
     )
-    delivered = _cmd.deliver_result(result)
+    delivered = _cmd.deliver_result(result, appliance_id=appliance.id)
     logger.info(
         "appliance.nettool.reply",
         appliance_id=str(appliance.id),
@@ -8046,6 +8046,7 @@ async def storage_reply(
         )
     delivered = _cmd.deliver_result(
         _cmd.NetToolResult(request_id=request_id, result=body.result, error=body.error),
+        appliance_id=appliance.id,
         channel=_cmd.CHANNEL_STORAGE,
     )
     logger.info(
