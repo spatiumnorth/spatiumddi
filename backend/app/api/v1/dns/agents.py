@@ -226,6 +226,10 @@ class AgentHeartbeatRequest(BaseModel):
     # than 422-ing the heartbeat. Absent (None) on a pre-#1077 agent, which
     # leaves the stored value untouched.
     spool: dict[str, Any] | None = None
+    # #3551 — the agent container's cgroup memory limit in bytes; null when
+    # the container has none. Absent on an older agent, which leaves the
+    # stored value untouched (an explicit null clears it).
+    memory_limit_bytes: int | None = Field(default=None, ge=0)
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     # Cumulative failed APPLY ATTEMPTS since the agent started, retries
@@ -1246,6 +1250,9 @@ async def agent_heartbeat(
         )
         # #1077 — spool state. Only written when the heartbeat carries it.
         apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
+        # #3551 — the container's memory limit, for the group memory estimate.
+        if "memory_limit_bytes" in body.model_fields_set:
+            server.memory_limit_bytes = body.memory_limit_bytes or None
         # #1067 — the daemon state. ``body.daemon`` has been declared on this model
         # since it was written and read by nothing: an agent whose ``named`` never
         # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was

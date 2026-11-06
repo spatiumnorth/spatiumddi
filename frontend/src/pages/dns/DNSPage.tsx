@@ -65,6 +65,7 @@ import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
+import { DnsMemoryBanner } from "./DnsMemoryBanner";
 import { DelegationModal } from "./DelegationModal";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
@@ -6679,6 +6680,20 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </button>
       </div>
 
+      {hasBind && (
+        <DnsMemoryBanner
+          groupId={group.id}
+          refreshKey={JSON.stringify([
+            views.map((v) => v.id),
+            blocklists.map((b) => [
+              b.id,
+              b.applied_group_ids,
+              b.applied_view_ids,
+            ]),
+          ])}
+        />
+      )}
+
       {servers.length > 0 && !hasBind && (
         <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           <strong>This group runs no BIND9 server.</strong> Views and
@@ -8012,6 +8027,16 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     tlsVerify: techUnsupported && opts?.forward_tls_verify !== false,
     forwardFirst: techUnsupported && opts?.forward_policy !== "first",
   };
+  // #3560: BIND9 9.20 will not load ``dnssec-validation yes`` without a
+  // trust anchor, so the API refuses the change on a group that renders
+  // BIND9 (an empty group counts). Offered only once an anchor exists; a
+  // group already stored at ``yes`` keeps the option so it can be re-saved.
+  const rendersBind9 =
+    groupServers.length === 0 || groupServers.some((s) => s.driver === "bind9");
+  const dnssecYesLocked =
+    rendersBind9 &&
+    (opts?.trust_anchors?.length ?? 0) === 0 &&
+    opts?.dnssec_validation !== "yes";
   const techReason =
     "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
 
@@ -8587,13 +8612,25 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <option value="auto">
               auto — validate using built-in managed keys (recommended)
             </option>
-            <option value="yes">
+            <option value="yes" disabled={dnssecYesLocked}>
               yes — validate; only against trust anchors added via the API
               (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {dnssecYesLocked && (
+          <p className="text-xs text-muted-foreground">
+            &quot;yes&quot; needs a trust anchor first: BIND 9.20 will not load
+            it without one. Add an anchor with POST
+            /dns/groups/&#123;id&#125;/options/trust-anchors, or use
+            &quot;auto&quot; (BIND&apos;s built-in root key). A root
+            (&quot;.&quot;) anchor must be initial-key (is_initial_key: true,
+            the default): a static root anchor is refused, because BIND will not
+            load it beside &quot;auto&quot; and it stops validating at the next
+            root key rollover.
+          </p>
+        )}
         {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
           <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
             {opts?.dnssec_warnings?.map((w) => (
@@ -10870,6 +10907,17 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           </button>
         </div>
       </div>
+      <DnsMemoryBanner
+        groupId={group.id}
+        refreshKey={JSON.stringify(
+          lists.map((b) => [
+            b.id,
+            b.applied_group_ids,
+            b.applied_view_ids,
+            b.entry_count,
+          ]),
+        )}
+      />
       {showCatalog && (
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}
@@ -11605,7 +11653,16 @@ export function BlocklistDetail({
           Last synced: {new Date(list.last_synced_at).toLocaleString()}
           {list.last_sync_status && <> — {list.last_sync_status}</>}
           {list.last_sync_error && (
-            <span className="text-destructive"> ({list.last_sync_error})</span>
+            <span
+              className={
+                list.last_sync_status === "error"
+                  ? "text-destructive"
+                  : "text-amber-600"
+              }
+            >
+              {" "}
+              ({list.last_sync_error})
+            </span>
           )}
         </p>
       )}

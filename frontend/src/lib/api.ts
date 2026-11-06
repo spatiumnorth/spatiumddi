@@ -5299,8 +5299,43 @@ export interface DNSServerGroup {
    *  driver; says where an existing group falls outside its supported scope
    *  (second server, pools). Empty for every other group. */
   scope_warnings?: string[];
+  /** #3551 — estimated named memory against the agents' limit. Filled by
+   *  `getGroup` only (null on the list, and for a group with no BIND9
+   *  server); `getMemoryEstimate` returns the same object. */
+  memory_estimate?: DNSMemoryEstimate | null;
   created_at: string;
   modified_at: string;
+}
+
+/** #3551 — one blocklist (RPZ) zone as named loads it. */
+export interface DNSMemoryRpzLoad {
+  zone: string;
+  views: string[];
+  entries: number;
+  estimated_bytes: number;
+}
+
+/** #3551 — a BIND9 group's estimated named memory against the memory limit
+ *  its agents report. Each view that applies a blocklist loads its own copy
+ *  of it (BIND cannot share one between views), so `warn` is set at 80 % of
+ *  the limit. `limit_source` is `default` when no agent has reported a limit
+ *  and the shipped 2 GiB DNS pod limit is assumed. */
+export interface DNSMemoryEstimate {
+  group_id: string;
+  estimated_bytes: number;
+  limit_bytes: number;
+  limit_source: "agent" | "default";
+  limit_server: string | null;
+  unknown_limit_servers: string[];
+  percent: number;
+  warn: boolean;
+  message: string | null;
+  baseline_bytes: number;
+  zone_records_loaded: number;
+  zone_bytes: number;
+  rpz_bytes: number;
+  rpz: DNSMemoryRpzLoad[];
+  views: string[];
 }
 
 /** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
@@ -5733,10 +5768,6 @@ export interface DNSServerOptions {
   recursion_enabled: boolean;
   allow_recursion: string[];
   dnssec_validation: string;
-  gss_tsig_enabled: boolean;
-  gss_tsig_keytab_path: string | null;
-  gss_tsig_realm: string | null;
-  gss_tsig_principal: string | null;
   notify_enabled: string;
   also_notify: string[];
   allow_notify: string[];
@@ -5869,6 +5900,9 @@ export interface DNSView {
   order: number;
   allow_query: string[] | null;
   allow_query_cache: string[] | null;
+  /** #3551 — set on the list when the group's estimated named memory is at
+   *  80 % or more of its agents' limit. */
+  memory_warning?: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -6362,6 +6396,11 @@ export const dnsApi = {
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
   getGroup: (id: string) =>
     api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
+  // #3551 — estimated named memory against the agents' limit.
+  getMemoryEstimate: (groupId: string) =>
+    api
+      .get<DNSMemoryEstimate | null>(`/dns/groups/${groupId}/memory-estimate`)
+      .then((r) => r.data),
   // Multi-resolver propagation check
   checkPropagation: (body: {
     name: string;
@@ -7165,6 +7204,9 @@ export interface DNSBlockList {
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+  /** #3551 — set when a BIND9 group this list is applied to is estimated at
+   *  80 % or more of its agents' memory limit. */
+  memory_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
@@ -7181,6 +7223,8 @@ export interface DNSBlockListFeedSkipped {
   bare_star?: number;
   dotless?: number;
   other?: number;
+  /** hosts / domains feeds: tokens that are not DNS names (#3531). */
+  invalid_name?: number;
 }
 
 export interface DNSBlockListEntry {

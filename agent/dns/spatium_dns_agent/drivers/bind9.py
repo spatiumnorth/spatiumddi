@@ -21,7 +21,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -1892,6 +1892,116 @@ def _zone_rel(zname: str, view: str | None) -> str:
     return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
 
 
+_VIEW_OPEN_LINE = re.compile(r'^view "([^"]+)" \{$')
+_IN_VIEW_LINE = re.compile(r'^\s*zone "([^"]+)" \{ in-view "([^"]+)"; \};$')
+
+
+def _in_view_map(tree: Path) -> dict[tuple[str, str], str]:
+    """``{(zone, view): defining view}`` for every ``in-view`` reference in
+    a rendered tree's ``named.conf`` (#3551).
+
+    The zone is spelled as its file is (no trailing dot), so the keys line up
+    with ``_zone_views_under``. Empty when the file cannot be read, or the
+    tree predates zone sharing."""
+    try:
+        text = (tree / "named.conf").read_text(errors="replace")
+    except OSError:
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    view: str | None = None
+    for line in text.splitlines():
+        opened = _VIEW_OPEN_LINE.match(line)
+        if opened:
+            view = opened.group(1)
+            continue
+        ref = _IN_VIEW_LINE.match(line)
+        if ref and view is not None:
+            out[(ref.group(1).rstrip("."), view)] = ref.group(2)
+    return out
+
+
+def _share_would_merge(
+    prev: Path,
+    prev_in_view: dict[tuple[str, str], str],
+    zname: str,
+    view: str,
+    owner: str,
+) -> bool:
+    """Whether referencing ``owner``'s copy of ``zname`` from ``view`` would
+    merge RFC 2136 records named holds in one copy into the other (#3551).
+
+    The bundle says what the control plane renders, not what named serves: a
+    dynamic zone's live copy can hold records a third party wrote into one
+    view only (#2850). Sharing such a pair would drop the referencing view's
+    records with its file, or show it the defining view's, which split-horizon
+    exists to keep apart. So a pair shares only when it already did, or when
+    neither live copy holds anything beyond a render. Otherwise each keeps its
+    own copy, exactly as before sharing existed."""
+    if prev_in_view.get((zname, view)) == owner:
+        return False
+    for v in (view, owner):
+        live = prev / _zone_rel(zname, v)
+        if _owned_sidecar(live).is_file() and _may_hold_unrendered(live):
+            return True
+    return False
+
+
+def _view_carry_sources(
+    new_dir: Path, prev: Path
+) -> dict[tuple[str, str | None], tuple[str, str | None]]:
+    """Each zone copy of the render that is new to its view because that view
+    referenced another view's copy with ``in-view`` in the tree it replaces,
+    mapped to that defining copy (#3551).
+
+    What named served in the view was the defining view's zone, RFC 2136
+    records included, so that is what the copy carries them from when the
+    view takes a copy of its own again."""
+    out: dict[tuple[str, str | None], tuple[str, str | None]] = {}
+    if not prev.exists():
+        return out
+    for (zname, view), owner in _in_view_map(prev).items():
+        if (
+            (new_dir / _zone_rel(zname, view)).is_file()
+            and not (prev / _zone_rel(zname, view)).exists()
+            and (prev / _zone_rel(zname, owner)).is_file()
+        ):
+            out[(zname, view)] = (zname, owner)
+    return out
+
+
+def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
+    """What a view's copy of ``zone`` must match to share an earlier view's
+    copy through ``in-view`` (#3551), or None when it can never share.
+
+    Under split-horizon every zone used to load once per view, so memory
+    scaled with views × data. A copy that would render identically is now
+    loaded once and referenced from the later views. The zone stanza and
+    file are a pure function of the bundle copy (plus render-wide state such
+    as the group key), so two copies equal apart from ``view_name`` render
+    the same bytes: same records (a ``view_id`` record makes the copies
+    differ, #24), same ``allow-update`` / ``allow-transfer`` / notify /
+    DNSSEC options.
+
+    The view's own ``allow-query`` is part of the key too. A shared zone
+    takes its query ACL from the view that DEFINES it, so referencing it
+    from a view with a wider ``allow-query`` would refuse that view's
+    clients (verified against BIND 9.20: REFUSED).
+
+    Forward zones never share: BIND refuses ``in-view`` of one (they are
+    resolver configuration, not zone data, and cost nothing to repeat).
+    """
+    if not zone.get("name") or zone.get("type", "primary") == "forward":
+        return None
+    body = {k: v for k, v in zone.items() if k != "view_name"}
+    return hashlib.sha256(
+        json.dumps(
+            [body, [str(c) for c in (view.get("allow_query") or [])]],
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _zone_label(zname: str, view: str | None) -> str:
     return f"{zname} (view {view})" if view else zname
 
@@ -2806,14 +2916,15 @@ class Bind9Driver(DriverBase):
         forwarders = opts.get("forwarders") or []
         recursion = "yes" if opts.get("recursion_enabled", True) else "no"
         allow_query = "; ".join(opts.get("allow_query") or ["any"])
+        # The group's own setting, blocklists or not (#3563). This used to be
+        # forced to ``no`` whenever a blocklist was attached, on the claim that
+        # BIND SERVFAILs a DO=1 query for a blocked signed name even with
+        # ``break-dnssec yes``. It does not: ``break-dnssec yes`` (rendered on
+        # every response-policy below) applies the rewrite regardless of DO,
+        # and the override only turned validation off for every UNblocked name
+        # while Settings still showed it on. Proven against a live named by
+        # tests/live_rpz_dnssec_check.py.
         dnssec = opts.get("dnssec_validation", "auto")
-        # RPZ rewrites break DNSSEC chain validation: even with
-        # `break-dnssec yes`, BIND9 returns SERVFAIL to clients that set the
-        # DO bit on DNSSEC-signed domains being blocked. For a blocking
-        # appliance the user intent is "block, don't validate", so silently
-        # disable validation when blocklists are present.
-        if bundle.get("blocklists"):
-            dnssec = "no"
         # Encrypted transports (issue #50). ``has_cert`` gates the listeners
         # on cert material actually being present in the bundle, not just on
         # the operator's intent flag — see _render_tls_statements.
@@ -2916,10 +3027,10 @@ class Bind9Driver(DriverBase):
             zones_list = "; ".join(
                 f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
             )
-            # break-dnssec lets RPZ rewrite responses from DNSSEC-signed zones
-            # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
-            # blocking use-case this is what you want: the user intent is to
-            # block, not to preserve validation integrity.
+            # break-dnssec lets RPZ rewrite answers for DNSSEC-signed names to
+            # clients that set DO=1 too; with ``no``, BIND serves those clients
+            # the real signed answer, so the block would not apply to them.
+            # Validation of every other name is unaffected (#3563).
             # qname-wait-recurse no (#2427): BIND's default (yes) resolves the
             # qname first and does not rewrite a failed lookup, so a blocked
             # name whose upstream is dead answered SERVFAIL after ~10 s instead
@@ -3115,8 +3226,30 @@ class Bind9Driver(DriverBase):
             # zone of its own (#1706). Files are namespaced per view (zones/<view>/...) so
             # identical zone names across views don't collide. Views are
             # already ordered low→high by the control plane for first-match
-            # precedence.
+            # precedence, and that order is never changed here: it is what
+            # decides which view a client lands in.
+            #
+            # #3551 — a zone whose copy in this view would render exactly as
+            # in an EARLIER view is loaded once, in that earlier view, and
+            # referenced here with ``in-view``. BIND needs the defining view
+            # above the referencing one, which picking the first view to hold
+            # the copy guarantees without reordering anything. Only the
+            # defining view gets a file, so everything that walks the rendered
+            # tree (freeze/thaw, reload, serial reads, held zones) addresses
+            # the one zone named actually holds. RPZ zones are NOT shared:
+            # BIND refuses a response-policy zone defined by ``in-view``
+            # ("is not a primary or secondary zone"), so each view using a
+            # list still loads its own copy.
             global_bls = [bl for bl in blocklists if bl.get("view_name") is None]
+            # zone name -> {share key: defining view}
+            defined_in: dict[str, dict[str, str]] = {}
+            # The tree this render replaces: what named serves now. A pair of
+            # copies whose live data differs beyond the render does not start
+            # sharing (``_share_would_merge``).
+            live_tree = self.state_dir / self.rendered_dir_name
+            if not live_tree.exists():
+                live_tree = self.state_dir / "rendered.prev"
+            live_in_view = _in_view_map(live_tree)
             for view in views:
                 vname = view.get("name") or ""
                 if not vname:
@@ -3141,7 +3274,31 @@ class Bind9Driver(DriverBase):
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
-                    body += _zone_stanza(zone, f"{vname}/")
+                    share = _view_share_key(zone, view)
+                    zname = zone.get("name") or ""
+                    if share is not None:
+                        owner = defined_in.get(zname, {}).get(share)
+                        if owner is not None and _share_would_merge(
+                            live_tree, live_in_view, zname.rstrip("."), vname, owner
+                        ):
+                            log.info(
+                                "bind9_view_zone_not_shared",
+                                zone=zname,
+                                view=vname,
+                                defining_view=owner,
+                                reason="a live copy holds RFC 2136 records "
+                                "the render does not; each view keeps its own",
+                            )
+                            owner = None
+                        if owner is not None:
+                            body += f'zone "{zname}" {{ in-view "{owner}"; }};\n'
+                            continue
+                    stanza = _zone_stanza(zone, f"{vname}/")
+                    # A copy that rendered nothing (a secondary with no
+                    # masters) defines nothing a later view could reference.
+                    if share is not None and stanza:
+                        defined_in.setdefault(zname, {}).setdefault(share, vname)
+                    body += stanza
                 for bl in view_bls:
                     body += _rpz_stanza(bl, f"{vname}/")
                 md = [str(m) for m in (view.get("match_destinations") or [])]
@@ -4097,13 +4254,16 @@ class Bind9Driver(DriverBase):
         # before they are read back, and reloaded with them once the render
         # carries them.
         carry = self._carry_candidates(new_dir, prev_tree)
+        # #3551 — a copy a view takes back from a shared zone carries from
+        # the defining view's live copy, which is what that view served.
+        sources = _view_carry_sources(new_dir, prev_tree)
         if changed is not None:
             changed |= carry
         frozen: dict[tuple[str, str | None], int | None] = {}
         running = bool(rndc and current.exists() and self.daemon_running())
         if running:
             frozen = self._freeze_before_swap(
-                base, new_dir, current, changed, carry=carry
+                base, new_dir, current, changed, carry=carry, sources=sources
             )
         # Until thawed, a zone frozen here refuses every update: whatever
         # fails below, nothing may leave it frozen.
@@ -4111,7 +4271,9 @@ class Bind9Driver(DriverBase):
         try:
             # Zones no running named froze (a start, or a freeze refused):
             # the frozen ones were carried inside the freeze (#2850).
-            unfrozen = carry - frozen.keys()
+            unfrozen = {
+                zv for zv in carry - frozen.keys() if sources.get(zv) not in frozen
+            }
             if unfrozen:
                 # A running named that refused the freeze may still take an
                 # update after the zone is read back, and the reload would
@@ -4124,7 +4286,7 @@ class Bind9Driver(DriverBase):
                     else set()
                 )
                 self._carry_dynamic_updates(
-                    new_dir, prev_tree, unfrozen, frozen, hold=hold
+                    new_dir, prev_tree, unfrozen, frozen, hold=hold, sources=sources
                 )
             # No running named decided these zones' serials (the freeze does
             # on a running one): every zone at a start, and the zones a
@@ -4182,11 +4344,12 @@ class Bind9Driver(DriverBase):
         dynamic zone each time."""
         if not prev.exists():
             return set()
+        sources = _view_carry_sources(new_dir, prev)
         return {
             zv
             for zv in _zone_views_under(new_dir)
             if _owned_sidecar(new_dir / _zone_rel(*zv)).is_file()
-            and _may_hold_unrendered(prev / _zone_rel(*zv))
+            and _may_hold_unrendered(prev / _zone_rel(*sources.get(zv, zv)))
         }
 
     def _carry_dynamic_updates(
@@ -4196,6 +4359,7 @@ class Bind9Driver(DriverBase):
         zones: Collection[tuple[str, str | None]],
         frozen: Collection[tuple[str, str | None]],
         hold: Collection[tuple[str, str | None]] = (),
+        sources: Mapping[tuple[str, str | None], tuple[str, str | None]] | None = None,
     ) -> None:
         """Carry what named holds of each of ``zones`` and the render lacks
         into the staged file, before the swap sets named's copy aside (#2850).
@@ -4213,11 +4377,20 @@ class Bind9Driver(DriverBase):
         render rather than its records. A file the checker reads and refuses
         is not held: named cannot load it either, and holding it would leave
         the zone unserved and fail every later apply. The render replaces it,
-        and the records only named held are reported lost."""
+        and the records only named held are reported lost.
+
+        ``sources``: a zone whose live copy is another view's (#3551), read
+        from that copy instead of its own path."""
         held = {(h.zone, h.view) for h in self.held_back if h.served}
         results = _parallel_map(
             lambda zv: self._carry_zone(
-                new_dir, prev, zv, zv in held, zv in frozen, zv in hold
+                new_dir,
+                prev,
+                zv,
+                zv in held,
+                zv in frozen,
+                zv in hold,
+                source=(sources or {}).get(zv),
             ),
             sorted(zones, key=lambda zv: (zv[0], zv[1] or "")),
         )
@@ -4233,11 +4406,12 @@ class Bind9Driver(DriverBase):
         held: bool,
         frozen: bool,
         hold: bool = False,
+        source: tuple[str, str | None] | None = None,
     ) -> HeldZone | None:
         zname, view = zv
         rel = _zone_rel(zname, view)
         staged = new_dir / rel
-        live = prev / rel
+        live = prev / _zone_rel(*(source or zv))
         state = _named_zone_state(zname, live, new_dir)
         if isinstance(state, _Unloadable):
             # named cannot load this file either, so holding the zone on it
@@ -4794,6 +4968,7 @@ class Bind9Driver(DriverBase):
         live: Path,
         changed: set[tuple[str, str | None]] | None,
         carry: Collection[tuple[str, str | None]] = (),
+        sources: Mapping[tuple[str, str | None], tuple[str, str | None]] | None = None,
     ) -> dict[tuple[str, str | None], int | None]:
         """Freeze each changed zone named serves, and wait until named has
         written it to its live file, before the new render goes in (#1407).
@@ -4837,7 +5012,7 @@ class Bind9Driver(DriverBase):
         froze: list[tuple[str, str | None]] = []
         try:
             return self._freeze_and_wait(
-                base, new_dir, live, changed, froze, carry=carry
+                base, new_dir, live, changed, froze, carry=carry, sources=sources
             )
         except BaseException:
             if froze:
@@ -4852,6 +5027,7 @@ class Bind9Driver(DriverBase):
         changed: set[tuple[str, str | None]] | None,
         froze: list[tuple[str, str | None]],
         carry: Collection[tuple[str, str | None]] = (),
+        sources: Mapping[tuple[str, str | None], tuple[str, str | None]] | None = None,
     ) -> dict[tuple[str, str | None], int | None]:
         """``_freeze_before_swap``'s body; appends each zone to ``froze`` the
         moment named confirms the freeze.
@@ -4923,8 +5099,19 @@ class Bind9Driver(DriverBase):
                 and _may_hold_unrendered(live / _zone_rel(*zv))
             )
         ]
+        # #3551 — a copy a view takes back from a shared zone carries from the
+        # defining view's copy, once that copy is frozen and written out.
+        sources = sources or {}
+        carried += [
+            zv
+            for zv, src in sources.items()
+            if src in frozen
+            and zv not in frozen
+            and _owned_sidecar(new_dir / _zone_rel(*zv)).is_file()
+            and _may_hold_unrendered(live / _zone_rel(*src))
+        ]
         if carried:
-            self._carry_dynamic_updates(new_dir, live, carried, frozen)
+            self._carry_dynamic_updates(new_dir, live, carried, frozen, sources=sources)
         for (zname, view), serving in frozen.items():
             staged = new_dir / _zone_rel(zname, view)
             serial = _soa_serial(staged)
@@ -5988,10 +6175,12 @@ class Bind9Driver(DriverBase):
         key_tag = rec.get("key_tag")
         if not shutil.which("rndc"):
             raise RuntimeError("rndc not available — cannot roll DNSSEC key")
-        # #1946 — under split-horizon the zone is loaded once per view that
-        # holds it, and a bare ``rndc dnssec … <zone>`` then fails with "zone
-        # was found in multiple views". Roll it in every view that holds it
-        # (BIND 9.20: each view's copy rolls; the key files are shared).
+        # #1946 — under split-horizon a zone whose copies differ per view is
+        # loaded once per view, and a bare ``rndc dnssec … <zone>`` then
+        # fails with "zone was found in multiple views". Roll it in every view
+        # that holds a copy (BIND 9.20: each view's copy rolls; the key files
+        # are shared). A copy shared through ``in-view`` (#3551) is one zone,
+        # addressed in its defining view only.
         failures: list[str] = []
         for scope in self._zone_rndc_scopes(zone):
             cmd = [

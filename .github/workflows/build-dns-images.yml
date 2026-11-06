@@ -114,6 +114,21 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_axfr_check.py
 
+      # Issue #3563 — a blocklist must not switch DNSSEC validation off. Signs
+      # example.com. locally, serves it from a second named, and asserts that
+      # the agent-rendered resolver rewrites a blocked signed name for DO=1
+      # and DO=0 clients, answers a SafeSearch-style redirect (#878) of a
+      # signed name with its target, sets AD on an unblocked one, and
+      # SERVFAILs a bogus-signed one (global and per-view response-policy).
+      # Exits non-zero on any failed expectation; never skips.
+      - name: RPZ + DNSSEC validation check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_rpz_dnssec_check.py
+
       # Issue #2249 — toggling query / response logging on a RUNNING named,
       # through the agent's real render + reload path. `rndc reconfig`
       # applies neither switch, so this is the only proof the explicit
@@ -142,6 +157,21 @@ jobs:
             -v "$PWD/agent/dns/tests:/checks:ro" \
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_dynamic_restart_check.py
+
+      # Issue #3551 — under split-horizon an identical zone is defined in
+      # one view and referenced from the others with `in-view`, so it loads
+      # once instead of once per view. Proves named accepts the result, that
+      # the shared zone answers in every view (picked by client source), that
+      # a record change and a shared <-> per-view transition both converge on
+      # a running named, and that a view's #920 transfer key is answered from
+      # the shared zone. Runs as `spatium`, like the agent.
+      - name: Views zone-sharing check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_views_share_check.py
 
       # get.trivy.dev, which trivy-action's own setup downloads from,
       # is gone (#3464): install from the GitHub release instead.

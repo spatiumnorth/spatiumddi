@@ -1253,6 +1253,12 @@ class SettingsUpdate(BaseModel):
             raise ValueError(
                 "dns_default_dnssec_validation must be one of " f"{sorted(DNSSEC_VALIDATION_MODES)}"
             )
+        if v == "yes":
+            raise ValueError(
+                "dns_default_dnssec_validation 'yes' is refused: a new group has no trust "
+                "anchor and BIND9 will not load 'dnssec-validation yes' without one. Use "
+                "'auto' (the built-in root key); set 'yes' per group once it has an anchor."
+            )
         return v
 
     @field_validator("resolver_mode")

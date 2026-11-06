@@ -1911,7 +1911,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="Default DNSSEC Validation"
-                  description="Default DNSSEC validation mode for new server groups."
+                  description="Default DNSSEC validation mode for new server groups. A new group has no trust anchor, and BIND 9.20 will not load 'yes' without one, so 'yes' is set per group once it has an anchor."
                 >
                   <select
                     value={values.dns_default_dnssec_validation ?? "auto"}
@@ -1922,7 +1922,11 @@ export function SettingsPage() {
                     className={inputCls}
                   >
                     <option value="auto">auto (recommended)</option>
-                    <option value="yes">yes — manual trust anchors</option>
+                    {/* #3560: refused by the API; kept (disabled) so a
+                        default stored before the refusal still displays. */}
+                    <option value="yes" disabled>
+                      yes — not available as a default (needs a trust anchor)
+                    </option>
                     <option value="no">no — disabled</option>
                   </select>
                 </Field>

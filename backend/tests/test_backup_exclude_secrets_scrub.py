@@ -74,7 +74,6 @@ _NOT_SECRETS: dict[tuple[str, str], str] = {
     ("dns_ingest_snapshot", "record_keys"): "record name, type and value as served in DNS",
     ("dns_server_group", "tsig_key_name"): "key name, not the secret",
     ("dns_server_group", "tsig_key_algorithm"): "algorithm name",
-    ("dns_server_options", "gss_tsig_keytab_path"): "filesystem path",
     ("dns_trust_anchor", "public_key"): "public DNSKEY",
     ("dnssec_key", "key_type"): "KSK / ZSK label",
     ("firewall_apply_state", "rendered_hash"): "ruleset digest",

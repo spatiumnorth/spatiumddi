@@ -26,9 +26,21 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import Select, String, and_, cast, exists, func, not_, or_, select, update
+from sqlalchemy import (
+    Select,
+    String,
+    and_,
+    cast,
+    event,
+    exists,
+    func,
+    not_,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import Session, SessionTransaction, aliased
 
 from app.db import exists_including_deleted
 from app.models.audit import AuditLog
@@ -55,8 +67,9 @@ INTEGRATION_OWNERSHIP: dict[str, str] = {
 INTEGRATION_OWNERSHIP_FKS: frozenset[str] = frozenset(INTEGRATION_OWNERSHIP)
 
 # #2577 — the audit action of the row ``release_outside_space`` writes for each
-# release, one per target per sync that released anything. The Integrations
-# dashboard lists these as reconciler warnings.
+# release, one per target per sync that released anything. #3532: also the row
+# ``retire_vanished_subnet`` writes when it keeps a subnet whose source network
+# is gone. The Integrations dashboard lists these as reconciler warnings.
 RELEASE_AUDIT_ACTION = "integration.release_outside_space"
 
 # #2577 — the sync error of a target whose IP space is in Trash. The sync
@@ -108,12 +121,10 @@ async def subnet_has_surviving_addresses(
     ``Subnet`` takes every address in it with it — including operator
     allocations, rows another integration owns, and the caller's own rows
     an operator edited (``user_modified_at`` set), which the address pass
-    would otherwise un-claim and keep. A mirror whose upstream network
-    left the desired set must check here first and un-claim the subnet
-    (clear its own FK) instead of deleting it when this returns True.
-    The OPNsense and firewall-mirror reconcilers hand-rolled this check
-    first; every other mirror goes through here so the predicate can't
-    drift again.
+    would otherwise un-claim and keep. It is the address half of
+    :func:`subnet_operator_state`, the full keep test a mirror's vanished
+    subnet (:func:`retire_vanished_subnet`) and a target delete both use;
+    on its own it misses a DHCP scope on the subnet (#3532).
 
     The subnet's untouched gateway placeholder (#3347: the UniFi and
     firewall-family mirrors keep one, unowned, as New Subnet does) is not a
@@ -210,6 +221,241 @@ def _jsonb_nonempty(col: Any) -> Any:
     return and_(col.is_not(None), cast(col, String).not_in(("{}", "[]", "null")))
 
 
+# #3532 / #3503 — the audit rows ``retire_vanished_subnet`` writes, held on the
+# session until its commit. A reconciler retires its vanished subnets early in
+# a sync and goes on to retract DNS records (its address absence-delete, the
+# next subnet's retraction), which bumps zone serials. An audit row added in
+# between is flushed by the next query's autoflush, which takes the audit-chain
+# lock, so every zone row written after it is written under the lock: the
+# order that deadlocks against a record create holding that zone (#3389,
+# #3503). Added at commit, they are flushed after every zone write.
+_DEFERRED_AUDIT_KEY = "integration_ownership_deferred_audit"
+
+
+def _defer_audit(db: AsyncSession, row: AuditLog) -> None:
+    db.info.setdefault(_DEFERRED_AUDIT_KEY, []).append(row)
+
+
+@event.listens_for(Session, "before_commit")
+def _add_deferred_audit(session: Session) -> None:
+    rows = session.info.pop(_DEFERRED_AUDIT_KEY, None)
+    if rows:
+        session.add_all(rows)
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _drop_deferred_audit(session: Session, transaction: SessionTransaction) -> None:
+    # A rolled-back sync wrote nothing, so neither do its audit rows.
+    if transaction.parent is None:
+        session.info.pop(_DEFERRED_AUDIT_KEY, None)
+
+
+async def subnet_operator_state(db: AsyncSession, subnet: Subnet, own_fk: str) -> list[str]:
+    """What keeps a mirrored subnet from being deleted with its source (#3532).
+
+    The one keep test for a subnet an integration owns: a target delete
+    (:func:`release_integration_rows`, #2287) and every reconciler whose
+    upstream network left the desired set (:func:`retire_vanished_subnet`)
+    both ask it, so the two cannot drift again. Before #3532 the vanished
+    path asked only :func:`subnet_has_surviving_addresses`, so a DHCP scope
+    on the subnet — live or in the Trash — went with it through the
+    ``dhcp_scope.subnet_id`` cascade, pools and reservations included.
+
+    Returns the reasons, empty when the subnet is purely mirrored:
+
+    * ``tags`` / ``custom_fields`` set on it;
+    * ``addresses`` — an address that is not purely the caller's own
+      survives (:func:`subnet_has_surviving_addresses`), or one an operator
+      registry row points at (:func:`address_registry_ref`);
+    * ``registry`` / ``domain_link`` — an OT zone, E911 binding, address
+      set or subnet-domain link hangs off it (:func:`subnet_operator_ref`);
+    * ``dhcp_scope`` — a DHCP scope on it, live or in the Trash;
+    * ``operator_edit`` — a person edited it (a user-written audit row).
+    """
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.models.ipam import SubnetDomain  # noqa: PLC0415
+
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    reasons: list[str] = []
+    if subnet.tags:
+        reasons.append("tags")
+    if subnet.custom_fields:
+        reasons.append("custom_fields")
+    if await subnet_has_surviving_addresses(db, subnet.id, own_fk) or await db.scalar(
+        select(exists().where(IPAddress.subnet_id == subnet.id, address_registry_ref(IPAddress.id)))
+    ):
+        reasons.append("addresses")
+    if await db.scalar(select(subnet_registry_ref(subnet.id))):
+        reasons.append("registry")
+    if await db.scalar(
+        select(func.count()).select_from(SubnetDomain).where(SubnetDomain.subnet_id == subnet.id)
+    ):
+        reasons.append("domain_link")
+    # include_deleted: a scope in the Trash is the operator's too, and the
+    # cascade would take it out of the Trash for good.
+    if await db.scalar(
+        select(func.count())
+        .select_from(DHCPScope)
+        .where(DHCPScope.subnet_id == subnet.id)
+        .execution_options(include_deleted=True)
+    ):
+        reasons.append("dhcp_scope")
+    if await db.scalar(select(_operator_touched("subnet", str(subnet.id)))):
+        reasons.append("operator_edit")
+    return reasons
+
+
+async def drop_wrapper_block(
+    db: AsyncSession, wrapper: IPBlock, own_fk: str, *, warnings: list[str] | None = None
+) -> bool:
+    """Delete an integration's wrapper block that backs no mirrored subnet (#3556).
+
+    Every mirror's wrapper-block pass calls this in place of its own
+    soft-delete-filtered "any subnet left?" check. That check misses a subnet
+    in the Trash, and the block delete then fails on the ``subnet.block_id``
+    ``RESTRICT`` foreign key, failing the whole sync on every tick. A child
+    block (live or trashed) is counted too: ``ip_block.parent_block_id`` is
+    ``CASCADE``, so the delete would destroy it with the wrapper (#3492's
+    rule, as :func:`release_outside_space` applies it). Returns True when the
+    block was deleted (the caller counts it).
+
+    Anything still under it keeps the block, still owned by the caller, and
+    changes nothing. Kept owned rather than released, so a network that
+    reappears is mirrored back into this same wrapper (it is the caller's
+    wrapper at that CIDR), and the block goes on the first tick after the
+    Trash entry is purged, instead of being left behind as an orphaned
+    "Auto-created for …" block nothing will ever remove. A subnet in the Trash
+    still restores into it. ``warnings`` gets a line while a trashed subnet is
+    what holds it, which the Trash's own retention bounds.
+    """
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    child = aliased(IPBlock)
+    any_subnet, any_child = (
+        await db.execute(
+            select(
+                exists_including_deleted(Subnet.block_id == wrapper.id),
+                exists_including_deleted(child.parent_block_id == wrapper.id),
+            )
+        )
+    ).one()
+    if not (any_subnet or any_child):
+        await db.delete(wrapper)
+        return True
+    live_subnet = await db.scalar(
+        select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
+    )
+    if any_subnet and not live_subnet and warnings is not None:
+        warnings.append(
+            f"wrapper block {wrapper.network} of {INTEGRATION_OWNERSHIP[own_fk]} was kept: "
+            "a subnet in the Trash still sits under it (#3556)"
+        )
+    return False
+
+
+async def retire_vanished_subnet(
+    db: AsyncSession, subnet: Subnet, own_fk: str, *, warnings: list[str] | None = None
+) -> bool:
+    """Retire a subnet the caller owns whose upstream network is gone (#3532).
+
+    Every mirror's subnet pass calls this for each owned subnet no longer in
+    the desired set, in place of its own delete. When
+    :func:`subnet_operator_state` finds anything operator-made on it, the
+    subnet is un-claimed (the caller's FK cleared, everything on it kept,
+    as #1558 did for addresses) and True is returned; the reconciler counts
+    it as updated. Otherwise its addresses' auto DNS records are retracted
+    and it is deleted; False, counted as deleted.
+
+    Either way one system audit row names the subnet, the integration and
+    the outcome, so a sync never removes or abandons a subnet silently, and
+    a released subnet carries the record that its source network is gone.
+    The row is added at the session's commit, after the sync's DNS
+    retractions, so it never takes the audit-chain lock ahead of a zone
+    write (#3503). ``warnings`` (the sync summary's list) gets a line for a release. A
+    released subnet is no longer owned, so the next sync does not see it
+    again: idempotent.
+    """
+    from app.services.dns.record_ops import retract_address_dns  # noqa: PLC0415
+
+    reasons = await subnet_operator_state(db, subnet, own_fk)
+    target_id = getattr(subnet, own_fk)
+    integration = INTEGRATION_OWNERSHIP[own_fk]
+    detail = {
+        "integration": integration,
+        "target_id": str(target_id) if target_id is not None else None,
+        "network": str(subnet.network),
+        "reason": "source network gone",
+    }
+    if reasons:
+        setattr(subnet, own_fk, None)
+        _defer_audit(
+            db,
+            AuditLog(
+                user_display_name="system",
+                auth_source="system",
+                action="update",
+                resource_type="subnet",
+                resource_id=str(subnet.id),
+                resource_display=str(subnet.network),
+                changed_fields=[own_fk],
+                old_value={own_fk: detail["target_id"]},
+                new_value={**detail, own_fk: None, "outcome": "released", "kept_for": reasons},
+                result="success",
+            ),
+        )
+        message = (
+            f"subnet {subnet.network} left {integration} but was kept and released "
+            f"for its operator content ({', '.join(reasons)}) (#3532)"
+        )
+        if warnings is not None:
+            warnings.append(message)
+        # ``summary.warnings`` is read by no surface for most mirrors, so the
+        # operator would never see it. The Integrations dashboard lists these
+        # rows as reconciler warnings (and as the target's sync warning), the
+        # same as a release outside the target's IP space.
+        target_model = ownership_target_model(own_fk)
+        target_name = (
+            await db.execute(select(target_model.name).where(target_model.id == target_id))
+        ).scalar_one_or_none()
+        _defer_audit(
+            db,
+            AuditLog(
+                user_display_name="system",
+                auth_source="system",
+                action=RELEASE_AUDIT_ACTION,
+                resource_type=ownership_resource_type(own_fk),
+                resource_id=str(target_id),
+                resource_display=str(target_name) if target_name is not None else str(target_id),
+                result="success",
+                new_value={
+                    "subnet_id": str(subnet.id),
+                    "network": str(subnet.network),
+                    "kept_for": reasons,
+                    "message": message,
+                },
+            ),
+        )
+        return True
+    await retract_address_dns(db, subnet_ids=[subnet.id])
+    _defer_audit(
+        db,
+        AuditLog(
+            user_display_name="system",
+            auth_source="system",
+            action="delete",
+            resource_type="subnet",
+            resource_id=str(subnet.id),
+            resource_display=str(subnet.network),
+            old_value=detail,
+            new_value={"outcome": "deleted"},
+            result="success",
+        ),
+    )
+    await db.delete(subnet)
+    return False
+
+
 @dataclass
 class ReleaseSummary:
     """What :func:`release_integration_rows` did, for the audit row."""
@@ -246,9 +492,11 @@ async def release_integration_rows(
     * Addresses the target owns that an operator touched
       (``user_modified_at``), another integration owns, or that carry a DNS
       record / static reservation are un-claimed (FK cleared, row kept).
-    * A subnet is un-claimed when any address in it survives, a DHCP scope
-      or a subnet-domain link hangs off it, or it carries tags / custom
-      fields. Otherwise it is purely mirrored and removed.
+    * A subnet is un-claimed when :func:`subnet_operator_state` finds
+      operator content on it: an address in it survives, a DHCP scope (live
+      or in Trash), a registry row or a subnet-domain link hangs off it, it
+      carries tags / custom fields, or a person edited it (#3532). Otherwise
+      it is purely mirrored and removed.
     * A block is un-claimed when it carries tags / custom fields or still
       has a child block or subnet that is not being removed.
     * Soft-deleted (Trash) rows are un-claimed so the cascade cannot
@@ -258,15 +506,10 @@ async def release_integration_rows(
     """
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
-    from app.models.dhcp import DHCPScope  # noqa: PLC0415
-    from app.models.ipam import IPBlock, Subnet, SubnetDomain  # noqa: PLC0415
+    from app.models.ipam import IPBlock, Subnet  # noqa: PLC0415
 
     summary = ReleaseSummary()
     fk_addr = getattr(IPAddress, own_fk)
-
-    # Operator registries whose FK to ip_address / subnet is ON DELETE CASCADE:
-    # a row one of them points at is operator content even when purely mirrored.
-    registry_ref = address_registry_ref(IPAddress.id)
 
     # 1. Addresses. A purely mirrored one is left for the FK cascade.
     survivor = or_(
@@ -302,36 +545,7 @@ async def release_integration_rows(
     )
     removed_subnets: list[Subnet] = []
     for sn in subnets:
-        keep = (
-            sn.deleted_at is not None
-            or bool(sn.tags)
-            or bool(sn.custom_fields)
-            or await subnet_has_surviving_addresses(db, sn.id, own_fk)
-            or bool(
-                await db.scalar(
-                    select(func.count())
-                    .select_from(IPAddress)
-                    .where(IPAddress.subnet_id == sn.id)
-                    .where(registry_ref)
-                )
-            )
-            or bool(await db.scalar(select(subnet_registry_ref(sn.id))))
-            or bool(
-                await db.scalar(
-                    select(func.count())
-                    .select_from(DHCPScope)
-                    .where(DHCPScope.subnet_id == sn.id)
-                    .execution_options(**opts)
-                )
-            )
-            or bool(
-                await db.scalar(
-                    select(func.count())
-                    .select_from(SubnetDomain)
-                    .where(SubnetDomain.subnet_id == sn.id)
-                )
-            )
-        )
+        keep = sn.deleted_at is not None or bool(await subnet_operator_state(db, sn, own_fk))
         if keep:
             setattr(sn, own_fk, None)
             summary.subnets_released += 1
@@ -812,7 +1026,11 @@ async def _report_release(
     name = (
         await db.execute(select(target_model.name).where(target_model.id == target_id))
     ).scalar_one_or_none()
-    db.add(
+    # Deferred to the commit like retire_vanished_subnet's rows: this runs
+    # mid-sync, and an audit row added here would be autoflushed (taking the
+    # audit-chain lock) before the sync's later DNS zone writes (#3556, #3503).
+    _defer_audit(
+        db,
         AuditLog(
             user_display_name="system",
             auth_source="system",
@@ -826,7 +1044,7 @@ async def _report_release(
                 "space_ids": [str(i) for i in space_ids],
                 "message": out.describe(),
             },
-        )
+        ),
     )
 
 
@@ -1059,7 +1277,9 @@ __all__ = [
     "owned_addresses_in_space",
     "owned_subnets_in_space",
     "ownership_target_model",
+    "drop_wrapper_block",
     "release_outside_space",
+    "retire_vanished_subnet",
     "SpaceRelease",
     "owned_by_other_integration",
     "ReleaseSummary",
@@ -1069,6 +1289,7 @@ __all__ = [
     "subnet_for_address",
     "subnet_has_surviving_addresses",
     "subnet_operator_ref",
+    "subnet_operator_state",
     "subnet_registry_ref",
     "unowned_subnets_at",
 ]

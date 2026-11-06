@@ -409,9 +409,66 @@ async def find_dns_servers(
             "duplicate_agent": duplicate_agent_active(s),
             "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
             "last_seen_at": s.last_seen_at.isoformat() if s.last_seen_at else None,
+            # #3551 — the agent container's memory limit; NULL = never
+            # reported (an older agent, an agentless driver) or no limit.
+            "memory_limit_bytes": s.memory_limit_bytes,
         }
         for s, group_name in rows
     ]
+
+
+class GetDnsGroupMemoryEstimateArgs(BaseModel):
+    group_id: str = Field(..., description="UUID of the DNS server group.")
+
+
+@register_tool(
+    name="get_dns_group_memory_estimate",
+    permission=("read", "dns_group"),
+    description=(
+        "Estimate a BIND9 server group's named memory and compare it with the "
+        "memory limit its agents report (#3551). Under split-horizon each DNS "
+        "view that applies a blocklist loads its own copy of it (BIND cannot "
+        "share a response-policy zone between views); identical zones load "
+        "once. Returns the estimate, the limit and where it came from "
+        "(``agent`` or the 2 GiB ``default``), the percentage, whether it "
+        "warns (80 % and over), and each blocklist zone with the views that "
+        "load it and its entry count. Answers 'will adding a view OOM this "
+        "group?' and 'why are the DNS agents being OOM-killed?'. Null for a "
+        "group with no BIND9 server. Read-only."
+    ),
+    args_model=GetDnsGroupMemoryEstimateArgs,
+    category="dns",
+    module="core.dns",
+)
+async def get_dns_group_memory_estimate(
+    db: AsyncSession, user: User, args: GetDnsGroupMemoryEstimateArgs
+) -> dict[str, Any] | None:
+    from app.services.dns.memory_estimate import group_memory_estimate  # noqa: PLC0415
+
+    try:
+        gid = uuid.UUID(args.group_id)
+    except ValueError:
+        return {"error": "group_id is not a UUID"}
+    est = await group_memory_estimate(db, gid)
+    if est is None:
+        return None
+    a = est.assessment
+    return {
+        "group_id": str(gid),
+        "estimated_bytes": a.estimated_bytes,
+        "limit_bytes": a.limit_bytes,
+        "limit_source": a.limit_source,
+        "limit_server": est.limit_server,
+        "unknown_limit_servers": list(est.unknown_limit_servers),
+        "percent": a.percent,
+        "warn": a.warn,
+        "message": est.message,
+        "zone_records_loaded": est.zone_records_loaded,
+        "rpz": [
+            {"zone": r.zone, "views": list(r.views), "entries": r.entries, "bytes": r.bytes}
+            for r in est.rpz
+        ],
+    }
 
 
 class PreviewZoneMoveArgs(BaseModel):
@@ -869,12 +926,13 @@ class ListDNSBlockListsArgs(BaseModel):
         "feed_entries_are_wildcard (whether feed entries block "
         "subdomains too — off means a list naming tracker.example "
         "leaves cdn.tracker.example resolving), enabled, "
-        "entry_count, feed_parse_skipped (adblock feeds only: how many "
+        "entry_count, feed_parse_skipped (how many "
         "rules the last refresh could not enforce, by category regex / "
         "modifier / badfilter / malformed, with malformed split by "
         "reason into star_in_name / no_anchor / trailing_dot / "
-        "start_anchor / bare_star / dotless / other; null = not "
-        "recorded), "
+        "start_anchor / bare_star / dotless / other; hosts / domains "
+        "feeds report invalid_name = tokens that are not DNS names; "
+        "null = not recorded), "
         "last_synced_at + last_sync_status / error. "
         "Use for 'which blocklists are active?', 'is the malware "
         "feed up to date?', or 'when did the ads blocklist last "
