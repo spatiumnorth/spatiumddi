@@ -25,11 +25,17 @@ from app.services.dhcp import agent_token as dhcp_tok
 from app.services.dns import agent_token as dns_tok
 from app.services.looking_glass import agent_token as lg_tok
 
+# One instant, captured from the real clock at import, so both mints share a
+# second but the tokens' ``exp`` (mint time + TTL) stays in the future when
+# ``verify_agent_token`` checks it against the real clock (#3658). A fixed
+# calendar date expired a day after it was written.
+_NOW = datetime.now(UTC).replace(microsecond=123456)
+
 
 class _Frozen(datetime):
     @classmethod
     def now(cls, tz=None):  # type: ignore[no-untyped-def]
-        return datetime(2026, 11, 5, 12, 0, 0, 123456, tzinfo=UTC)
+        return _NOW
 
 
 @pytest.mark.parametrize("mod", [dns_tok, dhcp_tok, lg_tok])

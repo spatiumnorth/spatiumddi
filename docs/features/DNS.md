@@ -872,7 +872,7 @@ A subnet gets one reverse zone per `/24` it spans (#1840), never one enclosing z
 
 `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SRV`, `CAA`, `TLSA`, `SSHFP`, `NAPTR`, `LOC`, `SVCB`, `HTTPS`, `DNAME`
 
-Plus the PowerDNS-only `ALIAS` (CNAME-at-apex) and `LUA` (computed responses) types, which are driver-gated — see §0 and `_DRIVER_GATED_RECORD_TYPES` in `backend/app/api/v1/dns/router.py`.
+Plus the PowerDNS-only `ALIAS` (CNAME-at-apex) and `LUA` (computed responses) types, which are driver-gated (and `LUA` writes are also superadmin-only) — see §0 and `_DRIVER_GATED_RECORD_TYPES` in `backend/app/api/v1/dns/router.py`.
 
 ### Record Model
 
@@ -3352,7 +3352,7 @@ per zone, AXFR the live zone from every server in the group and diff it against 
 
 synthesised at query time by `pdns_server`, so they have no BIND9 equivalent:
   - **ALIAS** — an apex CNAME-equivalent. Lets `example.com` itself point at a cloud load balancer's hostname, which a real CNAME can't do at the apex without breaking the SOA / NS rrset
-  - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. Authoring is gated on the usual DNS write permission — scope that permission accordingly, and treat it as more privileged than authoring an A record
+  - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. **Creating a LUA record, or changing an existing one's value, needs a superadmin** (#3637) — the DNS Editor role, which otherwise holds `admin` on `dns_record`, is refused with a 403 on the record create / update, bulk create, zone-file and spreadsheet import, and create-zone-from-template routes, and the refusal is audited. The snippet menu offers `ifportup` / `ifurlup`, which make the DNS server probe TCP ports and fetch URLs, so it is held to the same bar as GSLB pool health checks. Deleting a LUA record follows the ordinary record `delete` permission, and existing LUA records keep serving. The PowerDNS agent turns `enable-lua-records` on for every PowerDNS server (a global setting, not per-zone metadata)
 
 ### DNS pools (GSLB-lite)
 

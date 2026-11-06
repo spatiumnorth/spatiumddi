@@ -139,6 +139,12 @@ class _Dispatch:
         # Keyed by request_id so reply delivery is O(1). Bounded by the
         # operator's in-flight tool count — typically a handful.
         self.futures: dict[str, asyncio.Future[NetToolResult]] = {}
+        # request_id -> the appliance the command was queued for (#3621).
+        # ``deliver_result`` refuses a result from any other appliance, so
+        # one approved cert cannot answer another appliance's command.
+        # Set with the future, evicted in the same ``finally``: bounded by
+        # the in-flight count exactly like ``futures``.
+        self.owners: dict[str, uuid.UUID] = {}
 
 
 # Module-level singletons, one per CHANNEL — still the single
@@ -234,6 +240,7 @@ async def enqueue_command(
 
     future: asyncio.Future[NetToolResult] = asyncio.get_running_loop().create_future()
     _queues(channel).futures[request_id] = future
+    _queues(channel).owners[request_id] = appliance_id
 
     await _queues(channel).queues[appliance_id].put(command)
     logger.info(
@@ -259,6 +266,7 @@ async def enqueue_command(
         # Always evict the future map entry — a late result goes to
         # ``deliver_result`` which logs + discards.
         _queues(channel).futures.pop(request_id, None)
+        _queues(channel).owners.pop(request_id, None)
 
 
 async def pop_command(
@@ -294,15 +302,28 @@ async def pop_command(
         return command
 
 
-def deliver_result(result: NetToolResult, *, channel: str = CHANNEL_NETTOOL) -> bool:
+def deliver_result(
+    result: NetToolResult, *, appliance_id: uuid.UUID, channel: str = CHANNEL_NETTOOL
+) -> bool:
     """Hand a supervisor-returned result to the awaiting future.
 
     Returns True on a successful match, False when the future has
-    already been evicted (operator timed out). The supervisor's reply
-    endpoint returns 200 either way — late delivery isn't a
-    supervisor-side error. Mirrors ``k8s_proxy.deliver_response``.
+    already been evicted (operator timed out) or when ``appliance_id`` —
+    the appliance whose cert posted the result — is not the one the
+    command was queued for (#3621). The supervisor's reply endpoint
+    returns 200 either way — late delivery isn't a supervisor-side
+    error. Mirrors ``k8s_proxy.deliver_response``.
     """
-    future = _queues(channel).futures.get(result.request_id)
+    dispatch = _queues(channel)
+    owner = dispatch.owners.get(result.request_id)
+    if owner is not None and owner != appliance_id:
+        logger.warning(
+            "appliance.nettool.result_wrong_appliance",
+            request_id=result.request_id,
+            appliance_id=str(appliance_id),
+        )
+        return False
+    future = dispatch.futures.get(result.request_id)
     if future is None or future.done():
         logger.info("appliance.nettool.result_stale", request_id=result.request_id)
         return False

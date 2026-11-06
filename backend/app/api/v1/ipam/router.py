@@ -8965,6 +8965,25 @@ class MergeSubnetCommitResponse(BaseModel):
     summary: list[str]
 
 
+def _require_merge_sources_writable(
+    user: Any, subnet_id: uuid.UUID, sibling_ids: list[uuid.UUID]
+) -> None:
+    """403 unless the caller may write EVERY subnet a merge names.
+
+    The path subnet and each id in the body get the same per-subnet RBAC check
+    and token-binding check, before any of them is loaded, and a refusal is
+    one fixed answer whether the id is forbidden or does not exist, so the
+    preview cannot be used to probe ids."""
+    for sid in dict.fromkeys([subnet_id, *sibling_ids]):
+        if not user_has_permission(user, "write", "subnet", sid) or not token_scope_allows(
+            user, "subnet", sid
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied: need 'write' on every subnet named in the merge",
+            )
+
+
 @router.post(
     "/subnets/{subnet_id}/merge/preview",
     response_model=MergeSubnetPreviewResponse,
@@ -8977,6 +8996,7 @@ async def merge_subnet_preview(
     db: DB,
 ) -> MergeSubnetPreviewResponse:
     _require_type_write(current_user, "subnet")
+    _require_merge_sources_writable(current_user, subnet_id, body.sibling_subnet_ids)
     from app.services.ipam.subnet_merge import preview_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
@@ -9004,6 +9024,7 @@ async def merge_subnet_commit(
     db: DB,
 ) -> MergeSubnetCommitResponse:
     _require_type_write(current_user, "subnet")
+    _require_merge_sources_writable(current_user, subnet_id, body.sibling_subnet_ids)
     from app.services.ipam.subnet_merge import MergeError, commit_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
