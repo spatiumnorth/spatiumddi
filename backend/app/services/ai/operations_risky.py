@@ -61,6 +61,7 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import String, and_, cast, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.auth import User
 from app.services.ai.operations import (
@@ -178,27 +179,41 @@ def _mirrors_torn_down_first(root: Any) -> Any:
     from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
 
-    own_scope = and_(DHCPScope.subnet_id == IPAddress.subnet_id, DHCPScope.deleted_at.is_(None))
-    # The column tests first: they spare every other address the subqueries.
+    # Uncorrelated, so Postgres builds each set once per statement and probes
+    # it per address (a hashed SubPlan), and costs it that way. A correlated
+    # EXISTS was costed as a scan of dhcp_lease per lease mirror (no index of
+    # dhcp_lease serves a lookup by scope and address), and ran so past the
+    # hash memory; the inflated cost also made Postgres JIT-compile the
+    # preview's counts.
+    mirror = aliased(IPAddress)
+    own_scope = and_(DHCPScope.subnet_id == mirror.subnet_id, DHCPScope.deleted_at.is_(None))
+    lease_mirrors = (
+        select(mirror.id)
+        .join(DHCPScope, own_scope)
+        .join(
+            DHCPLease,
+            and_(DHCPLease.scope_id == DHCPScope.id, DHCPLease.ip_address == mirror.address),
+        )
+        .where(mirror.auto_from_lease.is_(True))
+    )
+    reservation_mirrors = (
+        select(mirror.id)
+        .join(DHCPScope, own_scope)
+        .join(
+            DHCPStaticAssignment,
+            and_(
+                DHCPStaticAssignment.scope_id == DHCPScope.id,
+                cast(DHCPStaticAssignment.id, String) == mirror.static_assignment_id,
+            ),
+        )
+        .where(mirror.static_assignment_id.is_not(None))
+        # Trashed reservations too, as ``remove_ipam_for_scope_statics`` reads them.
+        .execution_options(include_deleted=True)
+    )
+    # The column tests first: they spare every other address the lookups.
     torn = [
-        and_(
-            IPAddress.auto_from_lease.is_(True),
-            select(DHCPLease.id)
-            .join(DHCPScope, DHCPScope.id == DHCPLease.scope_id)
-            .where(own_scope, DHCPLease.ip_address == IPAddress.address)
-            .exists(),
-        ),
-        and_(
-            IPAddress.static_assignment_id.is_not(None),
-            # Trashed reservations too, as ``remove_ipam_for_scope_statics`` reads them.
-            select(DHCPStaticAssignment.id)
-            .join(DHCPScope, DHCPScope.id == DHCPStaticAssignment.scope_id)
-            .where(
-                own_scope, cast(DHCPStaticAssignment.id, String) == IPAddress.static_assignment_id
-            )
-            .execution_options(include_deleted=True)
-            .exists(),
-        ),
+        and_(IPAddress.auto_from_lease.is_(True), IPAddress.id.in_(lease_mirrors)),
+        and_(IPAddress.static_assignment_id.is_not(None), IPAddress.id.in_(reservation_mirrors)),
     ]
     if isinstance(root, Subnet):
         torn.insert(0, and_(IPAddress.subnet_id == root.id, IPAddress.auto_from_lease.is_(True)))
