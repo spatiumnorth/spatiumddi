@@ -1676,6 +1676,10 @@ async def agent_ingested_records(
     return {"zone": zone_name, **summary}
 
 
+# (server id, zone id) pairs already warned about by ``_ingest_report_view``.
+_REPORT_WITHOUT_VIEW_WARNED: set[tuple[uuid.UUID, uuid.UUID]] = set()
+
+
 async def _ingest_report_view(
     db: AsyncSession, server: DNSServer, zone: DNSZone, view_name: str | None
 ) -> tuple[uuid.UUID | None, bool]:
@@ -1697,7 +1701,12 @@ async def _ingest_report_view(
     holding = await zone_holding_views(db, zone)
     if view_name is None:
         if len(holding) > 1:
-            logger.warning(
+            # The agent reports every dynamic zone every few minutes, so warn
+            # once per server and zone in this process, then log at debug.
+            warned = (server.id, zone.id)
+            log_fn = logger.debug if warned in _REPORT_WITHOUT_VIEW_WARNED else logger.warning
+            _REPORT_WITHOUT_VIEW_WARNED.add(warned)
+            log_fn(
                 "dns_ingest_report_without_view",
                 server_id=str(server.id),
                 zone=zone.name,

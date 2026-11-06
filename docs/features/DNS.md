@@ -2604,8 +2604,12 @@ learned records unscoped. A learned record's view never changes which views
 the zone itself renders into, and a report from one view never matches or
 removes a record learned in another. A report that names no view (an agent
 built before the field) stores unscoped records as before, and the control
-plane logs `dns_ingest_report_without_view` when the zone is in more than one
-view. Learned records stored unscoped before this change stay unscoped.
+plane logs `dns_ingest_report_without_view` (once per server and zone, then at
+debug) when the zone is in more than one view. Learned records stored unscoped
+before this change stay unscoped. A learned record keeps its view when the
+zone later stops rendering into that view: it is then served nowhere, is not
+removed by reports from the zone's other views, and is listed (blocking the
+delete) when that view is deleted, until an operator removes it.
 
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only

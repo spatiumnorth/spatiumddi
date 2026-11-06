@@ -18,13 +18,17 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.api.v1.dns.agents import _auth_agent
 from app.main import app
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
 from app.services.dns import config_bundle as preview
 from app.services.dns.agent_config import build_config_bundle
+from app.services.dns.memory_estimate import _zone_records_loaded
+from app.services.dns.pool_geo import build_geo_steering, build_view_descriptors
 from app.services.dns.tsig import transfer_view_name
+from app.services.dns.view_collisions import zone_render_collisions
 
 ZONE = "corp.example.com"
 INSIDE_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
@@ -262,3 +266,96 @@ async def test_a_pinned_zone_renders_into_its_pin_only(
     assert served == {"inside": {"shared"}}
     assert await _previewed(db_session, server) == served
     assert await transfer_view_name(db_session, zone) == "inside"
+
+
+@pytest.mark.asyncio
+async def test_a_learned_row_never_moves_the_zone(db_session: AsyncSession) -> None:
+    """A learned row stamped with the LATER view leaves the unpinned zone in
+    both views, for the bundle, the preview, the transfer view the control
+    plane reads and the memory estimate alike. Counted as a placement, it
+    would take the zone out of ``inside`` and make ``outside`` the read view."""
+    group, server, inside, outside = await _group(db_session)
+    zone = _zone(group)
+    db_session.add(zone)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            _record(zone, "www", "192.0.2.80"),
+            _record(zone, "dc01", "192.0.2.10", view_id=OUTSIDE_ID, import_source="ddns_external"),
+        ]
+    )
+    await db_session.commit()
+
+    served = await _served(db_session, server)
+    assert served == {"inside": {"www"}, "outside": {"www", "dc01"}}
+    assert await _previewed(db_session, server) == served
+    assert await transfer_view_name(db_session, zone) == "inside"
+    geo = await build_geo_steering(db_session, group.id)
+    descs = build_view_descriptors([inside, outside], geo)
+    # inside's copy holds www, outside's www + dc01.
+    assert await _zone_records_loaded(db_session, group.id, descs, False) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_operator_scoped_record_still_places_an_unpinned_zone(
+    db_session: AsyncSession,
+) -> None:
+    """Only learned rows stopped placing the zone: an operator's view-scoped
+    record in an unpinned zone still renders it into that view alone, and a
+    learned row stamped with another view is then rendered nowhere."""
+    group, server, _inside, _outside = await _group(db_session)
+    zone = _zone(group)
+    db_session.add(zone)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            _record(zone, "www", "192.0.2.80"),
+            _record(zone, "ext", "192.0.2.81", view_id=OUTSIDE_ID),
+            _record(zone, "dc01", "192.0.2.10", view_id=INSIDE_ID, import_source="ddns_external"),
+        ]
+    )
+    await db_session.commit()
+
+    served = await _served(db_session, server)
+    assert served == {"outside": {"www", "ext"}}
+    assert await _previewed(db_session, server) == served
+    assert await transfer_view_name(db_session, zone) == "outside"
+
+
+@pytest.mark.asyncio
+async def test_the_collision_guard_ignores_a_learned_rows_view(db_session: AsyncSession) -> None:
+    """#2275 counts placements the way the bundle does: a learned row does not
+    put its zone into a view the zone's twin already holds."""
+    group, server, inside, _outside = await _group(db_session)
+    pinned = _zone(group, inside)
+    unpinned = _zone(group)
+    db_session.add_all([pinned, unpinned])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            _record(unpinned, "ext", "192.0.2.81", view_id=OUTSIDE_ID),
+            _record(
+                unpinned, "dc01", "192.0.2.10", view_id=INSIDE_ID, import_source="ddns_external"
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    assert await zone_render_collisions(db_session, group.id, names=[ZONE]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_report_without_a_view_warns_once_per_server_and_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The agent reports every few minutes; the warning is not repeated."""
+    group, server, _inside, _outside = await _group(db_session)
+    zone = _zone(group)
+    db_session.add(zone)
+    await db_session.commit()
+
+    with capture_logs() as events:
+        await _post(client, server, [_rec("dc01")])
+        await _post(client, server, [_rec("dc01")])
+    levels = [e["log_level"] for e in events if e["event"] == "dns_ingest_report_without_view"]
+    assert levels == ["warning", "debug"]
