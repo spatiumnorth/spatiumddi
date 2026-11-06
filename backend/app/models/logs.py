@@ -9,8 +9,19 @@ This is **operator triage**, not analytics. We keep a short rolling
 window (default 24 h) so the UI stays responsive and the table size
 is bounded; longer retention belongs in Loki / a SIEM.
 
-The FK cascade drops a server's entries when the server row is
-removed.
+Both tables are ``PARTITION BY RANGE (ts)`` (#2185), so retention is a
+partition drop rather than a mass ``DELETE``. ``ts`` is therefore part of the
+primary key, and a row can only be stored where a partition covers its
+timestamp; ``app.services.logs.partitions`` creates and retires them and
+tells ingest what is covered.
+
+``server_id`` is deliberately not a foreign key (#2185). With one, attaching
+a partition locks the referenced server table and dropping a retired one takes
+``ACCESS EXCLUSIVE`` there, and every connected agent's long poll holds that
+table in a transaction most of the time, so neither would get through on a
+live install. The rows of a deleted server stay until the retention window
+removes them: the Logs page looks rows up by the servers that exist, and the
+threat rollup only counts distinct servers.
 """
 
 from __future__ import annotations
@@ -21,7 +32,6 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     DateTime,
-    ForeignKey,
     Index,
     Integer,
     String,
@@ -53,15 +63,12 @@ class DNSQueryLogEntry(Base):
     __table_args__ = (
         Index("ix_dns_query_log_server_ts", "server_id", "ts"),
         Index("ix_dns_query_log_ts", "ts"),
+        {"postgresql_partition_by": "RANGE (ts)"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("dns_server.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     client_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
     client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     qname: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -111,15 +118,12 @@ class DHCPLogEntry(Base):
     __table_args__ = (
         Index("ix_dhcp_log_server_ts", "server_id", "ts"),
         Index("ix_dhcp_log_ts", "ts"),
+        {"postgresql_partition_by": "RANGE (ts)"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    server_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)

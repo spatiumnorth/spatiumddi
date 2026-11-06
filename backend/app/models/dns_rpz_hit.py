@@ -34,7 +34,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import BigInteger, DateTime, Index, String, Text
 from sqlalchemy.dialects.postgresql import INET, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -53,13 +53,15 @@ class DNSRPZHit(Base):
         Index("ix_dns_rpz_hit_ts", "ts"),
         # "Which feed is doing the work" rollup.
         Index("ix_dns_rpz_hit_zone_ts", "rpz_zone", "ts"),
+        # Time-partitioned like the other agent-shipped logs (#2185): retention
+        # is a partition drop, and ``ts`` is part of the primary key.
+        {"postgresql_partition_by": "RANGE (ts)"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server.id", ondelete="CASCADE"), nullable=False
-    )
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Not a foreign key, for the reason given in ``app.models.logs``.
+    server_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
 
     # Nullable because a hit whose log head didn't parse is still worth
     # counting — it proves the blocklist fired — even though it cannot

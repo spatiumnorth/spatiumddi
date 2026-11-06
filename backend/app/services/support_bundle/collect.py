@@ -649,7 +649,9 @@ async def collect_table_sizes(db: AsyncSession) -> str:
     is a sequential scan per table — 300 of them on a large install is
     minutes of held connection to answer "roughly how big is this",
     which is the only question this section exists for. Estimates are
-    labelled as such so nobody quotes them as row counts.
+    labelled as such so nobody quotes them as row counts. A partitioned table
+    is one entry, its partitions added up (#2185); ANALYZE gives the parent an
+    estimate of its own, so only the partitions' are counted.
     """
     # Through ``_guarded``, not a bare try/except: a swallowed statement
     # error leaves PostgreSQL in "current transaction is aborted", which
@@ -658,13 +660,16 @@ async def collect_table_sizes(db: AsyncSession) -> str:
     result = await _guarded(
         db,
         lambda: db.execute(text("""
-                    SELECT c.relname,
-                           GREATEST(c.reltuples, 0)::bigint AS approx_rows,
-                           pg_total_relation_size(c.oid)     AS total_bytes
+                    SELECT root.relname,
+                           COALESCE(sum(GREATEST(c.reltuples, 0)) FILTER (WHERE c.relkind = 'r'), 0)
+                               ::bigint AS approx_rows,
+                           sum(pg_total_relation_size(c.oid)) AS total_bytes
                       FROM pg_class c
-                      JOIN pg_namespace n ON n.oid = c.relnamespace
-                     WHERE c.relkind = 'r' AND n.nspname = 'public'
-                     ORDER BY pg_total_relation_size(c.oid) DESC
+                      JOIN pg_class root ON root.oid = COALESCE(pg_partition_root(c.oid), c.oid)
+                      JOIN pg_namespace n ON n.oid = root.relnamespace
+                     WHERE c.relkind IN ('r', 'p') AND n.nspname = 'public'
+                     GROUP BY root.relname
+                     ORDER BY total_bytes DESC
                     """)),
     )
     if isinstance(result, str):

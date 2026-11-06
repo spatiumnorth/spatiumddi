@@ -460,9 +460,8 @@ class PlatformSettings(Base):
     )
 
     # How many hours of agent-shipped DNS query log and DHCP activity log
-    # rows the nightly ``prune_logs`` sweep keeps (#2273). Capped at 168 by
-    # the API: the prune is one unbatched DELETE, so a longer window grows
-    # that single transaction. #2185 lifts the cap with partition drops.
+    # rows the log partition maintenance keeps (#2273, #2185). Capped at 168
+    # by the API; longer history belongs in Loki or a SIEM.
     log_retention_hours: Mapped[int] = mapped_column(
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )

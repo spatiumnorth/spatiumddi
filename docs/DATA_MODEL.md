@@ -524,8 +524,8 @@ Each row records *who* (`user_id`, `user_display_name`, `auth_source`,
 
 | Model | Table | Notes |
 |---|---|---|
-| `DNSQueryLogEntry` | `dns_query_log_entry` | parsed BIND9 query log lines (24h retention) |
-| `DHCPLogEntry` | `dhcp_log_entry` | parsed Kea `kea-dhcp4.log` lines |
+| `DNSQueryLogEntry` | `dns_query_log_entry` | parsed BIND9 query log lines (24h retention); `PARTITION BY RANGE (ts)`, primary key `(id, ts)` (#2185) |
+| `DHCPLogEntry` | `dhcp_log_entry` | parsed Kea `kea-dhcp4.log` lines; `PARTITION BY RANGE (ts)`, primary key `(id, ts)` (#2185) |
 | `DNSMetricSample` | `dns_metric_sample` | composite PK `(server_id, bucket_at)`; query/response counters |
 | `DHCPMetricSample` | `dhcp_metric_sample` | composite PK `(server_id, bucket_at)`; DHCP message counters |
 | `EventSubscription` | `event_subscription` | one downstream webhook receiver (HMAC-signed) |
