@@ -170,6 +170,35 @@ async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUI
     return group_ids
 
 
+async def _lock_scope_batch_rows(db: AsyncSession, batch: Any) -> None:
+    """#3617: lock what a block / space delete's cascade will write, in the
+    lease → mirror → zone order every lease-path writer takes
+    (``app.services.lock_order``): the batch's scopes' lease rows, the lease
+    mirrors of its subnets, then the zones its subnets publish into or are
+    linked to. Call before the first of them is written: the reverse-zone
+    retirement writes zones, and the lease purge then took each lease and its
+    mirror and zones one lease at a time, after them."""
+    from app.models.dhcp import DHCPLease, DHCPScope  # noqa: PLC0415
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.services.lock_order import (  # noqa: PLC0415
+        lock_lease_rows,
+        lock_zones_for_subnets,
+    )
+
+    scope_ids = sorted(row.obj.id for row in batch.rows if isinstance(row.obj, DHCPScope))
+    subnet_ids = sorted(row.obj.id for row in batch.rows if isinstance(row.obj, Subnet))
+    if scope_ids:
+        await lock_lease_rows(db, DHCPLease.scope_id.in_(scope_ids))
+    if subnet_ids:
+        await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.subnet_id.in_(subnet_ids), IPAddress.auto_from_lease.is_(True))
+            .order_by(IPAddress.id)
+            .with_for_update()
+        )
+        await lock_zones_for_subnets(db, subnet_ids)
+
+
 async def _purge_leases_for_scope_batch(
     db: AsyncSession, batch: Any, touched_subnets: set[UUID]
 ) -> None:
@@ -328,6 +357,18 @@ async def _apply_delete_subnet(
     _enforce_subnet_token_scope(user, args.subnet_id)
 
     if not args.permanent:
+        # #3617: the scopes' lease rows first, before the mirrors and zones
+        # below, in the order every lease-path writer takes them (see
+        # app.services.lock_order). The leases are purged further down, after
+        # the mirrors are gone; locked only then, they were taken after the
+        # mirror rows, against the expiry sweep's lease → mirror order.
+        from app.models.dhcp import DHCPLease  # noqa: PLC0415
+        from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+
+        await lock_lease_rows(
+            db,
+            DHCPLease.scope_id.in_(select(DHCPScope.id).where(DHCPScope.subnet_id == subnet.id)),
+        )
         await _revoke_subnet_lease_mirrors(db, subnet)
 
         # Wake DHCP agents for groups whose scopes are being trashed: soft-delete
@@ -614,6 +655,7 @@ async def _apply_delete_block(
         retire_auto_reverse_zones_for_batch,
     )
 
+    await _lock_scope_batch_rows(db, batch)  # #3617
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     touched: set[UUID] = set()  # recounted last, before commit (#3354)
@@ -777,6 +819,7 @@ async def _apply_delete_space(
         retire_auto_reverse_zones_for_batch,
     )
 
+    await _lock_scope_batch_rows(db, batch)  # #3617
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     touched: set[UUID] = set()  # recounted last, before commit (#3354)

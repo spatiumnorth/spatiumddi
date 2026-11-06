@@ -3012,7 +3012,15 @@ async def _sync_dns_record(
     against a zone (including retractions). Callers that report on the
     outcome — the DDNS path logs ``ddns_applied`` — must not claim more than
     this says (spatiumddi#1065).
+
+    Every zone the sync may write is row-locked first, in id order (#3617):
+    a retraction takes the PTR's reverse zone before the forward zone
+    (#1800) and a publish the forward zone first, so two syncs of different
+    addresses in one zone pair deadlocked. See ``app.services.lock_order``.
     """
+    from app.services.lock_order import lock_zones_for_sync  # noqa: PLC0415
+
+    await lock_zones_for_sync(db, ip, subnet, zone_id=zone_id, action=action)
     if action == "delete":
         result = await db.execute(
             select(DNSRecord)
@@ -8093,21 +8101,31 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
     """#428 — on subnet delete, revoke the DDNS records published for the
     subnet's DHCP-lease mirrors and drop the transient mirror rows. Returns
     the count revoked. Best-effort per row: a DNS-revoke hiccup must not
-    block the delete (the backstop / next reconcile cleans residue)."""
+    block the delete (the backstop / next reconcile cleans residue).
+
+    #3617: the mirror rows are locked by id, then every zone the delete may
+    write, in id order, before any revoke: one revoke per row took the zones
+    one address at a time, out of id order. The caller locks the scopes'
+    lease rows before this (``app.services.lock_order``)."""
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+    from app.services.lock_order import lock_zones_for_subnets  # noqa: PLC0415
 
     rows = (
         (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.subnet_id == subnet.id,
                     IPAddress.auto_from_lease.is_(True),
                 )
+                .order_by(IPAddress.id)
+                .with_for_update()
             )
         )
         .scalars()
         .all()
     )
+    await lock_zones_for_subnets(db, [subnet.id])
     # #3186 — their records a zone deleted earlier took into its batch go too.
     await purge_trashed_address_records(db, [row.id for row in rows])
     revoked = 0

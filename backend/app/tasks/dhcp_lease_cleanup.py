@@ -19,15 +19,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy import and_, or_, select
 
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPLease
-from app.models.ipam import IPAddress
 
 # The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
 # longer imports *up* from a task — servers.py:delete_lease used to); the sweep
@@ -42,6 +39,11 @@ from app.services.dhcp.normalize import norm_ip
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.feature_modules import is_module_enabled
 from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.lock_order import (
+    lock_lease_rows,
+    lock_mirror_rows,
+    lock_zones_for_addresses,
+)
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -77,52 +79,6 @@ def _write_order(subnet_id: Any, address: Any) -> tuple[str, int, int, str]:
 _MIRROR_LOOKUP_CHUNK = 1000
 
 
-async def _lock_mirror_rows(db: AsyncSession, keys: set[tuple[Any, str]]) -> list[IPAddress]:
-    """The ``auto_from_lease`` mirrors at ``keys`` ((subnet id, address)), row-locked.
-
-    Locked in id order, like the lease-events handler and
-    ``static_ipam.lock_static_rows``, so concurrent lockers never wait on each
-    other in a cycle (#3605). The ids are read first and locked in ascending
-    chunks, which keeps the whole lock order ascending however many chunks it
-    takes. A row that stopped matching in between (taken over by a reservation,
-    say) is dropped by the locked read; one created in between belongs to a
-    lease that is live again, and is not ours to delete.
-    """
-    by_subnet: dict[Any, list[str]] = {}
-    for subnet_id, address in keys:
-        by_subnet.setdefault(subnet_id, []).append(address)
-    ids: set[Any] = set()
-    for subnet_id, addresses in by_subnet.items():
-        addresses.sort()
-        for i in range(0, len(addresses), _MIRROR_LOOKUP_CHUNK):
-            id_res = await db.execute(
-                select(IPAddress.id).where(
-                    IPAddress.subnet_id == subnet_id,
-                    IPAddress.address.in_(addresses[i : i + _MIRROR_LOOKUP_CHUNK]),
-                    IPAddress.auto_from_lease.is_(True),
-                )
-            )
-            ids.update(id_res.scalars().all())
-    ordered = sorted(ids)
-    rows: list[IPAddress] = []
-    for i in range(0, len(ordered), _MIRROR_LOOKUP_CHUNK):
-        res = await db.execute(
-            select(IPAddress)
-            .where(
-                IPAddress.id.in_(ordered[i : i + _MIRROR_LOOKUP_CHUNK]),
-                IPAddress.auto_from_lease.is_(True),
-            )
-            .options(selectinload(IPAddress.subnet))
-            .order_by(IPAddress.id)
-            .with_for_update(of=IPAddress)
-            .execution_options(populate_existing=True)
-        )
-        rows.extend(
-            r for r in res.scalars().all() if (r.subnet_id, norm_ip(str(r.address))) in keys
-        )
-    return rows
-
-
 async def _sweep() -> tuple[int, int]:
     cutoff = datetime.now(UTC) - EXPIRY_GRACE
     async with task_session() as db:
@@ -142,6 +98,19 @@ async def _sweep() -> tuple[int, int]:
         # commits first, the row no longer matches ``expires_at < cutoff`` when
         # the lock is granted, and the sweep leaves it alone instead of
         # stamping the renewed lease ``expired``.
+        #
+        # #3617: the rows the second pass below hard-deletes are locked here
+        # too, in the same id-ordered statement. Locked only by that pass's
+        # delete, they were taken after the mirror rows.
+        delete_cutoff = datetime.now(UTC) - EXPIRED_DELETE_GRACE
+        await lock_lease_rows(
+            db,
+            DHCPLease.expires_at.is_not(None),
+            or_(
+                and_(DHCPLease.state == "active", DHCPLease.expires_at < cutoff),
+                and_(DHCPLease.state == "expired", DHCPLease.expires_at < delete_cutoff),
+            ),
+        )
         res = await db.execute(
             select(DHCPLease)
             .where(
@@ -193,7 +162,11 @@ async def _sweep() -> tuple[int, int]:
                 continue
             candidates.setdefault((subnet_id, norm_ip(str(lease.ip_address))), []).append(lease)
 
-        rows = await _lock_mirror_rows(db, set(candidates))
+        rows = await lock_mirror_rows(db, set(candidates), chunk=_MIRROR_LOOKUP_CHUNK)
+        # #3617: then every zone their revokes may write, in id order: each
+        # revoke locks its own zones in order, but one address's after
+        # another's are not.
+        await lock_zones_for_addresses(db, retracting=rows)
         rows.sort(key=lambda r: _write_order(r.subnet_id, r.address))
         for row in rows:
             # #1110 — a failover / HA partner still holding an active,
@@ -242,7 +215,7 @@ async def _sweep() -> tuple[int, int]:
         # longer grace so they stop lingering in the DHCP view (#478). History
         # was already stamped when the lease flipped to expired, and the mirror
         # was dropped above / by the agent, so this only removes the dead row.
-        delete_cutoff = datetime.now(UTC) - EXPIRED_DELETE_GRACE
+        # Its rows were locked with the first pass's (#3617).
         stale = await db.execute(
             select(DHCPLease).where(
                 DHCPLease.state == "expired",
