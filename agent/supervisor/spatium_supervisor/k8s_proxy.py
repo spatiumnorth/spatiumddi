@@ -7,6 +7,11 @@ for this appliance; this thread long-polls
 via ``k8s_api._request``, and POSTs the response back via
 ``/supervisor/k8s-proxy/reply/{request_id}``.
 
+Only the requests the shipped Fleet routes build are executed (#3618):
+pod list + pod log, workload list and rollout-restart, all in the
+``spatium`` namespace. Anything else is answered 403 unexecuted; see
+``_refusal``.
+
 Runs as a daemon thread alongside the heartbeat loop. The thread
 exits when the process exits — no clean shutdown handshake; the
 control plane's queue tolerates supervisors that vanish mid-poll
@@ -36,10 +41,12 @@ import base64
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import threading
 import time
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import structlog
@@ -63,6 +70,89 @@ _POLL_TIMEOUT_S = 32.0
 # instead of hammering the control plane.
 _BACKOFF_S = 5.0
 _REVOKED_BACKOFF_S = 30.0
+
+# #3618 — what the control plane may ask this supervisor to run. The
+# service account behind the proxy holds far more than the Fleet tab
+# needs (HelmChart CRUD in kube-system, which is cluster-admin by
+# another route; node delete; PVC delete), so relaying whatever method
+# and path arrives would hand every control-plane caller that power on
+# every appliance. Only the requests the shipped Fleet routes build are
+# executed: the pod list + pod log, the workload list, and the
+# rollout-restart patch, all in the ``spatium`` namespace. Anything
+# else is answered 403 without touching the kubeapi.
+_NAMESPACE = "spatium"
+_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
+_LABEL_RE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+_WORKLOAD_PLURALS = ("deployments", "daemonsets", "statefulsets")
+_PODS_PATH = f"/api/v1/namespaces/{_NAMESPACE}/pods"
+_WORKLOADS_PREFIX = f"/apis/apps/v1/namespaces/{_NAMESPACE}/"
+_RESTART_ANNOTATION = "kubectl.kubernetes.io/restartedAt"
+_FORWARDED_HEADERS = ("Accept", "Content-Type")
+
+
+def _is_name(value: str) -> bool:
+    return _NAME_RE.fullmatch(value) is not None
+
+
+def _refusal(
+    method: str, path: str, body: bytes, headers: dict[str, str]
+) -> str | None:
+    """Why ``method path`` is not one of the requests this proxy runs,
+    or None when it is. See ``_NAMESPACE`` above for the rule."""
+    split = urlsplit(path)
+    if split.scheme or split.netloc or split.fragment:
+        return "absolute or fragment URL"
+    try:
+        query = parse_qsl(
+            split.query, keep_blank_values=True, strict_parsing=bool(split.query)
+        )
+    except ValueError:
+        return "malformed query"
+    route = split.path
+    if method == "GET" and route == _PODS_PATH:
+        return "unexpected query" if query else None
+    if (
+        method == "GET"
+        and route.startswith(_PODS_PATH + "/")
+        and route.endswith("/log")
+    ):
+        pod = route[len(_PODS_PATH) + 1 : -len("/log")]
+        if not _is_name(pod):
+            return "bad pod name"
+        seen: set[str] = set()
+        for key, value in query:
+            if key in seen:
+                return "repeated query key"
+            seen.add(key)
+            if key == "tailLines" and value.isdigit() and len(value) <= 6:
+                continue
+            if key == "container" and _LABEL_RE.fullmatch(value):
+                continue
+            return f"query key {key!r} not allowed"
+        return None
+    if route.startswith(_WORKLOADS_PREFIX):
+        rest = route[len(_WORKLOADS_PREFIX) :].split("/")
+        if query or rest[0] not in _WORKLOAD_PLURALS:
+            return "not a workload list or restart"
+        if method == "GET" and len(rest) == 1:
+            return None
+        if method == "PATCH" and len(rest) == 2 and _is_name(rest[1]):
+            if headers.get("Content-Type") != "application/strategic-merge-patch+json":
+                return "restart patch must be a strategic-merge patch"
+            try:
+                patch = json.loads(body)
+                annotations = patch["spec"]["template"]["metadata"]["annotations"]
+            except (ValueError, TypeError, KeyError):
+                return "not a rollout-restart patch"
+            shape = {"spec": {"template": {"metadata": {"annotations": annotations}}}}
+            if (
+                patch != shape
+                or list(annotations) != [_RESTART_ANNOTATION]
+                or not isinstance(annotations[_RESTART_ANNOTATION], str)
+            ):
+                return "not a rollout-restart patch"
+            return None
+    return "method and path not allowed"
 
 
 def proxy_loop_forever(
@@ -124,8 +214,9 @@ def _proxy_once(
         return
 
     # Issue #183 — only proxy when k3s is actually our active
-    # runtime. On legacy compose deployments the kubeapi isn't
-    # reachable anyway, and the queue would just back up.
+    # runtime. Since Phase 7 ``detect_runtime`` is the constant
+    # "k3s", so this never skips today; a supervisor with no kubeapi
+    # credentials answers each request 502 from ``_call_local_kubeapi``.
     if appliance_state.detect_runtime() != "k3s":
         time.sleep(_BACKOFF_S)
         return
@@ -168,15 +259,38 @@ def _proxy_once(
         return
 
     # Execute against local kubeapi.
-    method = body.get("method") or "GET"
-    api_path = body.get("path") or "/"
-    req_headers = body.get("headers") or {}
+    method = str(body.get("method") or "GET").upper()
+    api_path = str(body.get("path") or "/")
+    req_headers = body.get("headers")
+    if not isinstance(req_headers, dict):
+        req_headers = {}
     req_body_b64 = body.get("body_b64") or ""
     req_body = base64.b64decode(req_body_b64) if req_body_b64 else b""
 
-    response_status, response_body = _call_local_kubeapi(
-        method, api_path, req_body, req_headers
-    )
+    refusal = _refusal(method, api_path, req_body, req_headers)
+    if refusal is None:
+        # Only the content-negotiation headers travel; anything else the
+        # control plane put there (Authorization, Impersonate-*) does not.
+        forwarded = {
+            k: str(req_headers[k]) for k in _FORWARDED_HEADERS if k in req_headers
+        }
+        response_status, response_body = _call_local_kubeapi(
+            method, api_path, req_body, forwarded
+        )
+    else:
+        log.warning(
+            "supervisor.k8s_proxy.refused",
+            request_id=request_id,
+            method=method,
+            path=api_path,
+            reason=refusal,
+        )
+        response_status = 403
+        response_body = json.dumps(
+            {
+                "error": f"supervisor: kubeapi proxy refused {method} {api_path}: {refusal}"
+            }
+        ).encode("utf-8")
 
     reply_path = f"/api/v1/appliance/supervisor/k8s-proxy/reply/{request_id}"
     reply_url = _effective_control_plane_url(cfg).rstrip("/") + reply_path
