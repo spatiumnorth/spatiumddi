@@ -5861,6 +5861,7 @@ type SyncResultPayload =
       imported_records: SyncRecord[];
       // push direction
       push_candidates: number;
+      push_skipped_matching?: number;
       pushed: number;
       pushed_records: SyncRecord[];
       push_errors: string[];
@@ -5911,6 +5912,7 @@ export function SyncResultModal({
     imported,
     skipped_unsupported,
     imported_records,
+    push_skipped_matching,
     pushed,
     pushed_records,
     push_errors,
@@ -5972,7 +5974,11 @@ export function SyncResultModal({
               value={push_errors.length}
               highlight={push_errors.length > 0 ? "bad" : undefined}
             />
-            <Stat label="Skipped" value={0} hint="DB already matches server" />
+            <Stat
+              label="Skipped"
+              value={push_skipped_matching ?? 0}
+              hint="DB already matches server"
+            />
           </div>
           {pushed > 0 && (
             <RecordTable
