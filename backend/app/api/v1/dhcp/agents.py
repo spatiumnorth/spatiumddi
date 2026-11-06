@@ -1457,10 +1457,28 @@ async def agent_lease_events(
     existing_leases = (
         (
             await db.execute(
-                select(DHCPLease).where(
+                select(DHCPLease)
+                .where(
                     DHCPLease.server_id == server.id,
                     DHCPLease.ip_address.in_(ips),
                 )
+                # #3624 — locked, by id, and re-read if the lock had to wait.
+                # The expiry sweep marks a lapsed lease ``expired`` and holds
+                # its row to commit. A plain read here returns the row as it
+                # was before that, the update below then waits for the sweep,
+                # and the session still holds ``state='active'``: assigning
+                # ``active`` again is no change, so the state was never
+                # written and a renewed lease stayed ``expired`` — which the
+                # sweep's first pass (``active`` only) never takes again, so
+                # its mirror and DNS records outlived it. Locking first makes
+                # the wait happen here, ``populate_existing`` hands back what
+                # the sweep committed, and the pass below restores the state,
+                # the mirror and the DDNS from that. Id order, the first of
+                # the batch's locks (dhcp_lease → ip_address → dns_zone →
+                # audit chain), as the sweep takes its lease rows (#3605).
+                .order_by(DHCPLease.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()

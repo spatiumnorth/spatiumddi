@@ -40,7 +40,6 @@ from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.feature_modules import is_module_enabled
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.lock_order import (
-    lock_lease_rows,
     lock_mirror_rows,
     lock_zones_for_addresses,
 )
@@ -99,28 +98,28 @@ async def _sweep() -> tuple[int, int]:
         # the lock is granted, and the sweep leaves it alone instead of
         # stamping the renewed lease ``expired``.
         #
-        # #3617: the rows the second pass below hard-deletes are locked here
-        # too, in the same id-ordered statement. Locked only by that pass's
-        # delete, they were taken after the mirror rows.
+        # #3624 — the second pass's rows (``expired`` past the longer grace)
+        # are locked in the same statement, not when their DELETE flushes. That
+        # flush came after the DDNS revokes below, which hold zone rows: a
+        # lease-events batch renewing one of those leases holds its row, then
+        # wants the zone to publish the renewal, while the sweep held the zone
+        # and wanted the row — 40P01. One statement keeps every lease lock
+        # ahead of the mirror and zone locks, and in one id order.
         delete_cutoff = datetime.now(UTC) - EXPIRED_DELETE_GRACE
-        await lock_lease_rows(
-            db,
-            DHCPLease.expires_at.is_not(None),
-            or_(
-                and_(DHCPLease.state == "active", DHCPLease.expires_at < cutoff),
-                and_(DHCPLease.state == "expired", DHCPLease.expires_at < delete_cutoff),
-            ),
-        )
         res = await db.execute(
             select(DHCPLease)
             .where(
-                DHCPLease.state == "active",
                 DHCPLease.expires_at.is_not(None),
-                DHCPLease.expires_at < cutoff,
+                or_(
+                    and_(DHCPLease.state == "active", DHCPLease.expires_at < cutoff),
+                    and_(DHCPLease.state == "expired", DHCPLease.expires_at < delete_cutoff),
+                ),
             )
             .order_by(DHCPLease.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
+        locked = list(res.scalars().all())
         cleaned = 0
         touched_subnets: set[Any] = set()  # recounted once below (#3345)
         # Lazy-import the DDNS revoke to keep this task light when
@@ -142,7 +141,9 @@ async def _sweep() -> tuple[int, int]:
         # held the mirror rows and then wanted the zone rows: a lock cycle,
         # 40P01, one side answered 500.
         resolved: list[tuple[DHCPLease, Any]] = []
-        for lease in res.scalars().all():
+        for lease in locked:
+            if lease.state != "active":
+                continue  # already expired: only the second pass wants it
             resolved.append((lease, await _resolve_lease_subnet_id(db, lease, subnet_cache)))
         resolved.sort(key=lambda pair: _write_order(pair[1], pair[0].ip_address))
 
@@ -215,18 +216,13 @@ async def _sweep() -> tuple[int, int]:
         # longer grace so they stop lingering in the DHCP view (#478). History
         # was already stamped when the lease flipped to expired, and the mirror
         # was dropped above / by the agent, so this only removes the dead row.
-        # Its rows were locked with the first pass's (#3617).
-        stale = await db.execute(
-            select(DHCPLease).where(
-                DHCPLease.state == "expired",
-                DHCPLease.expires_at.is_not(None),
-                DHCPLease.expires_at < delete_cutoff,
-            )
-        )
+        # Taken from the rows locked above (#3624): every one is ``expired``
+        # by now, including a lease the first pass has just expired, as before.
         deleted = 0
-        for lease in stale.scalars().all():
-            await db.delete(lease)
-            deleted += 1
+        for lease in locked:
+            if lease.expires_at is not None and lease.expires_at < delete_cutoff:
+                await db.delete(lease)
+                deleted += 1
 
         # The sweep writes no audit row, so it never waits for the audit-chain
         # lock and need not take it before the row locks (#3345).

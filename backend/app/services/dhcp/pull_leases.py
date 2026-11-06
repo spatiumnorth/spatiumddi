@@ -382,7 +382,10 @@ async def _pull_leases_core(
     # below) the zones its DDNS may write, by id. The pull used to take all
     # three per lease, in wire order, so the expiry sweep (leases → mirrors →
     # zones, #3605) or a lease batch could hold a row this pull wanted next
-    # while waiting for one it held.
+    # while waiting for one it held. Locking every lease row up front also
+    # makes a renewal wait for an expiry sweep that holds the row, so the
+    # per-address read below (``populate_existing``) sees what the sweep
+    # committed rather than a stale ``state='active'`` (#3624).
     wire_subnet = {
         lease.get("ip_address"): _find_containing_subnet(
             lease["ip_address"], subnets, preferred_subnet_ids=preferred_subnet_ids
@@ -403,9 +406,9 @@ async def _pull_leases_core(
         }
         for held in (
             await db.execute(
-                select(DHCPLease).where(
-                    DHCPLease.server_id == server.id, DHCPLease.state == "active"
-                )
+                select(DHCPLease)
+                .where(DHCPLease.server_id == server.id, DHCPLease.state == "active")
+                .execution_options(populate_existing=True)
             )
         ).scalars():
             sid = scope_subnet_ids.get(held.scope_id) if held.scope_id else None
@@ -437,20 +440,19 @@ async def _pull_leases_core(
         # aborted the server's pull on every tick. Keep the newest, drop the
         # rest (the kept row still holds the address, so no mirror or DDNS
         # teardown).
-        rows = list(
-            (
-                await db.execute(
-                    select(DHCPLease)
-                    .where(
-                        DHCPLease.server_id == server.id,
-                        DHCPLease.ip_address == ip,
-                    )
-                    .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
-                )
+        lease_q = (
+            select(DHCPLease)
+            .where(
+                DHCPLease.server_id == server.id,
+                DHCPLease.ip_address == ip,
             )
-            .scalars()
-            .all()
+            .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
         )
+        if apply:
+            # #3624 — re-read: the rows were locked above, possibly after a
+            # wait on the sweep, and must not keep a value read before it.
+            lease_q = lease_q.execution_options(populate_existing=True)
+        rows = list((await db.execute(lease_q)).scalars().all())
         existing = rows[0] if rows else None
         if apply and len(rows) > 1:
             for extra in rows[1:]:
