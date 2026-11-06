@@ -12,7 +12,7 @@ import httpx
 import structlog
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
@@ -22,7 +22,7 @@ from app.core.safe_fetch import FetchRefusedError, describe_fetch_error, safe_ge
 from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
 from app.services.agents.daemon_state import forget_stale_ok
-from app.services.dns_blocklist import parse_feed_detailed
+from app.services.dns_blocklist import looks_like_html, parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
 from app.services.forward_secrets import redact, secret_url_in_flight, url_display
 from app.tasks.module_gate import module_gated
@@ -43,6 +43,18 @@ _FEED_WRITE_BATCH = 5000
 def _batched(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+async def _refuse_feed_refresh(
+    db: AsyncSession, bl: DNSBlockList, error: str, event: str
+) -> dict[str, int | str]:
+    """Record a refused refresh (#3607): error state, entries untouched."""
+    bl.last_sync_status = "error"
+    bl.last_sync_error = error
+    bl.last_synced_at = datetime.now(UTC)
+    await db.commit()
+    logger.warning(event, list_id=str(bl.id), list_name=bl.name)
+    return {"status": "error", "added": 0, "removed": 0}
 
 
 async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
@@ -95,7 +107,9 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             shown_url = url_display(bl.feed_url)
             try:
                 with secret_url_in_flight(bl.feed_url):
-                    text = await safe_get_text(bl.feed_url, label="dns_blocklist_feed", timeout=60)
+                    text = await safe_get_text(
+                        bl.feed_url, label="dns_blocklist_feed", timeout=60, refuse_html=True
+                    )
             except FetchRefusedError as e:
                 # Permanent — the same URL gets the same answer; no retry.
                 bl.last_sync_status = "error"
@@ -143,6 +157,18 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 )
                 return {"status": "error", "added": 0, "removed": 0}
 
+            if looks_like_html(text):
+                # #3607: a web page is not a feed. Parsed, it yields zero
+                # rules and the refresh would empty the list and report
+                # success. Refuse; the existing entries stay.
+                return await _refuse_feed_refresh(
+                    db,
+                    bl,
+                    "Feed refused: the URL answered with a web page (HTML), not a data feed "
+                    "(a login or captive-portal page, a 404 served as 200, or a moved "
+                    "repository?); the list's entries left as they were.",
+                    "blocklist_feed_html_refused",
+                )
             parsed = parse_feed_detailed(text, bl.feed_format)
             if parsed.format_mismatch:
                 # The feed is a different format than the list is set to
@@ -167,6 +193,28 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 return {"status": "error", "added": 0, "removed": 0}
             domains = set(parsed.domains)
             wildcard = bool(bl.feed_entries_are_wildcard)
+
+            # #3607: a feed that parses to nothing is how an empty file, a
+            # blank answer or an unrecognisable body looks. Replacing a
+            # populated list with it would drop every feed entry, so refuse
+            # when the list has feed entries; a first refresh of a genuinely
+            # empty feed is allowed and reported below.
+            feed_empty = not domains and not parsed.exceptions
+            if feed_empty:
+                had_feed_entries = await db.scalar(
+                    select(func.count())
+                    .select_from(DNSBlockListEntry)
+                    .where(DNSBlockListEntry.list_id == bl.id, DNSBlockListEntry.source == "feed")
+                )
+                if had_feed_entries:
+                    return await _refuse_feed_refresh(
+                        db,
+                        bl,
+                        "Feed refused: it contained no rules (empty, or only comments) but the "
+                        f"list has {had_feed_entries} feed entries; the list's entries left as "
+                        "they were.",
+                        "blocklist_feed_empty_refused",
+                    )
 
             # A `*.`-prefixed feed is DECLARING it means "and every
             # subdomain" — as is every adblock `||name^` rule, which is
@@ -316,6 +364,10 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             bl.last_success_at = bl.last_synced_at
             bl.last_sync_status = "success"
             bl.last_sync_error = None
+            if feed_empty:
+                # Allowed (nothing to lose), but said out loud (#3607).
+                bl.last_sync_error = "Feed contained no rules; the list is empty."
+                logger.warning("blocklist_feed_empty", list_id=list_id, list_name=bl.name)
 
             # Groups whose rendered config folds in this blocklist: groups it's
             # assigned to directly, plus the owning groups of any views it's
