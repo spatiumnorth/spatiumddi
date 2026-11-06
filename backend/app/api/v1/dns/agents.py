@@ -114,7 +114,7 @@ from app.services.dns.soa_timers import (
     reconcile_soa_timers,
     renders_soa_timers,
 )
-from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name
+from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name, zone_holding_views
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import log_retention_hours
@@ -1650,6 +1650,7 @@ async def agent_ingested_records(
         return {"zone": zone_name, "skipped": skipped}
     if not zone.dynamic_update_enabled:
         return {"zone": zone_name, "skipped": "dynamic_update_disabled"}
+    report_view_id, stamp_view = await _ingest_report_view(db, server, zone, body.view_name)
 
     incoming = [
         IncomingRecord(
@@ -1669,8 +1670,46 @@ async def agent_ingested_records(
     # a collector here: the wake goes out after the commit below, and the
     # peers apply the op on their next poll instead of the 12 s safety tick.
     async with collecting_wakes():
-        summary = await _reconcile_and_audit(db, server, zone, zone_name, incoming)
+        summary = await _reconcile_and_audit(
+            db, server, zone, zone_name, incoming, report_view_id, stamp_view
+        )
     return {"zone": zone_name, **summary}
+
+
+async def _ingest_report_view(
+    db: AsyncSession, server: DNSServer, zone: DNSZone, view_name: str | None
+) -> tuple[uuid.UUID | None, bool]:
+    """The operator view whose copy of ``zone`` a filed report was read from,
+    and whether new mirror rows are stamped with it.
+
+    Under split-horizon each view loads its own copy of a dynamic zone, and an
+    RFC 2136 write lands in one copy only. A mirror row with no view renders
+    into every copy, so a record written through one view would be answered to
+    every other view's clients. So when the zone renders into more than one
+    view, a new mirror row carries the view the report was read from. In one
+    view, or with no views, it stays unscoped (the same answer either way).
+
+    A report naming no view comes from an agent built before the view field.
+    It keeps today's behaviour (unscoped rows, every mirror row in play); for a
+    zone in several views that is logged, since its rows render into all of
+    them until the agent is upgraded.
+    """
+    holding = await zone_holding_views(db, zone)
+    if view_name is None:
+        if len(holding) > 1:
+            logger.warning(
+                "dns_ingest_report_without_view",
+                server_id=str(server.id),
+                zone=zone.name,
+                views=[vd["name"] for vd in holding],
+            )
+        return None, False
+    vd = next((v for v in holding if v["name"] == view_name), None)
+    if vd is None or vd["kind"] != "operator":
+        # A geo view (no stored view to scope a row to): only a group with no
+        # operator views reads from one, and its rows carry no view anyway.
+        return None, False
+    return vd["id"], len(holding) > 1
 
 
 async def _ingest_target_zone(
@@ -1712,6 +1751,8 @@ async def _reconcile_and_audit(
     zone: DNSZone,
     zone_name: str,
     incoming: list[Any],
+    report_view_id: uuid.UUID | None = None,
+    stamp_view: bool = False,
 ) -> dict[str, Any]:
     from app.services.dns.ingest import (  # noqa: PLC0415
         reconcile_external_records,
@@ -1719,7 +1760,14 @@ async def _reconcile_and_audit(
     )
     from app.services.dns.server_resync import complete_deferred_resync  # noqa: PLC0415
 
-    result = await reconcile_external_records(db, zone, incoming, server=server)
+    result = await reconcile_external_records(
+        db,
+        zone,
+        incoming,
+        server=server,
+        report_view_id=report_view_id,
+        stamp_view=stamp_view,
+    )
     summary: dict[str, Any] = dict(to_summary(result))
     # #2654 — a re-enabled server's #2281 re-render waits for this: once it
     # has reported every dynamic zone, what it learned while disabled is in

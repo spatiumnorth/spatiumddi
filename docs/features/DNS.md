@@ -427,9 +427,13 @@ DNSView
 
 ### Where a zone renders, and deleting a view (#2275)
 
-A zone renders into the view its `view_id` names **and** into the view of each
-view-scoped record in it. A zone with neither is *shared* and renders into every
-view (and every geo view, §17). A group with no views renders each zone once.
+A zone with a `view_id` renders into that view alone among the operator views
+(and into every geo view, §17); a record in it scoped to another view is not
+rendered and does not carry the zone into that view. A zone with no `view_id`
+renders into the view of each view-scoped record in it, and with none of those
+it is *shared* and renders into every view (and every geo view). A record
+learned from an RFC 2136 update (§19.5) follows its zone and never decides
+where it renders. A group with no views renders each zone once.
 
 - **A view that still scopes zones or records cannot be deleted** (409, naming
   them). `view_id` is `ON DELETE SET NULL`, and NULL means shared, so deleting
@@ -2590,6 +2594,18 @@ other case nothing is filed and the endpoint answers
 `skipped: view_ambiguous` or `view_not_read`: the control plane never
 guesses a view, because a guess mirrors one view's records into another
 view's zone, where that view's clients are answered them.
+
+**A learned record keeps the view it was written in.** A zone rendered into
+several views loads one copy per view, and an RFC 2136 update lands in one
+of them. A record learned from a report that names its view is stored scoped
+to that view, so it renders into that view's copy only rather than into every
+view's. A zone rendered into a single view, or a group with no views, keeps
+learned records unscoped. A learned record's view never changes which views
+the zone itself renders into, and a report from one view never matches or
+removes a record learned in another. A report that names no view (an agent
+built before the field) stores unscoped records as before, and the control
+plane logs `dns_ingest_report_without_view` when the zone is in more than one
+view. Learned records stored unscoped before this change stay unscoped.
 
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only
