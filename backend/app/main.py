@@ -598,6 +598,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_spool_trimmed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_spool_trimmed_alert_rule_seed_skipped", reason=str(exc))
+    # DNS group memory-pressure alert rule — singleton, ENABLED by default
+    # (issue #3551). Silent unless a BIND9 group's estimated named memory
+    # nears its agents' limit. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_memory_pressure_alert_rule,
+        )
+
+        await seed_dns_memory_pressure_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_memory_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DNSSEC multi-signer alert rule — singleton, ENABLED by default
     # (issue #1762). Silent unless a signed zone sits on a group with more than
     # one DNS server, each signing with its own keys. Idempotent.

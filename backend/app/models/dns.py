@@ -366,6 +366,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #3551 — the agent container's own memory limit in bytes (its cgroup
+    # ``memory.max``), as last reported on the heartbeat. named and the agent
+    # share it, so it is what a group's RPZ and zone data must fit inside.
+    # NULL means UNKNOWN: an agent too old to report, an agentless driver, or
+    # a container with no limit at all. Only overwritten when a heartbeat
+    # carries the field. Read by ``services/dns/memory_estimate``.
+    memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # ── #1067 daemon state ──
     #
@@ -802,11 +809,12 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DNSSEC — auto | yes | no
     dnssec_validation: Mapped[str] = mapped_column(String(10), nullable=False, default="auto")
 
-    # GSS-TSIG (Kerberos)
-    gss_tsig_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    gss_tsig_keytab_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    gss_tsig_realm: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    gss_tsig_principal: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The four ``gss_tsig_*`` columns (#3561) are no longer mapped: they were
+    # stored and never rendered. They stay in the database for one release so
+    # a rolling upgrade's old api pods, which still map them, keep serving
+    # (expand/contract, docs/DEVELOPMENT.md); ``gss_tsig_enabled`` carries a
+    # ``false`` server default, so inserts from this model still satisfy its
+    # NOT NULL. The contract migration that drops them comes in the next release.
 
     # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")
@@ -1765,7 +1773,10 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Rules the last adblock-format refresh could not enforce, by category
-    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count.
+    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count, where
+    # ``malformed`` is the total of the reason buckets (#3519: ``star_in_name``,
+    # ``no_anchor``, ``trailing_dot``, ``start_anchor``, ``bare_star``,
+    # ``dotless``, ``other``); rows written before #3519 carry only the total.
     # NULL = no adblock refresh yet, or a format with no rule syntax to lose.
     feed_parse_skipped: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
 

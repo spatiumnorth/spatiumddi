@@ -266,6 +266,14 @@ def test_adblock_parses_every_rule_shape_for_what_it_says() -> None:
         # a path, a ``*`` inside a name, a ``|`` anchor, a bare word, and
         # ``*.wild…`` (not ``||`` syntax)
         "malformed": 5,
+        # #3519: the reasons behind ``malformed``, one rule each
+        "star_in_name": 1,  # ``||ad*.example.com^``
+        "no_anchor": 1,  # ``plain.example.com``
+        "trailing_dot": 0,
+        "start_anchor": 1,  # ``|anchor.example.com^``
+        "bare_star": 1,  # ``*.wild…``
+        "dotless": 0,
+        "other": 1,  # ``||path.example.com/banner.js``
     }
 
 
@@ -307,6 +315,7 @@ class _NullEngine:
 def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, holder: dict) -> None:
     class _Resp:
         is_redirect = False  # the guarded fetch follows redirects by hand
+        headers = {"content-type": "text/plain"}  # read by refuse_html (#3607)
 
         def __init__(self) -> None:
             self.text = holder["body"]
@@ -392,7 +401,19 @@ async def test_refresh_stores_feed_exceptions_and_skip_counts(
     assert list(entries) == ["ads.example"]
     await db_session.refresh(bl)
     assert bl.entry_count == 1
-    assert bl.feed_parse_skipped == {"regex": 1, "modifier": 1, "badfilter": 0, "malformed": 0}
+    assert bl.feed_parse_skipped == {
+        "regex": 1,
+        "modifier": 1,
+        "badfilter": 0,
+        "malformed": 0,
+        "star_in_name": 0,
+        "no_anchor": 0,
+        "trailing_dot": 0,
+        "start_anchor": 0,
+        "bare_star": 0,
+        "dotless": 0,
+        "other": 0,
+    }
 
     # The feed drops its exceptions: the feed row goes, the operator's stay.
     holder["body"] = "||ads.example^\n"
@@ -400,7 +421,19 @@ async def test_refresh_stores_feed_exceptions_and_skip_counts(
     assert out["status"] == "success"
     assert await _exceptions() == {"mine.example": "manual", "both.example": "manual"}
     await db_session.refresh(bl)
-    assert bl.feed_parse_skipped == {"regex": 0, "modifier": 0, "badfilter": 0, "malformed": 0}
+    assert bl.feed_parse_skipped == {
+        "regex": 0,
+        "modifier": 0,
+        "badfilter": 0,
+        "malformed": 0,
+        "star_in_name": 0,
+        "no_anchor": 0,
+        "trailing_dot": 0,
+        "start_anchor": 0,
+        "bare_star": 0,
+        "dotless": 0,
+        "other": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -554,3 +587,52 @@ def test_a_name_the_feed_blocks_and_excepts_is_not_an_entry() -> None:
     p = parse_feed_detailed("||both.example^\n@@||both.example^\n||ads.example^\n", "adblock")
     assert p.domains == ["ads.example"]
     assert p.exceptions == ["both.example"]
+
+
+def test_malformed_adblock_rules_are_split_by_reason_3519() -> None:
+    """The AdGuard DNS Filter's six kinds of skipped rule, each in its own
+    bucket, summing to the ``malformed`` total older readers rely on."""
+    p = parse_feed_detailed(
+        "||reachableads-av.*.amazonaws.com^\n"
+        "-tracker.biliapi.net^\n"
+        ".bbelements.com^\n"
+        "||adserver1.\n"
+        "|piwik.\n"
+        "|a.klaviyo.com^\n"
+        "*ad.durasite.net^\n"
+        # A ``*`` without ``||`` is bare_star wherever it sits, not only when
+        # it leads (the AdGuard DNS Filter's 13, not 1).
+        "-adx-*.rayjump.com^\n"
+        "://*.a-akamaihd.com^\n"
+        "||countly-\n"
+        "||host.example/ads\n"
+        "||ok.example^\n",
+        "adblock",
+    )
+    assert p.domains == ["ok.example"]
+    assert p.skipped is not None
+    d = p.skipped.as_dict()
+    assert d["star_in_name"] == 1
+    assert d["no_anchor"] == 2
+    assert d["trailing_dot"] == 1
+    assert d["start_anchor"] == 2
+    assert d["bare_star"] == 3
+    assert d["dotless"] == 1
+    assert d["other"] == 1
+    assert (
+        d["malformed"]
+        == 11
+        == sum(
+            d[k]
+            for k in (
+                "star_in_name",
+                "no_anchor",
+                "trailing_dot",
+                "start_anchor",
+                "bare_star",
+                "dotless",
+                "other",
+            )
+        )
+    )
+    assert p.skipped.total == 11

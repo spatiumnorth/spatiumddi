@@ -158,6 +158,21 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_dynamic_restart_check.py
 
+      # Issue #3551 — under split-horizon an identical zone is defined in
+      # one view and referenced from the others with `in-view`, so it loads
+      # once instead of once per view. Proves named accepts the result, that
+      # the shared zone answers in every view (picked by client source), that
+      # a record change and a shared <-> per-view transition both converge on
+      # a running named, and that a view's #920 transfer key is answered from
+      # the shared zone. Runs as `spatium`, like the agent.
+      - name: Views zone-sharing check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_views_share_check.py
+
       # get.trivy.dev, which trivy-action's own setup downloads from,
       # is gone (#3464): install from the GitHub release instead.
       - name: Install Trivy
