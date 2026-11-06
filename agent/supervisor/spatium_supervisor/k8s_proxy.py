@@ -48,6 +48,7 @@ from . import cp_tls
 from . import appliance_state, k8s_api
 from .cert_auth import build_auth_headers, load_cert
 from .config import SupervisorConfig
+from .heartbeat import _effective_control_plane_url
 from .identity import Identity, load_appliance_id
 
 log = structlog.get_logger(__name__)
@@ -88,7 +89,7 @@ def proxy_loop_forever(
         try:
             with cp_tls.client(
                 cfg.state_dir,
-                cfg.control_plane_url,
+                _effective_control_plane_url(cfg),
                 first_contact=False,
                 timeout=_POLL_TIMEOUT_S + 5.0,
             ) as client:
@@ -130,7 +131,7 @@ def _proxy_once(
         return
 
     poll_path = "/api/v1/appliance/supervisor/k8s-proxy/poll"
-    poll_url = cfg.control_plane_url.rstrip("/") + poll_path
+    poll_url = _effective_control_plane_url(cfg).rstrip("/") + poll_path
     headers = build_auth_headers(
         "POST", poll_path, cert_pem, identity.private_key, appliance_id
     )
@@ -178,7 +179,7 @@ def _proxy_once(
     )
 
     reply_path = f"/api/v1/appliance/supervisor/k8s-proxy/reply/{request_id}"
-    reply_url = cfg.control_plane_url.rstrip("/") + reply_path
+    reply_url = _effective_control_plane_url(cfg).rstrip("/") + reply_path
     reply_headers = build_auth_headers(
         "POST", reply_path, cert_pem, identity.private_key, appliance_id
     )
