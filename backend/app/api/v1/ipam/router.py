@@ -3012,7 +3012,15 @@ async def _sync_dns_record(
     against a zone (including retractions). Callers that report on the
     outcome — the DDNS path logs ``ddns_applied`` — must not claim more than
     this says (spatiumddi#1065).
+
+    Every zone the sync may write is row-locked first, in id order (#3617):
+    a retraction takes the PTR's reverse zone before the forward zone
+    (#1800) and a publish the forward zone first, so two syncs of different
+    addresses in one zone pair deadlocked. See ``app.services.lock_order``.
     """
+    from app.services.lock_order import lock_zones_for_sync  # noqa: PLC0415
+
+    await lock_zones_for_sync(db, ip, subnet, zone_id=zone_id, action=action)
     if action == "delete":
         result = await db.execute(
             select(DNSRecord)
@@ -8093,21 +8101,31 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
     """#428 — on subnet delete, revoke the DDNS records published for the
     subnet's DHCP-lease mirrors and drop the transient mirror rows. Returns
     the count revoked. Best-effort per row: a DNS-revoke hiccup must not
-    block the delete (the backstop / next reconcile cleans residue)."""
+    block the delete (the backstop / next reconcile cleans residue).
+
+    #3617: the mirror rows are locked by id, then every zone the delete may
+    write, in id order, before any revoke: one revoke per row took the zones
+    one address at a time, out of id order. The caller locks the scopes'
+    lease rows before this (``app.services.lock_order``)."""
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+    from app.services.lock_order import lock_zones_for_subnets  # noqa: PLC0415
 
     rows = (
         (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.subnet_id == subnet.id,
                     IPAddress.auto_from_lease.is_(True),
                 )
+                .order_by(IPAddress.id)
+                .with_for_update()
             )
         )
         .scalars()
         .all()
     )
+    await lock_zones_for_subnets(db, [subnet.id])
     # #3186 — their records a zone deleted earlier took into its batch go too.
     await purge_trashed_address_records(db, [row.id for row in rows])
     revoked = 0
@@ -8947,6 +8965,25 @@ class MergeSubnetCommitResponse(BaseModel):
     summary: list[str]
 
 
+def _require_merge_sources_writable(
+    user: Any, subnet_id: uuid.UUID, sibling_ids: list[uuid.UUID]
+) -> None:
+    """403 unless the caller may write EVERY subnet a merge names.
+
+    The path subnet and each id in the body get the same per-subnet RBAC check
+    and token-binding check, before any of them is loaded, and a refusal is
+    one fixed answer whether the id is forbidden or does not exist, so the
+    preview cannot be used to probe ids."""
+    for sid in dict.fromkeys([subnet_id, *sibling_ids]):
+        if not user_has_permission(user, "write", "subnet", sid) or not token_scope_allows(
+            user, "subnet", sid
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied: need 'write' on every subnet named in the merge",
+            )
+
+
 @router.post(
     "/subnets/{subnet_id}/merge/preview",
     response_model=MergeSubnetPreviewResponse,
@@ -8959,6 +8996,7 @@ async def merge_subnet_preview(
     db: DB,
 ) -> MergeSubnetPreviewResponse:
     _require_type_write(current_user, "subnet")
+    _require_merge_sources_writable(current_user, subnet_id, body.sibling_subnet_ids)
     from app.services.ipam.subnet_merge import preview_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
@@ -8986,6 +9024,7 @@ async def merge_subnet_commit(
     db: DB,
 ) -> MergeSubnetCommitResponse:
     _require_type_write(current_user, "subnet")
+    _require_merge_sources_writable(current_user, subnet_id, body.sibling_subnet_ids)
     from app.services.ipam.subnet_merge import MergeError, commit_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
