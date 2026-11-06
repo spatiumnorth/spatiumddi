@@ -52,6 +52,7 @@ from app.services.integration_ownership import (
     address_taken,
     addresses_in_space,
     drop_wrapper_block,
+    gateway_changed,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
@@ -416,7 +417,11 @@ async def _apply_blocks_and_subnets(
             if existing.description != d.description:
                 existing.description = d.description
                 changed = True
-            if existing.gateway != d.gateway:
+            # Docker is authoritative for its own gateway, so a vanished one
+            # clears (unlike the integrations that never clear an operator's).
+            if gateway_changed(existing.gateway, d.gateway) or (
+                d.gateway is None and existing.gateway is not None
+            ):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
