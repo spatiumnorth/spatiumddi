@@ -69,6 +69,7 @@ from app.services.bacnet.registry import (
     sync_subnet_id,
 )
 from app.services.bacnet.vendors import resolve_vendor_label
+from app.services.ipam.live_address import get_live_address
 from app.services.tags import apply_tag_filter
 
 router = APIRouter(
@@ -371,7 +372,7 @@ async def _load_ip(db: AsyncSession, ip_address_id: uuid.UUID, user: User) -> IP
     """
     from app.api.v1.ipam.router import _enforce_subnet_token_scope
 
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(status_code=422, detail="ip_address_id not found")
     _enforce_subnet_token_scope(user, ip.subnet_id)
@@ -814,7 +815,7 @@ async def get_device_by_address(
     """
     from app.api.v1.ipam.router import _enforce_subnet_token_scope
 
-    ip = await db.get(IPAddress, ip_address_id)
+    ip = await get_live_address(db, ip_address_id)
     if ip is None:
         raise HTTPException(
             status_code=404,

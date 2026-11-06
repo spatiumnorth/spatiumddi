@@ -408,6 +408,16 @@ describe("Edit IP status choices", () => {
 
 describe("Subnet detail", () => {
   function subnetDetail() {
+    // A user who may read DHCP scopes: the scope list is asked only with
+    // that grant (#3466), so the module is all that stops it below.
+    answer("authApi", "myPermissions", () =>
+      Promise.resolve({
+        is_superadmin: false,
+        grants: [
+          { action: "read", resource_type: "dhcp_scope", resource_id: null },
+        ],
+      }),
+    );
     answer("ipamApi", "listAddresses", () =>
       Promise.resolve([address({ id: "ip-1" })]),
     );
