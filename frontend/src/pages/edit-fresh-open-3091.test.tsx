@@ -580,6 +580,16 @@ describe("clears and inherit toggles go out in the diff (#3091)", () => {
     answers.dhcpApi = {
       listGroups: () => Promise.resolve([{ id: "g-9", name: "dh" }]),
     };
+    // The group list is asked only of a user who may read it (#3466).
+    answers.authApi = {
+      myPermissions: () =>
+        Promise.resolve({
+          is_superadmin: false,
+          grants: [
+            { action: "read", resource_type: "dhcp_server", resource_id: null },
+          ],
+        }),
+    };
     open(<EditBlockModal block={b} onClose={() => {}} />);
     fireEvent.click(await screen.findByRole("button", { name: "DHCP" }));
     return updateBlock;

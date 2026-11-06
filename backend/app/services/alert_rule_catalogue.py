@@ -170,7 +170,8 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
             _pct(
                 "Threshold (%)",
                 90,
-                "Fires when subnet utilization ≥ this. PTP / loopback subnets "
+                "Fires when subnet utilization ≥ this; an open alert resolves "
+                f"{int(a._PCT_RESOLVE_MARGIN)} points below it. PTP / loopback subnets "
                 "(prefix > utilization_max_prefix_*) are excluded.",
             )
         ],
@@ -272,7 +273,8 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "counts allocated IPAM rows — a pool can be exhausted while the "
                 "subnet looks empty. Empty uses 90% only while the free-address "
                 "floor below is also empty; with a floor set, empty means no "
-                "percent check.",
+                f"percent check. An open alert resolves {int(a._PCT_RESOLVE_MARGIN)} "
+                "points below this.",
                 initial=90,
             ),
             ParamSpec(
@@ -476,6 +478,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_SPOOL_TRIMMED, "Agent spool trimmed", "Infrastructure", []),
+    (a.RULE_TYPE_DNS_MEMORY_PRESSURE, "DNS group near its memory limit", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_DAEMON_DEGRADED, "Agent daemon degraded", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED, "Agent bundle render failed", "Infrastructure", []),
     (a.RULE_TYPE_AUDIT_CHAIN_BROKEN, "Audit chain broken", "Infrastructure", []),
