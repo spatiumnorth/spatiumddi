@@ -23,7 +23,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { DNSZone } from "@/lib/api";
+import type { DNSRecord, DNSZone } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 const answers: Record<string, Record<string, Answer>> = {};
@@ -241,6 +241,75 @@ describe("Add Record LUA type (#3637)", () => {
     expect(
       within(type).queryByRole("option", { name: "ALIAS" }),
     ).not.toBeNull();
+  });
+});
+
+describe("Edit Record LUA snippet (#3637)", () => {
+  const lua: DNSRecord = {
+    id: "rec-1",
+    zone_id: "zone-1",
+    view_id: null,
+    name: "p1",
+    fqdn: "p1.corp.example.test.",
+    record_type: "LUA",
+    value: "A \"'192.0.2.1'\"",
+    ttl: 300,
+    priority: null,
+    weight: null,
+    port: null,
+    auto_generated: false,
+    tailscale_tenant_id: null,
+    pool_member_id: null,
+    created_at: "2026-11-06T00:00:00.000Z",
+    modified_at: "2026-11-06T00:00:00.000Z",
+  };
+
+  function openEdit(isSuperadmin: boolean) {
+    answer("authApi", "myPermissions", () =>
+      Promise.resolve({ is_superadmin: isSuperadmin, grants: [] }),
+    );
+    // The dialog re-reads the row from the records list before it opens.
+    const qc = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+          queryFn: ({ queryKey }) =>
+            queryKey[0] === "dns-records" ? [lua] : [],
+        },
+      },
+    });
+    qc.setQueryData(["dns-records", "zone-1"], [lua]);
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <RecordModal
+            groupId="grp-1"
+            zoneId="zone-1"
+            zoneName="corp.example.test."
+            record={lua}
+            onClose={() => {}}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("is read-only, with no snippet picker, for a user who is not a superadmin", async () => {
+    openEdit(false);
+    const value = await screen.findByLabelText("Value");
+    expect(value.tagName).toBe("TEXTAREA");
+    expect((value as HTMLTextAreaElement).readOnly).toBe(true);
+    expect(screen.queryByLabelText("Insert LUA snippet template")).toBeNull();
+  });
+
+  it("is editable, with the snippet picker, for a superadmin", async () => {
+    openEdit(true);
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Value") as HTMLTextAreaElement).readOnly,
+      ).toBe(false),
+    );
+    expect(screen.getByLabelText("Insert LUA snippet template")).not.toBeNull();
   });
 });
 

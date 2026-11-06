@@ -3645,8 +3645,9 @@ function RecordModalForm({
         </div>
         <Field label="Value">
           {/* The label names the value box. The LUA snippet picker
-              beside it keeps its own name (#3509). */}
-          {type === "LUA" && (
+              beside it keeps its own name (#3509). It is not drawn for a
+              user who may not change the snippet (#3637). */}
+          {type === "LUA" && canWriteLua && (
             <div className="flex items-center justify-between gap-2">
               <select
                 className="rounded-md border bg-background px-2 py-1 text-xs"

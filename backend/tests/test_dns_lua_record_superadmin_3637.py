@@ -19,9 +19,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns import router as dns_router
-from app.core.security import create_access_token, hash_password
+from app.core.security import create_access_token, generate_api_token, hash_password
 from app.models.audit import AuditLog
-from app.models.auth import Group, Role, User
+from app.models.auth import APIToken, Group, Role, User
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.services.dns_io.parser import ParsedRecord, ParsedZone
 
@@ -295,4 +295,118 @@ async def test_zone_from_template(
     zones = (await db_session.execute(select(DNSZone).where(DNSZone.group_id == grp.id))).all()
     assert zones == []
     r = await client.post(url, headers=sa, json=body)
+    assert r.status_code == 201, r.text
+
+
+async def test_editor_resending_an_unchanged_lua_value_is_not_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A GET-then-PUT client re-sends every field; only a changed value is a
+    # LUA write, so a TTL edit that carries the stored snippet goes through.
+    h = await _user(db_session, superadmin=False)
+    zone = await _zone(db_session)
+    rec = await _lua_row(db_session, zone)
+    rec_id = rec.id
+    await db_session.commit()
+
+    r = await client.put(
+        f"{_base(zone)}/records/{rec_id}",
+        headers=h,
+        json={"name": "p1", "value": LUA_VALUE, "ttl": 120},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["ttl"] == 120
+
+
+async def test_a_superadmin_role_without_the_flag_may_write_lua(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # An LDAP / OIDC user mapped into a group whose role holds */* is a
+    # superadmin without the legacy column (#190).
+    tag = uuid.uuid4().hex[:8]
+    role = Role(name=f"r-{tag}", permissions=[{"action": "*", "resource_type": "*"}])
+    group = Group(name=f"g-{tag}")
+    group.roles = [role]
+    user = User(
+        username=f"u-{tag}",
+        email=f"{tag}@example.test",
+        display_name="Test",
+        hashed_password=hash_password("x" * 12),
+        is_superadmin=False,
+    )
+    user.groups = [group]
+    db_session.add_all([role, group, user])
+    await db_session.flush()
+    h = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+    zone = await _zone(db_session)
+    await db_session.commit()
+
+    r = await client.post(
+        f"{_base(zone)}/records",
+        headers=h,
+        json={"name": "p1", "record_type": "LUA", "value": LUA_VALUE},
+    )
+    assert r.status_code == 201, r.text
+
+
+async def _superadmin_token(db: AsyncSession, grants: list[dict] | None) -> dict[str, str]:
+    tag = uuid.uuid4().hex[:8]
+    owner = User(
+        username=f"u-{tag}",
+        email=f"{tag}@example.test",
+        display_name="Test",
+        hashed_password=hash_password("x" * 12),
+        is_superadmin=True,
+    )
+    owner.groups = []
+    db.add(owner)
+    await db.flush()
+    raw, _prefix, token_hash = generate_api_token()
+    db.add(
+        APIToken(
+            name=f"t-{tag}",
+            token_hash=token_hash,
+            prefix=raw[:10],
+            scope="user",
+            scopes=[],
+            resource_grants=grants,
+            user_id=owner.id,
+            created_by_user_id=owner.id,
+            is_active=True,
+        )
+    )
+    await db.flush()
+    return {"Authorization": f"Bearer {raw}"}
+
+
+async def test_superadmin_api_tokens(client: AsyncClient, db_session: AsyncSession) -> None:
+    # An unrestricted token of a superadmin is that superadmin. A token bound
+    # to one zone is never a superadmin (#374): it may write that zone's
+    # ordinary records, but not a LUA one.
+    zone = await _zone(db_session)
+    zone_id = zone.id
+    open_token = await _superadmin_token(db_session, None)
+    zone_token = await _superadmin_token(
+        db_session,
+        [
+            {"action": "write", "resource_type": "dns_zone", "resource_id": str(zone_id)},
+            {"action": "write", "resource_type": "dns_record", "resource_id": "*"},
+        ],
+    )
+    await db_session.commit()
+    url = f"{_base(zone)}/records"
+
+    r = await client.post(
+        url, headers=zone_token, json={"name": "p1", "record_type": "LUA", "value": LUA_VALUE}
+    )
+    assert r.status_code == 403, r.text
+    assert await _lua_count(db_session, zone_id) == 0
+    ok = await client.post(
+        url, headers=zone_token, json={"name": "w", "record_type": "A", "value": "192.0.2.5"}
+    )
+    assert ok.status_code == 201, ok.text
+
+    r = await client.post(
+        url, headers=open_token, json={"name": "p1", "record_type": "LUA", "value": LUA_VALUE}
+    )
     assert r.status_code == 201, r.text
