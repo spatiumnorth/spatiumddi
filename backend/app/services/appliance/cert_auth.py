@@ -17,14 +17,43 @@ cert chain proves the appliance was approved by an admin. Same
 security properties as mTLS; just a different transport for the
 cert + signature.
 
-Header contract:
+Header contract (signature version 2, #3631):
 
-* ``X-Appliance-Cert``       — base64(PEM cert from
-                                ``appliance.cert_pem``).
-* ``X-Appliance-Timestamp``  — ISO 8601 UTC. Server requires
-                                ±300 s skew (anti-replay).
-* ``X-Appliance-Signature``  — base64(Ed25519 signature over
-                                ``f"{method} {path}\\n{timestamp}\\n{appliance_id}"``).
+* ``X-Appliance-Cert``              — base64(PEM cert from
+                                       ``appliance.cert_pem``).
+* ``X-Appliance-Timestamp``         — ISO 8601 UTC. Server requires
+                                       ±300 s skew.
+* ``X-Appliance-Signature-Version`` — ``2``. Present = the request is
+                                       held to this form, never the
+                                       legacy one.
+* ``X-Appliance-Nonce``             — 32 hex chars, fresh per request, so
+                                       two genuine identical requests in
+                                       the same second still differ.
+* ``X-Appliance-Content-SHA256``    — hex SHA-256 of the exact body bytes.
+* ``X-Appliance-Signature``         — base64(Ed25519 signature over
+                                       :func:`_canonical_payload_v2`:
+                                       method, path + raw query string,
+                                       timestamp, nonce, appliance_id and
+                                       the body hash).
+
+A signature is accepted once: after it verifies, a hash of it is claimed in
+Redis (``SET NX EX``) for longer than the skew window, so a captured header
+set cannot be sent again. Redis is shared by every api replica, which a
+multi-node control plane needs. When Redis cannot be reached the claim fails
+OPEN with a warning: the signature still binds the method, the full target
+and the body, so what a repeat could do in that window is send the identical
+request again; failing closed would stop every supervisor heartbeat in the
+fleet for the length of a Redis failover (non-negotiable #5).
+
+Legacy form (supervisors older than #3631): no version header, signature
+over ``f"{method} {path}\\n{timestamp}\\n{appliance_id}"``. Accepted only
+while ``settings.appliance_legacy_signature_allowed`` is set, and logged per
+appliance (``appliance_cert_auth_legacy_signature``) so the end of the
+compatibility window is observable. It is claimed once like the current
+form; having no nonce, two genuine legacy requests to the same path in the
+same second sign identically and the second is refused. No legacy caller
+sends that: the heartbeat waits at least 2 s between requests, and a refused
+proxy poll is retried after its backoff.
 
 Server-side validation (this module):
 
@@ -38,11 +67,14 @@ Server-side validation (this module):
    replayed after the supervisor re-keyed).
 6. Verify timestamp within ±300 s of server time.
 7. Verify the signature against the cert's pubkey + the canonical
-   payload.
+   payload (the body hash is computed from the body the api received,
+   except on a streamed upload, where the route compares it afterwards).
+8. Claim the signature as used (refuse a repeat).
 
 On success, returns the ``Appliance`` row so the endpoint handler
 can read it without re-fetching. On failure, raises 403 with a
-generic "invalid client cert" message — never leaks which step
+generic "invalid client cert" message (401 for a repeated signature,
+:class:`CertAuthReplayed`) — never leaks which step
 failed (timing-side-channel + auth-error-disclosure hygiene).
 
 The session-token interim path stays in place as a fallback when
@@ -55,9 +87,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import structlog
 from cryptography import x509
@@ -67,6 +103,8 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.core.redis_client import make_async_redis
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     Appliance,
@@ -80,6 +118,23 @@ logger = structlog.get_logger(__name__)
 # appliance host before chrony locks in.
 _SKEW_TOLERANCE_SECONDS = 300
 
+# The current signature form, carried in ``X-Appliance-Signature-Version``.
+SIGNATURE_VERSION = "2"
+
+# How long an accepted signature is remembered. A timestamp is accepted from
+# ``now - skew`` to ``now + skew``, so a signature stamped at the far edge
+# stays acceptable for twice the skew; a minute on top covers clock steps
+# between api replicas.
+_REPLAY_TTL_SECONDS = 2 * _SKEW_TOLERANCE_SECONDS + 60
+
+_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Legacy-form use, per appliance, in this process: (count, last logged at).
+# Logged on first use and then at most every ``_LEGACY_LOG_INTERVAL_S``.
+_LEGACY_LOG_INTERVAL_S = 900.0
+_legacy_use: dict[uuid.UUID, tuple[int, float]] = {}
+
 
 @dataclass(frozen=True)
 class CertAuthPrincipal:
@@ -87,17 +142,35 @@ class CertAuthPrincipal:
     appliance row so the endpoint handler doesn't need a re-fetch."""
 
     appliance: Appliance
+    # ``"v2"`` when the signature covered the target and the body (so every
+    # field in the body is the supervisor's own); ``"legacy"`` otherwise.
+    scheme: Literal["v2", "legacy"] = "v2"
+    # The body hash the signature covers. On a streamed upload the api has
+    # not read the body yet, so the route compares it once it has.
+    content_sha256: str | None = None
+
+    @property
+    def body_bound(self) -> bool:
+        return self.scheme == "v2"
 
 
 class CertAuthFailed(HTTPException):
     """Generic 403 — never expose which step failed."""
 
-    def __init__(self, reason: str) -> None:
-        super().__init__(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.")
+    def __init__(self, reason: str, status_code: int = status.HTTP_403_FORBIDDEN) -> None:
+        super().__init__(status_code, "Invalid appliance client cert.")
         # Stash the reason on the exception for the route handler's
         # structured-log line; the operator-facing detail stays
         # generic.
         self.reason = reason
+
+
+class CertAuthReplayed(CertAuthFailed):
+    """401 — a valid signature that has already been accepted once. Not a
+    reason to fall back to another credential: the request is a repeat."""
+
+    def __init__(self) -> None:
+        super().__init__("signature already used", status.HTTP_401_UNAUTHORIZED)
 
 
 def _b64decode(value: str, field: str) -> bytes:
@@ -108,7 +181,8 @@ def _b64decode(value: str, field: str) -> bytes:
 
 
 def _canonical_payload(method: str, path: str, timestamp: str, appliance_id: str) -> bytes:
-    """The exact bytes the supervisor signs + we verify. Order matters:
+    """The legacy form's signed bytes (supervisors older than #3631). Order
+    matters:
     ``method`` + ``path`` lock the signature to the specific request;
     ``timestamp`` defeats replay; ``appliance_id`` prevents a
     supervisor reusing a signature meant for one row against another's
@@ -116,9 +190,95 @@ def _canonical_payload(method: str, path: str, timestamp: str, appliance_id: str
     return f"{method.upper()} {path}\n{timestamp}\n{appliance_id}".encode()
 
 
-async def authenticate_cert(request: Request, db: AsyncSession) -> CertAuthPrincipal | None:
+def _canonical_payload_v2(
+    method: str,
+    target: str,
+    timestamp: str,
+    nonce: str,
+    appliance_id: str,
+    content_sha256: str,
+) -> bytes:
+    """The bytes a current supervisor signs (#3631). ``target`` is the path
+    plus ``?`` and the raw query string when there is one, so a changed
+    query (``?error=`` on the capture upload) breaks the signature;
+    ``content_sha256`` binds the body. Must match the supervisor's
+    ``cert_auth.canonical_payload_v2`` byte for byte."""
+    return "\n".join(
+        (
+            "spatium-appliance-v2",
+            method.upper(),
+            target,
+            timestamp,
+            nonce,
+            appliance_id,
+            content_sha256,
+        )
+    ).encode("utf-8")
+
+
+def request_target(request: Request) -> str:
+    """Path plus the raw query string, as the supervisor signed it."""
+    query = request.scope.get("query_string", b"").decode("latin-1")
+    return request.url.path + (f"?{query}" if query else "")
+
+
+async def _claim_signature(appliance_id: uuid.UUID, signature: bytes) -> bool:
+    """Record ``signature`` as used. True on its first use; False when it
+    has been accepted before. Fails open (True) with a warning when Redis
+    cannot be reached; see the module docstring for why."""
+    key = f"appliance_sig:{appliance_id}:{hashlib.sha256(signature).hexdigest()}"
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            return bool(await r.set(key, "1", ex=_REPLAY_TTL_SECONDS, nx=True))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — never stop the fleet on a Redis blip
+        logger.warning(
+            "appliance_cert_auth_replay_guard_unavailable",
+            appliance_id=str(appliance_id),
+            error=str(exc)[:200],
+        )
+        return True
+
+
+def _note_legacy_use(appliance_id: uuid.UUID) -> None:
+    count, last = _legacy_use.get(appliance_id, (0, 0.0))
+    count += 1
+    now = time.monotonic()
+    if count == 1 or now - last >= _LEGACY_LOG_INTERVAL_S:
+        logger.warning(
+            "appliance_cert_auth_legacy_signature",
+            appliance_id=str(appliance_id),
+            uses_in_this_process=count,
+            hint=(
+                "this appliance's supervisor signs requests in the pre-#3631 form; "
+                "upgrade it, then set APPLIANCE_LEGACY_SIGNATURE_ALLOWED=false"
+            ),
+        )
+        last = now
+    _legacy_use[appliance_id] = (count, last)
+
+
+def legacy_signature_use() -> dict[str, int]:
+    """Legacy-form requests accepted by this process, per appliance id."""
+    return {str(k): v[0] for k, v in _legacy_use.items()}
+
+
+async def authenticate_cert(
+    request: Request,
+    db: AsyncSession,
+    *,
+    body_streamed: bool = False,
+) -> CertAuthPrincipal | None:
     """Validate cert-auth headers on ``request`` against the appliance
     row + CA.
+
+    The body hash is computed from ``await request.body()``. A route that
+    streams its body (``body_streamed=True``) cannot have it read here; the
+    declared ``X-Appliance-Content-SHA256`` is verified as signed, returned
+    on the principal, and the route must compare it with the bytes it
+    receives before it keeps them.
 
     Returns ``None`` when the headers are absent (route falls back to
     the session-token path); raises :class:`CertAuthFailed` (403) when
@@ -216,25 +376,69 @@ async def authenticate_cert(request: Request, db: AsyncSession) -> CertAuthPrinc
         raise CertAuthFailed(f"timestamp skew {skew:.0f}s > {_SKEW_TOLERANCE_SECONDS}s")
 
     # ── 7. Signature over the canonical payload. ──────────────────
-    try:
-        signature = _b64decode(sig_header, "X-Appliance-Signature")
-    except CertAuthFailed:
-        raise
-    payload = _canonical_payload(
-        request.method,
-        request.url.path,
-        ts_header,
-        str(appliance_id),
-    )
+    signature = _b64decode(sig_header, "X-Appliance-Signature")
+    version = request.headers.get("X-Appliance-Signature-Version")
+    scheme: Literal["v2", "legacy"]
+    content_sha256: str | None = None
+    if version is not None:
+        # The header names the form, so a current supervisor's request can
+        # never be checked as the legacy one.
+        if version != SIGNATURE_VERSION:
+            raise CertAuthFailed(f"unknown signature version {version!r}")
+        nonce = request.headers.get("X-Appliance-Nonce", "")
+        declared = request.headers.get("X-Appliance-Content-SHA256", "")
+        if not _NONCE_RE.match(nonce):
+            raise CertAuthFailed("nonce missing or malformed")
+        if not _SHA256_HEX_RE.match(declared):
+            raise CertAuthFailed("content hash missing or malformed")
+        if body_streamed:
+            content_sha256 = declared
+        else:
+            content_sha256 = hashlib.sha256(await request.body()).hexdigest()
+            if content_sha256 != declared:
+                raise CertAuthFailed("body does not match its signed hash")
+        payload = _canonical_payload_v2(
+            request.method,
+            request_target(request),
+            ts_header,
+            nonce,
+            str(appliance_id),
+            content_sha256,
+        )
+        scheme = "v2"
+    else:
+        if not settings.appliance_legacy_signature_allowed:
+            raise CertAuthFailed("legacy signature form not accepted")
+        payload = _canonical_payload(
+            request.method,
+            request.url.path,
+            ts_header,
+            str(appliance_id),
+        )
+        scheme = "legacy"
     try:
         cert_pubkey.verify(signature, payload)
     except InvalidSignature as exc:
         raise CertAuthFailed(f"signature: {exc}") from exc
 
-    return CertAuthPrincipal(appliance=row)
+    # ── 8. Single use. ────────────────────────────────────────────
+    if not await _claim_signature(appliance_id, signature):
+        raise CertAuthReplayed()
+    if scheme == "legacy":
+        _note_legacy_use(appliance_id)
+
+    return CertAuthPrincipal(appliance=row, scheme=scheme, content_sha256=content_sha256)
 
 
-__all__ = ["authenticate_cert", "CertAuthFailed", "CertAuthPrincipal"]
+__all__ = [
+    "SIGNATURE_VERSION",
+    "CertAuthFailed",
+    "CertAuthPrincipal",
+    "CertAuthReplayed",
+    "authenticate_cert",
+    "legacy_signature_use",
+    "request_target",
+]
 
 
 # Quiet ruff unused-import in the lazy-import block above. Putting the

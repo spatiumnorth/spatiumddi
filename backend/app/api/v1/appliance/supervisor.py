@@ -1612,6 +1612,11 @@ class SupervisorHeartbeatRequest(BaseModel):
 
     appliance_id: uuid.UUID
     session_token: str | None = None
+    # #3631 — base64 of a raw X25519 public key the supervisor process holds
+    # the private half of. The k3s join token is returned sealed to it
+    # (``desired_k3s_join_token_sealed``), never in clear. Trusted only on a
+    # request whose signature covered the body.
+    join_token_public_key: str | None = Field(default=None, max_length=64)
     # #358 Phase 1b — opt-in heartbeat long-poll. >0 asks the control
     # plane to hold the response open up to this many seconds (capped
     # server-side) waiting for a per-appliance wake, so operator commands
@@ -1996,12 +2001,18 @@ class SupervisorHeartbeatResponse(BaseModel):
     # ``desired_cluster_role`` = "member" → join the seed via
     # ``desired_k3s_server_url`` + ``desired_k3s_join_token``; "none" →
     # leave the cluster + revert to a plain application appliance.
-    # NULL = no change. The token is the plaintext node-token (the
-    # heartbeat channel is mTLS); the supervisor's host-side runner
-    # (Phase 7b) reconfigures k3s + reports back via cluster_join_state.
+    # NULL = no change. The supervisor's host-side runner (Phase 7b)
+    # reconfigures k3s + reports back via cluster_join_state.
+    #
+    # #3631 — the node-token travels only in ``desired_k3s_join_token_sealed``,
+    # sealed to the key the supervisor sent in its signed heartbeat body
+    # (``app.services.appliance.sealed_token``): this response can cross a
+    # plain-HTTP hop. ``desired_k3s_join_token`` is kept for the response
+    # shape older supervisors parse and is always null.
     desired_cluster_role: Literal["member", "none"] | None = None
     desired_k3s_server_url: str | None = None
     desired_k3s_join_token: str | None = None
+    desired_k3s_join_token_sealed: str | None = None
     # #1903 — id of the promote asking for the join; echoed back on the report.
     desired_cluster_transition_id: str | None = None
     # #1903 — that promote's age in seconds (a duration, never a timestamp, so
@@ -2399,12 +2410,23 @@ async def _supervisor_heartbeat(
     # cert yet).
     from app.services.appliance.cert_auth import (  # noqa: PLC0415
         CertAuthFailed,
+        CertAuthReplayed,
         authenticate_cert,
     )
 
     cert_principal = None
     try:
         cert_principal = await authenticate_cert(request, db)
+    except CertAuthReplayed as exc:
+        # #3631 — a signature that verified and has been accepted before is a
+        # repeat of an earlier heartbeat, not a cert pipeline problem, so it
+        # does not fall through to the session-token path below.
+        logger.warning(
+            "supervisor_heartbeat_signature_replayed",
+            appliance_id=str(body.appliance_id),
+        )
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, exc.detail) from exc
     except CertAuthFailed as exc:
         # #411 — a cert-auth FAILURE no longer hard-403s. The mTLS verifier
         # is a fallback that supersedes the session token only when the cert
@@ -3303,28 +3325,56 @@ async def _supervisor_heartbeat(
         ca = await ensure_ca(db)
         ca_chain_pem = ca.cert_pem
 
-    # #272 Phase 7 — decrypt the join token for the joiner (mTLS channel).
+    # #272 Phase 7 — the join token for the joiner.
     # SECURITY (GHSA-mj4g-hw3m-62rm / #400 C1, defence-in-depth): the k3s
     # join token is cluster-admin-equivalent, so only ever hand it back over a
-    # cert-authenticated (mTLS) request — never the credential-less /
+    # cert-authenticated request — never the credential-less /
     # session-token path. The auth gate above already closes the no-cert path
     # for approved rows; this is the belt-and-braces so the secret can't leak
     # even if that gate is later loosened.
-    desired_join_token: str | None = None
+    #
+    # #3631 — and never in clear: this response can cross a plain-HTTP hop
+    # (a member's supervisor calls the in-cluster Service over HTTP; the
+    # frontend forwards to the api over HTTP). It is sealed to the key the
+    # supervisor sent in this request's body, which is only trusted when the
+    # signature covered that body. A supervisor too old to send a key gets
+    # no token, and the join waits for its upgrade.
+    desired_join_token_sealed: str | None = None
     if (
         cert_principal is not None
         and row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
         and row.desired_k3s_join_token_encrypted is not None
     ):
-        from app.core.crypto import decrypt_str  # noqa: PLC0415
-
-        try:
-            desired_join_token = decrypt_str(row.desired_k3s_join_token_encrypted)
-        except Exception:  # noqa: BLE001
+        if not cert_principal.body_bound or not body.join_token_public_key:
             logger.warning(
-                "supervisor_heartbeat_join_token_decrypt_failed",
+                "supervisor_heartbeat_join_token_withheld",
                 appliance_id=str(row.id),
+                reason="supervisor sent no join-token key in a signed body; upgrade it",
             )
+        else:
+            from app.core.crypto import decrypt_str  # noqa: PLC0415
+            from app.services.appliance.sealed_token import (  # noqa: PLC0415
+                SealError,
+                seal,
+            )
+
+            try:
+                desired_join_token_sealed = seal(
+                    decrypt_str(row.desired_k3s_join_token_encrypted),
+                    body.join_token_public_key,
+                    row.id,
+                )
+            except SealError as exc:
+                logger.warning(
+                    "supervisor_heartbeat_join_token_key_invalid",
+                    appliance_id=str(row.id),
+                    error=str(exc),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "supervisor_heartbeat_join_token_decrypt_failed",
+                    appliance_id=str(row.id),
+                )
 
     # #272 Phase 7b — the cross-node firewall peer set this node must
     # open its k3s server ports to (empty unless row is a CP node).
@@ -3566,7 +3616,8 @@ async def _supervisor_heartbeat(
         role_assignment=role_assignment,
         desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
         desired_k3s_server_url=row.desired_k3s_server_url,
-        desired_k3s_join_token=desired_join_token,
+        desired_k3s_join_token=None,
+        desired_k3s_join_token_sealed=desired_join_token_sealed,
         desired_cluster_transition_id=(
             row.cluster_transition_id
             if row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
@@ -7715,27 +7766,43 @@ class K8sProxyReplyRequest(BaseModel):
     body_b64: str = ""
 
 
-@header_only
 async def _require_cert_auth(request: Request, db: DB) -> Appliance:
     """Shared cert-auth gate for the proxy endpoints. Returns the
-    authenticated appliance row. Raises 403 on failure — no fallback
-    to session-token here since the proxy channel only exists for
-    approved appliances with mTLS certs.
+    authenticated appliance row. Raises 403 on failure (401 for a
+    signature already used, #3631) — no fallback to session-token here
+    since the proxy channel only exists for approved appliances with
+    mTLS certs.
 
-    Reads only the request headers, so a route that streams its body
-    (the pcap upload) takes it as a dependency and the caller is checked
-    before any of the body is read.
+    Hashes the request body against the signature, so it is called from
+    the handler, after FastAPI has read the body. A route that streams its
+    body uses :func:`_require_cert_auth_streamed` instead.
     """
+    principal = await _cert_principal(request, db, body_streamed=False)
+    return principal.appliance
+
+
+@header_only
+async def _require_cert_auth_streamed(request: Request, db: DB) -> Any:
+    """:func:`_require_cert_auth` for a route that streams its body (the
+    pcap upload). Reads only the request headers, so the route takes it as
+    a dependency and the caller is checked before any of the body is read.
+    Returns the principal: its ``content_sha256`` (set for a current
+    supervisor) is the body hash the signature covers, and the route must
+    compare it with the bytes it received before keeping them."""
+    return await _cert_principal(request, db, body_streamed=True)
+
+
+async def _cert_principal(request: Request, db: AsyncSession, *, body_streamed: bool) -> Any:
     from app.services.appliance.cert_auth import (  # noqa: PLC0415
         CertAuthFailed,
         authenticate_cert,
     )
 
     try:
-        principal = await authenticate_cert(request, db)
+        principal = await authenticate_cert(request, db, body_streamed=body_streamed)
     except CertAuthFailed as exc:
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.") from exc
+        raise HTTPException(exc.status_code, "Invalid appliance client cert.") from exc
     if principal is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -7746,7 +7813,7 @@ async def _require_cert_auth(request: Request, db: DB) -> Appliance:
             status.HTTP_403_FORBIDDEN,
             f"Appliance in state {principal.appliance.state!r}; proxy disabled.",
         )
-    return principal.appliance
+    return principal
 
 
 @router.post(
@@ -8595,7 +8662,7 @@ async def pcap_upload(
     capture_id: uuid.UUID,
     request: Request,
     db: DB,
-    appliance: Annotated[Appliance, Depends(_require_cert_auth)],
+    principal: Annotated[Any, Depends(_require_cert_auth_streamed)],
 ) -> dict[str, str]:
     """Cert-authed. Streams the host-captured ``.pcap`` to the shared
     PCAP_DIR (``.partial`` → atomic rename + sha256), capped at
@@ -8609,9 +8676,13 @@ async def pcap_upload(
     from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
     from app.services.pcap.runner import HARD_MAX_BYTES, pcap_dir  # noqa: PLC0415
 
-    # ``appliance`` is resolved by the ``_require_cert_auth`` dependency,
-    # before the handler reads the body: the route carries a body-cap
-    # allowance above the app-wide cap (``app.core.body_limit``).
+    # ``principal`` is resolved by the ``_require_cert_auth_streamed``
+    # dependency, before the handler reads the body: the route carries a
+    # body-cap allowance above the app-wide cap (``app.core.body_limit``).
+    # The query (``?error=`` / ``?packets=``) is covered by the signature;
+    # the body is checked against its signed hash once it has arrived.
+    appliance: Appliance = principal.appliance
+    signed_sha256: str | None = principal.content_sha256
     row = await _pcap_capture_for_appliance(db, capture_id, appliance)
 
     error = request.query_params.get("error")
@@ -8695,6 +8766,17 @@ async def pcap_upload(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             "uploaded pcap exceeds the capture's byte cap",
         )
+
+    if signed_sha256 is not None and h.hexdigest() != signed_sha256:
+        # #3631 — the bytes are not the ones the supervisor signed. Keep
+        # nothing and leave the capture as it was.
+        partial.unlink(missing_ok=True)
+        logger.warning(
+            "appliance.pcap.upload_body_mismatch",
+            appliance_id=str(appliance.id),
+            capture_id=str(capture_id),
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.")
 
     if size == 0:
         # Stopped before the first packet flushed. Never leave a 0-byte file

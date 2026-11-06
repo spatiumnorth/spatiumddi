@@ -529,7 +529,9 @@ the reference topologies are in
   cluster-identity reset + rejoin** — wiping only the etcd `db` is not
   enough, the server CA / TLS / node password / flannel subnet all have
   to go too, then the node rejoins the seed via
-  `https://<seed-node-ip>:6443` with the Fernet'd join token. The
+  `https://<seed-node-ip>:6443` with the seed's join token (Fernet'd at
+  rest, and sealed in the heartbeat response to a one-off X25519 key the
+  joining supervisor sent in its signed request, never sent in clear). The
   host-side runner is `spatium-cluster-join` (etcd backup + rollback +
   a confirmation-marker guardrail so a stray trigger file can't fire a
   destructive wipe). **Even counts (2 / 4) are refused at the API** for
@@ -1576,7 +1578,7 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. (The mTLS *verifier* middleware lands in a follow-up — the cert pipeline is in place; heartbeat + poll endpoints currently auth via session-token.)
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. The heartbeat still accepts the session token as a fallback when the cert does not validate.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
 - **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.

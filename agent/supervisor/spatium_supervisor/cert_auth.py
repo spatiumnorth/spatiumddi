@@ -9,23 +9,39 @@ cert + CA chain on the first heartbeat after admin approval (see
 * Loads them back on subsequent boots.
 * Builds the auth headers the backend's ``cert_auth.py`` middleware
   validates: ``X-Appliance-Cert`` (base64 PEM), ``X-Appliance-
-  Timestamp`` (ISO 8601 UTC), ``X-Appliance-Signature`` (base64
-  Ed25519 over ``method + path + timestamp + appliance_id``).
+  Timestamp`` (ISO 8601 UTC), ``X-Appliance-Signature-Version`` (``2``),
+  ``X-Appliance-Nonce``, ``X-Appliance-Content-SHA256`` and
+  ``X-Appliance-Signature`` (base64 Ed25519 over
+  :func:`canonical_payload_v2`).
 
 The private key never leaves disk — we only sign payloads with it.
-The signed payload binds the request method + path + timestamp +
-appliance_id so a captured signature can't be replayed against a
-different endpoint or after the 5-min skew window.
+The signed payload (#3631) binds the method, the path AND query string
+exactly as sent, a hash of the exact body bytes, a fresh nonce, the
+timestamp and the appliance id, and the control plane accepts each
+signature once. So every call site signs the bytes it sends: serialise a
+JSON body once with :func:`encode_json` and send those bytes as
+``content=``, rather than letting httpx serialise ``json=`` separately.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
+import secrets
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+# The signature form; the control plane reads it from
+# ``X-Appliance-Signature-Version`` and never checks a request carrying it
+# against the older form.
+SIGNATURE_VERSION = "2"
+
+# Headers for a JSON body sent as pre-encoded bytes.
+JSON_CONTENT_TYPE = {"Content-Type": "application/json"}
 
 CERT_FILENAME = "cert.pem"
 CA_CHAIN_FILENAME = "ca-chain.pem"
@@ -90,24 +106,75 @@ def _atomic_write(path: Path, body: str) -> None:
     tmp.replace(path)
 
 
+def encode_json(body: object) -> bytes:
+    """Serialise a JSON request body once, so the bytes signed are the bytes
+    sent (pass them as ``content=`` with :data:`JSON_CONTENT_TYPE`)."""
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def canonical_payload_v2(
+    method: str,
+    target: str,
+    timestamp: str,
+    nonce: str,
+    appliance_id: str,
+    content_sha256: str,
+) -> bytes:
+    """The signed bytes. Must match the backend's ``_canonical_payload_v2``
+    byte for byte."""
+    return "\n".join(
+        (
+            "spatium-appliance-v2",
+            method.upper(),
+            target,
+            timestamp,
+            nonce,
+            appliance_id,
+            content_sha256,
+        )
+    ).encode("utf-8")
+
+
 def build_auth_headers(
     method: str,
-    path: str,
+    target: str,
     cert_pem: str,
     private_key: Ed25519PrivateKey,
-    appliance_id: uuid.UUID,
+    appliance_id: uuid.UUID | str,
+    body: bytes = b"",
+    *,
+    content_sha256: str | None = None,
 ) -> dict[str, str]:
-    """Build the three cert-auth headers. Caller passes the request
-    method (``"POST"``) + path (``/api/v1/appliance/supervisor/heartbeat``)
-    so the signature binds to the specific request, defeating replays."""
+    """Build the cert-auth headers for one request.
+
+    ``target`` is the path plus ``?`` and the query string exactly as the
+    request sends it (``/api/v1/.../upload/<id>?packets=3``). ``body`` is the
+    exact body bytes; a caller streaming a body it has hashed itself passes
+    ``content_sha256`` instead. Build these per request, never once for a
+    retry: the control plane accepts each signature once."""
     timestamp = datetime.now(UTC).isoformat(timespec="seconds")
-    payload = f"{method.upper()} {path}\n{timestamp}\n{appliance_id}".encode("utf-8")
+    nonce = secrets.token_hex(16)
+    digest = content_sha256 or hashlib.sha256(body).hexdigest()
+    payload = canonical_payload_v2(
+        method, target, timestamp, nonce, str(appliance_id), digest
+    )
     signature = private_key.sign(payload)
     return {
         "X-Appliance-Cert": base64.b64encode(cert_pem.encode("ascii")).decode("ascii"),
         "X-Appliance-Timestamp": timestamp,
+        "X-Appliance-Signature-Version": SIGNATURE_VERSION,
+        "X-Appliance-Nonce": nonce,
+        "X-Appliance-Content-SHA256": digest,
         "X-Appliance-Signature": base64.b64encode(signature).decode("ascii"),
     }
 
 
-__all__ = ["save_cert", "load_cert", "build_auth_headers"]
+__all__ = [
+    "JSON_CONTENT_TYPE",
+    "SIGNATURE_VERSION",
+    "build_auth_headers",
+    "canonical_payload_v2",
+    "encode_json",
+    "load_cert",
+    "save_cert",
+]

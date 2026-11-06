@@ -46,7 +46,14 @@ import structlog
 
 from . import appliance_state, approval_state, etcd_evict, firewall_peer_audit, watchdog
 from . import cp_tls
-from .cert_auth import build_auth_headers, load_cert, save_cert
+from . import sealed_token
+from .cert_auth import (
+    JSON_CONTENT_TYPE,
+    build_auth_headers,
+    encode_json,
+    load_cert,
+    save_cert,
+)
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
 from .identity import Identity
@@ -1247,6 +1254,24 @@ def revocation_reason(resp: httpx.Response) -> str | None:
     return None
 
 
+def _join_token(
+    body_out: dict[str, Any],
+    appliance_id: uuid.UUID,
+    log: structlog.stdlib.BoundLogger,
+) -> str | None:
+    """The k3s join token from a heartbeat response (#3631): sealed to this
+    process's key by a current control plane. A plaintext token is still
+    read, for the window where this supervisor is newer than the api."""
+    sealed = body_out.get("desired_k3s_join_token_sealed")
+    if isinstance(sealed, str) and sealed:
+        token = sealed_token.open_sealed(sealed, appliance_id)
+        if token is None:
+            log.warning("supervisor.heartbeat.join_token_unsealable")
+        return token
+    plain = body_out.get("desired_k3s_join_token")
+    return plain if isinstance(plain, str) else None
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -1382,11 +1407,36 @@ def heartbeat_once(
     # timestamp skew. When no cert yet (pre-approval), fall through
     # to the session_token body field — same shape as today.
     cached_cert = load_cert(cfg.state_dir)
-    headers: dict[str, str] = {}
+    if cached_cert is not None:
+        # #3631 — a join token for this node comes back sealed to this key
+        # (only on a cert-signed heartbeat, the only kind that gets one).
+        body["join_token_public_key"] = sealed_token.public_key_b64()
+
+    # #1747 — Postgres refuses U+0000 in a text value, so ONE NUL anywhere in
+    # this body (a host sidecar left NUL-filled by a power loss) makes the
+    # api answer 422 to every heartbeat and the node's Fleet row freezes for
+    # good. The slot-upgrade readers scrub their own values; this is the
+    # backstop for every other field read off a host file.
+    nul_fields: list[str] = []
+    body = _strip_nul(body, "", nul_fields)
+    if nul_fields:
+        log.warning("supervisor.heartbeat.nul_stripped", fields=nul_fields[:20])
+    # #3631 — the signature covers the body, so serialise it once and send
+    # exactly the bytes that were signed.
+    body_bytes = encode_json(body)
+
+    headers: dict[str, str] = dict(JSON_CONTENT_TYPE)
     if cached_cert is not None:
         try:
-            headers = build_auth_headers(
-                "POST", url_path, cached_cert, identity.private_key, appliance_id
+            headers.update(
+                build_auth_headers(
+                    "POST",
+                    url_path,
+                    cached_cert,
+                    identity.private_key,
+                    appliance_id,
+                    body_bytes,
+                )
             )
             # #411 — KEEP the session token in the body as a fallback even
             # when we present a cert. The server prefers the cert; if cert-
@@ -1401,19 +1451,9 @@ def heartbeat_once(
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 
-    # #1747 — Postgres refuses U+0000 in a text value, so ONE NUL anywhere in
-    # this body (a host sidecar left NUL-filled by a power loss) makes the
-    # api answer 422 to every heartbeat and the node's Fleet row freezes for
-    # good. The slot-upgrade readers scrub their own values; this is the
-    # backstop for every other field read off a host file.
-    nul_fields: list[str] = []
-    body = _strip_nul(body, "", nul_fields)
-    if nul_fields:
-        log.warning("supervisor.heartbeat.nul_stripped", fields=nul_fields[:20])
-
     try:
         resp = client.post(
-            url, json=body, headers=headers, timeout=float(hold_s) + 10.0
+            url, content=body_bytes, headers=headers, timeout=float(hold_s) + 10.0
         )
     except httpx.HTTPError as exc:
         # Transient network / DNS / timeout — don't count toward
@@ -1708,7 +1748,7 @@ def heartbeat_once(
         if appliance_state.maybe_fire_cluster_join(
             desired_cluster_role,
             body_out.get("desired_k3s_server_url"),  # type: ignore[arg-type]
-            body_out.get("desired_k3s_join_token"),  # type: ignore[arg-type]
+            _join_token(body_out, appliance_id, log),
             body_out.get("desired_cluster_transition_id"),  # type: ignore[arg-type]
             body_out.get("desired_cluster_transition_age_s"),  # type: ignore[arg-type]
         ):
