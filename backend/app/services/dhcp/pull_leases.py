@@ -390,20 +390,22 @@ async def _pull_leases_core(
         # aborted the server's pull on every tick. Keep the newest, drop the
         # rest (the kept row still holds the address, so no mirror or DDNS
         # teardown).
-        rows = list(
-            (
-                await db.execute(
-                    select(DHCPLease)
-                    .where(
-                        DHCPLease.server_id == server.id,
-                        DHCPLease.ip_address == ip,
-                    )
-                    .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
-                )
+        lease_q = (
+            select(DHCPLease)
+            .where(
+                DHCPLease.server_id == server.id,
+                DHCPLease.ip_address == ip,
             )
-            .scalars()
-            .all()
+            .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
         )
+        if apply:
+            # #3624 — lock the row and re-read it if the lock waited. The
+            # expiry sweep marks a lapsed lease ``expired`` and holds it to
+            # commit; a plain read here would keep ``state='active'`` in the
+            # session, so ``existing.state = "active"`` below is no change,
+            # is never written, and the renewed lease stays ``expired``.
+            lease_q = lease_q.with_for_update().execution_options(populate_existing=True)
+        rows = list((await db.execute(lease_q)).scalars().all())
         existing = rows[0] if rows else None
         if apply and len(rows) > 1:
             for extra in rows[1:]:
