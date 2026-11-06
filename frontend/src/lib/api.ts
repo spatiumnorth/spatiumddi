@@ -7223,6 +7223,8 @@ export interface DNSBlockListFeedSkipped {
   bare_star?: number;
   dotless?: number;
   other?: number;
+  /** hosts / domains feeds: tokens that are not DNS names (#3531). */
+  invalid_name?: number;
 }
 
 export interface DNSBlockListEntry {

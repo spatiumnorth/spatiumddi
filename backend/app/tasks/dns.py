@@ -144,6 +144,27 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 return {"status": "error", "added": 0, "removed": 0}
 
             parsed = parse_feed_detailed(text, bl.feed_format)
+            if parsed.format_mismatch:
+                # The feed is a different format than the list is set to
+                # read (#3531). Storing the parse would swap a good list for
+                # junk, so refuse: nothing is written and the existing
+                # entries stay.
+                bl.last_sync_status = "error"
+                bl.last_sync_error = (
+                    f"Feed appears to be {parsed.format_mismatch} format but the list is "
+                    f"set to {bl.feed_format}; refresh refused, the list's entries left as they were. "
+                    f"Change the list's feed format to {parsed.format_mismatch}."
+                )
+                bl.last_synced_at = datetime.now(UTC)
+                await db.commit()
+                logger.warning(
+                    "blocklist_feed_format_mismatch",
+                    list_id=list_id,
+                    list_name=bl.name,
+                    configured=bl.feed_format,
+                    detected=parsed.format_mismatch,
+                )
+                return {"status": "error", "added": 0, "removed": 0}
             domains = set(parsed.domains)
             wildcard = bool(bl.feed_entries_are_wildcard)
 
@@ -267,8 +288,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                     )
                     .execution_options(synchronize_session=False)
                 )
-            # What the feed carried that the list does not enforce (#2123);
-            # NULL for a format with no rule syntax to lose.
+            # What the feed carried that the list does not enforce (#2123, #3531).
             skipped = parsed.skipped.as_dict() if parsed.skipped else None
             bl.feed_parse_skipped = skipped
             if skipped and sum(skipped.values()):
