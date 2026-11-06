@@ -25,7 +25,6 @@ from app.services.dhcp import agent_token as dhcp_tok
 from app.services.dns import agent_token as dns_tok
 from app.services.looking_glass import agent_token as lg_tok
 
-
 # One instant, captured from the real clock at import, so both mints share a
 # second but the tokens' ``exp`` (mint time + TTL) stays in the future when
 # ``verify_agent_token`` checks it against the real clock (#3658). A fixed
