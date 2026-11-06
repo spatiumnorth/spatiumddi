@@ -899,6 +899,10 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
 
         await sweep_zone_ops(db, zone, zone.group_id)
+        # #3535: the zone row before its records, as every writer of them takes
+        # it (``_require_zone``). The stamp below writes the zone row first
+        # anyway (its autoflush); this lock makes that order this branch's own.
+        zone = await _require_zone(args.group_id, args.zone_id, db, lock="write")
         batch = await collect_soft_delete_batch(db, zone)
         await apply_soft_delete(db, batch, user.id)
         for row in batch.rows:
@@ -939,6 +943,13 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     from app.services.ipam.zone_binding import prune_zone_ids
 
     await sweep_zone_ops(db, zone, zone.group_id)
+    # #3535: the zone row before its records, FOR UPDATE (the lock its DELETE
+    # takes), as every writer of them takes the zone row first
+    # (``_require_zone``). A record write that came first finishes, and its
+    # record goes with the rest; one that comes second waits, then reads no
+    # zone (404). With the records deleted first, a writer could take the zone
+    # row at its serial bump and wait on its record: a deadlock with this.
+    zone = await _require_zone(args.group_id, args.zone_id, db, lock="delete")
     await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
     await db.delete(zone)
     # IPAM names zones in text / JSONB columns with no foreign key (#3443).

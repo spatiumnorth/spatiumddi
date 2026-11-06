@@ -9255,7 +9255,7 @@ async def create_record(
     db: DB,
     current_user: CurrentUser,
 ) -> DNSRecord:
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
@@ -9369,7 +9369,7 @@ async def update_record(
     db: DB,
     current_user: CurrentUser,
 ) -> DNSRecord:
-    record = await _require_record(group_id, zone_id, record_id, db)
+    record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
@@ -9568,7 +9568,7 @@ async def delete_record(
     BIND9 / PowerDNS also converge via the bundle drop; the enqueued op is an
     idempotent delete there. Restore re-pushes ``create`` (admin/trash.py).
     """
-    record = await _require_record(group_id, zone_id, record_id, db)
+    record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
 
@@ -9729,7 +9729,7 @@ async def bulk_delete_records(
     if not body.record_ids:
         return BulkDeleteRecordsResponse(deleted=0, skipped=[])
 
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.
@@ -9959,7 +9959,7 @@ async def bulk_create_records(
     current_user: CurrentUser,
 ) -> BulkCreateRecordsResponse:
     """Bulk-create records in one zone — one serial bump, one commit, one dispatch."""
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
 
@@ -11502,11 +11502,36 @@ def _refuse_superadmin_zone_fields(
 
 
 async def _require_zone(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, user: Any | None = None
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    user: Any | None = None,
+    *,
+    lock: Literal["write", "delete"] | None = None,
 ) -> DNSZone:
-    result = await db.execute(
-        select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
-    )
+    stmt = select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
+    if lock is not None:
+        # #3535: a writer of the zone's records takes the zone row first, as it
+        # reads it: FOR NO KEY UPDATE ("write"), the lock its serial bump takes
+        # anyway. A zone delete takes it too, FOR UPDATE ("delete") or FOR NO
+        # KEY UPDATE for a soft delete, before it touches the zone's records
+        # (``_apply_delete_zone``). Whichever comes second waits here for the
+        # first, and none waits for the zone row while it holds a record. A
+        # writer that waited on a delete then reads no zone (gone, or in the
+        # trash): 404, as a request sent after the delete gets. Read plainly,
+        # the writer went on, and its serial bump matched no row once a
+        # permanent delete committed (StaleDataError), or held the zone row
+        # while it waited on a record the delete held (a deadlock): a bare
+        # 500 either way. The lock is its own ``SELECT dns_zone.id``, the form
+        # the audit-chain hook and its test guard know (#3503); the read below
+        # then sees the row as the lock found it.
+        await db.execute(
+            select(DNSZone.id)
+            .where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
+            .with_for_update(key_share=lock == "write")
+        )
+        stmt = stmt.execution_options(populate_existing=True)
+    result = await db.execute(stmt)
     zone = result.scalar_one_or_none()
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
@@ -11665,10 +11690,16 @@ async def _check_driver_refusals(
 
 
 async def _require_record(
-    group_id: uuid.UUID, zone_id: uuid.UUID, record_id: uuid.UUID, db: DB
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    record_id: uuid.UUID,
+    db: DB,
+    *,
+    lock: bool = False,
 ) -> DNSRecord:
-    # Verify zone belongs to group first
-    await _require_zone(group_id, zone_id, db)
+    # Verify zone belongs to group first. A writer of the record (``lock``)
+    # takes the zone row first, before the record (#3535, see _require_zone).
+    await _require_zone(group_id, zone_id, db, lock="write" if lock else None)
     result = await db.execute(
         select(DNSRecord).where(DNSRecord.id == record_id, DNSRecord.zone_id == zone_id)
     )
