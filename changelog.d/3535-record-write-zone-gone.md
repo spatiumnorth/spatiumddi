@@ -11,4 +11,8 @@
   permanent, takes it before the zone's records: the request waits for
   the delete, then answers 404 Zone not found, as a request after the
   delete does. A write caught behind a soft zone delete no longer lands
-  in the trashed zone.
+  in the trashed zone. A zone delete that waited for a record write
+  already under way also discards the record op that write queued for
+  the zone's DNS servers: the op used to outlive the zone, retried up to
+  five times against servers that no longer serve it, then parked as
+  failed.

@@ -15,6 +15,10 @@ zone delete, soft or permanent, takes it before the zone's records: whichever
 comes second waits for the first, and nothing waits for the zone row while it
 holds a record.
 
+A zone delete also sweeps the zone's queued record ops, and it sweeps once it
+holds the zone row: a record write that held the row first queued its op before
+it let go, and a sweep run before the wait could not see that op.
+
 Each test runs the real zone delete and the real request, each on its own
 session, and orders them with a third session holding a lock one of them
 needs: the audit-chain lock, which both take last, one of the zone's records,
@@ -36,8 +40,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.main import app
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.services.audit_chain import _AUDIT_CHAIN_LOCK_KEY
+from app.services.dns.record_ops import QUEUED_OP_STATES
 from tests.conftest import _TestSessionLocal
 from tests.test_dns_dynamic_update_acl import _bind9_group_zone_key, _superadmin
 from tests.test_dns_server_move_render_deadlock_1703 import _STEP, _cleanup, _prepare
@@ -106,6 +111,7 @@ class _Zone:
     headers: dict[str, str]
     group_id: uuid.UUID
     zone_id: uuid.UUID
+    name: str
     hold_id: uuid.UUID
     www_id: uuid.UUID
 
@@ -118,7 +124,7 @@ async def _seed(db: AsyncSession) -> _Zone:
     z = _Zone()
     _, z.headers = await _superadmin(db)
     group, zone, _ = await _bind9_group_zone_key(db)
-    z.group_id, z.zone_id = group.id, zone.id
+    z.group_id, z.zone_id, z.name = group.id, zone.id, zone.name
     for name, value in (("hold", "192.0.2.9"), ("www", "192.0.2.10")):
         record = DNSRecord(
             zone_id=zone.id, name=name, fqdn=f"{name}.{zone.name}", record_type="A", value=value
@@ -386,3 +392,101 @@ async def test_a_record_edit_beside_a_permanent_zone_delete_held_at_the_zone_row
     ), f"{_said(w)} (the request {waited})"
     zone, every, _ = await _zone_state(z.zone_id)
     assert zone is None and every == 0, (zone, every)
+
+
+# A second zone in the same group, for the control request.
+_SIBLING = "sibling.example.com."
+
+
+async def _sibling(db: AsyncSession, z: _Zone) -> _Zone:
+    """A second zone in ``z``'s group, with its own ``www``. The request sent
+    there, with no zone delete beside it, shows the op it queues."""
+    s = _Zone()
+    s.headers, s.group_id, s.name = z.headers, z.group_id, _SIBLING
+    zone = DNSZone(group_id=z.group_id, name=_SIBLING, zone_type="primary", kind="forward")
+    db.add(zone)
+    await db.flush()
+    www = DNSRecord(
+        zone_id=zone.id, name="www", fqdn=f"www.{_SIBLING}", record_type="A", value="192.0.2.10"
+    )
+    db.add(www)
+    await db.flush()
+    s.zone_id, s.hold_id, s.www_id = zone.id, www.id, www.id
+    await db.commit()
+    return s
+
+
+def _group_servers(group_id: uuid.UUID) -> Any:
+    return DNSRecordOp.server_id.in_(select(DNSServer.id).where(DNSServer.group_id == group_id))
+
+
+async def _queued_ops(group_id: uuid.UUID, zone_name: str) -> list[tuple[str, str, Any]]:
+    """The ops still queued (pending or in flight) for ``zone_name`` on the
+    group's servers, as ``(op, state, zone_id)``."""
+    async with _TestSessionLocal() as check:
+        rows = await check.execute(
+            select(DNSRecordOp.op, DNSRecordOp.state, DNSRecordOp.zone_id).where(
+                _group_servers(group_id),
+                DNSRecordOp.zone_name == zone_name,
+                DNSRecordOp.state.in_(QUEUED_OP_STATES),
+            )
+        )
+        return [(r.op, r.state, r.zone_id) for r in rows]
+
+
+async def _ops_without_a_zone(group_id: uuid.UUID) -> int:
+    """The group's servers' ops whose zone row is gone (``dns_record_op.zone_id``
+    is ``ON DELETE SET NULL``)."""
+    async with _TestSessionLocal() as check:
+        return (
+            await check.execute(
+                select(func.count())
+                .select_from(DNSRecordOp)
+                .where(_group_servers(group_id), DNSRecordOp.zone_id.is_(None))
+            )
+        ).scalar_one()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True], ids=["soft", "permanent"])
+@pytest.mark.parametrize("case", _CREATES + _EDITS)
+async def test_a_zone_delete_behind_a_record_write_sweeps_the_op_the_write_queued(
+    concurrent_client: AsyncClient, db_session: AsyncSession, case: str, permanent: bool
+) -> None:
+    """The group's BIND9 server is agent-based, so a record write queues an op
+    for it. The request has taken the zone row, queued its op and waits for the
+    audit-chain lock when the delete arrives, so its op commits after the
+    delete has started. A sweep run before the delete waits at the zone row
+    cannot see that op. Left behind, it stays queued against a zone the agent
+    no longer serves (soft delete), or lives on with no zone (permanent delete:
+    its ``zone_id`` is set NULL). The delete must sweep once it holds the row."""
+    z = await _seed(db_session)
+    sibling = await _sibling(db_session, z)
+    control = await _send(concurrent_client, sibling, case)
+    assert 200 <= control.status_code < 300, f"the control request answered {_said(control)}"
+    assert await _queued_ops(
+        z.group_id, _SIBLING
+    ), f"the {case} request queued no op, so this test could not see one left behind"
+    gate = _Gate()
+    try:
+        await gate.hold("SELECT pg_advisory_xact_lock(:k)", k=_AUDIT_CHAIN_LOCK_KEY)
+        write = _send(concurrent_client, z, case)
+        gate.tasks.append(write)
+        writer = await _blocked_by(gate.probe, gate.pid, write)
+        assert writer is not None, f"the request never reached its audit: {await _answer(write)}"
+        delete = _delete_zone(concurrent_client, z, permanent=permanent)
+        gate.tasks.append(delete)
+        deleter = await _blocked_by(gate.probe, writer[0], delete)
+        assert (
+            deleter is not None
+        ), f"the zone delete never waited on the request: {await _answer(delete)}"
+        await gate.open()
+        w = await asyncio.wait_for(write, _STEP)
+        d = await asyncio.wait_for(delete, _STEP)
+    finally:
+        await gate.close()
+    assert 200 <= w.status_code < 300, f"{_said(w)}; the zone delete {_said(d)}"
+    assert d.status_code == 204, f"the zone delete answered {_said(d)}; the request {_said(w)}"
+    left = await _queued_ops(z.group_id, z.name)
+    assert left == [], f"the zone delete left these ops queued (op, state, zone_id): {left}"
+    assert await _ops_without_a_zone(z.group_id) == 0
