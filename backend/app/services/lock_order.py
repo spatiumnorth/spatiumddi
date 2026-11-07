@@ -53,10 +53,11 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Bind parameters per lock statement; asyncpg refuses more than 32,767.
@@ -148,6 +149,131 @@ async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
             # a lock taken for another reason (tests/_row_lock_order_guard.py).
             .execution_options(include_deleted=True, lock_order="zone_prelock")
         )
+
+
+async def address_ids_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> set[Any]:
+    """The ``ip_address`` rows a delete of ``zone_ids`` rewrites, unlocked.
+
+    ``ip_address.forward_zone_id`` / ``reverse_zone_id`` reference ``dns_zone``
+    and ``ip_address.dns_record_id`` references ``dns_record``, all ``ON DELETE
+    SET NULL``: deleting a zone (and with it, its records) locks every such
+    row. Records in the trash and rows in the trash are included."""
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    zones = sorted({z for z in zone_ids if z is not None})
+    found: set[Any] = set()
+    for i in range(0, len(zones), _CHUNK):
+        chunk = zones[i : i + _CHUNK]
+        record_ids = (
+            select(DNSRecord.id)
+            .where(DNSRecord.zone_id.in_(chunk))
+            .execution_options(include_deleted=True)
+            .scalar_subquery()
+        )
+        res = await db.execute(
+            select(IPAddress.id)
+            .where(
+                IPAddress.dns_record_id.in_(record_ids)
+                | IPAddress.forward_zone_id.in_(chunk)
+                | IPAddress.reverse_zone_id.in_(chunk)
+            )
+            .execution_options(include_deleted=True)
+        )
+        found.update(res.scalars().all())
+    return found
+
+
+async def address_ids_of_records(db: AsyncSession, record_ids: Iterable[Any]) -> set[Any]:
+    """The ``ip_address`` rows a delete of the ``dns_record`` rows
+    ``record_ids`` rewrites (``dns_record_id`` is ``ON DELETE SET NULL``),
+    unlocked."""
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    records = sorted({r for r in record_ids if r is not None})
+    found: set[Any] = set()
+    for i in range(0, len(records), _CHUNK):
+        res = await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.dns_record_id.in_(records[i : i + _CHUNK]))
+            .execution_options(include_deleted=True)
+        )
+        found.update(res.scalars().all())
+    return found
+
+
+async def _lock_address_ids(db: AsyncSession, ids: Iterable[Any], *, nowait: bool = False) -> None:
+    """Lock ``ip_address`` rows by id, ascending, ``FOR NO KEY UPDATE`` (the
+    lock the foreign key's ``SET NULL`` takes). A row deleted meanwhile is
+    skipped. ``nowait`` raises ``lock_not_available`` (55P03) instead of
+    waiting for a row another transaction holds."""
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    ordered = sorted(set(ids))
+    for i in range(0, len(ordered), _CHUNK):
+        await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.id.in_(ordered[i : i + _CHUNK]))
+            .order_by(IPAddress.id)
+            .with_for_update(key_share=True, nowait=nowait)
+            .execution_options(include_deleted=True)
+        )
+
+
+async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> list[Any]:
+    """Step 2 for a zone delete: lock the ``ip_address`` rows a delete of
+    ``zone_ids`` would rewrite (:func:`address_ids_of_zones`), ascending id,
+    BEFORE the zone rows (#3691). Taken after the zone row, by the foreign
+    key, that is step 3 before step 2, and a lease batch holding a mirror and
+    waiting for the zone deadlocks with it."""
+    ids = await address_ids_of_zones(db, zone_ids)
+    await _lock_address_ids(db, ids)
+    return sorted(ids)
+
+
+#: Tries :func:`lock_addresses_before` makes before it waits for a late row.
+_LATE_ROW_ATTEMPTS = 5
+
+
+def _lock_not_available(exc: DBAPIError) -> bool:
+    return getattr(exc.orig, "sqlstate", None) == "55P03"
+
+
+async def lock_addresses_before[T](
+    db: AsyncSession,
+    find_ids: Callable[[], Awaitable[set[Any]]],
+    take: Callable[[], Awaitable[T]],
+) -> T:
+    """Lock the ``ip_address`` rows ``find_ids`` names, ascending id, then run
+    ``take`` (which locks the zone row), and return what it returns (#3691).
+
+    A delete of a zone or of records rewrites the address rows linked to it
+    through ``ON DELETE SET NULL`` foreign keys, which locks them after the
+    zone row unless they are locked first. A row linked between the first
+    lock and ``take`` (by a writer that held the zone row, so the link was
+    not visible yet) is still taken after the zone. It is locked ``NOWAIT``:
+    if a lease batch has it and waits for the zone, the work is rolled back
+    to a savepoint, which releases the zone row, and tried again with the row
+    now in the first pass. The last try waits instead of retrying.
+
+    No row can be linked to the zone while ``take``'s lock is held: every
+    writer that links an address to a zone or to one of its records takes the
+    zone row first (``lock_zones_for_sync``), or its foreign-key check on
+    ``forward_zone_id`` / ``reverse_zone_id`` waits for a ``FOR UPDATE``.
+    """
+    for attempt in range(_LATE_ROW_ATTEMPTS):
+        last = attempt == _LATE_ROW_ATTEMPTS - 1
+        try:
+            async with db.begin_nested():
+                held = await find_ids()
+                await _lock_address_ids(db, held)
+                result = await take()
+                await _lock_address_ids(db, await find_ids() - held, nowait=not last)
+            return result
+        except DBAPIError as exc:
+            if last or not _lock_not_available(exc):
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _uuid_or_none(raw: Any) -> uuid.UUID | None:
