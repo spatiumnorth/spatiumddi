@@ -185,6 +185,10 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
 
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
+    # #2143 — the /summary snapshot is cached for a few seconds per access shape.
+    from app.services import platform_summary
+
+    platform_summary.invalidate_cache()
     # #986 — the effective TLD registry is cached the same way, so a test
     # that stores a snapshot would keep classifying later tests' zones
     # against it after the per-test TRUNCATE removed the row.
