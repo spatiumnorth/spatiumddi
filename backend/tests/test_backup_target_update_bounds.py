@@ -315,3 +315,41 @@ async def test_gcs_edit_with_blank_key_keeps_the_stored_key(
         headers=headers,
     )
     assert bad.status_code == 422, bad.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,config,field",
+    [
+        (
+            "gcs",
+            {"bucket": "b", "service_account_json": ENC_PREFIX + "planted"},
+            "service_account_json",
+        ),
+        (
+            "scp",
+            {
+                "host": "h.example.com",
+                "username": "u",
+                "remote_path": "/b",
+                "private_key": ENC_PREFIX + "x",
+            },
+            "private_key",
+        ),
+    ],
+)
+async def test_create_refuses_a_client_supplied_stored_ciphertext(
+    client: AsyncClient, db_session: AsyncSession, kind, config, field
+):
+    """``__enc__:`` marks stored ciphertext; a create carrying it would skip
+    the driver's key check and be stored as if it were wrapped (#3695)."""
+    headers = await _headers(db_session)
+    res = await client.post(
+        "/api/v1/backup/targets",
+        json={"name": "planted", "kind": kind, "config": config, "passphrase": "Pass-phrase-1234"},
+        headers=headers,
+    )
+    assert res.status_code == 422, res.text
+    assert field in res.text
+    rows = (await db_session.execute(select(BackupTarget))).scalars().all()
+    assert not rows
