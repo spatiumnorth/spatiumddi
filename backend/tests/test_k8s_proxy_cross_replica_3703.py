@@ -10,7 +10,9 @@ the sides: they share nothing but Redis.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import uuid
+from typing import Any
 
 import pytest
 
@@ -52,10 +54,12 @@ async def test_request_and_reply_cross_replicas(monkeypatch: pytest.MonkeyPatch)
     queued = await k8s_proxy.pop_request(aid, timeout=3.0)
     assert queued is not None
     assert queued.path == "/api/v1/namespaces/spatium/pods"
-    delivered = await k8s_proxy.deliver_response(
+    delivered: Any = k8s_proxy.deliver_response(
         k8s_proxy.K8sProxyResponse(request_id=queued.request_id, status=200, body_b64="e30="),
         appliance_id=aid,
     )
+    if inspect.isawaitable(delivered):  # async since #3703; sync before it
+        delivered = await delivered
     assert delivered is True
 
     status, body = await asyncio.wait_for(call, 5.0)
@@ -83,3 +87,43 @@ async def test_queue_is_bounded() -> None:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class _StalledRedis:
+    """Accepts the enqueue, then never answers a read — a master that took
+    the connection and went quiet, or a sentinel walk past dead pod names."""
+
+    def pipeline(self) -> Any:
+        class _Pipe:
+            def __getattr__(self, _name: str) -> Any:
+                return lambda *a, **k: None
+
+            async def execute(self) -> list[Any]:
+                return []
+
+        return _Pipe()
+
+    async def blpop(self, *_a: Any, **_k: Any) -> Any:
+        await asyncio.sleep(3600)
+
+    async def delete(self, *_a: Any) -> int:
+        await asyncio.sleep(3600)
+        return 0
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_a_stalled_redis_cannot_stretch_the_wait_past_its_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(k8s_proxy, "_client", lambda: _StalledRedis())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            k8s_proxy.k8s_call(uuid.uuid4(), "GET", "/api/v1/nodes", timeout=0.5),
+            timeout=8.0,
+        )
+    # 0.5 s wait + the bounded best-effort key cleanup, never the stall.
+    assert loop.time() - started < 4.0

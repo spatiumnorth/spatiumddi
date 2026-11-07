@@ -105,10 +105,26 @@ _OWNER_GRACE_SECONDS = 30
 # fallback entry is noticed within a second.
 _SLICE_SECONDS = 1.0
 _CONNECT_TIMEOUT = 2.0
+# A socket READ bound, longer than any BLPOP slice (which is the longest a
+# healthy server takes to answer), so a master that accepts the connection and
+# then stops answering fails the call instead of parking it. core.redis_client
+# leaves this unset on purpose (#925: the wake bus parks pub/sub reads); every
+# read here is at most one slice, so it is safe to set.
+_READ_TIMEOUT = _SLICE_SECONDS + 4.0
+# Upper bound on one Redis round trip from the caller's side: a sentinel walk
+# past dead per-pod names costs ~13 s even with the connect bounded (#925), and
+# an operator's wait must not stretch past its own timeout because of it.
+_OP_TIMEOUT = _SLICE_SECONDS + 5.0
+# Best-effort key cleanup after a request ends; every key also carries a TTL.
+_CLEANUP_TIMEOUT = 2.0
 
 
 def _client() -> Any:
-    return make_async_redis(settings.redis_url, socket_connect_timeout=_CONNECT_TIMEOUT)
+    return make_async_redis(
+        settings.redis_url,
+        socket_connect_timeout=_CONNECT_TIMEOUT,
+        socket_timeout=_READ_TIMEOUT,
+    )
 
 
 async def _close(client: Any) -> None:
@@ -154,6 +170,8 @@ async def enqueue_request(
     pre-flight readiness check that returns a clearer error before
     the long wait.
     """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     request_id = str(uuid.uuid4())
     body_b64 = base64.b64encode(body).decode("ascii") if body else ""
 
@@ -165,7 +183,7 @@ async def enqueue_request(
         body_b64=body_b64,
     )
 
-    future: asyncio.Future[K8sProxyResponse] = asyncio.get_running_loop().create_future()
+    future: asyncio.Future[K8sProxyResponse] = loop.create_future()
     _response_futures[request_id] = future
     _request_owner[request_id] = appliance_id
 
@@ -182,7 +200,7 @@ async def enqueue_request(
         pipe.rpush(qkey, json.dumps(dataclasses.asdict(request)))
         pipe.ltrim(qkey, -MAX_QUEUED_PER_APPLIANCE, -1)
         pipe.expire(qkey, _QUEUE_TTL_SECONDS)
-        await pipe.execute()
+        await asyncio.wait_for(pipe.execute(), timeout=min(timeout, _OP_TIMEOUT))
     except Exception as exc:  # noqa: BLE001 — degrade to the in-process queue
         logger.warning("appliance.k8s_proxy.redis_unavailable", op="enqueue", error=str(exc))
         if client is not None:
@@ -197,7 +215,7 @@ async def enqueue_request(
         path=path,
     )
     try:
-        return await _await_reply(client, request_id, future, timeout)
+        return await _await_reply(client, request_id, future, deadline)
     except TimeoutError:
         # Mark the local queue entry cancelled so a same-process poll
         # skips it; the Redis one is skipped via its deleted owner key.
@@ -216,7 +234,10 @@ async def enqueue_request(
         _request_owner.pop(request_id, None)
         if client is not None:
             try:
-                await client.delete(_OWNER_PREFIX + request_id, _REPLY_PREFIX + request_id)
+                await asyncio.wait_for(
+                    client.delete(_OWNER_PREFIX + request_id, _REPLY_PREFIX + request_id),
+                    timeout=_CLEANUP_TIMEOUT,
+                )
             except Exception:  # noqa: BLE001 — both keys carry a TTL
                 pass
             await _close(client)
@@ -226,12 +247,12 @@ async def _await_reply(
     client: Any,
     request_id: str,
     future: asyncio.Future[K8sProxyResponse],
-    timeout: float,
+    deadline: float,
 ) -> K8sProxyResponse:
     """Wait for the reply: the Redis reply list (any replica may have
-    received it) or the local future (the Redis-down fallback)."""
+    received it) or the local future (the Redis-down fallback), until the
+    loop time ``deadline`` — never past it, however Redis behaves."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
     while True:
         if future.done():
             return future.result()
@@ -245,12 +266,17 @@ async def _await_reply(
             client.blpop(_REPLY_PREFIX + request_id, timeout=min(_SLICE_SECONDS, remaining))
         )
         try:
-            await asyncio.wait({read, future}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(
+                {read, future}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
         finally:
-            if not read.done():
+            unfinished = not read.done()
+            if unfinished:
                 read.cancel()
         if future.done():
             return future.result()
+        if unfinished:
+            continue  # the deadline passed mid-read; the loop raises TimeoutError
         try:
             item = read.result()
         except asyncio.CancelledError:
@@ -333,15 +359,19 @@ async def _blpop_or_shutdown(client: Any, key: str, timeout: float) -> Any:
     read = asyncio.ensure_future(client.blpop(key, timeout=timeout))
     stop = _shutdown.shutdown_future()
     try:
-        await asyncio.wait({read, stop}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait(
+            {read, stop}, timeout=timeout + _OP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+        )
     finally:
         _shutdown.discard(stop)
-        if not read.done():
+        unfinished = not read.done()
+        if unfinished:
             read.cancel()
+    if unfinished:
+        # Shutdown, or Redis stalled well past the slice: end this read.
+        return None if _shutdown.shutdown_requested() else _FAILED
     try:
         item = read.result()
-    except asyncio.CancelledError:
-        return None
     except Exception as exc:  # noqa: BLE001 — caller degrades to the local queue
         logger.warning("appliance.k8s_proxy.redis_unavailable", op="pop", error=str(exc))
         return _FAILED

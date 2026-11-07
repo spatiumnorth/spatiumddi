@@ -7994,7 +7994,7 @@ async def nettool_poll(request: Request, db: DB) -> NetToolPollResponse:
 
     appliance = await _require_cert_auth(request, db)
     # #3606: end the auth's read transaction before the 30 s wait; the queue
-    # is in Redis and nothing is pending (cert auth only reads).
+    # is in memory and nothing is pending (cert auth only reads).
     await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0)
     if queued is None:
@@ -8109,7 +8109,7 @@ async def storage_poll(request: Request, db: DB) -> StoragePollResponse:
 
     appliance = await _require_cert_auth(request, db)
     # #3606: end the auth's read transaction before the 30 s wait; the queue
-    # is in Redis and nothing is pending (cert auth only reads).
+    # is in memory and nothing is pending (cert auth only reads).
     await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0, channel=_cmd.CHANNEL_STORAGE)
     if queued is None:
