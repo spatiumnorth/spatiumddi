@@ -25,9 +25,12 @@ LOCK = BACKEND / "requirements.txt"
 DOCKERFILE = BACKEND / "Dockerfile"
 PYPROJECT = BACKEND / "pyproject.toml"
 
+# Skip only where the Dockerfile itself is absent (a context that does not ship
+# it). Keying the skip on the lock too would turn deleting requirements.txt —
+# the regression this file guards — into a skip instead of a failure.
 pytestmark = pytest.mark.skipif(
-    not (LOCK.exists() and DOCKERFILE.exists()),
-    reason="Dockerfile / requirements.txt are not in the container image",
+    not DOCKERFILE.exists(),
+    reason="the Dockerfile is not in this tree",
 )
 
 
@@ -87,4 +90,18 @@ def test_every_pin_has_a_reason_to_exist() -> None:
     assert _pins()[canonicalize_name("redis")] < Version("7"), (
         "redis >= 7 cost ~25 % of /health/ready throughput (#3693); "
         "re-measure before raising this pin"
+    )
+
+
+def test_lock_is_generated_not_hand_edited() -> None:
+    """uv writes the pins sorted by name. A hand edit (the first cut of this
+    file swapped redis 8.1.0 for 6.4.0 by hand and left kombu out of order)
+    is a pin the documented command does not reproduce: regenerating would
+    silently undo it. The redis hold now lives in pyproject.toml instead."""
+    names = list(_pins())
+    assert names == sorted(names), "requirements.txt is not in uv's order; regenerate it"
+    redis = next(r for r in _declared() if canonicalize_name(r.name) == "redis")
+    assert not redis.specifier.contains("7.0.0"), (
+        "pyproject.toml must cap redis below 7 (#3693), or regenerating the lock "
+        "lifts it to the slower major"
     )

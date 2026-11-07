@@ -1,8 +1,13 @@
-# Pinned Python set for the api image and CI (#3693). Generated, do not hand-edit:
+# Pinned Python set for the api image and CI (#3693). Generated — regenerate with
+# the command below (it rewrites the file; put this comment block back on top):
 #
 #   cd backend && docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
 #     'pip -q install uv && uv pip compile pyproject.toml --extra dev \
-#        --python-version 3.12 --no-header --no-annotate -o requirements.txt'
+#        --python-version 3.12 --python-platform x86_64-unknown-linux-gnu \
+#        --no-header --no-annotate -o requirements.txt'
+#
+# The set is identical for aarch64-unknown-linux-gnu (checked when generated);
+# both image architectures install the same pins.
 #
 # Why it exists: the Dockerfile used to run a bare `pip install .` against
 # pyproject.toml's open ranges, so a rebuild of one commit resolved whatever PyPI
@@ -11,8 +16,9 @@
 # Bumping a package is a Dependabot PR against this file (or re-run the command
 # above), never an edit to pyproject.toml alone.
 #
-# redis is held below 7 on purpose: redis 8.1.0 cost ~25 % of /health/ready
-# throughput per api CPU against 6.4.0 (#3693). Re-measure before raising it.
+# redis is held below 7 on purpose, by the cap in pyproject.toml (so the
+# command above keeps it): redis 8.1.0 cost ~25 % of /health/ready throughput
+# per api CPU against 6.4.0 (#3693). Re-measure before raising it.
 # backend/tests/test_requirements_lock.py keeps this file a valid resolution of
 # pyproject.toml and the Dockerfile installing through it.
 alembic==1.20.1
@@ -71,7 +77,6 @@ grpcio==1.85.1
 grpcio-status==1.85.1
 h11==0.16.0
 hiredis==3.5.0
-kombu==5.7.0
 httpcore==1.0.9
 httpcore2==2.16.0
 httptools==0.9.0
@@ -88,6 +93,7 @@ jinja2==3.1.6
 jiter==0.19.0
 jmespath==1.1.0
 joserfc==1.8.0
+kombu==5.7.0
 ldap3==2.9.1
 librt==0.16.0
 lxml==6.1.3
