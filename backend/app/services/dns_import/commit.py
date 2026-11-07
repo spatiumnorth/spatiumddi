@@ -38,6 +38,7 @@ from app.services.dns.record_ops import (
     resolve_primary_server,
 )
 from app.services.dns.view_collisions import RenderGuard
+from app.services.dns.zone_apex import apex_name_length_error
 from app.services.dns_import.soa_mailbox import (
     admin_email_warning,
     importable_admin_email,
@@ -337,6 +338,17 @@ async def _create_zone_at(
         # only where it carried none (a forward / stub zone, no SOA).
         default_ttl=(await load_dns_defaults(db)).ttl,
     )
+    if zone_kwargs["zone_type"] == "primary":
+        # #3672 — a zone whose apex names would pass 253 characters is never
+        # served; fail this zone only, in words, rather than store it.
+        apex_err = apex_name_length_error(
+            target_name,
+            zone_kwargs["primary_ns"],
+            zone_kwargs["admin_email"],
+            [(r.name, r.record_type, r.value) for r in parsed.records],
+        )
+        if apex_err is not None:
+            raise ValueError(apex_err)
     # #2275 — the slot being empty is not enough: a zone with no view renders
     # into every view, so it must not land beside a same-name pinned zone (and
     # vice versa). Raising fails this zone only; the caller rolls it back.
