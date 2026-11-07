@@ -878,14 +878,6 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
-    write_audit(
-        db,
-        user=user,
-        action="delete",
-        resource_type="dhcp_server",
-        resource_id=str(s.id),
-        resource_display=s.name,
-    )
     # #430 — capture the group before delete; removing a member can drop a
     # group out of HA, re-rendering the survivors' failover block. Wake it.
     gid = s.server_group_id
@@ -894,6 +886,19 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     from app.services.dhcp.lease_cleanup import delete_leases_for_server  # noqa: PLC0415
 
     await delete_leases_for_server(db, s.id)
+    # #3687: the audit row goes after the lease teardown. Its flush takes the
+    # audit-chain lock, and the teardown's first query autoflushes pending
+    # rows: an audit row staged earlier took the chain lock before the zone
+    # rows ``delete_leases_for_server`` locks, the reverse of the order a
+    # permanent zone delete takes them (``app.services.lock_order``).
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="dhcp_server",
+        resource_id=str(s.id),
+        resource_display=s.name,
+    )
     await db.delete(s)
     if gid is not None:
         collect_wake(dhcp_group_channel(gid))

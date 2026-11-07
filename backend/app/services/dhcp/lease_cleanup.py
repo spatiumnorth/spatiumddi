@@ -428,13 +428,25 @@ async def delete_leases_for_server(
     # mirror is: batch by batch, each batch's leases came after the last
     # batch's mirrors (``app.services.lock_order``). Ids only, so the
     # identity map still holds one batch at a time.
-    await db.execute(
-        select(DHCPLease.id)
-        .where(DHCPLease.server_id == server_id)
-        .order_by(DHCPLease.id)
-        .limit(max_leases)
-        .with_for_update()
+    from app.services.lock_order import lock_zones_for_lease_mirrors  # noqa: PLC0415
+
+    locked_lease_ids = (
+        (
+            await db.execute(
+                select(DHCPLease.id)
+                .where(DHCPLease.server_id == server_id)
+                .order_by(DHCPLease.id)
+                .limit(max_leases)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
     )
+    # #3687: and the zones of the mirrors' records, trashed ones too, before
+    # the first purge: lease i's purge deletes its trashed records in any
+    # zone, and a later lease's revoke then locks and bumps its own.
+    await lock_zones_for_lease_mirrors(db, locked_lease_ids)
     while leases_removed < max_leases:
         batch = list(
             (
@@ -505,6 +517,7 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
     touched subnets and their blocks in the same transaction (#3345).
     """
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+    from app.services.lock_order import lock_zones_for_addresses  # noqa: PLC0415
 
     cutoff = datetime.now(UTC) - ORPHAN_MIRROR_GRACE
     conds = [getattr(IPAddress, c).is_(None) for c in _INTEGRATION_OWNER_COLUMNS]
@@ -526,6 +539,9 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
         .scalars()
         .all()
     )
+    # #3687: every zone the batch's records sit in, trashed ones too, before
+    # the first purge; the per-row revoke below then locks nothing new.
+    await lock_zones_for_addresses(db, retracting=rows)
     await purge_trashed_address_records(db, [row.id for row in rows])  # #3186
     for row in rows:
         if row.subnet is not None:
