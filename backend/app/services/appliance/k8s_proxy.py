@@ -187,26 +187,42 @@ async def enqueue_request(
     _response_futures[request_id] = future
     _request_owner[request_id] = appliance_id
 
+    # Connect (PING) first, so a failure is classified by whether the enqueue
+    # could have reached Redis. Before the PING succeeds nothing about this
+    # request was sent: fall back to the in-process queue. Once the pipeline
+    # is sent, a failure is ambiguous (a timeout after Redis may have run it),
+    # so the request is treated as queued in Redis and NOT also queued
+    # locally — a request in both queues could be executed twice.
     client: Any = None
     try:
         client = _client()
-        pipe = client.pipeline()
-        pipe.set(
-            _OWNER_PREFIX + request_id,
-            str(appliance_id),
-            ex=int(timeout) + _OWNER_GRACE_SECONDS,
-        )
-        qkey = _Q_PREFIX + str(appliance_id)
-        pipe.rpush(qkey, json.dumps(dataclasses.asdict(request)))
-        pipe.ltrim(qkey, -MAX_QUEUED_PER_APPLIANCE, -1)
-        pipe.expire(qkey, _QUEUE_TTL_SECONDS)
-        await asyncio.wait_for(pipe.execute(), timeout=min(timeout, _OP_TIMEOUT))
-    except Exception as exc:  # noqa: BLE001 — degrade to the in-process queue
+        await asyncio.wait_for(client.ping(), timeout=min(timeout, _OP_TIMEOUT))
+    except Exception as exc:  # noqa: BLE001 — Redis never got the command
         logger.warning("appliance.k8s_proxy.redis_unavailable", op="enqueue", error=str(exc))
         if client is not None:
             await _close(client)
             client = None
         await _request_queues[appliance_id].put(request)
+    else:
+        try:
+            pipe = client.pipeline()
+            pipe.set(
+                _OWNER_PREFIX + request_id,
+                str(appliance_id),
+                ex=int(timeout) + _OWNER_GRACE_SECONDS,
+            )
+            qkey = _Q_PREFIX + str(appliance_id)
+            pipe.rpush(qkey, json.dumps(dataclasses.asdict(request)))
+            pipe.ltrim(qkey, -MAX_QUEUED_PER_APPLIANCE, -1)
+            pipe.expire(qkey, _QUEUE_TTL_SECONDS)
+            await asyncio.wait_for(pipe.execute(), timeout=min(timeout, _OP_TIMEOUT))
+        except Exception as exc:  # noqa: BLE001 — may have run; wait on Redis only
+            logger.warning(
+                "appliance.k8s_proxy.enqueue_ambiguous",
+                appliance_id=str(appliance_id),
+                request_id=request_id,
+                error=str(exc),
+            )
     logger.info(
         "appliance.k8s_proxy.enqueued",
         appliance_id=str(appliance_id),

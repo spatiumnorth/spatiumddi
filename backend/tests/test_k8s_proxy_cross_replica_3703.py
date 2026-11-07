@@ -103,6 +103,9 @@ class _StalledRedis:
 
         return _Pipe()
 
+    async def ping(self) -> bool:
+        return True
+
     async def blpop(self, *_a: Any, **_k: Any) -> Any:
         await asyncio.sleep(3600)
 
@@ -127,3 +130,74 @@ async def test_a_stalled_redis_cannot_stretch_the_wait_past_its_timeout(
         )
     # 0.5 s wait + the bounded best-effort key cleanup, never the stall.
     assert loop.time() - started < 4.0
+
+
+class _AmbiguousRedis(_StalledRedis):
+    """Connects fine, then the enqueue pipeline times out — Redis may or may
+    not have run it."""
+
+    async def ping(self) -> bool:
+        return True
+
+    def pipeline(self) -> Any:
+        class _Pipe:
+            def __getattr__(self, _name: str) -> Any:
+                return lambda *a, **k: None
+
+            async def execute(self) -> list[Any]:
+                import redis.exceptions
+
+                raise redis.exceptions.TimeoutError("Timeout reading from socket")
+
+        return _Pipe()
+
+    async def blpop(self, *_a: Any, timeout: float = 1.0, **_k: Any) -> Any:
+        await asyncio.sleep(timeout)
+        return None
+
+    async def delete(self, *_a: Any) -> int:
+        return 0
+
+
+class _RefusingRedis(_StalledRedis):
+    """Cannot even connect: nothing was sent."""
+
+    async def ping(self) -> bool:
+        import redis.exceptions
+
+        raise redis.exceptions.ConnectionError("Error 111 connecting. Connection refused.")
+
+    async def blpop(self, *_a: Any, **_k: Any) -> Any:
+        return await self.ping()
+
+    async def get(self, *_a: Any) -> Any:
+        return await self.ping()
+
+
+async def test_an_ambiguous_enqueue_is_never_also_queued_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(k8s_proxy, "_client", lambda: _AmbiguousRedis())
+    aid = uuid.uuid4()
+    call = asyncio.create_task(k8s_proxy.k8s_call(aid, "GET", "/api/v1/nodes", timeout=0.6))
+    await asyncio.sleep(0.2)
+    # Redis may hold it; a local copy too would let a supervisor run it twice.
+    assert k8s_proxy.queue_depth(aid) == 0
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(call, timeout=5.0)
+    assert k8s_proxy.queue_depth(aid) == 0
+
+
+async def test_an_unreachable_redis_still_falls_back_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(k8s_proxy, "_client", lambda: _RefusingRedis())
+    aid = uuid.uuid4()
+    call = asyncio.create_task(k8s_proxy.k8s_call(aid, "GET", "/api/v1/nodes", timeout=5.0))
+    queued = await k8s_proxy.pop_request(aid, timeout=2.0)
+    assert queued is not None
+    assert await k8s_proxy.deliver_response(
+        k8s_proxy.K8sProxyResponse(request_id=queued.request_id, status=200, body_b64="e30="),
+        appliance_id=aid,
+    )
+    assert await asyncio.wait_for(call, 5.0) == (200, b"{}")
