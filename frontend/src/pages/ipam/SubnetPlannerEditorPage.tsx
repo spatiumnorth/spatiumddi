@@ -34,6 +34,7 @@ import {
   formatDialogError,
 } from "@/lib/api";
 import { newNodeId } from "@/lib/uuid";
+import { suggestChildCidr } from "@/lib/plan-suggest";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { Modal } from "@/components/ui/modal";
@@ -923,79 +924,4 @@ function reparentNode(
   return mutateNode(detached, dropId, {
     children: [...(findNode(detached, dropId)?.children ?? []), dragged],
   });
-}
-
-function suggestChildCidr(parent: PlanNode, existing: PlanNode[]): string {
-  // Choose a target prefix that's smaller than the parent (default +8, capped
-  // so the parent can fit the result). Then walk aligned slots of that size
-  // inside the parent and return the first one that doesn't overlap any
-  // existing sibling. If everything's taken at +8, step the slot size down by
-  // one bit (= halve it) and retry, up to /30.
-  const isV6 = parent.network.includes(":");
-  if (isV6) {
-    // No bigint helpers in this file yet — for v6 we just stamp parent's base
-    // with a guessed prefix and let the operator edit. Validation will flag
-    // any clash.
-    const slash = parent.network.indexOf("/");
-    const prefix = parseInt(parent.network.slice(slash + 1), 10);
-    const childPrefix = Math.min(prefix + 16, 127);
-    return `${parent.network.slice(0, slash)}/${childPrefix}`;
-  }
-  const parsed = parseCidrV4(parent.network);
-  if (!parsed) return parent.network;
-  const existingRanges = existing
-    .map((c) => parseCidrV4(c.network))
-    .filter((c): c is V4 => c !== null);
-
-  for (let target = parsed.prefix + 8; target <= 30; target++) {
-    if (target <= parsed.prefix) continue;
-    const slotSize = 2 ** (32 - target);
-    const start = parsed.base;
-    const end = start + 2 ** (32 - parsed.prefix);
-    for (let addr = start; addr < end; addr += slotSize) {
-      const candidate: V4 = { base: addr, prefix: target };
-      if (!existingRanges.some((e) => v4Overlaps(candidate, e))) {
-        return `${intToIp(addr)}/${target}`;
-      }
-    }
-  }
-  // No room at any size — return the parent's base as a placeholder.
-  return parent.network;
-}
-
-interface V4 {
-  base: number;
-  prefix: number;
-}
-
-function parseCidrV4(cidr: string): V4 | null {
-  const [ip, prefixStr] = cidr.split("/");
-  if (!ip || !prefixStr) return null;
-  const prefix = parseInt(prefixStr, 10);
-  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return null;
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  let n = 0;
-  for (const p of parts) {
-    const v = Number(p);
-    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
-    n = n * 256 + v;
-  }
-  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
-  return { base: (n & mask) >>> 0, prefix };
-}
-
-function v4Overlaps(a: V4, b: V4): boolean {
-  const aSize = 2 ** (32 - a.prefix);
-  const bSize = 2 ** (32 - b.prefix);
-  return a.base < b.base + bSize && b.base < a.base + aSize;
-}
-
-function intToIp(n: number): string {
-  return [
-    (n >>> 24) & 0xff,
-    (n >>> 16) & 0xff,
-    (n >>> 8) & 0xff,
-    n & 0xff,
-  ].join(".");
 }
