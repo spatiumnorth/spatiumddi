@@ -155,6 +155,41 @@ async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int,
     return fired, errors
 
 
+async def _lock_reapply_zones(db: Any, subnet_ids: list[Any]) -> None:
+    """#3687 — lock, in one id-ordered pass, every zone the run's DDNS
+    re-apply (:func:`_reapply_ddns_for_active_leases`) may write, trashed
+    records' zones included, before the first subnet is handled.
+
+    The run is one transaction over every subnet. A re-apply of a row with a
+    blank name deletes its trashed host records in any zone, and a later row's
+    publish locks its own: taking those zones one row at a time holds a record
+    and then waits for the zone, the reverse of a permanent zone delete (zone
+    row, then its records). Locked up front they are in id order, ahead of
+    every purge (``app.services.lock_order``)."""
+    from app.services.dns.ddns import resolve_effective_ddns  # noqa: PLC0415
+    from app.services.lock_order import lock_zones_for_addresses  # noqa: PLC0415
+
+    publishing: list[tuple[Subnet, IPAddress]] = []
+    for subnet_id in subnet_ids:
+        subnet = await db.get(Subnet, subnet_id)
+        if subnet is None or not (await resolve_effective_ddns(db, subnet)).enabled:
+            continue
+        rows = (
+            (
+                await db.execute(
+                    select(IPAddress).where(
+                        IPAddress.subnet_id == subnet_id,
+                        IPAddress.auto_from_lease.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        publishing.extend((subnet, row) for row in rows)
+    await lock_zones_for_addresses(db, publishing=publishing, ddns=True)
+
+
 async def _run_auto_sync() -> dict[str, Any]:
     # Imports are intentionally deferred so loading this module from the
     # Celery worker doesn't drag in the full FastAPI router graph at import
@@ -203,6 +238,7 @@ async def _run_auto_sync() -> dict[str, Any]:
             touched_subnet_ids: set[Any] = set()
 
             total_ddns_reapplied = 0
+            await _lock_reapply_zones(db, subnets)
             for subnet_id in subnets:
                 subnet_obj = await db.get(Subnet, subnet_id)
                 if subnet_obj is None:
