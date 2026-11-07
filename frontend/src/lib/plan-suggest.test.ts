@@ -1,18 +1,11 @@
 /**
- * @vitest-environment jsdom
- *
  * The Subnet Planner's + Subnet / + Block pre-fill never answers a CIDR a
  * sibling holds (#3711). Under an IPv6 node it was always the node's first
  * /(p+16); under an IPv4 node of /23 or longer, the node's own network.
  */
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { cidrContains } from "@/lib/cidr";
-
-vi.mock("@/hooks/useFeatureModules", () => ({
-  useFeatureModules: () => ({ ready: true, enabled: () => false }),
-}));
-
-const { suggestChildCidr } = await import("./SubnetPlannerEditorPage");
+import { suggestChildCidr } from "@/lib/plan-suggest";
 
 type N = Parameters<typeof suggestChildCidr>[0];
 const node = (network: string, children: N[] = []): N =>
@@ -68,5 +61,31 @@ describe("planner pre-fill (#3711)", () => {
   it("answers empty, never a sibling, when nothing fits", () => {
     const full = node("10.0.0.0/30", [node("10.0.0.0/30")]);
     expect(suggestChildCidr(node("10.0.0.0/30"), full.children)).toBe("");
+  });
+
+  it.each(["10.0.0.0/32", "10.0.0.0/31", "fd00::/128", "fd00::/127"])(
+    "%s: no room for a child, so empty",
+    (parent) => {
+      expect(suggestChildCidr(node(parent), [])).toBe("");
+    },
+  );
+
+  it("fills past siblings at both edges of the node", () => {
+    const p = "fd00::/120";
+    const kids = [node("fd00::/121"), node("fd00::80/122")];
+    const next = suggestChildCidr(node(p), kids);
+    expect(cidrContains(p, next)).toBe(true);
+    expect(next).toBe("fd00::c0/127");
+    const v4 = suggestChildCidr(node("10.0.0.0/24"), [
+      node("10.0.0.0/25"),
+      node("10.0.0.128/26"),
+    ]);
+    expect(v4).toBe("10.0.0.192/30");
+  });
+
+  it("ignores siblings of the other family", () => {
+    expect(suggestChildCidr(node("10.0.0.0/24"), [node("::/0")])).toBe(
+      suggestChildCidr(node("10.0.0.0/24"), []),
+    );
   });
 });
