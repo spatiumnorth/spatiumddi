@@ -1574,30 +1574,30 @@ async def reassert_ptrs_after_a_deletes(
     if not owners:
         return 0
 
-    async def _ptr_rows() -> list[Any]:
-        return list(
-            (
-                await db.execute(
-                    select(DNSRecord, DNSZone)
-                    .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
-                    .where(
-                        DNSZone.group_id == zone.group_id,
-                        DNSRecord.record_type == "PTR",
-                        DNSRecord.deleted_at.is_(None),
-                        func.lower(func.rtrim(DNSRecord.fqdn, ".")).in_(list(owners)),
-                    )
-                )
-            ).all()
+    async def _ptr_rows(*, refresh: bool = False) -> list[Any]:
+        stmt = (
+            select(DNSRecord, DNSZone)
+            .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
+            .where(
+                DNSZone.group_id == zone.group_id,
+                DNSRecord.record_type == "PTR",
+                DNSRecord.deleted_at.is_(None),
+                func.lower(func.rtrim(DNSRecord.fqdn, ".")).in_(list(owners)),
+            )
         )
+        if refresh:
+            stmt = stmt.execution_options(populate_existing=True)
+        return list((await db.execute(stmt)).all())
 
     rows = await _ptr_rows()
     if lock_zones and rows:
         # #3688: a caller that holds no zone row yet (the agent's ack, after its
         # op rows are committed) takes the reverse zones, ascending, before it
         # bumps them, then reads again: a zone a delete removed meanwhile drops
-        # out, and the bump never meets a row that is gone.
+        # out, the bump never meets a row that is gone, and it counts from the
+        # serial the lock found (``populate_existing``), not one read earlier.
         await lock_zone_rows(db, {rev_zone.id for _, rev_zone in rows})
-        rows = await _ptr_rows()
+        rows = await _ptr_rows(refresh=True)
     by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
     for ptr, rev_zone in rows:
         owner = owners.get(ptr.fqdn.rstrip(".").lower())

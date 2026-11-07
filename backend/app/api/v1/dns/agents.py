@@ -1294,10 +1294,6 @@ async def agent_heartbeat(
         server.agent_jwt_hash = hash_token(rotated_token)
 
     await db.commit()
-    if retried_deletes:
-        # #3688: after the commit, holding no op row (see ``apply_acks``).
-        await reassert_after_retried_deletes(db, server.id, retried_deletes)
-        await db.commit()
     response = AgentHeartbeatResponseV2(
         server_id=str(server.id),
         status=server.status,
@@ -1305,10 +1301,12 @@ async def agent_heartbeat(
         rotated_token=rotated_token,
         rotated_expires_at=rotated_exp,
     )
+    group_id = server.group_id
+    await _reassert_after_commit(db, server.id, retried_deletes)
     # #1171 — the heartbeat that finishes a roll (the group's last BIND9 agent
     # now renders the zones' own SOA timers), or brings an older agent back,
     # switches the group and moves the serials.
-    await _switch_soa_timers(db, server.group_id)
+    await _switch_soa_timers(db, group_id)
     return response
 
 
@@ -1347,12 +1345,31 @@ async def agent_ops_ack(
     retried_deletes = await ack_op(
         db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
     )
+    server_id = server.id
     await db.commit()
-    if retried_deletes:
-        # #3688: after the commit, holding no op row (see ``apply_acks``).
-        await reassert_after_retried_deletes(db, server.id, retried_deletes)
-        await db.commit()
+    await _reassert_after_commit(db, server_id, retried_deletes)
     return {"status": "ok"}
+
+
+async def _reassert_after_commit(
+    db: AsyncSession, server_id: uuid.UUID, retried: list[tuple[str, dict[str, Any]]]
+) -> None:
+    """#3688: the #1800 PTR re-assert, in a transaction of its own after the
+    ack has committed, holding no op row (see ``apply_acks``).
+
+    A failure here (a deadlock, a lost connection) is logged and rolled back,
+    never raised: the acks, the reset and any rotated token are already
+    committed, and a 500 would keep the rotated token from the agent (whose
+    old one no longer matches) and have it resend acks that already landed.
+    The PTR is left for the next structural pass, as before #1800."""
+    if not retried:
+        return
+    try:
+        await reassert_after_retried_deletes(db, server_id, retried)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.warning("dns_ptr_reassert_after_ack_failed", server_id=str(server_id), exc_info=True)
 
 
 class ZoneStateEntry(BaseModel):
