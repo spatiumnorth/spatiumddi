@@ -7863,7 +7863,7 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
 
     appliance = await _require_cert_auth(request, db)
     # #3606: end the auth's read transaction before the 30 s wait; the queue
-    # is in memory and nothing is pending (cert auth only reads).
+    # is in Redis and nothing is pending (cert auth only reads).
     await db.commit()
     queued = await _proxy.pop_request(appliance.id, timeout=30.0)
     if queued is None:
@@ -7892,8 +7892,8 @@ async def k8s_proxy_reply(
 ) -> dict[str, str]:
     """Supervisor-only endpoint. Once the supervisor has executed the
     proxied request against the local kubeapi, it POSTs the response
-    here. The backend's in-memory future map matches the request_id
-    + resolves the operator action's pending future.
+    here. The reply is pushed to Redis keyed by request_id, resolving the
+    operator action's pending wait on whichever api replica holds it.
 
     Returns 200 either way — late replies (operator already timed
     out + the future was GC'd) are logged + discarded server-side
@@ -7913,7 +7913,7 @@ async def k8s_proxy_reply(
         headers=body.headers,
         body_b64=body.body_b64,
     )
-    delivered = _proxy.deliver_response(response, appliance_id=appliance.id)
+    delivered = await _proxy.deliver_response(response, appliance_id=appliance.id)
     logger.info(
         "appliance.k8s_proxy.reply",
         appliance_id=str(appliance.id),
@@ -7994,7 +7994,7 @@ async def nettool_poll(request: Request, db: DB) -> NetToolPollResponse:
 
     appliance = await _require_cert_auth(request, db)
     # #3606: end the auth's read transaction before the 30 s wait; the queue
-    # is in memory and nothing is pending (cert auth only reads).
+    # is in Redis and nothing is pending (cert auth only reads).
     await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0)
     if queued is None:
@@ -8021,8 +8021,8 @@ async def nettool_reply(
 ) -> dict[str, str]:
     """Supervisor-only endpoint. Once the supervisor has run the
     dispatched tool against its local vantage, it POSTs the structured
-    result here. The backend's in-memory future map matches the
-    request_id + resolves the operator action's pending future.
+    result here. The result is pushed to the waiter's Redis reply list
+    (the waiter may be another api replica or the worker, #3706).
 
     Returns 200 either way — late replies (operator already timed out +
     the future was evicted) are logged + discarded server-side so the
@@ -8041,7 +8041,7 @@ async def nettool_reply(
         result=body.result,
         error=body.error,
     )
-    delivered = _cmd.deliver_result(result, appliance_id=appliance.id)
+    delivered = await _cmd.deliver_result(result, appliance_id=appliance.id)
     logger.info(
         "appliance.nettool.reply",
         appliance_id=str(appliance.id),
@@ -8054,8 +8054,8 @@ async def nettool_reply(
 
 # ── Storage management (md / multipath, #999 Part B) ─────────────────────
 #
-# Same transport as the nettool channel above (per-appliance queue +
-# per-request future) on its OWN queue, because a nettool is a read-only
+# Same transport as the nettool channel above (per-appliance Redis queue +
+# per-request reply, #3706) on its OWN queue, because a nettool is a read-only
 # reachability probe and ``mdadm --add`` overwrites a disk. Separate
 # queues mean a long-running topology dump cannot sit in front of a ping,
 # and neither endpoint's name lies about what it moves.
@@ -8109,7 +8109,7 @@ async def storage_poll(request: Request, db: DB) -> StoragePollResponse:
 
     appliance = await _require_cert_auth(request, db)
     # #3606: end the auth's read transaction before the 30 s wait; the queue
-    # is in memory and nothing is pending (cert auth only reads).
+    # is in Redis and nothing is pending (cert auth only reads).
     await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0, channel=_cmd.CHANNEL_STORAGE)
     if queued is None:
@@ -8137,7 +8137,7 @@ async def storage_reply(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "request_id path/body mismatch",
         )
-    delivered = _cmd.deliver_result(
+    delivered = await _cmd.deliver_result(
         _cmd.NetToolResult(request_id=request_id, result=body.result, error=body.error),
         appliance_id=appliance.id,
         channel=_cmd.CHANNEL_STORAGE,
@@ -8587,7 +8587,7 @@ async def eject_removable(
 
 #
 # The supervisor's pcap_proxy thread drives these. Unlike the nettool /
-# k8s-proxy in-memory queues, the authority is the packet_capture DB row
+# k8s-proxy Redis queues, the authority is the packet_capture DB row
 # (claimed via a guarded UPDATE), so any api replica can serve the poll.
 
 

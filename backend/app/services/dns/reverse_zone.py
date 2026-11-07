@@ -35,6 +35,7 @@ from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, rever
     reverse_zone_pieces,
 )
 from app.services.ipam.zone_binding import prune_zone_ids
+from app.services.lock_order import lock_zone_rows
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -500,24 +501,24 @@ async def surviving_sharer(
 
 
 async def _retirement_plan(
-    db: AsyncSession, subnet: Subnet, exclude_ids: frozenset[uuid.UUID]
+    db: AsyncSession,
+    subnet: Subnet,
+    exclude_ids: frozenset[uuid.UUID],
+    *,
+    refresh: bool = False,
 ) -> list[tuple[DNSZone, uuid.UUID | None]]:
     """Each reverse zone ``subnet`` auto-created, with the live subnet that
     keeps it (:func:`surviving_sharer`), or ``None`` when the zone goes with
     ``subnet``. It only reads, so a delete's approval preview decides which
-    zones the delete takes by the delete's own rule (spatiumddi#3511)."""
-    zones = (
-        (
-            await db.execute(
-                select(DNSZone).where(
-                    DNSZone.linked_subnet_id == subnet.id,
-                    DNSZone.is_auto_generated.is_(True),
-                )
-            )
-        )
-        .scalars()
-        .all()
+    zones the delete takes by the delete's own rule (spatiumddi#3511).
+    ``refresh`` re-reads zones already loaded, as their locks found them."""
+    stmt = select(DNSZone).where(
+        DNSZone.linked_subnet_id == subnet.id,
+        DNSZone.is_auto_generated.is_(True),
     )
+    if refresh:
+        stmt = stmt.execution_options(populate_existing=True)
+    zones = (await db.execute(stmt)).scalars().all()
     return [
         (zone, await surviving_sharer(db, zone, subnet, exclude_ids=exclude_ids)) for zone in zones
     ]
@@ -564,7 +565,17 @@ async def retire_auto_reverse_zones(
     retired: list[DNSZone] = []
     relinked: list[DNSZone] = []
     wake: set[uuid.UUID] = set()
-    for zone, survivor in await _retirement_plan(db, subnet, exclude_ids):
+    # #3688: the plan's zone rows before anything of theirs is written, in id
+    # order (``lock_order``), so the sweep below (queued ops) never runs ahead
+    # of the zone row: a zone delete takes the row, then the ops. The plan is
+    # read again once the rows are held, so a zone a delete removed meanwhile
+    # is not retired twice, and one a move re-homed meanwhile is swept in the
+    # group it is in now.
+    plan = await _retirement_plan(db, subnet, exclude_ids)
+    if plan:
+        await lock_zone_rows(db, [zone.id for zone, _ in plan])
+        plan = await _retirement_plan(db, subnet, exclude_ids, refresh=True)
+    for zone, survivor in plan:
         if survivor is not None:
             zone.linked_subnet_id = survivor
             relinked.append(zone)

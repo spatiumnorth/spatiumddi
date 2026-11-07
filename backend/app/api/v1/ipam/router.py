@@ -6061,7 +6061,8 @@ class FreeCidrRange(BaseModel):
     network: str
     first: str
     last: str
-    size: int
+    size: int = Field(description=_COUNT_DESC)
+    size_exact: str = Field(description=_EXACT_DESC)
     prefix_len: int
 
 
@@ -6086,7 +6087,17 @@ async def get_block_free_space(
     child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
     ranges = _compute_free_cidrs(str(block.network), occupied)
-    return [FreeCidrRange(**r) for r in ranges]
+    return [
+        FreeCidrRange(
+            network=r["network"],
+            first=r["first"],
+            last=r["last"],
+            size=_int64_count(r["size"]),
+            size_exact=str(r["size"]),
+            prefix_len=r["prefix_len"],
+        )
+        for r in ranges
+    ]
 
 
 class PlanRequestItem(BaseModel):
@@ -6105,7 +6116,8 @@ class PlannedSubnet(BaseModel):
     network: str
     first: str
     last: str
-    size: int
+    size: int = Field(description=_COUNT_DESC)
+    size_exact: str = Field(description=_EXACT_DESC)
 
 
 class UnfulfilledItem(BaseModel):
@@ -6227,7 +6239,8 @@ async def plan_block_allocation(
             network=str(net),
             first=str(net.network_address),
             last=str(net.broadcast_address),
-            size=net.num_addresses,
+            size=_int64_count(net.num_addresses),
+            size_exact=str(net.num_addresses),
         )
         for _, net in allocated
     ]
@@ -6248,7 +6261,8 @@ async def plan_block_allocation(
             network=str(n),
             first=str(n.network_address),
             last=str(n.broadcast_address),
-            size=n.num_addresses,
+            size=_int64_count(n.num_addresses),
+            size_exact=str(n.num_addresses),
             prefix_len=n.prefixlen,
         )
         for n in working
@@ -6266,7 +6280,8 @@ async def plan_block_allocation(
 class AggregationSuggestion(BaseModel):
     supernet: str
     prefix_len: int
-    total_size: int
+    total_size: int = Field(description=_COUNT_DESC)
+    total_size_exact: str = Field(description=_EXACT_DESC)
     subnet_ids: list[str]
     subnet_networks: list[str]
     # Stable identifier for the snooze map — hash of parent block + sorted
@@ -6369,7 +6384,8 @@ async def get_aggregation_suggestions(
             AggregationSuggestion(
                 supernet=str(super_net),
                 prefix_len=super_net.prefixlen,
-                total_size=super_net.num_addresses,
+                total_size=_int64_count(super_net.num_addresses),
+                total_size_exact=str(super_net.num_addresses),
                 subnet_ids=[str(rid) for rid, _ in members],
                 subnet_networks=child_cidrs,
                 candidate_key=key,
@@ -6378,7 +6394,7 @@ async def get_aggregation_suggestions(
                 ),
             )
         )
-    out.sort(key=lambda s: (-s.total_size, s.supernet))
+    out.sort(key=lambda s: (-int(s.total_size_exact), s.supernet))
     return out
 
 

@@ -30,7 +30,7 @@ async def _answer(appliance_id: uuid.UUID, *, replying_as: uuid.UUID) -> tuple[b
     )
     queued = await k8s_proxy.pop_request(appliance_id, timeout=1.0)
     assert queued is not None
-    delivered = k8s_proxy.deliver_response(
+    delivered = await k8s_proxy.deliver_response(
         k8s_proxy.K8sProxyResponse(request_id=queued.request_id, status=200, body_b64=""),
         appliance_id=replying_as,
     )

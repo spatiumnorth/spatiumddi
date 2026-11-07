@@ -1542,6 +1542,8 @@ async def reassert_ptrs_after_a_deletes(
     zone: DNSZone,
     primary: DNSServer,
     ops: Collection[dict[str, Any]],
+    *,
+    lock_zones: bool = False,
 ) -> int:
     """Queue a PTR ``create`` after every A/AAAA ``delete`` that took its PTR.
 
@@ -1571,8 +1573,9 @@ async def reassert_ptrs_after_a_deletes(
         owners[ip.reverse_pointer.lower()] = _qualified_owner(zone, rec.get("name") or "@")
     if not owners:
         return 0
-    rows = (
-        await db.execute(
+
+    async def _ptr_rows(*, refresh: bool = False) -> list[Any]:
+        stmt = (
             select(DNSRecord, DNSZone)
             .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
             .where(
@@ -1582,7 +1585,19 @@ async def reassert_ptrs_after_a_deletes(
                 func.lower(func.rtrim(DNSRecord.fqdn, ".")).in_(list(owners)),
             )
         )
-    ).all()
+        if refresh:
+            stmt = stmt.execution_options(populate_existing=True)
+        return list((await db.execute(stmt)).all())
+
+    rows = await _ptr_rows()
+    if lock_zones and rows:
+        # #3688: a caller that holds no zone row yet (the agent's ack, after its
+        # op rows are committed) takes the reverse zones, ascending, before it
+        # bumps them, then reads again: a zone a delete removed meanwhile drops
+        # out, the bump never meets a row that is gone, and it counts from the
+        # serial the lock found (``populate_existing``), not one read earlier.
+        await lock_zone_rows(db, {rev_zone.id for _, rev_zone in rows})
+        rows = await _ptr_rows(refresh=True)
     by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
     for ptr, rev_zone in rows:
         owner = owners.get(ptr.fqdn.rstrip(".").lower())
@@ -2577,7 +2592,7 @@ async def lock_heartbeat_ops(
 
 async def apply_acks(
     db: AsyncSession, server_id: uuid.UUID, acks: Collection[dict[str, Any]]
-) -> None:
+) -> list[tuple[str, dict[str, Any]]]:
     """Record an agent's verdicts on its ops (#1232). One load, one batched
     successor lookup, however many acks.
 
@@ -2592,6 +2607,13 @@ async def apply_acks(
     an earlier dispatch has already been counted — by the reset — and counting
     it again would spend the retry budget twice. An agent too old to echo
     ``dispatch`` is taken at its word, as before.
+
+    Returns the ``(zone name, record)`` of each A/AAAA delete that applied on a
+    retry (#1800). The caller commits, then passes them to
+    :func:`reassert_after_retried_deletes`: the re-assert bumps the PTR's
+    reverse zone, and a zone delete takes the zone row BEFORE the queued ops
+    this transaction holds, so bumping it from here deadlocked with a delete of
+    that zone (#3688).
     """
     parsed: list[tuple[uuid.UUID, dict[str, Any]]] = []
     for ack in acks:
@@ -2600,7 +2622,7 @@ async def apply_acks(
         except ValueError:
             continue
     if not parsed:
-        return
+        return []
     ops = {
         op.id: op
         for op in (
@@ -2640,14 +2662,18 @@ async def apply_acks(
     if failures:
         await fail_attempts(db, list(failures.values()), now=now)
     await db.flush()
-    if retried_deletes:
-        await _reassert_after_retried_deletes(db, server_id, retried_deletes)
+    return [(op.zone_name, dict(op.record)) for op in retried_deletes]
 
 
-async def _reassert_after_retried_deletes(
-    db: AsyncSession, server_id: uuid.UUID, ops: list[DNSRecordOp]
+async def reassert_after_retried_deletes(
+    db: AsyncSession, server_id: uuid.UUID, retried: Sequence[tuple[str, dict[str, Any]]]
 ) -> None:
     """#1800 — re-assert PTRs a RETRIED A/AAAA delete took with it.
+
+    Run in a transaction of its own AFTER the ack's commit (#3688): it holds no
+    op row then, so taking a reverse zone row cannot deadlock with a zone delete
+    (which takes the zone row, then the zone's ops). Losing it to a crash in
+    between leaves the PTR for the next structural pass, as before #1800.
 
     The PTR ``create`` queued after the delete ships in the same page, and the
     agent keeps going past a failed op. So when the delete failed and the
@@ -2660,9 +2686,9 @@ async def _reassert_after_retried_deletes(
     if server is None or server.driver not in PTR_CLEANUP_DRIVERS:
         return
     by_zone: dict[str, list[dict[str, Any]]] = {}
-    for op in ops:
-        by_zone.setdefault(op.zone_name.rstrip(".").lower(), []).append(
-            {"op": "delete", "record": op.record}
+    for zone_name, record in retried:
+        by_zone.setdefault(zone_name.rstrip(".").lower(), []).append(
+            {"op": "delete", "record": record}
         )
     for zone_name, zone_ops in by_zone.items():
         zone = (
@@ -2678,7 +2704,7 @@ async def _reassert_after_retried_deletes(
             .first()
         )
         if zone is not None:
-            await reassert_ptrs_after_a_deletes(db, zone, server, zone_ops)
+            await reassert_ptrs_after_a_deletes(db, zone, server, zone_ops, lock_zones=True)
 
 
 async def ack_op(
@@ -2688,9 +2714,9 @@ async def ack_op(
     message: str | None = None,
     *,
     server_id: uuid.UUID,
-) -> None:
+) -> list[tuple[str, dict[str, Any]]]:
     """One ack; see :func:`apply_acks`."""
-    await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])
+    return await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])
 
 
 def _subnet_address_records(subnet_ids: Sequence[uuid.UUID], *address_where: Any) -> list[Any]:

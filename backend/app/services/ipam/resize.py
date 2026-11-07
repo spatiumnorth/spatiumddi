@@ -1021,6 +1021,7 @@ async def preview_block_resize(
                 UNION ALL
                 SELECT b.id, b.network, b.name FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT id, network, name FROM descendants
                 WHERE id != CAST(:bid AS uuid)
@@ -1039,9 +1040,11 @@ async def preview_block_resize(
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT s.id, s.network, s.name FROM subnet s
                 WHERE s.block_id IN (SELECT id FROM descendants)
+                    AND s.deleted_at IS NULL
             """),
         {"bid": str(block.id)},
     )
@@ -1492,6 +1495,7 @@ async def commit_block_resize(
                 UNION ALL
                 SELECT b.id, b.network FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT network FROM descendants WHERE id != CAST(:bid AS uuid)
             """),
@@ -1511,9 +1515,11 @@ async def commit_block_resize(
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT s.network FROM subnet s
                 WHERE s.block_id IN (SELECT id FROM descendants)
+                    AND s.deleted_at IS NULL
             """),
         {"bid": str(block.id)},
     )
