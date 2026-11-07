@@ -1734,6 +1734,22 @@ async def agent_lease_events(
             publishing.append((subnet, row))
         else:
             retracting.append(row)
+    # #3687: a mirror this pass creates later (an address whose first event is
+    # a release, then a grant) is not in ``ipam_by_key`` yet, so its zones
+    # were left out, and an earlier event's purge of a trashed record had
+    # already run when its publish locked them. A transient row (never added
+    # to the session) names the zones its publish will write.
+    planned = set(ipam_by_key)
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx in stale or subnet is None or ev.state != "active":
+            continue
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
+        key = (subnet.id, norm_ip(ev.ip_address))
+        if lease.state != "active" or key in planned:
+            continue
+        planned.add(key)
+        publishing.append((subnet, _new_mirror_row(subnet, ev, lease)))
     await lock_zones_for_addresses(db, publishing=publishing, retracting=retracting, ddns=True)
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
