@@ -17,7 +17,12 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36,<2.1",
     "asyncpg>=0.30.0",
     "alembic>=1.14.0",
-    "redis[hiredis]>=5.2.0",
+    # Below 7 until re-measured (#3693): redis-py 7.4.1 / 8.1.0 cost ~10 % /
+    # ~25 % of /health/ready throughput per api CPU against 6.4.0 on the old
+    # per-probe client, and 8.1.0 still ~4 % with the pooled one. The cap
+    # lives here, not only in requirements.txt, so regenerating the lock with
+    # its documented command keeps it.
+    "redis[hiredis]>=5.2.0,<7",
     "celery[redis]>=5.4.0",
     "structlog>=24.4.0",
     "python-jose[cryptography]>=3.3.0",
