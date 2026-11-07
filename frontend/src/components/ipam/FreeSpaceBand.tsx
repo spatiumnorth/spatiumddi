@@ -7,7 +7,7 @@ import {
   type IPBlock,
   type Subnet,
 } from "@/lib/api";
-import { parseCidr } from "@/lib/cidr";
+import { bigFraction, cidrSpan } from "@/lib/cidr";
 import { cn } from "@/lib/utils";
 
 interface Segment {
@@ -15,7 +15,7 @@ interface Segment {
   width: number; // fraction width
   kind: "block" | "subnet" | "free";
   label: string;
-  size: number;
+  size: bigint;
   network?: string;
   utilization?: number; // 0..100 — only set for blocks/subnets
 }
@@ -60,9 +60,9 @@ export function FreeSpaceBand({
   });
 
   const segments = useMemo<Segment[]>(() => {
-    const parent = parseCidr(block.network);
+    // Exact BigInt spans, so an IPv6 block draws like an IPv4 one (#3707).
+    const parent = cidrSpan(block.network);
     if (!parent) return [];
-    const parentSize = Math.pow(2, 32 - parent.prefix);
 
     const mapRange = (
       net: string,
@@ -70,16 +70,14 @@ export function FreeSpaceBand({
       label: string,
       utilization?: number,
     ): Segment | null => {
-      const p = parseCidr(net);
+      const p = cidrSpan(net);
       if (!p) return null;
-      const size = Math.pow(2, 32 - p.prefix);
-      const start = (p.base - parent.base) / parentSize;
       return {
-        start,
-        width: size / parentSize,
+        start: bigFraction(p.base - parent.base, parent.size),
+        width: bigFraction(p.size, parent.size),
         kind,
         label,
-        size,
+        size: p.size,
         network: net,
         utilization,
       };
@@ -108,7 +106,7 @@ export function FreeSpaceBand({
       const s = mapRange(
         fr.network,
         "free",
-        `Free ${fr.network} (${fr.size.toLocaleString()} addrs)`,
+        `Free ${fr.network} (${(cidrSpan(fr.network)?.size ?? BigInt(fr.size)).toLocaleString()} addrs)`,
       );
       if (s) out.push(s);
     }
