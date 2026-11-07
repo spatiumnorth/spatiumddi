@@ -72,7 +72,7 @@ function preview(refusal: string | null): BackupManifestPreviewResponse {
   };
 }
 
-async function openAndFill(p: BackupManifestPreviewResponse) {
+async function openAndFill(p: BackupManifestPreviewResponse | unknown) {
   list.mockResolvedValue([
     {
       id: "t-1",
@@ -95,7 +95,12 @@ async function openAndFill(p: BackupManifestPreviewResponse) {
     ],
     note: null,
   });
-  previewArchiveManifest.mockResolvedValue(p);
+  if (p instanceof Error || !(p as { manifest?: unknown })?.manifest)
+    previewArchiveManifest.mockRejectedValue(p);
+  else
+    previewArchiveManifest.mockResolvedValue(
+      p as BackupManifestPreviewResponse,
+    );
   render(
     (
       <QueryClientProvider client={new QueryClient()}>
@@ -142,5 +147,17 @@ describe("Restore from archive: an archive the restore refuses (#3287)", () => {
     await openAndFill(preview(null));
     await vi.waitFor(() => expect(applyButton().disabled).toBe(false));
     expect(screen.queryByText(/This archive cannot be restored/)).toBeNull();
+  });
+});
+
+describe("Restore from archive: a failed preview (#3698)", () => {
+  it("names the API's reason and warns the restore re-reads the archive", async () => {
+    const reason = "archive 'x.zip' not found at /var/lib/none";
+    await openAndFill({ response: { data: { detail: reason } } });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(reason);
+    expect(screen.queryByText(/Full restore is unaffected/)).toBeNull();
+    expect(alert.textContent).toMatch(/reads the same archive again/);
+    await vi.waitFor(() => expect(applyButton().disabled).toBe(false));
   });
 });
