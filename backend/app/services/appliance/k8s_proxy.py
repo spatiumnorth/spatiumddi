@@ -8,12 +8,27 @@ enqueue a request here; the supervisor long-polls for it via
 ``/supervisor/k8s-proxy/reply/{request_id}``. NAT-friendly, no
 inbound firewall holes on the appliance side.
 
-In-memory only — per-appliance ``asyncio.Queue`` for inbound
-requests + per-request ``Future`` for inbound responses. Restart of
-the api container clears every queue; operators just retry. We
-considered Redis-backed durability but the use case is request/
-response pairs that complete within seconds; on-disk persistence
-buys nothing.
+Shared across api replicas (#3703): the operator's request lands on
+one api pod while the supervisor's long-poll is parked on another, so
+neither the request queue nor the reply may live in one process. Both
+ride Redis (``settings.redis_url``, the same bus as
+``app.core.agent_wake``):
+
+  * ``spatium:k8sproxy:q:{appliance_id}`` — LIST of request JSON. The
+    enqueue ``RPUSH``es (length-capped, TTL'd) and the supervisor's poll
+    ``BLPOP``s, so a request is delivered the instant it is pushed, on
+    whichever replica holds the poll.
+  * ``spatium:k8sproxy:o:{request_id}`` — the appliance the request was
+    queued for (#3618 reply-owner check), held for as long as the
+    operator is waiting. Its absence marks the request abandoned: a poll
+    skips it and a late reply is discarded.
+  * ``spatium:k8sproxy:r:{request_id}`` — LIST the reply is pushed to;
+    the waiting request ``BLPOP``s it, on whichever replica it runs.
+
+If Redis is unreachable the module degrades to the old per-process
+``asyncio.Queue`` + ``Future`` path (non-negotiable #5: degrade, never
+wedge) — correct for a single api replica, and the cluster case simply
+times out as it did before.
 
 Failure modes:
   * Operator request timeout → future cancelled, response (if it
@@ -27,6 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
+import json
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -34,6 +51,9 @@ from typing import Any
 
 import structlog
 
+from app.config import settings
+from app.core import shutdown as _shutdown
+from app.core.redis_client import make_async_redis
 from app.core.shutdown import get_or_shutdown
 
 logger = structlog.get_logger(__name__)
@@ -70,7 +90,35 @@ class K8sProxyResponse:
     body_b64: str = ""
 
 
-# Per-appliance queues. defaultdict so the first enqueue for a new
+_Q_PREFIX = "spatium:k8sproxy:q:"
+_OWNER_PREFIX = "spatium:k8sproxy:o:"
+_REPLY_PREFIX = "spatium:k8sproxy:r:"
+
+# At most this many requests wait for one appliance; the oldest are dropped
+# (their operators time out). Bounds Redis memory if a supervisor is offline.
+MAX_QUEUED_PER_APPLIANCE = 64
+# Every key expires on its own, so an abandoned entry cannot accumulate.
+_QUEUE_TTL_SECONDS = 300
+_REPLY_TTL_SECONDS = 60
+_OWNER_GRACE_SECONDS = 30
+# One Redis blocking read is at most this long, so shutdown / a local
+# fallback entry is noticed within a second.
+_SLICE_SECONDS = 1.0
+_CONNECT_TIMEOUT = 2.0
+
+
+def _client() -> Any:
+    return make_async_redis(settings.redis_url, socket_connect_timeout=_CONNECT_TIMEOUT)
+
+
+async def _close(client: Any) -> None:
+    try:
+        await client.aclose()
+    except Exception:  # noqa: BLE001 — closing a dead connection; nothing to do
+        pass
+
+
+# Per-process fallback, used only while Redis is unreachable. defaultdict so the first enqueue for a new
 # appliance auto-creates the queue without an init step.
 _request_queues: dict[uuid.UUID, asyncio.Queue[K8sProxyRequest]] = defaultdict(asyncio.Queue)
 
@@ -121,7 +169,26 @@ async def enqueue_request(
     _response_futures[request_id] = future
     _request_owner[request_id] = appliance_id
 
-    await _request_queues[appliance_id].put(request)
+    client: Any = None
+    try:
+        client = _client()
+        pipe = client.pipeline()
+        pipe.set(
+            _OWNER_PREFIX + request_id,
+            str(appliance_id),
+            ex=int(timeout) + _OWNER_GRACE_SECONDS,
+        )
+        qkey = _Q_PREFIX + str(appliance_id)
+        pipe.rpush(qkey, json.dumps(dataclasses.asdict(request)))
+        pipe.ltrim(qkey, -MAX_QUEUED_PER_APPLIANCE, -1)
+        pipe.expire(qkey, _QUEUE_TTL_SECONDS)
+        await pipe.execute()
+    except Exception as exc:  # noqa: BLE001 — degrade to the in-process queue
+        logger.warning("appliance.k8s_proxy.redis_unavailable", op="enqueue", error=str(exc))
+        if client is not None:
+            await _close(client)
+            client = None
+        await _request_queues[appliance_id].put(request)
     logger.info(
         "appliance.k8s_proxy.enqueued",
         appliance_id=str(appliance_id),
@@ -130,10 +197,10 @@ async def enqueue_request(
         path=path,
     )
     try:
-        return await asyncio.wait_for(future, timeout=timeout)
+        return await _await_reply(client, request_id, future, timeout)
     except TimeoutError:
-        # Mark the queue entry cancelled so the supervisor's next
-        # poll skips it (if it hasn't already popped it).
+        # Mark the local queue entry cancelled so a same-process poll
+        # skips it; the Redis one is skipped via its deleted owner key.
         request.cancelled = True
         logger.warning(
             "appliance.k8s_proxy.timeout",
@@ -143,50 +210,184 @@ async def enqueue_request(
         )
         raise
     finally:
-        # Always evict the future map entry — late responses go to
+        # Always evict the owner / future entries — late responses go to
         # ``deliver_response`` which logs + discards.
         _response_futures.pop(request_id, None)
         _request_owner.pop(request_id, None)
+        if client is not None:
+            try:
+                await client.delete(_OWNER_PREFIX + request_id, _REPLY_PREFIX + request_id)
+            except Exception:  # noqa: BLE001 — both keys carry a TTL
+                pass
+            await _close(client)
+
+
+async def _await_reply(
+    client: Any,
+    request_id: str,
+    future: asyncio.Future[K8sProxyResponse],
+    timeout: float,
+) -> K8sProxyResponse:
+    """Wait for the reply: the Redis reply list (any replica may have
+    received it) or the local future (the Redis-down fallback)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if future.done():
+            return future.result()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+        if client is None:
+            await asyncio.wait({future}, timeout=remaining)
+            continue
+        read = asyncio.ensure_future(
+            client.blpop(_REPLY_PREFIX + request_id, timeout=min(_SLICE_SECONDS, remaining))
+        )
+        try:
+            await asyncio.wait({read, future}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not read.done():
+                read.cancel()
+        if future.done():
+            return future.result()
+        try:
+            item = read.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — Redis died mid-wait; local future only
+            logger.warning("appliance.k8s_proxy.redis_unavailable", op="reply", error=str(exc))
+            await _close(client)
+            client = None
+            continue
+        if item is not None:
+            return K8sProxyResponse(**json.loads(item[1]))
 
 
 async def pop_request(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> K8sProxyRequest | None:
     """Long-poll for the next request bound for ``appliance_id``.
 
     Returns the dequeued request, or ``None`` if no request arrives
-    within ``timeout``. Cancelled entries (operator timed out
+    within ``timeout``. Abandoned entries (operator timed out
     upstream) are skipped — the supervisor never sees stale work.
+    Requests queued by any api replica are seen (#3703).
     """
-    queue = _request_queues[appliance_id]
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            return None
-        # #3015 — also ended by api shutdown, answering "no request" at once.
-        request, _ended = await get_or_shutdown(queue, remaining)
-        if request is None:
-            return None
-        if request.cancelled:
-            # Skip stale entries and keep waiting on the same queue.
-            logger.info(
-                "appliance.k8s_proxy.skip_cancelled",
-                appliance_id=str(appliance_id),
-                request_id=request.request_id,
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    local = _request_queues[appliance_id]
+    client: Any = None
+    try:
+        client = _client()
+    except Exception as exc:  # noqa: BLE001 — degrade to the in-process queue
+        logger.warning("appliance.k8s_proxy.redis_unavailable", op="pop", error=str(exc))
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0 or _shutdown.shutdown_requested():
+                return None
+            # The in-process queue is only fed while Redis is down.
+            while not local.empty():
+                queued = local.get_nowait()
+                if not queued.cancelled:
+                    return queued
+            if client is None:
+                # #3015 — also ended by api shutdown, answering "no request" at once.
+                queued, _ended = await get_or_shutdown(local, min(remaining, _SLICE_SECONDS))
+                if queued is not None and not queued.cancelled:
+                    return queued
+                continue
+            raw = await _blpop_or_shutdown(
+                client, _Q_PREFIX + str(appliance_id), min(remaining, _SLICE_SECONDS)
             )
-            continue
-        return request
+            if raw is _FAILED:
+                await _close(client)
+                client = None
+                continue
+            if raw is None:
+                continue
+            data = json.loads(raw)
+            try:
+                alive = await client.exists(_OWNER_PREFIX + data["request_id"])
+            except Exception:  # noqa: BLE001 — deliver rather than drop on a blip
+                alive = True
+            if not alive:
+                logger.info(
+                    "appliance.k8s_proxy.skip_cancelled",
+                    appliance_id=str(appliance_id),
+                    request_id=data["request_id"],
+                )
+                continue
+            return K8sProxyRequest(**data)
+    finally:
+        if client is not None:
+            await _close(client)
 
 
-def deliver_response(response: K8sProxyResponse, *, appliance_id: uuid.UUID) -> bool:
-    """Hand a supervisor-returned response to the awaiting future.
+_FAILED: Any = object()
 
-    Returns True on successful match, False when the future has
-    already been GC'd (operator timed out, future evicted from the
-    map) or when ``appliance_id`` — the appliance whose cert posted
-    the reply — is not the one the request was queued for. The
-    supervisor's POST returns 200 either way — late delivery isn't a
-    supervisor-side error.
+
+async def _blpop_or_shutdown(client: Any, key: str, timeout: float) -> Any:
+    """One ``BLPOP`` slice raced against api shutdown (#3015). Returns the
+    popped value, ``None`` on timeout / shutdown, ``_FAILED`` on a Redis
+    error."""
+    read = asyncio.ensure_future(client.blpop(key, timeout=timeout))
+    stop = _shutdown.shutdown_future()
+    try:
+        await asyncio.wait({read, stop}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        _shutdown.discard(stop)
+        if not read.done():
+            read.cancel()
+    try:
+        item = read.result()
+    except asyncio.CancelledError:
+        return None
+    except Exception as exc:  # noqa: BLE001 — caller degrades to the local queue
+        logger.warning("appliance.k8s_proxy.redis_unavailable", op="pop", error=str(exc))
+        return _FAILED
+    return None if item is None else item[1]
+
+
+async def deliver_response(response: K8sProxyResponse, *, appliance_id: uuid.UUID) -> bool:
+    """Hand a supervisor-returned response to the awaiting request, which
+    may be waiting on a different api replica (#3703).
+
+    Returns True on successful match, False when nobody is waiting any
+    more (operator timed out) or when ``appliance_id`` — the appliance
+    whose cert posted the reply — is not the one the request was queued
+    for. The supervisor's POST returns 200 either way — late delivery
+    isn't a supervisor-side error.
     """
+    client: Any = None
+    try:
+        client = _client()
+        owner = await client.get(_OWNER_PREFIX + response.request_id)
+        if owner is not None:
+            owner_s = owner.decode() if isinstance(owner, bytes) else str(owner)
+            if owner_s != str(appliance_id):
+                logger.warning(
+                    "appliance.k8s_proxy.reply_wrong_appliance",
+                    request_id=response.request_id,
+                    appliance_id=str(appliance_id),
+                )
+                return False
+            rkey = _REPLY_PREFIX + response.request_id
+            pipe = client.pipeline()
+            pipe.rpush(rkey, json.dumps(dataclasses.asdict(response)))
+            pipe.expire(rkey, _REPLY_TTL_SECONDS)
+            await pipe.execute()
+            return True
+        # No owner key: nobody waits via Redis. A same-process waiter that
+        # enqueued while Redis was down is handled below.
+    except Exception as exc:  # noqa: BLE001 — degrade to the in-process path
+        logger.warning("appliance.k8s_proxy.redis_unavailable", op="reply", error=str(exc))
+    finally:
+        if client is not None:
+            await _close(client)
+    return _deliver_local(response, appliance_id)
+
+
+def _deliver_local(response: K8sProxyResponse, appliance_id: uuid.UUID) -> bool:
     owner = _request_owner.get(response.request_id)
     if owner is not None and owner != appliance_id:
         logger.warning(
@@ -208,8 +409,8 @@ def deliver_response(response: K8sProxyResponse, *, appliance_id: uuid.UUID) -> 
 
 
 def queue_depth(appliance_id: uuid.UUID) -> int:
-    """Operator-facing diagnostic: how many requests are queued for
-    this appliance? Surfaced on heartbeat for monitoring."""
+    """How many requests wait in THIS process's fallback queue (only
+    non-zero while Redis is down; the shared queue lives in Redis)."""
     queue = _request_queues.get(appliance_id)
     if queue is None:
         return 0
