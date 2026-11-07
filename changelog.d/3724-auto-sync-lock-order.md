@@ -1,3 +1,3 @@
 ### Fixed
 
-- The IPAM to DNS auto-sync no longer deadlocks with a permanent DNS zone delete: each subnet's DDNS re-apply and drift sync now lock their address rows (ascending id) and zones before writing, and commit per subnet, so a zone delete is no longer answered with a 500 (#3724).
+- The IPAM to DNS auto-sync and the Sync DNS commit (subnet, block and space) no longer deadlock with a permanent DNS zone delete: they now lock the address rows they will write (ascending id) before any zone. The auto-sync also commits each subnet on its own, so a subnet that fails is rolled back alone instead of failing the whole run (#3724).

@@ -412,10 +412,12 @@ async def lock_zones_for_addresses(
     retracting: Iterable[Any] = (),
     zone_id: Any = None,
     ddns: bool = False,
+    extra_zone_ids: Iterable[Any] = (),
 ) -> None:
     """Lock, in one id-ordered pass, every zone the DNS syncs of a unit of
-    work may write: a publish of each ``(subnet, ip_row)`` in ``publishing``
-    and a retraction of each row in ``retracting``.
+    work may write: a publish of each ``(subnet, ip_row)`` in ``publishing``,
+    a retraction of each row in ``retracting``, and ``extra_zone_ids`` (the
+    zones of records the work deletes outright, #3724).
 
     For a transaction that syncs several addresses (a lease batch, the
     sweep): each sync locks its own zones in order, but one address's zones
@@ -425,9 +427,10 @@ async def lock_zones_for_addresses(
     publish writes into instead of the subnet's own (#428)."""
     pub = [(subnet, ip) for subnet, ip in publishing if ip is not None]
     rows = [ip for ip in retracting if ip is not None] + [ip for _subnet, ip in pub]
-    if not rows:
+    zones = {z for z in extra_zone_ids if z is not None}
+    if not rows and not zones:
         return
-    zones = await _published_zone_ids(db, [ip.id for ip in rows])
+    zones |= await _published_zone_ids(db, [ip.id for ip in rows])
     subnet_cache: dict[Any, set[Any] | None] = {}
     for subnet, ip in pub:
         zones |= await _publish_zone_ids(db, ip, subnet, zone_id, subnet_cache, ddns)
