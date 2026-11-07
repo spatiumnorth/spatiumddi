@@ -198,25 +198,33 @@ function ConfirmRestoreModal({
           ?
         </p>
         {error && (
-          <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
+          <p
+            role="alert"
+            className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300"
+          >
             {error}
           </p>
         )}
-        {(leftBehind || parentLeft.length > 0) && (
-          <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
-            {/* No row count: one held-back entry stands for all of a
+        {/* A status region is announced most reliably when its container is
+            already on the page before its text changes, so the container is
+            always rendered and only the box inside it comes and goes. */}
+        <div role="status" className="empty:hidden">
+          {(leftBehind || parentLeft.length > 0) && (
+            <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
+              {/* No row count: one held-back entry stands for all of a
                 subnet's records ("2 IPAM records of …"), so counting entries
                 would understate what stayed behind (#3188). */}
-            <p className="font-medium">
-              Restored, but these were left in the Trash:
-            </p>
-            <ul className="mt-1 list-disc pl-4">
-              {[...parentLeft, ...(leftBehind ?? [])].map((l, i) => (
-                <li key={`${i}-${l}`}>{l}</li>
-              ))}
-            </ul>
-          </div>
-        )}
+              <p className="font-medium">
+                Restored, but these were left in the Trash:
+              </p>
+              <ul className="mt-1 list-disc pl-4">
+                {[...parentLeft, ...(leftBehind ?? [])].map((l, i) => (
+                  <li key={`${i}-${l}`}>{l}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -323,7 +331,10 @@ function ConfirmPermanentDeleteModal({
           {purgeScope(entry)} It cannot be restored.
         </p>
         {error && (
-          <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
+          <p
+            role="alert"
+            className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300"
+          >
             {error}
           </p>
         )}

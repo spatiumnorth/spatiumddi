@@ -21,10 +21,11 @@ import type { TrashEntry } from "@/lib/api";
 
 const list = vi.fn();
 const restore = vi.fn();
+const permanentDelete = vi.fn();
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
-  return { ...actual, trashApi: { list, restore, permanentDelete: vi.fn() } };
+  return { ...actual, trashApi: { list, restore, permanentDelete } };
 });
 
 const { TrashPage } = await import("./TrashPage");
@@ -623,5 +624,60 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
   it("adds no count for a row deleted alone", async () => {
     const t = await openDelete("dns_zone", 1);
     expect(t).not.toMatch(/other row/);
+  });
+});
+
+describe("the dialogs announce what happened (#3525)", () => {
+  function renderPage() {
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("announces a refused restore as an alert", async () => {
+    await clash(true);
+    expect(screen.getByRole("alert").textContent).toMatch(/Cannot restore/);
+  });
+
+  it("has the status region on the page before rows are left behind, then fills it", async () => {
+    list.mockResolvedValue({ items: [entry(2)], total: 1 });
+    restore.mockResolvedValue({
+      batch_id: "b-1",
+      restored: 1,
+      skipped: [
+        { type: "dns_record", id: "r-2", display: "cn.", reason: "clash" },
+      ],
+      held_back: [],
+    });
+    renderPage();
+    fireEvent.click(await screen.findByText("Restore"));
+    const region = screen.getByRole("status");
+    expect(region.textContent).toBe("");
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await screen.findByText(/left in the Trash/);
+    expect(screen.getByRole("status")).toBe(region);
+    expect(region.textContent).toMatch(/left in the Trash/);
+  });
+
+  it("announces a refused permanent delete as an alert", async () => {
+    list.mockResolvedValue({ items: [entry(1)], total: 1 });
+    permanentDelete.mockRejectedValue({
+      response: { status: 409, data: { detail: "Still referenced" } },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByText("Delete"));
+    const buttons = await screen.findAllByRole("button", {
+      name: "Delete permanently",
+    });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByRole("alert").textContent).toMatch(/Still referenced/);
   });
 });
