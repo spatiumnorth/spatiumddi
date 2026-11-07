@@ -36,6 +36,7 @@ import { QrCode } from "@/components/QrCode";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -822,6 +823,20 @@ export function ApiTokensPage() {
       apiTokensApi.update(t.id, { is_active: false }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
+  const [confirmRevokeAll, setConfirmRevokeAll] = useState(false);
+  // #1359 — own tokens only (the route takes no user id).
+  const revokeAllMut = useMutation({
+    mutationFn: () => apiTokensApi.revokeAll(),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      qc.invalidateQueries({ queryKey: ["users"] });
+      setConfirmRevokeAll(false);
+    },
+  });
+  const closeRevokeAll = () => {
+    setConfirmRevokeAll(false);
+    revokeAllMut.reset();
+  };
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiTokensApi.delete(id),
     onSuccess: () => {
@@ -841,6 +856,12 @@ export function ApiTokensPage() {
               token inherits its owner's permissions.
             </p>
           </div>
+          <button
+            onClick={() => setConfirmRevokeAll(true)}
+            className="shrink-0 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Revoke all my tokens
+          </button>
           <button
             onClick={() => setShowCreate(true)}
             className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
@@ -1015,6 +1036,29 @@ export function ApiTokensPage() {
             onClose={() => setReenable(null)}
           />
         )}
+        <ConfirmModal
+          open={confirmRevokeAll}
+          title="Revoke all my API tokens"
+          message={
+            <>
+              Revoke every API token you own? Automation using them stops
+              working; you can mint new ones.
+              {revokeAllMut.isError && (
+                <span className="mt-2 block text-destructive">
+                  {formatDialogError(
+                    revokeAllMut.error,
+                    "Failed to revoke API tokens",
+                  )}
+                </span>
+              )}
+            </>
+          }
+          confirmLabel="Revoke all"
+          tone="destructive"
+          loading={revokeAllMut.isPending}
+          onConfirm={() => revokeAllMut.mutate()}
+          onClose={closeRevokeAll}
+        />
         {confirmDelete && (
           <Modal
             title="Delete API Token"

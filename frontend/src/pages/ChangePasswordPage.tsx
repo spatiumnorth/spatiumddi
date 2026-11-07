@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
-import { authApi } from "@/lib/api";
+import { apiTokensApi, authApi, formatApiError } from "@/lib/api";
 import { setMustChangePassword } from "@/lib/authToken";
 import { evaluatePolicy, parsePasswordError } from "@/lib/password-policy";
 import { cn } from "@/lib/utils";
@@ -22,6 +22,12 @@ export function ChangePasswordPage() {
   const [error, setError] = useState("");
   const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+  // #1359 — a password change does not revoke API tokens unless asked.
+  const [revokeTokens, setRevokeTokens] = useState(false);
+  // Set after a successful change that left live API tokens: the page then
+  // says so instead of navigating away.
+  const [tokensLeft, setTokensLeft] = useState<number | null>(null);
+  const [revokeError, setRevokeError] = useState("");
 
   const { data: policy } = useQuery({
     queryKey: ["password-policy"],
@@ -64,8 +70,16 @@ export function ChangePasswordPage() {
 
     setLoading(true);
     try {
-      await authApi.changePassword(currentPassword, newPassword);
+      const outcome = await authApi.changePassword(
+        currentPassword,
+        newPassword,
+        revokeTokens,
+      );
       setMustChangePassword(false);
+      if (outcome && outcome.api_token_count > 0) {
+        setTokensLeft(outcome.api_token_count);
+        return;
+      }
       navigate("/dashboard");
     } catch (err) {
       // Three shapes reach here: the policy / history 400's
@@ -86,6 +100,51 @@ export function ChangePasswordPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function revokeLeft() {
+    setRevokeError("");
+    try {
+      await apiTokensApi.revokeAll();
+      navigate("/dashboard");
+    } catch (err) {
+      setRevokeError(formatApiError(err, "Failed to revoke API tokens"));
+    }
+  }
+
+  if (tokensLeft !== null) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        <div className="w-full max-w-sm space-y-4 rounded-lg border bg-card p-8 shadow-sm">
+          <h1 className="text-2xl font-bold tracking-tight">
+            Password changed
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Your other sessions were signed out. {tokensLeft} API token
+            {tokensLeft === 1 ? " is" : "s are"} still active: a password change
+            does not revoke them. If you changed your password because of a
+            compromise, revoke them too.
+          </p>
+          {revokeError && (
+            <p className="text-sm text-destructive">{revokeError}</p>
+          )}
+          <button
+            type="button"
+            onClick={revokeLeft}
+            className="w-full rounded-md border px-4 py-2 text-sm hover:bg-muted"
+          >
+            Revoke all my API tokens
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate("/dashboard")}
+            className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+          >
+            Continue
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -141,6 +200,21 @@ export function ChangePasswordPage() {
               <p className="text-sm text-destructive">Passwords do not match</p>
             )}
           </div>
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={revokeTokens}
+              onChange={(e) => setRevokeTokens(e.target.checked)}
+            />
+            <span>
+              Also revoke all my API tokens
+              <span className="block text-xs text-muted-foreground">
+                A password change signs out your other sessions but leaves API
+                tokens working.
+              </span>
+            </span>
+          </label>
           {error && <p className="text-sm text-destructive">{error}</p>}
           {policyErrors.length > 0 && (
             <ul className="list-disc space-y-1 pl-5 text-sm text-destructive">

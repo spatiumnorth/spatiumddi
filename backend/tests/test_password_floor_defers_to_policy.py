@@ -135,7 +135,7 @@ async def test_a_relaxed_policy_is_honoured_below_eight(
         json={"current_password": "OldPass123!", "new_password": "abcdef"},
         headers=_bearer(user),
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
 
 
 async def test_a_wrong_current_password_still_wins(

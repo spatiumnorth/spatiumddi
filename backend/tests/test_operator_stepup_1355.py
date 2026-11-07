@@ -185,13 +185,13 @@ async def test_resetting_a_superadmins_password_needs_the_step_up(
     r = await client.post(
         url, headers=headers, json={"new_password": _NEW_PW, "stepup_password": _PW}
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
 
     plain = await _user(db_session, superadmin=False)
     r = await client.post(
         f"/api/v1/users/{plain.id}/reset-password", headers=headers, json={"new_password": _NEW_PW}
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
 
 
 # ── API tokens ──────────────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ async def test_resetting_your_own_password_needs_the_step_up(
     r = await client.post(
         url, headers=headers, json={"new_password": _NEW_PW, "stepup_password": _PW}
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
 
 
 @pytest.mark.asyncio
