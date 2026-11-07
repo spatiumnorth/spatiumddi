@@ -16,11 +16,14 @@
 #     fixes still land via Dependabot *security* updates, which fire regardless
 #     of these ``ignore`` rules; base-image CVEs are also caught by the weekly
 #     Trivy scan (trivy-scheduled.yml).
-#   * ``pip`` is SECURITY-ONLY. The Python manifests use unpinned ``>=`` ranges
-#     with no lock file, so a routine version PR only raises a floor pip already
-#     satisfies (it installs the latest anyway) — pure noise. Ignoring every
-#     ``pip`` version-update leaves only security updates, the sole thing worth
-#     a PR here.
+#   * ``pip`` for the AGENTS is SECURITY-ONLY. Their manifests use unpinned ``>=``
+#     ranges with no lock file, so a routine version PR only raises a floor pip
+#     already satisfies (it installs the latest anyway) — pure noise. Ignoring
+#     every version-update leaves only security updates. The BACKEND is the
+#     opposite since #3693: ``backend/requirements.txt`` pins the whole api
+#     image set (a rebuild of one commit used to resolve different packages),
+#     so a bump of that file IS the change that reaches production — minor and
+#     patch PRs are grouped weekly, majors stay deferred.
 #   * The backend Docker base is pinned to Python 3.12 (mypy target-version
 #     py312 / setup-python 3.12) — no 3.13/3.14 until a deliberate move.
 # Net effect: at most a couple of grouped minor/patch PRs a week (docker, npm,
@@ -112,10 +115,31 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  # Python — control plane (backend) plus the three standalone agents.
+  # Python — control plane (backend). ``backend/requirements.txt`` is the pinned
+  # set the image and CI install through (#3693), so version updates are LIVE
+  # here: Dependabot bumps the pins, one grouped PR a week, and CI runs the whole
+  # suite against the bumped set before it can ship. Majors are deferred like
+  # every other ecosystem (redis 6 -> 7+ is one: it cost ~25 % of /health/ready
+  # throughput, see the header of requirements.txt).
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      backend-python:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # Python — the three standalone agents (no lock file yet; see #3693 follow-up).
   - package-ecosystem: "pip"
     directories:
-      - "/backend"
       - "/agent/dhcp"
       - "/agent/dns"
       - "/agent/supervisor"
