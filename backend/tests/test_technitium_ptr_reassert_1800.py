@@ -393,7 +393,9 @@ async def test_a_subnet_purge_retracts_the_ptr_without_a_reassert(db_session):
 # ── A retried A delete lands after the re-assert (validation) ───────────
 
 
-async def _retry_a_delete_after_the_ptr_create(db: AsyncSession, server: DNSServer) -> DNSRecordOp:
+async def _retry_a_delete_after_the_ptr_create(
+    db: AsyncSession, server: DNSServer, *, reassert: bool = True
+) -> DNSRecordOp:
     """First page: the A delete fails, the PTR create applies. Second page: the
     A delete's retry applies — after the create, so Technitium took the PTR."""
     page, _ = await page_pending_ops(db, server)
@@ -417,11 +419,14 @@ async def _retry_a_delete_after_the_ptr_create(db: AsyncSession, server: DNSServ
     await db.flush()
     page, _ = await page_pending_ops(db, server)
     assert [p["op_id"] for p in page] == [str(a_op.id)]
-    await record_ops.apply_acks(
+    retried = await record_ops.apply_acks(
         db,
         server.id,
         [{"op_id": page[0]["op_id"], "result": "ok", "dispatch": page[0]["dispatch"]}],
     )
+    # The re-assert runs after the ack's commit (#3688), as the agent routes do.
+    if reassert:
+        await record_ops.reassert_after_retried_deletes(db, server.id, retried)
     return a_op
 
 
