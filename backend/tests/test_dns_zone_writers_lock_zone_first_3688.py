@@ -455,3 +455,30 @@ async def test_a_delegation_whose_records_are_deleted_right_after_commit_answers
     assert resp.status_code == 201, _said(resp)
     assert armed["on"] is False, "the commit hook never fired"
     assert any(r["record_type"] == "NS" and r["name"] == "sub" for r in resp.json()), resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_zone_edit_whose_zone_is_deleted_right_after_commit_answers_200(
+    concurrent_client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zone delete queued behind the edit's zone lock runs the moment the
+    edit commits. The route must answer from the edit's own transaction, not
+    re-read a zone row that is gone by then."""
+    z = await _seed(db_session)
+    real_commit = AsyncSession.commit
+    armed = {"on": True}
+
+    async def commit_then_delete(self: AsyncSession) -> None:
+        await real_commit(self)
+        if not armed["on"]:
+            return
+        armed["on"] = False
+        async with _TestSessionLocal() as other:
+            await other.execute(sa_delete(DNSZone).where(DNSZone.id == z.zone_id))
+            await real_commit(other)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_delete)
+    resp = await concurrent_client.put(z.url, headers=z.headers, json={"ttl": 600})
+    assert resp.status_code == 200, _said(resp)
+    assert armed["on"] is False, "the commit hook never fired"
+    assert resp.json()["id"] == str(z.zone_id) and resp.json()["ttl"] == 600, resp.text
