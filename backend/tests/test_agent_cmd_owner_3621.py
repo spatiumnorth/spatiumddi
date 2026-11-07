@@ -104,7 +104,7 @@ async def test_owner_records_are_evicted_on_delivery_and_on_timeout(
     queued = await agent_cmd.pop_command(target, timeout=2.0, channel=channel)
     assert queued is not None
     assert dispatch.owners == {queued.request_id: target}
-    assert agent_cmd.deliver_result(
+    assert await agent_cmd.deliver_result(
         agent_cmd.NetToolResult(request_id=queued.request_id, result={}),
         appliance_id=target,
         channel=channel,
