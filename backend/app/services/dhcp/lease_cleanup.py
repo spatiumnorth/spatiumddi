@@ -516,8 +516,13 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
     Returns the number of mirror rows freed. Does not commit; recounts the
     touched subnets and their blocks in the same transaction (#3345).
     """
+    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
-    from app.services.lock_order import lock_zones_for_addresses  # noqa: PLC0415
+    from app.services.lock_order import (  # noqa: PLC0415
+        address_ids_of_records,
+        lock_addresses_before,
+        lock_zones_for_addresses,
+    )
 
     cutoff = datetime.now(UTC) - ORPHAN_MIRROR_GRACE
     conds = [getattr(IPAddress, c).is_(None) for c in _INTEGRATION_OWNER_COLUMNS]
@@ -541,7 +546,34 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
     )
     # #3687: every zone the batch's records sit in, trashed ones too, before
     # the first purge; the per-row revoke below then locks nothing new.
-    await lock_zones_for_addresses(db, retracting=rows)
+    # #3690: after the address rows the sweep writes (the mirrors, and any
+    # row linked to a record it deletes), ascending id, as a permanent zone
+    # delete takes them (#3691); holding a zone and then writing one of them
+    # deadlocks with it.
+    row_ids = sorted(row.id for row in rows)
+
+    async def _written() -> set[Any]:
+        record_ids = (
+            (
+                await db.execute(
+                    select(DNSRecord.id)
+                    .where(
+                        DNSRecord.ip_address_id.in_(row_ids),
+                        DNSRecord.auto_generated.is_(True),
+                    )
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return set(row_ids) | await address_ids_of_records(db, record_ids)
+
+    async def _zones() -> None:
+        await lock_zones_for_addresses(db, retracting=rows)
+
+    if rows:
+        await lock_addresses_before(db, _written, _zones)
     await purge_trashed_address_records(db, [row.id for row in rows])  # #3186
     for row in rows:
         if row.subnet is not None:
