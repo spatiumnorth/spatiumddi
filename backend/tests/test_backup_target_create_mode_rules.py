@@ -92,3 +92,30 @@ async def test_stored_row_with_both_modes_stays_editable(
     assert r.status_code == 200, r.text
     assert r.json()["config"]["account_key"] == REDACTED_SENTINEL
     assert r.json()["config"]["connection_string"] == REDACTED_SENTINEL
+
+
+@pytest.mark.asyncio
+async def test_add_https_put_bearer_keeps_credential(client: AsyncClient, db_session: AsyncSession):
+    headers = await _headers(db_session)
+    cfg = {"url": "https://example.com/up", "auth": "bearer", "credential": "tok"}
+    r = await client.post(_URL, json={**_BASE, "kind": "https_put", "config": cfg}, headers=headers)
+    assert r.status_code == 201, r.text
+    assert r.json()["config"]["credential"] == REDACTED_SENTINEL
+
+
+@pytest.mark.asyncio
+async def test_add_none_then_edit_to_bearer_has_no_inherited_token(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """The issue's step 4: a token typed under auth none must not become the
+    bearer token on a later move to bearer with the credential left blank."""
+    headers = await _headers(db_session)
+    cfg = {"url": "https://example.com/up", "auth": "none", "credential": "tok"}
+    r = await client.post(_URL, json={**_BASE, "kind": "https_put", "config": cfg}, headers=headers)
+    assert r.status_code == 201, r.text
+    r = await client.patch(
+        f"{_URL}/{r.json()['id']}",
+        json={"config": {"url": "https://example.com/up", "auth": "bearer", "credential": ""}},
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text
