@@ -659,6 +659,13 @@ describe("the dialogs announce what happened (#3525)", () => {
     fireEvent.click(await screen.findByText("Restore"));
     const region = screen.getByRole("status");
     expect(region.textContent).toBe("");
+    // Not hidden while empty: a display:none region is outside the
+    // accessibility tree, so showing it with its text is a new region that
+    // screen readers do not announce. jsdom loads no Tailwind, so this reads
+    // the class and attribute that would hide it.
+    expect(region.className).not.toMatch(/(^|[\s:])hidden\b/);
+    expect(region.hasAttribute("hidden")).toBe(false);
+    expect(region.getAttribute("aria-hidden")).toBeNull();
     const buttons = await screen.findAllByRole("button", { name: "Restore" });
     fireEvent.click(buttons[buttons.length - 1]);
     await screen.findByText(/left in the Trash/);

@@ -184,6 +184,7 @@ function ConfirmRestoreModal({
     onError: showError,
   });
   const pending = mut.isPending || parentMut.isPending;
+  const hasLeft = leftBehind !== null || parentLeft.length > 0;
 
   return (
     <Modal title="Restore from trash?" onClose={onClose}>
@@ -207,9 +208,13 @@ function ConfirmRestoreModal({
         )}
         {/* A status region is announced most reliably when its container is
             already on the page before its text changes, so the container is
-            always rendered and only the box inside it comes and goes. */}
-        <div role="status" className="empty:hidden">
-          {(leftBehind || parentLeft.length > 0) && (
+            always rendered and only the box inside it comes and goes. It is
+            never hidden while empty (display:none takes it out of the
+            accessibility tree, and showing it with its text is then a new
+            region, which screen readers do not announce): an empty one only
+            gives up the space-y gap above it. */}
+        <div role="status" style={hasLeft ? undefined : { marginTop: 0 }}>
+          {hasLeft && (
             <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
               {/* No row count: one held-back entry stands for all of a
                 subnet's records ("2 IPAM records of …"), so counting entries
