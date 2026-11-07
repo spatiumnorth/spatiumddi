@@ -7027,9 +7027,14 @@ async def update_zone(
         )
     )
     collect_wake(dns_group_channel(group_id))
-    await db.commit()
+    # #3688: answer from the transaction's own state. A zone delete queued
+    # behind the zone-row lock runs the moment we commit, so a refresh or
+    # read AFTER the commit finds the row gone and 500s a committed edit.
+    await db.flush()
     await db.refresh(zone)
-    return await _zone_out(db, zone)
+    out = await _zone_out(db, zone)
+    await db.commit()
+    return out
 
 
 # ── Dynamic-update (RFC 2136) ACLs (issue #641) ─────────────────────────────
@@ -8354,7 +8359,8 @@ async def move_zone_commit(
         )
     )
     await db.commit()
-    await db.refresh(zone)
+    # No refresh after the commit (#3688): a delete queued behind the zone
+    # lock runs right after it, and the response is built from the plan.
     resp = ZoneMoveCommitResponse.from_plan(plan)
     resp.target_tsig_key_generated = plan.target_tsig_key_generated
     return resp
@@ -8795,9 +8801,13 @@ async def apply_delegation(
             result="success",
         )
     )
-    await db.commit()
+    # #3688: load server-generated columns BEFORE the commit. A delete of the
+    # parent zone queued behind the zone-row lock runs the instant we commit,
+    # so a refresh after it finds the records gone and 500s a committed
+    # delegation. ``expire_on_commit=False`` keeps the loaded values.
     for record in created:
         await db.refresh(record)
+    await db.commit()
     return created
 
 

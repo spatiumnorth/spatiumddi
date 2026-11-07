@@ -421,3 +421,37 @@ async def test_an_ack_bumps_no_reverse_zone_until_its_transaction_is_committed(
     ).all()
     assert pending == [], "the ack re-asserted the PTR inside its own transaction"
     assert a_op.state == "applied"
+
+
+# --- a committed delegation answers from what it wrote ----------------------
+
+
+@pytest.mark.asyncio
+async def test_a_delegation_whose_records_are_deleted_right_after_commit_answers_201(
+    concurrent_client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent zone delete queued behind the delegation's zone lock runs the
+    moment it commits and removes the records it just wrote. The route must
+    answer its 201 from what it wrote, not refresh them after the commit."""
+    parent, child = await _parent_and_child(db_session)
+    real_commit = AsyncSession.commit
+    armed = {"on": True}
+
+    async def commit_then_delete(self: AsyncSession) -> None:
+        await real_commit(self)
+        if not armed["on"]:
+            return
+        armed["on"] = False
+        async with _TestSessionLocal() as other:
+            await other.execute(
+                sa_delete(DNSRecord).where(
+                    DNSRecord.zone_id == parent.zone_id, DNSRecord.name == "sub"
+                )
+            )
+            await real_commit(other)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_delete)
+    resp = await concurrent_client.post(f"{child.url}/delegate-from-parent", headers=child.headers)
+    assert resp.status_code == 201, _said(resp)
+    assert armed["on"] is False, "the commit hook never fired"
+    assert any(r["record_type"] == "NS" and r["name"] == "sub" for r in resp.json()), resp.text
