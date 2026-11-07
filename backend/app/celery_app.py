@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 from celery import Celery, Task
+from celery.backends.redis import RedisBackend
 from celery.exceptions import Reject
 from celery.schedules import crontab, schedule
 from celery.signals import (
@@ -127,7 +128,41 @@ class SpatiumTask(Task):
             raise
 
 
-celery_app = Celery(
+def _skip_result_subscribe(producer: Any, task_id: str) -> None:
+    """Stand-in for ``RedisBackend.on_task_call`` (#3704): subscribe nothing."""
+
+
+class SpatiumCelery(Celery):
+    """The app, with the Redis result backend's send-time SUBSCRIBE turned off
+    (#3704).
+
+    On every send, ``RedisBackend.on_task_call`` SUBSCRIBEs the task's result
+    channel on a pub/sub connection, so a later ``result.get()`` can be woken
+    by a publish; and every ``AsyncResult``'s ``__del__`` UNSUBSCRIBEs it
+    again. Only a caller blocked in ``.get()`` ever reads that connection, and
+    no process here calls ``.get()``: beat only enqueues, and the api reads a
+    task's state with a plain GET (``AsyncResult.state``). So the replies were
+    never read, and redis-py keeps every channel in ``PubSub.channels`` and
+    ``pending_unsubscribe_channels`` until they are: about 250 bytes per send,
+    for the life of the process. Beat sends ~96k tasks a day, which is how it
+    grew ~40 MiB/day into its 256Mi limit; the api leaked the same way at its
+    own dispatch rate. Workers were never affected (``task_join_will_block``
+    already skips the subscribe inside a worker).
+
+    Results are still stored by the worker and read the same way. A ``.get()``
+    still works: it subscribes on demand (``add_pending_result``) and checks
+    the stored meta first, so a result published before it subscribed is not
+    missed. Only the Redis backend (and its Sentinel subclass) is changed; other
+    backends (``rpc://`` needs its send-time hook) keep theirs."""
+
+    def _get_backend(self) -> Any:
+        backend = super()._get_backend()
+        if isinstance(backend, RedisBackend):
+            backend.on_task_call = _skip_result_subscribe
+        return backend
+
+
+celery_app = SpatiumCelery(
     "spatiumddi",
     task_cls=SpatiumTask,
     broker=settings.celery_broker_url,
