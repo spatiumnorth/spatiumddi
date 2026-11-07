@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from typing import Any
 
 from sqlalchemy import ColumnElement, and_, exists, false, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.dhcp import DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
+from app.services.ipam.address_create_rules import reclaim_available_row
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -205,16 +208,28 @@ async def find_untouched_gateway_row(db: AsyncSession, subnet: Subnet) -> IPAddr
 
 async def gateway_target_problem(db: AsyncSession, subnet: Subnet, gateway: str) -> str | None:
     """Why the gateway cannot move onto ``gateway``, an address other than the
-    stored one, or None. The address is free, or holds a ``reserved`` row (an
+    stored one, or None. The address is free: it has no row, or holds an
+    ``available`` row (a free slot Next available offers, #2980, which the
+    gateway takes over as Bulk allocate does, #3319), or a ``reserved`` row (an
     infrastructure reservation such as the router's own, kept as it is). Any
-    other row is a host, a DHCP lease, a discovered or orphaned address: the
-    gateway would point at it, and when the row went the address would be
-    offered as free. Resize refuses the same (#2413)."""
+    other row is a host, a DHCP lease, a discovered or orphaned address, or an
+    ``available`` row still linked to a DHCP reservation: the gateway would
+    point at it, and when the row went the address would be offered as free.
+    Edit Subnet, Resize's gateway move, the import and the mirror sync share
+    this rule (#2413, #3709)."""
     row = await db.scalar(
         select(IPAddress).where(IPAddress.subnet_id == subnet.id, IPAddress.address == gateway)
     )
     if row is None or row.status == GATEWAY_STATUS:
         return None
+    if row.status == "available" and row.static_assignment_id is None:
+        linked = await db.scalar(
+            select(func.count())
+            .select_from(DHCPStaticAssignment)
+            .where(DHCPStaticAssignment.ip_address_id == row.id)
+        )
+        if not linked:
+            return None
     holder = f'"{row.hostname}" ({row.status})' if row.hostname else f"a {row.status} row"
     return (
         f"Gateway {gateway} is already held by {holder} in subnet {subnet.network}: "
@@ -228,16 +243,27 @@ async def add_gateway_row(
     gateway: str,
     *,
     created_by_user_id: uuid.UUID | None,
+    user: Any = None,
 ) -> IPAddress | None:
     """Add the reserved gateway row at ``gateway`` (as ``create_placeholder_rows``
-    does) unless a row already holds it, and flush. Returns the new row, or None
-    when the address was already held (``gateway_target_problem`` let it through
-    as a reservation of the operator's)."""
+    does) unless a row already holds it, and flush. An ``available`` row there
+    is a free slot and is taken over (``reclaim_available_row``, audited under
+    ``user``) and made the gateway row. Returns the new or taken-over row, or
+    None when the address was already held (``gateway_target_problem`` let it
+    through as a reservation of the operator's)."""
     held = await db.scalar(
         select(IPAddress.id).where(IPAddress.subnet_id == subnet.id, IPAddress.address == gateway)
     )
     if held is not None:
-        return None
+        row = await reclaim_available_row(db, subnet, gateway, user)
+        if row is None:
+            return None
+        row.status = GATEWAY_STATUS
+        row.description = GATEWAY_DESCRIPTION
+        row.hostname = GATEWAY_HOSTNAME
+        row.created_by_user_id = created_by_user_id
+        await db.flush()
+        return row
     row = IPAddress(
         subnet_id=subnet.id,
         address=gateway,
