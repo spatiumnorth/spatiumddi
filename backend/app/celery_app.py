@@ -7,6 +7,8 @@ from typing import Any
 
 import structlog
 from celery import Celery, Task
+from celery.backends.base import DisabledBackend
+from celery.beat import PersistentScheduler
 from celery.exceptions import Reject
 from celery.schedules import crontab, schedule
 from celery.signals import (
@@ -127,6 +129,26 @@ class SpatiumTask(Task):
             raise
 
 
+class NoResultBackendScheduler(PersistentScheduler):
+    """Beat's scheduler, with the result backend switched off (#3704).
+
+    Beat only enqueues; it never reads a result. But every send hands back an
+    ``AsyncResult`` whose ``__del__`` calls ``backend.remove_pending_result``,
+    and on the Redis backend that ``UNSUBSCRIBE``s the task's result channel
+    on a pub/sub connection nothing in beat ever reads. redis-py records each
+    one in ``pending_unsubscribe_channels`` until the server's reply is read,
+    so the set (and the unread replies) grew by one entry per scheduled send,
+    for the life of the process: ~40 MiB/day, until the 256Mi limit OOM-killed
+    beat. Swapping in ``DisabledBackend`` AFTER the schedule is set up (its
+    ``supports_autoexpire`` is False, which would add a
+    ``celery.backend_cleanup`` entry) leaves nothing to subscribe or cancel.
+    Workers keep their own backend, so results are still stored as before."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.app._backend = DisabledBackend(app=self.app)
+
+
 celery_app = Celery(
     "spatiumddi",
     task_cls=SpatiumTask,
@@ -215,6 +237,7 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     broker_pool_limit=BROKER_POOL_LIMIT,
+    beat_scheduler="app.celery_app:NoResultBackendScheduler",
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},
