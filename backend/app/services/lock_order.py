@@ -343,7 +343,6 @@ async def lock_zones_for_lease_mirrors(db: AsyncSession, lease_ids: Iterable[Any
     await lock_zone_rows(db, zones)
 
 
-
 async def zone_ids_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> set[Any]:
     """The zones a write over ``subnet_ids`` may touch: the zones holding a
     record of any of their addresses (the lease mirrors' DDNS, the subnet's own
