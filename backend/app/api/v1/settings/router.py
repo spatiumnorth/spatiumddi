@@ -949,6 +949,9 @@ RETENTION_FIELDS: tuple[str, ...] = (
     "metric_retention_days",
     "log_retention_hours",
     "e911_resolution_log_retention_days",
+    # Not a retention window, but a limit on what the E911 trail records and
+    # answers (#3633); it rides this audited group so a change is never silent.
+    "e911_lookup_log_budget_per_minute",
 )
 
 

@@ -588,9 +588,9 @@ const RETENTION_ROWS: {
   },
   {
     key: "e911_lookup_log_budget_per_minute",
-    label: "E911 HELD lookups logged per caller",
+    label: "E911 HELD lookups per caller",
     description:
-      "Per API token or user, per minute. 1–6000. Past it, a HELD lookup is still answered, and is counted in one trail row per caller per minute (N lookups not individually logged) instead of getting a row of its own, so a read-only token cannot grow the table without bound.",
+      "Per API token or user, per minute; a device self-query has neither, so it is counted per source address. 1–6000. Past it, a HELD lookup is refused (429, Retry-After) and returns no location, so every location returned has its own trail row and a read-only token cannot grow the table without bound. Size it for the caller's busiest minute, such as phones re-registering after an outage, and give each integration its own token.",
     unit: "lookups / min",
     min: 1,
     max: 6000,

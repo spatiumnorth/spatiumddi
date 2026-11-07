@@ -37,6 +37,11 @@ async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
     The row is removed with a Core DELETE and the FK ``ON DELETE CASCADE`` takes
     its records, so the delete is atomic with the teardown that gated it.
     """
+    # #3691: the ``ip_address`` rows the delete nulls out come before the zone
+    # row, as the lease path takes them (``app.services.lock_order``).
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [zone.id])
     # A LIVE record under a trashed zone (a restore before #1957 could leave one)
     # is not served or listed anywhere, and the FK CASCADE below would destroy it
     # without a word. The default filter hides trashed records, so this only ever

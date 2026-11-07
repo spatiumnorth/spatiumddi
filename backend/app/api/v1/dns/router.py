@@ -287,7 +287,11 @@ from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
 from app.services.ipam.zone_binding import prune_group_ids, prune_zone_ids
-from app.services.lock_order import lock_zone_rows
+from app.services.lock_order import (
+    address_ids_of_records,
+    lock_addresses_before,
+    lock_zone_rows,
+)
 from app.services.soft_delete import (
     SoftDeleteBatch,
     add_to_batch,
@@ -9748,7 +9752,17 @@ async def delete_record(
     BIND9 / PowerDNS also converge via the bundle drop; the enqueued op is an
     idempotent delete there. Restore re-pushes ``create`` (admin/trash.py).
     """
-    record = await _require_record(group_id, zone_id, record_id, db, lock=True)
+    if permanent:
+        # #3691: the delete nulls ``ip_address.dns_record_id`` (ON DELETE SET
+        # NULL), which locks those rows; they come before the zone row, as a
+        # lease batch takes them (``app.services.lock_order``).
+        record = await lock_addresses_before(
+            db,
+            lambda: address_ids_of_records(db, [record_id]),
+            lambda: _require_record(group_id, zone_id, record_id, db, lock=True),
+        )
+    else:
+        record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
 
@@ -9909,7 +9923,15 @@ async def bulk_delete_records(
     if not body.record_ids:
         return BulkDeleteRecordsResponse(deleted=0, skipped=[])
 
-    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    if permanent:
+        # #3691 — see delete_record: the addresses linked to the records first.
+        zone = await lock_addresses_before(
+            db,
+            lambda: address_ids_of_records(db, body.record_ids),
+            lambda: _require_zone(group_id, zone_id, db, current_user, lock="write"),
+        )
+    else:
+        zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.

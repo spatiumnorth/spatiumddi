@@ -53,10 +53,11 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Bind parameters per lock statement; asyncpg refuses more than 32,767.
@@ -148,6 +149,131 @@ async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
             # a lock taken for another reason (tests/_row_lock_order_guard.py).
             .execution_options(include_deleted=True, lock_order="zone_prelock")
         )
+
+
+async def address_ids_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> set[Any]:
+    """The ``ip_address`` rows a delete of ``zone_ids`` rewrites, unlocked.
+
+    ``ip_address.forward_zone_id`` / ``reverse_zone_id`` reference ``dns_zone``
+    and ``ip_address.dns_record_id`` references ``dns_record``, all ``ON DELETE
+    SET NULL``: deleting a zone (and with it, its records) locks every such
+    row. Records in the trash and rows in the trash are included."""
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    zones = sorted({z for z in zone_ids if z is not None})
+    found: set[Any] = set()
+    for i in range(0, len(zones), _CHUNK):
+        chunk = zones[i : i + _CHUNK]
+        record_ids = (
+            select(DNSRecord.id)
+            .where(DNSRecord.zone_id.in_(chunk))
+            .execution_options(include_deleted=True)
+            .scalar_subquery()
+        )
+        res = await db.execute(
+            select(IPAddress.id)
+            .where(
+                IPAddress.dns_record_id.in_(record_ids)
+                | IPAddress.forward_zone_id.in_(chunk)
+                | IPAddress.reverse_zone_id.in_(chunk)
+            )
+            .execution_options(include_deleted=True)
+        )
+        found.update(res.scalars().all())
+    return found
+
+
+async def address_ids_of_records(db: AsyncSession, record_ids: Iterable[Any]) -> set[Any]:
+    """The ``ip_address`` rows a delete of the ``dns_record`` rows
+    ``record_ids`` rewrites (``dns_record_id`` is ``ON DELETE SET NULL``),
+    unlocked."""
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    records = sorted({r for r in record_ids if r is not None})
+    found: set[Any] = set()
+    for i in range(0, len(records), _CHUNK):
+        res = await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.dns_record_id.in_(records[i : i + _CHUNK]))
+            .execution_options(include_deleted=True)
+        )
+        found.update(res.scalars().all())
+    return found
+
+
+async def _lock_address_ids(db: AsyncSession, ids: Iterable[Any], *, nowait: bool = False) -> None:
+    """Lock ``ip_address`` rows by id, ascending, ``FOR NO KEY UPDATE`` (the
+    lock the foreign key's ``SET NULL`` takes). A row deleted meanwhile is
+    skipped. ``nowait`` raises ``lock_not_available`` (55P03) instead of
+    waiting for a row another transaction holds."""
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    ordered = sorted(set(ids))
+    for i in range(0, len(ordered), _CHUNK):
+        await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.id.in_(ordered[i : i + _CHUNK]))
+            .order_by(IPAddress.id)
+            .with_for_update(key_share=True, nowait=nowait)
+            .execution_options(include_deleted=True)
+        )
+
+
+async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> list[Any]:
+    """Step 2 for a zone delete: lock the ``ip_address`` rows a delete of
+    ``zone_ids`` would rewrite (:func:`address_ids_of_zones`), ascending id,
+    BEFORE the zone rows (#3691). Taken after the zone row, by the foreign
+    key, that is step 3 before step 2, and a lease batch holding a mirror and
+    waiting for the zone deadlocks with it."""
+    ids = await address_ids_of_zones(db, zone_ids)
+    await _lock_address_ids(db, ids)
+    return sorted(ids)
+
+
+#: Tries :func:`lock_addresses_before` makes before it waits for a late row.
+_LATE_ROW_ATTEMPTS = 5
+
+
+def _lock_not_available(exc: DBAPIError) -> bool:
+    return getattr(exc.orig, "sqlstate", None) == "55P03"
+
+
+async def lock_addresses_before[T](
+    db: AsyncSession,
+    find_ids: Callable[[], Awaitable[set[Any]]],
+    take: Callable[[], Awaitable[T]],
+) -> T:
+    """Lock the ``ip_address`` rows ``find_ids`` names, ascending id, then run
+    ``take`` (which locks the zone row), and return what it returns (#3691).
+
+    A delete of a zone or of records rewrites the address rows linked to it
+    through ``ON DELETE SET NULL`` foreign keys, which locks them after the
+    zone row unless they are locked first. A row linked between the first
+    lock and ``take`` (by a writer that held the zone row, so the link was
+    not visible yet) is still taken after the zone. It is locked ``NOWAIT``:
+    if a lease batch has it and waits for the zone, the work is rolled back
+    to a savepoint, which releases the zone row, and tried again with the row
+    now in the first pass. The last try waits instead of retrying.
+
+    No row can be linked to the zone while ``take``'s lock is held: every
+    writer that links an address to a zone or to one of its records takes the
+    zone row first (``lock_zones_for_sync``), or its foreign-key check on
+    ``forward_zone_id`` / ``reverse_zone_id`` waits for a ``FOR UPDATE``.
+    """
+    for attempt in range(_LATE_ROW_ATTEMPTS):
+        last = attempt == _LATE_ROW_ATTEMPTS - 1
+        try:
+            async with db.begin_nested():
+                held = await find_ids()
+                await _lock_address_ids(db, held)
+                result = await take()
+                await _lock_address_ids(db, await find_ids() - held, nowait=not last)
+            return result
+        except DBAPIError as exc:
+            if last or not _lock_not_available(exc):
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _uuid_or_none(raw: Any) -> uuid.UUID | None:
@@ -296,17 +422,14 @@ async def lock_zones_for_addresses(
     await lock_zone_rows(db, zones)
 
 
-async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> None:
-    """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
-    write: the zones holding a record of any of their addresses (the lease
-    mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
-    and the reverse zones the subnets are linked to (retired or re-linked)."""
+async def zone_ids_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> set[Any]:
+    """The zones a write over ``subnet_ids`` may touch: the zones holding a
+    record of any of their addresses (the lease mirrors' DDNS, the subnet's own
+    A / PTR) and the reverse zones the subnets are linked to."""
     from app.models.dns import DNSRecord, DNSZone  # noqa: PLC0415
     from app.models.ipam import IPAddress  # noqa: PLC0415
 
     ids = sorted({s for s in subnet_ids if s is not None})
-    if not ids:
-        return
     zones: set[Any] = set()
     for i in range(0, len(ids), _CHUNK):
         chunk = ids[i : i + _CHUNK]
@@ -330,13 +453,121 @@ async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) ->
             .scalars()
             .all()
         )
-    await lock_zone_rows(db, zones)
+    return zones
+
+
+async def zone_ids_for_scope_statics(db: AsyncSession, scope_ids: Iterable[Any]) -> set[Any]:
+    """The zones a restore of ``scope_ids`` publishes their reservations into.
+
+    A soft-delete of a scope (or of its subnet) deletes each reservation's
+    address row and its A / PTR records, and the restore re-creates them
+    (``remirror_scope_statics``), so no record names the zones yet and
+    :func:`zone_ids_for_subnets` cannot find them. They are resolved the way
+    the re-mirror's own sync resolves them: ``_publish_zone_ids`` over a
+    transient row at each reservation's address, so the forward zone, the
+    extras and the reverse zone are the ones the publish will lock. Reads
+    include the trashed reservations, which are un-stamped later.
+
+    A row already at the address (a scope trashed on its own leaves its subnet
+    live, and the address may have been allocated meanwhile) is taken over by
+    the re-mirror, which publishes into that row's own forward zone and keeps
+    its reverse zone: its zones are added too."""
+    from app.models.dhcp import DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.services.dhcp.normalize import norm_ip  # noqa: PLC0415
+
+    ids = sorted({s for s in scope_ids if s is not None})
+    zones: set[Any] = set()
+    subnet_cache: dict[Any, set[Any] | None] = {}
+    subnets: dict[Any, Any] = {}
+    for i in range(0, len(ids), _CHUNK):
+        chunk = ids[i : i + _CHUNK]
+        scopes = (
+            (
+                await db.execute(
+                    select(DHCPScope)
+                    .where(DHCPScope.id.in_(chunk))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {sc.id: sc for sc in scopes}
+        incumbents = {
+            (row.subnet_id, norm_ip(str(row.address))): row
+            for row in (
+                await db.execute(
+                    select(IPAddress)
+                    .where(IPAddress.subnet_id.in_({sc.subnet_id for sc in scopes}))
+                    .where(
+                        IPAddress.address.in_(
+                            select(DHCPStaticAssignment.ip_address)
+                            .where(DHCPStaticAssignment.scope_id.in_(chunk))
+                            .execution_options(include_deleted=True)
+                        )
+                    )
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        }
+        statics = (
+            (
+                await db.execute(
+                    select(DHCPStaticAssignment)
+                    .where(DHCPStaticAssignment.scope_id.in_(chunk))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for st in statics:
+            scope = by_id.get(st.scope_id)
+            if scope is None:
+                continue
+            if scope.subnet_id not in subnets:
+                subnets[scope.subnet_id] = (
+                    await db.execute(
+                        select(Subnet)
+                        .where(Subnet.id == scope.subnet_id)
+                        .execution_options(include_deleted=True)
+                    )
+                ).scalar_one_or_none()
+            subnet = subnets[scope.subnet_id]
+            if subnet is None:
+                continue
+            # Never added to the session: built only to be read.
+            row = incumbents.get((subnet.id, norm_ip(str(st.ip_address))))
+            ip = IPAddress(
+                subnet_id=subnet.id,
+                address=str(st.ip_address),
+                hostname=(st.hostname or "").strip(),
+                status="static_dhcp",
+                forward_zone_id=row.forward_zone_id if row is not None else None,
+                reverse_zone_id=row.reverse_zone_id if row is not None else None,
+                extra_zone_ids=list(row.extra_zone_ids or []) if row is not None else [],
+            )
+            zones |= await _publish_zone_ids(db, ip, subnet, None, subnet_cache, False)
+    zones.discard(None)
+    return zones
+
+
+async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> None:
+    """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
+    write: the zones holding a record of any of their addresses (the lease
+    mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
+    and the reverse zones the subnets are linked to (retired or re-linked)."""
+    await lock_zone_rows(db, await zone_ids_for_subnets(db, subnet_ids))
 
 
 __all__ = [
     "lock_lease_rows",
     "lock_mirror_rows",
     "lock_zones_for_subnets",
+    "zone_ids_for_subnets",
     "lock_zone_rows",
     "lock_zones_for_addresses",
     "lock_zones_for_sync",

@@ -47,7 +47,6 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import Select, and_, case, func, or_, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -934,67 +933,6 @@ def log_resolution(
             evidence_age_seconds=resolution.evidence_age_seconds,
         )
     )
-
-
-async def count_suppressed_resolution(
-    db: AsyncSession,
-    resolution: Resolution,
-    *,
-    caller_key: str,
-    user_id: uuid.UUID | None,
-    api_token_id: uuid.UUID | None,
-    source_ip: str | None,
-    actor_kind: str,
-) -> None:
-    """Count one lookup past the caller's logging budget (#3514).
-
-    Instead of a row per lookup, one counter row per caller per minute:
-    ``suppressed_count`` goes up by one, and the identity / ERL / confidence
-    columns are overwritten with this lookup's, so the row reads "N lookups
-    not individually logged, the last of them was this". A single
-    ``INSERT … ON CONFLICT DO UPDATE`` on ``(caller_key, window_start)``, so
-    two concurrent lookups from one caller cannot create two rows or lose an
-    increment, and the table grows by at most one row per caller per minute.
-    """
-    now = datetime.now(UTC)
-    values = {
-        "id": uuid.uuid4(),
-        "queried_at": now,
-        "identity_kind": resolution.identity_kind,
-        "identity_value": resolution.identity_value[:255],
-        "actor_kind": actor_kind,
-        "actor_id": api_token_id or user_id,
-        "source_ip": source_ip,
-        "erl_id": resolution.erl.id if resolution.erl else None,
-        "rule_matched": resolution.rule_matched,
-        "confidence": resolution.confidence,
-        "degraded_reason": resolution.degraded_reason,
-        "evidence_age_seconds": resolution.evidence_age_seconds,
-        "caller_key": caller_key[:64],
-        "window_start": now.replace(second=0, microsecond=0),
-        "suppressed_count": 1,
-    }
-    stmt = pg_insert(E911ResolutionLog).values(**values)
-    last = (
-        "queried_at",
-        "identity_kind",
-        "identity_value",
-        "source_ip",
-        "erl_id",
-        "rule_matched",
-        "confidence",
-        "degraded_reason",
-        "evidence_age_seconds",
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["caller_key", "window_start"],
-        index_where=E911ResolutionLog.caller_key.isnot(None),
-        set_={
-            "suppressed_count": E911ResolutionLog.suppressed_count + 1,
-            **{c: stmt.excluded[c] for c in last},
-        },
-    )
-    await db.execute(stmt)
 
 
 @router.get("/location", response_model=LocationResponse)
