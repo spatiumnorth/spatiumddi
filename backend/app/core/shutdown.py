@@ -168,3 +168,22 @@ def install_signal_hook() -> bool:
             sigint=repr(signal.getsignal(signal.SIGINT)),
         )
     return installed
+
+
+async def wait_or_shutdown(aws: set[asyncio.Future[Any]], timeout: float) -> bool:
+    """``asyncio.wait(aws, FIRST_COMPLETED)`` for at most ``timeout`` seconds,
+    ended early by shutdown. Return True if shutdown began.
+
+    The caller still owns ``aws``: nothing in it is cancelled here, so a reply
+    that lands in the same instant is still the caller's to read.
+    """
+    if _requested:
+        return True
+    fut = shutdown_future()
+    try:
+        await asyncio.wait(
+            {*aws, fut}, timeout=max(timeout, 0.0), return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        discard(fut)
+    return _requested
