@@ -84,6 +84,7 @@ from app.services.dns.named_conf_validation import (
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone,
     records_for_view,
     views_rendering_zone,
 )
@@ -1493,17 +1494,19 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             return copies
 
         # Split-horizon expansion (issue #24) composed with geo steering
-        # (issue #530). Operator views: the zone materialises in every
-        # view it has content for — each view referenced by a scoped
-        # record PLUS the zone's own pinned ``view_id``; with no explicit
-        # scoping it's "global" and renders into every operator view.
+        # (issue #530). Operator views: a pinned zone materialises in its
+        # pin alone; an unpinned one in each view referenced by a scoped
+        # record (a learned record follows the zone, ``places_zone``); with
+        # no explicit scoping it's "global" and renders into every operator
+        # view.
         # Geo + catch-all views always render the zone (like a global
         # zone) so the catch-all serves the default member set. Per-view
         # record filtering is delegated to ``records_for_view``. The rule is
         # shared with the transfer-key resolver (#920), so the view drift and
         # sync ask for is always one that holds the zone.
         # #2275 — the collision guard counts placements from the same call.
-        for vd in views_rendering_zone(view_descs, z.view_id, (r.view_id for r in rec_rows)):
+        placing = (r.view_id for r in rec_rows if places_zone(r))
+        for vd in views_rendering_zone(view_descs, z.view_id, placing):
             recs = records_for_view(rec_rows, vd, geo)
             copies.append(
                 {

@@ -57,16 +57,7 @@ _TABLES = {DNSZone: _ZONE, DHCPLease: _LEASE, IPAddress: _MIRROR_TABLE}
 #: here, each with why. A zone-order violation under one of these frames is
 #: not recorded; a lease-after-mirror one still is. Keep it short: every entry
 #: is a deadlock waiting for its interleaving.
-KNOWN_UNFIXED: dict[str, str] = {
-    "restore_row": (
-        "a Trash restore un-stamps the restored rows (a reverse zone among "
-        "them) before it re-pushes the records of zones that stayed, so a "
-        "restored zone with a higher id than a stayed one is held first. The "
-        "re-push itself locks its zones in id order; ordering the un-stamp "
-        "means pre-locking every zone of the batch inside the generic restore "
-        "spine, which is out of #3617's scope."
-    ),
-}
+KNOWN_UNFIXED: dict[str, str] = {}
 
 #: One entry per offence, read and cleared by the conftest fixture.
 violations: list[str] = []

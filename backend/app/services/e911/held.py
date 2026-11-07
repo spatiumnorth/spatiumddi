@@ -76,6 +76,7 @@ ERROR_XML_ERROR = "xmlError"
 ERROR_NOT_LOCATABLE = "notLocatable"
 ERROR_CANNOT_PROVIDE = "cannotProvideLiType"
 ERROR_LOCATION_UNKNOWN = "locationUnknown"
+ERROR_GENERAL_LIS_ERROR = "generalLisError"
 
 _DOCTYPE_RE = re.compile(rb"<!DOCTYPE", re.IGNORECASE)
 
