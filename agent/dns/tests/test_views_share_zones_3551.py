@@ -353,6 +353,44 @@ def test_a_copy_holding_third_party_records_is_not_shared(tmp_path: Path) -> Non
     assert (root / "zones" / "default" / "example.com.db").is_file()
 
 
+def test_turning_updates_off_does_not_merge_copies_holding_client_names(
+    tmp_path: Path,
+) -> None:
+    """Updates on: a copy per view, an .owned sidecar each, a journal on
+    default's copy (a name a client added, not yet ingested). Updates then
+    turned off, and a render for another reason: the zone is now static and
+    would share, but default's journal is data the control plane has not seen,
+    and the sidecar is gone with the switch-off. It must stay per view."""
+    Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
+    live = _promote(tmp_path)
+    default_copy = live / "zones" / "default" / "example.com.db"
+    default_copy.with_name(default_copy.name + ".jnl").write_bytes(b"journal")
+
+    static = _both("example.com.", [_A])
+    conf, root = _render(tmp_path, _bundle(static))
+    assert "in-view" not in conf
+    # The next render, for another zone's change, sees a live tree whose
+    # copies carry no sidecar any more (updates are off).
+    live = _promote(tmp_path)
+    assert not (live / "zones" / "default" / "example.com.db.owned").exists()
+    default_copy = live / "zones" / "default" / "example.com.db"
+    default_copy.with_name(default_copy.name + ".jnl").write_bytes(b"journal")
+
+    conf, root = _render(tmp_path, _bundle(static))
+
+    assert "in-view" not in conf
+    assert (root / "zones" / "default" / "example.com.db").is_file()
+    assert (root / "zones" / "restricted" / "example.com.db").is_file()
+
+
+def test_updates_off_with_no_client_data_still_shares(tmp_path: Path) -> None:
+    """The same switch-off with nothing held beyond a render shares."""
+    Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
+    _promote(tmp_path)
+    conf, _ = _render(tmp_path, _bundle(_both("example.com.", [_A])))
+    assert 'in-view "restricted"' in _view_block(conf, "default")
+
+
 def test_a_dynamic_zone_is_never_shared_across_views(tmp_path: Path) -> None:
     """An update sent through one view would land in the one shared copy and
     be answered in every view, so a zone that accepts updates keeps a copy per

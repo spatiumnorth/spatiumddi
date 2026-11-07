@@ -1936,12 +1936,20 @@ def _share_would_merge(
     records with its file, or show it the defining view's, which split-horizon
     exists to keep apart. So a pair shares only when it already did, or when
     neither live copy holds anything beyond a render. Otherwise each keeps its
-    own copy, exactly as before sharing existed."""
+    own copy, exactly as before sharing existed.
+
+    Turning updates off does not release a pair: see the loop below."""
     if prev_in_view.get((zname, view)) == owner:
         return False
     for v in (view, owner):
         live = prev / _zone_rel(zname, v)
-        if _owned_sidecar(live).is_file() and _may_hold_unrendered(live):
+        # No ``.owned`` test: the sidecar is written only while the zone takes
+        # updates, so after updates are turned OFF the surviving copy has
+        # none while its journal still holds names a client added and the
+        # control plane may not have ingested. Judging by the data alone keeps
+        # that pair apart; a static zone's copies are pure renders with no
+        # journal, so they still share (and a pair already sharing stays so).
+        if _may_hold_unrendered(live):
             return True
     return False
 
