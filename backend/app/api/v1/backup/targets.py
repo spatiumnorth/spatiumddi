@@ -61,6 +61,7 @@ from app.services.backup.targets import (
     is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
+    normalize_config_for_create,
     redact_config_secrets,
     safe_filename,
     secret_field_names,
@@ -400,6 +401,8 @@ async def create_target(
                 detail=f"'{name}' must be the secret itself, not a stored '{ENC_PREFIX}' value",
             )
     try:
+        # Same auth-mode rules as Edit (#3696): one mode, no unused credential.
+        body.config = normalize_config_for_create(driver, body.config)
         driver.validate_config(body.config)
         # Second pass, allowed to resolve DNS (the https_put SSRF guard).
         # Only at create / update / test — never on the scheduled-run
