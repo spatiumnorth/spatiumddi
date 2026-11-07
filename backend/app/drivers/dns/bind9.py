@@ -232,7 +232,8 @@ def _shared_zone_views(
     later views, so memory scales with distinct zone data rather than with
     views × data. Views keep their order (it decides a client's view), and
     the defining view is always the earlier one, which ``in-view`` requires.
-    Forward zones never share: BIND refuses ``in-view`` of one. RPZ zones
+    Zones that accept client updates never share either. Forward zones
+    never share: BIND refuses ``in-view`` of one. RPZ zones
     are not considered at all: BIND refuses a response-policy zone defined
     by ``in-view``.
     """
@@ -241,6 +242,10 @@ def _shared_zone_views(
     for view in views:
         for z in zones:
             if z.view_name != view.name or z.zone_type == "forward":
+                continue
+            # A zone that accepts client updates keeps a copy per view, or an
+            # update sent through one view would be answered in all of them.
+            if z.dynamic_update_enabled:
                 continue
             bare = dataclasses.replace(z, view_name=None)
             owner = next((v for d, v in defined.get(z.name, []) if d == bare), None)

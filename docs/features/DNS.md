@@ -470,10 +470,13 @@ view "default"    { zone "example.com." { in-view "restricted"; }; };
 Views keep the order you gave them (it decides which view a client lands
 in); the defining view is simply the first one that holds the copy. Only
 that view has a zone file, and a record change to the zone reaches every
-view that references it. An RFC 2136 update from a client of any of those
-views lands in the one shared zone; if the copies later stop being identical,
-each view's new copy starts from the shared zone's data, so no view loses a
-record it was serving.
+view that references it. A zone that accepts RFC 2136 updates from clients
+is never shared (#3632): an update sent through one view would land in the
+one shared zone and be answered in every view, which split-horizon exists to
+prevent. When copies that were shared stop being shared (they stop being
+identical, or a zone an earlier build shared accepts updates), each view's
+new copy starts from the shared zone's data, so no view loses a record it was
+serving.
 
 | Shared once | Still one copy per view |
 |---|---|
@@ -481,7 +484,9 @@ record it was serving.
 | Primary, secondary and stub zones | A zone whose `allow-transfer`, notify, also-notify, dynamic-update ACL or DNSSEC settings differ between its copies (options live on the defining view only) |
 | | A zone in views whose `allow-query` differs: a shared zone takes its query ACL from the defining view, so sharing it would refuse the other view's clients |
 | | Forward zones (BIND refuses `in-view` of one; they hold no data, so the repeat is free) |
-| | A dynamic zone whose copies named already holds separately, when either copy holds RFC 2136 records the control plane did not render (a DHCP server's or AD's updates, §8 #2850): the copies differ on named even when the bundle's are identical, and sharing would drop one view's records or show them to the other |
+| | A dynamic zone (dynamic updates on): an update a client sends through one view would be answered in the others |
+| | Every primary zone of a group with no usable group key of its own: the first operator TSIG key then holds the zone-wide update grant, and clients hold that key |
+| | A zone that has stopped taking dynamic updates while a copy still holds RFC 2136 records the control plane did not render (§8 #2850): the copies differ on named even when the bundle's are identical. Each copy keeps its own until the zone itself next changes, which reloads the copy from the render and drops those records anyway (#3632). The control plane's preview cannot see named, so for that window it shows the zone shared |
 | | **Every RPZ (blocklist) zone** |
 
 **Blocklists are not shared, and are usually the larger cost.** BIND
