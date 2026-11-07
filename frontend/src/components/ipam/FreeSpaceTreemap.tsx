@@ -95,7 +95,9 @@ export function FreeSpaceTreemap({
     for (const f of freeRanges) {
       out.push({
         name: f.network,
-        size: f.size,
+        // `size` saturates at 2^63 - 1 for IPv6 (#3708), which would draw a
+        // free /49 and a free /64 the same; weigh by the exact count instead.
+        size: f.size_exact ? Number(f.size_exact) : f.size,
         exact: f.size_exact,
         kind: "free",
         network: f.network,

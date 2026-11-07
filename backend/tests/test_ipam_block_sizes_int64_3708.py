@@ -113,3 +113,23 @@ def test_openapi_keeps_the_sizes_typed():
         props = schemas[model]["properties"]
         assert props[field]["type"] == "integer", (model, field)
         assert props[f"{field}_exact"]["type"] == "string", (model, field)
+
+
+async def test_aggregation_sorts_on_the_exact_size(client: AsyncClient, db_session: AsyncSession):
+    """Both supernets saturate ``total_size``; the larger must still come first."""
+    h = await _headers(db_session)
+    block = await _v6(
+        db_session,
+        (
+            "fd37:8:0:4::/64",
+            "fd37:8:0:5::/64",
+            "fd37:8:0:8::/63",
+            "fd37:8:0:a::/63",
+        ),
+    )
+    r = await client.get(f"/api/v1/ipam/blocks/{block.id}/aggregation-suggestions", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [s["supernet"] for s in body] == ["fd37:8:0:8::/62", "fd37:8:0:4::/63"]
+    assert [s["total_size"] for s in body] == [CAP, CAP]
+    assert [s["total_size_exact"] for s in body] == [str(2**66), str(2**65)]
