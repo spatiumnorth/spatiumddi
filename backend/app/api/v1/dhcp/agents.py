@@ -18,7 +18,6 @@ from typing import Annotated, Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
@@ -39,6 +38,7 @@ from app.core.celery_dispatch import dispatch
 from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
 from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (

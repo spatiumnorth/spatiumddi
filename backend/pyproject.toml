@@ -25,7 +25,6 @@ dependencies = [
     "redis[hiredis]>=5.2.0,<7",
     "celery[redis]>=5.4.0",
     "structlog>=24.4.0",
-    "python-jose[cryptography]>=3.3.0",
     "bcrypt>=4.0.0",
     "python-multipart>=0.0.18",
     "pydantic-settings>=2.6.0",
