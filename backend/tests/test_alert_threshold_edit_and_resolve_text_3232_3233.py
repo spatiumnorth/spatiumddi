@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -373,7 +375,7 @@ async def test_private_use_characters_in_operator_text_survive_unmarking_3558() 
     """A subnet name holding U+E000 ... U+E001 is not a threshold mark (#3558)."""
     token = alerts_svc._MARK_THRESHOLDS.set(True)
     try:
-        name = "net 7 x  "
+        name = "net \ue0007\ue001 x \ue001 \ue000"
         marked = f"Subnet {name} utilisation 50.0% (threshold {alerts_svc._thr(46)}%)"
         clean, idx = alerts_svc._unmark_thresholds(marked)
     finally:
@@ -382,3 +384,59 @@ async def test_private_use_characters_in_operator_text_survive_unmarking_3558() 
     # Only the real threshold (its token carries the %) is marked.
     toks = [t.group() for t in alerts_svc._NUM_RE.finditer(clean)]
     assert [toks[i] for i in idx] == ["46%"]
+
+
+async def test_private_use_characters_in_a_subnet_name_reach_the_event_and_notifications_3558(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: a real pass over a subnet whose name holds U+E000 ... U+E001
+    stores, delivers and renders the name whole, and the held note (#3542)
+    still splits off cleanly (#3558)."""
+    from app.services import audit_forward
+
+    sent: list[dict] = []
+
+    async def _targets() -> list[dict]:
+        return [{"kind": "webhook", "name": "w"}]
+
+    async def _capture(target: dict, payload: dict) -> str:
+        sent.append(dict(payload))
+        return audit_forward.DELIVERED
+
+    monkeypatch.setattr(audit_forward, "_load_targets", _targets)
+    monkeypatch.setattr(audit_forward, "_deliver_to_target", _capture)
+    rule = AlertRule(
+        name="u",
+        rule_type=alerts_svc.RULE_TYPE_SUBNET_UTILIZATION,
+        severity="warning",
+        enabled=True,
+        threshold_percent=46,
+        notify_webhook=True,
+    )
+    db_session.add(rule)
+    subnet = await _subnet(db_session)
+    name = "lan \ue0007\ue001 x"
+    subnet.name = name
+    subnet.utilization_percent = 50.0
+    await db_session.commit()
+    await alerts_svc.evaluate_all(db_session)
+
+    ev = await _event(db_session)
+    assert name in ev.subject_display
+    assert f"{name} utilisation 50.0% (threshold 46%)" in ev.message
+    assert "\ue000" in ev.message and "\ue001" in ev.message
+    assert sent and all(name in p["message"] for p in sent)
+    assert (
+        name in json.loads(audit_forward.render_for_target("json_lines", 16, sent[-1]))["message"]
+    )
+    for fmt in ("rfc5424_cef", "rfc5424_leef"):
+        assert name in audit_forward.render_for_target(fmt, 16, sent[-1])
+
+    # Inside the resolve margin the subject is held; the note still splits
+    # off and the name is untouched.
+    subnet.utilization_percent = 44.0
+    await db_session.commit()
+    await alerts_svc.evaluate_all(db_session)
+    ev = await _event(db_session)
+    assert name in ev.message and "held open" in ev.message
+    assert "\ue002" not in ev.message
