@@ -59,7 +59,9 @@ from uuid import UUID
 import structlog
 from fastapi import HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import String, and_, cast, func, not_, or_, select
+from sqlalchemy import String, and_, any_, cast, func, literal, not_, or_, select
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -126,7 +128,7 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     # then retracts into the batch the records of its subnets' other addresses
     # in zones that stay (#1906), counted with the batch's records, as the
     # trash holds them.
-    torn_down_first = _mirrors_torn_down_first(root)
+    torn_down_first = _mirrors_torn_down_first(root, batch)
     counts["dns_record"] = (
         counts.get("dns_record", 0)
         - await count_held_records_deleted_first(db, batch, torn_down_first)
@@ -166,16 +168,17 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     return "cascades " + ", ".join(parts)
 
 
-def _mirrors_torn_down_first(root: Any) -> Any:
+def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
     """The addresses a soft delete of ``root`` deletes before its stamp, as a
-    condition on ``IPAddress``: the lease and reservation mirrors of each live
-    scope on their subnet, which the batch holds
-    (``_purge_leases_for_scope_batch``), and for a subnet its every lease
-    mirror (``_revoke_subnet_lease_mirrors``). Their records go with them, so
-    the retraction never sees them, and neither does the preview's count of it
-    (spatiumddi#3536); nor does the stamp of a reverse zone the delete trashes,
-    so the preview's count of that zone's records leaves them out too
-    (spatiumddi#3511)."""
+    condition on ``IPAddress``: for each scope ``batch`` holds
+    (``_purge_leases_for_scope_batch``), its lease mirrors on its subnet, and
+    its reservations' mirrors whatever subnet they sit in, as
+    ``remove_ipam_for_scope_statics`` finds them by the reservation alone; and
+    for a subnet its every lease mirror (``_revoke_subnet_lease_mirrors``).
+    Their records go with them, so the retraction never sees them, and neither
+    does the preview's count of it (spatiumddi#3536); nor does the stamp of a
+    reverse zone the delete trashes, so the preview's count of that zone's
+    records leaves them out too (spatiumddi#3511)."""
     from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
 
@@ -196,24 +199,26 @@ def _mirrors_torn_down_first(root: Any) -> Any:
         )
         .where(mirror.auto_from_lease.is_(True))
     )
-    reservation_mirrors = (
-        select(mirror.id)
-        .join(DHCPScope, own_scope)
-        .join(
-            DHCPStaticAssignment,
-            and_(
-                DHCPStaticAssignment.scope_id == DHCPScope.id,
-                cast(DHCPStaticAssignment.id, String) == mirror.static_assignment_id,
-            ),
+    # The batch's scopes as one array parameter: a space's worth of them as an
+    # IN list, beside the count's own list of subnets, could pass asyncpg's
+    # bind-parameter limit.
+    scope_ids = [row.obj.id for row in batch.rows if isinstance(row.obj, DHCPScope)]
+    reservations = (
+        select(cast(DHCPStaticAssignment.id, String)).where(
+            DHCPStaticAssignment.scope_id == any_(literal(scope_ids, ARRAY(PG_UUID(as_uuid=True))))
         )
-        .where(mirror.static_assignment_id.is_not(None))
         # Trashed reservations too, as ``remove_ipam_for_scope_statics`` reads them.
         .execution_options(include_deleted=True)
     )
     # The column tests first: they spare every other address the lookups.
+    # The back-link's also makes an address with none read false, not NULL,
+    # so the NOT of the retraction's count keeps it.
     torn = [
         and_(IPAddress.auto_from_lease.is_(True), IPAddress.id.in_(lease_mirrors)),
-        and_(IPAddress.static_assignment_id.is_not(None), IPAddress.id.in_(reservation_mirrors)),
+        and_(
+            IPAddress.static_assignment_id.is_not(None),
+            IPAddress.static_assignment_id.in_(reservations),
+        ),
     ]
     if isinstance(root, Subnet):
         torn.insert(0, and_(IPAddress.subnet_id == root.id, IPAddress.auto_from_lease.is_(True)))
