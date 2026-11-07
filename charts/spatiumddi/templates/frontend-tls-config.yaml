@@ -158,6 +158,20 @@ data:
 
         resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ${SPATIUM_RESOLVER_IPV6};
 
+        # HELD's own "api unavailable" answer (#3679). An RFC 5985 client does not
+        # read JSON, and the server-level ``error_page 502 504 @starting`` would
+        # redirect a POST to a static file, which nginx answers with its HTML
+        # "405 Not Allowed". A ``return`` has no method to refuse. 503 +
+        # Retry-After + a held+xml ``generalLisError`` is the shape a LIS client
+        # retries on. Keep the body in step with held.render_error().
+        location @held_unavailable {
+            default_type application/held+xml;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+            add_header Retry-After 2 always;
+            add_header X-Content-Type-Options "nosniff" always;
+            return 503 '<?xml version="1.0" encoding="UTF-8"?>\n<error xmlns="urn:ietf:params:xml:ns:geopriv:held" code="generalLisError"><message>The location service is not reachable right now; retry shortly.</message></error>';
+        }
+
         # Same nginx-local healthcheck as the :80 block, so a probe
         # pointed at either port answers without touching an upstream.
         location = /nginx-health {
@@ -529,6 +543,7 @@ data:
         # index.html with a 200. Must not diverge from
         # frontend/default.conf.template.
         location /held {
+            error_page 502 504 =503 @held_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass         $api_upstream;
             proxy_set_header   Host $http_host;
@@ -543,6 +558,7 @@ data:
         # ACME http-01 challenge (issue #438) — also reachable over HTTPS
         # so a CA that follows the :80→:443 redirect still resolves it.
         location /.well-known/acme-challenge/ {
+            error_page 502 504 @api_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass         $api_upstream;
             proxy_set_header   Host $http_host;
