@@ -558,7 +558,9 @@ async def commit_import(
                 if gateway:
                     existing.gateway = gateway
                 if moves_gateway_row and gateway:
-                    await add_gateway_row(db, existing, gateway, created_by_user_id=current_user.id)
+                    await add_gateway_row(
+                        db, existing, gateway, created_by_user_id=current_user.id, user=current_user
+                    )
                     recount_subnet_ids.append(existing.id)
                     touched_blocks.add(existing.block_id)
                 if custom_fields:
