@@ -9491,6 +9491,18 @@ async def k8s_get_pod_logs(
             status.HTTP_504_GATEWAY_TIMEOUT,
             "Supervisor didn't reply in 20s.",
         ) from exc
+    # kubeapi's own 4xx on a log read is about what the caller named: 404 for
+    # a pod that does not exist, 400 for a container that is not in that pod.
+    # Both are client errors, not a failing upstream (#3628).
+    if status_code in (400, 404):
+        raise HTTPException(
+            (
+                status.HTTP_404_NOT_FOUND
+                if status_code == 404
+                else status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            f"kubeapi rejected the log request ({status_code}): {body[:200]!r}",
+        )
     if not 200 <= status_code < 300:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
