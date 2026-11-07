@@ -287,7 +287,11 @@ from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
 from app.services.ipam.zone_binding import prune_group_ids, prune_zone_ids
-from app.services.lock_order import address_ids_of_records, lock_addresses_before
+from app.services.lock_order import (
+    address_ids_of_records,
+    lock_addresses_before,
+    lock_zone_rows,
+)
 from app.services.soft_delete import (
     SoftDeleteBatch,
     add_to_batch,
@@ -3889,9 +3893,15 @@ async def apply_record(
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="DNS server not found")
-    zone = await db.get(DNSZone, body.zone_id)
-    if zone is None or zone.group_id != server.group_id:
-        raise HTTPException(status_code=404, detail="Zone not found on this server's group")
+    # #3688: the zone row first, as every record write takes it (#3535): the
+    # serial bump below must not meet a zone delete that committed meanwhile
+    # (StaleDataError) or land on a zone just moved to the trash.
+    try:
+        zone = await _require_zone(server.group_id, body.zone_id, db, lock="write")
+    except HTTPException:
+        raise HTTPException(
+            status_code=404, detail="Zone not found on this server's group"
+        ) from None
 
     if body.op != "delete":
         record = await db.get(DNSRecord, body.record_id)
@@ -6815,7 +6825,19 @@ async def update_zone(
     db: DB,
     current_user: CurrentUser,
 ) -> ZoneResponse:
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3688: the zone row first, as the record writes take it (#3535). A change
+    # to name or view_id rewrites a key column of UNIQUE (group_id, view_id,
+    # name), which takes FOR UPDATE anyway, so take that lock up front; every
+    # other edit takes the FOR NO KEY UPDATE its serial bump takes. Read
+    # plainly, an edit caught by a permanent delete died with StaleDataError
+    # (a bare 500), and one caught by a soft delete wrote into the trashed zone.
+    zone = await _require_zone(
+        group_id,
+        zone_id,
+        db,
+        current_user,
+        lock="delete" if {"name", "view_id"} & body.model_fields_set else "write",
+    )
     _reject_if_synthesised_zone(zone, "edit")
     # #1563 — explicit null CLEARS the nullable zone fields: view_id,
     # linked_subnet_id, domain_id, customer_id and notify_enabled (the
@@ -7009,9 +7031,14 @@ async def update_zone(
         )
     )
     collect_wake(dns_group_channel(group_id))
-    await db.commit()
+    # #3688: answer from the transaction's own state. A zone delete queued
+    # behind the zone-row lock runs the moment we commit, so a refresh or
+    # read AFTER the commit finds the row gone and 500s a committed edit.
+    await db.flush()
     await db.refresh(zone)
-    return await _zone_out(db, zone)
+    out = await _zone_out(db, zone)
+    await db.commit()
+    return out
 
 
 # ── Dynamic-update (RFC 2136) ACLs (issue #641) ─────────────────────────────
@@ -8262,7 +8289,11 @@ async def move_zone_commit(
     db: DB,
     current_user: SuperAdmin,
 ) -> ZoneMoveCommitResponse:
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3688: FOR UPDATE first (group_id is a key column), before the move's
+    # sweep of the zone's queued ops and every other write, so a record write
+    # that held the row first has committed its op by the time the sweep runs
+    # and a zone delete meets the move in the same order it takes everything.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="delete")
     # A reconciler-owned zone is not the operator's to re-home — the next
     # sync would recreate it in the group the integration is bound to.
     _reject_if_synthesised_zone(zone, "move")
@@ -8332,7 +8363,8 @@ async def move_zone_commit(
         )
     )
     await db.commit()
-    await db.refresh(zone)
+    # No refresh after the commit (#3688): a delete queued behind the zone
+    # lock runs right after it, and the response is built from the plan.
     resp = ZoneMoveCommitResponse.from_plan(plan)
     resp.target_tsig_key_generated = plan.target_tsig_key_generated
     return resp
@@ -8682,6 +8714,11 @@ async def apply_delegation(
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
     once and the agent / Windows-driver push happens uniformly.
     """
+    # #3688: the child and its parent are both written (the parent's records
+    # and serial), so lock both in ascending id order (``lock_order``) before
+    # anything is read for the write. The parent is found by name, so it is
+    # probed first, locked, and re-found: a parent that changed meanwhile is a
+    # 409, not a write into the wrong zone.
     child = await _require_zone(group_id, zone_id, db, current_user)
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
@@ -8690,6 +8727,20 @@ async def apply_delegation(
             detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
         )
     _enforce_zone_token_scope(current_user, parent.id)
+    parent_id = parent.id
+    await lock_zone_rows(db, [child.id, parent_id])
+    child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    parent = await find_parent_zone(db, group_id, child.name)
+    if parent is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
+        )
+    if parent.id != parent_id:
+        raise HTTPException(
+            status_code=409, detail="The zone hierarchy changed during the request; retry"
+        )
+    await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
@@ -8754,9 +8805,13 @@ async def apply_delegation(
             result="success",
         )
     )
-    await db.commit()
+    # #3688: load server-generated columns BEFORE the commit. A delete of the
+    # parent zone queued behind the zone-row lock runs the instant we commit,
+    # so a refresh after it finds the records gone and 500s a committed
+    # delegation. ``expire_on_commit=False`` keeps the loaded values.
     for record in created:
         await db.refresh(record)
+    await db.commit()
     return created
 
 
