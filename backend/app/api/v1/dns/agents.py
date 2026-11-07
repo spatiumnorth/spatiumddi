@@ -100,6 +100,7 @@ from app.services.dns.record_ops import (
     ack_op,
     apply_acks,
     lock_heartbeat_ops,
+    reassert_after_retried_deletes,
     reset_unacknowledged_ops,
     return_ops_dispatched_elsewhere,
 )
@@ -1272,7 +1273,7 @@ async def agent_heartbeat(
         )
 
     # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
-    await apply_acks(db, server.id, body.ops_ack)
+    retried_deletes = await apply_acks(db, server.id, body.ops_ack)
     # #1232 — then return any op this agent was sent and never acknowledged
     # (it restarted, or the long-poll response was lost) to the retry path.
     # After the acks, so an ack arriving now is not reset under it; here and
@@ -1300,10 +1301,12 @@ async def agent_heartbeat(
         rotated_token=rotated_token,
         rotated_expires_at=rotated_exp,
     )
+    group_id = server.group_id
+    await _reassert_after_commit(db, server.id, retried_deletes)
     # #1171 — the heartbeat that finishes a roll (the group's last BIND9 agent
     # now renders the zones' own SOA timers), or brings an older agent back,
     # switches the group and moves the serials.
-    await _switch_soa_timers(db, server.group_id)
+    await _switch_soa_timers(db, group_id)
     return response
 
 
@@ -1339,11 +1342,34 @@ async def agent_ops_ack(
     # 404, not a StaleDataError when the ack's flush finds it gone.
     if not await lock_op_ids(db, DNSRecordOp.id == op_id, DNSRecordOp.server_id == server.id):
         raise HTTPException(status_code=404, detail="Op not found")
-    await ack_op(
+    retried_deletes = await ack_op(
         db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
     )
+    server_id = server.id
     await db.commit()
+    await _reassert_after_commit(db, server_id, retried_deletes)
     return {"status": "ok"}
+
+
+async def _reassert_after_commit(
+    db: AsyncSession, server_id: uuid.UUID, retried: list[tuple[str, dict[str, Any]]]
+) -> None:
+    """#3688: the #1800 PTR re-assert, in a transaction of its own after the
+    ack has committed, holding no op row (see ``apply_acks``).
+
+    A failure here (a deadlock, a lost connection) is logged and rolled back,
+    never raised: the acks, the reset and any rotated token are already
+    committed, and a 500 would keep the rotated token from the agent (whose
+    old one no longer matches) and have it resend acks that already landed.
+    The PTR is left for the next structural pass, as before #1800."""
+    if not retried:
+        return
+    try:
+        await reassert_after_retried_deletes(db, server_id, retried)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.warning("dns_ptr_reassert_after_ack_failed", server_id=str(server_id), exc_info=True)
 
 
 class ZoneStateEntry(BaseModel):
