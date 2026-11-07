@@ -1,5 +1,0 @@
-### Fixed
-
-- Fleet pod list and pod logs no longer always answer 504 on appliances: the supervisor's kubeapi proxy now starts by default (`K8S_PROXY_ENABLED=false` opts out) and, like the other proxy loops, reaches the control plane through the in-cluster URL on a cluster member whose `CONTROL_PLANE_URL` is empty (#3618).
-- The supervisor's kubeapi proxy now runs only the requests the Fleet tab makes (pod list, pod log, workload list and rollout-restart, in the `spatium` namespace) and refuses anything else with a 403, rather than relaying whatever the control plane asked for with the supervisor's service account. A reply is accepted only from the appliance the request was sent to, and pod, container, namespace and workload names are checked as Kubernetes names before they reach a kubeapi path (#3618).
-- Pod logs open again through the kubeapi proxy: kubeapi answers a `text/plain` Accept on a log with 406, so the logs route now asks for `*/*` and the supervisor sends `*/*` for the pod-log request whatever the control plane sent (#3618).
