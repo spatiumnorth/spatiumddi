@@ -35,6 +35,7 @@ registration / 404 → sleep + retry), dormant when no capture is queued.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -45,7 +46,7 @@ import httpx
 import structlog
 
 from . import cp_tls
-from .cert_auth import build_auth_headers, load_cert
+from .cert_auth import JSON_CONTENT_TYPE, build_auth_headers, encode_json, load_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url
 from .identity import Identity, load_appliance_id
@@ -320,18 +321,21 @@ def _post_progress(
     cert_pem = load_cert(cfg.state_dir)
     if not base_url or cert_pem is None:
         return False
-    headers = build_auth_headers(
-        "POST", path, cert_pem, identity.private_key, appliance_id
-    )
     try:
-        resp = client.post(
-            base_url.rstrip("/") + path,
-            headers=headers,
-            json={
+        body = encode_json(
+            {
                 "packets": int(packets) if packets not in (None, "") else None,
                 "bytes_captured": int(bytes_captured),
                 "elapsed_s": float(elapsed_s),
-            },
+            }
+        )
+        headers = build_auth_headers(
+            "POST", path, cert_pem, identity.private_key, appliance_id, body
+        )
+        resp = client.post(
+            base_url.rstrip("/") + path,
+            headers={**headers, **JSON_CONTENT_TYPE},
+            content=body,
         )
         if resp.status_code == 200:
             return bool(resp.json().get("cancel"))
@@ -359,12 +363,23 @@ def _upload_pcap(
     cert_pem = load_cert(cfg.state_dir)
     if not base_url or cert_pem is None:
         return
-    # Cert signature is over the bare path (query excluded server-side).
+    q = f"?packets={int(packets)}" if packets not in (None, "") else ""
+    # #3631 — the signature covers the query and the body. The body is
+    # streamed, so hash the file first and sign that; the control plane
+    # compares it with what arrives before it keeps the file.
+    digest = hashlib.sha256()
+    with open(pcap_file, "rb") as fh:
+        for block in iter(lambda: fh.read(4 * 1024 * 1024), b""):
+            digest.update(block)
     headers = build_auth_headers(
-        "POST", path, cert_pem, identity.private_key, appliance_id
+        "POST",
+        path + q,
+        cert_pem,
+        identity.private_key,
+        appliance_id,
+        content_sha256=digest.hexdigest(),
     )
     headers["Content-Type"] = "application/octet-stream"
-    q = f"?packets={int(packets)}" if packets not in (None, "") else ""
 
     def _gen() -> Any:
         with open(pcap_file, "rb") as fh:
@@ -401,14 +416,12 @@ def _finalize_error(
     cert_pem = load_cert(cfg.state_dir)
     if not base_url or cert_pem is None:
         return
+    target = path + f"?error={quote(message[:300], safe='')}"
     headers = build_auth_headers(
-        "POST", path, cert_pem, identity.private_key, appliance_id
+        "POST", target, cert_pem, identity.private_key, appliance_id
     )
     try:
-        client.post(
-            base_url.rstrip("/") + path + f"?error={quote(message[:300])}",
-            headers=headers,
-        )
+        client.post(base_url.rstrip("/") + target, headers=headers)
     except httpx.HTTPError as exc:
         log.warning(
             "supervisor.pcap.finalize_error_failed", capture_id=cid, error=str(exc)

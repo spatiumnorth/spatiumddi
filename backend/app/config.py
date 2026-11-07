@@ -383,6 +383,19 @@ class Settings(BaseSettings):
     # extra round-trip into the OS.
     appliance_mode: bool = False
 
+    # #3631 — supervisors sign their requests to the control plane. The
+    # current form (``X-Appliance-Signature-Version: 2``) covers the method,
+    # the path and query, a hash of the body, a nonce and a timestamp, and
+    # each signature is accepted once. Supervisors on older builds send no
+    # version header and sign only the method, the path and a timestamp.
+    # This flag keeps accepting that older form so an appliance keeps
+    # working while it waits for its own upgrade; every use of it is logged
+    # per appliance (``appliance_cert_auth_legacy_signature``), so the
+    # window can be closed (set false) once those lines stop appearing.
+    # A request carrying the version header is always held to the current
+    # form, whatever this says.
+    appliance_legacy_signature_allowed: bool = True
+
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.
     #

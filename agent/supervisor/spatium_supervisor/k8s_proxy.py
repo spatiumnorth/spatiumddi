@@ -53,7 +53,7 @@ import structlog
 
 from . import cp_tls
 from . import appliance_state, k8s_api
-from .cert_auth import build_auth_headers, load_cert
+from .cert_auth import JSON_CONTENT_TYPE, build_auth_headers, encode_json, load_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url
 from .identity import Identity, load_appliance_id
@@ -312,17 +312,23 @@ def _proxy_once(
 
     reply_path = f"/api/v1/appliance/supervisor/k8s-proxy/reply/{request_id}"
     reply_url = _effective_control_plane_url(cfg).rstrip("/") + reply_path
-    reply_headers = build_auth_headers(
-        "POST", reply_path, cert_pem, identity.private_key, appliance_id
+    reply_body = encode_json(
+        {
+            "request_id": request_id,
+            "status": response_status,
+            "headers": {},
+            "body_b64": base64.b64encode(response_body).decode("ascii"),
+        }
     )
-    reply_body = {
-        "request_id": request_id,
-        "status": response_status,
-        "headers": {},
-        "body_b64": base64.b64encode(response_body).decode("ascii"),
-    }
+    reply_headers = build_auth_headers(
+        "POST", reply_path, cert_pem, identity.private_key, appliance_id, reply_body
+    )
     try:
-        reply_resp = client.post(reply_url, headers=reply_headers, json=reply_body)
+        reply_resp = client.post(
+            reply_url,
+            headers={**reply_headers, **JSON_CONTENT_TYPE},
+            content=reply_body,
+        )
     except httpx.HTTPError as exc:
         log.warning("supervisor.k8s_proxy.reply_failed", error=str(exc))
         return
