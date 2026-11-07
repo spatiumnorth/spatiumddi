@@ -111,7 +111,7 @@ async def test_patch_config_secrets_never_reach_the_audit_row(
         .all()
     )
     assert len(rows) == len(configs)
-    blob = json.dumps([r.new_value for r in rows])
+    blob = json.dumps([[r.new_value, r.old_value, r.changed_fields] for r in rows], default=str)
     for cfg in configs:
         for value in cfg.values():
             assert value not in blob

@@ -478,6 +478,8 @@ async def update_target(
     payload = body.model_dump(exclude_unset=True)
     # What the row held before this edit, for the audit diff (#3697).
     before = {k: getattr(row, k, None) for k in payload if k not in ("passphrase", "config")}
+    # A driver can force ``write_only`` whatever the form sent.
+    before.setdefault("write_only", row.write_only)
     before_config = dict(row.config or {})
     before_passphrase = row.passphrase_encrypted
 

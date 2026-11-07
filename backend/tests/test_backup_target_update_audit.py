@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AuditLog
+from app.services.backup.targets.secrets_config import ENC_PREFIX
 from tests.test_backup_target_update_bounds import _enc, _headers, _target
 
 
@@ -80,3 +81,45 @@ async def test_rotating_a_secret_records_the_key_not_the_value(
     (row,) = await _rows(db_session)
     assert row.new_value == {"config_keys_changed": ["connection_string"]}
     assert "CS-NEW" not in str(row.new_value)
+
+
+@pytest.mark.asyncio
+async def test_rotating_the_passphrase_names_it_never_the_value(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _headers(db_session)
+    t = await _target(db_session, "azure_blob", {"container": "c"})
+    same = await client.patch(
+        f"/api/v1/backup/targets/{t.id}",
+        json={"passphrase": "a-passphrase-long-enough"},
+        headers=headers,
+    )
+    assert same.status_code == 200, same.text
+    assert await _rows(db_session) == []  # same passphrase, fresh ciphertext: no change
+    res = await client.patch(
+        f"/api/v1/backup/targets/{t.id}",
+        json={"passphrase": "another-long-passphrase-1"},
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    (row,) = await _rows(db_session)
+    assert row.changed_fields == ["passphrase"]
+    assert "passphrase-" not in str([row.new_value, row.old_value])
+
+
+@pytest.mark.asyncio
+async def test_undecryptable_stored_secret_does_not_fail_the_edit(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _headers(db_session)
+    t = await _target(
+        db_session,
+        "azure_blob",
+        {"container": "c", "connection_string": ENC_PREFIX + "not-a-valid-token"},
+    )
+    body = _form()
+    body["config"]["connection_string"] = "CS-NEW"
+    res = await client.patch(f"/api/v1/backup/targets/{t.id}", json=body, headers=headers)
+    assert res.status_code == 200, res.text
+    (row,) = await _rows(db_session)
+    assert row.new_value == {"config_keys_changed": ["connection_string"]}
