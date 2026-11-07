@@ -18,6 +18,8 @@ in this list.
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.api.deps import require_superadmin
 from app.main import app
 from tests.test_builtin_roles_match_routes import _dependency_calls, _iter_routes
@@ -137,18 +139,21 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
 }
 
 
+def route_is_gated(route: Any) -> bool:
+    """True when the route carries ``SuperAdmin`` or a ``require_*permission``
+    dependency (route- or router-level; ``require_module`` is not one)."""
+    calls = list(_dependency_calls(route.dependant))
+    if any(c is require_superadmin for c in calls):
+        return True
+    return any(getattr(c, "spatium_requires", None) is not None for c in calls)
+
+
 def _ungated_get_paths() -> set[str]:
-    out: set[str] = set()
-    for route in _iter_routes(app.routes):
-        if "GET" not in route.methods:
-            continue
-        calls = list(_dependency_calls(route.dependant))
-        if any(c is require_superadmin for c in calls):
-            continue
-        if any(getattr(c, "spatium_requires", None) is not None for c in calls):
-            continue
-        out.add(route.path)
-    return out
+    return {
+        route.path
+        for route in _iter_routes(app.routes)
+        if "GET" in route.methods and not route_is_gated(route)
+    }
 
 
 def _all_get_paths() -> set[str]:
