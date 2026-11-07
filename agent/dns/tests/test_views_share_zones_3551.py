@@ -353,34 +353,101 @@ def test_a_copy_holding_third_party_records_is_not_shared(tmp_path: Path) -> Non
     assert (root / "zones" / "default" / "example.com.db").is_file()
 
 
-def test_turning_updates_off_does_not_merge_copies_holding_client_names(
-    tmp_path: Path,
-) -> None:
-    """Updates on: a copy per view, an .owned sidecar each, a journal on
-    default's copy (a name a client added, not yet ingested). Updates then
-    turned off, and a render for another reason: the zone is now static and
-    would share, but default's journal is data the control plane has not seen,
-    and the sidecar is gone with the switch-off. It must stay per view."""
+def _switch_off_with_a_client_name(tmp_path: Path) -> list[dict]:
+    """Updates on, a copy per view, a journal on default's copy (a name a
+    client added); then the switch-off render, promoted as the swap would.
+    Returns the static zones that render shipped."""
     Bind9Driver(state_dir=tmp_path).render(_bundle(_dynamic([_A])))
     live = _promote(tmp_path)
     default_copy = live / "zones" / "default" / "example.com.db"
     default_copy.with_name(default_copy.name + ".jnl").write_bytes(b"journal")
 
     static = _both("example.com.", [_A])
-    conf, root = _render(tmp_path, _bundle(static))
+    conf, _root = _render(tmp_path, _bundle(static))
     assert "in-view" not in conf
-    # The next render, for another zone's change, sees a live tree whose
-    # copies carry no sidecar any more (updates are off).
+    # The swap sets the journal aside with the old tree; named keeps the
+    # name in memory, and the new live copy is a bare render with no
+    # journal and no sidecar.
     live = _promote(tmp_path)
+    default_copy = live / "zones" / "default" / "example.com.db"
+    assert not default_copy.with_name(default_copy.name + ".jnl").exists()
     assert not (live / "zones" / "default" / "example.com.db.owned").exists()
+    return static
+
+
+def test_turning_updates_off_does_not_merge_copies_holding_client_names(
+    tmp_path: Path,
+) -> None:
+    """The renders after the switch-off, for other zones' changes, must not
+    share the zone while named still serves default's client-added name from
+    memory: sharing would replace default's copy and drop it (#3632)."""
+    static = _switch_off_with_a_client_name(tmp_path)
+    other = _both("other.example.", [_A])
+
+    for n in range(3):
+        other[0]["records"] = [_A, _rec(f"o{n}", "192.0.2.50")]
+        other[1]["records"] = list(other[0]["records"])
+        conf, root = _render(tmp_path, _bundle(static + other))
+        assert 'zone "example.com." { in-view' not in conf, n
+        assert (root / "zones" / "default" / "example.com.db").is_file()
+        assert (root / "zones" / "restricted" / "example.com.db").is_file()
+        _promote(tmp_path)
+
+
+def test_the_marker_is_bookkeeping_not_pushed_config(tmp_path: Path) -> None:
+    """The marker the switch-off leaves beside the copy is not config: the
+    rendered-config snapshot the operator sees does not carry it."""
+    from spatium_dns_agent.admin_pusher import _walk_rendered
+
+    _switch_off_with_a_client_name(tmp_path)
+    live = tmp_path / "rendered"
+    assert (live / "zones" / "default" / "example.com.db.unrendered").exists()
+
+    paths = [rel for rel, _ in _walk_rendered(live)]
+
+    assert "zones/default/example.com.db" in paths
+    assert not [p for p in paths if p.endswith(".unrendered")]
+
+
+def test_a_held_copy_shares_once_its_file_changes(tmp_path: Path) -> None:
+    """A change to the zone itself reloads default's copy from the render,
+    which drops what only named held: holding the pair apart then saves
+    nothing, so it shares (the control case, where an ingested name's row is
+    deleted)."""
+    _switch_off_with_a_client_name(tmp_path)
+    changed = _both("example.com.", [_A, _rec("w2", "192.0.2.12")])
+
+    conf, root = _render(tmp_path, _bundle(changed))
+
+    assert 'zone "example.com." { in-view "restricted"; };' in _view_block(
+        conf, "default"
+    )
+    assert not (root / "zones" / "default" / "example.com.db").exists()
+
+
+def test_an_ingested_name_shares_once_its_row_is_deleted(tmp_path: Path) -> None:
+    """The walk's control: default's name was ingested into a default-view
+    row before the switch-off. The copies differ while the row exists, and
+    share at the render that deletes it."""
+    extra = _rec("client", "198.51.100.79")
+    dyn = _dynamic([_A])
+    dyn[1]["records"].append(extra)
+    Bind9Driver(state_dir=tmp_path).render(_bundle(dyn))
+    live = _promote(tmp_path)
     default_copy = live / "zones" / "default" / "example.com.db"
     default_copy.with_name(default_copy.name + ".jnl").write_bytes(b"journal")
+    static = _both("example.com.", [_A])
+    static[1]["records"].append(extra)
+    for _ in range(2):
+        conf, _root = _render(tmp_path, _bundle(static))
+        assert "in-view" not in conf
+        _promote(tmp_path)
 
-    conf, root = _render(tmp_path, _bundle(static))
+    conf, _root = _render(tmp_path, _bundle(_both("example.com.", [_A])))
 
-    assert "in-view" not in conf
-    assert (root / "zones" / "default" / "example.com.db").is_file()
-    assert (root / "zones" / "restricted" / "example.com.db").is_file()
+    assert 'zone "example.com." { in-view "restricted"; };' in _view_block(
+        conf, "default"
+    )
 
 
 def test_updates_off_with_no_client_data_still_shares(tmp_path: Path) -> None:

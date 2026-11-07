@@ -486,7 +486,7 @@ serving.
 | | Forward zones (BIND refuses `in-view` of one; they hold no data, so the repeat is free) |
 | | A dynamic zone (dynamic updates on): an update a client sends through one view would be answered in the others |
 | | Every primary zone of a group with no usable group key of its own: the first operator TSIG key then holds the zone-wide update grant, and clients hold that key |
-| | A zone that has just stopped taking dynamic updates while a live copy still holds RFC 2136 records the control plane did not render (§8 #2850): the copies differ on named even when the bundle's are identical |
+| | A zone that has stopped taking dynamic updates while a copy still holds RFC 2136 records the control plane did not render (§8 #2850): the copies differ on named even when the bundle's are identical. Each copy keeps its own until the zone itself next changes, which reloads the copy from the render and drops those records anyway (#3632). The control plane's preview cannot see named, so for that window it shows the zone shared |
 | | **Every RPZ (blocklist) zone** |
 
 **Blocklists are not shared, and are usually the larger cost.** BIND

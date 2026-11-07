@@ -26,6 +26,8 @@ source address (127.0.0.2 lands in ``restricted``, anything else in
 * a dynamic zone is never shared, so an update stays in the view it was sent
   through (#3632), and one an earlier build shared splits back into per-view
   copies that each carry the shared zone's records;
+* turning updates off does not share a zone while a copy's client-added name
+  is still only in named, until a change to the zone reloads it (#3632);
 * an identical inline-signed zone shares and signs once.
 
 Exits non-zero on the first failed expectation. Never skips.
@@ -491,6 +493,65 @@ def dynamic_unshare(state: Path) -> None:
     _stop(driver)
 
 
+def dynamic_switch_off(state: Path) -> None:
+    """Updates turned off while a view's copy holds a name a client added,
+    which the control plane never ingested (#3632). named still serves it from
+    memory, so later renders for other zones must not share the zone (that
+    would replace the copy and drop the name), and turning updates back on
+    keeps it. A change to the zone itself reloads the copy and shares it."""
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    print("\n=== updates turned off while a copy holds a client's name ===")
+    driver = Bind9Driver(state_dir=state)
+    www = [("www", "192.0.2.10")]
+    driver.apply_config(_dynamic_bundle(www))
+    rc = _third_party_update(_DEFAULT_SRC, "client", "198.51.100.82")
+    check("a default-view client's update is taken", rc == "NOERROR", rc)
+    pid = driver.daemon_pid
+    off = _bundle({"restricted": www, "default": www})
+    driver.apply_config(off)
+    for n in range(3):
+        for z in off["zones"]:
+            if z["name"] == _SPLIT:
+                z["records"].append(
+                    {"name": f"o{n}", "type": "A", "value": "192.0.2.40", "ttl": 300}
+                )
+        driver.apply_config(off)
+    conf = (state / "rendered" / "named.conf").read_text()
+    check(
+        "three renders for another zone do not share it",
+        f'zone "{_SHARED}" {{ in-view' not in conf,
+    )
+    check(
+        "the client's name is still answered in default only",
+        _both(f"client.{_SHARED}") == ("NXDOMAIN", "198.51.100.82"),
+        str(_both(f"client.{_SHARED}")),
+    )
+    driver.apply_config(_dynamic_bundle(www))
+    check(
+        "turning updates back on keeps it",
+        _both(f"client.{_SHARED}") == ("NXDOMAIN", "198.51.100.82"),
+        str(_both(f"client.{_SHARED}")),
+    )
+    driver.apply_config(off)
+    changed = [*www, ("w2", "192.0.2.12")]
+    driver.apply_config(_bundle({"restricted": changed, "default": changed}))
+    conf = (state / "rendered" / "named.conf").read_text()
+    check(
+        "a change to the zone itself shares it",
+        f'zone "{_SHARED}" {{ in-view "restricted"; }};' in conf,
+    )
+    check(
+        "the change answers in both views",
+        _both(f"w2.{_SHARED}") == ("192.0.2.12",) * 2,
+        str(_both(f"w2.{_SHARED}")),
+    )
+    check(
+        "named was NOT restarted", driver.daemon_pid == pid, f"pid {driver.daemon_pid}"
+    )
+    _stop(driver)
+
+
 def dnssec_shared(state: Path) -> None:
     """An identical inline-signed zone shares, and signs, once."""
     import dns.message
@@ -537,7 +598,14 @@ def main() -> int:
                 f"FAIL: `{tool}` not on PATH — this must run inside the bind9 agent image"
             )
             return 1
-    for case in (shared, dynamic_upgrade, dynamic_per_view, dynamic_unshare, dnssec_shared):
+    for case in (
+        shared,
+        dynamic_upgrade,
+        dynamic_per_view,
+        dynamic_unshare,
+        dynamic_switch_off,
+        dnssec_shared,
+    ):
         state = Path(tempfile.mkdtemp(prefix="views-share-check-"))
         _rndc_keys(state)
         try:
