@@ -50,8 +50,8 @@ Failure modes:
   * Appliance offline / not approved → ``enqueue_command`` raises
     :class:`ApplianceOffline` *before* the long wait (router → 503).
   * Operator timeout → ``asyncio.TimeoutError`` (router → 504); the
-    queue entry is marked cancelled so the supervisor's next poll skips
-    it.
+    owner key is deleted (or, on the in-process fallback, the entry is
+    marked cancelled) so the supervisor's next poll skips it.
   * Supervisor returns a structured tool result → forwarded verbatim to
     the awaiting future.
 
@@ -77,17 +77,15 @@ from app.core import shutdown as _shutdown
 from app.core.redis_client import make_async_redis
 from app.core.shutdown import get_or_shutdown
 
-# The Redis-wait machinery is k8s_proxy's (#3703); the bounds below are its too.
-from app.services.appliance.k8s_proxy import (
-    _CLEANUP_TIMEOUT,
-    _CONNECT_TIMEOUT,
-    _FAILED,
-    _OP_TIMEOUT,
-    _READ_TIMEOUT,
-    _SLICE_SECONDS,
-    _blpop_or_shutdown,
-    _close,
-)
+# The Redis-wait bounds and blocking read are k8s_proxy's too (#3703).
+from app.services.appliance.redis_channel import CLEANUP_TIMEOUT as _CLEANUP_TIMEOUT
+from app.services.appliance.redis_channel import CONNECT_TIMEOUT as _CONNECT_TIMEOUT
+from app.services.appliance.redis_channel import FAILED as _FAILED
+from app.services.appliance.redis_channel import OP_TIMEOUT as _OP_TIMEOUT
+from app.services.appliance.redis_channel import READ_TIMEOUT as _READ_TIMEOUT
+from app.services.appliance.redis_channel import SLICE_SECONDS as _SLICE_SECONDS
+from app.services.appliance.redis_channel import blpop_or_shutdown
+from app.services.appliance.redis_channel import close_client as _close
 
 logger = structlog.get_logger(__name__)
 
@@ -451,7 +449,12 @@ async def pop_command(
                 if queued is not None and not queued.cancelled:
                     return queued
                 continue
-            raw = await _blpop_or_shutdown(client, qkey, min(remaining, _SLICE_SECONDS))
+            raw = await blpop_or_shutdown(
+                client,
+                qkey,
+                min(remaining, _SLICE_SECONDS),
+                log_event="appliance.nettool.redis_unavailable",
+            )
             if raw is _FAILED:
                 await _close(client)
                 client = None

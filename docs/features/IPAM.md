@@ -518,8 +518,8 @@ can reach the target segment (routed ICMP / directed broadcast), and a false-neg
 it is a pure DB read, so it verifies hosts on segments the worker cannot reach at all,
 provided some other subsystem (an SNMP poll of the local switch, a DHCP lease)
 observed them — which is why `auto` is the sensible default on a segmented network.
-**Appliance-vantage *active* verify** (a worker→supervisor result channel) remains the
-named follow-up, alongside the
+**Appliance-vantage *active* verify** (running the probe over the command channel, which
+the worker can now reach) remains the named follow-up, alongside the
 deferred [auto-resolve on-segment appliance from the target subnet] and the
 [scheduled-shutdown companion] below.
 

@@ -56,6 +56,16 @@ from app.core import shutdown as _shutdown
 from app.core.redis_client import make_async_redis
 from app.core.shutdown import get_or_shutdown
 
+# The Redis-wait bounds and blocking read are shared with agent_cmd (#3706).
+from app.services.appliance.redis_channel import CLEANUP_TIMEOUT as _CLEANUP_TIMEOUT
+from app.services.appliance.redis_channel import CONNECT_TIMEOUT as _CONNECT_TIMEOUT
+from app.services.appliance.redis_channel import FAILED as _FAILED
+from app.services.appliance.redis_channel import OP_TIMEOUT as _OP_TIMEOUT
+from app.services.appliance.redis_channel import READ_TIMEOUT as _READ_TIMEOUT
+from app.services.appliance.redis_channel import SLICE_SECONDS as _SLICE_SECONDS
+from app.services.appliance.redis_channel import blpop_or_shutdown
+from app.services.appliance.redis_channel import close_client as _close
+
 logger = structlog.get_logger(__name__)
 
 
@@ -101,22 +111,6 @@ MAX_QUEUED_PER_APPLIANCE = 64
 _QUEUE_TTL_SECONDS = 300
 _REPLY_TTL_SECONDS = 60
 _OWNER_GRACE_SECONDS = 30
-# One Redis blocking read is at most this long, so shutdown / a local
-# fallback entry is noticed within a second.
-_SLICE_SECONDS = 1.0
-_CONNECT_TIMEOUT = 2.0
-# A socket READ bound, longer than any BLPOP slice (which is the longest a
-# healthy server takes to answer), so a master that accepts the connection and
-# then stops answering fails the call instead of parking it. core.redis_client
-# leaves this unset on purpose (#925: the wake bus parks pub/sub reads); every
-# read here is at most one slice, so it is safe to set.
-_READ_TIMEOUT = _SLICE_SECONDS + 4.0
-# Upper bound on one Redis round trip from the caller's side: a sentinel walk
-# past dead per-pod names costs ~13 s even with the connect bounded (#925), and
-# an operator's wait must not stretch past its own timeout because of it.
-_OP_TIMEOUT = _SLICE_SECONDS + 5.0
-# Best-effort key cleanup after a request ends; every key also carries a TTL.
-_CLEANUP_TIMEOUT = 2.0
 
 
 def _client() -> Any:
@@ -125,13 +119,6 @@ def _client() -> Any:
         socket_connect_timeout=_CONNECT_TIMEOUT,
         socket_timeout=_READ_TIMEOUT,
     )
-
-
-async def _close(client: Any) -> None:
-    try:
-        await client.aclose()
-    except Exception:  # noqa: BLE001 — closing a dead connection; nothing to do
-        pass
 
 
 # Per-process fallback, used only while Redis is unreachable. defaultdict so the first enqueue for a new
@@ -365,33 +352,12 @@ async def pop_request(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> K8sP
             await _close(client)
 
 
-_FAILED: Any = object()
-
-
 async def _blpop_or_shutdown(client: Any, key: str, timeout: float) -> Any:
-    """One ``BLPOP`` slice raced against api shutdown (#3015). Returns the
-    popped value, ``None`` on timeout / shutdown, ``_FAILED`` on a Redis
-    error."""
-    read = asyncio.ensure_future(client.blpop(key, timeout=timeout))
-    stop = _shutdown.shutdown_future()
-    try:
-        await asyncio.wait(
-            {read, stop}, timeout=timeout + _OP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
-        )
-    finally:
-        _shutdown.discard(stop)
-        unfinished = not read.done()
-        if unfinished:
-            read.cancel()
-    if unfinished:
-        # Shutdown, or Redis stalled well past the slice: end this read.
-        return None if _shutdown.shutdown_requested() else _FAILED
-    try:
-        item = read.result()
-    except Exception as exc:  # noqa: BLE001 — caller degrades to the local queue
-        logger.warning("appliance.k8s_proxy.redis_unavailable", op="pop", error=str(exc))
-        return _FAILED
-    return None if item is None else item[1]
+    """One ``BLPOP`` slice raced against api shutdown (#3015); see
+    :func:`app.services.appliance.redis_channel.blpop_or_shutdown`."""
+    return await blpop_or_shutdown(
+        client, key, timeout, log_event="appliance.k8s_proxy.redis_unavailable"
+    )
 
 
 async def deliver_response(response: K8sProxyResponse, *, appliance_id: uuid.UUID) -> bool:

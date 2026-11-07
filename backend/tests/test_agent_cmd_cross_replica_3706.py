@@ -4,17 +4,21 @@ replicas and the Celery worker through Redis.
 A command enqueued on one process must reach the supervisor whose poll is
 parked on another, and the reply must reach the waiter. Each "process" gets
 its own private fallback state (``_dispatches``); the only thing they share
-is the fake Redis below, which is the point. Storage commands run ``mdadm``,
-so the at-most-once tests matter most for that channel.
+is Redis — the real one the suite uses for the cross-process tests, and a fake
+one only where a fault has to be injected. Storage commands run ``mdadm``, so
+the at-most-once tests matter most for that channel.
 """
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 import json
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -115,9 +119,24 @@ def procs(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Process, Process]]:
     yield Process(monkeypatch), Process(monkeypatch)
 
 
+# The cross-process tests below run against the REAL Redis the suite uses
+# (``settings.redis_url``, as #3703's do), not the fake: what they prove is
+# that BLPOP hands one command to one poll and the reply list reaches a waiter
+# in another process. Each simulated process keeps its own fallback state, so on
+# the pre-#3706 module (one process's memory) the poll on the other side gets
+# nothing and the assertion on it fails.
+
+
+async def _deliver(result: agent_cmd.NetToolResult, **kw: Any) -> bool:
+    out: Any = agent_cmd.deliver_result(result, **kw)
+    if inspect.isawaitable(out):  # async since #3706; sync before it
+        out = await out
+    return bool(out)
+
+
 @pytest.mark.parametrize("channel", CHANNELS)
 async def test_command_and_reply_cross_replicas(
-    redis: FakeRedis, procs: tuple[Process, Process], channel: str
+    procs: tuple[Process, Process], channel: str
 ) -> None:
     a, b = procs
     aid = uuid.uuid4()
@@ -129,9 +148,9 @@ async def test_command_and_reply_cross_replicas(
 
     b.use()  # the supervisor's poll + reply land on another replica
     queued = await agent_cmd.pop_command(aid, timeout=3.0, channel=channel)
-    assert queued is not None
+    assert queued is not None, "the command never crossed to the other replica"
     assert (queued.tool, queued.params) == ("ping", {"host": "10.0.0.1"})
-    assert await agent_cmd.deliver_result(
+    assert await _deliver(
         agent_cmd.NetToolResult(request_id=queued.request_id, result={"ok": True}),
         appliance_id=aid,
         channel=channel,
@@ -141,30 +160,49 @@ async def test_command_and_reply_cross_replicas(
     assert outcome.result == {"ok": True}
 
 
-async def test_worker_enqueue_reaches_supervisor_poll_on_an_api_replica(
-    redis: FakeRedis, procs: tuple[Process, Process]
+async def test_worker_wake_reaches_supervisor_poll_on_an_api_replica(
+    procs: tuple[Process, Process],
 ) -> None:
-    """A scheduled Wake-on-LAN enqueues from the Celery worker, which has no
-    poll of its own; it still waits for the reply for its own timeout."""
+    """A scheduled Wake-on-LAN calls ``wol.wake_via_appliance`` from the Celery
+    worker, which has no supervisor poll of its own; the packet is sent by the
+    appliance whose poll is parked on an api replica, and the worker gets the
+    result back."""
+    from app.services import wol
+
     worker, api = procs
     aid = uuid.uuid4()
-    wire = {"mac": "aa:bb:cc:dd:ee:ff", "port": 9}
+    appliance = SimpleNamespace(
+        id=aid, state="approved", last_seen_at=datetime.now(UTC), hostname="edge-1"
+    )
+
+    class _DB:
+        async def get(self, _model: Any, ident: Any) -> Any:
+            return appliance if ident == aid else None
+
+    wire = wol.WolWireRequest(mac="aa:bb:cc:dd:ee:ff", broadcast="192.0.2.255", port=9)
     worker.use()
-    call = asyncio.create_task(agent_cmd.enqueue_command(aid, "wol", wire, timeout=5.0))
+    call = asyncio.create_task(wol.wake_via_appliance(_DB(), aid, wire))  # type: ignore[arg-type]
     await asyncio.sleep(0.2)
+
     api.use()
     queued = await agent_cmd.pop_command(aid, timeout=3.0)
-    assert queued is not None and queued.tool == "wol" and queued.params == wire
-    await agent_cmd.deliver_result(
-        agent_cmd.NetToolResult(request_id=queued.request_id, result={"sent": 1}),
+    assert queued is not None, "the worker's wake never reached the api replica's poll"
+    assert queued.tool == "wol" and queued.params["mac"] == wire.mac
+    assert await _deliver(
+        agent_cmd.NetToolResult(
+            request_id=queued.request_id,
+            result={"mac": wire.mac, "broadcast": wire.broadcast, "port": 9, "sent": True},
+        ),
         appliance_id=aid,
     )
     worker.use()
-    assert (await asyncio.wait_for(call, 5.0)).result == {"sent": 1}
+    result = await asyncio.wait_for(call, 5.0)
+    assert result.sent is True
+    assert result.ran_from == "appliance:edge-1"
 
 
 async def test_wrong_appliance_reply_refused_and_abandoned_command_skipped(
-    redis: FakeRedis, procs: tuple[Process, Process]
+    procs: tuple[Process, Process],
 ) -> None:
     a, b = procs
     aid = uuid.uuid4()
@@ -177,15 +215,18 @@ async def test_wrong_appliance_reply_refused_and_abandoned_command_skipped(
     queued = await agent_cmd.pop_command(aid, timeout=3.0, channel=agent_cmd.CHANNEL_STORAGE)
     assert queued is not None
     forged = agent_cmd.NetToolResult(request_id=queued.request_id, result={"forged": True})
-    assert not await agent_cmd.deliver_result(
-        forged, appliance_id=uuid.uuid4(), channel=agent_cmd.CHANNEL_STORAGE
-    )
+    assert not await _deliver(forged, appliance_id=uuid.uuid4(), channel=agent_cmd.CHANNEL_STORAGE)
     # Not the same channel either.
-    assert not await agent_cmd.deliver_result(forged, appliance_id=aid)
-    call.cancel()
-    await asyncio.gather(call, return_exceptions=True)
-
+    assert not await _deliver(forged, appliance_id=aid)
+    # The genuine reply still lands after the refused ones.
+    assert await _deliver(
+        agent_cmd.NetToolResult(request_id=queued.request_id, result={"ok": 1}),
+        appliance_id=aid,
+        channel=agent_cmd.CHANNEL_STORAGE,
+    )
     a.use()
+    assert (await asyncio.wait_for(call, 5.0)).result == {"ok": 1}
+
     with pytest.raises(TimeoutError):
         await agent_cmd.enqueue_command(aid, "ping", {}, timeout=0.3)
     b.use()
@@ -194,21 +235,24 @@ async def test_wrong_appliance_reply_refused_and_abandoned_command_skipped(
 
 @pytest.mark.parametrize("channel", CHANNELS)
 async def test_a_command_is_handed_out_at_most_once(
-    redis: FakeRedis, procs: tuple[Process, Process], channel: str
+    procs: tuple[Process, Process], channel: str
 ) -> None:
     a, b = procs
     aid = uuid.uuid4()
     a.use()
     call = asyncio.create_task(
-        agent_cmd.enqueue_command(aid, "ping", {}, timeout=1.5, channel=channel)
+        agent_cmd.enqueue_command(aid, "ping", {}, timeout=2.5, channel=channel)
     )
     await asyncio.sleep(0.2)
-    # Two polls (two replicas, or a supervisor retry) race for one command.
+    # Two polls on another replica (or a supervisor retry) race for one command
+    # through a real BLPOP; exactly one gets it.
+    b.use()
     got = await asyncio.gather(
-        agent_cmd.pop_command(aid, timeout=1.0, channel=channel),
-        agent_cmd.pop_command(aid, timeout=1.0, channel=channel),
+        agent_cmd.pop_command(aid, timeout=1.5, channel=channel),
+        agent_cmd.pop_command(aid, timeout=1.5, channel=channel),
     )
     assert sum(g is not None for g in got) == 1
+    a.use()
     with pytest.raises(TimeoutError):
         await call
 
