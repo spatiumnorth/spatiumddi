@@ -1136,6 +1136,10 @@ class _Housekeeper:
         self._pending: tuple[Callable[[], None], float, Any] | None = None
         self._pending_seq = 0
         self._done_seq = 0
+        # #3735 — the seqs whose run() gave up waiting. The worker logs
+        # housekeeping_done for exactly those jobs, decided under the lock, so
+        # the line no longer depends on two clocks agreeing about a near-tie.
+        self._deferred: set[int] = set()
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -1164,6 +1168,7 @@ class _Housekeeper:
             while self._done_seq < seq:
                 left = started + wait_s - time.monotonic()
                 if left <= 0:
+                    self._deferred.add(seq)
                     log.info(
                         "supervisor.heartbeat.housekeeping_deferred",
                         waited_s=round(time.monotonic() - started, 1),
@@ -1189,7 +1194,7 @@ class _Housekeeper:
             with self._cond:
                 while self._pending is None:
                     self._cond.wait()
-                (job, wait_s, log), seq = self._pending, self._pending_seq
+                (job, _wait_s, log), seq = self._pending, self._pending_seq
                 self._pending = None
                 self._running = True
             started = time.monotonic()
@@ -1200,11 +1205,19 @@ class _Housekeeper:
             finally:
                 took = time.monotonic() - started
                 with self._cond:
+                    # #3735 — log the job a run() deferred, and do it before
+                    # publishing completion: drain() may return the moment
+                    # notify_all() fires.
+                    if seq in self._deferred:
+                        log.info(
+                            "supervisor.heartbeat.housekeeping_done",
+                            elapsed_s=round(took, 1),
+                        )
+                    # A superseded job never runs; forget its seq with this one.
+                    self._deferred = {s for s in self._deferred if s > seq}
                     self._running = False
                     self._done_seq = seq
                     self._cond.notify_all()
-            if took > wait_s:
-                log.info("supervisor.heartbeat.housekeeping_done", elapsed_s=round(took, 1))
 
 
 _housekeeper = _Housekeeper()
