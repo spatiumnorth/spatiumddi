@@ -704,8 +704,8 @@ async def test_retry_after_is_the_remaining_window() -> None:
     from app.core import auth_throttle
 
     class FakeRedis:
-        async def ttl(self, key):  # type: ignore[no-untyped-def]
-            return 17
+        async def pttl(self, key):  # type: ignore[no-untyped-def]
+            return 16_400
 
         async def aclose(self) -> None:
             pass
@@ -725,8 +725,8 @@ class _FakeRedis:
         self.keys[key] = self.keys.get(key, 0) + 1
         return self.keys[key]
 
-    async def ttl(self, key):  # type: ignore[no-untyped-def]
-        return 37 if key in self.keys else -2
+    async def pttl(self, key):  # type: ignore[no-untyped-def]
+        return 36_200 if key in self.keys else -2
 
     async def aclose(self) -> None:
         pass
@@ -845,7 +845,7 @@ async def test_the_self_query_past_the_budget_is_refused_and_writes_nothing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ttl", [-2, -1, 0])
+@pytest.mark.parametrize("ttl", [-2, -1])
 async def test_retry_after_falls_back_to_the_window_without_a_live_key(ttl: int) -> None:
     """A key that has expired (-2) or lost its expiry (-1) must not produce a
     Retry-After of 0 or less: the client would retry at once."""
@@ -854,7 +854,7 @@ async def test_retry_after_falls_back_to_the_window_without_a_live_key(ttl: int)
     from app.core import auth_throttle
 
     class R:
-        async def ttl(self, key):  # type: ignore[no-untyped-def]
+        async def pttl(self, key):  # type: ignore[no-untyped-def]
             return ttl
 
         async def aclose(self) -> None:
@@ -903,3 +903,32 @@ async def test_held_reads_the_log_budget_setting_live(client, db_session) -> Non
     assert res.status_code == 200, res.text
     assert limiter.await_args is not None
     assert limiter.await_args.args[1] == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pttl_ms", "expected"), [(300, 1), (0, 1), (52_400, 53), (1000, 1), (1001, 2)]
+)
+async def test_retry_after_rounds_up_from_milliseconds(pttl_ms: int, expected: int) -> None:
+    """#3633: whole-second TTL rounds to nearest, so the header could be 0.5 s
+    short (refused again after waiting it out) or 0 -> the 60 s fallback."""
+    from unittest.mock import patch
+
+    from app.core import auth_throttle
+
+    class R:
+        async def pttl(self, key):  # type: ignore[no-untyped-def]
+            return pttl_ms
+
+        async def aclose(self) -> None:
+            pass
+
+    with patch.object(auth_throttle, "make_async_redis", lambda *a, **k: R()):
+        assert await auth_throttle.e911_lookup_retry_after("t") == expected
+        assert await auth_throttle.stepup_block_seconds_left("u") == expected
+
+
+def test_pttl_helper_ceils_and_falls_back() -> None:
+    from app.core.auth_throttle import retry_after_from_pttl_ms as f
+
+    assert (f(300, 60), f(52_400, 60), f(-1, 60), f(-2, 60)) == (1, 53, 60, 60)
