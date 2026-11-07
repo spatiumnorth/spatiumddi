@@ -427,9 +427,13 @@ DNSView
 
 ### Where a zone renders, and deleting a view (#2275)
 
-A zone renders into the view its `view_id` names **and** into the view of each
-view-scoped record in it. A zone with neither is *shared* and renders into every
-view (and every geo view, §17). A group with no views renders each zone once.
+A zone with a `view_id` renders into that view alone among the operator views
+(and into every geo view, §17); a record in it scoped to another view is not
+rendered and does not carry the zone into that view. A zone with no `view_id`
+renders into the view of each view-scoped record in it, and with none of those
+it is *shared* and renders into every view (and every geo view). A record
+learned from an RFC 2136 update (§19.5) follows its zone and never decides
+where it renders. A group with no views renders each zone once.
 
 - **A view that still scopes zones or records cannot be deleted** (409, naming
   them). `view_id` is `ON DELETE SET NULL`, and NULL means shared, so deleting
@@ -470,10 +474,13 @@ view "default"    { zone "example.com." { in-view "restricted"; }; };
 Views keep the order you gave them (it decides which view a client lands
 in); the defining view is simply the first one that holds the copy. Only
 that view has a zone file, and a record change to the zone reaches every
-view that references it. An RFC 2136 update from a client of any of those
-views lands in the one shared zone; if the copies later stop being identical,
-each view's new copy starts from the shared zone's data, so no view loses a
-record it was serving.
+view that references it. A zone that accepts RFC 2136 updates from clients
+is never shared (#3632): an update sent through one view would land in the
+one shared zone and be answered in every view, which split-horizon exists to
+prevent. When copies that were shared stop being shared (they stop being
+identical, or a zone an earlier build shared accepts updates), each view's
+new copy starts from the shared zone's data, so no view loses a record it was
+serving.
 
 | Shared once | Still one copy per view |
 |---|---|
@@ -481,7 +488,9 @@ record it was serving.
 | Primary, secondary and stub zones | A zone whose `allow-transfer`, notify, also-notify, dynamic-update ACL or DNSSEC settings differ between its copies (options live on the defining view only) |
 | | A zone in views whose `allow-query` differs: a shared zone takes its query ACL from the defining view, so sharing it would refuse the other view's clients |
 | | Forward zones (BIND refuses `in-view` of one; they hold no data, so the repeat is free) |
-| | A dynamic zone whose copies named already holds separately, when either copy holds RFC 2136 records the control plane did not render (a DHCP server's or AD's updates, §8 #2850): the copies differ on named even when the bundle's are identical, and sharing would drop one view's records or show them to the other |
+| | A dynamic zone (dynamic updates on): an update a client sends through one view would be answered in the others |
+| | Every primary zone of a group with no usable group key of its own: the first operator TSIG key then holds the zone-wide update grant, and clients hold that key |
+| | A zone that has stopped taking dynamic updates while a copy still holds RFC 2136 records the control plane did not render (§8 #2850): the copies differ on named even when the bundle's are identical. Each copy keeps its own until the zone itself next changes, which reloads the copy from the render and drops those records anyway (#3632). The control plane's preview cannot see named, so for that window it shows the zone shared |
 | | **Every RPZ (blocklist) zone** |
 
 **Blocklists are not shared, and are usually the larger cost.** BIND
@@ -2614,6 +2623,22 @@ other case nothing is filed and the endpoint answers
 `skipped: view_ambiguous` or `view_not_read`: the control plane never
 guesses a view, because a guess mirrors one view's records into another
 view's zone, where that view's clients are answered them.
+
+**A learned record keeps the view it was written in.** A zone rendered into
+several views loads one copy per view, and an RFC 2136 update lands in one
+of them. A record learned from a report that names its view is stored scoped
+to that view, so it renders into that view's copy only rather than into every
+view's. A zone rendered into a single view, or a group with no views, keeps
+learned records unscoped. A learned record's view never changes which views
+the zone itself renders into, and a report from one view never matches or
+removes a record learned in another. A report that names no view (an agent
+built before the field) stores unscoped records as before, and the control
+plane logs `dns_ingest_report_without_view` (once per server and zone, then at
+debug) when the zone is in more than one view. Learned records stored unscoped
+before this change stay unscoped. A learned record keeps its view when the
+zone later stops rendering into that view: it is then served nowhere, is not
+removed by reports from the zone's other views, and is listed (blocking the
+delete) when that view is deleted, until an operator removes it.
 
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only

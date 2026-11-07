@@ -29,6 +29,7 @@ from app.models.dns import DNSRecord, DNSServer, DNSView, DNSZone
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone_clause,
     records_for_view,
     views_rendering_zone,
 )
@@ -365,6 +366,7 @@ async def served_apex_for_zones(
                     DNSRecord.zone_id.in_(viewed),
                     DNSRecord.deleted_at.is_(None),
                     DNSRecord.view_id.is_not(None),
+                    places_zone_clause(),
                 )
                 .distinct()
             )

@@ -105,7 +105,12 @@ _MAX_ERROR = 2000
 #   ``initial-key``. Unchanged for every other group; for one in either state
 #   the ETag moves once, so a group BIND refused before the upgrade converges at
 #   the upgrade instead of at its first change.
-RENDERER_REVISION = 16
+# 17 (#3638): a zone pinned to a view renders into that view alone among the
+#   operator views, even when one of its records names another view (left by
+#   a re-pin or a restore). Unchanged for every other zone; a group holding
+#   such a zone stops serving it in the other view at the upgrade instead of
+#   at its next change.
+RENDERER_REVISION = 17
 
 
 def _serves(revision: int | None) -> bool:
