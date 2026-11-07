@@ -99,7 +99,7 @@ _STEPUP_FAIL_WINDOW_SECONDS = 15 * 60
 # for the legitimate caller and tight for anything enumerating a VLAN.
 _E911_SELF_RL_MAX = 10
 _E911_SELF_RL_WINDOW_SECONDS = 300
-# Window for the per-caller budget of HELD lookups that get a trail row
+# Window for the per-caller budget of HELD lookups
 # (#3514). The budget itself is ``PlatformSettings.e911_lookup_log_budget_per_minute``.
 _E911_LOG_RL_WINDOW_SECONDS = 60
 
@@ -229,7 +229,9 @@ async def login_rate_limited(ip: str | None) -> bool:
 # own budget is not charged to the install-wide one, so hammering one name
 # cannot spend everyone's budget on its own; a request the install-wide
 # budget refuses gives the username its attempt back.
-# Returns {allowed, username_charged, global_charged, retry_after}.
+# Returns {allowed, username_charged, global_charged, retry_after_ms}: the
+# refusing key's PTTL in MILLISECONDS, rounded up to a header by
+# ``retry_after_from_pttl_ms`` (#3633).
 _LOGIN_CLAIM_LUA = """
 local function bump(key)
   local n = redis.call('INCR', key)
@@ -243,7 +245,7 @@ local mg = tonumber(ARGV[3])
 local uc = 0
 if mu > 0 then
   if bump(KEYS[1]) > mu then
-    return {0, 0, 0, redis.call('TTL', KEYS[1])}
+    return {0, 0, 0, redis.call('PTTL', KEYS[1])}
   end
   uc = 1
 end
@@ -252,12 +254,25 @@ if mg > 0 then
     if uc == 1 then
       redis.call('DECR', KEYS[1])
     end
-    return {0, 0, 0, redis.call('TTL', KEYS[2])}
+    return {0, 0, 0, redis.call('PTTL', KEYS[2])}
   end
   return {1, uc, 1, 0}
 end
 return {1, uc, 0, 0}
 """
+
+
+def retry_after_from_pttl_ms(pttl_ms: int, fallback: int) -> int:
+    """Whole seconds for a ``Retry-After`` header from a Redis ``PTTL``.
+
+    Rounds UP, minimum 1: ``TTL`` rounds to nearest, so a header built from
+    it can be up to 0.5 s short (the client that waits exactly that long is
+    refused again) and reads 0 when under 0.5 s remains. ``fallback`` is for
+    a key that is gone (-2) or has no expiry (-1): too long only delays a
+    retry, too short sends the client back while it is still blocked."""
+    if pttl_ms < 0:
+        return fallback
+    return max(1, -(-pttl_ms // 1000))
 
 
 @dataclass(frozen=True)
@@ -324,10 +339,10 @@ async def claim_login_attempt(username: str) -> LoginClaim:
             username_charged=bool(int(user_charged)),
             global_charged=bool(int(global_charged)),
         )
-    ttl = int(ttl)
-    # Too long a Retry-After only delays a retry; too short sends the client
-    # back while it is still refused.
-    return LoginClaim(allowed=False, retry_after=ttl if ttl > 0 else LOGIN_FAIL_WINDOW_SECONDS)
+    return LoginClaim(
+        allowed=False,
+        retry_after=retry_after_from_pttl_ms(int(ttl), LOGIN_FAIL_WINDOW_SECONDS),
+    )
 
 
 async def refund_login_attempt(username: str, claim: LoginClaim) -> None:
@@ -381,18 +396,19 @@ async def e911_self_query_rate_limited(ip: str | None) -> bool:
 
 
 async def e911_lookup_log_rate_limited(actor: str, budget: int) -> bool:
-    """True when ``actor`` has logged more than ``budget`` lookups in the
-    current minute (#3514).
+    """True when ``actor`` has made more than ``budget`` HELD lookups in the
+    current minute (#3514, #3633).
 
-    ``POST /held`` is a read-scoped route that still writes one
-    ``e911_resolution_log`` row per call, so without a bound a read token
+    ``POST /held`` is a read-scoped route that writes one
+    ``e911_resolution_log`` row per answer, so without a bound a read token
     grows that table as fast as it can call. Past the budget the lookup is
-    still ANSWERED; it is counted in a per-caller per-minute counter row
-    instead of getting a row of its own.
+    REFUSED (429) and resolves nothing, so every location handed out has a
+    trail row of its own.
 
-    **Fails OPEN**, the opposite of the self-query throttle: this guards
-    the log, not the answer, and an outage must not cost the audit trail.
-    The retention prune (``prune_e911_resolution_log``) still bounds growth.
+    **Fails OPEN**: this guards the trail's growth, and an outage of the
+    counter must not turn into a location outage on an emergency-services
+    surface. Every answer still gets its own row, and the retention prune
+    (``prune_e911_resolution_log``) still bounds growth.
     """
     key = f"e911_log_rl:{actor}"
     try:
@@ -405,6 +421,22 @@ async def e911_lookup_log_rate_limited(actor: str, budget: int) -> bool:
     except Exception as exc:  # noqa: BLE001 — fail open, see above
         logger.warning("e911_lookup_log_rate_limit_redis_unavailable", error=str(exc))
         return False
+
+
+async def e911_lookup_retry_after(actor: str) -> int:
+    """Seconds until ``actor``'s lookup budget window resets, for a
+    ``Retry-After`` header. Falls back to the full window when it cannot be
+    read: a client told to wait a bit too long is better than one told 0."""
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            pttl = int(await r.pttl(f"e911_log_rl:{actor}"))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — see above
+        logger.warning("e911_lookup_retry_after_redis_unavailable", error=str(exc))
+        return _E911_LOG_RL_WINDOW_SECONDS
+    return retry_after_from_pttl_ms(pttl, _E911_LOG_RL_WINDOW_SECONDS)
 
 
 async def mfa_challenge_consume(jti: str | None) -> bool:
@@ -579,13 +611,13 @@ async def stepup_block_seconds_left(user_id: object) -> int:
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            ttl = int(await r.ttl(_stepup_key(user_id)))
+            pttl = int(await r.pttl(_stepup_key(user_id)))
         finally:
             await r.aclose()
     except Exception as exc:  # noqa: BLE001 — only the header depends on it
         logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
         return _STEPUP_FAIL_WINDOW_SECONDS
-    return ttl if ttl > 0 else _STEPUP_FAIL_WINDOW_SECONDS
+    return retry_after_from_pttl_ms(pttl, _STEPUP_FAIL_WINDOW_SECONDS)
 
 
 async def record_stepup_password_failure(user_id: object) -> None:
