@@ -46,7 +46,12 @@ from app.models.dhcp import (
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.class_refs import reserved_name_reason
 from app.services.dhcp.option_spelling import group_raw_codes
-from app.services.dhcp.option_validation import canonical_domain_options, rekey_raw_options
+from app.services.dhcp.option_validation import (
+    canonical_domain_options,
+    raw_code_keys,
+    rekey_raw_options,
+    validate_options,
+)
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 from app.services.import_savepoint import entity_savepoint
 from app.services.ipam.resize import _total_ips
@@ -54,6 +59,7 @@ from app.services.ipam.utilization import recount_subnets_and_blocks
 
 from .canonical import (
     ConflictAction,
+    ImportedClientClass,
     ImportedScope,
     ImportPreview,
     ImportSource,
@@ -169,6 +175,68 @@ def drop_invalid_pools(scopes: list[ImportedScope]) -> list[str]:
                     f"not imported: {problem}"
                 )
         scope.pools = kept
+    return warnings
+
+
+def _drop_refused_options(options: dict[str, Any], *, address_family: str, owner: str) -> list[str]:
+    """Remove each option ``validate_options`` refuses from ``options``.
+
+    Raw-code keys (``code:NN`` / ``opt-NN``) are left to ``rekey_raw_options``,
+    which re-spells them for the target group at commit. Returns one warning
+    per removed option, naming it and the reason.
+    """
+    warnings: list[str] = []
+    raw = set(raw_code_keys(options))
+    for key in list(options):
+        if str(key) in raw:
+            continue
+        try:
+            validate_options({key: options[key]}, address_family=address_family)
+        except ValueError as exc:
+            warnings.append(f"{owner}: option {str(key)!r} not imported: {exc}")
+            del options[key]
+    return warnings
+
+
+def drop_invalid_options(
+    scopes: list[ImportedScope], client_classes: list[ImportedClientClass]
+) -> list[str]:
+    """Remove every option the scope / static / client-class API would refuse.
+
+    The importers kept an ``option-data`` / ``option`` name as the source wrote
+    it, so an option the save-time check (``validate_options``) refuses — a
+    name the platform does not map (``dhcp-renewal-time``), or a value Kea
+    cannot load (``routers`` ``10.250.4.999``) — was stored and reached the
+    rendered Kea config, whose load then fails for the whole server group
+    (#3730). Same contract as the other ``drop_*`` checks: runs on the preview
+    and again on the commit, the scope / reservation / class is still
+    imported, and each dropped option is named in the returned warnings.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        warnings.extend(
+            _drop_refused_options(
+                scope.options, address_family=scope.address_family, owner=scope.subnet_cidr
+            )
+        )
+        for r in scope.reservations:
+            warnings.extend(
+                _drop_refused_options(
+                    r.options,
+                    address_family=scope.address_family,
+                    owner=f"{scope.subnet_cidr}: reservation {r.ip_address}",
+                )
+            )
+    for cc in client_classes:
+        if not cc.supported:
+            continue
+        warnings.extend(
+            _drop_refused_options(
+                cc.options,
+                address_family=cc.address_family or "ipv4",
+                owner=f"client class {cc.name!r}",
+            )
+        )
     return warnings
 
 
@@ -685,6 +753,7 @@ async def commit_import(
     warnings.extend(drop_invalid_reservations(preview.scopes))
     warnings.extend(drop_unservable_hostnames(preview.scopes))
     warnings.extend(drop_invalid_pools(preview.scopes))
+    warnings.extend(drop_invalid_options(preview.scopes, preview.client_classes))
 
     # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
     # importer keeps an unmapped option as ``opt-NN``), whatever the target
