@@ -82,6 +82,15 @@ def test_an_identical_copy_is_referenced_in_view() -> None:
     assert 'zone "example.com." { in-view "restricted"; };' in _default_view(out)
 
 
+def test_a_dynamic_zone_keeps_its_own_copy_per_view() -> None:
+    out = _render(
+        _z("restricted", dynamic_update_enabled=True),
+        _z("default", dynamic_update_enabled=True),
+    )
+    assert "in-view" not in out
+    assert out.count("type master;") == 2
+
+
 def test_a_view_specific_record_keeps_its_own_copy() -> None:
     other = RecordData(name="www", record_type="A", value="198.51.100.10", ttl=300)
     out = _render(_z("restricted"), _z("default", (other,)))

@@ -103,6 +103,11 @@ def _agent_view(apex: Any, ns_from_records: list[str]) -> dict[str, Any]:
         "soa": {"mname": apex.soa_mname, "rname": apex.soa_rname},
         "ns": list(apex.ns) if apex.ns else ns_from_records,
         "placeholder_glue_loopback": apex.placeholder_glue,
+        # #3670: the agent's own notes on why.
+        "unaddressed_primary_ns": next(
+            (d for k, d in apex.notes if k == "unaddressed_primary_ns"), None
+        ),
+        "unaddressed_ns": [d for k, d in apex.notes if k == "unaddressed_ns"],
     }
 
 
@@ -144,6 +149,8 @@ async def _compare(
                     "soa": v["soa"],
                     "ns": v["ns"],
                     "placeholder_glue_loopback": v["placeholder_glue_loopback"],
+                    "unaddressed_primary_ns": v["unaddressed_primary_ns"],
+                    "unaddressed_ns": v["unaddressed_ns"],
                 }
                 for v in served["by_view"]
             }
@@ -153,6 +160,8 @@ async def _compare(
                 "soa": served["soa"],
                 "ns": served["ns"],
                 "placeholder_glue_loopback": served["placeholder_glue_loopback"],
+                "unaddressed_primary_ns": served["unaddressed_primary_ns"],
+                "unaddressed_ns": served["unaddressed_ns"],
             }
             for view_name, agent in per_view.items():
                 assert agent == want, (zone.name, view_name)

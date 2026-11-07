@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import uuid
@@ -1967,6 +1968,44 @@ class ResolverSettingsUpdate(BaseModel):
         return self
 
 
+# ── Settings-save audit (non-negotiable #4) ────────────────────────────────────
+#
+# Some sections of the settings PUT write their own audit row (SSH, resolver,
+# syslog, APT, maintenance, supervisor registration, branding, retention and
+# the integration switches, which are feature-module rows). Every OTHER field
+# used to be saved with only a ``logger.info`` line. One extra row per save
+# covers exactly those, so a single save writes the section rows it always did
+# plus at most one "general" row; nothing is recorded twice, and the sections
+# keep their purpose-built shapes (and the redaction each needs).
+
+# Fields whose changes a dedicated section row already records.
+_SECTION_AUDITED_PREFIXES: tuple[str, ...] = (
+    "ssh_",
+    "resolver_",
+    "syslog_",
+    "apt_",
+    "maintenance_",
+    "login_banner_",
+    "env_banner_",
+)
+_SECTION_AUDITED_FIELDS: frozenset[str] = frozenset(
+    {*RETENTION_FIELDS, "app_title", "supervisor_registration_enabled"}
+)
+
+# Write-only secrets: request field -> encrypted column. The audit row shows
+# that they changed, never what they were or became.
+_SECRET_FIELD_COLUMNS: dict[str, str] = {
+    "fingerbank_api_key": "fingerbank_api_key_encrypted",
+    "snmp_community": "snmp_community_encrypted",
+    "audit_forward_webhook_url": "audit_forward_webhook_url_encrypted",
+    "audit_forward_webhook_auth_header": "audit_forward_webhook_auth_header_encrypted",
+}
+
+
+def _is_section_audited(field: str) -> bool:
+    return field in _SECTION_AUDITED_FIELDS or field.startswith(_SECTION_AUDITED_PREFIXES)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -2158,6 +2197,21 @@ async def update_settings(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="resolver override mode requires at least one DNS server",
             )
+
+    # Old values of the fields the generic audit row below covers, taken before
+    # anything is popped or written. Secrets are reduced to set / unset and
+    # ``snmp_v3_users`` to its redacted shape.
+    _general_fields = [f for f in changes if not _is_section_audited(f)]
+    _general_old: dict[str, Any] = {}
+    for _f in _general_fields:
+        if _f in _SECRET_FIELD_COLUMNS:
+            _general_old[_f] = (
+                "<set>" if getattr(settings, _SECRET_FIELD_COLUMNS[_f]) else "<unset>"
+            )
+        elif _f == "snmp_v3_users":
+            _general_old[_f] = [_redact_v3_user(u) for u in (settings.snmp_v3_users or [])]
+        else:
+            _general_old[_f] = copy.deepcopy(getattr(settings, _f, None))
 
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
@@ -2813,6 +2867,39 @@ async def update_settings(
                     "env_banner_fg": str(settings.env_banner_fg or ""),
                     "env_banner_position": str(settings.env_banner_position or "top"),
                 },
+            )
+        )
+
+    # Every field the section rows above do not cover: one row, old and new
+    # values, secrets shown as set / cleared only. Echoing the form back (no
+    # real change) writes nothing.
+    _general_new: dict[str, Any] = {}
+    for _f in _general_fields:
+        if _f in _SECRET_FIELD_COLUMNS:
+            _general_new[_f] = "<cleared>" if changes.get(f"{_f}_cleared") else "<set>"
+        elif _f == "snmp_v3_users":
+            _general_new[_f] = snmp_users_audit
+        else:
+            _general_new[_f] = getattr(settings, _f, None)
+    _general_changed = sorted(
+        f
+        for f in _general_fields
+        if f in _SECRET_FIELD_COLUMNS or _general_new[f] != _general_old[f]
+    )
+    if _general_changed:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="general",
+                resource_display="Platform settings",
+                result="success",
+                changed_fields=_general_changed,
+                old_value={f: _general_old[f] for f in _general_changed},
+                new_value={f: _general_new[f] for f in _general_changed},
             )
         )
 
