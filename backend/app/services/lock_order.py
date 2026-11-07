@@ -284,7 +284,15 @@ def _uuid_or_none(raw: Any) -> uuid.UUID | None:
 
 
 async def _published_zone_ids(db: AsyncSession, ip_ids: list[Any]) -> set[Any]:
-    """The zones holding an auto-generated record of any of ``ip_ids``."""
+    """The zones holding an auto-generated record of any of ``ip_ids``, live or
+    trashed.
+
+    The trashed ones count (#3687): the writers that purge an address's
+    trashed records (``purge_trashed_address_records``) delete them in
+    whatever zone they sit, and a permanent zone delete takes the zone row
+    before it deletes that zone's records, trashed ones included. A purge
+    that ran before its zone was locked would hold the record and then wait
+    for the zone, the reverse of the delete."""
     from app.models.dns import DNSRecord  # noqa: PLC0415
 
     found: set[Any] = set()
@@ -299,6 +307,7 @@ async def _published_zone_ids(db: AsyncSession, ip_ids: list[Any]) -> set[Any]:
                         DNSRecord.auto_generated.is_(True),
                     )
                     .distinct()
+                    .execution_options(include_deleted=True)
                 )
             )
             .scalars()
@@ -420,6 +429,76 @@ async def lock_zones_for_addresses(
     for subnet, ip in pub:
         zones |= await _publish_zone_ids(db, ip, subnet, zone_id, subnet_cache, ddns)
     await lock_zone_rows(db, zones)
+
+
+async def _mirror_zone_and_address_ids(
+    db: AsyncSession, lease_ids: list[Any]
+) -> tuple[set[Any], set[Any]]:
+    """(zone ids, ``ip_address`` ids) a teardown of the mirrors at
+    ``lease_ids``' addresses writes: the zones holding an auto-generated
+    record, live or trashed, of such a mirror, and the mirrors plus every
+    address linked to one of those records (``dns_record_id``)."""
+    from app.models.dhcp import DHCPLease  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    zones: set[Any] = set()
+    addrs: set[Any] = set()
+    records: set[Any] = set()
+    for i in range(0, len(lease_ids), _CHUNK):
+        chunk = lease_ids[i : i + _CHUNK]
+        mirrors = (
+            select(IPAddress.id)
+            .join(DHCPLease, DHCPLease.ip_address == IPAddress.address)
+            .where(DHCPLease.id.in_(chunk), IPAddress.auto_from_lease.is_(True))
+            .execution_options(include_deleted=True)
+        )
+        addrs.update((await db.execute(mirrors)).scalars().all())
+        for zone_id, record_id in (
+            await db.execute(
+                select(DNSRecord.zone_id, DNSRecord.id)
+                .join(IPAddress, IPAddress.id == DNSRecord.ip_address_id)
+                .join(DHCPLease, DHCPLease.ip_address == IPAddress.address)
+                .where(
+                    DHCPLease.id.in_(chunk),
+                    IPAddress.auto_from_lease.is_(True),
+                    DNSRecord.auto_generated.is_(True),
+                )
+                .execution_options(include_deleted=True)
+            )
+        ).all():
+            zones.add(zone_id)
+            records.add(record_id)
+    addrs |= await address_ids_of_records(db, records)
+    return zones, addrs
+
+
+async def lock_zones_for_lease_mirrors(db: AsyncSession, lease_ids: Iterable[Any]) -> None:
+    """Lock, in one id-ordered pass, every zone holding an auto-generated
+    record, live or trashed, of the lease mirror at any of ``lease_ids``'
+    addresses (#3687) — after the ``ip_address`` rows that teardown writes:
+    the mirrors and the addresses linked to the records it deletes (``dns_record_id``
+    is ``ON DELETE SET NULL``), ascending id (#3690). A permanent zone
+    delete locks those address rows before its zone row (#3691), so a
+    teardown holding the zone and then writing an address would deadlock
+    with it.
+
+    For a unit of work that tears the mirrors down lease by lease (a DHCP
+    server delete) and so purges their trashed records in any zone before it
+    reaches a later lease's live zones. Matched on address alone: a zone
+    locked for an address the lease's own subnet does not hold costs only
+    the wait a writer to it would have had anyway."""
+    ids = sorted({i for i in lease_ids if i is not None})
+    if not ids:
+        return
+
+    async def find() -> set[Any]:
+        return (await _mirror_zone_and_address_ids(db, ids))[1]
+
+    async def take() -> None:
+        await lock_zone_rows(db, (await _mirror_zone_and_address_ids(db, ids))[0])
+
+    await lock_addresses_before(db, find, take)
 
 
 async def zone_ids_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> set[Any]:
@@ -559,14 +638,52 @@ async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) ->
     """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
     write: the zones holding a record of any of their addresses (the lease
     mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
-    and the reverse zones the subnets are linked to (retired or re-linked)."""
-    await lock_zone_rows(db, await zone_ids_for_subnets(db, subnet_ids))
+    and the reverse zones the subnets are linked to (retired or re-linked).
+
+    The subnets' address rows that carry a record or a mirror are locked
+    first, ascending id (#3690): the retraction rewrites them, and a
+    permanent zone delete locks them before the zone row (#3691)."""
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    sids = sorted({s for s in subnet_ids if s is not None})
+
+    async def find() -> set[Any]:
+        found: set[Any] = set()
+        for i in range(0, len(sids), _CHUNK):
+            found.update(
+                (
+                    await db.execute(
+                        select(IPAddress.id)
+                        .where(
+                            IPAddress.subnet_id.in_(sids[i : i + _CHUNK]),
+                            IPAddress.auto_from_lease.is_(True)
+                            | IPAddress.dns_record_id.is_not(None)
+                            | IPAddress.id.in_(
+                                select(DNSRecord.ip_address_id)
+                                .where(DNSRecord.ip_address_id.is_not(None))
+                                .execution_options(include_deleted=True)
+                            ),
+                        )
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return found
+
+    async def take() -> None:
+        await lock_zone_rows(db, await zone_ids_for_subnets(db, sids))
+
+    await lock_addresses_before(db, find, take)
 
 
 __all__ = [
     "lock_lease_rows",
     "lock_mirror_rows",
     "lock_zones_for_subnets",
+    "lock_zones_for_lease_mirrors",
     "zone_ids_for_subnets",
     "lock_zone_rows",
     "lock_zones_for_addresses",
