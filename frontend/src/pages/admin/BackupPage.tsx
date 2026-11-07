@@ -182,6 +182,7 @@ function CreateBackupCard() {
         <Field label="Passphrase" required>
           <input
             type="password"
+            maxLength={512}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
             placeholder="At least 8 characters"
@@ -192,6 +193,7 @@ function CreateBackupCard() {
         <Field label="Confirm passphrase" required>
           <input
             type="password"
+            maxLength={512}
             value={passphrase2}
             onChange={(e) => setPassphrase2(e.target.value)}
             placeholder="Retype to catch typos"
@@ -442,6 +444,7 @@ function RestoreBackupCard() {
         <Field label="Passphrase" required>
           <input
             type="password"
+            maxLength={512}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
             placeholder="The passphrase used at backup time"

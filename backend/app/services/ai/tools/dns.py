@@ -173,6 +173,9 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
                 "ns": list(view.apex.ns),
                 "source": view.apex.source,
                 "placeholder_glue_loopback": view.apex.placeholder_glue,
+                "placeholder_reason": view.apex.placeholder_reason,
+                "unaddressed_primary_ns": view.apex.unaddressed_primary_ns,
+                "unaddressed_ns": list(view.apex.unaddressed_ns),
                 # Split-horizon views that serve different apexes; empty when
                 # they agree. The fields above are then the worst view's.
                 "by_view": [

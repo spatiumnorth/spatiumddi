@@ -1984,6 +1984,9 @@ class ServedApexInView(BaseModel):
     ns: list[str]
     source: Literal["declared", "primary_ns", "placeholder"]
     placeholder_glue_loopback: bool
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    unaddressed_ns: list[str] = []
 
 
 class ServedApex(BaseModel):
@@ -2007,8 +2010,18 @@ class ServedApex(BaseModel):
     # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
     source: Literal["declared", "primary_ns", "placeholder"]
     # The placeholder NS is glued to 127.0.0.1: every resolver that follows
-    # the zone's NS set is sent to its own loopback.
+    # the zone's NS set is sent to its own loopback. This also holds for a
+    # declared apex NS record naming ``ns1.<zone>`` with no address record.
     placeholder_glue_loopback: bool
+    # Why the placeholder is served (#3670), null unless ``source`` is
+    # ``placeholder``: ``primary_ns_has_no_address`` (the Primary NS is inside
+    # the zone and no A/AAAA record holds it; ``unaddressed_primary_ns`` names
+    # it) or ``no_primary_ns`` (no Primary NS that can resolve, no NS records).
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    # Declared apex NS inside the zone, other than the placeholder, with no
+    # A/AAAA record: BIND will not load the zone until one is added.
+    unaddressed_ns: list[str] = []
     # Under split-horizon the apex is rendered per view, from that view's
     # records. Empty when every view serves the same apex (or there are no
     # views); otherwise each view's apex in render order, and the fields above
@@ -9194,6 +9207,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
         ns=list(view.apex.ns),
         source=view.apex.source,
         placeholder_glue_loopback=view.apex.placeholder_glue,
+        placeholder_reason=view.apex.placeholder_reason,
+        unaddressed_primary_ns=view.apex.unaddressed_primary_ns,
+        unaddressed_ns=list(view.apex.unaddressed_ns),
         by_view=[
             ServedApexInView(
                 view=name,
@@ -9201,6 +9217,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
                 ns=list(a.ns),
                 source=a.source,
                 placeholder_glue_loopback=a.placeholder_glue,
+                placeholder_reason=a.placeholder_reason,
+                unaddressed_primary_ns=a.unaddressed_primary_ns,
+                unaddressed_ns=list(a.unaddressed_ns),
             )
             for name, a in view.by_view
         ],
@@ -10750,6 +10769,8 @@ class SyncWithServerResponse(BaseModel):
     imported_records: list[dict]
     # Push (DB → server)
     push_candidates: int
+    # #3671 — the zone's records the server already holds, so none was pushed.
+    push_skipped_matching: int = 0
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
@@ -10830,6 +10851,7 @@ async def sync_zone_with_server_endpoint(
         skipped_unsupported=result.pull.skipped_unsupported,
         imported_records=result.pull.imported_records,
         push_candidates=result.push.candidates,
+        push_skipped_matching=result.push.already_matched,
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
