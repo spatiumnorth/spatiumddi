@@ -776,6 +776,33 @@ async def commit_import(
                 "options if they are needed"
             )
 
+    # #3730 — the same re-spell + value check for the raw codes on reservations
+    # and client classes; ``drop_invalid_options`` leaves every raw key to here.
+    for parsed in preview.scopes:
+        for res in parsed.reservations:
+            if not res.options:
+                continue
+            res.options, dropped = rekey_raw_options(
+                res.options, raw_codes=raw_codes, address_family=parsed.address_family
+            )
+            if dropped:
+                warnings.append(
+                    f"{parsed.subnet_cidr}: reservation {res.ip_address}: dropped raw "
+                    f"option(s) {', '.join(dropped)}, which no server in the target group "
+                    "can serve"
+                )
+    for cc in preview.client_classes:
+        if not cc.supported or not cc.options:
+            continue
+        cc.options, dropped = rekey_raw_options(
+            cc.options, raw_codes=raw_codes, address_family=cc.address_family or "ipv4"
+        )
+        if dropped:
+            warnings.append(
+                f"client class {cc.name!r}: dropped raw option(s) {', '.join(dropped)}, "
+                "which no server in the target group can serve"
+            )
+
     # Subnets whose reservation mirrors an overwrite removed; recounted once
     # after every scope, not per scope (#3354). A scope whose savepoint rolled
     # back may leave its subnet here: recounting an unchanged subnet is a no-op.

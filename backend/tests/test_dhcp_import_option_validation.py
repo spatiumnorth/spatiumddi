@@ -126,3 +126,118 @@ async def test_commit_does_not_store_refused_options(
     cc = (await db_session.execute(select(DHCPClientClass))).scalars().one()
     assert set(cc.options) == {"ntp-servers"}
     assert any("'routers'" in x for x in _refused(resp.json()["warnings"]))
+
+
+_RAW_CONF = json.dumps(
+    {
+        "Dhcp4": {
+            "subnet4": [
+                {
+                    "subnet": "192.0.2.0/24",
+                    "pools": [{"pool": "192.0.2.10 - 192.0.2.50"}],
+                    "option-data": [{"code": 43, "data": "zz"}, {"code": 43, "data": "0a0b"}],
+                    "reservations": [
+                        {
+                            "hw-address": "aa:bb:cc:dd:ee:01",
+                            "ip-address": "192.0.2.20",
+                            "option-data": [{"code": 43, "data": "zz"}],
+                        }
+                    ],
+                }
+            ],
+            "client-classes": [
+                {
+                    "name": "voip",
+                    "test": "option[60].exists",
+                    "option-data": [{"code": 43, "data": "zz"}],
+                }
+            ],
+        }
+    }
+).encode()
+
+
+@pytest.mark.asyncio
+async def test_raw_code_with_a_bad_value_is_dropped_on_every_owner(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """``code:NN`` keys skip the name check but must not skip the value check."""
+    token, group, space, block = await _setup(db_session)
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/preview",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("kea.conf", _RAW_CONF, "application/json")},
+        data={"target_group_id": str(group.id), "ipam_space_id": str(space.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    plan = resp.json()
+    # Force a known-bad value into every owner, whatever the parser kept.
+    plan["scopes"][0]["options"] = {"code:43": "zz"}
+    plan["scopes"][0]["reservations"][0]["options"] = {"code:43": "zz"}
+    plan["client_classes"][0]["options"] = {"code:43": "zz"}
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": plan,
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    scope = (await db_session.execute(select(DHCPScope))).scalars().one()
+    assert not scope.options
+    static = (await db_session.execute(select(DHCPStaticAssignment))).scalars().one()
+    assert not static.options_override
+    cc = (await db_session.execute(select(DHCPClientClass))).scalars().one()
+    assert not cc.options
+    assert sum("code:43" in w for w in resp.json()["warnings"]) >= 3
+
+
+_ISC = b"""
+subnet 192.0.2.0 netmask 255.255.255.0 {
+  range 192.0.2.10 192.0.2.50;
+  option routers 10.250.4.999;
+  option dhcp-renewal-time 300;
+  option domain-name-servers 192.0.2.1;
+  host h1 { hardware ethernet aa:bb:cc:dd:ee:01; fixed-address 192.0.2.20;
+            option routers 10.250.4.999; option ntp-servers 192.0.2.2; }
+}
+"""
+
+
+@pytest.mark.asyncio
+async def test_isc_import_drops_refused_options(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token, group, space, block = await _setup(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.post(
+        "/api/v1/dhcp/import/isc/preview",
+        headers=headers,
+        files={"file": ("dhcpd.conf", _ISC, "text/plain")},
+        data={"target_group_id": str(group.id), "ipam_space_id": str(space.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    plan = resp.json()
+    w = _refused(plan["warnings"])
+    assert any("'routers'" in x for x in w) and any("'dhcp-renewal-time'" in x for x in w), w
+    assert set(plan["scopes"][0]["options"]) == {"dns-servers"}
+    resp = await client.post(
+        "/api/v1/dhcp/import/isc/commit",
+        headers=headers,
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": plan,
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    scope = (await db_session.execute(select(DHCPScope))).scalars().one()
+    assert set(scope.options) == {"dns-servers"}
+    static = (await db_session.execute(select(DHCPStaticAssignment))).scalars().one()
+    assert set(static.options_override) == {"ntp-servers"}
