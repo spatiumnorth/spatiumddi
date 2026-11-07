@@ -100,6 +100,7 @@ from app.services.dns.record_ops import (
     ack_op,
     apply_acks,
     lock_heartbeat_ops,
+    reassert_after_retried_deletes,
     reset_unacknowledged_ops,
     return_ops_dispatched_elsewhere,
 )
@@ -1272,7 +1273,7 @@ async def agent_heartbeat(
         )
 
     # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
-    await apply_acks(db, server.id, body.ops_ack)
+    retried_deletes = await apply_acks(db, server.id, body.ops_ack)
     # #1232 — then return any op this agent was sent and never acknowledged
     # (it restarted, or the long-poll response was lost) to the retry path.
     # After the acks, so an ack arriving now is not reset under it; here and
@@ -1293,6 +1294,10 @@ async def agent_heartbeat(
         server.agent_jwt_hash = hash_token(rotated_token)
 
     await db.commit()
+    if retried_deletes:
+        # #3688: after the commit, holding no op row (see ``apply_acks``).
+        await reassert_after_retried_deletes(db, server.id, retried_deletes)
+        await db.commit()
     response = AgentHeartbeatResponseV2(
         server_id=str(server.id),
         status=server.status,
@@ -1339,10 +1344,14 @@ async def agent_ops_ack(
     # 404, not a StaleDataError when the ack's flush finds it gone.
     if not await lock_op_ids(db, DNSRecordOp.id == op_id, DNSRecordOp.server_id == server.id):
         raise HTTPException(status_code=404, detail="Op not found")
-    await ack_op(
+    retried_deletes = await ack_op(
         db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
     )
     await db.commit()
+    if retried_deletes:
+        # #3688: after the commit, holding no op row (see ``apply_acks``).
+        await reassert_after_retried_deletes(db, server.id, retried_deletes)
+        await db.commit()
     return {"status": "ok"}
 
 

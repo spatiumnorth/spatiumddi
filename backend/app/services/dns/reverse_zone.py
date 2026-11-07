@@ -35,6 +35,7 @@ from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, rever
     reverse_zone_pieces,
 )
 from app.services.ipam.zone_binding import prune_zone_ids
+from app.services.lock_order import lock_zone_rows
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -564,7 +565,16 @@ async def retire_auto_reverse_zones(
     retired: list[DNSZone] = []
     relinked: list[DNSZone] = []
     wake: set[uuid.UUID] = set()
-    for zone, survivor in await _retirement_plan(db, subnet, exclude_ids):
+    # #3688: the plan's zone rows before anything of theirs is written, in id
+    # order (``lock_order``), so the sweep below (queued ops) never runs ahead
+    # of the zone row: a zone delete takes the row, then the ops. The plan is
+    # read again once the rows are held, so a zone a delete removed meanwhile
+    # is not retired twice.
+    plan = await _retirement_plan(db, subnet, exclude_ids)
+    if plan:
+        await lock_zone_rows(db, [zone.id for zone, _ in plan])
+        plan = await _retirement_plan(db, subnet, exclude_ids)
+    for zone, survivor in plan:
         if survivor is not None:
             zone.linked_subnet_id = survivor
             relinked.append(zone)
