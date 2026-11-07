@@ -97,6 +97,9 @@ class PushResult:
     # #2667 — agent-managed server: the missing rows were queued as record
     # ops for the agent to apply, not applied on the wire by us.
     queued_for_agent: bool = False
+    # #3671 — DB rows already on the server, counted by the same comparison
+    # that picks the candidates: the zone's records that need no push.
+    already_matched: int = 0
 
 
 @dataclass
@@ -900,6 +903,7 @@ async def _additive_push(
     # index after dispatch.
     pushable_types = _syncable_types(driver, _PUSHABLE_TYPES)
     candidate_rows: list[DNSRecord] = []
+    already_matched = 0
     for row in db_rows:
         rtype = row.record_type.upper()
         if rtype not in pushable_types:
@@ -909,6 +913,7 @@ async def _additive_push(
         if skip_apex_ns and is_apex_ns(row, zone.name):
             continue
         if _key(row, zone.name, relative_targets=rel) in on_wire_keys:
+            already_matched += 1
             continue
         candidate_rows.append(row)
 
@@ -930,6 +935,7 @@ async def _additive_push(
             pushed=candidates,
             pushed_records=pushed_records,
             push_errors=push_errors,
+            already_matched=already_matched,
         )
 
     # #3004: nothing to send takes no serial. The bump used to come before
@@ -941,7 +947,11 @@ async def _additive_push(
     # agentless push, in ``_queue_for_agent`` for a new agent op.
     if not candidate_rows:
         return PushResult(
-            candidates=0, pushed=0, pushed_records=pushed_records, push_errors=push_errors
+            candidates=0,
+            pushed=0,
+            pushed_records=pushed_records,
+            push_errors=push_errors,
+            already_matched=already_matched,
         )
 
     # Each op carries the complete DB set at its (name, type), as the record
@@ -969,7 +979,9 @@ async def _additive_push(
     await stamp_rrsets_for_ops(db, zone, payloads)
 
     if not is_agentless(primary.driver):
-        return await _queue_for_agent(db, primary, zone, candidate_rows, payloads)
+        queued = await _queue_for_agent(db, primary, zone, candidate_rows, payloads)
+        queued.already_matched = already_matched
+        return queued
 
     target_serial = bump_zone_serial(zone)
     changes: list[RecordChange] = [
@@ -1006,6 +1018,7 @@ async def _additive_push(
             pushed=0,
             pushed_records=pushed_records,
             push_errors=[f"batch failed: {exc}"],
+            already_matched=already_matched,
         )
 
     pushed = 0
@@ -1040,6 +1053,7 @@ async def _additive_push(
         pushed=pushed,
         pushed_records=pushed_records,
         push_errors=push_errors,
+        already_matched=already_matched,
     )
 
 

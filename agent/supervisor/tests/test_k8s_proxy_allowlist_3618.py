@@ -189,7 +189,7 @@ def _run_once(
         def post(self, url: str, **kw: Any) -> _Resp:
             if url.endswith("/poll"):
                 return _Resp(queued)
-            replies.append(kw["json"])
+            replies.append(json.loads(kw["content"]))
             return _Resp({"delivered": "true"})
 
     cfg = SupervisorConfig(

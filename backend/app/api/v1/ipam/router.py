@@ -1510,19 +1510,31 @@ def _binding_value(value: Any) -> Any:
 
 
 async def _assert_scoped_zones(
-    db: AsyncSession, user: Any, subnet: Subnet, zone_ids: Iterable[Any]
+    db: AsyncSession,
+    user: Any,
+    subnet: Subnet,
+    zone_ids: Iterable[Any],
+    *,
+    already: Iterable[Any] = (),
 ) -> None:
-    """403 when a scoped subnet writer (#2438) names a DNS zone the subnet does
-    not already publish into and the caller holds no write on.
+    """403 when a caller without type-level subnet write (#2438) names a DNS
+    zone the subnet does not already publish into and the caller holds no
+    write on. That is a holder of a grant scoped to one subnet, or one admitted
+    to the address routes through an address set.
 
     The zone in an IPAM body decides where records are written, so without
-    this a grant on one subnet would publish into any zone whose id the holder
-    knew. A scoped grant must not reach a zone it never named."""
+    this a grant on one subnet or set would publish into any zone whose id the
+    holder knew. A scoped grant must not reach a zone it never named. A zone in
+    ``already`` (a row's current binding) passes, so a re-save is not refused.
+    A caller holding the type-level subnet write is not checked."""
+    if not _subnet_write_is_scoped(user):
+        return
     wanted = {str(z) for z in zone_ids if z}
     if not wanted:
         return
     _, primary, additional = await _resolve_effective_dns(db, subnet)
     allowed = {str(z) for z in (additional or []) if z}
+    allowed |= {str(z) for z in already if z}
     if primary is not None:
         allowed.add(str(primary))
     for zid in sorted(wanted - allowed):
@@ -1699,11 +1711,12 @@ def _ip_int_in_dynamic_pool(ip_int: int, ranges: list[tuple[int, int]]) -> bool:
 
 
 async def _load_writable_set_ranges(
-    db: AsyncSession, user: Any, subnet_id: uuid.UUID
+    db: AsyncSession, user: Any, subnet_id: uuid.UUID, action: str = "write"
 ) -> WritableSetRanges:
     """Resolve the caller's address-set-delegated writable ranges on this subnet
-    (alias for :func:`app.services.ipam.address_set_gate.load_writable_set_ranges`)."""
-    return await load_writable_set_ranges(db, user, subnet_id)
+    (alias for :func:`app.services.ipam.address_set_gate.load_writable_set_ranges`).
+    ``action="delete"`` resolves the sets the caller may delete addresses in."""
+    return await load_writable_set_ranges(db, user, subnet_id, action)
 
 
 async def _require_ip_writable(db: AsyncSession, user: Any, ip: IPAddress) -> None:
@@ -1716,6 +1729,26 @@ async def _require_ip_writable(db: AsyncSession, user: Any, ip: IPAddress) -> No
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"No write permission on subnet or any address set covering {ip.address}",
+        )
+
+
+async def _require_ip_deletable(db: AsyncSession, user: Any, ip: IPAddress) -> None:
+    """403 unless ``user`` holds a ``delete`` grant covering this one address:
+    ``delete`` on its subnet, or on an address set whose range holds it.
+
+    The coarse gate of the delete routes admits any address-set delete grant
+    whatever its set, so a set-scoped grant is matched against the address
+    here (#3636)."""
+    ip_int = int(ipaddress.ip_address(str(ip.address)))
+    if not _user_can_write_ip(
+        user,
+        ip_int,
+        user_has_permission(user, "delete", "subnet", ip.subnet_id),
+        await _load_writable_set_ranges(db, user, ip.subnet_id, action="delete"),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"No delete permission on subnet or any address set covering {ip.address}",
         )
 
 
@@ -3012,7 +3045,15 @@ async def _sync_dns_record(
     against a zone (including retractions). Callers that report on the
     outcome — the DDNS path logs ``ddns_applied`` — must not claim more than
     this says (spatiumddi#1065).
+
+    Every zone the sync may write is row-locked first, in id order (#3617):
+    a retraction takes the PTR's reverse zone before the forward zone
+    (#1800) and a publish the forward zone first, so two syncs of different
+    addresses in one zone pair deadlocked. See ``app.services.lock_order``.
     """
+    from app.services.lock_order import lock_zones_for_sync  # noqa: PLC0415
+
+    await lock_zones_for_sync(db, ip, subnet, zone_id=zone_id, action=action)
     if action == "delete":
         result = await db.execute(
             select(DNSRecord)
@@ -8093,21 +8134,31 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
     """#428 — on subnet delete, revoke the DDNS records published for the
     subnet's DHCP-lease mirrors and drop the transient mirror rows. Returns
     the count revoked. Best-effort per row: a DNS-revoke hiccup must not
-    block the delete (the backstop / next reconcile cleans residue)."""
+    block the delete (the backstop / next reconcile cleans residue).
+
+    #3617: the mirror rows are locked by id, then every zone the delete may
+    write, in id order, before any revoke: one revoke per row took the zones
+    one address at a time, out of id order. The caller locks the scopes'
+    lease rows before this (``app.services.lock_order``)."""
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+    from app.services.lock_order import lock_zones_for_subnets  # noqa: PLC0415
 
     rows = (
         (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.subnet_id == subnet.id,
                     IPAddress.auto_from_lease.is_(True),
                 )
+                .order_by(IPAddress.id)
+                .with_for_update()
             )
         )
         .scalars()
         .all()
     )
+    await lock_zones_for_subnets(db, [subnet.id])
     # #3186 — their records a zone deleted earlier took into its batch go too.
     await purge_trashed_address_records(db, [row.id for row in rows])
     revoked = 0
@@ -10257,11 +10308,12 @@ async def create_address(
         )
     # A holder admitted by a grant scoped to this subnet (#2438) publishes only
     # into the zones the subnet already uses (or ones it may write).
-    scoped_writer = subnet_writable and _subnet_write_is_scoped(current_user)
-    if scoped_writer:
-        await _assert_scoped_zones(
-            db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
-        )
+    # The same holds for one admitted through an address set: the zone check
+    # runs for every caller without type-level subnet write.
+    scoped_writer = _subnet_write_is_scoped(current_user)
+    await _assert_scoped_zones(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
 
     # MAC address required for static_dhcp
     assert_static_dhcp_has_mac(body.status, body.mac_address)
@@ -10677,10 +10729,22 @@ async def update_address(
     # GHSA-875w — a zone this edit names must be one the token may write; the
     # row's current bindings pass, so a re-save is not refused.
     if "dns_zone_id" in touched or "extra_zone_ids" in touched:
+        zone_subnet = await db.get(Subnet, ip.subnet_id)
+        if zone_subnet is not None:
+            await _assert_scoped_zones(
+                db,
+                current_user,
+                zone_subnet,
+                [
+                    body.dns_zone_id if "dns_zone_id" in touched else None,
+                    *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
+                ],
+                already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
+            )
         await _enforce_zone_token_scope(
             db,
             current_user,
-            await db.get(Subnet, ip.subnet_id),
+            zone_subnet,
             [
                 body.dns_zone_id if "dns_zone_id" in touched else None,
                 *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
@@ -11055,6 +11119,9 @@ async def delete_alias(
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     await _require_ip_writable(db, current_user, ip)
+    # The route's ``delete`` must cover this address too (#3636), as on the
+    # address's own delete.
+    await _require_ip_deletable(db, current_user, ip)
     rec = await db.get(DNSRecord, record_id)
     if rec is None or rec.ip_address_id != ip.id:
         raise HTTPException(status_code=404, detail="Alias not found")
@@ -11287,6 +11354,9 @@ async def delete_address(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
+    # Removing the row takes a delete grant that covers THIS address: delete
+    # on its subnet, or on an address set containing it.
+    await _require_ip_deletable(db, current_user, ip)
 
     subnet = await db.get(Subnet, ip.subnet_id)
 
@@ -11819,6 +11889,7 @@ async def bulk_allocate_preview(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     # The preview reports name collisions in the zone the body names, so it
     # is held to the same zone rule as the commit.
+    await _assert_scoped_zones(db, current_user, subnet, [body.dns_zone_id])
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
     await assert_zones_exist(db, [body.dns_zone_id])
 
@@ -11907,6 +11978,7 @@ async def bulk_allocate_commit(
     # lacked the check).
     _enforce_subnet_token_scope(current_user, subnet_id)
     # GHSA-875w — a zone named in the body must be one the token may write.
+    await _assert_scoped_zones(db, current_user, subnet, [body.dns_zone_id])
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
     await assert_zones_exist(db, [body.dns_zone_id])
     if subnet.kind == "multicast":
@@ -12192,6 +12264,11 @@ async def allocate_next_ip(
             detail="mac_address is required when status is 'static_dhcp'",
         )
 
+    # A zone named in the body must be one the caller may publish into: the
+    # subnet's own zones or one it holds write on (#2438), as create_address.
+    await _assert_scoped_zones(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
     # GHSA-875w — a zone named in the body must be one the token may write.
     await _enforce_zone_token_scope(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
@@ -12847,9 +12924,9 @@ class IPAddressBulkDeleteResponse(BaseModel):
     deleted_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []  # system rows (network/broadcast) or already-orphaned
-    # Why a row in ``skipped`` was skipped, keyed by id (#1714). Only the
-    # reservation refusal is itemised today; other skips keep the generic
-    # meaning documented above.
+    # Why a row in ``skipped`` was skipped, keyed by id (#1714). The
+    # reservation refusal and a missing delete grant (#3636) are itemised;
+    # other skips keep the generic meaning documented above.
     skipped_reasons: dict[str, str] = {}
 
 
@@ -12889,6 +12966,8 @@ async def bulk_delete_addresses(
     # Address-set write delegation (#103): resolve writable ranges once per
     # distinct subnet so a per-IP check is cheap.
     set_gate_cache: dict[uuid.UUID, tuple[bool, WritableSetRanges]] = {}
+    # The same, for the ``delete`` grant a removal also needs.
+    delete_gate_cache: dict[uuid.UUID, tuple[bool, WritableSetRanges]] = {}
 
     async def _gate_for(sid: uuid.UUID) -> tuple[bool, WritableSetRanges]:
         if sid not in set_gate_cache:
@@ -12897,6 +12976,14 @@ async def bulk_delete_addresses(
                 await _load_writable_set_ranges(db, current_user, sid),
             )
         return set_gate_cache[sid]
+
+    async def _delete_gate_for(sid: uuid.UUID) -> tuple[bool, WritableSetRanges]:
+        if sid not in delete_gate_cache:
+            delete_gate_cache[sid] = (
+                user_has_permission(current_user, "delete", "subnet", sid),
+                await _load_writable_set_ranges(db, current_user, sid, action="delete"),
+            )
+        return delete_gate_cache[sid]
 
     # Linked DHCP reservations, gathered once with the single delete's own
     # helper (#1714). The single delete removes them with the row and refuses
@@ -12937,6 +13024,19 @@ async def bulk_delete_addresses(
             current_user, int(ipaddress.ip_address(str(ip.address))), subnet_writable, set_ranges
         ):
             skipped.append(ip.id)
+            continue
+        # Nor may it go without a delete grant covering this address.
+        subnet_deletable, delete_ranges = await _delete_gate_for(ip.subnet_id)
+        if not _user_can_write_ip(
+            current_user,
+            int(ipaddress.ip_address(str(ip.address))),
+            subnet_deletable,
+            delete_ranges,
+        ):
+            skipped.append(ip.id)
+            skipped_reasons[str(ip.id)] = (
+                f"No delete permission on subnet or any address set covering {ip.address}"
+            )
             continue
         row_statics = statics_by_ip.get(ip.id, [])
         refusal = _static_delete_refusal(current_user, row_statics, f"Address {ip.address}")
@@ -13198,10 +13298,19 @@ async def bulk_edit_addresses(
                     if loaded is not None:
                         subnet_cache[ip.subnet_id] = loaded
                 try:
+                    zone_subnet = subnet_cache.get(ip.subnet_id)
+                    if zone_subnet is not None:
+                        await _assert_scoped_zones(
+                            db,
+                            current_user,
+                            zone_subnet,
+                            [new_zone_id],
+                            already=[ip.forward_zone_id],
+                        )
                     await _enforce_zone_token_scope(
                         db,
                         current_user,
-                        subnet_cache.get(ip.subnet_id),
+                        zone_subnet,
                         [new_zone_id],
                         already=[ip.forward_zone_id],
                     )

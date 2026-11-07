@@ -48,8 +48,8 @@ async def _appliance(db: AsyncSession) -> Appliance:
 def _auth_as(monkeypatch: pytest.MonkeyPatch, row: Appliance) -> None:
     """Make the cert gate authenticate as ``row`` (the real gate, patched below it)."""
 
-    async def _authenticate(_request: Any, _db: Any) -> Any:
-        return SimpleNamespace(appliance=row)
+    async def _authenticate(_request: Any, _db: Any, **_kw: Any) -> Any:
+        return SimpleNamespace(appliance=row, content_sha256=None)
 
     monkeypatch.setattr(cert_auth, "authenticate_cert", _authenticate)
 

@@ -3527,6 +3527,12 @@ function RecordModalForm({
   const [port, setPort] = useState(String(record?.port ?? ""));
   const [viewId, setViewId] = useState<string>(record?.view_id ?? "");
   const [error, setError] = useState("");
+  // #3637 — a LUA snippet runs inside pdns_server, so writing one is
+  // superadmin-only on the server (create and change of its value).
+  const { isSuperadmin: canWriteLua } = usePermissions();
+  const recordTypes = canWriteLua
+    ? RECORD_TYPES
+    : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
   const nameErr = recordOwnerError(name);
 
@@ -3629,7 +3635,7 @@ function RecordModalForm({
               // shift around a Type that won't actually change (#424).
               disabled={!!record}
             >
-              {RECORD_TYPES.map((t) => (
+              {recordTypes.map((t) => (
                 <option key={t} value={t}>
                   {t}
                 </option>
@@ -3639,8 +3645,9 @@ function RecordModalForm({
         </div>
         <Field label="Value">
           {/* The label names the value box. The LUA snippet picker
-              beside it keeps its own name (#3509). */}
-          {type === "LUA" && (
+              beside it keeps its own name (#3509). It is not drawn for a
+              user who may not change the snippet (#3637). */}
+          {type === "LUA" && canWriteLua && (
             <div className="flex items-center justify-between gap-2">
               <select
                 className="rounded-md border bg-background px-2 py-1 text-xs"
@@ -3694,6 +3701,12 @@ function RecordModalForm({
               placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
               rows={4}
               required
+              readOnly={!canWriteLua}
+              title={
+                canWriteLua
+                  ? undefined
+                  : "Only a superadmin can change a LUA snippet"
+              }
             />
           ) : (
             <input
@@ -3747,14 +3760,16 @@ function RecordModalForm({
             <code className="rounded bg-violet-500/20 px-1">
               CNAME 'createReverse(...)'
             </code>
-            . The snippet executes inside <em>pdns_server</em> at query time, so
-            an untrusted snippet is a server-side code-execution risk — keep
-            this surface admin-only. The agent automatically sets{" "}
+            . The snippet executes inside <em>pdns_server</em> at query time (it
+            can probe TCP ports and fetch URLs from the DNS server), so only a
+            superadmin can create a LUA record or change its value; the API
+            answers 403 to anyone else. The PowerDNS agent enables LUA records
+            on every PowerDNS server (the{" "}
             <code className="rounded bg-violet-500/20 px-1">
-              ENABLE-LUA-RECORDS=1
+              enable-lua-records
             </code>{" "}
-            metadata on the zone the first time you save a LUA record. Zone must
-            live in a powerdns-only group; API returns 422 otherwise.
+            setting), not per zone. Zone must live in a powerdns-only group; API
+            returns 422 otherwise.
           </div>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -5846,6 +5861,7 @@ type SyncResultPayload =
       imported_records: SyncRecord[];
       // push direction
       push_candidates: number;
+      push_skipped_matching?: number;
       pushed: number;
       pushed_records: SyncRecord[];
       push_errors: string[];
@@ -5896,6 +5912,7 @@ export function SyncResultModal({
     imported,
     skipped_unsupported,
     imported_records,
+    push_skipped_matching,
     pushed,
     pushed_records,
     push_errors,
@@ -5957,7 +5974,11 @@ export function SyncResultModal({
               value={push_errors.length}
               highlight={push_errors.length > 0 ? "bad" : undefined}
             />
-            <Stat label="Skipped" value={0} hint="DB already matches server" />
+            <Stat
+              label="Skipped"
+              value={push_skipped_matching ?? 0}
+              hint="DB already matches server"
+            />
           </div>
           {pushed > 0 && (
             <RecordTable
@@ -6095,7 +6116,16 @@ function ServedApexRows({
   onEditZone,
   editDisabledReason,
 }: {
-  apex: Pick<ServedApex, "soa" | "ns" | "source" | "placeholder_glue_loopback">;
+  apex: Pick<
+    ServedApex,
+    | "soa"
+    | "ns"
+    | "source"
+    | "placeholder_glue_loopback"
+    | "placeholder_reason"
+    | "unaddressed_primary_ns"
+    | "unaddressed_ns"
+  >;
   viewName?: string;
   zoneName: string;
   onEditZone: () => void;
@@ -6131,13 +6161,30 @@ function ServedApexRows({
   // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
   // holds its own address for ns1), or ``invalid.`` for a zone whose name is
   // not a host name, which never resolves.
-  const warning = apex.placeholder_glue_loopback
-    ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-    : apex.source === "placeholder" && apex.ns.includes("invalid.")
-      ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-      : apex.source === "placeholder"
-        ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
-        : null;
+  const unaddressedPrimary = apex.unaddressed_primary_ns;
+  const warning =
+    apex.placeholder_glue_loopback && unaddressedPrimary
+      ? `The Primary NS ${unaddressedPrimary} is inside the zone, but the zone holds no A or AAAA record for it, and BIND will not load a zone whose NS has no address. This placeholder name server, glued to 127.0.0.1, is served instead, so resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for ${unaddressedPrimary}.`
+      : apex.placeholder_glue_loopback && apex.source === "declared"
+        ? `The apex NS record ${apex.ns.join(", ")} has no A or AAAA record in the zone, so it is served glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for it.`
+        : apex.placeholder_glue_loopback
+          ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
+          : apex.source === "placeholder" && apex.ns.includes("invalid.")
+            ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
+            : apex.source === "placeholder"
+              ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
+              : null;
+  // A declared apex draws no NS rows of ours, so its warning gets its own row.
+  const unaddressedNs = apex.unaddressed_ns ?? [];
+  const declaredWarning =
+    apex.source === "declared"
+      ? [
+          warning,
+          unaddressedNs.length > 0
+            ? `The apex NS ${unaddressedNs.join(", ")} lies inside the zone with no A or AAAA record, and BIND will not load a zone whose NS has no address. Add the address record.`
+            : null,
+        ].filter((w): w is string => !!w)
+      : [];
   const nameCell = (
     <td className="py-1.5 pl-5 font-mono text-xs font-medium">
       <span className="inline-flex items-center gap-1.5">
@@ -6180,6 +6227,26 @@ function ServedApexRows({
           </div>
         </td>
       </tr>
+      {declaredWarning.length > 0 && (
+        <tr
+          className="border-b bg-muted/20"
+          data-testid="served-apex-declared-warning"
+        >
+          <td className="w-8 py-1.5 pl-3" />
+          <td colSpan={6} className="py-1.5 pr-3">
+            {declaredWarning.map((w) => (
+              <div
+                key={w}
+                role="alert"
+                className="text-xs text-amber-700 dark:text-amber-400"
+                data-testid="served-apex-warning"
+              >
+                {w}
+              </div>
+            ))}
+          </td>
+        </tr>
+      )}
       {showNs &&
         apex.ns.map((ns) => (
           <tr
