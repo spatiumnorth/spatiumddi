@@ -7,8 +7,7 @@ from typing import Any
 
 import structlog
 from celery import Celery, Task
-from celery.backends.base import DisabledBackend
-from celery.beat import PersistentScheduler
+from celery.backends.redis import RedisBackend
 from celery.exceptions import Reject
 from celery.schedules import crontab, schedule
 from celery.signals import (
@@ -129,27 +128,41 @@ class SpatiumTask(Task):
             raise
 
 
-class NoResultBackendScheduler(PersistentScheduler):
-    """Beat's scheduler, with the result backend switched off (#3704).
-
-    Beat only enqueues; it never reads a result. But every send hands back an
-    ``AsyncResult`` whose ``__del__`` calls ``backend.remove_pending_result``,
-    and on the Redis backend that ``UNSUBSCRIBE``s the task's result channel
-    on a pub/sub connection nothing in beat ever reads. redis-py records each
-    one in ``pending_unsubscribe_channels`` until the server's reply is read,
-    so the set (and the unread replies) grew by one entry per scheduled send,
-    for the life of the process: ~40 MiB/day, until the 256Mi limit OOM-killed
-    beat. Swapping in ``DisabledBackend`` AFTER the schedule is set up (its
-    ``supports_autoexpire`` is False, which would add a
-    ``celery.backend_cleanup`` entry) leaves nothing to subscribe or cancel.
-    Workers keep their own backend, so results are still stored as before."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.app._backend = DisabledBackend(app=self.app)
+def _skip_result_subscribe(producer: Any, task_id: str) -> None:
+    """Stand-in for ``RedisBackend.on_task_call`` (#3704): subscribe nothing."""
 
 
-celery_app = Celery(
+class SpatiumCelery(Celery):
+    """The app, with the Redis result backend's send-time SUBSCRIBE turned off
+    (#3704).
+
+    On every send, ``RedisBackend.on_task_call`` SUBSCRIBEs the task's result
+    channel on a pub/sub connection, so a later ``result.get()`` can be woken
+    by a publish; and every ``AsyncResult``'s ``__del__`` UNSUBSCRIBEs it
+    again. Only a caller blocked in ``.get()`` ever reads that connection, and
+    no process here calls ``.get()``: beat only enqueues, and the api reads a
+    task's state with a plain GET (``AsyncResult.state``). So the replies were
+    never read, and redis-py keeps every channel in ``PubSub.channels`` and
+    ``pending_unsubscribe_channels`` until they are: about 250 bytes per send,
+    for the life of the process. Beat sends ~96k tasks a day, which is how it
+    grew ~40 MiB/day into its 256Mi limit; the api leaked the same way at its
+    own dispatch rate. Workers were never affected (``task_join_will_block``
+    already skips the subscribe inside a worker).
+
+    Results are still stored by the worker and read the same way. A ``.get()``
+    still works: it subscribes on demand (``add_pending_result``) and checks
+    the stored meta first, so a result published before it subscribed is not
+    missed. Only the Redis backend (and its Sentinel subclass) is changed; other
+    backends (``rpc://`` needs its send-time hook) keep theirs."""
+
+    def _get_backend(self) -> Any:
+        backend = super()._get_backend()
+        if isinstance(backend, RedisBackend):
+            backend.on_task_call = _skip_result_subscribe
+        return backend
+
+
+celery_app = SpatiumCelery(
     "spatiumddi",
     task_cls=SpatiumTask,
     broker=settings.celery_broker_url,
@@ -237,7 +250,6 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     broker_pool_limit=BROKER_POOL_LIMIT,
-    beat_scheduler="app.celery_app:NoResultBackendScheduler",
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},
