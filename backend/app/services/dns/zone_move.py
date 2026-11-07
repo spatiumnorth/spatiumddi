@@ -59,7 +59,7 @@ from app.models.dns import (
 from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import SIGNING_DRIVERS, lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
-from app.services.dns.pool_geo import build_geo_steering
+from app.services.dns.pool_geo import EXTERNAL_IMPORT_SOURCE, build_geo_steering
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
     count_queued_zone_ops,
@@ -346,16 +346,17 @@ async def assemble_move_plan(
     # then renders into no operator view at all rather than into one.
     scoped = (
         await db.execute(
-            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at)
+            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at, DNSRecord.import_source)
             .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
             .execution_options(include_deleted=True)
         )
     ).all()
     # Where the zone's LIVE scoped records would place it in the target (#2275).
+    # A learned record follows the zone and does not place it (``places_zone``).
     live_record_view_ids: set[uuid.UUID] = set()
-    for _rid, view_id, deleted_at in scoped:
+    for _rid, view_id, deleted_at, import_source in scoped:
         action, new_id, old_name = _resolve(view_id)
-        if deleted_at is None and new_id is not None:
+        if deleted_at is None and new_id is not None and import_source != EXTERNAL_IMPORT_SOURCE:
             live_record_view_ids.add(new_id)
         if action == "remapped":
             plan.records_remapped += 1

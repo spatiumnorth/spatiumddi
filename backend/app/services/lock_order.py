@@ -296,17 +296,14 @@ async def lock_zones_for_addresses(
     await lock_zone_rows(db, zones)
 
 
-async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> None:
-    """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
-    write: the zones holding a record of any of their addresses (the lease
-    mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
-    and the reverse zones the subnets are linked to (retired or re-linked)."""
+async def zone_ids_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> set[Any]:
+    """The zones a write over ``subnet_ids`` may touch: the zones holding a
+    record of any of their addresses (the lease mirrors' DDNS, the subnet's own
+    A / PTR) and the reverse zones the subnets are linked to."""
     from app.models.dns import DNSRecord, DNSZone  # noqa: PLC0415
     from app.models.ipam import IPAddress  # noqa: PLC0415
 
     ids = sorted({s for s in subnet_ids if s is not None})
-    if not ids:
-        return
     zones: set[Any] = set()
     for i in range(0, len(ids), _CHUNK):
         chunk = ids[i : i + _CHUNK]
@@ -330,13 +327,121 @@ async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) ->
             .scalars()
             .all()
         )
-    await lock_zone_rows(db, zones)
+    return zones
+
+
+async def zone_ids_for_scope_statics(db: AsyncSession, scope_ids: Iterable[Any]) -> set[Any]:
+    """The zones a restore of ``scope_ids`` publishes their reservations into.
+
+    A soft-delete of a scope (or of its subnet) deletes each reservation's
+    address row and its A / PTR records, and the restore re-creates them
+    (``remirror_scope_statics``), so no record names the zones yet and
+    :func:`zone_ids_for_subnets` cannot find them. They are resolved the way
+    the re-mirror's own sync resolves them: ``_publish_zone_ids`` over a
+    transient row at each reservation's address, so the forward zone, the
+    extras and the reverse zone are the ones the publish will lock. Reads
+    include the trashed reservations, which are un-stamped later.
+
+    A row already at the address (a scope trashed on its own leaves its subnet
+    live, and the address may have been allocated meanwhile) is taken over by
+    the re-mirror, which publishes into that row's own forward zone and keeps
+    its reverse zone: its zones are added too."""
+    from app.models.dhcp import DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.services.dhcp.normalize import norm_ip  # noqa: PLC0415
+
+    ids = sorted({s for s in scope_ids if s is not None})
+    zones: set[Any] = set()
+    subnet_cache: dict[Any, set[Any] | None] = {}
+    subnets: dict[Any, Any] = {}
+    for i in range(0, len(ids), _CHUNK):
+        chunk = ids[i : i + _CHUNK]
+        scopes = (
+            (
+                await db.execute(
+                    select(DHCPScope)
+                    .where(DHCPScope.id.in_(chunk))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {sc.id: sc for sc in scopes}
+        incumbents = {
+            (row.subnet_id, norm_ip(str(row.address))): row
+            for row in (
+                await db.execute(
+                    select(IPAddress)
+                    .where(IPAddress.subnet_id.in_({sc.subnet_id for sc in scopes}))
+                    .where(
+                        IPAddress.address.in_(
+                            select(DHCPStaticAssignment.ip_address)
+                            .where(DHCPStaticAssignment.scope_id.in_(chunk))
+                            .execution_options(include_deleted=True)
+                        )
+                    )
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        }
+        statics = (
+            (
+                await db.execute(
+                    select(DHCPStaticAssignment)
+                    .where(DHCPStaticAssignment.scope_id.in_(chunk))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for st in statics:
+            scope = by_id.get(st.scope_id)
+            if scope is None:
+                continue
+            if scope.subnet_id not in subnets:
+                subnets[scope.subnet_id] = (
+                    await db.execute(
+                        select(Subnet)
+                        .where(Subnet.id == scope.subnet_id)
+                        .execution_options(include_deleted=True)
+                    )
+                ).scalar_one_or_none()
+            subnet = subnets[scope.subnet_id]
+            if subnet is None:
+                continue
+            # Never added to the session: built only to be read.
+            row = incumbents.get((subnet.id, norm_ip(str(st.ip_address))))
+            ip = IPAddress(
+                subnet_id=subnet.id,
+                address=str(st.ip_address),
+                hostname=(st.hostname or "").strip(),
+                status="static_dhcp",
+                forward_zone_id=row.forward_zone_id if row is not None else None,
+                reverse_zone_id=row.reverse_zone_id if row is not None else None,
+                extra_zone_ids=list(row.extra_zone_ids or []) if row is not None else [],
+            )
+            zones |= await _publish_zone_ids(db, ip, subnet, None, subnet_cache, False)
+    zones.discard(None)
+    return zones
+
+
+async def lock_zones_for_subnets(db: AsyncSession, subnet_ids: Iterable[Any]) -> None:
+    """Lock, in one id-ordered pass, every zone a delete of ``subnet_ids`` may
+    write: the zones holding a record of any of their addresses (the lease
+    mirrors' DDNS, the subnet's own A / PTR, which a soft-delete retracts),
+    and the reverse zones the subnets are linked to (retired or re-linked)."""
+    await lock_zone_rows(db, await zone_ids_for_subnets(db, subnet_ids))
 
 
 __all__ = [
     "lock_lease_rows",
     "lock_mirror_rows",
     "lock_zones_for_subnets",
+    "zone_ids_for_subnets",
     "lock_zone_rows",
     "lock_zones_for_addresses",
     "lock_zones_for_sync",
