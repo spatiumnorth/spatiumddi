@@ -592,15 +592,15 @@ function RestoreFromArchiveModal({
   // The restore's own refusals (missing member, unsupported format_version,
   // a schema this install cannot place), read from the preview (#3287).
   const restoreRefused = previewQ.data?.restorable === false;
-  // A failed preview downloads the same archive the restore does, so the
-  // restore would meet the same failure: Apply stays off (#3698).
+  // A failed preview reads the same archive the restore does, so the restore
+  // may meet the same failure. Apply stays available (a preview-only error,
+  // e.g. a timeout, must not strand a disaster restore) but the modal says so.
   const previewFailed = previewQ.isError;
   const canSubmit =
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
     !restoreRefused &&
-    !previewFailed &&
     (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
   const { dialogProps, titleProps } = useModalDialog(onClose);
@@ -660,7 +660,8 @@ function RestoreFromArchiveModal({
           >
             The archive could not be read:{" "}
             {formatApiError(previewQ.error, "preview failed")}. A restore reads
-            the same archive, so Apply is off until it can be read.
+            the same archive again and may fail the same way before changing
+            anything; Full restore is still offered.
           </div>
         )}
         <form

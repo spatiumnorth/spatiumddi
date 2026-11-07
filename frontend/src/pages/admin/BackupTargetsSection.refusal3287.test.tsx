@@ -151,14 +151,13 @@ describe("Restore from archive: an archive the restore refuses (#3287)", () => {
 });
 
 describe("Restore from archive: a failed preview (#3698)", () => {
-  it("names the API's reason and keeps Apply disabled", async () => {
+  it("names the API's reason and warns the restore re-reads the archive", async () => {
     const reason = "archive 'x.zip' not found at /var/lib/none";
     await openAndFill({ response: { data: { detail: reason } } });
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain(reason);
     expect(screen.queryByText(/Full restore is unaffected/)).toBeNull();
-    await vi.waitFor(() => expect(applyButton().disabled).toBe(true));
-    fireEvent.click(applyButton());
-    expect(restoreFromArchive).not.toHaveBeenCalled();
+    expect(alert.textContent).toMatch(/reads the same archive again/);
+    await vi.waitFor(() => expect(applyButton().disabled).toBe(false));
   });
 });
