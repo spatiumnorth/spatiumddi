@@ -49,7 +49,30 @@ vi.mock("@/lib/api", async () => {
 
 const { PodLogsModal } = await import("./FleetTab");
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  getLogs.mockClear();
+});
+
+function renderModal() {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={qc}>
+      <PodLogsModal
+        appliance={{ id: "ap-1", hostname: "node1" } as unknown as ApplianceRow}
+        onClose={() => {}}
+      />
+    </QueryClientProvider>,
+  );
+}
+
+function callsFor(pod: string): (string | undefined)[] {
+  return (getLogs.mock.calls as unknown as unknown[][])
+    .filter((c) => c[1] === pod)
+    .map((c) => (c[2] as { container?: string }).container);
+}
 
 describe("Fleet pod logs (#3628)", () => {
   it("never pairs a newly chosen pod with the previous pod's container", async () => {
@@ -96,5 +119,26 @@ describe("Fleet pod logs (#3628)", () => {
           (c[2] as { container?: string }).container === "a2",
       ),
     ).toBe(false);
+  });
+
+  it("opening the dialog sends one request, for the first pod's first container", async () => {
+    renderModal();
+    await waitFor(() => expect(getLogs).toHaveBeenCalled());
+    // Let any trailing effect-driven re-request land before counting.
+    await new Promise((r) => setTimeout(r, 50));
+    // The pre-fix effect sent container=undefined first (a 400 from kubeapi
+    // on a multi-container pod), then a1.
+    expect(callsFor("pod-a")).toEqual(["a1"]);
+  });
+
+  it("switching pod sends exactly one request, for a container the new pod has", async () => {
+    renderModal();
+    await waitFor(() => expect(callsFor("pod-a")).toEqual(["a1"]));
+    fireEvent.change(screen.getAllByRole("combobox")[0], {
+      target: { value: "pod-b" },
+    });
+    await waitFor(() => expect(callsFor("pod-b").length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(callsFor("pod-b")).toEqual(["b1"]);
   });
 });
