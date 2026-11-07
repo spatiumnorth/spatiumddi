@@ -276,7 +276,9 @@ async def test_auto_sync_commits_a_big_subnet_in_bounded_batches(
     for the whole subnet (it waited ~2 min for 1,000 renames)."""
     import app.tasks.ipam_dns_sync as sync_mod
 
-    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 3)
+    # ``raising=False`` so this runs (and fails on its assertions) against a
+    # build that commits a whole subnet at once and has no batch size.
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 3, raising=False)
     await _auto_sync_subnet_with(db_session, 7, 74)
 
     locked_per_call: list[int] = []
@@ -342,3 +344,136 @@ async def test_auto_sync_failed_batch_rolls_back_alone_and_names_itself(
     )
     msgs = [e for a in audit for e in (a.new_value or {}).get("errors", [])]
     assert any("batch 2/" in m and "addresses" in m and "boom" in m for m in msgs), msgs
+
+
+async def _between_batches(monkeypatch: pytest.MonkeyPatch, before_second: Any) -> None:
+    """Run ``before_second`` (committed, on its own session) after the first
+    batch of the run has committed and before the second one starts."""
+    import app.tasks.ipam_dns_sync as sync_mod
+
+    real_batch = sync_mod._sync_batch
+    seen = 0
+
+    async def hooked(db: Any, subnet_id: Any, batch: Any, **k: Any) -> Any:
+        nonlocal seen
+        seen += 1
+        if seen == 2:
+            await before_second()
+        return await real_batch(db, subnet_id, batch, **k)
+
+    monkeypatch.setattr(sync_mod, "_sync_batch", hooked)
+
+
+async def _forward_records(db: AsyncSession, subnet_id: Any) -> dict[str, list[Any]]:
+    from app.models.dns import DNSRecord
+
+    rows = (
+        await db.execute(
+            select(IPAddress.hostname, DNSRecord.name, DNSRecord.zone_id)
+            .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+            .where(
+                IPAddress.subnet_id == subnet_id,
+                DNSRecord.record_type == "A",
+                DNSRecord.auto_generated.is_(True),
+            )
+        )
+    ).all()
+    out: dict[str, list[Any]] = {}
+    for host, name, zone_id in rows:
+        out.setdefault(host, []).append((name, zone_id))
+    return out
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_zone_purged_between_batches_writes_nothing_into_it(
+    client: Any, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanent zone delete that lands between two batches of one subnet:
+    the later batches publish nothing into the deleted zone, report no error,
+    and the run does not fail. The plan named the zone; the batch must not
+    trust it (nor a subnet object cached from an earlier batch)."""
+    import app.tasks.ipam_dns_sync as sync_mod
+    from app.models.dns import DNSZone
+    from tests.test_ipam_alias_cname_exclusive_2080 import _headers
+
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 1, raising=False)
+    await _auto_sync_subnet_with(db_session, 4, 76)
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.network == "10.93.76.0/24"))
+    ).scalar_one()
+    zone = await db_session.get(DNSZone, subnet.dns_zone_id)
+    assert zone is not None
+    subnet_id, zone_id, group_id = subnet.id, zone.id, zone.group_id
+    h = await _headers(db_session)
+    await db_session.commit()
+
+    async def purge() -> None:
+        resp = await client.delete(
+            f"/api/v1/dns/groups/{group_id}/zones/{zone_id}?permanent=true", headers=h
+        )
+        assert resp.status_code == 204, resp.text
+
+    await _between_batches(monkeypatch, purge)
+    result = await sync_mod._run_auto_sync()
+    assert result["errors"] == 0, result
+    db_session.expire_all()
+    assert await db_session.get(DNSZone, zone_id) is None
+    # Nothing published into the purged zone, and the addresses left after the
+    # delete got no forward record at all (the subnet names no zone now).
+    fwd = await _forward_records(db_session, subnet_id)
+    assert all(z != zone_id for recs in fwd.values() for _n, z in recs), fwd
+    assert len(fwd) <= 1, fwd
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_later_batch_publishes_the_live_name(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An address renamed after the plan but before its batch is published
+    under its new name, not the one the plan read."""
+    import app.tasks.ipam_dns_sync as sync_mod
+
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 1, raising=False)
+    await _auto_sync_subnet_with(db_session, 4, 77)
+    subnet_id = (
+        await db_session.execute(select(Subnet.id).where(Subnet.network == "10.93.77.0/24"))
+    ).scalar_one()
+    await db_session.commit()
+    renamed: list[str] = []
+
+    async def rename() -> None:
+        # Every address the first batch did not publish gets a new name.
+        from app.models.dns import DNSRecord
+
+        async with _TestSessionLocal() as db:
+            published = select(DNSRecord.ip_address_id).where(
+                DNSRecord.record_type == "A", DNSRecord.ip_address_id.is_not(None)
+            )
+            rows = (
+                (
+                    await db.execute(
+                        select(IPAddress).where(
+                            IPAddress.subnet_id == subnet_id,
+                            IPAddress.hostname.like("b%"),
+                            IPAddress.id.not_in(published),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for ip in rows:
+                ip.hostname = f"re{ip.hostname}"
+                renamed.append(ip.hostname)
+            await db.commit()
+
+    await _between_batches(monkeypatch, rename)
+    result = await sync_mod._run_auto_sync()
+    assert result["errors"] == 0, result
+    db_session.expire_all()
+    fwd = await _forward_records(db_session, subnet_id)
+    assert renamed, "the hook renamed nothing"
+    for host in renamed:
+        assert host in fwd, (host, fwd)
+    for host, recs in fwd.items():
+        assert [n for n, _z in recs] == [host], fwd
