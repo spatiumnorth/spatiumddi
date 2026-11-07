@@ -119,9 +119,11 @@ describe("Restore from archive: Selective needs a custom-format dump (#2222)", (
     expect(screen.queryByText(/dump is plain SQL/)).toBeNull();
   });
 
-  it("keeps Full restore available when the format cannot be read", async () => {
+  it("keeps Full restore selectable (Apply stays off, #3698) when the format cannot be read", async () => {
     await openModal(new Error("destination unreachable"));
-    expect(await screen.findByText(/could not be read/)).toBeTruthy();
+    expect(
+      (await screen.findAllByText(/could not be read/)).length,
+    ).toBeGreaterThan(0);
     expect(selectiveRadio().disabled).toBe(true);
     const full = screen
       .getByText("Full restore", { selector: "strong" })

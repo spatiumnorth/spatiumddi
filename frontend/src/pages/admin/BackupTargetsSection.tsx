@@ -570,7 +570,7 @@ function RestoreFromArchiveModal({
   const selectiveDisabledReason = previewQ.isLoading
     ? "Checking the archive's database dump format…"
     : previewQ.isError
-      ? "The archive's database dump format could not be read, so a selective restore is not offered. Full restore is unaffected."
+      ? "The archive could not be read, so a selective restore is not offered."
       : previewQ.data?.selective_restore_supported
         ? null
         : "Selective restore needs a custom-format database dump. This archive's dump is " +
@@ -592,11 +592,15 @@ function RestoreFromArchiveModal({
   // The restore's own refusals (missing member, unsupported format_version,
   // a schema this install cannot place), read from the preview (#3287).
   const restoreRefused = previewQ.data?.restorable === false;
+  // A failed preview downloads the same archive the restore does, so the
+  // restore would meet the same failure: Apply stays off (#3698).
+  const previewFailed = previewQ.isError;
   const canSubmit =
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
     !restoreRefused &&
+    !previewFailed &&
     (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
   const { dialogProps, titleProps } = useModalDialog(onClose);
@@ -647,6 +651,16 @@ function RestoreFromArchiveModal({
           >
             This archive cannot be restored:{" "}
             {previewQ.data?.restore_refusal ?? "the restore refuses it"}
+          </div>
+        )}
+        {previewFailed && (
+          <div
+            role="alert"
+            className="mb-3 break-words rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2 text-xs text-red-700 dark:text-red-300"
+          >
+            The archive could not be read:{" "}
+            {formatApiError(previewQ.error, "preview failed")}. A restore reads
+            the same archive, so Apply is off until it can be read.
           </div>
         )}
         <form
