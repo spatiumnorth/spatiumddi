@@ -1089,7 +1089,16 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # record goes with the rest; one that comes second waits, then reads no
     # zone (404). With the records deleted first, a writer could take the zone
     # row at its serial bump and wait on its record: a deadlock with this.
+    # #3691: the ``ip_address`` rows the delete will null out (the zone's
+    # records' mirrors, forward / reverse links) come before the zone row, the
+    # global order (``app.services.lock_order``): a lease batch holds a mirror
+    # and waits for the zone. Re-taken under the zone lock for a row linked in
+    # between.
+    from app.services.lock_order import lock_addresses_of_zones
+
+    await lock_addresses_of_zones(db, [args.zone_id])
     zone = await _require_zone(args.group_id, args.zone_id, db, lock="delete")
+    await lock_addresses_of_zones(db, [zone.id])
     # The queued ops once the zone row is held, as on the soft branch: a record
     # write that held the row first has committed its op by now. Swept before
     # the lock, that op outlived the zone with a NULL ``zone_id``.

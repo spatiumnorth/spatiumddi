@@ -150,6 +150,49 @@ async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
         )
 
 
+async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> list[Any]:
+    """Step 2 for a zone delete: lock the ``ip_address`` rows a delete of
+    ``zone_ids`` would rewrite, ascending id, BEFORE the zone rows (#3691).
+
+    ``ip_address.forward_zone_id`` / ``reverse_zone_id`` reference ``dns_zone``
+    and ``ip_address.dns_record_id`` references ``dns_record``, all ``ON DELETE
+    SET NULL``: deleting a zone (and with it, its records) locks every such
+    row. Taken after the zone row, that is step 3 before step 2, and a lease
+    batch holding a mirror and waiting for the zone deadlocks with it. Records
+    in the trash and rows in the trash are included. The caller re-runs this
+    once it holds the zone rows, to take any row linked in between (it is then
+    out of order, but only a row nobody held when the first pass ran).
+    """
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+    from app.models.ipam import IPAddress  # noqa: PLC0415
+
+    zones = sorted({z for z in zone_ids if z is not None})
+    if not zones:
+        return []
+    locked: set[Any] = set()
+    for i in range(0, len(zones), _CHUNK):
+        chunk = zones[i : i + _CHUNK]
+        record_ids = (
+            select(DNSRecord.id)
+            .where(DNSRecord.zone_id.in_(chunk))
+            .execution_options(include_deleted=True)
+            .scalar_subquery()
+        )
+        res = await db.execute(
+            select(IPAddress.id)
+            .where(
+                IPAddress.dns_record_id.in_(record_ids)
+                | IPAddress.forward_zone_id.in_(chunk)
+                | IPAddress.reverse_zone_id.in_(chunk)
+            )
+            .order_by(IPAddress.id)
+            .with_for_update(key_share=True, of=IPAddress)
+            .execution_options(include_deleted=True)
+        )
+        locked.update(res.scalars().all())
+    return sorted(locked)
+
+
 def _uuid_or_none(raw: Any) -> uuid.UUID | None:
     try:
         return uuid.UUID(str(raw))
