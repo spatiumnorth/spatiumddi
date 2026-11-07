@@ -54,7 +54,7 @@ import structlog
 from app.config import settings
 from app.core import shutdown as _shutdown
 from app.core.redis_client import make_async_redis
-from app.core.shutdown import get_or_shutdown
+from app.core.shutdown import get_or_shutdown, wait_or_shutdown
 
 # The Redis-wait bounds and blocking read are shared with agent_cmd (#3706).
 from app.services.appliance.redis_channel import CLEANUP_TIMEOUT as _CLEANUP_TIMEOUT
@@ -263,21 +263,22 @@ async def _await_reply(
         if remaining <= 0:
             raise TimeoutError
         if client is None:
-            await asyncio.wait({future}, timeout=remaining)
+            if await wait_or_shutdown({future}, remaining) and not future.done():
+                raise TimeoutError  # the api is shutting down; answer now (#3015)
             continue
         read = asyncio.ensure_future(
             client.blpop(_REPLY_PREFIX + request_id, timeout=min(_SLICE_SECONDS, remaining))
         )
         try:
-            await asyncio.wait(
-                {read, future}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
-            )
+            stopping = await wait_or_shutdown({read, future}, remaining)
         finally:
             unfinished = not read.done()
             if unfinished:
                 read.cancel()
         if future.done():
             return future.result()
+        if stopping and unfinished:
+            raise TimeoutError  # the api is shutting down; answer now (#3015)
         if unfinished:
             continue  # the deadline passed mid-read; the loop raises TimeoutError
         try:
