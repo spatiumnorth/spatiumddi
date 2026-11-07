@@ -242,3 +242,103 @@ async def test_lock_targets_include_each_record_owner_and_zone(db_session: Async
         db_session, DnsSyncCommitRequest(delete_stale_record_ids=[ptr.id])
     )
     assert none_addrs == set() and none_zones == set()
+
+
+async def _auto_sync_subnet_with(db_session: AsyncSession, n: int, octet: int) -> None:
+    """A DNS-bound subnet with ``n`` named, unsynced addresses, auto-sync on."""
+    from app.models.settings import PlatformSettings
+
+    _server, subnet, _zone, _ip = await _setup(db_session, octet, ddns=False)
+    for k in range(n):
+        db_session.add(
+            IPAddress(
+                subnet_id=subnet.id,
+                address=f"10.93.{octet}.{100 + k}",
+                status="allocated",
+                hostname=f"b{k}",
+            )
+        )
+    ps = await db_session.get(PlatformSettings, 1)
+    if ps is None:
+        ps = PlatformSettings(id=1)
+        db_session.add(ps)
+    ps.dns_auto_sync_enabled = True
+    ps.dns_auto_sync_last_run_at = None
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_commits_a_big_subnet_in_bounded_batches(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subnet is committed in batches of ``SYNC_BATCH_SIZE`` addresses, each
+    locking only its own rows, so a zone delete waits for one batch and not
+    for the whole subnet (it waited ~2 min for 1,000 renames)."""
+    import app.tasks.ipam_dns_sync as sync_mod
+
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 3)
+    await _auto_sync_subnet_with(db_session, 7, 74)
+
+    locked_per_call: list[int] = []
+    real_lock = router_mod._lock_dns_sync_rows
+
+    async def counting_lock(db: Any, address_ids: Any, **k: Any) -> Any:
+        ids = set(address_ids)
+        locked_per_call.append(len(ids))
+        return await real_lock(db, ids, **k)
+
+    monkeypatch.setattr(router_mod, "_lock_dns_sync_rows", counting_lock)
+    commits = 0
+    real_commit = AsyncSession.commit
+
+    async def counting_commit(self: AsyncSession) -> None:
+        nonlocal commits
+        commits += 1
+        await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", counting_commit)
+
+    result = await sync_mod._run_auto_sync()
+    assert result["errors"] == 0, result
+    assert result["created"] == 7, result
+    assert result["subnets_touched"] == 1
+    # 7 addresses (plus the fixture's own) -> every batch within the bound.
+    assert len(locked_per_call) >= 3
+    assert max(locked_per_call) <= 3, locked_per_call
+    assert sum(locked_per_call) >= 7
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_failed_batch_rolls_back_alone_and_names_itself(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.tasks.ipam_dns_sync as sync_mod
+    from app.models.audit import AuditLog
+
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 2)
+    await _auto_sync_subnet_with(db_session, 6, 75)
+
+    real_batch = sync_mod._sync_batch
+    seen = 0
+
+    async def flaky(db: Any, subnet_id: Any, batch: Any, **k: Any) -> Any:
+        nonlocal seen
+        seen += 1
+        counts = await real_batch(db, subnet_id, batch, **k)
+        if seen == 2:
+            raise RuntimeError("boom")
+        return counts
+
+    monkeypatch.setattr(sync_mod, "_sync_batch", flaky)
+    result = await sync_mod._run_auto_sync()
+    assert seen >= 3
+    # The failed batch's rows are rolled back, the others committed and counted.
+    assert result["errors"] == 1, result
+    assert 0 < result["created"] < 6 + 1, result
+    audit = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.action == "dns-sync")))
+        .scalars()
+        .all()
+    )
+    msgs = [e for a in audit for e in (a.new_value or {}).get("errors", [])]
+    assert any("batch 2/" in m and "addresses" in m and "boom" in m for m in msgs), msgs
