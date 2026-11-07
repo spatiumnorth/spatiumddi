@@ -47,6 +47,7 @@ from app.models.dns import (
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone_clause,
     views_rendering_zone,
 )
 
@@ -308,6 +309,7 @@ async def _zone_records_loaded(
     if not zones:
         return 0
     counts: dict[uuid.UUID, dict[Any, int]] = {}
+    placing: dict[uuid.UUID, set[Any]] = {}
     pooled: set[uuid.UUID] = set()
     rows = await db.execute(
         select(
@@ -315,13 +317,17 @@ async def _zone_records_loaded(
             DNSRecord.view_id,
             func.count(),
             func.count(DNSRecord.pool_member_id),
+            # Rows that place the zone in their view (``places_zone``).
+            func.count().filter(places_zone_clause()),
         )
         .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
         .where(DNSZone.group_id == group_id, DNSRecord.deleted_at.is_(None))
         .group_by(DNSRecord.zone_id, DNSRecord.view_id)
     )
-    for zone_id, view_id, n, n_pool in rows.all():
+    for zone_id, view_id, n, n_pool, n_placing in rows.all():
         counts.setdefault(zone_id, {})[view_id] = int(n)
+        if view_id is not None and n_placing:
+            placing.setdefault(zone_id, set()).add(view_id)
         if n_pool:
             pooled.add(zone_id)
 
@@ -332,7 +338,7 @@ async def _zone_records_loaded(
         if not descs:
             total += sum(by_view.values())
             continue
-        scoped = [v for v in by_view if v is not None]
+        scoped = placing.get(zone_id, set())
         per_view: list[tuple[str, Any, int]] = []
         for vd in views_rendering_zone(descs, zone_view_id, scoped):
             own = by_view.get(vd["id"], 0) if vd["kind"] == "operator" else 0
