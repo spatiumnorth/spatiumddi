@@ -82,6 +82,11 @@ async def _zone_delete_race(
     probe = AsyncSession(engine)
     task: asyncio.Task[Any] | None = None
     try:
+        # The real delete locks the addresses it rewrites first (#3691): a
+        # path parks on the first of them or on the zone, whichever it needs.
+        from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+        await lock_addresses_of_zones(gate, [zone_id])
         await gate.execute(text("SELECT id FROM dns_zone WHERE id = :z FOR UPDATE"), {"z": zone_id})
         gate_pid = (await gate.execute(text("SELECT pg_backend_pid()"))).scalar_one()
         task = asyncio.create_task(path())
