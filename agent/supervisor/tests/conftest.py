@@ -24,3 +24,12 @@ def _no_apply_grace_leak(monkeypatch: pytest.MonkeyPatch) -> None:
     from spatium_supervisor import watchdog
 
     monkeypatch.setattr(watchdog, "_last_apply_at", None, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _signing_mode_reset() -> None:
+    """#3631 — the signing form is process state a heartbeat answer moves;
+    one test's mocked control plane must not set the next test's form."""
+    from spatium_supervisor import cert_auth
+
+    cert_auth._reset_signing_mode()
