@@ -13,12 +13,16 @@ fails the test that made it.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import uuid
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.api.v1.admin import trash as trash_router
 from app.core.security import hash_password
@@ -27,6 +31,17 @@ from app.models.dhcp import DHCPScope, DHCPServerGroup, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, Subnet
 from tests.test_lease_events_insert_order_3480 import _ddns_subnet
+from tests.test_lock_order_3617 import _hold_first_call, _no_deadlock, _race
+
+
+@pytest.fixture
+async def engine() -> AsyncGenerator[AsyncEngine, None]:
+    """Sessions of their own, each on its own connection."""
+    eng = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
+    try:
+        yield eng
+    finally:
+        await eng.dispose()
 
 
 async def _trashed_reservations(
@@ -113,3 +128,106 @@ async def test_restore_of_reservations_takes_forward_zone_before_reverse(
         .all()
     )
     assert sorted(names) == ["h10", "h11"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trash_subnet", [True, False], ids=["subnet", "scope-only"])
+async def test_restore_of_reservations_and_a_ddns_writer_do_not_deadlock(
+    db_session: AsyncSession,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    trash_subnet: bool,
+) -> None:
+    """The ddi-pg walk's case 1 on two real sessions. The restore is held just
+    before its re-mirror; a writer that takes the forward zone then the reverse
+    one by id (the lease-events DDNS publish) is started then. Unfixed, the
+    restore holds the reverse zone alone, the writer takes the forward zone and
+    waits for the reverse, and the re-mirror's ask for the forward zone closes
+    the cycle (40P01). Fixed, the restore already holds both."""
+    from app.services.lock_order import lock_zone_rows
+
+    subnet, scope, fwd, rev, user = await _trashed_reservations(
+        db_session, trash_subnet=trash_subnet
+    )
+    row_type, row_id = ("subnet", subnet.id) if trash_subnet else ("dhcp_scope", scope.id)
+    fwd_id, rev_id, user_id = fwd.id, rev.id, user.id
+
+    holder: dict[str, AsyncSession] = {}
+    reached = asyncio.Event()
+    log: list[str] = []
+    _hold_first_call(monkeypatch, trash_router, "remirror_scope_statics", holder, reached, log)
+
+    async def _restore() -> None:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            holder["db"] = db
+            u = await db.get(User, user_id)
+            await trash_router.restore_row(row_type, row_id, db, u)
+
+    async def _writer() -> None:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            await lock_zone_rows(db, [fwd_id, rev_id])
+            await db.commit()
+
+    _no_deadlock(await _race(_restore, _writer, reached), log)
+
+    names = (
+        (
+            await db_session.execute(
+                select(DNSRecord.name)
+                .where(DNSRecord.zone_id == fwd_id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert sorted(names) == ["h10", "h11"]
+
+
+@pytest.mark.asyncio
+async def test_scope_statics_zones_include_an_incumbent_rows_own_zone(
+    db_session: AsyncSession,
+) -> None:
+    """A scope trashed on its own leaves its subnet live, and an operator may
+    allocate a reservation's address in the meantime, in a zone other than the
+    subnet's and with no name (so no record names that zone). The re-mirror
+    takes that row over and publishes the reservation's name into the row's
+    own zone (``address_own_forward_zone_id``), so the pre-lock has to take it
+    too; a transient row at the address would resolve the subnet's zone only."""
+    from app.services.lock_order import zone_ids_for_scope_statics
+
+    subnet, scope, fwd, rev, _user = await _trashed_reservations(db_session, trash_subnet=False)
+    other = DNSZone(
+        group_id=fwd.group_id,
+        name=f"o{uuid.uuid4().hex[:6]}.example.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.example.",
+        admin_email="admin.example.",
+    )
+    db_session.add(other)
+    await db_session.flush()
+    db_session.add(
+        IPAddress(
+            subnet_id=subnet.id,
+            address="10.31.1.10",
+            status="allocated",
+            hostname="",
+            forward_zone_id=other.id,
+        )
+    )
+    await db_session.commit()
+
+    assert await zone_ids_for_scope_statics(db_session, [scope.id]) == {
+        fwd.id,
+        rev.id,
+        other.id,
+    }
+    # The premise: the re-mirror does publish into the row's own zone.
+    await trash_router.restore_row("dhcp_scope", scope.id, db_session, _user)
+    names = (
+        (await db_session.execute(select(DNSRecord.name).where(DNSRecord.zone_id == other.id)))
+        .scalars()
+        .all()
+    )
+    assert names == ["h10"]

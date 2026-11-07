@@ -340,9 +340,15 @@ async def zone_ids_for_scope_statics(db: AsyncSession, scope_ids: Iterable[Any])
     the re-mirror's own sync resolves them: ``_publish_zone_ids`` over a
     transient row at each reservation's address, so the forward zone, the
     extras and the reverse zone are the ones the publish will lock. Reads
-    include the trashed reservations, which are un-stamped later."""
+    include the trashed reservations, which are un-stamped later.
+
+    A row already at the address (a scope trashed on its own leaves its subnet
+    live, and the address may have been allocated meanwhile) is taken over by
+    the re-mirror, which publishes into that row's own forward zone and keeps
+    its reverse zone: its zones are added too."""
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.services.dhcp.normalize import norm_ip  # noqa: PLC0415
 
     ids = sorted({s for s in scope_ids if s is not None})
     zones: set[Any] = set()
@@ -362,6 +368,25 @@ async def zone_ids_for_scope_statics(db: AsyncSession, scope_ids: Iterable[Any])
             .all()
         )
         by_id = {sc.id: sc for sc in scopes}
+        incumbents = {
+            (row.subnet_id, norm_ip(str(row.address))): row
+            for row in (
+                await db.execute(
+                    select(IPAddress)
+                    .where(IPAddress.subnet_id.in_({sc.subnet_id for sc in scopes}))
+                    .where(
+                        IPAddress.address.in_(
+                            select(DHCPStaticAssignment.ip_address)
+                            .where(DHCPStaticAssignment.scope_id.in_(chunk))
+                            .execution_options(include_deleted=True)
+                        )
+                    )
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        }
         statics = (
             (
                 await db.execute(
@@ -388,11 +413,16 @@ async def zone_ids_for_scope_statics(db: AsyncSession, scope_ids: Iterable[Any])
             subnet = subnets[scope.subnet_id]
             if subnet is None:
                 continue
+            # Never added to the session: built only to be read.
+            row = incumbents.get((subnet.id, norm_ip(str(st.ip_address))))
             ip = IPAddress(
                 subnet_id=subnet.id,
                 address=str(st.ip_address),
                 hostname=(st.hostname or "").strip(),
                 status="static_dhcp",
+                forward_zone_id=row.forward_zone_id if row is not None else None,
+                reverse_zone_id=row.reverse_zone_id if row is not None else None,
+                extra_zone_ids=list(row.extra_zone_ids or []) if row is not None else [],
             )
             zones |= await _publish_zone_ids(db, ip, subnet, None, subnet_cache, False)
     zones.discard(None)
