@@ -122,9 +122,13 @@ class WritableSetRanges:
 
 
 async def load_writable_set_ranges(
-    db: AsyncSession, user: Any, subnet_id: uuid.UUID
+    db: AsyncSession, user: Any, subnet_id: uuid.UUID, action: str = "write"
 ) -> WritableSetRanges:
     """Return the :class:`WritableSetRanges` the ``user`` can WRITE on this subnet.
+
+    ``action`` names the grant a set must carry to count: ``"write"`` (the
+    default) for a mutation, ``"delete"`` for removing addresses, so a delete
+    grant scoped to one set reaches only the addresses inside that set.
 
     A set counts when the user holds ``write`` on its address_set id — ``admin``
     implies ``write`` via the permission matcher, so a SINGLE ``write`` check per
@@ -160,7 +164,7 @@ async def load_writable_set_ranges(
     explicit_overflowed = False
     for set_id, range_kind, start_addr, end_addr, explicit in fetched:
         # ``admin`` implies ``write`` through ``_action_matches`` — one check.
-        if not user_has_permission(user, "write", "address_set", set_id):
+        if not user_has_permission(user, action, "address_set", set_id):
             continue
         if range_kind == "contiguous" and start_addr is not None and end_addr is not None:
             s = _pack_ip(start_addr)
