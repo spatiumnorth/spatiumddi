@@ -137,8 +137,10 @@ function ModalShell({
 /**
  * Family + prefix Find Free starts on (#3324). An IPv6 block starts on IPv6:
  * /64, the usual subnet, or one step below a block already /64 or longer,
- * held to the /126 the server accepts. Anything else (no block, an IPv4
- * block) keeps the IPv4 /24 the dialog has always opened on.
+ * held to the /126 the server accepts. An IPv4 block longer than /24 starts
+ * one step below itself, held to /30, since a /24 cannot fit in it (#3712).
+ * Anything else (no block, an IPv4 block of /24 or shorter) keeps the IPv4
+ * /24 the dialog has always opened on.
  */
 function startingSearch(blockCidr?: string): {
   family: 4 | 6;
@@ -148,7 +150,23 @@ function startingSearch(blockCidr?: string): {
   if (blockCidr?.includes(":") && Number.isInteger(blockPrefix)) {
     return { family: 6, prefix: Math.min(Math.max(64, blockPrefix + 1), 126) };
   }
+  if (Number.isInteger(blockPrefix) && blockPrefix > 24) {
+    return { family: 4, prefix: Math.min(blockPrefix + 1, 30) };
+  }
   return { family: 4, prefix: 24 };
+}
+
+/** Why an empty answer is certain: the block is smaller than the size asked (#3712). */
+function tooSmallNote(
+  blockCidr: string | undefined,
+  prefix: number,
+  family: 4 | 6,
+): string {
+  const blockPrefix = Number(blockCidr?.split("/")[1]);
+  if (!blockCidr || !Number.isInteger(blockPrefix)) return "";
+  if (blockCidr.includes(":") !== (family === 6)) return "";
+  if (blockPrefix <= prefix) return "";
+  return ` This block is a /${blockPrefix}, smaller than a /${prefix}, so nothing of that size fits.`;
 }
 
 export function FindFreeModal({
@@ -295,6 +313,11 @@ export function FindFreeModal({
               No free CIDRs of /{submitted?.prefix_length ?? prefixLength} found
               in {defaultBlockId ? "this block" : "this space"} (IPv
               {submitted?.address_family ?? addressFamily}).
+              {tooSmallNote(
+                defaultBlockCidr,
+                submitted?.prefix_length ?? prefixLength,
+                submitted?.address_family ?? addressFamily,
+              )}
             </p>
           )}
           {data.candidates.length > 0 && (
