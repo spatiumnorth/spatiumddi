@@ -21,6 +21,7 @@ Scope per run:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -36,6 +37,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.services.lock_order import address_ids_of_records
 from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
@@ -120,6 +122,41 @@ async def _auto_from_lease_ip_ids(db: Any, subnet_id: Any) -> set[Any]:
     return set(rows.scalars().all())
 
 
+async def _prelock_subnet_work(
+    db: Any, subnet: Subnet, *, mirrors: bool, extra_ids: Iterable[Any] = ()
+) -> None:
+    """Take the rows this subnet's sync will write in the global lock order
+    (#3724): its ``ip_address`` rows ascending id, then their zones ascending
+    id, before the first ``_sync_dns_record``.
+
+    That helper locks a row's zone and then writes the row, so row by row the
+    run held a zone while writing an address a permanent zone delete (which
+    locks address rows, then the zone, #3691) could hold: 40P01. ``mirrors``
+    adds the subnet's lease mirrors (the DDNS re-apply); ``extra_ids`` are the
+    other addresses the drift apply writes. The run commits after each subnet,
+    so the locks are bounded by one subnet's rows, not the whole run's."""
+    from app.services.lock_order import (  # noqa: PLC0415
+        lock_address_rows,
+        lock_zones_for_addresses,
+    )
+
+    ids = set(extra_ids)
+    if mirrors:
+        ids |= await _auto_from_lease_ip_ids(db, subnet.id)
+    if not ids:
+        return
+    ordered = await lock_address_rows(db, ids)
+    publishing: list[tuple[Subnet, Any]] = []
+    for i in range(0, len(ordered), 1000):
+        rows = await db.execute(
+            select(IPAddress)
+            .where(IPAddress.id.in_(ordered[i : i + 1000]), IPAddress.subnet_id == subnet.id)
+            .order_by(IPAddress.id)
+        )
+        publishing.extend((subnet, r) for r in rows.scalars().all())
+    await lock_zones_for_addresses(db, publishing=publishing, ddns=mirrors)
+
+
 async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int, list[str]]:
     """#428 — eventual-consistency net for DDNS-enabled subnets. Re-runs
     the DDNS policy for every active lease-mirrored row so a record that a
@@ -130,13 +167,16 @@ async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int,
     Returns (records_fired, errors)."""
     from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
 
+    await _prelock_subnet_work(db, subnet, mirrors=True)
     rows = (
         (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.subnet_id == subnet.id,
                     IPAddress.auto_from_lease.is_(True),
                 )
+                .order_by(IPAddress.id)
             )
         )
         .scalars()
@@ -204,6 +244,11 @@ async def _run_auto_sync() -> dict[str, Any]:
 
             total_ddns_reapplied = 0
             for subnet_id in subnets:
+                # #3724 — one transaction per subnet: the row locks above are
+                # held to the commit, so they cover one subnet, never the run,
+                # and the next subnet starts with none held (a lock taken for
+                # it after another's zone would break the global order).
+                await db.commit()
                 subnet_obj = await db.get(Subnet, subnet_id)
                 if subnet_obj is None:
                     continue
@@ -226,16 +271,6 @@ async def _run_auto_sync() -> dict[str, Any]:
                         m for m in report.mismatched if m.ip_id not in lease_ip_ids
                     ]
 
-                # #428 — eventual-consistency net (Q3): regenerate any lease
-                # DDNS record a swallowed inline apply missed.
-                if ddns_on:
-                    fired, ddns_errors = await _reapply_ddns_for_active_leases(db, subnet_obj)
-                    total_ddns_reapplied += fired
-                    errors.extend(ddns_errors)
-                    if fired:
-                        total_created += fired
-                        touched_subnet_ids.add(subnet_id)
-
                 # A live address with no name publishes nothing, so its own
                 # host record and PTR are retracted whatever
                 # ``dns_auto_sync_delete_stale`` says: that setting governs
@@ -247,6 +282,28 @@ async def _run_auto_sync() -> dict[str, Any]:
                     for s in report.stale
                     if ps.dns_auto_sync_delete_stale or s.blank_name_host_record
                 ]
+                # #3724 — lock every address row this subnet will write (the
+                # re-apply's mirrors and the drift apply's) ascending, then
+                # their zones, before the first sync takes a zone.
+                try:
+                    apply_ids = {m.ip_id for m in report.missing}
+                    touched_records = [m.record_id for m in report.mismatched] + stale_to_delete
+                    if touched_records:
+                        apply_ids |= await address_ids_of_records(db, touched_records)
+                    await _prelock_subnet_work(db, subnet_obj, mirrors=ddns_on, extra_ids=apply_ids)
+                except Exception as exc:  # noqa: BLE001 — one subnet must not poison the run
+                    errors.append(f"lock({subnet_id}): {exc}")
+                    continue
+                # #428 — eventual-consistency net (Q3): regenerate any lease
+                # DDNS record a swallowed inline apply missed.
+                if ddns_on:
+                    fired, ddns_errors = await _reapply_ddns_for_active_leases(db, subnet_obj)
+                    total_ddns_reapplied += fired
+                    errors.extend(ddns_errors)
+                    if fired:
+                        total_created += fired
+                        touched_subnet_ids.add(subnet_id)
+
                 if not report.missing and not report.mismatched and not stale_to_delete:
                     continue
 

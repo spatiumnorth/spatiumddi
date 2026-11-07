@@ -220,6 +220,18 @@ async def _lock_address_ids(db: AsyncSession, ids: Iterable[Any], *, nowait: boo
         )
 
 
+async def lock_address_rows(db: AsyncSession, ids: Iterable[Any]) -> list[Any]:
+    """Step 2 for a writer that knows its address rows up front (#3724): lock
+    ``ids`` ``FOR NO KEY UPDATE``, ascending id, before it takes any zone.
+
+    A zone delete locks the rows it detaches before the zone (#3691), so a
+    writer that took a zone first and wrote an address later (the IPAM -> DNS
+    auto-sync, one ``_sync_dns_record`` per row) deadlocked with it."""
+    ordered = sorted(set(ids))
+    await _lock_address_ids(db, ordered)
+    return ordered
+
+
 async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> list[Any]:
     """Step 2 for a zone delete: lock the ``ip_address`` rows a delete of
     ``zone_ids`` would rewrite (:func:`address_ids_of_zones`), ascending id,
