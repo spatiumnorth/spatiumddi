@@ -162,6 +162,25 @@ def config_check(
     raise KeaCheckUnavailable(f"{binary} -t exited with code {proc.returncode}: {reason}")
 
 
+def lease4_del(socket_path: Path, ip_address: str) -> bool:
+    """Delete one DHCPv4 lease by address (``lease_cmds`` hook, #1287).
+
+    Returns True when Kea deleted a lease, False when it had none at that
+    address (result 3, "empty") — already gone is the state the caller wants.
+    Raises :class:`ValueError` for a non-IPv4 address and :class:`KeaCtrlError`
+    for any other refusal.
+    """
+    import ipaddress
+
+    addr = ipaddress.ip_address(ip_address)
+    if addr.version != 4:
+        raise ValueError(f"lease4-del needs an IPv4 address, got {ip_address!r}")
+    resp = send_command(
+        socket_path, "lease4-del", {"ip-address": str(addr)}, accept_results=(0, 3)
+    )
+    return resp.get("result") == 0
+
+
 def version_get(socket_path: Path) -> str | None:
     """Return the running kea-dhcp4 daemon's version (e.g. ``"3.0.3"``).
 
