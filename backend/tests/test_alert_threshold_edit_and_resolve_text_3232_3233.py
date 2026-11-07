@@ -367,3 +367,18 @@ async def test_legacy_var_description_is_the_text_main_seeded() -> None:
         "than resolving it. Auto-resolves when usage drops below the "
         "threshold."
     )
+
+
+async def test_private_use_characters_in_operator_text_survive_unmarking_3558() -> None:
+    """A subnet name holding U+E000 ... U+E001 is not a threshold mark (#3558)."""
+    token = alerts_svc._MARK_THRESHOLDS.set(True)
+    try:
+        name = "net 7 x  "
+        marked = f"Subnet {name} utilisation 50.0% (threshold {alerts_svc._thr(46)}%)"
+        clean, idx = alerts_svc._unmark_thresholds(marked)
+    finally:
+        alerts_svc._MARK_THRESHOLDS.reset(token)
+    assert clean == f"Subnet {name} utilisation 50.0% (threshold 46%)"
+    # Only the real threshold (its token carries the %) is marked.
+    toks = [t.group() for t in alerts_svc._NUM_RE.finditer(clean)]
+    assert [toks[i] for i in idx] == ["46%"]
