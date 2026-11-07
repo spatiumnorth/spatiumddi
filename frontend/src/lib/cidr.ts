@@ -92,7 +92,7 @@ export function isCgnatCidr(cidr: string): boolean {
  * for malformed input — callers should only feed strings that came from
  * backend-validated CIDRs, so this is acceptable as a fall-back.
  */
-function addressToBigInt(addr: string): bigint {
+export function addressToBigInt(addr: string): bigint {
   if (addr.includes(":")) {
     // IPv6 — expand `::` into the required number of zero groups.
     let head = addr;
