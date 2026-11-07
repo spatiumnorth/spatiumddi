@@ -815,6 +815,22 @@ async def _apply_create_ip_address(
     if args.status == "static_dhcp" and not args.mac_address:
         raise ValueError("mac_address is required when status is 'static_dhcp'")
 
+    # #3646 — an approver who may not write reservations is refused as a
+    # permission error, which leaves the request pending for one who may. A
+    # plain ValueError would end it ``failed`` for good over a refusal that is
+    # about THIS approver, not the request.
+    if args.status == "static_dhcp" and args.mac_address:
+        from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+        if not user_has_permission(user, "write", "dhcp_static"):
+            raise OperationPermissionError(
+                "write",
+                "dhcp_static",
+                "The approver has no 'write' permission on DHCP reservations "
+                f"(dhcp_static), so no reservation can be made for {args.address}. "
+                "Another approver who holds it can approve this request.",
+            )
+
     # #3250 — a static_dhcp request that can get no reservation fails here,
     # before anything is written, rather than ending provisioned without one.
     reason = await _static_dhcp_scope_error(db, subnet, args, user=user)
@@ -3441,6 +3457,13 @@ async def _preview_create_dns_zone(
         soa_err = soa_field_error(getattr(args, soa_field), soa_field)
         if soa_err is not None:
             return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if args.zone_type == "primary":
+        # #3672 — the REST create's apex-name rule.
+        from app.services.dns.zone_apex import apex_name_length_error  # noqa: PLC0415
+
+        apex_err = apex_name_length_error(name, args.primary_ns, args.admin_email)
+        if apex_err is not None:
+            return PreviewResult(ok=False, detail=apex_err)
     if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
@@ -3516,6 +3539,12 @@ async def _apply_create_dns_zone(
         soa_err = soa_field_error(getattr(args, soa_field), soa_field)
         if soa_err is not None:
             raise ValueError(f"{soa_field} {soa_err}")
+    if args.zone_type == "primary":
+        from app.services.dns.zone_apex import apex_name_length_error  # noqa: PLC0415
+
+        apex_err = apex_name_length_error(name, args.primary_ns, args.admin_email)
+        if apex_err is not None:
+            raise ValueError(apex_err)
     if await zone_name_taken(db, grp.id, None, name):
         raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
 

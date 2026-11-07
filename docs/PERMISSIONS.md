@@ -218,8 +218,13 @@ on inactive.
    aliases, bulk-edit and bulk-delete addresses, deprecate stale IPs, and the
    address import (preview and commit). Each of those checks every address it
    touches against the set's range, so the holder changes only addresses
-   inside the sets it holds. Every other mutating IPAM route, including one
-   added later, refuses such a holder with 403 until it is listed
+   inside the sets it holds. Like a subnet-scoped holder, it publishes only
+   into the zones the subnet uses, or a zone it holds `write` on (#3636).
+   Deleting an address, or one of its aliases, takes a `delete` grant that
+   covers that address: `delete` on subnets, or on an address set holding
+   it, so a `delete` grant on one set does not reach addresses outside it,
+   whatever `write` the caller holds. Every other mutating IPAM route,
+   including one added later, refuses such a holder with 403 until it is listed
    (`_ADDRESS_SET_ROUTES` in `backend/app/api/v1/ipam/router.py`). Reads
    still need a normal read grant.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin

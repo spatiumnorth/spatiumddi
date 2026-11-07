@@ -257,7 +257,7 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
-from app.services.dns.zone_apex import served_apex_for_zones
+from app.services.dns.zone_apex import apex_name_length_error, served_apex_for_zones
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -1984,6 +1984,9 @@ class ServedApexInView(BaseModel):
     ns: list[str]
     source: Literal["declared", "primary_ns", "placeholder"]
     placeholder_glue_loopback: bool
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    unaddressed_ns: list[str] = []
 
 
 class ServedApex(BaseModel):
@@ -2007,8 +2010,18 @@ class ServedApex(BaseModel):
     # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
     source: Literal["declared", "primary_ns", "placeholder"]
     # The placeholder NS is glued to 127.0.0.1: every resolver that follows
-    # the zone's NS set is sent to its own loopback.
+    # the zone's NS set is sent to its own loopback. This also holds for a
+    # declared apex NS record naming ``ns1.<zone>`` with no address record.
     placeholder_glue_loopback: bool
+    # Why the placeholder is served (#3670), null unless ``source`` is
+    # ``placeholder``: ``primary_ns_has_no_address`` (the Primary NS is inside
+    # the zone and no A/AAAA record holds it; ``unaddressed_primary_ns`` names
+    # it) or ``no_primary_ns`` (no Primary NS that can resolve, no NS records).
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    # Declared apex NS inside the zone, other than the placeholder, with no
+    # A/AAAA record: BIND will not load the zone until one is added.
+    unaddressed_ns: list[str] = []
     # Under split-horizon the apex is rendered per view, from that view's
     # records. Empty when every view serves the same apex (or there are no
     # views); otherwise each view's apex in render order, and the fields above
@@ -6063,6 +6076,11 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, zone_fields, None, db)
+    if body.zone_type == "primary":
+        # #3672 — a name too long to carry the apex defaults is never served.
+        apex_err = apex_name_length_error(body.name, body.primary_ns, body.admin_email)
+        if apex_err is not None:
+            raise HTTPException(status_code=422, detail=apex_err)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -6858,6 +6876,7 @@ async def update_zone(
         mail_err = admin_email_error(changes["admin_email"])
         if mail_err is not None:
             raise HTTPException(status_code=422, detail=f"Admin Email (admin_email) {mail_err}")
+    await _enforce_apex_name_length(db, zone, changes)  # #3672
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
@@ -8510,6 +8529,16 @@ async def create_zone_from_template(
             port=checked.port,
         )
 
+    # #3672 — the template's apex NS records stand in for the placeholder.
+    apex_err = apex_name_length_error(
+        body.zone_name,
+        None,
+        None,
+        [(r["name"], r["record_type"], r["value"]) for r in record_payloads],
+    )
+    if apex_err is not None:
+        raise HTTPException(status_code=422, detail=apex_err)
+
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -9182,6 +9211,39 @@ async def list_records(
     )
 
 
+async def _enforce_apex_name_length(db: DB, zone: DNSZone, changes: dict[str, Any]) -> None:
+    """422 an edit that leaves a primary zone's apex names past 253 (#3672).
+
+    Only an edit that moves one of the inputs (the name, the type, the Primary
+    NS or the Admin Email) is checked, so a zone stored before the rule stays
+    editable by a request that re-sends what it holds. The zone's own apex NS
+    records count, as they replace the placeholder name server.
+    """
+    keys = ("name", "zone_type", "primary_ns", "admin_email")
+    if not any(k in changes and changes[k] != getattr(zone, k) for k in keys):
+        return
+    if changes.get("zone_type", zone.zone_type) != "primary":
+        return
+    ns_rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value).where(
+                DNSRecord.zone_id == zone.id,
+                DNSRecord.record_type == "NS",
+                DNSRecord.name.in_(("@", "")),
+                DNSRecord.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    err = apex_name_length_error(
+        changes.get("name", zone.name),
+        changes.get("primary_ns", zone.primary_ns),
+        changes.get("admin_email", zone.admin_email),
+        [(r.name, r.record_type, r.value) for r in ns_rows],
+    )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
+
+
 async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
     """The apex a primary zone is served with (#3518), or None for a zone that
     is not primary (a secondary, stub or forward zone has no apex of ours)."""
@@ -9194,6 +9256,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
         ns=list(view.apex.ns),
         source=view.apex.source,
         placeholder_glue_loopback=view.apex.placeholder_glue,
+        placeholder_reason=view.apex.placeholder_reason,
+        unaddressed_primary_ns=view.apex.unaddressed_primary_ns,
+        unaddressed_ns=list(view.apex.unaddressed_ns),
         by_view=[
             ServedApexInView(
                 view=name,
@@ -9201,6 +9266,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
                 ns=list(a.ns),
                 source=a.source,
                 placeholder_glue_loopback=a.placeholder_glue,
+                placeholder_reason=a.placeholder_reason,
+                unaddressed_primary_ns=a.unaddressed_primary_ns,
+                unaddressed_ns=list(a.unaddressed_ns),
             )
             for name, a in view.by_view
         ],
@@ -9308,7 +9376,7 @@ async def create_record(
     db: DB,
     current_user: CurrentUser,
 ) -> DNSRecord:
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _require_superadmin_for_lua(
@@ -9425,7 +9493,7 @@ async def update_record(
     db: DB,
     current_user: CurrentUser,
 ) -> DNSRecord:
-    record = await _require_record(group_id, zone_id, record_id, db)
+    record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
@@ -9628,7 +9696,7 @@ async def delete_record(
     BIND9 / PowerDNS also converge via the bundle drop; the enqueued op is an
     idempotent delete there. Restore re-pushes ``create`` (admin/trash.py).
     """
-    record = await _require_record(group_id, zone_id, record_id, db)
+    record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
 
@@ -9789,7 +9857,7 @@ async def bulk_delete_records(
     if not body.record_ids:
         return BulkDeleteRecordsResponse(deleted=0, skipped=[])
 
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.
@@ -10019,7 +10087,7 @@ async def bulk_create_records(
     current_user: CurrentUser,
 ) -> BulkCreateRecordsResponse:
     """Bulk-create records in one zone — one serial bump, one commit, one dispatch."""
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
 
@@ -10544,7 +10612,11 @@ async def import_zone_commit(
     Per-record changes are encoded in the ``new_value`` JSONB payload so
     per-record history is recoverable without generating N audit rows.
     """
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3535: the zone row first, as every record writer takes it, so an import
+    # caught behind a zone delete answers 404. Its serial bump used to fail on
+    # the deleted row (a 500). With a view, its record edits went out before
+    # the bump and could deadlock with a delete that took the zone row first.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -10750,6 +10822,8 @@ class SyncWithServerResponse(BaseModel):
     imported_records: list[dict]
     # Push (DB → server)
     push_candidates: int
+    # #3671 — the zone's records the server already holds, so none was pushed.
+    push_skipped_matching: int = 0
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
@@ -10830,6 +10904,7 @@ async def sync_zone_with_server_endpoint(
         skipped_unsupported=result.pull.skipped_unsupported,
         imported_records=result.pull.imported_records,
         push_candidates=result.push.candidates,
+        push_skipped_matching=result.push.already_matched,
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
@@ -11266,7 +11341,11 @@ async def import_zone_spreadsheet_commit(
     are queued as record ops in one batch on one serial bump, like the
     zone-file import, and audited as one ``dns_zone_import`` row.
     """
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3535: the zone row first, as every record writer takes it, so an import
+    # caught behind a zone delete answers 404. Its record edits go out before
+    # its serial bump, and a delete that took the zone row between them
+    # deadlocked with it.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if mode == "replace" and (confirm_zone or "").strip().rstrip(".").lower() != (
         zone.name.rstrip(".").lower()
     ):
@@ -11578,11 +11657,36 @@ def _refuse_superadmin_zone_fields(
 
 
 async def _require_zone(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, user: Any | None = None
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    user: Any | None = None,
+    *,
+    lock: Literal["write", "delete"] | None = None,
 ) -> DNSZone:
-    result = await db.execute(
-        select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
-    )
+    stmt = select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
+    if lock is not None:
+        # #3535: a writer of the zone's records takes the zone row first, as it
+        # reads it: FOR NO KEY UPDATE ("write"), the lock its serial bump takes
+        # anyway. A zone delete takes it too, FOR UPDATE ("delete") or FOR NO
+        # KEY UPDATE for a soft delete, before it touches the zone's records
+        # (``_apply_delete_zone``). Whichever comes second waits here for the
+        # first, and none waits for the zone row while it holds a record. A
+        # writer that waited on a delete then reads no zone (gone, or in the
+        # trash): 404, as a request sent after the delete gets. Read plainly,
+        # the writer went on, and its serial bump matched no row once a
+        # permanent delete committed (StaleDataError), or held the zone row
+        # while it waited on a record the delete held (a deadlock): a bare
+        # 500 either way. The lock is its own ``SELECT dns_zone.id``, the form
+        # the audit-chain hook and its test guard know (#3503); the read below
+        # then sees the row as the lock found it.
+        await db.execute(
+            select(DNSZone.id)
+            .where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
+            .with_for_update(key_share=lock == "write")
+        )
+        stmt = stmt.execution_options(populate_existing=True)
+    result = await db.execute(stmt)
     zone = result.scalar_one_or_none()
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
@@ -11780,10 +11884,16 @@ async def _check_driver_refusals(
 
 
 async def _require_record(
-    group_id: uuid.UUID, zone_id: uuid.UUID, record_id: uuid.UUID, db: DB
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    record_id: uuid.UUID,
+    db: DB,
+    *,
+    lock: bool = False,
 ) -> DNSRecord:
-    # Verify zone belongs to group first
-    await _require_zone(group_id, zone_id, db)
+    # Verify zone belongs to group first. A writer of the record (``lock``)
+    # takes the zone row first, before the record (#3535, see _require_zone).
+    await _require_zone(group_id, zone_id, db, lock="write" if lock else None)
     result = await db.execute(
         select(DNSRecord).where(DNSRecord.id == record_id, DNSRecord.zone_id == zone_id)
     )

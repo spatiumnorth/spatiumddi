@@ -499,6 +499,36 @@ async def surviving_sharer(
     return row[0] if row else None
 
 
+async def _retirement_plan(
+    db: AsyncSession, subnet: Subnet, exclude_ids: frozenset[uuid.UUID]
+) -> list[tuple[DNSZone, uuid.UUID | None]]:
+    """Each reverse zone ``subnet`` auto-created, with the live subnet that
+    keeps it (:func:`surviving_sharer`), or ``None`` when the zone goes with
+    ``subnet``. It only reads, so a delete's approval preview decides which
+    zones the delete takes by the delete's own rule (spatiumddi#3511)."""
+    zones = (
+        (
+            await db.execute(
+                select(DNSZone).where(
+                    DNSZone.linked_subnet_id == subnet.id,
+                    DNSZone.is_auto_generated.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        (zone, await surviving_sharer(db, zone, subnet, exclude_ids=exclude_ids)) for zone in zones
+    ]
+
+
+def _batch_subnets(batch: SoftDeleteBatch) -> tuple[list[Subnet], frozenset[uuid.UUID]]:
+    """The subnets ``batch`` trashes, and their ids: none of them keeps a zone."""
+    subnets = [row.obj for row in batch.rows if isinstance(row.obj, Subnet)]
+    return subnets, frozenset(sub.id for sub in subnets)
+
+
 async def retire_auto_reverse_zones(
     db: AsyncSession,
     subnet: Subnet,
@@ -531,23 +561,10 @@ async def retire_auto_reverse_zones(
     from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
     from app.services.soft_delete import add_to_batch  # noqa: PLC0415
 
-    zones = (
-        (
-            await db.execute(
-                select(DNSZone).where(
-                    DNSZone.linked_subnet_id == subnet.id,
-                    DNSZone.is_auto_generated.is_(True),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
     retired: list[DNSZone] = []
     relinked: list[DNSZone] = []
     wake: set[uuid.UUID] = set()
-    for zone in zones:
-        survivor = await surviving_sharer(db, zone, subnet, exclude_ids=exclude_ids)
+    for zone, survivor in await _retirement_plan(db, subnet, exclude_ids):
         if survivor is not None:
             zone.linked_subnet_id = survivor
             relinked.append(zone)
@@ -601,8 +618,7 @@ async def retire_auto_reverse_zones_for_batch(
     ``apply_soft_delete``. The batch's own subnets are never a survivor — they
     are all going — so only a subnet outside the batch keeps a shared zone
     alive. Returns the DNS group ids to wake after the commit."""
-    subnets = [row.obj for row in batch.rows if isinstance(row.obj, Subnet)]
-    going = frozenset(sub.id for sub in subnets)
+    subnets, going = _batch_subnets(batch)
     wake: set[uuid.UUID] = set()
     for sub in subnets:
         _retired, _relinked, groups = await retire_auto_reverse_zones(
@@ -610,6 +626,25 @@ async def retire_auto_reverse_zones_for_batch(
         )
         wake |= groups
     return wake
+
+
+async def add_retiring_reverse_zones(db: AsyncSession, batch: SoftDeleteBatch) -> None:
+    """Add to ``batch`` the reverse zones a soft delete of it retires into it,
+    with their records: the zones :func:`retire_auto_reverse_zones_for_batch`
+    adds, by the same plan, and for one subnet's batch the zones
+    :func:`retire_auto_reverse_zones` adds (the subnet is never its own
+    survivor either way). It only reads: no queued op is swept, no zone is
+    re-linked, no group is woken. The approval preview of a subnet, block or
+    space delete counts the batch this leaves, so it names the zones and
+    records the delete trashes and the approve-time drift check sees them
+    change (spatiumddi#3511)."""
+    from app.services.soft_delete import add_to_batch  # noqa: PLC0415
+
+    subnets, going = _batch_subnets(batch)
+    for sub in subnets:
+        for zone, survivor in await _retirement_plan(db, sub, going):
+            if survivor is None:
+                await add_to_batch(db, batch, zone)
 
 
 async def _trashed_sharer(

@@ -24,7 +24,7 @@ from typing import Any, Literal
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import admin_email_error, primary_ns_error
+from app.core.dns_names import MAX_NAME_LEN, admin_email_error, primary_ns_error
 from app.models.dns import DNSRecord, DNSServer, DNSView, DNSZone
 from app.services.dns.pool_geo import (
     build_geo_steering,
@@ -34,6 +34,7 @@ from app.services.dns.pool_geo import (
 )
 
 ApexSource = Literal["declared", "primary_ns", "placeholder"]
+PlaceholderReason = Literal["primary_ns_has_no_address", "no_primary_ns"]
 
 PLACEHOLDER_NS_LABEL = "ns1"
 PLACEHOLDER_NS_ADDRESS = "127.0.0.1"
@@ -57,6 +58,19 @@ class ServedApex:
     source: ApexSource
     # The agent writes ``ns1 IN A 127.0.0.1`` beside the placeholder NS.
     placeholder_glue: bool
+    # The agent's ``unaddressed_primary_ns`` note: a Primary NS inside the zone
+    # with no A/AAAA record, passed over for the placeholder (#3670).
+    unaddressed_primary_ns: str | None = None
+    # The agent's ``unaddressed_ns`` note: declared apex NS inside the zone, other
+    # than the placeholder, with no A/AAAA record (BIND will not load the zone).
+    unaddressed_ns: tuple[str, ...] = ()
+
+    @property
+    def placeholder_reason(self) -> PlaceholderReason | None:
+        """Why the placeholder NS is served, None when it is not."""
+        if self.source != "placeholder":
+            return None
+        return "primary_ns_has_no_address" if self.unaddressed_primary_ns else "no_primary_ns"
 
 
 def _absolute_name(value: object) -> str | None:
@@ -140,6 +154,7 @@ def compute_served_apex(
         rname_fallback = _PLACEHOLDER_OUTSIDE_RNAME
 
     source: ApexSource
+    unaddressed_primary: str | None = None
     if declared_ns:
         source = "declared"
         ns_set = declared_ns
@@ -149,15 +164,75 @@ def compute_served_apex(
     else:
         source = "placeholder"
         ns_set = [placeholder]
+        if primary is not None:
+            unaddressed_primary = primary
 
     placeholder_glue = (
         _inside(placeholder, origin)
         and placeholder.lower() in {n.lower() for n in ns_set}
         and placeholder.lower() not in addressed
     )
+    unaddressed_ns = tuple(
+        n
+        for n in declared_ns
+        if _inside(n, origin) and n.lower() not in addressed and n.lower() != placeholder.lower()
+    )
     mname = primary or (declared_ns[0] if declared_ns else placeholder)
     rname = admin or rname_fallback
-    return ServedApex(mname, rname, tuple(ns_set), source, placeholder_glue)
+    return ServedApex(
+        mname,
+        rname,
+        tuple(ns_set),
+        source,
+        placeholder_glue,
+        unaddressed_primary,
+        unaddressed_ns,
+    )
+
+
+def apex_name_length_error(
+    zone_name: str,
+    primary_ns: str | None,
+    admin_email: str | None,
+    records: Iterable[tuple[str, str, str]] = (),
+) -> str | None:
+    """Why primary zone ``zone_name`` cannot be served with the apex names it
+    would get, or None (#3672).
+
+    A zone name may be 253 characters, but with no Primary NS its SOA names
+    the placeholder ``ns1.<zone>``, and with no Admin Email the mailbox
+    ``admin.<zone>``: four and six characters more. Past 253 those are not DNS
+    names at all, so BIND refuses the zone and it is never served. The names
+    an operator types are held to 253 by their own validators; this catches
+    the ones the zone is given in their absence. ``records`` are the zone's
+    as for :func:`compute_served_apex`: an apex NS record replaces the
+    placeholder name server.
+    """
+    apex = compute_served_apex(zone_name, primary_ns, admin_email, records)
+    zone = str(zone_name or "").rstrip(".")
+    unset: list[str] = []
+    served_as: list[str] = []
+    room = MAX_NAME_LEN
+    for served, field, what in (
+        (apex.soa_mname, "Primary NS (primary_ns)", "name server"),
+        (apex.soa_rname, "Admin Email (admin_email)", "mailbox"),
+    ):
+        body = served.rstrip(".")
+        if len(body) <= MAX_NAME_LEN:
+            continue
+        label = body[: -len(zone) - 1] if zone else body
+        unset.append(field)
+        served_as.append(f"the {what} '{label}.<zone name>' ({len(body)} characters)")
+        room = min(room, MAX_NAME_LEN - len(label) - 1)
+    if not unset:
+        return None
+    return (
+        f"zone name is {len(zone)} characters, so with no {' and no '.join(unset)} "
+        f"set the zone would be served with {' and '.join(served_as)}, over the "
+        f"{MAX_NAME_LEN}-character limit of a DNS name, and the DNS server would "
+        f"refuse the zone. Set the {' and the '.join(unset)}, or shorten the zone "
+        f"name to at most {room} characters"
+    )
 
 
 @dataclass(frozen=True)
