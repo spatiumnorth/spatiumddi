@@ -280,6 +280,29 @@ async def test_shared_zones_count_once_and_view_scoped_ones_per_copy(
 
 
 @pytest.mark.asyncio
+async def test_a_dynamic_zone_counts_once_per_view(db_session: AsyncSession) -> None:
+    group, _views = await _group(db_session, ["restricted", "default"], [None])
+    zone = DNSZone(
+        group_id=group.id,
+        name="dyn.example.com.",
+        primary_ns="ns1.example.com.",
+        admin_email="hostmaster.example.com.",
+        dynamic_update_enabled=True,
+    )
+    db_session.add(zone)
+    await db_session.flush()
+    for i in range(3):
+        db_session.add(
+            DNSRecord(zone_id=zone.id, name=f"h{i}", record_type="A", value=f"192.0.2.{i}")
+        )
+    await db_session.flush()
+
+    est = await group_memory_estimate(db_session, group.id)
+    assert est is not None
+    assert est.zone_records_loaded == 3 * 2
+
+
+@pytest.mark.asyncio
 async def test_the_smallest_reported_limit_is_used(db_session: AsyncSession) -> None:
     group, _ = await _group(db_session, [], [2048 * MIB, 1024 * MIB, None])
     est = await group_memory_estimate(db_session, group.id)
