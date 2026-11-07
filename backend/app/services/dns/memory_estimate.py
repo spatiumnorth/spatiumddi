@@ -47,6 +47,7 @@ from app.models.dns import (
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone_clause,
     views_rendering_zone,
 )
 
@@ -292,12 +293,13 @@ async def _zone_records_loaded(
     scoped to each view. A view's copy is keyed by the view-scoped records it
     adds, its view's ``allow-query`` (the agent shares only across equal
     ones) and, for a zone holding pool records under geo steering, the view
-    itself (geo views serve different members). Forward zones hold no data;
-    a secondary's records arrive by transfer and are not known here.
+    itself (geo views serve different members). A zone that accepts client
+    updates is never shared, so each view counts its own copy. Forward zones
+    hold no data; a secondary's records arrive by transfer and are not known here.
     """
     zones = (
         await db.execute(
-            select(DNSZone.id, DNSZone.view_id).where(
+            select(DNSZone.id, DNSZone.view_id, DNSZone.dynamic_update_enabled).where(
                 DNSZone.group_id == group_id,
                 DNSZone.deleted_at.is_(None),
                 DNSZone.zone_type == "primary",
@@ -307,6 +309,7 @@ async def _zone_records_loaded(
     if not zones:
         return 0
     counts: dict[uuid.UUID, dict[Any, int]] = {}
+    placing: dict[uuid.UUID, set[Any]] = {}
     pooled: set[uuid.UUID] = set()
     rows = await db.execute(
         select(
@@ -314,31 +317,35 @@ async def _zone_records_loaded(
             DNSRecord.view_id,
             func.count(),
             func.count(DNSRecord.pool_member_id),
+            # Rows that place the zone in their view (``places_zone``).
+            func.count().filter(places_zone_clause()),
         )
         .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
         .where(DNSZone.group_id == group_id, DNSRecord.deleted_at.is_(None))
         .group_by(DNSRecord.zone_id, DNSRecord.view_id)
     )
-    for zone_id, view_id, n, n_pool in rows.all():
+    for zone_id, view_id, n, n_pool, n_placing in rows.all():
         counts.setdefault(zone_id, {})[view_id] = int(n)
+        if view_id is not None and n_placing:
+            placing.setdefault(zone_id, set()).add(view_id)
         if n_pool:
             pooled.add(zone_id)
 
     total = 0
-    for zone_id, zone_view_id in zones:
+    for zone_id, zone_view_id, zone_dynamic in zones:
         by_view = counts.get(zone_id, {})
         shared = by_view.get(None, 0)
         if not descs:
             total += sum(by_view.values())
             continue
-        scoped = [v for v in by_view if v is not None]
+        scoped = placing.get(zone_id, set())
         per_view: list[tuple[str, Any, int]] = []
         for vd in views_rendering_zone(descs, zone_view_id, scoped):
             own = by_view.get(vd["id"], 0) if vd["kind"] == "operator" else 0
             key = (
                 vd["id"] if own else None,
                 tuple(str(c) for c in (vd.get("allow_query") or [])),
-                vd["name"] if (geo_active and zone_id in pooled) else None,
+                vd["name"] if zone_dynamic or (geo_active and zone_id in pooled) else None,
             )
             per_view.append((vd["name"], key, shared + own))
         total += sum(records for _views, records in zone_copies(per_view))

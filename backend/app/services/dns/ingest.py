@@ -56,6 +56,19 @@ the whole-RRset replace an operator's edit sends: the database only knows the
 values that have been reported, and a replace would wipe any other value the
 target server holds at that name.
 
+**Split-horizon.** A zone rendered into several views has one copy per view,
+and an RFC 2136 write lands in one of them. The report names the view whose
+copy the agent read (the endpoint files it under that view's zone row), and a
+new mirror row is stamped with that view (``view_id``), so it renders into
+that view's copy only rather than into every view's. A zone rendered into one
+view, or a group with no views, keeps mirror rows unscoped as before. The
+diff reads only the mirror rows that copy can hold (unscoped, or scoped to
+the report's view), so a row learned in another view's copy is never matched,
+nor dropped, by this report. A report that names no view (an agent built
+before the view field) mirrors exactly as before: every mirror row of the
+zone is in play and new rows are unscoped. A learned row's view never moves
+the zone itself (``pool_geo.places_zone``).
+
 The server a record came from is never sent an op for it: it already holds
 the record. A disabled server's report is ignored and its snapshot is kept
 as it was when it was paused, so on re-enable the changes a writer made on it
@@ -76,12 +89,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import is_agentless
 from app.models.dns import DNSIngestSnapshot, DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.services.dns.pool_geo import EXTERNAL_IMPORT_SOURCE
 from app.services.dns.zone_apex import compute_served_apex
 
 logger = structlog.get_logger(__name__)
-
-# Provenance marker for a record the agent read back off the live zone.
-EXTERNAL_IMPORT_SOURCE = "ddns_external"
 
 # A correction that failed permanently (``MAX_OP_ATTEMPTS``) is not queued
 # again for this long, so a value one server will not accept is retried a few
@@ -204,6 +215,8 @@ async def reconcile_external_records(
     incoming: list[IncomingRecord],
     *,
     server: DNSServer | None = None,
+    report_view_id: Any = None,
+    stamp_view: bool = False,
 ) -> IngestResult:
     """Reconcile the ``ddns_external`` mirror rows for one zone.
 
@@ -215,6 +228,13 @@ async def reconcile_external_records(
     ``server`` is the agent the report came from. Without it, or when it has
     no enabled agent peers in its group, the report is the whole truth (the
     #641 behaviour). With peers, see the module docstring (#2654).
+
+    ``report_view_id`` is the operator view whose copy of the zone the report
+    was read from, or None (no views, a geo view, or an agent that names no
+    view). When set, only the mirror rows that copy holds take part in the
+    diff: unscoped ones and ones scoped to that view. ``stamp_view`` stamps
+    new mirror rows with ``report_view_id``; the caller sets it when the zone
+    renders into more than one view.
 
     The caller is responsible for gating on ``zone.dynamic_update_enabled``
     and for committing the session.
@@ -247,12 +267,16 @@ async def reconcile_external_records(
         for r in existing
         if r.import_source != EXTERNAL_IMPORT_SOURCE
     }
-    # Current external mirror rows, keyed for diff.
+    # Current external mirror rows, keyed for diff: only those the reported
+    # copy holds. A row learned in another view's copy is that copy's to keep
+    # or drop, so it is neither matched nor removed here.
     external_by_key: dict[tuple[str, str, str], DNSRecord] = {
         _key(r.name, r.record_type, r.value): r
         for r in existing
         if r.import_source == EXTERNAL_IMPORT_SOURCE
+        and (report_view_id is None or r.view_id is None or r.view_id == report_view_id)
     }
+    mirror_view_id = report_view_id if stamp_view else None
 
     # An earlier build mirrored the placeholder glue as an external row. It is
     # simply never "desired" here, so the vanished-row sweep below removes it.
@@ -276,11 +300,11 @@ async def reconcile_external_records(
         desired.setdefault(_key(rec.name, rtype, rec.value), rec)
 
     if server is None:
-        await _full_reconcile(db, zone, desired, external_by_key, result)
+        await _full_reconcile(db, zone, desired, external_by_key, result, mirror_view_id)
         return result
 
     if not await _enabled_agent_peers(db, zone, server):
-        await _full_reconcile(db, zone, desired, external_by_key, result)
+        await _full_reconcile(db, zone, desired, external_by_key, result, mirror_view_id)
         await _save_snapshot(db, server, zone, set(desired))
         return result
 
@@ -296,7 +320,9 @@ async def reconcile_external_records(
         return result
 
     result.mode = "multi"
-    await _transition_reconcile(db, zone, server, desired, external_by_key, managed_nt, result)
+    await _transition_reconcile(
+        db, zone, server, desired, external_by_key, managed_nt, result, mirror_view_id
+    )
     return result
 
 
@@ -306,12 +332,13 @@ async def _full_reconcile(
     desired: dict[tuple[str, str, str], IncomingRecord],
     external_by_key: dict[tuple[str, str, str], DNSRecord],
     result: IngestResult,
+    view_id: Any = None,
 ) -> None:
     """The report is the whole truth: one agent server in the group (#641)."""
     for k, rec in desired.items():
         if k in external_by_key:
             continue  # already mirrored
-        _add_mirror(db, zone, rec, result)
+        _add_mirror(db, zone, rec, result, view_id)
 
     # Remove mirrors that vanished upstream (present in DB, absent from the
     # agent's current external set). Hard-delete — a stale mirror would
@@ -361,6 +388,7 @@ async def _transition_reconcile(
     external_by_key: dict[tuple[str, str, str], DNSRecord],
     managed_nt: set[tuple[str, str]],
     result: IngestResult,
+    view_id: Any = None,
 ) -> None:
     """Several agent servers: act on what changed on ``server`` (#2654)."""
     from app.services.dns.record_ops import (  # noqa: PLC0415 — record_ops imports models heavily
@@ -390,7 +418,7 @@ async def _transition_reconcile(
             carried.discard(k)  # look again next report
             result.deferred += 1
             continue
-        added_rows.append(_add_mirror(db, zone, desired[k], result))
+        added_rows.append(_add_mirror(db, zone, desired[k], result, view_id))
 
     # Vanished from this server since its last report.
     for k in previous - current:
@@ -457,13 +485,20 @@ async def _transition_reconcile(
 
 
 def _add_mirror(
-    db: AsyncSession, zone: DNSZone, rec: IncomingRecord, result: IngestResult
+    db: AsyncSession,
+    zone: DNSZone,
+    rec: IncomingRecord,
+    result: IngestResult,
+    view_id: Any = None,
 ) -> DNSRecord:
     rtype = rec.record_type.upper()
     zone_name_no_dot = zone.name.rstrip(".")
     fqdn = zone_name_no_dot if rec.name == "@" else f"{rec.name}.{zone_name_no_dot}"
     row = DNSRecord(
         zone_id=zone.id,
+        # The view whose copy the write landed in, when the zone renders into
+        # several; None renders the row into every copy of the zone.
+        view_id=view_id,
         name=rec.name,
         fqdn=fqdn,
         record_type=rtype,

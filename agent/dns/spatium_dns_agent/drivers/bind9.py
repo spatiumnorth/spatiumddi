@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hashlib
 import ipaddress
 import json
@@ -1926,6 +1927,7 @@ def _share_would_merge(
     zname: str,
     view: str,
     owner: str,
+    staged: Path,
 ) -> bool:
     """Whether referencing ``owner``'s copy of ``zname`` from ``view`` would
     merge RFC 2136 records named holds in one copy into the other (#3551).
@@ -1936,14 +1938,37 @@ def _share_would_merge(
     records with its file, or show it the defining view's, which split-horizon
     exists to keep apart. So a pair shares only when it already did, or when
     neither live copy holds anything beyond a render. Otherwise each keeps its
-    own copy, exactly as before sharing existed."""
+    own copy, exactly as before sharing existed.
+
+    Keeping a copy apart preserves what named holds of it only while the copy
+    is not reloaded, and it is reloaded exactly when its file changes
+    (``_zones_differing``). ``staged`` is the defining view's copy in this
+    render, which is the bytes either copy would render; a live copy whose
+    file differs from it is reloaded from the render either way, so it is no
+    reason to stay apart.
+
+    No ``.owned`` test (#3632): that sidecar is written only while the zone
+    takes updates, so once updates are turned off a copy holding names a
+    client added has none. Neither the journal: the render after the
+    switch-off replaces both copies' files with renders and sets the journal
+    aside with the old tree, while named still serves the names from memory.
+    That render marks such a copy (``_unrendered_marker``), so the renders
+    after it see it too."""
     if prev_in_view.get((zname, view)) == owner:
         return False
     for v in (view, owner):
         live = prev / _zone_rel(zname, v)
-        if _owned_sidecar(live).is_file() and _may_hold_unrendered(live):
+        if _may_hold_unrendered(live) and _same_file_bytes(staged, live):
             return True
     return False
+
+
+def _same_file_bytes(a: Path, b: Path) -> bool:
+    """Whether two files hold the same bytes; False when either is unreadable."""
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
 
 
 def _view_carry_sources(
@@ -1969,7 +1994,29 @@ def _view_carry_sources(
     return out
 
 
-def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
+def _zone_accepts_updates(zone: dict[str, Any], *, foreign_loopback: bool = False) -> bool:
+    """Whether the zone takes RFC 2136 updates from clients. The render adds
+    the operator's ``allow-update`` / ``update-policy`` grants (beyond the
+    loopback key) only behind ``dynamic_update_enabled``, the same switch the
+    ``.owned`` sidecar keys on.
+
+    The loopback grant, on every primary zone, is a client grant too when
+    the key standing in for it is not the control plane's own
+    (``foreign_loopback``): a group with no usable group key renders its
+    first operator key there (#2835), and clients hold that key."""
+    if zone.get("dynamic_update_enabled"):
+        return True
+    return foreign_loopback and zone.get("type", "primary") not in {
+        "forward",
+        "secondary",
+        "slave",
+        "stub",
+    }
+
+
+def _view_share_key(
+    zone: dict[str, Any], view: dict[str, Any], *, foreign_loopback: bool = False
+) -> str | None:
     """What a view's copy of ``zone`` must match to share an earlier view's
     copy through ``in-view`` (#3551), or None when it can never share.
 
@@ -1989,8 +2036,15 @@ def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
 
     Forward zones never share: BIND refuses ``in-view`` of one (they are
     resolver configuration, not zone data, and cost nothing to repeat).
+
+    Neither does a zone that accepts client updates: one shared copy takes
+    an update sent through any view and answers every view with it, which
+    split-horizon exists to keep apart. Each view keeps its own copy
+    (``_zone_accepts_updates``).
     """
     if not zone.get("name") or zone.get("type", "primary") == "forward":
+        return None
+    if _zone_accepts_updates(zone, foreign_loopback=foreign_loopback):
         return None
     body = {k: v for k, v in zone.items() if k != "view_name"}
     return hashlib.sha256(
@@ -2042,6 +2096,23 @@ def _rpz_sidecar(path: Path) -> Path:
     """The hash sidecar of an RPZ zone file. Not ``*.db``, so neither the
     zone enumeration nor the byte comparison ever mistakes it for a zone."""
     return path.with_name(path.name + _RPZ_HASH_SUFFIX)
+
+
+def _write_rpz_sidecar(path: Path, key: str) -> None:
+    """Record ``key`` beside the RPZ file at ``path``, if the name can exist.
+
+    The sidecar is an optimisation: a zone without one is rendered every
+    time, as for a bundle with no hash. A zone name within ~14 bytes of the
+    file system's limit leaves no room for ``.sha256`` (#3672); that zone is
+    served, just never reused.
+    """
+    try:
+        _write_new_inode(
+            _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
+        )
+    except OSError as exc:
+        if not _name_too_long(exc):
+            raise
 
 
 def _rpz_render_key(bl: dict[str, Any]) -> str | None:
@@ -2128,9 +2199,78 @@ def _write_new_inode(path: Path, data: bytes) -> None:
 def _copy_new_inode(src: Path, dst: Path) -> None:
     """A private copy of ``src`` at ``dst``, as a new inode."""
     tmp = dst.with_name(dst.name + ".tmp")
-    shutil.copyfile(src, tmp)
+    try:
+        shutil.copyfile(src, tmp)
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+        # ``dst`` fits a file name and its temp name does not (#3672): a zone
+        # name within 4 bytes of the limit. Unlinking first still leaves
+        # ``dst`` a new inode, so a hard link into another tree keeps its
+        # bytes; only the atomic rename is lost, in a staging tree.
+        dst.unlink(missing_ok=True)
+        shutil.copyfile(src, dst)
+        _fsync_path(dst)
+        return
     _fsync_path(tmp)
     os.replace(tmp, dst)
+
+
+#: The longest name a single path component may have (Linux ``NAME_MAX``).
+#: A zone's file is ``<zone>.db``; its sidecars add more (#3672).
+_NAME_MAX = 255
+
+
+def _name_too_long(exc: OSError) -> bool:
+    return exc.errno == errno.ENAMETOOLONG
+
+
+#: What named appends to a zone's file name for the files it keeps beside it
+#: (#3672). It opens the journal on every load of a primary zone, dynamic or
+#: not, and a journal name past ``NAME_MAX`` is "journal open failed: unexpected
+#: error ... not loaded due to errors", verified against BIND 9.20. Inline-
+#: signing adds the signed copy and its journal, opened the same way.
+_NAMED_JOURNAL_SUFFIX = ".jnl"
+_NAMED_SIGNED_JOURNAL_SUFFIX = ".signed.jnl"
+
+
+def _named_files_fit(path: Path, signed: bool) -> bool:
+    """Whether named can name every file it keeps beside the zone file at
+    ``path`` (#3672). A zone whose files it cannot name is one named will not
+    load: written anyway, it passes ``named-checkzone`` (which opens no
+    journal) and then fails the reload verification, and with it the whole
+    apply."""
+    suffix = _NAMED_SIGNED_JOURNAL_SUFFIX if signed else _NAMED_JOURNAL_SUFFIX
+    return len(path.name.encode()) + len(suffix) <= _NAME_MAX
+
+
+def _file_name_refusal(zname: str) -> str:
+    """The held-back reason for a zone whose files cannot be named (#3672)."""
+    return (
+        f"the zone name is {len(zname)} characters, too long for the agent to "
+        f"store the zone: its file, or a file kept beside it (such as the DNS "
+        f"server's journal, or with DNSSEC its signed copy), would need a name "
+        f"longer than the file system's {_NAME_MAX} bytes. Shorten the zone name"
+    )
+
+
+def _discard(path: Path, zone: str) -> None:
+    """Remove a staged file of a held-back zone, never failing the apply.
+
+    A name too long to exist (#3672) names a file that was never written, so
+    there is nothing to remove; it used to raise out of the hold-back and
+    reject the whole config, the #1403 failure again. Any other error is
+    logged and the zone is still held back: a stale staged file of one zone
+    is that zone's problem, not every other zone's.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        if _name_too_long(exc):
+            return
+        log.warning(
+            "bind9_hold_back_cleanup_failed", zone=zone, path=str(path), error=str(exc)
+        )
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:
@@ -2198,6 +2338,20 @@ _PLAIN_OWNER = re.compile(r"^[A-Za-z0-9_*.-]+$")
 
 def _owned_sidecar(zone_file: Path) -> Path:
     return zone_file.with_name(zone_file.name + _OWNED_SUFFIX)
+
+
+# A static zone's copy named may still hold records of beyond its render
+# (#3632): updates were turned off while a client's names sat in it, unseen by
+# the control plane. The render after the switch-off writes a file identical
+# to the live one, so named is not reloaded and keeps serving those names from
+# memory, but the journal goes aside with the old tree and the new file is a
+# bare render: nothing on disk would say so any more. This marker says it, for
+# as long as each render leaves the copy's file unchanged.
+_UNRENDERED_SUFFIX = ".unrendered"
+
+
+def _unrendered_marker(zone_file: Path) -> Path:
+    return zone_file.with_name(zone_file.name + _UNRENDERED_SUFFIX)
 
 
 def _canon_owner(owner: str, origin: str) -> str:
@@ -2327,11 +2481,14 @@ def _is_pure_render(zone_file: Path) -> bool:
 
 def _may_hold_unrendered(zone_file: Path) -> bool:
     """Whether named may hold records in this live zone that no render put
-    there: it took an update (a journal), dumped the zone over our file, or
-    the file already carries records forward."""
+    there: it took an update (a journal), dumped the zone over our file, the
+    file already carries records forward, or an earlier render found one of
+    these and the file has not changed since (``_unrendered_marker``)."""
     if not zone_file.is_file():
         return False
     if zone_file.with_name(zone_file.name + ".jnl").exists():
+        return True
+    if _unrendered_marker(zone_file).exists():
         return True
     return not _is_pure_render(zone_file)
 
@@ -2882,8 +3039,14 @@ class Bind9Driver(DriverBase):
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
+    #: Zones the last render could not write a file for, because a file name
+    #: the zone needs is longer than the file system allows (#3672). Held back
+    #: like a zone named-checkzone refuses: not served, everything else applies.
+    _unwritable_zones: tuple[HeldZone, ...] = ()
+
     def render(self, bundle: dict[str, Any]) -> None:
         self._skipped_records = set()
+        self._unwritable_zones = ()
         self._learned_rrsets = {}
         # A new render may grant the SOA where the last one did not (#2835).
         self._soa_refused_zones: set[str] = set()
@@ -3188,8 +3351,20 @@ class Bind9Driver(DriverBase):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
             self._primary_rels.add(rel_zfile)
-            for kind, detail in self._write_zone_file(new_dir / rel_zfile, zone):
-                apex_notes.append((zname.rstrip("."), kind, detail))
+            if not _named_files_fit(
+                new_dir / rel_zfile, bool(zone.get("dnssec_enabled"))
+            ):
+                self._hold_unwritable(new_dir / rel_zfile, zname, file_prefix)
+            else:
+                try:
+                    for kind, detail in self._write_zone_file(
+                        new_dir / rel_zfile, zone
+                    ):
+                        apex_notes.append((zname.rstrip("."), kind, detail))
+                except OSError as exc:
+                    if not _name_too_long(exc):
+                        raise
+                    self._hold_unwritable(new_dir / rel_zfile, zname, file_prefix)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"{update_clause}{allow_transfer}{dnssec_clause}"
@@ -3206,7 +3381,15 @@ class Bind9Driver(DriverBase):
             zname = bl["rpz_zone_name"]
             rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
-            self._place_rpz_zone_file(new_dir / rel, bl, rel)
+            try:
+                if _named_files_fit(new_dir / rel, False):
+                    self._place_rpz_zone_file(new_dir / rel, bl, rel)
+                else:
+                    self._hold_unwritable(new_dir / rel, zname, file_prefix)
+            except OSError as exc:
+                if not _name_too_long(exc):
+                    raise
+                self._hold_unwritable(new_dir / rel, zname, file_prefix)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"allow-query {{ localhost; }}; }};\n"
@@ -3274,12 +3457,19 @@ class Bind9Driver(DriverBase):
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
-                    share = _view_share_key(zone, view)
+                    share = _view_share_key(
+                        zone, view, foreign_loopback=bool(tsig_keys) and not loopback_owned
+                    )
                     zname = zone.get("name") or ""
                     if share is not None:
                         owner = defined_in.get(zname, {}).get(share)
                         if owner is not None and _share_would_merge(
-                            live_tree, live_in_view, zname.rstrip("."), vname, owner
+                            live_tree,
+                            live_in_view,
+                            zname.rstrip("."),
+                            vname,
+                            owner,
+                            new_dir / _zone_rel(zname.rstrip("."), owner),
                         ):
                             log.info(
                                 "bind9_view_zone_not_shared",
@@ -3298,6 +3488,14 @@ class Bind9Driver(DriverBase):
                     # masters) defines nothing a later view could reference.
                     if share is not None and stanza:
                         defined_in.setdefault(zname, {}).setdefault(share, vname)
+                        # A static copy kept as it was: whatever named held of
+                        # it beyond a render, it still holds (#3632).
+                        rel = _zone_rel(zname.rstrip("."), vname)
+                        live_copy = live_tree / rel
+                        if _may_hold_unrendered(live_copy) and _same_file_bytes(
+                            new_dir / rel, live_copy
+                        ):
+                            _unrendered_marker(new_dir / rel).touch()
                     body += stanza
                 for bl in view_bls:
                     body += _rpz_stanza(bl, f"{vname}/")
@@ -3531,6 +3729,32 @@ class Bind9Driver(DriverBase):
             lines.append(f"{digest}.zones IN PTR {text_with_dot}")
         path.write_text("\n".join(lines) + "\n")
 
+    def _hold_unwritable(self, path: Path, zname: str, file_prefix: str) -> None:
+        """Hold back a zone whose file, or a sidecar of it, cannot be named (#3672).
+
+        Only a name too long comes here (an ``ENAMETOOLONG`` from the write,
+        or a journal named could not name, :func:`_named_files_fit`): it is a
+        property of the zone's name, so it fails the same way on every render
+        and holding the zone back is the whole answer. Any other write error (a full disk) still fails the
+        apply, since it is no verdict on one zone. The stanza stays in
+        named.conf, as for a new zone named-checkzone refuses: named cannot
+        load the missing file and answers SERVFAIL for the zone, rather than
+        handing its names to recursion.
+        """
+        zone = zname.rstrip(".")
+        view = file_prefix.rstrip("/") or None
+        label = _zone_label(zone, view)
+        # Whatever the write got as far as: a zone file without its sidecar
+        # would be read as a render it is not.
+        for staged in (path, _rpz_sidecar(path), _owned_sidecar(path)):
+            _discard(staged, label)
+        reason = _file_name_refusal(zone)
+        log.warning("bind9_zone_file_name_too_long", zone=label, reason=reason)
+        self._unwritable_zones = (
+            *self._unwritable_zones,
+            HeldZone(zone, view, reason, False),
+        )
+
     def _write_zone_file(
         self, path: Path, zone: dict[str, Any]
     ) -> tuple[tuple[str, str], ...]:
@@ -3679,9 +3903,7 @@ class Bind9Driver(DriverBase):
                     # that; it changes no byte, and the backup sharing the
                     # inode loses nothing.
                     os.utime(path)
-                _write_new_inode(
-                    _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
-                )
+                _write_rpz_sidecar(path, key)
                 log.info(
                     "bind9_rpz_reused",
                     zone=bl["rpz_zone_name"],
@@ -3692,9 +3914,7 @@ class Bind9Driver(DriverBase):
                 return
         self._write_rpz_zone_file(path, bl)
         if key is not None:
-            _write_new_inode(
-                _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
-            )
+            _write_rpz_sidecar(path, key)
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file, streaming it to disk.
@@ -3887,8 +4107,9 @@ class Bind9Driver(DriverBase):
             yield f"*.{d} CNAME rpz-passthru."
 
     def validate(self) -> None:
-        # What this apply holds back (#1403); refilled by _check_zone_files.
-        self.held_back = ()
+        # What this apply holds back (#1403); refilled by _check_zone_files,
+        # after the zones the render could not write a file for (#3672).
+        self.held_back = tuple(self._unwritable_zones)
         new_dir = self.state_dir / "rendered.new"
         conf = new_dir / "named.conf"
         # Fail closed (#1224). Skipping validation because the checker is
@@ -4028,26 +4249,46 @@ class Bind9Driver(DriverBase):
             last_good = live / rel
             served = last_good.is_file()
             staged_sidecar = _rpz_sidecar(new_dir / rel)
-            if served:
-                # A copy as a new inode, never a write through the staged
-                # name: that name can be a hard link into ``rendered.prev``
-                # (#2157), whose bytes the #882 revert restores from.
-                _copy_new_inode(last_good, new_dir / rel)
-                # The staged sidecar described the refused render; the file
-                # is now the live one, so it gets the live one's (or none).
-                if _rpz_sidecar(last_good).is_file():
-                    _copy_new_inode(_rpz_sidecar(last_good), staged_sidecar)
+            label = _zone_label(zname, view)
+            # One zone's files must never fail the apply (#3672): an error
+            # here escaped the driver and rejected the whole config, which is
+            # the #1403 failure this hold-back exists to prevent. A sidecar
+            # name past the file system's limit was the case met live.
+            try:
+                if served:
+                    # A copy as a new inode, never a write through the staged
+                    # name: that name can be a hard link into ``rendered.prev``
+                    # (#2157), whose bytes the #882 revert restores from.
+                    _copy_new_inode(last_good, new_dir / rel)
+                    # The staged sidecar described the refused render; the
+                    # file is now the live one, so it gets the live one's (or
+                    # none).
+                    if _rpz_sidecar(last_good).is_file():
+                        _copy_new_inode(_rpz_sidecar(last_good), staged_sidecar)
+                    else:
+                        _discard(staged_sidecar, label)
+                    # Same for a dynamic zone's ownership sidecar (#2850): the
+                    # refused render's would say the control plane gave up
+                    # names it never stopped serving, and the next render
+                    # would carry them back as a third party's.
+                    if _owned_sidecar(last_good).is_file():
+                        _restage_owned(last_good, new_dir / rel)
+                    else:
+                        _discard(_owned_sidecar(new_dir / rel), label)
                 else:
-                    staged_sidecar.unlink(missing_ok=True)
-                # Same for a dynamic zone's ownership sidecar (#2850): the
-                # refused render's would say the control plane gave up names
-                # it never stopped serving, and the next render would carry
-                # them back as a third party's.
-                _restage_owned(last_good, new_dir / rel)
-            else:
-                (new_dir / rel).unlink()
-                staged_sidecar.unlink(missing_ok=True)
-                _owned_sidecar(new_dir / rel).unlink(missing_ok=True)
+                    _discard(new_dir / rel, label)
+                    _discard(staged_sidecar, label)
+                    _discard(_owned_sidecar(new_dir / rel), label)
+            except OSError as exc:
+                log.warning(
+                    "bind9_hold_back_cleanup_failed",
+                    zone=label,
+                    error=str(exc),
+                    detail=(
+                        "the zone is still held back; only its staged files "
+                        "could not all be put back"
+                    ),
+                )
             held.append(HeldZone(zname, view, detail, served))
         if held:
             log.warning(
@@ -4060,7 +4301,8 @@ class Bind9Driver(DriverBase):
                     "served. Every other change in the config applied."
                 ),
             )
-        self.held_back = tuple(held)
+        # After any zone the render could not write at all (#3672).
+        self.held_back = (*self.held_back, *held)
 
     def _checkzone(self, new_dir: Path, zv: tuple[str, str | None]) -> str | None:
         """``named-checkzone`` one staged zone file: None if it loads, else the

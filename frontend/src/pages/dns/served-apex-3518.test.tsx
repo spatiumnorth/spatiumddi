@@ -277,4 +277,46 @@ describe("the SOA and apex NS a zone serves (#3518)", () => {
     expect(screen.queryByTestId("served-apex-soa")).toBeNull();
     expect(screen.queryByTestId("served-apex-driver-note")).toBeNull();
   });
+
+  it("names the Primary NS that has no address record (#3670)", async () => {
+    await openZone(
+      apex({
+        soa: { mname: "ns.example.com.", rname: "admin.example.com." },
+        placeholder_reason: "primary_ns_has_no_address",
+        unaddressed_primary_ns: "ns.example.com.",
+      }),
+    );
+    const warning = screen.getByTestId("served-apex-warning").textContent ?? "";
+    expect(warning).toContain("Add an A or AAAA record for ns.example.com.");
+    expect(warning).not.toContain("Set a Primary NS");
+  });
+
+  it("warns of loopback glue on a declared apex NS with no address (#3670)", async () => {
+    await openZone(
+      apex({
+        source: "declared",
+        ns: ["ns1.example.com."],
+        placeholder_glue_loopback: true,
+      }),
+    );
+    expect(screen.queryByTestId("served-apex-ns")).toBeNull();
+    const warning = screen.getByTestId("served-apex-warning").textContent ?? "";
+    expect(warning).toContain("ns1.example.com.");
+    expect(warning).toContain("127.0.0.1");
+    expect(warning).toContain("Add an A or AAAA record");
+  });
+
+  it("asks for the address of a declared in-zone NS with none (#3670)", async () => {
+    await openZone(
+      apex({
+        source: "declared",
+        ns: ["ns2.example.com."],
+        placeholder_glue_loopback: false,
+        unaddressed_ns: ["ns2.example.com."],
+      }),
+    );
+    expect(screen.getByTestId("served-apex-warning").textContent).toContain(
+      "ns2.example.com.",
+    );
+  });
 });
