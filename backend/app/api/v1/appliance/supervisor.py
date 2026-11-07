@@ -7863,7 +7863,7 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
 
     appliance = await _require_cert_auth(request, db)
     # #3606: end the auth's read transaction before the 30 s wait; the queue
-    # is in memory and nothing is pending (cert auth only reads).
+    # is in Redis and nothing is pending (cert auth only reads).
     await db.commit()
     queued = await _proxy.pop_request(appliance.id, timeout=30.0)
     if queued is None:
@@ -7892,8 +7892,8 @@ async def k8s_proxy_reply(
 ) -> dict[str, str]:
     """Supervisor-only endpoint. Once the supervisor has executed the
     proxied request against the local kubeapi, it POSTs the response
-    here. The backend's in-memory future map matches the request_id
-    + resolves the operator action's pending future.
+    here. The reply is pushed to Redis keyed by request_id, resolving the
+    operator action's pending wait on whichever api replica holds it.
 
     Returns 200 either way — late replies (operator already timed
     out + the future was GC'd) are logged + discarded server-side
@@ -7913,7 +7913,7 @@ async def k8s_proxy_reply(
         headers=body.headers,
         body_b64=body.body_b64,
     )
-    delivered = _proxy.deliver_response(response, appliance_id=appliance.id)
+    delivered = await _proxy.deliver_response(response, appliance_id=appliance.id)
     logger.info(
         "appliance.k8s_proxy.reply",
         appliance_id=str(appliance.id),
