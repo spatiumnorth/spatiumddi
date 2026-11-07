@@ -4,7 +4,7 @@ inspection.
 Distinct from the audit-forward surface under ``/settings/audit-
 forward-targets``. Audit-forward fires on every audit row in a syslog
 / webhook / SMTP wire format the operator picks; this surface emits
-**typed events** (``subnet.created``, ``ip.allocated``, …) shaped for
+**typed events** (``subnet.created``, ``ip.created``, …) shaped for
 downstream automation, with HMAC signing and an outbox-backed
 delivery queue.
 
