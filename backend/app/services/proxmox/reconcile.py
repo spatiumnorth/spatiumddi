@@ -48,6 +48,7 @@ from app.services.integration_ownership import (
     address_taken,
     addresses_in_space,
     drop_wrapper_block,
+    gateway_changed,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
@@ -671,7 +672,7 @@ async def _apply_blocks_and_subnets(
             # whatever's already there alone. Operators who manually
             # set the correct upstream gateway on a Proxmox-mirrored
             # subnet shouldn't see it cleared on every sync.
-            if d.gateway and existing.gateway != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:

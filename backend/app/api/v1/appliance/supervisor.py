@@ -68,7 +68,7 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
     load_der_public_key,
 )
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select, update
@@ -529,6 +529,11 @@ class SupervisorCapabilities(BaseModel):
     # repeats, so the column kept its first value through every upgrade.
     # No max_length here: a bad value must not 422 the whole heartbeat.
     supervisor_version: str | None = None
+    # #3631 — the supervisor opens a join token sealed to the key it sends in
+    # its signed heartbeat. One that does not report this is never handed a
+    # join token, so a promote of it is refused up front rather than left to
+    # wait for a token that will not come.
+    sealed_join_token: bool = False
 
 
 class SupervisorRoleRestore(BaseModel):
@@ -1612,6 +1617,11 @@ class SupervisorHeartbeatRequest(BaseModel):
 
     appliance_id: uuid.UUID
     session_token: str | None = None
+    # #3631 — base64 of a raw X25519 public key the supervisor process holds
+    # the private half of. The k3s join token is returned sealed to it
+    # (``desired_k3s_join_token_sealed``), never in clear. Trusted only on a
+    # request whose signature covered the body.
+    join_token_public_key: str | None = Field(default=None, max_length=64)
     # #358 Phase 1b — opt-in heartbeat long-poll. >0 asks the control
     # plane to hold the response open up to this many seconds (capped
     # server-side) waiting for a per-appliance wake, so operator commands
@@ -1996,12 +2006,18 @@ class SupervisorHeartbeatResponse(BaseModel):
     # ``desired_cluster_role`` = "member" → join the seed via
     # ``desired_k3s_server_url`` + ``desired_k3s_join_token``; "none" →
     # leave the cluster + revert to a plain application appliance.
-    # NULL = no change. The token is the plaintext node-token (the
-    # heartbeat channel is mTLS); the supervisor's host-side runner
-    # (Phase 7b) reconfigures k3s + reports back via cluster_join_state.
+    # NULL = no change. The supervisor's host-side runner (Phase 7b)
+    # reconfigures k3s + reports back via cluster_join_state.
+    #
+    # #3631 — the node-token travels only in ``desired_k3s_join_token_sealed``,
+    # sealed to the key the supervisor sent in its signed heartbeat body
+    # (``app.services.appliance.sealed_token``): this response can cross a
+    # plain-HTTP hop. ``desired_k3s_join_token`` is kept for the response
+    # shape older supervisors parse and is always null.
     desired_cluster_role: Literal["member", "none"] | None = None
     desired_k3s_server_url: str | None = None
     desired_k3s_join_token: str | None = None
+    desired_k3s_join_token_sealed: str | None = None
     # #1903 — id of the promote asking for the join; echoed back on the report.
     desired_cluster_transition_id: str | None = None
     # #1903 — that promote's age in seconds (a duration, never a timestamp, so
@@ -2327,6 +2343,7 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
 async def supervisor_heartbeat(
     body: SupervisorHeartbeatRequest,
     request: Request,
+    response: Response,
     db: DB,
 ) -> SupervisorHeartbeatResponse:
     """Persist supervisor-reported appliance-host state + return the
@@ -2359,6 +2376,15 @@ async def supervisor_heartbeat(
     A deliberate refusal (revoked row, or no row the credential opens) is a
     403 carrying ``REVOCATION_HEADER``; see its comment.
     """
+    # #3631 — tell the supervisor which signature forms this control plane
+    # checks. A supervisor that gets an answer without this header is
+    # talking to an older control plane and signs the legacy form for it.
+    from app.services.appliance.cert_auth import (  # noqa: PLC0415
+        SIGNATURE_VERSION,
+        SIGNATURE_VERSIONS_HEADER,
+    )
+
+    response.headers[SIGNATURE_VERSIONS_HEADER] = SIGNATURE_VERSION
     try:
         return await _supervisor_heartbeat(body, request, db)
     except Exception as exc:
@@ -2399,12 +2425,23 @@ async def _supervisor_heartbeat(
     # cert yet).
     from app.services.appliance.cert_auth import (  # noqa: PLC0415
         CertAuthFailed,
+        CertAuthReplayed,
         authenticate_cert,
     )
 
     cert_principal = None
     try:
         cert_principal = await authenticate_cert(request, db)
+    except CertAuthReplayed as exc:
+        # #3631 — a signature that verified and has been accepted before is a
+        # repeat of an earlier heartbeat, not a cert pipeline problem, so it
+        # does not fall through to the session-token path below.
+        logger.warning(
+            "supervisor_heartbeat_signature_replayed",
+            appliance_id=str(body.appliance_id),
+        )
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, exc.detail) from exc
     except CertAuthFailed as exc:
         # #411 — a cert-auth FAILURE no longer hard-403s. The mTLS verifier
         # is a fallback that supersedes the session token only when the cert
@@ -3303,28 +3340,56 @@ async def _supervisor_heartbeat(
         ca = await ensure_ca(db)
         ca_chain_pem = ca.cert_pem
 
-    # #272 Phase 7 — decrypt the join token for the joiner (mTLS channel).
+    # #272 Phase 7 — the join token for the joiner.
     # SECURITY (GHSA-mj4g-hw3m-62rm / #400 C1, defence-in-depth): the k3s
     # join token is cluster-admin-equivalent, so only ever hand it back over a
-    # cert-authenticated (mTLS) request — never the credential-less /
+    # cert-authenticated request — never the credential-less /
     # session-token path. The auth gate above already closes the no-cert path
     # for approved rows; this is the belt-and-braces so the secret can't leak
     # even if that gate is later loosened.
-    desired_join_token: str | None = None
+    #
+    # #3631 — and never in clear: this response can cross a plain-HTTP hop
+    # (a member's supervisor calls the in-cluster Service over HTTP; the
+    # frontend forwards to the api over HTTP). It is sealed to the key the
+    # supervisor sent in this request's body, which is only trusted when the
+    # signature covered that body. A supervisor too old to send a key gets
+    # no token, and the join waits for its upgrade.
+    desired_join_token_sealed: str | None = None
     if (
         cert_principal is not None
         and row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
         and row.desired_k3s_join_token_encrypted is not None
     ):
-        from app.core.crypto import decrypt_str  # noqa: PLC0415
-
-        try:
-            desired_join_token = decrypt_str(row.desired_k3s_join_token_encrypted)
-        except Exception:  # noqa: BLE001
+        if not cert_principal.body_bound or not body.join_token_public_key:
             logger.warning(
-                "supervisor_heartbeat_join_token_decrypt_failed",
+                "supervisor_heartbeat_join_token_withheld",
                 appliance_id=str(row.id),
+                reason="supervisor sent no join-token key in a signed body; upgrade it",
             )
+        else:
+            from app.core.crypto import decrypt_str  # noqa: PLC0415
+            from app.services.appliance.sealed_token import (  # noqa: PLC0415
+                SealError,
+                seal,
+            )
+
+            try:
+                desired_join_token_sealed = seal(
+                    decrypt_str(row.desired_k3s_join_token_encrypted),
+                    body.join_token_public_key,
+                    row.id,
+                )
+            except SealError as exc:
+                logger.warning(
+                    "supervisor_heartbeat_join_token_key_invalid",
+                    appliance_id=str(row.id),
+                    error=str(exc),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "supervisor_heartbeat_join_token_decrypt_failed",
+                    appliance_id=str(row.id),
+                )
 
     # #272 Phase 7b — the cross-node firewall peer set this node must
     # open its k3s server ports to (empty unless row is a CP node).
@@ -3566,7 +3631,8 @@ async def _supervisor_heartbeat(
         role_assignment=role_assignment,
         desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
         desired_k3s_server_url=row.desired_k3s_server_url,
-        desired_k3s_join_token=desired_join_token,
+        desired_k3s_join_token=None,
+        desired_k3s_join_token_sealed=desired_join_token_sealed,
         desired_cluster_transition_id=(
             row.cluster_transition_id
             if row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
@@ -5560,6 +5626,17 @@ async def promote_control_plane(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"Appliance {row.hostname!r} (deployment_kind={row.deployment_kind!r}) can't join "
                 "a k3s control-plane cluster — only OS-appliance nodes can.",
+            )
+        # #3631 — the join token is only ever sent sealed to a key from the
+        # supervisor's signed heartbeat. A supervisor that has reported its
+        # capabilities (they always carry its version) without saying it can
+        # open one is too old to receive it, and the join would wait for ever.
+        caps = row.capabilities or {}
+        if caps.get("supervisor_version") and not caps.get("sealed_join_token"):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} runs a supervisor too old to receive the "
+                "cluster join token. Upgrade the appliance, then promote it.",
             )
         targets.append(row)
 
@@ -7715,27 +7792,43 @@ class K8sProxyReplyRequest(BaseModel):
     body_b64: str = ""
 
 
-@header_only
 async def _require_cert_auth(request: Request, db: DB) -> Appliance:
     """Shared cert-auth gate for the proxy endpoints. Returns the
-    authenticated appliance row. Raises 403 on failure — no fallback
-    to session-token here since the proxy channel only exists for
-    approved appliances with mTLS certs.
+    authenticated appliance row. Raises 403 on failure (401 for a
+    signature already used, #3631) — no fallback to session-token here
+    since the proxy channel only exists for approved appliances with
+    mTLS certs.
 
-    Reads only the request headers, so a route that streams its body
-    (the pcap upload) takes it as a dependency and the caller is checked
-    before any of the body is read.
+    Hashes the request body against the signature, so it is called from
+    the handler, after FastAPI has read the body. A route that streams its
+    body uses :func:`_require_cert_auth_streamed` instead.
     """
+    principal = await _cert_principal(request, db, body_streamed=False)
+    return principal.appliance
+
+
+@header_only
+async def _require_cert_auth_streamed(request: Request, db: DB) -> Any:
+    """:func:`_require_cert_auth` for a route that streams its body (the
+    pcap upload). Reads only the request headers, so the route takes it as
+    a dependency and the caller is checked before any of the body is read.
+    Returns the principal: its ``content_sha256`` (set for a current
+    supervisor) is the body hash the signature covers, and the route must
+    compare it with the bytes it received before keeping them."""
+    return await _cert_principal(request, db, body_streamed=True)
+
+
+async def _cert_principal(request: Request, db: AsyncSession, *, body_streamed: bool) -> Any:
     from app.services.appliance.cert_auth import (  # noqa: PLC0415
         CertAuthFailed,
         authenticate_cert,
     )
 
     try:
-        principal = await authenticate_cert(request, db)
+        principal = await authenticate_cert(request, db, body_streamed=body_streamed)
     except CertAuthFailed as exc:
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.") from exc
+        raise HTTPException(exc.status_code, "Invalid appliance client cert.") from exc
     if principal is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -7746,7 +7839,7 @@ async def _require_cert_auth(request: Request, db: DB) -> Appliance:
             status.HTTP_403_FORBIDDEN,
             f"Appliance in state {principal.appliance.state!r}; proxy disabled.",
         )
-    return principal.appliance
+    return principal
 
 
 @router.post(
@@ -7769,6 +7862,9 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
+    # #3606: end the auth's read transaction before the 30 s wait; the queue
+    # is in memory and nothing is pending (cert auth only reads).
+    await db.commit()
     queued = await _proxy.pop_request(appliance.id, timeout=30.0)
     if queued is None:
         # No request within the timeout — return an empty shape so
@@ -7817,7 +7913,7 @@ async def k8s_proxy_reply(
         headers=body.headers,
         body_b64=body.body_b64,
     )
-    delivered = _proxy.deliver_response(response)
+    delivered = _proxy.deliver_response(response, appliance_id=appliance.id)
     logger.info(
         "appliance.k8s_proxy.reply",
         appliance_id=str(appliance.id),
@@ -7897,6 +7993,9 @@ async def nettool_poll(request: Request, db: DB) -> NetToolPollResponse:
     from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
+    # #3606: end the auth's read transaction before the 30 s wait; the queue
+    # is in memory and nothing is pending (cert auth only reads).
+    await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0)
     if queued is None:
         # No command within the timeout — empty shape so the supervisor
@@ -7942,7 +8041,7 @@ async def nettool_reply(
         result=body.result,
         error=body.error,
     )
-    delivered = _cmd.deliver_result(result)
+    delivered = _cmd.deliver_result(result, appliance_id=appliance.id)
     logger.info(
         "appliance.nettool.reply",
         appliance_id=str(appliance.id),
@@ -8009,6 +8108,9 @@ async def storage_poll(request: Request, db: DB) -> StoragePollResponse:
     from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
+    # #3606: end the auth's read transaction before the 30 s wait; the queue
+    # is in memory and nothing is pending (cert auth only reads).
+    await db.commit()
     queued = await _cmd.pop_command(appliance.id, timeout=30.0, channel=_cmd.CHANNEL_STORAGE)
     if queued is None:
         return StoragePollResponse(request_id="", params={})
@@ -8037,6 +8139,7 @@ async def storage_reply(
         )
     delivered = _cmd.deliver_result(
         _cmd.NetToolResult(request_id=request_id, result=body.result, error=body.error),
+        appliance_id=appliance.id,
         channel=_cmd.CHANNEL_STORAGE,
     )
     logger.info(
@@ -8541,6 +8644,14 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
             return PcapPollResponse(**cmd)
         if _asyncio.get_running_loop().time() >= deadline:
             return PcapPollResponse()
+        # #3606: end this pass's read transaction before the sleep, so the
+        # empty claim query does not hold its ACCESS SHARE lock on
+        # packet_capture through it (a restore or an ALTER would wait out the
+        # whole poll). Nothing is pending: cert auth only reads, and
+        # claim_next commits or rolls back whatever it writes. The loop
+        # re-reads the queue every pass and the appliance row is not used
+        # again after the auth.
+        await db.commit()
         if await sleep_or_shutdown(2.0):
             # #3015 — this api process is stopping: the next pass makes one
             # last claim check and answers the empty shape, so the supervisor
@@ -8577,7 +8688,7 @@ async def pcap_upload(
     capture_id: uuid.UUID,
     request: Request,
     db: DB,
-    appliance: Annotated[Appliance, Depends(_require_cert_auth)],
+    principal: Annotated[Any, Depends(_require_cert_auth_streamed)],
 ) -> dict[str, str]:
     """Cert-authed. Streams the host-captured ``.pcap`` to the shared
     PCAP_DIR (``.partial`` → atomic rename + sha256), capped at
@@ -8591,9 +8702,13 @@ async def pcap_upload(
     from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
     from app.services.pcap.runner import HARD_MAX_BYTES, pcap_dir  # noqa: PLC0415
 
-    # ``appliance`` is resolved by the ``_require_cert_auth`` dependency,
-    # before the handler reads the body: the route carries a body-cap
-    # allowance above the app-wide cap (``app.core.body_limit``).
+    # ``principal`` is resolved by the ``_require_cert_auth_streamed``
+    # dependency, before the handler reads the body: the route carries a
+    # body-cap allowance above the app-wide cap (``app.core.body_limit``).
+    # The query (``?error=`` / ``?packets=``) is covered by the signature;
+    # the body is checked against its signed hash once it has arrived.
+    appliance: Appliance = principal.appliance
+    signed_sha256: str | None = principal.content_sha256
     row = await _pcap_capture_for_appliance(db, capture_id, appliance)
 
     error = request.query_params.get("error")
@@ -8678,6 +8793,17 @@ async def pcap_upload(
             "uploaded pcap exceeds the capture's byte cap",
         )
 
+    if signed_sha256 is not None and h.hexdigest() != signed_sha256:
+        # #3631 — the bytes are not the ones the supervisor signed. Keep
+        # nothing and leave the capture as it was.
+        partial.unlink(missing_ok=True)
+        logger.warning(
+            "appliance.pcap.upload_body_mismatch",
+            appliance_id=str(appliance.id),
+            capture_id=str(capture_id),
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.")
+
     if size == 0:
         # Stopped before the first packet flushed. Never leave a 0-byte file
         # orphaned in PCAP_DIR (no row would reference it, so prune/delete —
@@ -8744,6 +8870,23 @@ class ApplianceWorkloadRow(BaseModel):
     last_restarted_at: str | None = None
 
 
+# #3618 — every operator-supplied kubeapi identifier is a DNS-1123 name
+# before it is spliced into a proxied path, so ``?`` / ``&`` / ``/`` / ``..``
+# can never change which request the supervisor is asked to run. The
+# supervisor applies its own allowlist as well; this gives the caller a
+# 422 naming the field instead of a relayed 403.
+_K8S_NAME_PATTERN = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+_K8S_LABEL_PATTERN = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+
+
+def _require_k8s_name(field: str, value: str, *, pattern: str = _K8S_NAME_PATTERN) -> None:
+    if not re.fullmatch(pattern, value):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{field}: not a valid Kubernetes name",
+        )
+
+
 class ApplianceWorkloadsResponse(BaseModel):
     workloads: list[ApplianceWorkloadRow]
     #: Per-kind failures. Reported rather than raised so a cluster with an
@@ -8781,6 +8924,7 @@ async def k8s_list_workloads(
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
     from app.services.service_control import kube as _kube  # noqa: PLC0415
 
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8838,8 +8982,10 @@ class ApplianceRestartDeploymentRequest(BaseModel):
     # workload kind the appliance runs, so restricting the restart to two
     # of the three would leave rows in the picker that error on click.
     kind: Literal["Deployment", "DaemonSet", "StatefulSet"]
-    namespace: str = Field(default="spatium", min_length=1, max_length=64)
-    name: str = Field(min_length=1, max_length=253)
+    namespace: str = Field(
+        default="spatium", min_length=1, max_length=63, pattern=_K8S_LABEL_PATTERN
+    )
+    name: str = Field(min_length=1, max_length=253, pattern=_K8S_NAME_PATTERN)
 
 
 @router.post(
@@ -9222,6 +9368,7 @@ async def k8s_list_pods(
             f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
         )
 
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
     path = f"/api/v1/namespaces/{namespace}/pods"
     try:
         status_code, body = await _proxy.k8s_call(row.id, "GET", path, timeout=15.0)
@@ -9313,10 +9460,12 @@ async def k8s_get_pod_logs(
             f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
         )
 
-    # Reject obvious path-injection on operator-supplied strings —
-    # the proxy concatenates them into the kubeapi URL.
-    if "/" in pod or "/" in namespace or (container and "/" in container):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid identifier")
+    # Reject path / query injection on operator-supplied strings —
+    # the proxy concatenates them into the kubeapi URL (#3618).
+    _require_k8s_name("pod", pod)
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    if container:
+        _require_k8s_name("container", container, pattern=_K8S_LABEL_PATTERN)
     tail = max(1, min(10_000, tail_lines))
 
     # Context before the window, so a key the window starts inside is caught
@@ -9331,10 +9480,12 @@ async def k8s_get_pod_logs(
     if container:
         path += f"&container={container}"
 
+    # ``*/*``, not ``text/plain``: kubeapi answers pod logs with 406 to a
+    # text/plain Accept (it lists only json / yaml / protobuf), and the
+    # supervisor forwards this header since #3618. The direct reader in
+    # services/appliance/k8s.py sends ``*/*`` for the same reason.
     try:
-        status_code, body = await _proxy.k8s_call(
-            row.id, "GET", path, accept="text/plain", timeout=20.0
-        )
+        status_code, body = await _proxy.k8s_call(row.id, "GET", path, accept="*/*", timeout=20.0)
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,

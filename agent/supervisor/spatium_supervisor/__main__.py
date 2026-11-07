@@ -437,7 +437,8 @@ def main() -> int:
     # (no cert / no registration / no k3s → sleep + retry); safe
     # to spawn even on legacy compose deployments. The proxy is
     # net-new for #183; pre-#183 control planes don't enqueue
-    # anything so the loop just sees empty polls.
+    # anything so the loop just sees empty polls. On by default
+    # (#3618); K8S_PROXY_ENABLED=false opts out.
     if cfg.k8s_proxy_enabled:
         identity_for_proxy, _ = load_or_generate(cfg.state_dir)
         start_proxy_thread(cfg, identity_for_proxy)

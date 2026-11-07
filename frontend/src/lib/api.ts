@@ -3539,8 +3539,13 @@ async function _unwrapBlobError(err: unknown): Promise<Error> {
           if (typeof detail === "string") {
             return new Error(detail);
           }
-          // FastAPI 422 returns a list under ``detail``; fall back
-          // to the JSON-stringified version.
+          // FastAPI 422 returns a list under ``detail``; format it like
+          // every other error site rather than showing raw JSON.
+          if (Array.isArray(detail)) {
+            return new Error(
+              formatApiError({ response: { data: parsed } }, "Request failed"),
+            );
+          }
           return new Error(JSON.stringify(parsed));
         }
       } catch {
@@ -4043,6 +4048,9 @@ export interface PlatformSettings {
   appliance_revoked_retention_days: number;
   metric_retention_days: number;
   log_retention_hours: number;
+  /** E911 lookup trail bounds (#3514). Superadmin-only. */
+  e911_resolution_log_retention_days: number;
+  e911_lookup_log_budget_per_minute: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
@@ -6281,6 +6289,11 @@ export interface ServedApex {
   ns: string[];
   source: "declared" | "primary_ns" | "placeholder";
   placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
   // Split-horizon views that serve different apexes, in render order; empty
   // when they agree. The fields above are then the worst view's.
   by_view: ServedApexInView[];
@@ -6292,6 +6305,11 @@ export interface ServedApexInView {
   ns: string[];
   source: "declared" | "primary_ns" | "placeholder";
   placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
 }
 
 export interface DNSRecordPage extends Page<DNSRecord> {
@@ -7046,6 +7064,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_candidates: number;
+        push_skipped_matching: number;
         pushed: number;
         pushed_records: {
           name: string;
@@ -7223,6 +7242,8 @@ export interface DNSBlockListFeedSkipped {
   bare_star?: number;
   dotless?: number;
   other?: number;
+  /** hosts / domains feeds: tokens that are not DNS names (#3531). */
+  invalid_name?: number;
 }
 
 export interface DNSBlockListEntry {
@@ -11996,6 +12017,9 @@ export interface ProvisioningRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  // Name of the IPAM template args.template_id names, resolved server-side so
+  // viewers without read on IPAM templates still get it (#3649).
+  template_name?: string | null;
 }
 
 export interface ProvisioningRequestListParams {

@@ -173,6 +173,9 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
                 "ns": list(view.apex.ns),
                 "source": view.apex.source,
                 "placeholder_glue_loopback": view.apex.placeholder_glue,
+                "placeholder_reason": view.apex.placeholder_reason,
+                "unaddressed_primary_ns": view.apex.unaddressed_primary_ns,
+                "unaddressed_ns": list(view.apex.unaddressed_ns),
                 # Split-horizon views that serve different apexes; empty when
                 # they agree. The fields above are then the worst view's.
                 "by_view": [
@@ -926,12 +929,13 @@ class ListDNSBlockListsArgs(BaseModel):
         "feed_entries_are_wildcard (whether feed entries block "
         "subdomains too — off means a list naming tracker.example "
         "leaves cdn.tracker.example resolving), enabled, "
-        "entry_count, feed_parse_skipped (adblock feeds only: how many "
+        "entry_count, feed_parse_skipped (how many "
         "rules the last refresh could not enforce, by category regex / "
         "modifier / badfilter / malformed, with malformed split by "
         "reason into star_in_name / no_anchor / trailing_dot / "
-        "start_anchor / bare_star / dotless / other; null = not "
-        "recorded), "
+        "start_anchor / bare_star / dotless / other; hosts / domains "
+        "feeds report invalid_name = tokens that are not DNS names; "
+        "null = not recorded), "
         "last_synced_at + last_sync_status / error. "
         "Use for 'which blocklists are active?', 'is the malware "
         "feed up to date?', or 'when did the ads blocklist last "

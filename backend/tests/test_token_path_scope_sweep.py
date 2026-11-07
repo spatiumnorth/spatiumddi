@@ -1248,6 +1248,7 @@ _ZONE_FIELD = re.compile(r"(^|\.)\w*zone_ids?$")
 _CONTAINER_BODY_FIELDS = {
     "subnet_id",
     "subnet_ids",
+    "sibling_subnet_ids",
     "block_id",
     "space_id",
     "address_id",
@@ -1260,6 +1261,7 @@ _ZONE_CHECKS = ("_enforce_zone_token_scope(",)
 #: Calls that hold a token to the subnet, block or space named in a body.
 _CONTAINER_CHECKS = (
     "_enforce_subnet_token_binding(",
+    "_require_merge_sources_writable(",
     "_refuse_bound_token(",
     "_enforce_subnet_token_scope(",
     "_refuse_container_scan_for_bound_token(",

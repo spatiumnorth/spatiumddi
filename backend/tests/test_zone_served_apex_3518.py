@@ -115,6 +115,9 @@ async def test_the_placeholder_case(client: AsyncClient, db_session: AsyncSessio
         "ns": ["ns1.apex.example.com."],
         "source": "placeholder",
         "placeholder_glue_loopback": True,
+        "placeholder_reason": "no_primary_ns",
+        "unaddressed_primary_ns": None,
+        "unaddressed_ns": [],
         "by_view": [],
     }
     # Not records: the list and its counts are untouched.
@@ -311,3 +314,74 @@ async def test_views_that_agree_are_summarised_once(
     await db_session.commit()
     apex = (await _get(client, zone, h)).json()["served_apex"]
     assert apex["source"] == "primary_ns" and apex["by_view"] == []
+
+
+async def test_a_record_only_reader_gets_no_served_apex(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    rec_only = await _user(db_session, [{"action": "read", "resource_type": "dns_record"}])
+    zone_reader = await _user(
+        db_session,
+        [
+            {"action": "read", "resource_type": "dns_record"},
+            {"action": "read", "resource_type": "dns_zone"},
+        ],
+    )
+    zone = await _zone(db_session)
+    db_session.add(_rec(zone, "www", "A", "192.0.2.1"))
+    await db_session.commit()
+
+    r = await _get(client, zone, _h(rec_only))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["served_apex"] is None
+    assert body["total"] == 1
+
+    body = (await _get(client, zone, _h(zone_reader))).json()
+    assert body["served_apex"]["soa"]["mname"] == "ns1.apex.example.com."
+
+
+async def test_an_in_zone_primary_ns_with_no_address_names_itself(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3670: the placeholder is served because the Primary NS has no A/AAAA."""
+    h = _h(await _user(db_session, None))
+    zone = await _zone(db_session, primary_ns="ns.apex.example.com.")
+    await db_session.commit()
+    sa = (await _get(client, zone, h)).json()["served_apex"]
+    assert sa["source"] == "placeholder"
+    assert sa["placeholder_reason"] == "primary_ns_has_no_address"
+    assert sa["unaddressed_primary_ns"] == "ns.apex.example.com."
+    # Once the address exists the Primary NS is served and nothing is flagged.
+    db_session.add(_rec(zone, "ns", "A", "192.0.2.53"))
+    await db_session.commit()
+    sa = (await _get(client, zone, h)).json()["served_apex"]
+    assert sa["source"] == "primary_ns"
+    assert sa["placeholder_reason"] is None
+    assert sa["unaddressed_primary_ns"] is None
+
+
+async def test_a_declared_placeholder_ns_is_flagged_as_loopback_glue(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = _h(await _user(db_session, None))
+    zone = await _zone(db_session, primary_ns="ns1.example.net.")
+    db_session.add(_rec(zone, "@", "NS", "ns1.apex.example.com."))
+    await db_session.commit()
+    sa = (await _get(client, zone, h)).json()["served_apex"]
+    assert sa["source"] == "declared"
+    assert sa["placeholder_glue_loopback"] is True
+    assert sa["placeholder_reason"] is None
+    assert sa["unaddressed_ns"] == []
+
+
+async def test_an_unaddressed_declared_ns_is_listed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = _h(await _user(db_session, None))
+    zone = await _zone(db_session)
+    db_session.add(_rec(zone, "@", "NS", "ns2.apex.example.com."))
+    await db_session.commit()
+    sa = (await _get(client, zone, h)).json()["served_apex"]
+    assert sa["placeholder_glue_loopback"] is False
+    assert sa["unaddressed_ns"] == ["ns2.apex.example.com."]

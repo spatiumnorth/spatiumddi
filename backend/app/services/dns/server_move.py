@@ -60,6 +60,11 @@ from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import second_signer_refusal
+from app.services.dns.dnssec_trust import (
+    NEEDS_ANCHOR_MESSAGE,
+    count_anchors,
+    stored_validation,
+)
 from app.services.dns.record_ops import QUEUED_OP_STATES, primary_candidate
 from app.services.dns.row_locks import lock_op_ids, lock_zone_state_rows
 from app.services.dns.tsig import ensure_group_tsig_key
@@ -201,6 +206,11 @@ async def ensure_group_single_driver(
                 f"a {driver!r} server would ignore them. Remove the anchors first.",
                 status_code=422,
             )
+    # #3560 — a BIND9 server in a group set to ``dnssec-validation yes`` with
+    # no trust anchor would make named refuse the whole config.
+    if driver == "bind9" and await stored_validation(db, group_id) == "yes":
+        if not await count_anchors(db, group_id):
+            raise ServerMoveError(f"Group {group_name!r}: {NEEDS_ANCHOR_MESSAGE}", status_code=422)
     # #1784 — the experimental agentless Technitium driver supports ONE
     # server per group. Enforced on every path that puts a server in a group
     # (create, driver change, move) because they all come through here.

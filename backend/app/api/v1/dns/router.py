@@ -153,6 +153,14 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.dnssec_trust import (
+    NEEDS_ANCHOR_MESSAGE,
+    STATIC_ROOT_ANCHOR_MESSAGE,
+    count_anchors,
+    has_static_root_anchor,
+    is_root_zone,
+    stored_validation,
+)
 from app.services.dns.drift import zone_state_in_sync
 from app.services.dns.memory_estimate import GroupMemoryEstimate, group_memory_estimate
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
@@ -249,7 +257,7 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
-from app.services.dns.zone_apex import served_apex_for_zones
+from app.services.dns.zone_apex import apex_name_length_error, served_apex_for_zones
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -1329,8 +1337,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored group forwarders that cannot work with the group's transport,
     # saved before the #2128 refusal. Advisory: the save is not refused.
     forwarder_warnings: list[str] = Field(default_factory=list)
-    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
-    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    # DNSSEC config stored before the API refused it, and what is rendered
+    # instead: ``yes`` with no trust anchor on a BIND9 group renders as
+    # ``auto`` (#3560), a static root anchor as initial-key (#3609).
     dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
@@ -1975,6 +1984,9 @@ class ServedApexInView(BaseModel):
     ns: list[str]
     source: Literal["declared", "primary_ns", "placeholder"]
     placeholder_glue_loopback: bool
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    unaddressed_ns: list[str] = []
 
 
 class ServedApex(BaseModel):
@@ -1998,8 +2010,18 @@ class ServedApex(BaseModel):
     # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
     source: Literal["declared", "primary_ns", "placeholder"]
     # The placeholder NS is glued to 127.0.0.1: every resolver that follows
-    # the zone's NS set is sent to its own loopback.
+    # the zone's NS set is sent to its own loopback. This also holds for a
+    # declared apex NS record naming ``ns1.<zone>`` with no address record.
     placeholder_glue_loopback: bool
+    # Why the placeholder is served (#3670), null unless ``source`` is
+    # ``placeholder``: ``primary_ns_has_no_address`` (the Primary NS is inside
+    # the zone and no A/AAAA record holds it; ``unaddressed_primary_ns`` names
+    # it) or ``no_primary_ns`` (no Primary NS that can resolve, no NS records).
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    # Declared apex NS inside the zone, other than the placeholder, with no
+    # A/AAAA record: BIND will not load the zone until one is added.
+    unaddressed_ns: list[str] = []
     # Under split-horizon the apex is rendered per view, from that view's
     # records. Empty when every view serves the same apex (or there are no
     # views); otherwise each view's apex in render order, and the fields above
@@ -4200,9 +4222,16 @@ async def _options_response(
     drivers = await _group_driver_names(db, group_id)
     if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
         out.dnssec_warnings.append(
-            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
-            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
-            "validate against BIND's built-in root anchor."
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND 9.20 "
+            "refuses that config, so it is rendered as 'auto' (BIND's built-in root key) "
+            "until you add a trust anchor or set 'auto' here."
+        )
+    if "bind9" in drivers and has_static_root_anchor(opts.trust_anchors or ()):
+        out.dnssec_warnings.append(
+            "The root ('.') trust anchor is stored as static, which BIND refuses beside "
+            "'auto' and which fails at the next root key rollover in any mode, so it is "
+            "rendered as initial-key (RFC 5011). Re-add it as an initial-key anchor to "
+            "make the stored row match (#3609)."
         )
     if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
@@ -4614,6 +4643,15 @@ async def update_options(
     for k, v in changes.items():
         setattr(opts, k, v)
 
+    # #3560: BIND9 refuses ``dnssec-validation yes`` with no trust anchor.
+    # Transition-only, so a row stored before this check still saves other options.
+    if (
+        changes.get("dnssec_validation") == "yes"
+        and before.get("dnssec_validation") != "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id)
+    ):
+        raise HTTPException(status_code=422, detail=NEEDS_ANCHOR_MESSAGE)
     _refuse_plain_port_forwarders_on_encrypted(opts, forwarders_before, transport_before)
     await _assert_encrypted_transport_sane(opts, db)
     if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
@@ -4692,6 +4730,10 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # #3609: a static root anchor is never right — BIND refuses it under
+    # ``auto`` and it breaks at the next root key rollover under ``yes``.
+    if is_root_zone(body.zone_name) and not body.is_initial_key:
+        raise HTTPException(status_code=422, detail=STATIC_ROOT_ANCHOR_MESSAGE)
     # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
     # group another driver serves would be accepted and ignored.
     others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")
@@ -4755,6 +4797,22 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    # #3560: removing the last anchor under ``yes`` would leave BIND9 with a
+    # config it refuses to load.
+    if (
+        await stored_validation(db, group_id) == "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id, exclude_id=anchor.id)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This is the group's last trust anchor and dnssec_validation is 'yes', "
+                "which BIND9 refuses to load without one. Set dnssec_validation to 'auto' "
+                "first (BIND's built-in root key), or add another trust anchor before "
+                "removing this one."
+            ),
+        )
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -6018,6 +6076,11 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, zone_fields, None, db)
+    if body.zone_type == "primary":
+        # #3672 — a name too long to carry the apex defaults is never served.
+        apex_err = apex_name_length_error(body.name, body.primary_ns, body.admin_email)
+        if apex_err is not None:
+            raise HTTPException(status_code=422, detail=apex_err)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -6813,6 +6876,7 @@ async def update_zone(
         mail_err = admin_email_error(changes["admin_email"])
         if mail_err is not None:
             raise HTTPException(status_code=422, detail=f"Admin Email (admin_email) {mail_err}")
+    await _enforce_apex_name_length(db, zone, changes)  # #3672
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
@@ -8440,6 +8504,9 @@ async def create_zone_from_template(
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=_validation_message(exc)) from exc
+        await _require_superadmin_for_lua(
+            db, current_user, [checked.record_type], what="create a LUA record"
+        )
         await _check_driver_gated_record_type(checked.record_type, group_id, db)
         checked.priority, checked.weight, checked.port = _normalize_record_struct_fields(
             checked.record_type, checked.priority, checked.weight, checked.port
@@ -8461,6 +8528,16 @@ async def create_zone_from_template(
             weight=checked.weight,
             port=checked.port,
         )
+
+    # #3672 — the template's apex NS records stand in for the placeholder.
+    apex_err = apex_name_length_error(
+        body.zone_name,
+        None,
+        None,
+        [(r["name"], r["record_type"], r["value"]) for r in record_payloads],
+    )
+    if apex_err is not None:
+        raise HTTPException(status_code=422, detail=apex_err)
 
     existing = await db.execute(
         select(DNSZone).where(
@@ -9100,7 +9177,8 @@ async def list_records(
 
     ``served_apex`` (#3518) carries the SOA and apex NS the zone serves from
     its settings, which no stored record holds. It is not part of ``items`` or
-    ``total``.
+    ``total``. It comes from the zone's settings, so it is returned only to a
+    caller who may read the zone itself; a record-only reader gets null.
     """
     zone = await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(_, zone_id)
@@ -9125,8 +9203,45 @@ async def list_records(
         total=total,
         page=page,
         page_size=page_size,
-        served_apex=await _served_apex(db, zone),
+        served_apex=(
+            await _served_apex(db, zone)
+            if user_has_permission(_, "read", "dns_zone", zone.id)
+            else None
+        ),
     )
+
+
+async def _enforce_apex_name_length(db: DB, zone: DNSZone, changes: dict[str, Any]) -> None:
+    """422 an edit that leaves a primary zone's apex names past 253 (#3672).
+
+    Only an edit that moves one of the inputs (the name, the type, the Primary
+    NS or the Admin Email) is checked, so a zone stored before the rule stays
+    editable by a request that re-sends what it holds. The zone's own apex NS
+    records count, as they replace the placeholder name server.
+    """
+    keys = ("name", "zone_type", "primary_ns", "admin_email")
+    if not any(k in changes and changes[k] != getattr(zone, k) for k in keys):
+        return
+    if changes.get("zone_type", zone.zone_type) != "primary":
+        return
+    ns_rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value).where(
+                DNSRecord.zone_id == zone.id,
+                DNSRecord.record_type == "NS",
+                DNSRecord.name.in_(("@", "")),
+                DNSRecord.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    err = apex_name_length_error(
+        changes.get("name", zone.name),
+        changes.get("primary_ns", zone.primary_ns),
+        changes.get("admin_email", zone.admin_email),
+        [(r.name, r.record_type, r.value) for r in ns_rows],
+    )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
@@ -9141,6 +9256,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
         ns=list(view.apex.ns),
         source=view.apex.source,
         placeholder_glue_loopback=view.apex.placeholder_glue,
+        placeholder_reason=view.apex.placeholder_reason,
+        unaddressed_primary_ns=view.apex.unaddressed_primary_ns,
+        unaddressed_ns=list(view.apex.unaddressed_ns),
         by_view=[
             ServedApexInView(
                 view=name,
@@ -9148,6 +9266,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
                 ns=list(a.ns),
                 source=a.source,
                 placeholder_glue_loopback=a.placeholder_glue,
+                placeholder_reason=a.placeholder_reason,
+                unaddressed_primary_ns=a.unaddressed_primary_ns,
+                unaddressed_ns=list(a.unaddressed_ns),
             )
             for name, a in view.by_view
         ],
@@ -9258,6 +9379,9 @@ async def create_record(
     zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    await _require_superadmin_for_lua(
+        db, current_user, [body.record_type], what="create a LUA record"
+    )
     await _check_driver_gated_record_type(body.record_type, group_id, db)
     await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
@@ -9388,6 +9512,10 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
+    if "value" in changes:
+        await _require_superadmin_for_lua(
+            db, current_user, [record.record_type], what="change a LUA record's value"
+        )
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     if "value" in changes or "ttl" in changes:
@@ -9963,6 +10091,9 @@ async def bulk_create_records(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
 
+    await _require_superadmin_for_lua(
+        db, current_user, [r.record_type for r in body.records], what="create a LUA record"
+    )
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
@@ -10512,6 +10643,12 @@ async def import_zone_commit(
     # record type the group's drivers cannot serve (the provider would reject
     # the op and keep retrying it, rather than the operator getting a 422).
     _reject_if_synthesised_zone(zone, "import")
+    await _require_superadmin_for_lua(
+        db,
+        current_user,
+        [c.record_type for c in diff.to_create] + [c.record_type for c in diff.to_update],
+        what="import a LUA record",
+    )
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
     await _check_driver_refusals(
@@ -10685,6 +10822,8 @@ class SyncWithServerResponse(BaseModel):
     imported_records: list[dict]
     # Push (DB → server)
     push_candidates: int
+    # #3671 — the zone's records the server already holds, so none was pushed.
+    push_skipped_matching: int = 0
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
@@ -10765,6 +10904,7 @@ async def sync_zone_with_server_endpoint(
         skipped_unsupported=result.pull.skipped_unsupported,
         imported_records=result.pull.imported_records,
         push_candidates=result.push.candidates,
+        push_skipped_matching=result.push.already_matched,
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
@@ -11234,6 +11374,13 @@ async def import_zone_spreadsheet_commit(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
+    await _require_superadmin_for_lua(
+        db,
+        current_user,
+        [c.record_type for c in plan.creates]
+        + [u.candidate.record_type for u in plan.updates if "value" in u.changed],
+        what="import a LUA record",
+    )
 
     await _check_driver_refusals(
         [(c.record_type, c.value, c.ttl) for c in plan.creates]
@@ -11599,6 +11746,45 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
                 f"supports manual DNSSEC key management (#49)."
             ),
         )
+
+
+# LUA records are code PowerDNS runs inside pdns_server at query time, and the
+# snippet menu offers TCP / HTTP(S) probes made from the DNS server's address.
+# That is infrastructure authority, so writing one is superadmin-only (like the
+# GSLB pools' health checks), on top of the ``write`` on ``dns_record`` the
+# routes take. Reading, serving and deleting an existing LUA record are not
+# affected: a delete removes code rather than adding it.
+_SUPERADMIN_ONLY_RECORD_TYPES = frozenset({"LUA"})
+
+
+async def _require_superadmin_for_lua(
+    db: DB, user: Any, record_types: Iterable[str | None], *, what: str
+) -> None:
+    """403 (audited) unless ``user`` is a superadmin, when ``record_types``
+    holds a type whose records run code on the DNS server.
+
+    Call before anything is written: the refusal commits its audit row.
+    """
+    gated = sorted(
+        {(t or "").strip().upper() for t in record_types} & _SUPERADMIN_ONLY_RECORD_TYPES
+    )
+    if not gated or is_effective_superadmin(user):
+        return
+    names = ", ".join(gated)
+    await refuse_and_audit(
+        db,
+        user,
+        None,
+        action="write",
+        resource_type="dns_record",
+        resource_id="",
+        resource_display=f"{names} record ({what})",
+        reason=f"{names} record write refused: superadmin only",
+        detail=(
+            f"Permission denied: {names} records run code inside the DNS server "
+            f"at query time, so only a superadmin may {what}."
+        ),
+    )
 
 
 async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID, db: DB) -> None:
