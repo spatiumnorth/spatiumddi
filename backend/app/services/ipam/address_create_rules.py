@@ -143,7 +143,8 @@ async def reclaim_available_row(
     A row still linked to a DHCP reservation is not a free slot whatever its
     status says (409). Returns ``None`` when the address has no
     ``available`` row. ``user`` may be ``None`` for a system caller (an
-    integration mirror's gateway), which the audit row records as ``system``.
+    integration mirror's gateway), which the audit row records as ``system``
+    (display name and auth source), as the other system-actor rows do.
     """
     from app.api.v1.ipam.router import (  # noqa: PLC0415 — avoid a cycle
         _purge_withdrawn_aliases,
@@ -204,7 +205,7 @@ async def reclaim_available_row(
         AuditLog(
             user_id=getattr(user, "id", None),
             user_display_name=getattr(user, "display_name", None) or "system",
-            auth_source=getattr(user, "auth_source", None) or "local",
+            auth_source=getattr(user, "auth_source", None) or "system",
             action="update",
             resource_type="ip_address",
             resource_id=str(row.id),

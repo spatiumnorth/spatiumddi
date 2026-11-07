@@ -255,6 +255,13 @@ async def add_gateway_row(
         select(IPAddress.id).where(IPAddress.subnet_id == subnet.id, IPAddress.address == gateway)
     )
     if held is not None:
+        # Only a free slot is taken over. Anything else (a reserved row, or a
+        # row ``gateway_target_problem`` refuses, such as an available row
+        # still linked to a DHCP reservation, which a mirror sync of an
+        # unmoved gateway reaches without asking) is left as it stands, rather
+        # than ``reclaim_available_row`` raising its 409 into a reconciler.
+        if await gateway_target_problem(db, subnet, gateway) is not None:
+            return None
         row = await reclaim_available_row(db, subnet, gateway, user)
         if row is None:
             return None
