@@ -33,7 +33,12 @@ from sqlalchemy.pool import NullPool
 from app.models.dhcp import DHCPLease, DHCPStaticAssignment
 from app.models.dns import DNSRecord
 from app.models.ipam import IPAddress, Subnet
-from tests.test_lease_events_insert_order_3480 import _ddns_subnet
+from tests.test_lease_events_insert_order_3480 import (  # noqa: F401 — the fixture
+    _ddns_subnet,
+    _lease,
+    _two_agents,
+    concurrent_client,
+)
 from tests.test_lock_order_3617 import _server
 
 _PARK_DEADLINE_S = 20.0
@@ -325,18 +330,107 @@ async def test_reservation_hand_over_does_not_deadlock_a_zone_delete(
 
 
 @pytest.mark.asyncio
-async def test_auto_sync_reapply_locks_the_trashed_records_zone(
+async def test_auto_sync_reapply_does_not_deadlock_a_zone_delete(
     db_session: AsyncSession, engine: AsyncEngine
 ) -> None:
-    from app.tasks.ipam_dns_sync import _lock_reapply_zones
+    """B has no name and only a trashed host record in Z, so its re-apply
+    retracts and purges it; A's re-apply then publishes into Z. Each row's
+    sync locks its own zones, trashed records' included, before it purges, so
+    no up-front lock of every zone the run may write is needed (one would hold
+    every DDNS zone for the whole run, every interval)."""
+    from app.tasks.ipam_dns_sync import _reapply_ddns_for_active_leases
 
     subnet, _ = await _ddns_subnet(db_session)
+    subnet.ddns_hostname_policy = "client_provided"
     zid = await _forward_zone(db_session, subnet)
-    row = IPAddress(subnet_id=subnet.id, address="10.31.1.40", status="dhcp", auto_from_lease=True)
-    db_session.add(row)
+    b = IPAddress(subnet_id=subnet.id, address="10.31.1.40", status="dhcp", auto_from_lease=True)
+    db_session.add(b)
     await db_session.flush()
-    db_session.add(_trashed(zid, row.id, "gone", "10.31.1.40"))
+    a = IPAddress(
+        subnet_id=subnet.id,
+        address="10.31.1.30",
+        status="dhcp",
+        auto_from_lease=True,
+        hostname="a-host",
+    )
+    db_session.add(a)
+    await db_session.flush()
+    db_session.add(_trashed(zid, b.id, "b-host", "10.31.1.40"))
     await db_session.commit()
-    await _lock_reapply_zones(db_session, [subnet.id])
-    assert await _zone_is_locked(engine, zid)
-    await db_session.rollback()
+    subnet_id, a_id = subnet.id, a.id
+
+    async def _reapply() -> None:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            sub = await db.get(Subnet, subnet_id)
+            assert sub is not None
+            fired, errors = await _reapply_ddns_for_active_leases(db, sub)
+            assert not errors, errors
+            assert fired == 1
+            await db.commit()
+
+    await _zone_delete_race(engine, zid, _reapply)
+    published = (
+        await db_session.execute(
+            select(DNSRecord.id).where(DNSRecord.ip_address_id == a_id, DNSRecord.zone_id == zid)
+        )
+    ).all()
+    assert published
+
+
+@pytest.mark.asyncio
+async def test_lease_events_lock_a_mirror_made_in_the_pass_up_front(
+    concurrent_client: Any,  # noqa: F811 — the imported fixture
+    db_session: AsyncSession,
+) -> None:
+    """Y's mirror holds only a trashed record, in a zone made after the
+    subnet's, so its id sorts last. X has no mirror and its first event is a
+    release, so the grant after it creates the mirror inside the pass. Its
+    publish took the subnet's zones after the up-front lock had taken Y's
+    zone: out of id order (the row lock order guard fails the test then)."""
+    from app.models.dns import DNSZone
+
+    subnet, _ = await _ddns_subnet(db_session)
+    late = DNSZone(
+        group_id=(await db_session.get(DNSZone, await _forward_zone(db_session, subnet))).group_id,
+        name=f"late{uuid.uuid4().hex[:6]}.example.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.late.example.",
+        admin_email="admin.late.example.",
+    )
+    db_session.add(late)
+    await db_session.flush()
+    y = IPAddress(subnet_id=subnet.id, address="10.31.1.60", status="dhcp", auto_from_lease=True)
+    db_session.add(y)
+    await db_session.flush()
+    db_session.add(_trashed(late.id, y.id, "y-host", "10.31.1.60"))
+    await db_session.commit()
+    (server,) = (await _two_agents(db_session, [subnet]))[:1]
+    x_id_subnet = subnet.id
+
+    def _event(ip: str, n: int, state: str) -> dict[str, Any]:
+        ev = _lease(ip, n)
+        ev["state"] = state
+        return ev
+
+    events = [
+        _event("10.31.1.60", 0x60, "released"),
+        _event("10.31.1.70", 0x70, "released"),
+        _event("10.31.1.70", 0x70, "active"),
+    ]
+    resp = await concurrent_client.post(
+        "/api/v1/dhcp/agents/lease-events",
+        headers={"x-test-server": str(server.id)},
+        json={"leases": events},
+    )
+    assert resp.status_code == 200, resp.text
+    x = (
+        await db_session.execute(
+            select(IPAddress)
+            .where(IPAddress.subnet_id == x_id_subnet, IPAddress.address == "10.31.1.70")
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert (
+        await db_session.execute(select(DNSRecord.id).where(DNSRecord.ip_address_id == x.id))
+    ).all(), "the grant published nothing"
