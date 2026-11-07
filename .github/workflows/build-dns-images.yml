@@ -173,6 +173,21 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_views_share_check.py
 
+      # Issue #3672 — a zone too long for named to keep its files (the zone
+      # file, its journal, with DNSSEC its signed copy) must be held back
+      # alone: named refuses such a zone at load, which used to fail the
+      # reload verification and with it the whole apply. Proves named starts
+      # and reloads with a held zone's stanza and no file, answers SERVFAIL
+      # for it, applies every other change, and that the longest zones it can
+      # journal (248, 241 inline-signed) are served. Runs as `spatium`.
+      - name: Long zone name check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_long_zone_check.py
+
       # get.trivy.dev, which trivy-action's own setup downloads from,
       # is gone (#3464): install from the GitHub release instead.
       - name: Install Trivy

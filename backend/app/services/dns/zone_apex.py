@@ -24,7 +24,7 @@ from typing import Any, Literal
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import admin_email_error, primary_ns_error
+from app.core.dns_names import MAX_NAME_LEN, admin_email_error, primary_ns_error
 from app.models.dns import DNSRecord, DNSServer, DNSView, DNSZone
 from app.services.dns.pool_geo import (
     build_geo_steering,
@@ -187,6 +187,51 @@ def compute_served_apex(
         placeholder_glue,
         unaddressed_primary,
         unaddressed_ns,
+    )
+
+
+def apex_name_length_error(
+    zone_name: str,
+    primary_ns: str | None,
+    admin_email: str | None,
+    records: Iterable[tuple[str, str, str]] = (),
+) -> str | None:
+    """Why primary zone ``zone_name`` cannot be served with the apex names it
+    would get, or None (#3672).
+
+    A zone name may be 253 characters, but with no Primary NS its SOA names
+    the placeholder ``ns1.<zone>``, and with no Admin Email the mailbox
+    ``admin.<zone>``: four and six characters more. Past 253 those are not DNS
+    names at all, so BIND refuses the zone and it is never served. The names
+    an operator types are held to 253 by their own validators; this catches
+    the ones the zone is given in their absence. ``records`` are the zone's
+    as for :func:`compute_served_apex`: an apex NS record replaces the
+    placeholder name server.
+    """
+    apex = compute_served_apex(zone_name, primary_ns, admin_email, records)
+    zone = str(zone_name or "").rstrip(".")
+    unset: list[str] = []
+    served_as: list[str] = []
+    room = MAX_NAME_LEN
+    for served, field, what in (
+        (apex.soa_mname, "Primary NS (primary_ns)", "name server"),
+        (apex.soa_rname, "Admin Email (admin_email)", "mailbox"),
+    ):
+        body = served.rstrip(".")
+        if len(body) <= MAX_NAME_LEN:
+            continue
+        label = body[: -len(zone) - 1] if zone else body
+        unset.append(field)
+        served_as.append(f"the {what} '{label}.<zone name>' ({len(body)} characters)")
+        room = min(room, MAX_NAME_LEN - len(label) - 1)
+    if not unset:
+        return None
+    return (
+        f"zone name is {len(zone)} characters, so with no {' and no '.join(unset)} "
+        f"set the zone would be served with {' and '.join(served_as)}, over the "
+        f"{MAX_NAME_LEN}-character limit of a DNS name, and the DNS server would "
+        f"refuse the zone. Set the {' and the '.join(unset)}, or shorten the zone "
+        f"name to at most {room} characters"
     )
 
 
