@@ -31,6 +31,7 @@ from __future__ import annotations
 import functools
 import ipaddress
 import re
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -2866,12 +2867,18 @@ def _compose_peak_and_now(peak: str, current: str) -> str:
 
 # #3233 — a matcher prints each rule knob it reports (a threshold, a floor,
 # a day count) through ``_thr``. During an evaluation pass that wraps the
-# value in two private-use characters, which ``evaluate_all`` strips before
+# value in a nonce-bearing pair of private-use markers, which ``evaluate_all`` strips before
 # the message is stored, keeping only WHICH numeric tokens were thresholds.
 # Outside a pass (a matcher called directly) ``_thr`` is plain formatting.
 _MARK_THRESHOLDS: ContextVar[bool] = ContextVar("_alert_mark_thresholds", default=False)
-_THR_OPEN, _THR_CLOSE = "\ue000", "\ue001"
-_THR_MARK_RE = re.compile(f"{_THR_OPEN}([^{_THR_OPEN}{_THR_CLOSE}]*){_THR_CLOSE}")
+# #3558 — the marks carry a per-process random nonce. Operator text (a subnet
+# name, a pool name) is interpolated into the same message and may itself hold
+# U+E000 / U+E001; a bare pair would be read as a mark and stripped from the
+# stored message and every notification. Only a pair holding the nonce, which
+# no operator can know, is a mark.
+_THR_NONCE = secrets.token_hex(8)
+_THR_OPEN, _THR_CLOSE = f"\ue000{_THR_NONCE}\ue001", f"\ue001{_THR_NONCE}\ue000"
+_THR_MARK_RE = re.compile(f"{re.escape(_THR_OPEN)}(.*?){re.escape(_THR_CLOSE)}", re.DOTALL)
 
 
 def _thr(value: object, fmt: str = "") -> str:

@@ -4408,7 +4408,7 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
 // picks a pod from the dropdown; backend fetches the last N lines
 // via the proxy and we render in a textarea. Refresh button to
 // re-fetch.
-function PodLogsModal({
+export function PodLogsModal({
   appliance,
   onClose,
 }: {
@@ -4435,16 +4435,14 @@ function PodLogsModal({
   const selectedPodInfo = podsQuery.data?.pods.find(
     (p) => p.name === selectedPod,
   );
-  // Reset container picker when the pod changes — first container
-  // is the natural default.
-  useEffect(() => {
-    if (
-      selectedPodInfo &&
-      !selectedPodInfo.containers.includes(selectedContainer)
-    ) {
-      setSelectedContainer(selectedPodInfo.containers[0] ?? "");
-    }
-  }, [selectedPodInfo, selectedContainer]);
+  // The container is DERIVED from the pod, never stored-then-reset: an
+  // effect that resets it runs after the render that already built the
+  // logs query from the new pod and the previous pod's container, and
+  // kubeapi answers that mismatch with a 400 (#3628).
+  const effectiveContainer =
+    selectedPodInfo && selectedPodInfo.containers.includes(selectedContainer)
+      ? selectedContainer
+      : (selectedPodInfo?.containers[0] ?? "");
 
   const logsQuery = useQuery({
     queryKey: [
@@ -4453,12 +4451,12 @@ function PodLogsModal({
       appliance.id,
       "k8s-logs",
       selectedPod,
-      selectedContainer,
+      effectiveContainer,
       tailLines,
     ],
     queryFn: () =>
       applianceApprovalApi.k8sGetPodLogs(appliance.id, selectedPod, {
-        container: selectedContainer || undefined,
+        container: effectiveContainer || undefined,
         tail_lines: tailLines,
       }),
     enabled: !!selectedPod,
@@ -4500,7 +4498,7 @@ function PodLogsModal({
             <label className="text-xs">
               Container
               <select
-                value={selectedContainer}
+                value={effectiveContainer}
                 onChange={(e) => setSelectedContainer(e.target.value)}
                 className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
               >
