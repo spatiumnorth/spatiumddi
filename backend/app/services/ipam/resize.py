@@ -97,6 +97,7 @@ from app.services.ipam.subnet_boundary import (
     boundary_host_conflicts,
     ensure_boundary_rows,
 )
+from app.services.ipam.subnet_placeholders import add_gateway_row, gateway_target_problem
 
 logger = structlog.get_logger(__name__)
 
@@ -643,14 +644,13 @@ async def _load_boundary_placeholders(
 async def _gateway_target_in_use(
     db: AsyncSession, subnet: Subnet, target: str, old_gateway: str | None
 ) -> bool:
-    """True when an address row other than the current gateway already sits
-    on ``target`` — the new gateway cannot be reserved over a host (#2413)."""
+    """True when the new gateway cannot sit on ``target``: a host, lease or
+    discovered row holds it (#2413). Same rule as Edit Subnet
+    (``gateway_target_problem``, #3709): no row, a ``reserved`` row (kept as the
+    gateway's) and an ``available`` row (a free slot, taken over) are fine."""
     if old_gateway is not None and str(ipaddress.ip_address(old_gateway)) == target:
         return False
-    row = await db.scalar(
-        select(IPAddress.id).where(IPAddress.subnet_id == subnet.id, IPAddress.address == target)
-    )
-    return row is not None
+    return await gateway_target_problem(db, subnet, target) is not None
 
 
 # ── Preview: subnets ─────────────────────────────────────────────────────────
@@ -1021,6 +1021,7 @@ async def preview_block_resize(
                 UNION ALL
                 SELECT b.id, b.network, b.name FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT id, network, name FROM descendants
                 WHERE id != CAST(:bid AS uuid)
@@ -1039,9 +1040,11 @@ async def preview_block_resize(
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT s.id, s.network, s.name FROM subnet s
                 WHERE s.block_id IN (SELECT id FROM descendants)
+                    AND s.deleted_at IS NULL
             """),
         {"bid": str(block.id)},
     )
@@ -1286,15 +1289,15 @@ async def commit_subnet_resize(
             )
             if old_row is not None:
                 await db.delete(old_row)
-        gateway_row = IPAddress(
-            subnet_id=subnet.id,
-            address=new_gateway,
-            status="reserved",
-            description="Gateway",
-            hostname="gateway",
+        # None when a reserved row already holds the address: kept as the
+        # gateway's. An available row is taken over (#3709).
+        gateway_row = await add_gateway_row(
+            db,
+            subnet,
+            new_gateway,
             created_by_user_id=(current_user.id if current_user is not None else None),
+            user=current_user,
         )
-        db.add(gateway_row)
         await db.flush()
 
     # 4. Recompute utilization on this subnet and roll the parent block chain.
@@ -1492,6 +1495,7 @@ async def commit_block_resize(
                 UNION ALL
                 SELECT b.id, b.network FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT network FROM descendants WHERE id != CAST(:bid AS uuid)
             """),
@@ -1511,9 +1515,11 @@ async def commit_block_resize(
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                    WHERE b.deleted_at IS NULL
             )
             SELECT s.network FROM subnet s
                 WHERE s.block_id IN (SELECT id FROM descendants)
+                    AND s.deleted_at IS NULL
             """),
         {"bid": str(block.id)},
     )

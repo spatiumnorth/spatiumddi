@@ -8,12 +8,14 @@ import {
   type IPBlock,
   type Subnet,
 } from "@/lib/api";
+import { bigFraction, cidrSpan } from "@/lib/cidr";
 
 type Kind = "block" | "subnet" | "free";
 
 interface Cell {
   name: string;
-  size: number;
+  size: number; // relative weight (fraction of the block), not a count
+  addrs: bigint; // exact address count, for the tooltip
   kind: Kind;
   network: string;
   subName?: string;
@@ -67,11 +69,21 @@ export function FreeSpaceTreemap({
 
   const cells = useMemo<Cell[]>(() => {
     const out: Cell[] = [];
+    const parent = cidrSpan(block.network);
+    const weigh = (cidr: string): { size: number; addrs: bigint } => {
+      const span = cidrSpan(cidr);
+      if (!span || !parent) return { size: 0, addrs: 0n };
+      // At least 1 so a vanishing child stays a (hairline) cell.
+      return {
+        size: Math.max(1, bigFraction(span.size, parent.size) * 2 ** 48),
+        addrs: span.size,
+      };
+    };
     for (const b of childBlocks) {
       out.push({
         name: b.network,
         subName: b.name ?? undefined,
-        size: addressCount(b.network),
+        ...weigh(b.network),
         kind: "block",
         network: b.network,
         utilization: b.utilization_percent,
@@ -81,7 +93,7 @@ export function FreeSpaceTreemap({
       out.push({
         name: s.network,
         subName: s.name ?? undefined,
-        size: addressCount(s.network),
+        ...weigh(s.network),
         kind: "subnet",
         network: s.network,
         utilization: s.utilization_percent,
@@ -90,13 +102,14 @@ export function FreeSpaceTreemap({
     for (const f of freeRanges) {
       out.push({
         name: f.network,
-        size: f.size,
+        // The API's `size` saturates for IPv6; the prefix is exact.
+        ...weigh(f.network),
         kind: "free",
         network: f.network,
       });
     }
     return out.filter((c) => c.size > 0);
-  }, [childBlocks, directSubnets, freeRanges]);
+  }, [block.network, childBlocks, directSubnets, freeRanges]);
 
   if (error != null) {
     return (
@@ -131,20 +144,6 @@ export function FreeSpaceTreemap({
   );
 }
 
-function addressCount(cidr: string): number {
-  const slash = cidr.indexOf("/");
-  if (slash === -1) return 1;
-  const prefix = parseInt(cidr.slice(slash + 1), 10);
-  const isV6 = cidr.includes(":");
-  const total = isV6 ? 128 : 32;
-  const hostBits = total - prefix;
-  // For IPv6, sizes can exceed Number.MAX_SAFE_INTEGER (>= /53). Clamp to a
-  // visualisation-sized number — Recharts treats this as a relative weight,
-  // not an exact count.
-  if (hostBits >= 53) return Number.MAX_SAFE_INTEGER / 2;
-  return Math.pow(2, hostBits);
-}
-
 interface TreemapCellProps {
   x?: number;
   y?: number;
@@ -169,6 +168,7 @@ function TreemapCell(props: TreemapCellProps) {
           utilization: props.utilization,
           name: props.network,
           size: 0,
+          addrs: 0n,
         }
       : props.payload;
   const colors = datum ? COLORS[datum.kind] : COLORS.free;
@@ -243,7 +243,7 @@ function TreemapTooltip({
       <div className="font-mono">{c.network}</div>
       {c.subName && <div className="text-muted-foreground">{c.subName}</div>}
       <div className="text-muted-foreground">
-        {c.kind} · {c.size.toLocaleString()} addrs
+        {c.kind} · {c.addrs.toLocaleString()} addrs
         {c.kind !== "free" && typeof c.utilization === "number" && (
           <> · {Math.round(c.utilization)}% used</>
         )}

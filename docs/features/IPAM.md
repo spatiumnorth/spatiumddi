@@ -509,17 +509,17 @@ ad-hoc wake raises no alert: alerting is keyed on a schedule subject, and an ad-
 run has none.
 
 **ACTIVE probes run from the SERVER vantage only**, regardless of the schedule's *wake*
-vantage. The appliance command channel (`agent_cmd`) is an in-memory, per-replica
-dispatch the **api** process owns; the verify task runs in the **Celery worker**, and
-there is no worker→supervisor result-return path today. So for an appliance-vantage
+vantage. The appliance command channel (`agent_cmd`) is Redis-backed (#3706), so the
+**Celery worker** can reach a supervisor and read its reply, but the verify probe is not
+wired onto it yet. So for an appliance-vantage
 wake, an active probe still runs from the control plane: correct when the api/worker
 can reach the target segment (routed ICMP / directed broadcast), and a false-negative
 (unverified) — never a false wake — when it can't. **`seen` sidesteps this entirely**:
 it is a pure DB read, so it verifies hosts on segments the worker cannot reach at all,
 provided some other subsystem (an SNMP poll of the local switch, a DHCP lease)
 observed them — which is why `auto` is the sensible default on a segmented network.
-**Appliance-vantage *active* verify** (a worker→supervisor result channel) remains the
-named follow-up, alongside the
+**Appliance-vantage *active* verify** (running the probe over the command channel, which
+the worker can now reach) remains the named follow-up, alongside the
 deferred [auto-resolve on-segment appliance from the target subnet] and the
 [scheduled-shutdown companion] below.
 
@@ -538,17 +538,15 @@ originates:
   command channel). **This is the preferred path** when an appliance is on the
   segment — it needs no router changes at all.
 
-  > ⚠️ **Scheduled fires can't use appliance vantage yet.** The appliance
-  > command channel (`agent_cmd`) is an **in-memory, per-replica** queue that the
-  > supervisor long-polls off the **api** process, but a scheduled fire runs in
-  > the **Celery beat worker** — a different process — so its enqueue never
-  > reaches the supervisor and the wake records per-host delivery failures (it is
-  > not silent, but it does not send). This is the same agent_cmd limitation the
-  > verify probe hits above; the fix is the tracked worker→supervisor
-  > Redis-backed multi-replica dispatch. **Until then, for a *scheduled* wake to a
-  > remote segment use server vantage + the router directed-broadcast config
-  > (below), or trigger the appliance-vantage wake interactively via "Run now"
-  > (which originates in the api process and reaches the supervisor).**
+  > **Scheduled fires can use appliance vantage.** The appliance command channel
+  > (`agent_cmd`) rides Redis (#3706): the command is queued per appliance and the
+  > reply returns on a per-request list, so a scheduled fire in the **Celery beat
+  > worker**, or an interactive wake on any api replica, reaches the target
+  > appliance's supervisor whichever replica its long-poll is parked on, and the
+  > worker waits for the reply (30 s) like any other caller. Delivery is at most
+  > once. If Redis is unreachable the channel degrades to a per-process queue, which
+  > only serves a single api replica — a scheduled fire then records per-host
+  > delivery failures rather than sending.
 
 #### Stagger auto-tuning (Phase 3)
 

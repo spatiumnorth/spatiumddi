@@ -14,13 +14,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only the dependency manifest first so this layer is cached independently
-# of source code changes.
-COPY pyproject.toml .
+# of source code changes. ``requirements.txt`` is the pinned set (#3693): without
+# it ``pip install .`` took whatever PyPI held the day this layer was last
+# invalidated, so two builds of one commit shipped different packages (redis
+# 6.4.0 vs 8.1.0 cost ~25 % of /health/ready throughput). Editing it
+# invalidates the layer, which is the point.
+COPY pyproject.toml requirements.txt ./
 
 # Create a minimal stub package so hatchling can resolve metadata without
 # needing the full source tree, then install runtime deps only.
 RUN mkdir -p app && touch app/__init__.py && \
-    pip install --no-cache-dir --prefix=/install .
+    pip install --no-cache-dir --prefix=/install -c requirements.txt .
 
 # #2895 — the machine-made Python third-party notice list, served by the About
 # page. Generated here, from the packages the runtime image actually receives
@@ -253,6 +257,7 @@ USER root
 # ``pip`` command too, which ``make ci-backend-lint`` execs into this image.
 RUN python -m ensurepip --default-pip \
     && python -m pip install --no-cache-dir --root-user-action=ignore \
+        -c requirements.txt \
         "pytest>=8.3.0" \
         "pytest-asyncio>=0.24.0" \
         "pytest-cov>=6.0.0" \

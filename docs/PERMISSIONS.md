@@ -278,7 +278,7 @@ A route missing from the map admits no type-level grant at all, and
 | Routes | Needs |
 |---|---|
 | `/spaces…` | `ip_space` |
-| `/blocks…`, the aggregation snoozes, `/plans…` (except `POST /blocks/{block_id}/allocate-subnet`, which needs `subnet` only) | `ip_block` |
+| `/blocks…`, the aggregation snoozes, `/plans…` (except `POST /blocks/{block_id}/allocate-subnet`, which needs `write` on `subnet` and, as well, `write` on the target block — see the #3425 paragraph above) | `ip_block` |
 | `/subnets…`, including the subnet's own addresses, aliases, network context and reconciliation | `subnet` |
 | `/addresses/{id}` reads, address search, stale-IP / hygiene / vendor reports | `ip_address` |
 | Address writes: create, next-IP, bulk-allocate, edit, delete, aliases, bulk edit / delete, profile, wake, stale-IP deprecate, address import | `subnet` (the action of the method; the handler also checks the row's subnet, or an address set covering the address, #103) |
@@ -345,7 +345,7 @@ classified.
 
 | Routes | Needs |
 |---|---|
-| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` (except `POST /servers/{server_id}/apply-record`, which needs `dns_record` only) | `dns_group` |
+| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` (except `POST /servers/{server_id}/apply-record`, which is superadmin-only: its handler takes `SuperAdmin`, so no grant reaches it) | `dns_group` |
 | `/groups/{id}/zones`, a zone and its settings (DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
 | `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
 

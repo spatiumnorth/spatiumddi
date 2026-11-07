@@ -16,3 +16,17 @@ export function formatCount(
   if (fallback === null || fallback === undefined) return "—";
   return fallback.toLocaleString();
 }
+
+/**
+ * The exact number of addresses in a CIDR, as a decimal string computed with
+ * BigInt (a block's or subnet's own size, which the API does not send as a
+ * count). Null when the text is not a CIDR.
+ */
+export function cidrAddressCountExact(cidr: string): string | null {
+  const m = /^[^/]+\/(\d{1,3})$/.exec(cidr);
+  if (!m) return null;
+  const total = cidr.includes(":") ? 128 : 32;
+  const prefix = parseInt(m[1], 10);
+  if (prefix > total) return null;
+  return (BigInt(1) << BigInt(total - prefix)).toString();
+}
