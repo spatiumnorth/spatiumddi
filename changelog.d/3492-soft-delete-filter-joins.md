@@ -1,4 +1,0 @@
-### Fixed
-
-- Rows under a subnet, block, space, DNS zone or DHCP scope in the Trash no longer show up through queries that reach the trashed parent only by a join or a subquery. The Trash filter now covers every join, `EXISTS`, `IN (…)`, CTE and scalar subquery in a query, so lists, reports, counts and lookups (IP addresses under a trashed subnet, records under a trashed zone, subnet counts per block or VLAN, and the like) stop counting or returning them. Checks that must still see the Trash, such as whether an integration-owned subnet or block can be removed while a trashed scope, subnet or child block still hangs off it, keep counting the trashed rows.
-- The new-devices list, its `?subnet_id=` filter, the summary counts, the Copilot tool and the new-MAC and IP-squat alert rules now drop sightings of addresses in a subnet in the Trash (they used an outer join or no join to the subnet).
