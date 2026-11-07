@@ -8,6 +8,7 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { parseCidr } from "@/lib/cidr";
+import { formatCount } from "@/lib/format-count";
 import { cn } from "@/lib/utils";
 
 interface Segment {
@@ -108,7 +109,7 @@ export function FreeSpaceBand({
       const s = mapRange(
         fr.network,
         "free",
-        `Free ${fr.network} (${fr.size.toLocaleString()} addrs)`,
+        `Free ${fr.network} (${formatCount(fr.size_exact, fr.size)} addrs)`,
       );
       if (s) out.push(s);
     }

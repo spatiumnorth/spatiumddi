@@ -8,12 +8,15 @@ import {
   type IPBlock,
   type Subnet,
 } from "@/lib/api";
+import { cidrAddressCountExact, formatCount } from "@/lib/format-count";
 
 type Kind = "block" | "subnet" | "free";
 
 interface Cell {
   name: string;
   size: number;
+  // Exact address count as a decimal string, for the tooltip (#3708).
+  exact?: string | null;
   kind: Kind;
   network: string;
   subName?: string;
@@ -72,6 +75,7 @@ export function FreeSpaceTreemap({
         name: b.network,
         subName: b.name ?? undefined,
         size: addressCount(b.network),
+        exact: cidrAddressCountExact(b.network),
         kind: "block",
         network: b.network,
         utilization: b.utilization_percent,
@@ -82,6 +86,7 @@ export function FreeSpaceTreemap({
         name: s.network,
         subName: s.name ?? undefined,
         size: addressCount(s.network),
+        exact: cidrAddressCountExact(s.network),
         kind: "subnet",
         network: s.network,
         utilization: s.utilization_percent,
@@ -91,6 +96,7 @@ export function FreeSpaceTreemap({
       out.push({
         name: f.network,
         size: f.size,
+        exact: f.size_exact,
         kind: "free",
         network: f.network,
       });
@@ -243,7 +249,7 @@ function TreemapTooltip({
       <div className="font-mono">{c.network}</div>
       {c.subName && <div className="text-muted-foreground">{c.subName}</div>}
       <div className="text-muted-foreground">
-        {c.kind} · {c.size.toLocaleString()} addrs
+        {c.kind} · {formatCount(c.exact, c.size)} addrs
         {c.kind !== "free" && typeof c.utilization === "number" && (
           <> · {Math.round(c.utilization)}% used</>
         )}
