@@ -52,7 +52,9 @@ from app.services.dns.named_conf_validation import (
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone,
     records_for_view,
+    views_rendering_zone,
 )
 from app.services.dns_blocklist import (
     EffectiveBlocklist,
@@ -318,24 +320,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             continue
 
         # Split-horizon (issue #24) composed with geo steering (#530).
-        # Operator views: the zone materialises in each view referenced by
-        # a scoped record PLUS its own pinned ``view_id``; with no explicit
+        # Operator views: a pinned zone materialises in its pin alone; an
+        # unpinned one in each view referenced by a scoped record (a learned
+        # record follows the zone, ``places_zone``); with no explicit
         # scoping it's a "global" zone rendered into every operator view.
         # Geo + catch-all views always render the zone (like a global one)
-        # so the catch-all serves the default member set. Per-view record
+        # so the catch-all serves the default member set. The placement is
+        # the agent bundle's own call (``views_rendering_zone``), so this
+        # preview cannot disagree with what the agents serve. Per-view record
         # filtering (operator scope ∪ shared/default, geo-member isolation)
         # is delegated to ``records_for_view``.
-        record_view_ids = {r.view_id for r in all_records if r.view_id is not None}
-        zone_view_ids = {z.view_id} if z.view_id is not None else set()
-        operator_target_ids = record_view_ids | zone_view_ids
-
-        for vd in view_descs:
-            if (
-                vd["kind"] == "operator"
-                and operator_target_ids
-                and vd["id"] not in operator_target_ids
-            ):
-                continue
+        placing = (r.view_id for r in all_records if places_zone(r))
+        for vd in views_rendering_zone(view_descs, z.view_id, placing):
             recs = tuple(_record_data(r) for r in records_for_view(all_records, vd, geo))
             zones.append(_zone_data(z, recs, vd["name"]))
 

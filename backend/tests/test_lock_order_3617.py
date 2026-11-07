@@ -498,6 +498,106 @@ async def test_permanent_subnet_delete_locks_every_scope_lease_first(
     assert await db_session.get(Subnet, subnet_id, populate_existing=True) is None
 
 
+# ── A Trash restore against another id-ordered zone writer (#3627) ──────────
+
+
+@pytest.mark.asyncio
+async def test_trash_restore_locks_its_zones_in_id_order(
+    db_session: AsyncSession, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch holds a trashed reverse zone R (higher id) and a trashed record
+    of a zone F that stayed (lower id). The restore un-stamped R, then
+    re-pushed the record into F: it held R and wanted F, while a DDNS-style
+    writer that takes F then R by id held F and wanted R. Now the restore
+    pre-locks F and R in id order before it un-stamps anything."""
+    from app.api.v1.admin import trash as trash_router
+    from app.models.dns import DNSServerGroup, DNSZone
+    from app.services.lock_order import lock_zone_rows
+
+    tag = uuid.uuid4().hex[:6]
+    grp = DNSServerGroup(name=f"dg-{tag}")
+    db_session.add(grp)
+    await db_session.flush()
+    fwd = DNSZone(
+        group_id=grp.id,
+        name=f"f{tag}.example.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.example.",
+        admin_email="admin.example.",
+    )
+    db_session.add(fwd)
+    await db_session.flush()
+    rev = DNSZone(
+        group_id=grp.id,
+        name=f"1.{tag[:2]}.10.in-addr.arpa.",
+        zone_type="primary",
+        kind="reverse",
+        primary_ns="ns1.example.",
+        admin_email="admin.example.",
+    )
+    db_session.add(rev)
+    await db_session.flush()
+    assert fwd.id < rev.id  # the suite makes zone ids ascend in creation order
+    user = User(
+        username=f"u-{tag}",
+        email=f"{tag}@example.com",
+        display_name="Test",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    batch = uuid.uuid4()
+    now = datetime.now(UTC)
+    db_session.add_all(
+        [
+            user,
+            DNSRecord(
+                zone_id=fwd.id,
+                name="h1",
+                fqdn=f"h1.{fwd.name}",
+                record_type="A",
+                value="10.9.1.1",
+                deleted_at=now,
+                deletion_batch_id=batch,
+            ),
+        ]
+    )
+    rev.deleted_at = now
+    rev.deletion_batch_id = batch
+    await db_session.commit()
+    fwd_id, rev_id, user_id = fwd.id, rev.id, user.id
+
+    holder: dict[str, AsyncSession] = {}
+    reached = asyncio.Event()
+    log: list[str] = []
+    # Held where the unfixed restore has un-stamped R and not yet reached F.
+    _hold_first_call(monkeypatch, trash_router, "push_records_restore", holder, reached, log)
+
+    async def _restore() -> None:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            holder["db"] = db
+            u = await db.get(User, user_id)
+            await trash_router.restore_row("dns_zone", rev_id, db, u)
+
+    async def _writer() -> None:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            await lock_zone_rows(db, [fwd_id, rev_id])
+            await db.commit()
+
+    _no_deadlock(await _race(_restore, _writer, reached), log)
+
+    zone = await db_session.get(DNSZone, rev_id, populate_existing=True)
+    assert zone is not None and zone.deleted_at is None
+    rec = (
+        await db_session.execute(
+            select(DNSRecord.deleted_at)
+            .where(DNSRecord.zone_id == fwd_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert rec is None
+
+
 # ── The guard itself ────────────────────────────────────────────────────────
 
 

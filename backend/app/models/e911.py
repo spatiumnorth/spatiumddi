@@ -397,10 +397,13 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     person as this feature gets, and duplicating it per lookup would turn
     an access log into a movement history.
 
-    Two kinds of row (#3514): an individually logged lookup
-    (``suppressed_count`` NULL), and a counter row standing for every HELD
-    lookup one caller made past its per-minute budget in one window
-    (``suppressed_count`` = N, "N lookups not individually logged").
+    Every lookup that returns a location has a row of its own
+    (``suppressed_count`` NULL). Past the per-minute budget a HELD lookup is
+    refused (#3633) and writes nothing. The ``caller_key`` / ``window_start``
+    / ``suppressed_count`` columns hold counter rows written by development
+    builds before that (#3514; no release shipped them): "N lookups not
+    individually logged". They are kept so those rows stay readable until
+    the retention prune drops them.
     """
 
     __tablename__ = "e911_resolution_log"
@@ -450,14 +453,13 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     #: after-action review can tell a fresh answer from a lucky one.
     evidence_age_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    # ── Counter rows (#3514) ──────────────────────────────────────────
-    # Past the per-caller budget (``PlatformSettings.
-    # e911_lookup_log_budget_per_minute``) a HELD lookup is not logged as its
-    # own row; it is COUNTED, in one row per caller per minute window, so the
-    # trail still says that N more lookups happened. On such a row the
-    # columns above describe the LAST lookup counted (``queried_at`` is when
-    # it happened), and these three are set. All three are NULL on an
-    # individually logged lookup.
+    # ── Counter rows (#3514, no longer written since #3633) ──────────
+    # Builds of main between #3514 and #3633 COUNTED HELD lookups past the
+    # per-caller budget in one row per caller per minute window instead of
+    # logging each; on such a row the columns above describe the LAST lookup
+    # counted, and these three are set. Nothing writes them now: past the
+    # budget a lookup is refused. All three are NULL on every row written
+    # since, and the retention prune ages the old ones out.
     #: The budget's caller key: the API token id, else the user id, else the
     #: source address.
     caller_key: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -467,10 +467,10 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )
 
-    # E911 lookup trail bounds (#3514). ``POST /held`` is read-scoped but
-    # writes one ``e911_resolution_log`` row per lookup, so the table is
-    # bounded twice: past this many logged lookups per caller per minute the
-    # lookup is answered without a row, and the daily
+    # E911 lookup trail bounds (#3514, #3633). ``POST /held`` is read-scoped
+    # but writes one ``e911_resolution_log`` row per lookup, so the table is
+    # bounded twice: past this many lookups per caller per minute the lookup
+    # is refused (429) and writes nothing, and the daily
     # ``prune_e911_resolution_log`` sweep drops rows older than the retention.
     e911_lookup_log_budget_per_minute: Mapped[int] = mapped_column(
         Integer, nullable=False, default=120, server_default=sa_text("120")

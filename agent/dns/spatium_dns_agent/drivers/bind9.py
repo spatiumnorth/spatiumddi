@@ -1927,6 +1927,7 @@ def _share_would_merge(
     zname: str,
     view: str,
     owner: str,
+    staged: Path,
 ) -> bool:
     """Whether referencing ``owner``'s copy of ``zname`` from ``view`` would
     merge RFC 2136 records named holds in one copy into the other (#3551).
@@ -1937,14 +1938,37 @@ def _share_would_merge(
     records with its file, or show it the defining view's, which split-horizon
     exists to keep apart. So a pair shares only when it already did, or when
     neither live copy holds anything beyond a render. Otherwise each keeps its
-    own copy, exactly as before sharing existed."""
+    own copy, exactly as before sharing existed.
+
+    Keeping a copy apart preserves what named holds of it only while the copy
+    is not reloaded, and it is reloaded exactly when its file changes
+    (``_zones_differing``). ``staged`` is the defining view's copy in this
+    render, which is the bytes either copy would render; a live copy whose
+    file differs from it is reloaded from the render either way, so it is no
+    reason to stay apart.
+
+    No ``.owned`` test (#3632): that sidecar is written only while the zone
+    takes updates, so once updates are turned off a copy holding names a
+    client added has none. Neither the journal: the render after the
+    switch-off replaces both copies' files with renders and sets the journal
+    aside with the old tree, while named still serves the names from memory.
+    That render marks such a copy (``_unrendered_marker``), so the renders
+    after it see it too."""
     if prev_in_view.get((zname, view)) == owner:
         return False
     for v in (view, owner):
         live = prev / _zone_rel(zname, v)
-        if _owned_sidecar(live).is_file() and _may_hold_unrendered(live):
+        if _may_hold_unrendered(live) and _same_file_bytes(staged, live):
             return True
     return False
+
+
+def _same_file_bytes(a: Path, b: Path) -> bool:
+    """Whether two files hold the same bytes; False when either is unreadable."""
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
 
 
 def _view_carry_sources(
@@ -1970,7 +1994,29 @@ def _view_carry_sources(
     return out
 
 
-def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
+def _zone_accepts_updates(zone: dict[str, Any], *, foreign_loopback: bool = False) -> bool:
+    """Whether the zone takes RFC 2136 updates from clients. The render adds
+    the operator's ``allow-update`` / ``update-policy`` grants (beyond the
+    loopback key) only behind ``dynamic_update_enabled``, the same switch the
+    ``.owned`` sidecar keys on.
+
+    The loopback grant, on every primary zone, is a client grant too when
+    the key standing in for it is not the control plane's own
+    (``foreign_loopback``): a group with no usable group key renders its
+    first operator key there (#2835), and clients hold that key."""
+    if zone.get("dynamic_update_enabled"):
+        return True
+    return foreign_loopback and zone.get("type", "primary") not in {
+        "forward",
+        "secondary",
+        "slave",
+        "stub",
+    }
+
+
+def _view_share_key(
+    zone: dict[str, Any], view: dict[str, Any], *, foreign_loopback: bool = False
+) -> str | None:
     """What a view's copy of ``zone`` must match to share an earlier view's
     copy through ``in-view`` (#3551), or None when it can never share.
 
@@ -1990,8 +2036,15 @@ def _view_share_key(zone: dict[str, Any], view: dict[str, Any]) -> str | None:
 
     Forward zones never share: BIND refuses ``in-view`` of one (they are
     resolver configuration, not zone data, and cost nothing to repeat).
+
+    Neither does a zone that accepts client updates: one shared copy takes
+    an update sent through any view and answers every view with it, which
+    split-horizon exists to keep apart. Each view keeps its own copy
+    (``_zone_accepts_updates``).
     """
     if not zone.get("name") or zone.get("type", "primary") == "forward":
+        return None
+    if _zone_accepts_updates(zone, foreign_loopback=foreign_loopback):
         return None
     body = {k: v for k, v in zone.items() if k != "view_name"}
     return hashlib.sha256(
@@ -2287,6 +2340,20 @@ def _owned_sidecar(zone_file: Path) -> Path:
     return zone_file.with_name(zone_file.name + _OWNED_SUFFIX)
 
 
+# A static zone's copy named may still hold records of beyond its render
+# (#3632): updates were turned off while a client's names sat in it, unseen by
+# the control plane. The render after the switch-off writes a file identical
+# to the live one, so named is not reloaded and keeps serving those names from
+# memory, but the journal goes aside with the old tree and the new file is a
+# bare render: nothing on disk would say so any more. This marker says it, for
+# as long as each render leaves the copy's file unchanged.
+_UNRENDERED_SUFFIX = ".unrendered"
+
+
+def _unrendered_marker(zone_file: Path) -> Path:
+    return zone_file.with_name(zone_file.name + _UNRENDERED_SUFFIX)
+
+
 def _canon_owner(owner: str, origin: str) -> str:
     """``owner`` (``@``, relative or absolute) as an absolute lowercase name,
     spelled as ``named-compilezone -s full`` spells it. ``origin`` ends in a
@@ -2414,11 +2481,14 @@ def _is_pure_render(zone_file: Path) -> bool:
 
 def _may_hold_unrendered(zone_file: Path) -> bool:
     """Whether named may hold records in this live zone that no render put
-    there: it took an update (a journal), dumped the zone over our file, or
-    the file already carries records forward."""
+    there: it took an update (a journal), dumped the zone over our file, the
+    file already carries records forward, or an earlier render found one of
+    these and the file has not changed since (``_unrendered_marker``)."""
     if not zone_file.is_file():
         return False
     if zone_file.with_name(zone_file.name + ".jnl").exists():
+        return True
+    if _unrendered_marker(zone_file).exists():
         return True
     return not _is_pure_render(zone_file)
 
@@ -3387,12 +3457,19 @@ class Bind9Driver(DriverBase):
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
-                    share = _view_share_key(zone, view)
+                    share = _view_share_key(
+                        zone, view, foreign_loopback=bool(tsig_keys) and not loopback_owned
+                    )
                     zname = zone.get("name") or ""
                     if share is not None:
                         owner = defined_in.get(zname, {}).get(share)
                         if owner is not None and _share_would_merge(
-                            live_tree, live_in_view, zname.rstrip("."), vname, owner
+                            live_tree,
+                            live_in_view,
+                            zname.rstrip("."),
+                            vname,
+                            owner,
+                            new_dir / _zone_rel(zname.rstrip("."), owner),
                         ):
                             log.info(
                                 "bind9_view_zone_not_shared",
@@ -3411,6 +3488,14 @@ class Bind9Driver(DriverBase):
                     # masters) defines nothing a later view could reference.
                     if share is not None and stanza:
                         defined_in.setdefault(zname, {}).setdefault(share, vname)
+                        # A static copy kept as it was: whatever named held of
+                        # it beyond a render, it still holds (#3632).
+                        rel = _zone_rel(zname.rstrip("."), vname)
+                        live_copy = live_tree / rel
+                        if _may_hold_unrendered(live_copy) and _same_file_bytes(
+                            new_dir / rel, live_copy
+                        ):
+                            _unrendered_marker(new_dir / rel).touch()
                     body += stanza
                 for bl in view_bls:
                     body += _rpz_stanza(bl, f"{vname}/")

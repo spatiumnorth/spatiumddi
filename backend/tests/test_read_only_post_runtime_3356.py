@@ -583,9 +583,8 @@ EXEMPT: dict[str, str] = {}
 ALLOWED_WRITES: dict[str, tuple[str, tuple[str, ...]]] = {
     "/held": (
         "#3514: POST /held writes the e911_resolution_log lookup trail, kept on purpose. "
-        "Bounded by a per-caller logging budget (past it the lookup is counted in one "
-        "upserted row per caller per minute; see "
-        "test_held_over_budget_writes_only_the_counter_upsert) and the daily "
+        "Bounded by a per-caller lookup budget (past it the lookup is refused with a "
+        "429 and writes nothing; see test_held_over_budget_writes_nothing) and the daily "
         "prune_e911_resolution_log retention sweep, both settings.",
         ("DML: INSERT INTO e911_resolution_log ", "DML: flush new E911ResolutionLog"),
     ),
@@ -645,12 +644,11 @@ async def test_read_only_post_writes_nothing_and_calls_nothing(
     assert resp.status_code == 200, f"{path} -> {resp.status_code} {resp.text[:300]}"
 
 
-async def test_held_over_budget_writes_only_the_counter_upsert(
+async def test_held_over_budget_writes_nothing(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """#3514: past the logging budget, the one write /held makes is the counter
-    upsert (a single ``INSERT INTO e911_resolution_log … ON CONFLICT``, no ORM
-    flush), and it leaves a counter row. Anything else is still a violation."""
+    """#3633: past the logging budget /held answers 429 and makes no write at
+    all, and leaves no trail row."""
     from unittest.mock import AsyncMock, patch
 
     from sqlalchemy import select
@@ -663,16 +661,16 @@ async def test_held_over_budget_writes_only_the_counter_upsert(
     limiter = AsyncMock(return_value=True)
     with (
         patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", limiter),
+        patch("app.api.v1.e911.held_router.e911_lookup_retry_after", AsyncMock(return_value=30)),
         forbid_writes_and_sockets(names, ips) as guard,
     ):
         guard.armed = True
         resp = await _call(client, req, seed.raw_token)
         guard.armed = False
-    assert resp.status_code == 200, resp.text[:300]
-    assert len(guard.violations) == 1, guard.violations
-    assert guard.violations[0].startswith("DML: INSERT INTO e911_resolution_log "), guard.violations
+    assert resp.status_code == 429, resp.text[:300]
+    assert guard.violations == []
     rows = (await db_session.execute(select(E911ResolutionLog))).scalars().all()
-    assert [r.suppressed_count for r in rows] == [1]
+    assert rows == []
 
 
 # ── Negative controls ─────────────────────────────────────────────────────
