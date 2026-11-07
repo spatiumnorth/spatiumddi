@@ -414,7 +414,9 @@ export interface FreeCidrRange {
   network: string;
   first: string;
   last: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   size: number;
+  size_exact?: string;
   prefix_len: number;
 }
 
@@ -428,7 +430,9 @@ export interface PlannedSubnet {
   network: string;
   first: string;
   last: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   size: number;
+  size_exact?: string;
 }
 
 export interface UnfulfilledItem {
@@ -440,7 +444,9 @@ export interface UnfulfilledItem {
 export interface AggregationSuggestion {
   supernet: string;
   prefix_len: number;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   total_size: number;
+  total_size_exact?: string;
   subnet_ids: string[];
   subnet_networks: string[];
   // Stable hash that ties the suggestion to a snooze entry. The popover

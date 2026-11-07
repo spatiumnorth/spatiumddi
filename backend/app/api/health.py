@@ -272,7 +272,7 @@ async def readiness() -> JSONResponse:
     # Redis check
     try:
         from app.config import settings
-        from app.core.redis_client import make_async_redis
+        from app.core.redis_client import shared_async_redis
 
         # #590 — socket_timeout too, and both knobs now reach the SENTINEL
         # hops as well (redis_client._sentinel_kwargs): an unbounded
@@ -280,9 +280,11 @@ async def readiness() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        # #3693 — the pooled client, not a fresh one per probe: building
+        # and closing a client here paid a TCP connect plus the connect
+        # handshake on every call, which was most of this endpoint's CPU.
+        r = shared_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         await cast(Awaitable[bool], r.ping())
-        await r.aclose()
         checks["redis"] = "ok"
     except Exception as exc:
         logger.warning("readiness_check_failed", check="redis", error=str(exc))
@@ -433,7 +435,7 @@ async def platform_health(current_user: OptionalUser) -> JSONResponse:
     t0 = monotonic()
     try:
         from app.config import settings
-        from app.core.redis_client import make_async_redis
+        from app.core.redis_client import shared_async_redis
 
         # #590 — socket_timeout too, and both knobs now reach the SENTINEL
         # hops as well (redis_client._sentinel_kwargs): an unbounded
@@ -441,9 +443,11 @@ async def platform_health(current_user: OptionalUser) -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        # #3693 — the pooled client, not a fresh one per probe: building
+        # and closing a client here paid a TCP connect plus the connect
+        # handshake on every call, which was most of this endpoint's CPU.
+        r = shared_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         await cast(Awaitable[bool], r.ping())
-        await r.aclose()
         components.append(
             {
                 "name": "redis",
@@ -526,7 +530,7 @@ async def platform_health(current_user: OptionalUser) -> JSONResponse:
     # it without involving the pool at all.
     try:
         from app.config import settings
-        from app.core.redis_client import make_async_redis
+        from app.core.redis_client import shared_async_redis
         from app.tasks.heartbeat import BEAT_HEARTBEAT_KEY  # noqa: PLC0415
 
         # Sentinel-aware (HA Redis uses ``sentinel://``, which raw
@@ -538,9 +542,8 @@ async def platform_health(current_user: OptionalUser) -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        r = shared_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         raw = await r.get(BEAT_HEARTBEAT_KEY)
-        await r.aclose()
         if raw is None:
             components.append(
                 {

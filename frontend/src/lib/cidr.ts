@@ -92,7 +92,7 @@ export function isCgnatCidr(cidr: string): boolean {
  * for malformed input — callers should only feed strings that came from
  * backend-validated CIDRs, so this is acceptable as a fall-back.
  */
-function addressToBigInt(addr: string): bigint {
+export function addressToBigInt(addr: string): bigint {
   if (addr.includes(":")) {
     // IPv6 — expand `::` into the required number of zero groups.
     let head = addr;
@@ -115,6 +115,40 @@ function addressToBigInt(addr: string): bigint {
   let out = 0n;
   for (const p of parts) out = (out << 8n) + BigInt(Number(p) & 0xff);
   return out;
+}
+
+/**
+ * A CIDR as an exact integer range, either family: the network's first
+ * address and the number of host bits. BigInt throughout, because an IPv6
+ * prefix shorter than /75 holds more than 2^53 addresses (#3707). Null for a
+ * malformed or prefix-less string.
+ */
+export function cidrSpan(
+  cidr: string,
+): { base: bigint; hostBits: number; size: bigint } | null {
+  const [ip, prefixStr] = cidr.split("/");
+  if (!ip || !prefixStr) return null;
+  const v6 = ip.includes(":");
+  const total = v6 ? 128 : 32;
+  const prefix = Number(prefixStr);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > total) return null;
+  if (!v6 && ip.split(".").length !== 4) return null;
+  const hostBits = total - prefix;
+  const size = 1n << BigInt(hostBits);
+  // Mask off host bits, as parseCidr does.
+  const base = (addressToBigInt(ip) >> BigInt(hostBits)) << BigInt(hostBits);
+  return { base, hostBits, size };
+}
+
+/**
+ * `part / whole` as a plain number in 0..1, for drawing. Both are exact
+ * BigInts; the division is done at 2^-48 resolution so a /128 beside a /48
+ * still reads as (almost) zero instead of overflowing a double.
+ */
+export function bigFraction(part: bigint, whole: bigint): number {
+  if (whole <= 0n) return 0;
+  const scale = 48n;
+  return Number((part << scale) / whole) / 2 ** Number(scale);
 }
 
 /**

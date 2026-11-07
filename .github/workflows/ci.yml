@@ -279,10 +279,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            backend/requirements.txt
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -c requirements.txt -e ".[dev]"
 
       - name: ruff check
         run: python -m ruff check app tests
@@ -479,10 +481,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            backend/requirements.txt
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -c requirements.txt -e ".[dev]"
 
       - name: Install the PostgreSQL 16 client
         # From PGDG, as backend/Dockerfile does: the client major must match
