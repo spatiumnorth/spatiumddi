@@ -241,9 +241,18 @@ async def purge_lease(
     its own subnet before returning.
 
     Returns whether an IPAM mirror row was removed. Does not commit.
+
+    The lease row is locked before the mirror and its zones (#3617, the order
+    in ``app.services.lock_order``): it was only written at the end, after
+    them. A caller tearing several leases down locks all of their rows first
+    (they are then locked here again for free).
     """
+    from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+
     if now is None:
         now = datetime.now(UTC)
+    if lease.id is not None:
+        await lock_lease_rows(db, DHCPLease.id == lease.id)
     sid = await _resolve_lease_subnet_id(db, lease) if subnet_id is _UNSET else subnet_id
 
     mirror_removed = False
@@ -319,9 +328,30 @@ async def delete_leases_for_scope(
 
     Returns ``(leases_removed, mirrors_removed)`` for audit / preview.
     """
+    # #3617: every lease row first, then the subnet's lease mirrors, then
+    # the zones their DDNS lives in, each in id order, before the per-lease
+    # teardown writes any of them (``app.services.lock_order``).
+    from app.services.lock_order import lock_lease_rows, lock_zones_for_subnets  # noqa: PLC0415
+
+    await lock_lease_rows(db, DHCPLease.scope_id == scope_id)
     leases = list(
         (await db.execute(select(DHCPLease).where(DHCPLease.scope_id == scope_id))).scalars().all()
     )
+    scope_subnet_id = (
+        await db.execute(
+            select(DHCPScope.subnet_id)
+            .where(DHCPScope.id == scope_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one_or_none()
+    if leases and scope_subnet_id is not None:
+        await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.subnet_id == scope_subnet_id, IPAddress.auto_from_lease.is_(True))
+            .order_by(IPAddress.id)
+            .with_for_update()
+        )
+        await lock_zones_for_subnets(db, [scope_subnet_id])
     now = datetime.now(UTC)
     leases_removed = 0
     mirrors_removed = 0
@@ -394,6 +424,17 @@ async def delete_leases_for_server(
     mirrors_removed = 0
     touched: set[uuid.UUID] = set()
     capped = False
+    # #3617: the rows this call may tear down, locked by id before the first
+    # mirror is: batch by batch, each batch's leases came after the last
+    # batch's mirrors (``app.services.lock_order``). Ids only, so the
+    # identity map still holds one batch at a time.
+    await db.execute(
+        select(DHCPLease.id)
+        .where(DHCPLease.server_id == server_id)
+        .order_by(DHCPLease.id)
+        .limit(max_leases)
+        .with_for_update()
+    )
     while leases_removed < max_leases:
         batch = list(
             (

@@ -1984,6 +1984,9 @@ class ServedApexInView(BaseModel):
     ns: list[str]
     source: Literal["declared", "primary_ns", "placeholder"]
     placeholder_glue_loopback: bool
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    unaddressed_ns: list[str] = []
 
 
 class ServedApex(BaseModel):
@@ -2007,8 +2010,18 @@ class ServedApex(BaseModel):
     # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
     source: Literal["declared", "primary_ns", "placeholder"]
     # The placeholder NS is glued to 127.0.0.1: every resolver that follows
-    # the zone's NS set is sent to its own loopback.
+    # the zone's NS set is sent to its own loopback. This also holds for a
+    # declared apex NS record naming ``ns1.<zone>`` with no address record.
     placeholder_glue_loopback: bool
+    # Why the placeholder is served (#3670), null unless ``source`` is
+    # ``placeholder``: ``primary_ns_has_no_address`` (the Primary NS is inside
+    # the zone and no A/AAAA record holds it; ``unaddressed_primary_ns`` names
+    # it) or ``no_primary_ns`` (no Primary NS that can resolve, no NS records).
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    # Declared apex NS inside the zone, other than the placeholder, with no
+    # A/AAAA record: BIND will not load the zone until one is added.
+    unaddressed_ns: list[str] = []
     # Under split-horizon the apex is rendered per view, from that view's
     # records. Empty when every view serves the same apex (or there are no
     # views); otherwise each view's apex in render order, and the fields above
@@ -8485,6 +8498,9 @@ async def create_zone_from_template(
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=_validation_message(exc)) from exc
+        await _require_superadmin_for_lua(
+            db, current_user, [checked.record_type], what="create a LUA record"
+        )
         await _check_driver_gated_record_type(checked.record_type, group_id, db)
         checked.priority, checked.weight, checked.port = _normalize_record_struct_fields(
             checked.record_type, checked.priority, checked.weight, checked.port
@@ -9191,6 +9207,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
         ns=list(view.apex.ns),
         source=view.apex.source,
         placeholder_glue_loopback=view.apex.placeholder_glue,
+        placeholder_reason=view.apex.placeholder_reason,
+        unaddressed_primary_ns=view.apex.unaddressed_primary_ns,
+        unaddressed_ns=list(view.apex.unaddressed_ns),
         by_view=[
             ServedApexInView(
                 view=name,
@@ -9198,6 +9217,9 @@ async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
                 ns=list(a.ns),
                 source=a.source,
                 placeholder_glue_loopback=a.placeholder_glue,
+                placeholder_reason=a.placeholder_reason,
+                unaddressed_primary_ns=a.unaddressed_primary_ns,
+                unaddressed_ns=list(a.unaddressed_ns),
             )
             for name, a in view.by_view
         ],
@@ -9308,6 +9330,9 @@ async def create_record(
     zone = await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    await _require_superadmin_for_lua(
+        db, current_user, [body.record_type], what="create a LUA record"
+    )
     await _check_driver_gated_record_type(body.record_type, group_id, db)
     await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
@@ -9438,6 +9463,10 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
+    if "value" in changes:
+        await _require_superadmin_for_lua(
+            db, current_user, [record.record_type], what="change a LUA record's value"
+        )
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     if "value" in changes or "ttl" in changes:
@@ -10013,6 +10042,9 @@ async def bulk_create_records(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
 
+    await _require_superadmin_for_lua(
+        db, current_user, [r.record_type for r in body.records], what="create a LUA record"
+    )
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
@@ -10558,6 +10590,12 @@ async def import_zone_commit(
     # record type the group's drivers cannot serve (the provider would reject
     # the op and keep retrying it, rather than the operator getting a 422).
     _reject_if_synthesised_zone(zone, "import")
+    await _require_superadmin_for_lua(
+        db,
+        current_user,
+        [c.record_type for c in diff.to_create] + [c.record_type for c in diff.to_update],
+        what="import a LUA record",
+    )
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
     await _check_driver_refusals(
@@ -10731,6 +10769,8 @@ class SyncWithServerResponse(BaseModel):
     imported_records: list[dict]
     # Push (DB → server)
     push_candidates: int
+    # #3671 — the zone's records the server already holds, so none was pushed.
+    push_skipped_matching: int = 0
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
@@ -10811,6 +10851,7 @@ async def sync_zone_with_server_endpoint(
         skipped_unsupported=result.pull.skipped_unsupported,
         imported_records=result.pull.imported_records,
         push_candidates=result.push.candidates,
+        push_skipped_matching=result.push.already_matched,
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
@@ -11276,6 +11317,13 @@ async def import_zone_spreadsheet_commit(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
+    await _require_superadmin_for_lua(
+        db,
+        current_user,
+        [c.record_type for c in plan.creates]
+        + [u.candidate.record_type for u in plan.updates if "value" in u.changed],
+        what="import a LUA record",
+    )
 
     await _check_driver_refusals(
         [(c.record_type, c.value, c.ttl) for c in plan.creates]
@@ -11616,6 +11664,45 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
                 f"supports manual DNSSEC key management (#49)."
             ),
         )
+
+
+# LUA records are code PowerDNS runs inside pdns_server at query time, and the
+# snippet menu offers TCP / HTTP(S) probes made from the DNS server's address.
+# That is infrastructure authority, so writing one is superadmin-only (like the
+# GSLB pools' health checks), on top of the ``write`` on ``dns_record`` the
+# routes take. Reading, serving and deleting an existing LUA record are not
+# affected: a delete removes code rather than adding it.
+_SUPERADMIN_ONLY_RECORD_TYPES = frozenset({"LUA"})
+
+
+async def _require_superadmin_for_lua(
+    db: DB, user: Any, record_types: Iterable[str | None], *, what: str
+) -> None:
+    """403 (audited) unless ``user`` is a superadmin, when ``record_types``
+    holds a type whose records run code on the DNS server.
+
+    Call before anything is written: the refusal commits its audit row.
+    """
+    gated = sorted(
+        {(t or "").strip().upper() for t in record_types} & _SUPERADMIN_ONLY_RECORD_TYPES
+    )
+    if not gated or is_effective_superadmin(user):
+        return
+    names = ", ".join(gated)
+    await refuse_and_audit(
+        db,
+        user,
+        None,
+        action="write",
+        resource_type="dns_record",
+        resource_id="",
+        resource_display=f"{names} record ({what})",
+        reason=f"{names} record write refused: superadmin only",
+        detail=(
+            f"Permission denied: {names} records run code inside the DNS server "
+            f"at query time, so only a superadmin may {what}."
+        ),
+    )
 
 
 async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID, db: DB) -> None:

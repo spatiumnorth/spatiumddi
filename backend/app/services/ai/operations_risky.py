@@ -59,8 +59,9 @@ from uuid import UUID
 import structlog
 from fastapi import HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, not_, select
+from sqlalchemy import String, and_, cast, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.auth import User
 from app.services.ai.operations import (
@@ -87,30 +88,57 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     """Render the soft-delete cascade blast radius for ``root`` as a stable,
     count-bearing string (#3a).
 
-    Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, so
-    the preview reflects exactly what would be soft-deleted right now. Counts
-    are grouped by resource type and rendered in a fixed order so the string is
-    deterministic for a given set of rows (the approve-time drift compare is a
-    plain string equality, so ordering must not jitter). The root row itself is
-    excluded from the cascade counts (it's the target, not collateral)."""
+    Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, plus
+    the reverse zones a subnet, block or space delete then retires into that
+    batch, chosen by the apply's own rule, with the records still in them when
+    it stamps the batch, and the records of the batch's addresses it retracts
+    into the batch from zones that stay, so the preview reflects exactly what
+    would be soft-deleted right now. Counts are grouped by resource type and
+    rendered in a fixed order so the string is deterministic for a given set
+    of rows (the approve-time drift compare is a plain string equality, so
+    ordering must not jitter). The root row itself is excluded from the
+    cascade counts (it's the target, not collateral)."""
     # Local import — keep the soft_delete dependency off module load.
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        count_held_records_deleted_first,
+        count_records_to_retract,
+    )
+    from app.services.dns.reverse_zone import add_retiring_reverse_zones  # noqa: PLC0415
     from app.services.soft_delete import (  # noqa: PLC0415
         _resource_type,
         collect_soft_delete_batch,
     )
 
     batch = await collect_soft_delete_batch(db, root)
+    # The apply adds the reverse zones the batch's subnets auto-created, with
+    # their records (#1066, #2734); counted here as it will trash them (#3511).
+    # A batch with no subnet in it (a zone's, a scope's) gains nothing.
+    await add_retiring_reverse_zones(db, batch)
     # ``counts()`` includes the set-based children (a zone's records, #1231),
     # which are never loaded as rows. The root is the target, not collateral.
     counts = batch.counts()
     root_rt = _resource_type(root)
     counts[root_rt] = counts.get(root_rt, 0) - 1
+    # Before its stamp the apply deletes the DHCP mirrors of the batch's
+    # subnets, with their records (#3536). It never trashes their records in
+    # the zones above, so they come off the zones' count, and a lease granted
+    # or expiring in between leaves the preview as it was (#3511). The apply
+    # then retracts into the batch the records of its subnets' other addresses
+    # in zones that stay (#1906), counted with the batch's records, as the
+    # trash holds them.
+    torn_down_first = _mirrors_torn_down_first(root)
+    counts["dns_record"] = (
+        counts.get("dns_record", 0)
+        - await count_held_records_deleted_first(db, batch, torn_down_first)
+        + await count_records_to_retract(db, batch, not_(torn_down_first))
+    )
     labels = {
         "ip_block": "child block",
         "subnet": "subnet",
         "dhcp_scope": "DHCP scope",
         "dhcp_pool": "DHCP pool",
         "dhcp_static_assignment": "DHCP reservation",
+        "dns_zone": "DNS zone",
         "dns_record": "DNS record",
     }
     order = [
@@ -119,6 +147,7 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
         "dhcp_scope",
         "dhcp_pool",
         "dhcp_static_assignment",
+        "dns_zone",
         "dns_record",
     ]
     parts = []
@@ -135,6 +164,60 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     if not parts:
         return "cascades nothing (empty)"
     return "cascades " + ", ".join(parts)
+
+
+def _mirrors_torn_down_first(root: Any) -> Any:
+    """The addresses a soft delete of ``root`` deletes before its stamp, as a
+    condition on ``IPAddress``: the lease and reservation mirrors of each live
+    scope on their subnet, which the batch holds
+    (``_purge_leases_for_scope_batch``), and for a subnet its every lease
+    mirror (``_revoke_subnet_lease_mirrors``). Their records go with them, so
+    the retraction never sees them, and neither does the preview's count of it
+    (spatiumddi#3536); nor does the stamp of a reverse zone the delete trashes,
+    so the preview's count of that zone's records leaves them out too
+    (spatiumddi#3511)."""
+    from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+
+    # Uncorrelated, so Postgres builds each set once per statement and probes
+    # it per address (a hashed SubPlan), and costs it that way. A correlated
+    # EXISTS was costed as a scan of dhcp_lease per lease mirror (no index of
+    # dhcp_lease serves a lookup by scope and address), and ran so past the
+    # hash memory; the inflated cost also made Postgres JIT-compile the
+    # preview's counts.
+    mirror = aliased(IPAddress)
+    own_scope = and_(DHCPScope.subnet_id == mirror.subnet_id, DHCPScope.deleted_at.is_(None))
+    lease_mirrors = (
+        select(mirror.id)
+        .join(DHCPScope, own_scope)
+        .join(
+            DHCPLease,
+            and_(DHCPLease.scope_id == DHCPScope.id, DHCPLease.ip_address == mirror.address),
+        )
+        .where(mirror.auto_from_lease.is_(True))
+    )
+    reservation_mirrors = (
+        select(mirror.id)
+        .join(DHCPScope, own_scope)
+        .join(
+            DHCPStaticAssignment,
+            and_(
+                DHCPStaticAssignment.scope_id == DHCPScope.id,
+                cast(DHCPStaticAssignment.id, String) == mirror.static_assignment_id,
+            ),
+        )
+        .where(mirror.static_assignment_id.is_not(None))
+        # Trashed reservations too, as ``remove_ipam_for_scope_statics`` reads them.
+        .execution_options(include_deleted=True)
+    )
+    # The column tests first: they spare every other address the lookups.
+    torn = [
+        and_(IPAddress.auto_from_lease.is_(True), IPAddress.id.in_(lease_mirrors)),
+        and_(IPAddress.static_assignment_id.is_not(None), IPAddress.id.in_(reservation_mirrors)),
+    ]
+    if isinstance(root, Subnet):
+        torn.insert(0, and_(IPAddress.subnet_id == root.id, IPAddress.auto_from_lease.is_(True)))
+    return or_(*torn)
 
 
 async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUID]:
@@ -168,6 +251,35 @@ async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUI
             await push_scope_delete(db, row.obj)
             group_ids.add(row.obj.group_id)
     return group_ids
+
+
+async def _lock_scope_batch_rows(db: AsyncSession, batch: Any) -> None:
+    """#3617: lock what a block / space delete's cascade will write, in the
+    lease → mirror → zone order every lease-path writer takes
+    (``app.services.lock_order``): the batch's scopes' lease rows, the lease
+    mirrors of its subnets, then the zones its subnets publish into or are
+    linked to. Call before the first of them is written: the reverse-zone
+    retirement writes zones, and the lease purge then took each lease and its
+    mirror and zones one lease at a time, after them."""
+    from app.models.dhcp import DHCPLease, DHCPScope  # noqa: PLC0415
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.services.lock_order import (  # noqa: PLC0415
+        lock_lease_rows,
+        lock_zones_for_subnets,
+    )
+
+    scope_ids = sorted(row.obj.id for row in batch.rows if isinstance(row.obj, DHCPScope))
+    subnet_ids = sorted(row.obj.id for row in batch.rows if isinstance(row.obj, Subnet))
+    if scope_ids:
+        await lock_lease_rows(db, DHCPLease.scope_id.in_(scope_ids))
+    if subnet_ids:
+        await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.subnet_id.in_(subnet_ids), IPAddress.auto_from_lease.is_(True))
+            .order_by(IPAddress.id)
+            .with_for_update()
+        )
+        await lock_zones_for_subnets(db, subnet_ids)
 
 
 async def _purge_leases_for_scope_batch(
@@ -328,6 +440,18 @@ async def _apply_delete_subnet(
     _enforce_subnet_token_scope(user, args.subnet_id)
 
     if not args.permanent:
+        # #3617: the scopes' lease rows first, before the mirrors and zones
+        # below, in the order every lease-path writer takes them (see
+        # app.services.lock_order). The leases are purged further down, after
+        # the mirrors are gone; locked only then, they were taken after the
+        # mirror rows, against the expiry sweep's lease → mirror order.
+        from app.models.dhcp import DHCPLease  # noqa: PLC0415
+        from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+
+        await lock_lease_rows(
+            db,
+            DHCPLease.scope_id.in_(select(DHCPScope.id).where(DHCPScope.subnet_id == subnet.id)),
+        )
         await _revoke_subnet_lease_mirrors(db, subnet)
 
         # Wake DHCP agents for groups whose scopes are being trashed: soft-delete
@@ -406,6 +530,14 @@ async def _apply_delete_subnet(
     # Recounted with the block below, never per scope: a recount holds its
     # locks to commit, through the next scope's push (#3354).
     touched: set[UUID] = set()
+    # #3617: every scope's lease rows before the first teardown. Each one
+    # locks the subnet's lease mirrors, so a subnet served by two groups had
+    # its second scope's leases locked after the first's mirrors.
+    if scope_rows:
+        from app.models.dhcp import DHCPLease  # noqa: PLC0415
+        from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+
+        await lock_lease_rows(db, DHCPLease.scope_id.in_([s.id for s in scope_rows]))
     for scope in scope_rows:
         await push_scope_delete(db, scope)
         # Leases have a nullable ON DELETE SET NULL backlink to the scope, so the
@@ -614,6 +746,7 @@ async def _apply_delete_block(
         retire_auto_reverse_zones_for_batch,
     )
 
+    await _lock_scope_batch_rows(db, batch)  # #3617
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     touched: set[UUID] = set()  # recounted last, before commit (#3354)
@@ -777,6 +910,7 @@ async def _apply_delete_space(
         retire_auto_reverse_zones_for_batch,
     )
 
+    await _lock_scope_batch_rows(db, batch)  # #3617
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     touched: set[UUID] = set()  # recounted last, before commit (#3354)

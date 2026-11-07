@@ -590,6 +590,21 @@ async def _preview_create_ip_address(
         zone = await db.get(DNSZone, zone_id) if zone_id else None
         if zone is not None:
             rtype = "AAAA" if addr_obj.version == 6 else "A"
+            # #3647 — the address sync skips a forward record beside a CNAME
+            # (#1441), so promising one would be false. Refuse, as the DNS
+            # record kind does; the approve re-preview re-runs this, so a
+            # CNAME added since submit is refused the same way.
+            from app.services.dns.cname_conflict import (
+                describe_cname_conflict,
+                find_cname_conflict,
+            )
+
+            clash = await find_cname_conflict(
+                db, zone.id, view_id=None, name=args.hostname, record_type=rtype
+            )
+            if clash is not None:
+                owner = f"{args.hostname}.{zone.name.rstrip('.')}"
+                return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
             parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
@@ -799,6 +814,22 @@ async def _apply_create_ip_address(
 
     if args.status == "static_dhcp" and not args.mac_address:
         raise ValueError("mac_address is required when status is 'static_dhcp'")
+
+    # #3646 — an approver who may not write reservations is refused as a
+    # permission error, which leaves the request pending for one who may. A
+    # plain ValueError would end it ``failed`` for good over a refusal that is
+    # about THIS approver, not the request.
+    if args.status == "static_dhcp" and args.mac_address:
+        from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+        if not user_has_permission(user, "write", "dhcp_static"):
+            raise OperationPermissionError(
+                "write",
+                "dhcp_static",
+                "The approver has no 'write' permission on DHCP reservations "
+                f"(dhcp_static), so no reservation can be made for {args.address}. "
+                "Another approver who holds it can approve this request.",
+            )
 
     # #3250 — a static_dhcp request that can get no reservation fails here,
     # before anything is written, rather than ending provisioned without one.
