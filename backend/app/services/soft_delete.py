@@ -868,7 +868,11 @@ async def restore_batch(
     # forward then reverse by id. Zones are step 3 of the lease / mirror / zone
     # order (``app.services.lock_order``); nothing of steps 1 and 2 is written
     # yet, so the whole order holds.
-    from app.services.lock_order import lock_zone_rows, zone_ids_for_subnets  # noqa: PLC0415
+    from app.services.lock_order import (  # noqa: PLC0415
+        lock_zone_rows,
+        zone_ids_for_scope_statics,
+        zone_ids_for_subnets,
+    )
 
     to_lock: set[Any] = set(zone_ids)
     to_lock.update(o.zone_id for o in result.restored if isinstance(o, DNSRecord))
@@ -877,6 +881,15 @@ async def restore_batch(
             db,
             [o.id for o in result.restored if isinstance(o, Subnet)]
             + [o.subnet_id for o in result.restored if isinstance(o, DHCPScope)],
+        )
+    )
+    # A restored scope's reservations are re-mirrored (``remirror_scope_statics``)
+    # and publish into zones no record names yet: their forward and reverse
+    # zones are taken here too, or the re-mirror asks for the forward zone
+    # while holding the reverse one.
+    to_lock.update(
+        await zone_ids_for_scope_statics(
+            db, [o.id for o in result.restored if isinstance(o, DHCPScope)]
         )
     )
     await lock_zone_rows(db, to_lock)
