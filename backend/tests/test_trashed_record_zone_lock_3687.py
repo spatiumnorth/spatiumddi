@@ -66,10 +66,18 @@ async def _blocked_by(probe: AsyncSession, pid: int) -> bool:
 
 
 async def _zone_delete_race(
-    engine: AsyncEngine, zone_id: uuid.UUID, path: Callable[[], Awaitable[Any]]
+    engine: AsyncEngine,
+    zone_id: uuid.UUID,
+    path: Callable[[], Awaitable[Any]],
+    *,
+    take_chain_lock: bool = False,
 ) -> None:
     """Hold ``zone_id``, start ``path``, let it park on the zone, then delete
-    the zone's records. Fails if either side errors (a deadlock, say)."""
+    the zone's records. Fails if either side errors (a deadlock, say).
+
+    ``take_chain_lock`` has the delete take the audit-chain advisory lock next,
+    as the real zone delete does at its audit flush, so a path that holds the
+    chain lock while it waits for the zone deadlocks with it."""
     gate = AsyncSession(engine)
     probe = AsyncSession(engine)
     task: asyncio.Task[Any] | None = None
@@ -88,6 +96,15 @@ async def _zone_delete_race(
         assert parked, f"the path never waited on the zone: {task.done() and task.exception()!r}"
         gate_error: BaseException | None = None
         try:
+            if take_chain_lock:
+                from app.services.audit_chain import _AUDIT_CHAIN_LOCK_KEY  # noqa: PLC0415
+
+                await asyncio.wait_for(
+                    gate.execute(
+                        text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY}
+                    ),
+                    _STEP,
+                )
             await asyncio.wait_for(
                 gate.execute(text("DELETE FROM dns_record WHERE zone_id = :z"), {"z": zone_id}),
                 _STEP,
@@ -262,6 +279,56 @@ async def test_server_delete_does_not_deadlock_a_zone_delete(
             await db.commit()
 
     await _zone_delete_race(engine, zid, _delete)
+
+
+@pytest.mark.asyncio
+async def test_server_delete_route_audits_after_the_zone_locks(
+    db_session: AsyncSession, engine: AsyncEngine
+) -> None:
+    """``delete_server`` staged its audit row first; the teardown's first query
+    autoflushed it, so the chain lock was held while the zone rows were
+    waited for. A zone delete holds the zone and then wants the chain lock."""
+    from app.api.v1.dhcp.servers import delete_server
+    from app.core.security import hash_password
+    from app.models.auth import User
+
+    subnet, _ = await _ddns_subnet(db_session)
+    zid = await _forward_zone(db_session, subnet)
+    srv, scope = await _server(db_session, "kea", subnet)
+    a = IPAddress(subnet_id=subnet.id, address="10.31.1.30", status="dhcp", auto_from_lease=True)
+    db_session.add(a)
+    await db_session.flush()
+    await _live_published(db_session, subnet, a, "a-host")
+    db_session.add(
+        DHCPLease(
+            server_id=srv.id,
+            scope_id=scope.id,
+            ip_address="10.31.1.30",
+            mac_address="aa:bb:cc:31:01:30",
+            state="active",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    admin = User(
+        username=f"sd-{uuid.uuid4().hex[:6]}",
+        email=f"sd-{uuid.uuid4().hex[:6]}@example.test",
+        display_name="sd",
+        hashed_password=hash_password("x"),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    admin.groups = []
+    db_session.add(admin)
+    await db_session.commit()
+    srv_id, admin_id = srv.id, admin.id
+
+    async def _delete() -> None:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            user = await db.get(User, admin_id)
+            assert user is not None
+            await delete_server(srv_id, db, user)
+
+    await _zone_delete_race(engine, zid, _delete, take_chain_lock=True)
 
 
 @pytest.mark.asyncio
