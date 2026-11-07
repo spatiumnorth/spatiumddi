@@ -61,10 +61,12 @@ from app.services.backup.targets import (
     is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
+    normalize_config_for_create,
     redact_config_secrets,
     safe_filename,
     secret_field_names,
 )
+from app.services.backup.targets.secrets_config import ENC_PREFIX
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
 # so every body here is authorised from its headers before it is read
@@ -388,7 +390,19 @@ async def create_target(
     _assert_hint_keeps_passphrase_secret(body.passphrase, body.passphrase_hint)
 
     driver = get_destination(body.kind)
+    # ``__enc__:`` marks stored ciphertext. A value arriving on create is
+    # never that: accepting it would skip the driver's checks (a driver may
+    # treat it as an already-validated stored secret) and be stored unwrapped.
+    for name in sorted(secret_field_names(driver)):
+        value = body.config.get(name)
+        if isinstance(value, str) and value.startswith(ENC_PREFIX):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not a stored '{ENC_PREFIX}' value",
+            )
     try:
+        # Same auth-mode rules as Edit (#3696): one mode, no unused credential.
+        body.config = normalize_config_for_create(driver, body.config)
         driver.validate_config(body.config)
         # Second pass, allowed to resolve DNS (the https_put SSRF guard).
         # Only at create / update / test — never on the scheduled-run
@@ -476,6 +490,12 @@ async def update_target(
         raise HTTPException(status_code=404, detail="backup target not found")
 
     payload = body.model_dump(exclude_unset=True)
+    # What the row held before this edit, for the audit diff (#3697).
+    before = {k: getattr(row, k, None) for k in payload if k not in ("passphrase", "config")}
+    # A driver can force ``write_only`` whatever the form sent.
+    before.setdefault("write_only", row.write_only)
+    before_config = dict(row.config or {})
+    before_passphrase = row.passphrase_encrypted
 
     new_keep_n = payload.get("retention_keep_last_n", row.retention_keep_last_n)
     new_keep_days = payload.get("retention_keep_days", row.retention_keep_days)
@@ -614,29 +634,71 @@ async def update_target(
                 continue
             setattr(row, key, payload[key])
 
-    db.add(
-        AuditLog(
-            action="update",
-            resource_type="backup_target",
-            resource_id=str(row.id),
-            resource_display=row.name,
-            user_id=current_user.id,
-            user_display_name=current_user.username,
-            result="success",
-            # Never the raw payload: ``config`` carries credentials, and
-            # ``url`` can too (a presigned query string). Record which
-            # config keys changed, not their values.
-            new_value={
-                **{k: v for k, v in payload.items() if k not in ("passphrase", "config")},
-                **(
-                    {"config_keys_changed": sorted(payload["config"] or {})}
-                    if "config" in payload
-                    else {}
-                ),
-                **({"config_fields_cleared": secrets_cleared} if secrets_cleared else {}),
-            },
-        )
+    # Audit only what this edit changed (#3697): the console's Save sends
+    # the whole form, so a payload key is not evidence of a change. Config
+    # secrets are compared by their stored (wrapped) form, and only the key
+    # name is recorded, never a value.
+    old_value: dict[str, Any] = {}
+    new_value: dict[str, Any] = {}
+    for k, old in before.items():
+        cur = getattr(row, k, None)
+        if cur != old:
+            old_value[k] = old
+            new_value[k] = cur
+    config_keys_changed: list[str] = []
+    if "config" in payload and row.config is not None:
+        after_config = row.config
+        secret_names = set(secret_field_names(driver))
+        for key in sorted(set(before_config) | set(after_config)):
+            a, b = before_config.get(key), after_config.get(key)
+            if (a or None) == (b or None):
+                continue
+            if key in secret_names and a and b and a != b:
+                # Re-wrapping an unchanged secret yields fresh ciphertext;
+                # compare plaintext so only a real rotation counts.
+                try:
+                    if (
+                        decrypt_config_secrets(driver, {key: a})[key]
+                        == decrypt_config_secrets(driver, {key: b})[key]
+                    ):
+                        continue
+                except SecretFieldError:
+                    pass
+            config_keys_changed.append(key)
+    passphrase_changed = row.passphrase_encrypted != before_passphrase
+    if passphrase_changed:
+        try:
+            passphrase_changed = decrypt_str(before_passphrase) != decrypt_str(
+                row.passphrase_encrypted
+            )
+        except ValueError:
+            pass
+    changed_fields = sorted(
+        [
+            *new_value,
+            *(["config"] if config_keys_changed else []),
+            *(["passphrase"] if passphrase_changed else []),
+        ]
     )
+    if changed_fields:
+        if config_keys_changed:
+            new_value["config_keys_changed"] = config_keys_changed
+        if secrets_cleared:
+            new_value["config_fields_cleared"] = secrets_cleared
+        db.add(
+            AuditLog(
+                action="update",
+                resource_type="backup_target",
+                resource_id=str(row.id),
+                resource_display=row.name,
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                changed_fields=changed_fields,
+                old_value=old_value or None,
+                new_value=new_value,
+            )
+        )
     await db.commit()
     await db.refresh(row)
     return _to_response(row)

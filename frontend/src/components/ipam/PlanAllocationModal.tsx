@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { Loader2, Plus, X } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { formatCount } from "@/lib/format-count";
 import {
   ipamApi,
   type IPBlock,
@@ -221,7 +222,7 @@ export function PlanAllocationModal({
                             {a.first} – {a.last}
                           </td>
                           <td className="px-2 py-1 text-right">
-                            {a.size.toLocaleString()}
+                            {formatCount(a.size_exact, a.size)}
                           </td>
                         </tr>
                       ))}

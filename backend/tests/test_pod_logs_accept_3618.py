@@ -44,3 +44,29 @@ async def test_logs_route_queues_any_media_type(monkeypatch: pytest.MonkeyPatch)
     assert seen["accept"] == "*/*"
     assert "container=agent" in seen["path"]
     assert resp.body == b"hello\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream,expected", [(400, 422), (404, 404), (500, 502)])
+async def test_logs_route_client_errors_are_not_502(
+    monkeypatch: pytest.MonkeyPatch, upstream: int, expected: int
+) -> None:
+    """#3628: a container not in the pod (kubeapi 400) is the caller's error."""
+    from fastapi import HTTPException
+
+    async def _k8s_call(*_a: Any, **_kw: Any) -> tuple[int, bytes]:
+        return upstream, b"container x is not valid for pod y"
+
+    monkeypatch.setattr(k8s_proxy, "k8s_call", _k8s_call)
+    handler = getattr(sup.k8s_get_pod_logs, "__wrapped__", sup.k8s_get_pod_logs)
+    with pytest.raises(HTTPException) as ei:
+        await handler(
+            appliance_id=uuid.uuid4(),
+            pod="dns-bind9-abc12",
+            current_user=None,
+            db=_DB(),
+            namespace="spatium",
+            container="agent",
+            tail_lines=10,
+        )
+    assert ei.value.status_code == expected

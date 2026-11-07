@@ -41,6 +41,7 @@ from app.services.backup.targets.secrets_config import (
     decrypt_config_secrets,
     encrypt_config_secrets,
     merge_config_for_update,
+    normalize_config_for_create,
     redact_config_secrets,
     secret_field_names,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "is_pre_restore_archive",
     "list_destination_kinds",
     "merge_config_for_update",
+    "normalize_config_for_create",
     "redact_config_secrets",
     "safe_filename",
     "secret_field_names",
