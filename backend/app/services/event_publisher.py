@@ -9,7 +9,7 @@ with HMAC-signed POSTs + exponential-backoff retry + a dead-letter
 state.
 
 Mapping is from ``(AuditLog.action, AuditLog.resource_type)`` to a
-typed event name like ``subnet.created`` / ``ip.allocated``. Audit
+typed event name like ``subnet.created`` / ``ip.created``. Audit
 rows whose ``(action, resource_type)`` pair doesn't map to a known
 event type are silently skipped — this surface is for typed
 automation, not raw audit forwarding (which has its own pipeline).
