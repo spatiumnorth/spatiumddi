@@ -3457,6 +3457,13 @@ async def _preview_create_dns_zone(
         soa_err = soa_field_error(getattr(args, soa_field), soa_field)
         if soa_err is not None:
             return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if args.zone_type == "primary":
+        # #3672 — the REST create's apex-name rule.
+        from app.services.dns.zone_apex import apex_name_length_error  # noqa: PLC0415
+
+        apex_err = apex_name_length_error(name, args.primary_ns, args.admin_email)
+        if apex_err is not None:
+            return PreviewResult(ok=False, detail=apex_err)
     if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
@@ -3532,6 +3539,12 @@ async def _apply_create_dns_zone(
         soa_err = soa_field_error(getattr(args, soa_field), soa_field)
         if soa_err is not None:
             raise ValueError(f"{soa_field} {soa_err}")
+    if args.zone_type == "primary":
+        from app.services.dns.zone_apex import apex_name_length_error  # noqa: PLC0415
+
+        apex_err = apex_name_length_error(name, args.primary_ns, args.admin_email)
+        if apex_err is not None:
+            raise ValueError(apex_err)
     if await zone_name_taken(db, grp.id, None, name):
         raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
 

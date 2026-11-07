@@ -4658,8 +4658,56 @@ const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 // ``subnet`` at the type level — the subnet owns its addresses
 // (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or any
 // ``delete`` grant on an address set, scoped or not (the ``_ADDRESS_SET_ROUTES``
-// admit, ``has_any_grant_for``). The handler then wants write on the row.
+// admit, ``has_any_grant_for``). The handler then wants write on the row AND a
+// delete grant covering it: delete on its subnet, or on an address set that
+// contains it. This is the coarse test; a row's own delete is decided by
+// ``permitsDeleteIp`` where the subnet's sets are known.
 // Clean Orphans is not on that allow-list: it takes ``delete`` on ``subnet``.
+// Pre-parsed address-set bounds (BigInt, IPv4 + IPv6), so a per-row
+// membership test does not re-parse the same strings on every render.
+type SetRanges = {
+  contiguous: Array<{ lo: bigint; hi: bigint }>;
+  explicit: Set<bigint>;
+};
+
+function buildSetRanges(
+  sets: Array<{
+    range_kind: string;
+    start_address: string | null;
+    end_address: string | null;
+    explicit_addresses: string[];
+  }>,
+): SetRanges {
+  const contiguous: Array<{ lo: bigint; hi: bigint }> = [];
+  const explicit = new Set<bigint>();
+  for (const s of sets) {
+    if (s.range_kind === "explicit") {
+      for (const raw of s.explicit_addresses) {
+        const v = ipToBigInt(raw);
+        if (v !== null) explicit.add(v);
+      }
+      continue;
+    }
+    if (!s.start_address || !s.end_address) continue;
+    let lo = ipToBigInt(s.start_address);
+    let hi = ipToBigInt(s.end_address);
+    if (lo === null || hi === null) continue;
+    if (lo > hi) [lo, hi] = [hi, lo];
+    contiguous.push({ lo, hi });
+  }
+  return { contiguous, explicit };
+}
+
+function addressInSetRanges(ranges: SetRanges, address: string): boolean {
+  const ip = ipToBigInt(address);
+  if (ip === null) return false;
+  if (ranges.explicit.has(ip)) return true;
+  for (const { lo, hi } of ranges.contiguous) {
+    if (ip >= lo && ip <= hi) return true;
+  }
+  return false;
+}
+
 function canDeleteInIpam(perms: {
   can: (action: string, type: string, id?: string | null) => boolean;
   hasAnyGrantFor: (action: string, type: string) => boolean;
@@ -5102,47 +5150,47 @@ export function SubnetDetail({
   // gate (``_user_can_write_ip``): contiguous = ``lo <= ip <= hi`` on the
   // integer value, explicit = exact integer membership — both computed via
   // ``ipToBigInt`` so the client and server agree for IPv4 and IPv6 alike.
-  const writableRanges = useMemo(() => {
-    const contiguous: Array<{ lo: bigint; hi: bigint }> = [];
-    const explicit = new Set<bigint>();
-    for (const s of writableSets) {
-      if (s.range_kind === "explicit") {
-        for (const raw of s.explicit_addresses) {
-          const v = ipToBigInt(raw);
-          if (v !== null) explicit.add(v);
-        }
-        continue;
-      }
-      if (!s.start_address || !s.end_address) continue;
-      let lo = ipToBigInt(s.start_address);
-      let hi = ipToBigInt(s.end_address);
-      if (lo === null || hi === null) continue;
-      if (lo > hi) [lo, hi] = [hi, lo];
-      contiguous.push({ lo, hi });
-    }
-    return { contiguous, explicit };
+  const writableRanges = useMemo(
+    () => buildSetRanges(writableSets),
     // ``writableSets`` is intentionally read inside but keyed via the stable
     // ``writableSetsKey`` string so the memo only re-runs on real changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [writableSetsKey]);
+    [writableSetsKey],
+  );
 
   // True when the operator may edit the given IP: subnet-write, OR the IP
   // falls inside a writable address set's range. Unparseable input fails
   // closed (no set match) as a last resort, consistent with the backend
   // skipping unparseable bounds.
-  const ipInWritableSet = (address: string): boolean => {
-    const ip = ipToBigInt(address);
-    if (ip === null) return false;
-    if (writableRanges.explicit.has(ip)) return true;
-    for (const { lo, hi } of writableRanges.contiguous) {
-      if (ip >= lo && ip <= hi) return true;
-    }
-    return false;
-  };
+  const ipInWritableSet = (address: string): boolean =>
+    addressInSetRanges(writableRanges, address);
 
   // The full per-IP write decision used by gray-out + checkbox + menu.
   const permitsWriteIp = (address: string): boolean =>
     subnetWritable || ipInWritableSet(address);
+
+  // The same for removing the row: delete on subnets, or a delete grant on
+  // an address set that contains the address (the server asks the same). The
+  // subnet half is type-level: the delete routes' gate takes no grant scoped
+  // to one subnet (they are not on its instance allow-list).
+  const subnetDeletable = perms.can("delete", "subnet");
+  const deletableSets = addressSets.filter((s) =>
+    perms.can("delete", "address_set", s.id),
+  );
+  const deletableSetsKey = deletableSets
+    .map(
+      (s) =>
+        `${s.id}|${s.range_kind}|${s.start_address ?? ""}|${s.end_address ?? ""}|${s.explicit_addresses.join(",")}`,
+    )
+    .join(";");
+  const deletableRanges = useMemo(
+    () => buildSetRanges(deletableSets),
+    // Keyed by ``deletableSetsKey`` for the reason ``writableRanges`` is.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [deletableSetsKey],
+  );
+  const permitsDeleteIp = (address: string): boolean =>
+    subnetDeletable || addressInSetRanges(deletableRanges, address);
 
   // #1155 — the header's write actions, each on the check the server makes
   // for it, so a read-only operator is not handed a form that ends in
@@ -5174,9 +5222,9 @@ export function SubnetDetail({
   // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
   const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
   // A row's Delete, the orphan purge and Bulk delete are deletes: the router
-  // gate wants ``delete``, the handler write on the row's subnet or address
-  // set (#3409). Clean Orphans asks its own, below.
-  const canDeleteIpam = canDeleteInIpam(perms);
+  // gate wants ``delete``, the handler write on the row and delete on its
+  // subnet or an address set holding it (#3409), see ``permitsDeleteIp``.
+  // Clean Orphans asks its own, below.
 
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
@@ -6223,7 +6271,7 @@ export function SubnetDetail({
                 onClick={() => setShowBulkDelete(true)}
                 className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-2.5 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
                 {...permissionGate(
-                  canAllocate && canDeleteIpam,
+                  canAllocate && (subnetDeletable || deletableSets.length > 0),
                   NEEDS_ADDRESS_DELETE,
                 )}
               >
@@ -7146,7 +7194,7 @@ export function SubnetDetail({
                                           // #3392 — the purge is a DELETE: as
                                           // the right-click Delete Forever….
                                           {...permissionGate(
-                                            canDeleteIpam,
+                                            permitsDeleteIp(addr.address),
                                             NEEDS_ADDRESS_DELETE,
                                           )}
                                         >
@@ -7186,7 +7234,7 @@ export function SubnetDetail({
                                         // #3409 — DELETE /addresses/{id} takes
                                         // delete, not write.
                                         {...permissionGate(
-                                          canDeleteIpam,
+                                          permitsDeleteIp(addr.address),
                                           NEEDS_ADDRESS_DELETE,
                                         )}
                                       >
@@ -7234,7 +7282,7 @@ export function SubnetDetail({
                                   destructive
                                   onSelect={() => setConfirmDeleteAddr(addr)}
                                   {...permissionGate(
-                                    canDeleteIpam,
+                                    permitsDeleteIp(addr.address),
                                     NEEDS_ADDRESS_DELETE,
                                   )}
                                 >
@@ -7258,7 +7306,8 @@ export function SubnetDetail({
                                   destructive
                                   onSelect={() => setConfirmPurgeAddr(addr)}
                                   {...permissionGate(
-                                    permitsWrite && canDeleteIpam,
+                                    permitsWrite &&
+                                      permitsDeleteIp(addr.address),
                                     NEEDS_ADDRESS_DELETE,
                                   )}
                                 >
@@ -7443,7 +7492,7 @@ export function SubnetDetail({
           // #3409 — the detail's Delete is the same DELETE: not offered
           // without delete.
           onDelete={
-            canDeleteIpam
+            viewingAddress && permitsDeleteIp(viewingAddress.address)
               ? () => {
                   const a = viewingAddress;
                   setViewingAddress(null);
