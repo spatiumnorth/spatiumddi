@@ -1339,7 +1339,7 @@ multi-target delivery with pluggable wire formats.
 
 curated automation surface for downstream consumers.
 
-- 144 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.allocated`)
+- 144 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.created`)
 - HMAC-SHA256 signed POSTs with reserved `X-SpatiumDDI-*` headers
 - Outbox-backed at-least-once delivery with exponential backoff + dead-letter
 - Per-subscription manual retry, custom headers, and one-time secret reveal

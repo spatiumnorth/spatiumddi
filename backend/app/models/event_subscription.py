@@ -2,8 +2,8 @@
 
 Distinct from ``AuditForwardTarget`` (which fires on every audit row in
 the platform's chosen wire format). This surface emits **typed events**
-shaped for downstream automation: ``subnet.created`` / ``ip.allocated``
-/ ``zone.modified`` and the rest. Each event is delivered with an
+shaped for downstream automation: ``subnet.created`` / ``ip.created``
+/ ``dns.zone.updated`` and the rest. Each event is delivered with an
 HMAC-SHA256 signature so the receiver can verify authenticity, and
 delivery is backed by a database outbox with exponential-backoff retry
 + dead-letter state — at-least-once semantics modulo a crash window

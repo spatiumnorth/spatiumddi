@@ -84,7 +84,12 @@ def test_long_poll_waits_race_the_shutdown_flag(path: str) -> None:
 # every ``while`` loop inside an ``async def`` of an api module that sleeps or
 # waits with a timeout must use the shutdown helpers.
 _HOLD_SCAN_ROOTS = ("backend/app/api", "backend/app/services/appliance")
-_SHUTDOWN_MARKERS = ("sleep_or_shutdown", "get_or_shutdown", "WakeResult.SHUTDOWN")
+_SHUTDOWN_MARKERS = (
+    "sleep_or_shutdown",
+    "get_or_shutdown",
+    "wait_or_shutdown",
+    "WakeResult.SHUTDOWN",
+)
 # SSE streams are deliberately still cut at the 20 s mark (documented #3015
 # exception). Keyed by (path, enclosing async def name).
 _SSE_ALLOWLIST = {
@@ -99,7 +104,14 @@ def _is_wait_call(node: ast.AST) -> bool:
         return False
     f = node.func
     name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
-    return name in {"sleep", "wait_for", "wait", "sleep_or_shutdown", "get_or_shutdown"}
+    return name in {
+        "sleep",
+        "wait_for",
+        "wait",
+        "sleep_or_shutdown",
+        "get_or_shutdown",
+        "wait_or_shutdown",
+    }
 
 
 def _find_holds() -> list[tuple[str, str, int, str]]:
