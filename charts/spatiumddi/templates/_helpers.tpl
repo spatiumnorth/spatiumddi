@@ -154,7 +154,9 @@ anti-affinity (#590).
 
   {{- include "spatiumddi.deploymentStrategy" (dict
         "mode" .Values.api.podAntiAffinity
-        "replicas" .Values.api.replicas) | nindent 2 }}
+        "replicas" .Values.api.replicas
+        "root" $ "deployment" (printf "%s-api" (include "spatiumddi.fullname" $))
+        "container" "api") | nindent 2 }}
 
 Required anti-affinity + ``replicas == number of eligible nodes`` makes the
 default surge pod UNSCHEDULABLE, and the default ``maxUnavailable: 0`` then
@@ -191,19 +193,93 @@ cluster has no second node to surge onto in the shape that matters, and the
 frontend's hostNetwork path already accepts the same trade with Recreate.
 The opposite direction (1 → 3) is the ``replicas > 1`` case above and is
 unchanged.
+
+#3780 — except on a ROLLBACK at one replica. Retiring first there deletes
+the newer release's only pod, and when the older release cannot run on the
+schema the newer one migrated (#1227), its pod waits in ``wait-for-migrate``
+forever: no api, no web UI, and so no way to re-apply the newer release from
+the API, which is the documented recovery. Surge-first keeps the newer pod
+serving until the older one is ready, which is never in that case, and only
+a moment in the ordinary one. The release rolled back TO decides this, so it
+has to be in the chart being installed, not the one being left.
+
+So pass ``root`` (the chart root), ``deployment`` (the Deployment's name) and
+``container`` (its main container) as well, and at one replica under ``hard``
+the helper surges first when the live ReplicaSets (``lookup``) say:
+
+  * a READY pod of this Deployment runs a SemVer release NEWER than this
+    render's image tag: this render is a rollback. It stays true on every
+    later render of the same release while the newer pod serves (the
+    template already carries the older tag by then), and stops being true
+    once the older pod is ready and the newer one retired; and
+  * no ReplicaSet of it with pods carries a required anti-affinity term,
+    so the #1541 wedge (a surviving 3-node pod) still retires first.
+
+Anything it cannot read (``helm template``, a tag that is not a 1.x+ SemVer
+release, a CalVer or nightly build, no live Deployment) retires first, as
+before. An ordinary upgrade is never a rollback, so it keeps #1659's
+strategy, and ``replicas > 1`` is untouched. ``replicaSets`` replaces the
+lookup with a given list (the chart tests, which have no cluster).
 */}}
 {{- define "spatiumddi.deploymentStrategy" -}}
 {{- $mode := default "soft" .mode -}}
+{{- $keepServing := and (eq $mode "hard") (eq (int .replicas) 1) .root
+      (eq (include "spatiumddi.newerReleaseServing" .) "true") -}}
 strategy:
   type: RollingUpdate
   rollingUpdate:
-  {{- if eq $mode "hard" }}
+  {{- if and (eq $mode "hard") (not $keepServing) }}
     maxSurge: 0
     maxUnavailable: 1
   {{- else }}
     maxSurge: 1
     maxUnavailable: 0
   {{- end }}
+{{- end -}}
+
+{{/*
+"true" when this render rolls ``deployment`` back from a newer release that
+still serves (#3780; see spatiumddi.deploymentStrategy). Only 1.x and later
+SemVer tags count: a CalVer tag (YYYY.MM.DD-N), a nightly (0.0.0-...), "dev"
+or "latest" is an unknown version, never an older one (core/versions.py).
+*/}}
+{{- define "spatiumddi.newerReleaseServing" -}}
+{{- $root := .root -}}
+{{- $release := `^[1-9][0-9]{0,2}\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$` -}}
+{{- $ours := toString ($root.Values.image.tag | default $root.Chart.AppVersion) -}}
+{{- $newer := false -}}
+{{- $blocked := false -}}
+{{- if regexMatch $release $ours -}}
+  {{- $items := .replicaSets -}}
+  {{- if not (hasKey . "replicaSets") -}}
+    {{- $items = get (default (dict) (lookup "apps/v1" "ReplicaSet" $root.Release.Namespace "")) "items" -}}
+  {{- end -}}
+  {{- range $rs := (default (list) $items) -}}
+    {{- $owned := false -}}
+    {{- range $ref := (default (list) (dig "metadata" "ownerReferences" (list) $rs)) -}}
+      {{- if and (eq (toString $ref.kind) "Deployment") (eq (toString $ref.name) (toString $.deployment)) -}}
+        {{- $owned = true -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if and $owned (gt (int (dig "status" "replicas" 0 $rs)) 0) -}}
+      {{- $podSpec := dig "spec" "template" "spec" (dict) $rs -}}
+      {{- if dig "affinity" "podAntiAffinity" "requiredDuringSchedulingIgnoredDuringExecution" (list) $podSpec -}}
+        {{- $blocked = true -}}
+      {{- end -}}
+      {{- if gt (int (dig "status" "readyReplicas" 0 $rs)) 0 -}}
+        {{- range $c := (default (list) $podSpec.containers) -}}
+          {{- if eq (toString $c.name) (toString $.container) -}}
+            {{- $tag := last (splitList ":" (last (splitList "/" (toString $c.image)))) -}}
+            {{- if and (regexMatch $release $tag) (gt ((semver $tag).Compare (semver $ours)) 0) -}}
+              {{- $newer = true -}}
+            {{- end -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if and $newer (not $blocked) }}true{{ end -}}
 {{- end -}}
 
 {{- define "spatiumddi.podAntiAffinity" -}}

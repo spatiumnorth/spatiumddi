@@ -60,7 +60,11 @@
 #                      rollout wedges once replicas == nodes (#590); plus a
 #                      dedicated pass asserting the appliance's api / worker /
 #                      frontend retire first at one replica too, where the
-#                      blocking term rides on the OUTGOING pods (#1541).
+#                      blocking term rides on the OUTGOING pods (#1541),
+#                      and a scratch-chart pass over the helper itself: a
+#                      ROLLBACK at one replica surges first, so the newer
+#                      release keeps serving (#3780; ``lookup`` decides it,
+#                      which ``helm template`` cannot answer).
 #   hpa-replicas     — every render, plus --require passes, a control and
 #                      negative controls: a workload an autoscaler scales
 #                      renders no ``spec.replicas`` (#3111), while the
@@ -353,6 +357,153 @@ for n in 1 3; do
         --retire-first api --retire-first worker --retire-first frontend \
         "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
 done
+
+# #3780 — at one replica under ``hard`` a ROLLBACK surges first, so the
+# newer release's only api / worker pod keeps serving while the older
+# release's pod waits on a schema it cannot run. The decision reads the live
+# ReplicaSets through ``lookup``, which ``helm template`` cannot answer (the
+# renders above therefore retire first, and must). So the helper is rendered
+# here in a scratch chart against given ReplicaSets, one Deployment per case,
+# and each case's strategy is checked against the expected one.
+echo "── rollback keeps the newer release serving at one replica (umbrella helpers, #3780)"
+RB_CHART="$OUT/rollback-strategy-chart"
+rm -rf "$RB_CHART"
+mkdir -p "$RB_CHART/templates"
+cp "$UMBRELLA/templates/_helpers.tpl" "$RB_CHART/templates/_helpers.tpl"
+cat > "$RB_CHART/Chart.yaml" <<'EOF'
+apiVersion: v2
+name: spatiumddi
+version: 0.0.0
+appVersion: "0.0.0"
+EOF
+cat > "$RB_CHART/templates/cases.yaml" <<'EOF'
+{{- range $c := .Values.cases }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $c.name }}
+  labels:
+    expect: {{ $c.expect }}
+spec:
+  {{- $root := dict "Values" (dict "image" (dict "tag" $c.ours)) "Chart" $.Chart "Release" $.Release }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" (default "hard" $c.mode) "replicas" (default 1 $c.replicas) "root" $root "deployment" "x-api" "container" "api" "replicaSets" (default (list) $c.rs)) | nindent 2 }}
+{{- end }}
+EOF
+cat > "$RB_CHART/values.yaml" <<'EOF'
+cases:
+  - name: rollback-newer-serving
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "ghcr.io/o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-later-render-older-pod-not-ready
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "ghcr.io/o/spatiumddi-api:1.0.0"}]}}}}
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "reg:5000/o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-to-release-candidate
+    expect: surge
+    ours: 1.0.0-rc.1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.2"}]}}}}
+  - name: rollback-from-release-candidate
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1-rc.1"}]}}}}
+  - name: ordinary-upgrade
+    expect: retire
+    ours: 1.0.1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: rollback-complete-older-serving
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 0},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: demote-old-pod-carries-required-term-1541
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {affinity: {podAntiAffinity: {requiredDuringSchedulingIgnoredDuringExecution: [{topologyKey: kubernetes.io/hostname}]}},
+                                  containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: three-replicas-unchanged
+    expect: retire
+    ours: 1.0.0
+    replicas: 3
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 3, readyReplicas: 3},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: upgrade-from-calver-bridge
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:2026.11.03-1"}]}}}}
+  - name: calver-render-is-unknown
+    expect: retire
+    ours: 2026.11.03-1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: nightly-render-is-unknown
+    expect: retire
+    ours: 0.0.0-nightly-20261108
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: newer-pod-of-another-deployment
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-worker}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: soft-mode-always-surges
+    expect: surge
+    mode: soft
+    ours: 1.0.0
+EOF
+if helm template rb "$RB_CHART" > "$OUT/rollback-strategy.yaml"; then
+    python3 - "$OUT/rollback-strategy.yaml" <<'EOF' || failures=$((failures + 1))
+import sys
+
+import yaml
+
+bad = 0
+seen = 0
+for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
+    if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+        continue
+    seen += 1
+    name = doc["metadata"]["name"]
+    want = doc["metadata"]["labels"]["expect"]
+    rolling = doc["spec"]["strategy"]["rollingUpdate"]
+    got = "retire" if (rolling["maxSurge"], rolling["maxUnavailable"]) == (0, 1) else "surge"
+    if got != want:
+        print(f"   FAIL: {name}: expected {want}-first, rendered {got}-first ({rolling})", file=sys.stderr)
+        bad += 1
+if seen == 0:
+    print("   FAIL: the #3780 case render produced no Deployment", file=sys.stderr)
+    bad += 1
+print(f"   {seen - bad}/{seen} rollback-strategy cases hold")
+sys.exit(1 if bad else 0)
+EOF
+else
+    echo "   FAIL: the #3780 rollback-strategy case chart did not render" >&2
+    failures=$((failures + 1))
+fi
 
 # #1805 — the api Service's PreferSameNode is the appliance's, not the
 # umbrella default's. The default render (a BYO-Kubernetes install) must omit
