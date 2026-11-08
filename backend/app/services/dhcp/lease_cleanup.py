@@ -384,11 +384,13 @@ async def delete_leases_for_scope(
 SCOPE_DELETE_BATCH = 25
 
 # Wall-clock budget for the teardown a scope soft-delete runs in its request,
-# once the scope is in the Trash: the server delete's bound (#2290), for the
-# same reason. ``app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases``
+# once the scope is in the Trash. Kept well under the 30 s statement limit
+# (asyncpg ``command_timeout``) and typical proxy timeouts: at 20 s the walked
+# deletes answered in 23-30 s (#3772). Unlike the server delete's bound
+# (#2290, whose remainder cascades away), the rest here goes to a task. ``app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases``
 # tears the rest down, enqueued when the request stops short and run again by
 # the lease sweep for any scope in the Trash that still has leases.
-SCOPE_DELETE_INLINE_DEADLINE_S = 20.0
+SCOPE_DELETE_INLINE_DEADLINE_S = 10.0
 
 
 async def scope_lease_counts(db: AsyncSession, scope_id: uuid.UUID) -> tuple[int, int]:
