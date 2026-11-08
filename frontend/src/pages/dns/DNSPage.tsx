@@ -114,6 +114,7 @@ import {
   formatApiError,
   formatDialogError,
   tlsCertsApi,
+  type DNSServerOptions,
   type DNSServerGroup,
   type DNSServer,
   type DNSZone,
@@ -8051,9 +8052,16 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
   const { isSuperadmin } = useDnsGrants();
-  const { data: opts, isLoading } = useQuery({
+  // Read again on every open (#3739): the cached copy may predate another
+  // client's change, and the form is filled from this read, not the cache.
+  const {
+    data: opts,
+    isLoading,
+    isFetching,
+  } = useQuery({
     queryKey: ["dns-options", groupId],
     queryFn: () => dnsApi.getOptions(groupId),
+    refetchOnMount: "always",
   });
   // Certificate picker for the DoT/DoH listeners (issue #50). Shares the
   // appliance cert store with the web UI cert + the ACME client, so the
@@ -8159,9 +8167,14 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const [forwardTlsVerify, setForwardTlsVerify] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [initialized, setInitialized] = useState(false);
+  // The options the form was last filled from. A Save sends only what differs
+  // from it (#3739), so an option the operator did not touch stays as another
+  // client stored it. Fill from a settled read only (not the stale cache a
+  // refetch is about to replace), and again when a later read arrives
+  // (header Refresh, own Save) unless the operator has unsaved edits.
+  const [filledFrom, setFilledFrom] = useState<DNSServerOptions | null>(null);
 
-  if (opts && !initialized) {
+  if (opts && !isFetching && opts !== filledFrom && (!dirty || !filledFrom)) {
     setForwardersEnabled(opts.forwarders.length > 0);
     setForwarders(opts.forwarders.join("\n"));
     setForwardPolicy(opts.forward_policy);
@@ -8203,7 +8216,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     setForwardTransport(opts.forward_transport);
     setForwardTlsHostname(opts.forward_tls_hostname ?? "");
     setForwardTlsVerify(opts.forward_tls_verify);
-    setInitialized(true);
+    setFilledFrom(opts);
   }
 
   const saveMut = useMutation({
@@ -8344,7 +8357,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   }
 
   function save() {
-    saveMut.mutate({
+    const body = {
       forwarders: forwardersEnabled ? list(forwarders) : [],
       forward_policy: forwardPolicy,
       recursion_enabled: recursionEnabled,
@@ -8389,7 +8402,60 @@ export function OptionsTab({ groupId }: { groupId: string }) {
       forward_transport: forwardTransport,
       forward_tls_hostname: forwardTlsHostname.trim() || null,
       forward_tls_verify: forwardTlsVerify,
-    });
+    };
+    // Send only what changed (#3739). The baseline is the fill-time read run
+    // through the same shaping, so a field left alone compares equal.
+    const o = filledFrom!;
+    const diff = changedFields(
+      {
+        forwarders: o.forwarders,
+        forward_policy: o.forward_policy,
+        recursion_enabled: o.recursion_enabled,
+        allow_recursion: o.allow_recursion,
+        dnssec_validation: o.dnssec_validation,
+        notify_enabled: o.notify_enabled,
+        allow_query: o.allow_query,
+        allow_transfer: o.allow_transfer,
+        query_log_enabled: o.query_log_enabled,
+        response_log_enabled: o.query_log_enabled && o.response_log_enabled,
+        query_log_channel: o.query_log_channel,
+        query_log_file: o.query_log_file,
+        query_log_severity: o.query_log_severity,
+        rrl_enabled: o.rrl_enabled,
+        rrl_responses_per_second: o.rrl_responses_per_second,
+        rrl_window: o.rrl_window,
+        rrl_slip: o.rrl_slip,
+        rrl_qps_scale: o.rrl_qps_scale ?? null,
+        rrl_exempt_clients: o.rrl_exempt_clients,
+        rrl_log_only: o.rrl_log_only,
+        minimal_responses: o.minimal_responses,
+        tcp_clients: o.tcp_clients ?? null,
+        clients_per_query: o.clients_per_query ?? null,
+        max_clients_per_query: o.max_clients_per_query ?? null,
+        dnsdist_enabled: o.dnsdist_enabled,
+        dnsdist_max_qps_per_client: o.dnsdist_max_qps_per_client ?? null,
+        dnsdist_action: o.dnsdist_action,
+        dnsdist_dynblock_qps: o.dnsdist_dynblock_qps ?? null,
+        dnsdist_dynblock_seconds: o.dnsdist_dynblock_seconds,
+        dot_enabled: o.dot_enabled,
+        dot_port: o.dot_port,
+        doh_enabled: o.doh_enabled,
+        doh_port: o.doh_port,
+        doh_path: o.doh_path.trim() || "/dns-query",
+        doq_enabled: o.doq_enabled ?? false,
+        doq_port: o.doq_port ?? 853,
+        tls_certificate_id: o.tls_certificate_id ?? null,
+        forward_transport: o.forward_transport,
+        forward_tls_hostname: o.forward_tls_hostname?.trim() || null,
+        forward_tls_verify: o.forward_tls_verify,
+      },
+      body,
+    );
+    if (Object.keys(diff).length === 0) {
+      setDirty(false);
+      return;
+    }
+    saveMut.mutate(diff);
   }
 
   if (isLoading)
@@ -11548,6 +11614,211 @@ function BlocklistModalForm({
   );
 }
 
+// Edit Blocked Domain / Edit Exception read the row when they open (#3739):
+// the clicked row comes from a table loaded earlier, and the console has no
+// single-entry read, so the table's own queries are refetched and the row
+// picked out of them. A Save sends only what changed.
+function EditBlockedDomainModal({
+  listId,
+  entry,
+  onClose,
+}: {
+  listId: string;
+  entry: DNSBlockListEntry;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow(entry, () =>
+    refetchRow<DNSBlockListEntry>(
+      qc,
+      [["dns-blocklist-entries", listId]],
+      entry.id,
+    ),
+  );
+  const [domain, setDomain] = useState("");
+  const [reason, setReason] = useState("");
+  const [wildcard, setWildcard] = useState(true);
+  const [seeded, setSeeded] = useState(false);
+  if (fresh.ready && fresh.row && !seeded) {
+    setDomain(fresh.row.domain);
+    setReason(fresh.row.reason ?? "");
+    setWildcard(fresh.row.is_wildcard);
+    setSeeded(true);
+  }
+  const save = useMutation({
+    mutationFn: async () => {
+      const diff = changedFields(
+        {
+          domain: fresh.row!.domain,
+          reason: fresh.row!.reason ?? "",
+          is_wildcard: fresh.row!.is_wildcard,
+        },
+        { domain, reason, is_wildcard: wildcard },
+      );
+      if (Object.keys(diff).length === 0) return;
+      await dnsBlocklistApi.updateEntry(listId, entry.id, diff);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", listId] });
+      onClose();
+    },
+  });
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Blocked Domain"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !seeded) return null;
+  return (
+    <Modal title="Edit Blocked Domain" onClose={onClose}>
+      <div className="space-y-3">
+        <Field label="Domain">
+          <input
+            className={inputCls}
+            value={domain}
+            onChange={(ev) => setDomain(ev.target.value)}
+            autoFocus
+          />
+        </Field>
+        <Field label="Reason">
+          <input
+            className={inputCls}
+            value={reason}
+            onChange={(ev) => setReason(ev.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            checked={wildcard}
+            onChange={(ev) => setWildcard(ev.target.checked)}
+          />
+          Block subdomains too (
+          <code className="font-mono text-xs">*.{domain || "domain"}</code>)
+        </label>
+        {save.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(save.error, "Save failed")}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => save.mutate()}
+            disabled={!domain.trim() || save.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {save.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function EditExceptionModal({
+  listId,
+  exception,
+  onClose,
+}: {
+  listId: string;
+  exception: DNSBlockListException;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow(exception, () =>
+    refetchRow<DNSBlockListException>(
+      qc,
+      [["dns-blocklist-exceptions", listId]],
+      exception.id,
+    ),
+  );
+  const [domain, setDomain] = useState("");
+  const [reason, setReason] = useState("");
+  const [seeded, setSeeded] = useState(false);
+  if (fresh.ready && fresh.row && !seeded) {
+    setDomain(fresh.row.domain);
+    setReason(fresh.row.reason ?? "");
+    setSeeded(true);
+  }
+  const save = useMutation({
+    mutationFn: async () => {
+      const diff = changedFields(
+        { domain: fresh.row!.domain, reason: fresh.row!.reason ?? "" },
+        { domain, reason },
+      );
+      if (Object.keys(diff).length === 0) return;
+      await dnsBlocklistApi.updateException(listId, exception.id, diff);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", listId] });
+      onClose();
+    },
+  });
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Exception"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !seeded) return null;
+  return (
+    <Modal title="Edit Exception" onClose={onClose}>
+      <div className="space-y-3">
+        <Field label="Domain">
+          <input
+            className={inputCls}
+            value={domain}
+            onChange={(ev) => setDomain(ev.target.value)}
+            autoFocus
+          />
+        </Field>
+        <Field label="Reason">
+          <input
+            className={inputCls}
+            value={reason}
+            onChange={(ev) => setReason(ev.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        {save.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(save.error, "Save failed")}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => save.mutate()}
+            disabled={!domain.trim() || save.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {save.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export function BlocklistDetail({
   list,
   onBack,
@@ -11619,27 +11890,12 @@ export function BlocklistDetail({
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] }),
   });
   const [editEntry, setEditEntry] = useState<DNSBlockListEntry | null>(null);
-  const [editDomain, setEditDomain] = useState("");
-  const [editEntryReason, setEditEntryReason] = useState("");
-  const [editEntryWildcard, setEditEntryWildcard] = useState(true);
   // Inline toggle — fires immediately from the row checkbox, no Save button.
   const toggleEntryWildcard = useMutation({
     mutationFn: ({ id, value }: { id: string; value: boolean }) =>
       dnsBlocklistApi.updateEntry(list.id, id, { is_wildcard: value }),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] }),
-  });
-  const updateEntry = useMutation({
-    mutationFn: () =>
-      dnsBlocklistApi.updateEntry(list.id, editEntry!.id, {
-        domain: editDomain,
-        reason: editEntryReason,
-        is_wildcard: editEntryWildcard,
-      }),
-    onSuccess: () => {
-      setEditEntry(null);
-      qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
-    },
   });
   const addException = useMutation({
     mutationFn: () =>
@@ -11660,19 +11916,6 @@ export function BlocklistDetail({
   });
   const [editException, setEditException] =
     useState<DNSBlockListException | null>(null);
-  const [editExcDomain, setEditExcDomain] = useState("");
-  const [editExcReason, setEditExcReason] = useState("");
-  const updateException = useMutation({
-    mutationFn: () =>
-      dnsBlocklistApi.updateException(list.id, editException!.id, {
-        domain: editExcDomain,
-        reason: editExcReason,
-      }),
-    onSuccess: () => {
-      setEditException(null);
-      qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", list.id] });
-    },
-  });
   const refresh = useMutation({
     mutationFn: () => dnsBlocklistApi.refresh(list.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
@@ -11889,9 +12132,6 @@ export function BlocklistDetail({
                           className="text-muted-foreground hover:text-foreground"
                           onClick={() => {
                             setEditEntry(e);
-                            setEditDomain(e.domain);
-                            setEditEntryReason(e.reason ?? "");
-                            setEditEntryWildcard(e.is_wildcard);
                           }}
                           title="Edit domain"
                           aria-label="Edit domain"
@@ -12026,8 +12266,6 @@ export function BlocklistDetail({
                         className="text-muted-foreground hover:text-foreground"
                         onClick={() => {
                           setEditException(ex);
-                          setEditExcDomain(ex.domain);
-                          setEditExcReason(ex.reason ?? "");
                         }}
                         title="Edit exception"
                         aria-label="Edit exception"
@@ -12060,90 +12298,18 @@ export function BlocklistDetail({
       </div>
 
       {editException && (
-        <Modal title="Edit Exception" onClose={() => setEditException(null)}>
-          <div className="space-y-3">
-            <Field label="Domain">
-              <input
-                className={inputCls}
-                value={editExcDomain}
-                onChange={(ev) => setEditExcDomain(ev.target.value)}
-                autoFocus
-              />
-            </Field>
-            <Field label="Reason">
-              <input
-                className={inputCls}
-                value={editExcReason}
-                onChange={(ev) => setEditExcReason(ev.target.value)}
-                placeholder="Optional"
-              />
-            </Field>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setEditException(null)}
-                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => updateException.mutate()}
-                disabled={!editExcDomain.trim() || updateException.isPending}
-                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {updateException.isPending ? "Saving…" : "Save"}
-              </button>
-            </div>
-          </div>
-        </Modal>
+        <EditExceptionModal
+          listId={list.id}
+          exception={editException}
+          onClose={() => setEditException(null)}
+        />
       )}
       {editEntry && (
-        <Modal title="Edit Blocked Domain" onClose={() => setEditEntry(null)}>
-          <div className="space-y-3">
-            <Field label="Domain">
-              <input
-                className={inputCls}
-                value={editDomain}
-                onChange={(ev) => setEditDomain(ev.target.value)}
-                autoFocus
-              />
-            </Field>
-            <Field label="Reason">
-              <input
-                className={inputCls}
-                value={editEntryReason}
-                onChange={(ev) => setEditEntryReason(ev.target.value)}
-                placeholder="Optional"
-              />
-            </Field>
-            <label className="flex items-center gap-2 text-sm cursor-pointer">
-              <input
-                type="checkbox"
-                checked={editEntryWildcard}
-                onChange={(ev) => setEditEntryWildcard(ev.target.checked)}
-              />
-              Block subdomains too (
-              <code className="font-mono text-xs">
-                *.{editDomain || "domain"}
-              </code>
-              )
-            </label>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setEditEntry(null)}
-                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => updateEntry.mutate()}
-                disabled={!editDomain.trim() || updateEntry.isPending}
-                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {updateEntry.isPending ? "Saving…" : "Save"}
-              </button>
-            </div>
-          </div>
-        </Modal>
+        <EditBlockedDomainModal
+          listId={list.id}
+          entry={editEntry}
+          onClose={() => setEditEntry(null)}
+        />
       )}
       {showBulk && (
         <Modal title="Bulk Add Domains" onClose={() => setShowBulk(false)} wide>
