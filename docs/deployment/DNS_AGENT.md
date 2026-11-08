@@ -1077,10 +1077,34 @@ dns-bind9-ns1:
 ```
 
 > The agent reads `AGENT_ROLES` (default `authoritative`), `AGENT_GROUP`,
-> and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
+> `SERVER_HOST` and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
 > (`agent/dns/spatium_dns_agent/config.py`). The role is a label only —
 > the control plane fans record ops out to every enabled agent-based
 > server in the group regardless of role.
+>
+> **`SERVER_HOST` is where the control plane reads zones back from** (drift,
+> pull-from-server). `SERVER_NAME` stays the server's name; `SERVER_HOST`, when
+> set, is registered as `DNSServer.host` and updated on every re-registration.
+> A StatefulSet pod's bare name resolves only inside the pod, so the Helm chart
+> and `k8s/dns/` set it to `<pod>.<instance>-headless.<namespace>.svc.cluster.local`
+> (#3757). It must be `SERVER_NAME` or a qualified form of it; anything else
+> (an IP, another name) is ignored with a `dns_agent_host_ignored` warning.
+> Re-registration moves the host only while it is still a value registration
+> wrote, never over an operator's edit and never while the server awaits
+> approval. An agent that already holds a token never calls `/register` on a
+> restart, so it records the `SERVER_HOST` it last registered in its state dir
+> (`registered_host`) and registers once more at startup when the configured
+> value differs. That is what heals an install upgraded from a chart that set
+> none: the upgrade restarts the agent pod, which registers once with the new
+> value. The value is recorded only when the response echoes the row's `host`,
+> which says the control plane read the field; `helm upgrade` restarts the
+> agent and the api together, and an api pod of the previous release answers
+> 200 while ignoring `host`. With no echo, or no answer at all, the agent keeps
+> serving on its cached token and config and repeats the registration from its
+> heartbeat loop every 5 minutes for up to an hour, then on its next start.
+> Without `SERVER_HOST` the host is `SERVER_NAME`. As a
+> backstop, an agent-managed server whose host does not resolve is read at its
+> `last_seen_ip` instead, with or without a DNS VIP.
 
 > **`AGENT_GROUP` only decides where a BRAND-NEW agent lands.** On
 > re-registration the control plane resolves the existing row by `agent_id`
