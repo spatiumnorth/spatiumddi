@@ -360,3 +360,20 @@ def test_a_signed_zone_whose_key_files_bind_cannot_write_is_held_back(
         assert "at most 214 characters" in reason
     else:
         assert drv._unwritable_zones == ()
+
+
+def test_the_apply_error_words_a_name_length_hold_apart_from_bad_data() -> None:
+    from spatium_dns_agent.drivers.base import HeldZone
+    from spatium_dns_agent.sync import _partial_apply_error
+
+    err = _partial_apply_error(
+        [
+            HeldZone("a.test", None, "bad", False),
+            HeldZone("b.test", None, "long", False, True),
+        ],
+        [],
+    )
+    assert "named-checkzone refused a zone file, held back until the data loads" in err
+    assert "zone name too long: a zone held back until renamed" in err
+    only = _partial_apply_error([HeldZone("b.test", None, "long", False, True)], [])
+    assert "named-checkzone" not in only

@@ -192,10 +192,19 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
             + ")"
             for h in held
         )
-        count = "a zone file" if len(held) == 1 else f"{len(held)} zone files"
+        long_names = [h for h in held if h.name_too_long]
+        bad_data = len(held) - len(long_names)
+        lead: list[str] = []
+        if bad_data:
+            count = "a zone file" if bad_data == 1 else f"{bad_data} zone files"
+            lead.append(
+                f"named-checkzone refused {count}, held back until the data loads"
+            )
+        if long_names:
+            count = "a zone" if len(long_names) == 1 else f"{len(long_names)} zones"
+            lead.append(f"zone name too long: {count} held back until renamed")
         parts.append(
-            f"named-checkzone refused {count}, held back until the data loads; "
-            f"every other change in this config is live: {zones}"
+            f"{'; '.join(lead)}; every other change in this config is live: {zones}"
         )
     if refused:
         parts.append(
@@ -327,7 +336,9 @@ class SyncLoop:
             # the cause. Ask the control plane first (the first poll). Only
             # deaths the agent WATCHED quarantine it (``apply_guard`` module
             # doc): an unexplained end of the process can be a power cut.
-            if self._guard.condemned(etag) and (died == etag or self._quarantine.etag != etag):
+            if self._guard.condemned(etag) and (
+                died == etag or self._quarantine.etag != etag
+            ):
                 self._quarantine.record(etag, self._death_reason(etag, deaths))
             self._begin_boot_hold(bundle, etag, deaths)
             self._boot_hold_since = _hold_clock()
@@ -343,7 +354,9 @@ class SyncLoop:
             # #2019 — "the last-known-good" can be the very bundle that is
             # quarantined (it applied, was committed, and the daemon died a
             # moment later), and then it is no fallback at all.
-            if prev_bundle is not None and self._previous_usable(prev_etag, etag, before_sync=True):
+            if prev_bundle is not None and self._previous_usable(
+                prev_etag, etag, before_sync=True
+            ):
                 log.warning(
                     "bootstrap_skipping_quarantined_bundle",
                     failed_etag=etag,
@@ -496,7 +509,9 @@ class SyncLoop:
         if watched:
             seen = f" (the agent saw it exit {'once' if watched == 1 else f'{watched} times'})"
         oom = ""
-        if self._guard.died_oom_killed or (self.oom_watch is not None and self.oom_watch.record):
+        if self._guard.died_oom_killed or (
+            self.oom_watch is not None and self.oom_watch.record
+        ):
             oom = (
                 " (the container's OOM killer: the daemon ran out of memory under "
                 "its limit; large RPZ blocklists are the usual cause, see "
@@ -513,7 +528,10 @@ class SyncLoop:
         OOM killer did it, otherwise ``daemon_died`` (cause unknown here; the
         control plane names it OOM when the kubelet saw one)."""
         if self._guard.died_oom_killed:
-            return {"reason": REASON_OOM, "memory_limit_bytes": self._guard.oom_limit_bytes}
+            return {
+                "reason": REASON_OOM,
+                "memory_limit_bytes": self._guard.oom_limit_bytes,
+            }
         return {"reason": REASON_DAEMON_DIED}
 
     def _report_boot_hold(self, status: ApplyStatus) -> None:
@@ -630,7 +648,9 @@ class SyncLoop:
             if bundle is None:
                 return
             if failed_etag is None:
-                log.warning("bootstrap_hold_applying_cache_offline", etag=etag, deaths=deaths)
+                log.warning(
+                    "bootstrap_hold_applying_cache_offline", etag=etag, deaths=deaths
+                )
                 if self._bootstrap_apply(
                     bundle, etag, booting_from_previous=False, before_sync=False
                 ):
@@ -651,7 +671,9 @@ class SyncLoop:
                 held_etag=etag,
                 failed_etag=failed_etag,
             )
-            if self._bootstrap_apply(bundle, etag, booting_from_previous=True, before_sync=False):
+            if self._bootstrap_apply(
+                bundle, etag, booting_from_previous=True, before_sync=False
+            ):
                 self._report_boot_hold(status)
                 self._end_boot_hold()
             return
@@ -732,7 +754,9 @@ class SyncLoop:
         elif usable_previous:
             serving = "last_known_good"
         else:
-            serving = "nothing: the cache is condemned and there is no other last-known-good"
+            serving = (
+                "nothing: the cache is condemned and there is no other last-known-good"
+            )
         if not self._boot_hold_max_wait_logged:
             self._boot_hold_max_wait_logged = True
             log.warning(
@@ -962,7 +986,9 @@ class SyncLoop:
             for zone in applied.get("zones") or []:
                 served = reported.get(_zone_key(zone.get("name")))
                 serial = zone.get("serial")
-                if served is not None and (serial is None or _serial_later(served, int(serial))):
+                if served is not None and (
+                    serial is None or _serial_later(served, int(serial))
+                ):
                     # Record ops moved it past the structural apply's serial.
                     zone = {**zone, "serial": served}
                 zones.append(zone)
@@ -1160,7 +1186,9 @@ class SyncLoop:
             # broken config as fast as the wake tick fires.
             if self._quarantine.blocks(etag, new_structural):
                 log.info("sync_skipping_quarantined_bundle", etag=etag)
-                self._return_unapplied_ops(bundle, "the bundle carrying it is quarantined")
+                self._return_unapplied_ops(
+                    bundle, "the bundle carrying it is quarantined"
+                )
                 # #2019 — the control plane still serves the bundle the daemon
                 # died on: serve the last-known-good meanwhile, if there is one.
                 # Before parking on the etag below: the fallback's apply sets
@@ -1409,9 +1437,9 @@ class SyncLoop:
             return
         self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
         self.heartbeat.config_apply = self.apply_status
-        if self.heartbeat.daemon_status.get("status") == "degraded" and not is_oom_status(
-            self.heartbeat.daemon_status
-        ):
+        if self.heartbeat.daemon_status.get(
+            "status"
+        ) == "degraded" and not is_oom_status(self.heartbeat.daemon_status):
             # Clear a degraded verdict this loop set on a previous cycle;
             # leaving it would make a recovered server look broken forever.
             # An OOM-kill verdict (#1725) is not this loop's to clear: an apply
@@ -1503,7 +1531,9 @@ class SyncLoop:
         """
         ops = [op for op in bundle.get("pending_record_ops") or [] if op.get("op_id")]
         for op in ops:
-            self.heartbeat.pending_acks.append(_ack(op, "error", f"not applied: {reason}"))
+            self.heartbeat.pending_acks.append(
+                _ack(op, "error", f"not applied: {reason}")
+            )
         if ops:
             log.warning("record_ops_returned_unapplied", count=len(ops), reason=reason)
 
@@ -1546,7 +1576,9 @@ class SyncLoop:
             # #2019 — the last-known-good is the bundle the daemon died on (it
             # was committed the moment its apply returned). Reverting to it
             # would put the daemon back on the config that kills it.
-            log.warning("sync_previous_unusable_daemon_died_on_it", previous_etag=prev_etag)
+            log.warning(
+                "sync_previous_unusable_daemon_died_on_it", previous_etag=prev_etag
+            )
             prev_bundle = None
         if prev_bundle is None:
             if daemon_disturbed:
@@ -1642,7 +1674,9 @@ class SyncLoop:
             keys |= {str(z).rstrip(".").lower() for z in hook()}
         return keys
 
-    def _report_zone_state(self, bundle: dict[str, Any], skip: set[str] | None = None) -> bool:
+    def _report_zone_state(
+        self, bundle: dict[str, Any], skip: set[str] | None = None
+    ) -> bool:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
 
         Best-effort. A dead control plane or transient 5xx never blocks
@@ -1816,7 +1850,10 @@ class SyncLoop:
         keeps refusing) must not cost one ``rndc`` per signed zone every 20 s
         for as long as it lasts.
         """
-        delay = min(DNSSEC_SETTLE_SECONDS * (2**self._dnssec_settle_streak), DNSSEC_REFRESH_SECONDS)
+        delay = min(
+            DNSSEC_SETTLE_SECONDS * (2**self._dnssec_settle_streak),
+            DNSSEC_REFRESH_SECONDS,
+        )
         self._dnssec_settle_streak = min(self._dnssec_settle_streak + 1, 8)
         self._dnssec_refresh_at = time.monotonic() + delay
 

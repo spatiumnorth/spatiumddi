@@ -30,4 +30,4 @@ export function partialApplyDetail(error: string | null | undefined): string {
 export const PARTIAL_APPLY_LABEL = "Zones refused";
 
 export const PARTIAL_APPLY_EXPLAIN =
-  "This agent applied the saved configuration, but its daemon refused the zones named below. Every other zone is served as saved, and nothing was rolled back. Fix the refused zones' data.";
+  "This agent applied the saved configuration, but its daemon refused the zones named below. Every other zone is served as saved, and nothing was rolled back. Fix the refused zones' data, or shorten a zone name the reason says is too long.";
