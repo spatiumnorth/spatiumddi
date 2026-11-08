@@ -17,6 +17,19 @@ them takes its locks in ONE order:
 4. the audit-chain advisory lock, at commit (#3389, #3503 — see
    ``app.services.audit_chain.LOCKED_BEFORE_AUDIT_TABLES``).
 
+A zone's **sync gate** (#3724, :func:`lock_zone_gate`) comes before all four:
+a transaction-scoped advisory lock per zone, shared by a long writer that
+commits in batches (the IPAM -> DNS auto-sync) and exclusive for a permanent
+zone delete. A taker holds no row lock when it takes the gate, and takes
+several gates in ascending key order, so it can never be waited on by a
+transaction that holds a row and wants a gate. Its purpose is fairness, not
+exclusion: Postgres queues a new shared request behind a waiting exclusive
+one, so a delete waiting for one batch's rows is not overtaken by the next
+batch at the commit boundary (which had it wait a second whole batch).
+Any new taker must take the gate before its first row lock, or it creates a
+cycle; so a writer that deletes several zones one after another in one
+transaction (the trash sweep, a subnet purge's reverse zones) takes none.
+
 Why this order: it is the one the hottest writer already had. A lease-events
 batch upserts its lease rows first (one flush, which writes the rows of one
 mapper in primary-key order), then locks the mirror rows ``FOR UPDATE`` by id
@@ -63,10 +76,11 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+import zlib
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -139,6 +153,27 @@ async def lock_mirror_rows(
             r for r in res.scalars().all() if (r.subnet_id, norm_ip(str(r.address))) in keys
         )
     return rows
+
+
+#: Advisory-lock namespace of the per-zone sync gate (#3724), "ZSYN".
+ZONE_SYNC_GATE_NS = 0x5A53594E
+
+
+def _zone_gate_key(zone_id: Any) -> int:
+    """Signed 32-bit crc32 of the zone id: the second int of the gate's key."""
+    key = zlib.crc32(str(zone_id).encode("utf-8"))
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def lock_zone_gate(db: AsyncSession, zone_ids: Iterable[Any], *, exclusive: bool) -> None:
+    """Step 0 (#3724): take the sync gate of each zone in ``zone_ids``, shared
+    (a batch writer) or ``exclusive`` (a permanent zone delete), in ascending
+    key order, to the end of the transaction. Call it before any row lock.
+    Two zones whose ids collide on the crc32 share a gate, which only costs a
+    wait."""
+    fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+    for key in sorted({_zone_gate_key(z) for z in zone_ids if z is not None}):
+        await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": ZONE_SYNC_GATE_NS, "key": key})
 
 
 async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
@@ -230,12 +265,30 @@ async def _lock_address_ids(db: AsyncSession, ids: Iterable[Any], *, nowait: boo
         )
 
 
+async def lock_address_rows(db: AsyncSession, ids: Iterable[Any]) -> list[Any]:
+    """Step 2 for a writer that knows its address rows up front (#3724): lock
+    ``ids`` ``FOR NO KEY UPDATE``, ascending id, before it takes any zone.
+
+    A zone delete locks the rows it detaches before the zone (#3691), so a
+    writer that took a zone first and wrote an address later (the IPAM -> DNS
+    auto-sync, one ``_sync_dns_record`` per row) deadlocked with it."""
+    ordered = sorted(set(ids))
+    await _lock_address_ids(db, ordered)
+    return ordered
+
+
 async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> list[Any]:
     """Step 2 for a zone delete: lock the ``ip_address`` rows a delete of
     ``zone_ids`` would rewrite (:func:`address_ids_of_zones`), ascending id,
     BEFORE the zone rows (#3691). Taken after the zone row, by the foreign
     key, that is step 3 before step 2, and a lease batch holding a mirror and
-    waiting for the zone deadlocks with it."""
+    waiting for the zone deadlocks with it.
+
+    It takes no sync gate (#3724): the trash sweep purges many zones in one
+    transaction, each after the last one's rows, so a gate here would be
+    taken after a row lock, and in the sweep's order rather than by key. A
+    caller that deletes one zone and holds nothing yet takes the gate itself
+    first (the Trash page's permanent delete)."""
     ids = await address_ids_of_zones(db, zone_ids)
     await _lock_address_ids(db, ids)
     return sorted(ids)
@@ -412,6 +465,33 @@ async def lock_zones_for_sync(
         await lock_zones_for_addresses(db, publishing=[(subnet, ip)], zone_id=zone_id)
 
 
+async def zone_ids_for_addresses(
+    db: AsyncSession,
+    *,
+    publishing: Iterable[tuple[Any, Any]] = (),
+    retracting: Iterable[Any] = (),
+    zone_id: Any = None,
+    ddns: bool = False,
+    extra_zone_ids: Iterable[Any] = (),
+) -> set[Any]:
+    """Every zone the DNS syncs of a unit of work may write (read-only): a
+    publish of each ``(subnet, ip_row)`` in ``publishing``, a retraction of
+    each row in ``retracting``, and ``extra_zone_ids`` (the zones of records
+    the work deletes outright, #3724). ``ddns`` adds each subnet's DDNS
+    override zone, which a lease publish writes into instead of the subnet's
+    own (#428)."""
+    pub = [(subnet, ip) for subnet, ip in publishing if ip is not None]
+    rows = [ip for ip in retracting if ip is not None] + [ip for _subnet, ip in pub]
+    zones = {z for z in extra_zone_ids if z is not None}
+    if not rows:
+        return zones
+    zones |= await _published_zone_ids(db, [ip.id for ip in rows])
+    subnet_cache: dict[Any, set[Any] | None] = {}
+    for subnet, ip in pub:
+        zones |= await _publish_zone_ids(db, ip, subnet, zone_id, subnet_cache, ddns)
+    return zones
+
+
 async def lock_zones_for_addresses(
     db: AsyncSession,
     *,
@@ -419,26 +499,26 @@ async def lock_zones_for_addresses(
     retracting: Iterable[Any] = (),
     zone_id: Any = None,
     ddns: bool = False,
+    extra_zone_ids: Iterable[Any] = (),
 ) -> None:
     """Lock, in one id-ordered pass, every zone the DNS syncs of a unit of
-    work may write: a publish of each ``(subnet, ip_row)`` in ``publishing``
-    and a retraction of each row in ``retracting``.
+    work may write (:func:`zone_ids_for_addresses`).
 
     For a transaction that syncs several addresses (a lease batch, the
     sweep): each sync locks its own zones in order, but one address's zones
     after another's are not in id order between them, so a writer taking the
     same zones for its own addresses in another order could still wait in a
-    cycle. ``ddns`` adds each subnet's DDNS override zone, which a lease
-    publish writes into instead of the subnet's own (#428)."""
-    pub = [(subnet, ip) for subnet, ip in publishing if ip is not None]
-    rows = [ip for ip in retracting if ip is not None] + [ip for _subnet, ip in pub]
-    if not rows:
-        return
-    zones = await _published_zone_ids(db, [ip.id for ip in rows])
-    subnet_cache: dict[Any, set[Any] | None] = {}
-    for subnet, ip in pub:
-        zones |= await _publish_zone_ids(db, ip, subnet, zone_id, subnet_cache, ddns)
-    await lock_zone_rows(db, zones)
+    cycle."""
+    zones = await zone_ids_for_addresses(
+        db,
+        publishing=publishing,
+        retracting=retracting,
+        zone_id=zone_id,
+        ddns=ddns,
+        extra_zone_ids=extra_zone_ids,
+    )
+    if zones:
+        await lock_zone_rows(db, zones)
 
 
 async def _mirror_zone_and_address_ids(

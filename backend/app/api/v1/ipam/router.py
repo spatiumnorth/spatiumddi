@@ -9299,6 +9299,115 @@ def _stale_ids(report: Any) -> frozenset[uuid.UUID]:
     return frozenset(s.record_id for s in report.stale)
 
 
+async def _dns_sync_lock_targets(
+    db: AsyncSession,
+    body: DnsSyncCommitRequest,
+    *,
+    allowed_stale_ids: Iterable[uuid.UUID] = (),
+) -> tuple[set[uuid.UUID], set[uuid.UUID]]:
+    """The ``ip_address`` rows and the extra ``dns_zone`` rows a
+    :func:`_apply_dns_sync` of ``body`` may write (#3724), unlocked.
+
+    Addresses: the ones it syncs (``create_for_ip_ids`` and the address each
+    ticked record belongs to), the address a deleted stale record belongs to
+    (whose DNS cache the delete clears), and every row whose
+    ``dns_record_id`` names a record it deletes (``ON DELETE SET NULL``).
+    Zones: the zones of the records it deletes, which an orphan's (no live
+    address) are not found through any address."""
+    from app.services.lock_order import address_ids_of_records  # noqa: PLC0415
+
+    allowed = frozenset(allowed_stale_ids)
+    delete_ids = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid in allowed]
+    record_ids = sorted(set(body.update_record_ids) | set(delete_ids))
+    addresses: set[uuid.UUID] = set(body.create_for_ip_ids)
+    zones: set[uuid.UUID] = set()
+    for i in range(0, len(record_ids), 1000):
+        res = await db.execute(
+            select(DNSRecord.ip_address_id, DNSRecord.zone_id).where(
+                DNSRecord.id.in_(record_ids[i : i + 1000])
+            )
+        )
+        for ip_id, zone_id in res.all():
+            if ip_id is not None:
+                addresses.add(ip_id)
+            zones.add(zone_id)
+    if record_ids:
+        addresses |= await address_ids_of_records(db, record_ids)
+    return addresses, zones
+
+
+async def _lock_dns_sync_rows(
+    db: AsyncSession,
+    address_ids: Iterable[uuid.UUID],
+    *,
+    zone_ids: Iterable[uuid.UUID] = (),
+    ddns: bool = False,
+    restrict_subnet_id: uuid.UUID | None = None,
+    gate_zones: bool = False,
+) -> list[uuid.UUID]:
+    """Lock a DNS sync's rows in the global order (#3724): ``address_ids``
+    ascending, then every zone their syncs may write plus ``zone_ids``,
+    ascending. Returns the address ids locked.
+
+    ``_sync_dns_record`` locks an address's zones and then writes the
+    address, so a sync of several addresses in one transaction held a zone
+    while it wrote the next address, which a permanent zone delete (address
+    rows, then the zone, #3691) could hold: 40P01. ``ddns`` adds each
+    subnet's DDNS override zone (the lease re-apply publishes into it);
+    ``restrict_subnet_id`` leaves out addresses the sync will not publish.
+
+    ``gate_zones`` first takes, shared, the sync gate of every zone the rows
+    may write (``lock_zone_gate``, before any row lock; the caller must hold
+    none): a permanent zone delete takes it exclusive, so it queues ahead of
+    the caller's next batch instead of losing to it at the commit boundary."""
+    from app.services.lock_order import (  # noqa: PLC0415
+        lock_address_rows,
+        lock_zone_gate,
+        lock_zones_for_addresses,
+        zone_ids_for_addresses,
+    )
+
+    async def publishing_rows(
+        ids: list[uuid.UUID], *, refresh: bool = False
+    ) -> list[tuple[Subnet, IPAddress]]:
+        subnets: dict[uuid.UUID, Subnet | None] = {}
+        found: list[tuple[Subnet, IPAddress]] = []
+        for i in range(0, len(ids), 1000):
+            q = select(IPAddress).where(IPAddress.id.in_(ids[i : i + 1000]))
+            if restrict_subnet_id is not None:
+                q = q.where(IPAddress.subnet_id == restrict_subnet_id)
+            if refresh:
+                # Re-read under the lock: the rows are in the session already
+                # from the unlocked pass, and may have changed since.
+                q = q.execution_options(populate_existing=True)
+            for ip in (await db.execute(q.order_by(IPAddress.id))).scalars().all():
+                if ip.subnet_id not in subnets:
+                    subnets[ip.subnet_id] = await db.get(Subnet, ip.subnet_id)
+                sn = subnets[ip.subnet_id]
+                if sn is not None:
+                    found.append((sn, ip))
+        return found
+
+    wanted = sorted(set(address_ids))
+    extra = list(zone_ids)
+    if gate_zones:
+        await lock_zone_gate(
+            db,
+            await zone_ids_for_addresses(
+                db, publishing=await publishing_rows(wanted), ddns=ddns, extra_zone_ids=extra
+            ),
+            exclusive=False,
+        )
+    ordered = await lock_address_rows(db, wanted)
+    await lock_zones_for_addresses(
+        db,
+        publishing=await publishing_rows(ordered, refresh=gate_zones),
+        ddns=ddns,
+        extra_zone_ids=extra,
+    )
+    return ordered
+
+
 async def _apply_dns_sync(
     db: AsyncSession,
     body: DnsSyncCommitRequest,
@@ -9306,6 +9415,7 @@ async def _apply_dns_sync(
     allowed_stale_ids: Iterable[uuid.UUID] = (),
     restrict_subnet_id: uuid.UUID | None = None,
     skipped_stale_out: list[uuid.UUID] | None = None,
+    prelocked: bool = False,
 ) -> tuple[int, int, int, list[str]]:
     """Apply create/update/delete actions, looking up each IP's owning subnet
     on the fly. ``restrict_subnet_id`` scopes the create/update set to a
@@ -9320,7 +9430,18 @@ async def _apply_dns_sync(
     any auto-generated record in the install — another subnet's, another
     space's — by naming it. The rest are ignored rather than refused, so one
     record that stopped being stale between preview and commit does not
-    fail the whole sync; they are appended to ``skipped_stale_out``."""
+    fail the whole sync; they are appended to ``skipped_stale_out``.
+
+    Every row it writes is locked first, addresses then zones
+    (:func:`_lock_dns_sync_rows`, #3724); ``prelocked`` says the caller has
+    already locked them (and maybe more) that way."""
+    if not prelocked:
+        lock_addresses, lock_zones = await _dns_sync_lock_targets(
+            db, body, allowed_stale_ids=allowed_stale_ids
+        )
+        await _lock_dns_sync_rows(
+            db, lock_addresses, zone_ids=lock_zones, restrict_subnet_id=restrict_subnet_id
+        )
     created = 0
     updated = 0
     deleted = 0

@@ -15,12 +15,18 @@ Scope per run:
     ``dns_auto_sync_delete_stale`` is on — except a live address's own host
     record and PTR when its name is blank, which are always retracted (the
     address publishes nothing);
-  * writes a single audit row per run with a per-subnet tally.
+  * commits each subnet in batches of ``SYNC_BATCH_SIZE`` addresses, each
+    batch locking the address rows it will write and then their zones
+    (#3724), so a run holds one batch's locks at a time (a zone delete waits
+    at most one batch) and a batch that fails is rolled back alone and
+    reported, with its subnet and size, in the run's errors;
+  * writes a single audit row per run with the run's totals.
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -120,28 +126,46 @@ async def _auto_from_lease_ip_ids(db: Any, subnet_id: Any) -> set[Any]:
     return set(rows.scalars().all())
 
 
-async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int, list[str]]:
+async def _reapply_ddns_for_active_leases(
+    db: Any, subnet: Subnet, *, locked_ids: set[Any] | None = None
+) -> tuple[int, list[str]]:
     """#428 — eventual-consistency net for DDNS-enabled subnets. Re-runs
     the DDNS policy for every active lease-mirrored row so a record that a
     swallowed inline ``apply_ddns_for_lease`` failure missed — including a
     generated ``dhcp-<a-b-c-d>`` name the hostname-driven drift check can't
     see — gets regenerated. Idempotent: ``apply_ddns_for_lease`` skips a
     row whose hostname is unchanged and already published under that name.
+    ``locked_ids`` are the rows the caller has already locked, addresses
+    then zones (#3724); only those are re-applied, so a mirror created since
+    is not written after a zone is held. Without it the subnet's mirrors are
+    locked here first.
+
     Returns (records_fired, errors)."""
+    from app.api.v1.ipam.router import _lock_dns_sync_rows  # noqa: PLC0415
     from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
 
-    rows = (
-        (
-            await db.execute(
-                select(IPAddress).where(
-                    IPAddress.subnet_id == subnet.id,
-                    IPAddress.auto_from_lease.is_(True),
-                )
+    if locked_ids is None:
+        locked_ids = set(
+            await _lock_dns_sync_rows(
+                db,
+                await _auto_from_lease_ip_ids(db, subnet.id),
+                ddns=True,
+                restrict_subnet_id=subnet.id,
             )
         )
-        .scalars()
-        .all()
-    )
+    ordered = sorted(locked_ids)
+    rows: list[IPAddress] = []
+    for i in range(0, len(ordered), 1000):
+        res = await db.execute(
+            select(IPAddress)
+            .where(
+                IPAddress.id.in_(ordered[i : i + 1000]),
+                IPAddress.subnet_id == subnet.id,
+                IPAddress.auto_from_lease.is_(True),
+            )
+            .order_by(IPAddress.id)
+        )
+        rows.extend(res.scalars().all())
     fired = 0
     errors: list[str] = []
     for row in rows:
@@ -155,17 +179,172 @@ async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int,
     return fired, errors
 
 
+# #3724 — addresses per auto-sync transaction. A batch holds its address rows
+# (and then their zones) until it commits, and a permanent zone delete that
+# meets one waits for it, so the batch must finish well inside the API's 30 s
+# statement timeout. On the appliance a rename costs ~0.11 s (1,000 of them
+# took 105-120 s), so 100 addresses is ~11 s: under the timeout with ~2.5x
+# headroom for a slower box, where 200 (~22 s) would not have it.
+SYNC_BATCH_SIZE = 100
+
+
+def _first_line(exc: BaseException) -> str:
+    """``Type: first line`` of an exception. A cancelled statement's message
+    carries the whole SQL text and its parameters (~6 KB for a batch), which
+    would fill the run's audit row."""
+    lines = str(exc).strip().splitlines()
+    return f"{type(exc).__name__}: {lines[0]}" if lines else type(exc).__name__
+
+
+@dataclass
+class _Unit:
+    """One address's share of a subnet's auto-sync, or one orphan record.
+    An address's records stay in one unit (so one batch): the apply holds back
+    the records of an address that the request does not name."""
+
+    create_ip_ids: list[Any] = field(default_factory=list)
+    update_record_ids: list[Any] = field(default_factory=list)
+    delete_record_ids: list[Any] = field(default_factory=list)
+    mirror_ip_ids: list[Any] = field(default_factory=list)
+
+
+async def _plan_subnet(db: Any, subnet_id: Any, *, delete_stale: bool) -> list[_Unit]:
+    """A subnet's auto-sync work, read-only: one :class:`_Unit` per address
+    (or orphan record) that needs a create, update, delete or DDNS re-apply,
+    ordered by id. Locks nothing; each batch re-reads what it writes."""
+    from app.services.dns.ddns import resolve_effective_ddns  # noqa: PLC0415
+    from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
+
+    subnet_obj = await db.get(Subnet, subnet_id)
+    if subnet_obj is None:
+        return []
+    ddns_on = (await resolve_effective_ddns(db, subnet_obj)).enabled
+
+    report = await compute_subnet_dns_drift(db, subnet_id)
+
+    # #428 — honor the DDNS opt-in (Q1): when a subnet's DDNS is OFF, the
+    # backstop must not publish lease-mirrored rows. Manual allocations still
+    # sync regardless. (When DDNS is ON, the re-apply pass is the authority
+    # for lease rows.)
+    if not ddns_on and (report.missing or report.mismatched):
+        lease_ip_ids = await _auto_from_lease_ip_ids(db, subnet_id)
+        report.missing = [m for m in report.missing if m.ip_id not in lease_ip_ids]
+        report.mismatched = [m for m in report.mismatched if m.ip_id not in lease_ip_ids]
+
+    units: dict[Any, _Unit] = {}
+
+    def unit(key: Any) -> _Unit:
+        return units.setdefault(key, _Unit())
+
+    for m in report.missing:
+        unit(m.ip_id).create_ip_ids.append(m.ip_id)
+    for mm in report.mismatched:
+        unit(mm.ip_id).update_record_ids.append(mm.record_id)
+    # A live address with no name publishes nothing, so its own host record
+    # and PTR are retracted whatever ``dns_auto_sync_delete_stale`` says: that
+    # setting governs records left behind by deleted or orphaned addresses,
+    # not the withdrawal an address's own blank name asks for (the edit path
+    # does the same when a name is cleared).
+    for st in report.stale:
+        if delete_stale or st.blank_name_host_record:
+            unit(st.ip_id if st.ip_id is not None else st.record_id).delete_record_ids.append(
+                st.record_id
+            )
+    if ddns_on:
+        for ip_id in await _auto_from_lease_ip_ids(db, subnet_id):
+            unit(ip_id).mirror_ip_ids.append(ip_id)
+    return [units[k] for k in sorted(units, key=str)]
+
+
+async def _sync_batch(
+    db: Any,
+    subnet_id: Any,
+    batch: list[_Unit],
+    *,
+    errors: list[str],
+) -> tuple[int, int, int, int]:
+    """One batch of a subnet's auto-sync, uncommitted: lock the batch's
+    address rows (ascending) and then their zones, run the DDNS re-apply for
+    its lease mirrors and the drift apply for the rest. Returns
+    (created, updated, deleted, ddns_reapplied); per-address failures go to
+    ``errors``, anything else raises. Subnet and DDNS state are re-read here,
+    so a zone or subnet removed since the plan writes nothing."""
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        DnsSyncCommitRequest,
+        _apply_dns_sync,
+        _dns_sync_lock_targets,
+        _lock_dns_sync_rows,
+    )
+    from app.services.dns.ddns import resolve_effective_ddns  # noqa: PLC0415
+
+    subnet_obj = await db.get(Subnet, subnet_id)
+    if subnet_obj is None:
+        return 0, 0, 0, 0
+    ddns_on = (await resolve_effective_ddns(db, subnet_obj)).enabled
+
+    body = DnsSyncCommitRequest(
+        create_for_ip_ids=[i for u in batch for i in u.create_ip_ids],
+        update_record_ids=[i for u in batch for i in u.update_record_ids],
+        delete_stale_record_ids=[i for u in batch for i in u.delete_record_ids],
+    )
+    # #2577 — the plan is this subnet's own, so the stale records it asks to
+    # delete are what may be deleted.
+    allowed_stale = list(body.delete_stale_record_ids)
+    mirror_ids = {i for u in batch for i in u.mirror_ip_ids} if ddns_on else set()
+
+    # #3724 — lock every row this batch will write (the re-apply's mirrors
+    # and the drift apply's addresses, ascending, then all their zones,
+    # ascending) before the first sync takes a zone. The zones' sync gates
+    # go first (shared): a permanent zone delete takes them exclusive, so the
+    # batch after the one it waits for queues behind it.
+    lock_ids, lock_zones = await _dns_sync_lock_targets(db, body, allowed_stale_ids=allowed_stale)
+    locked = set(
+        await _lock_dns_sync_rows(
+            db,
+            lock_ids | mirror_ids,
+            zone_ids=lock_zones,
+            ddns=ddns_on,
+            restrict_subnet_id=subnet_id,
+            gate_zones=True,
+        )
+    )
+
+    # The subnet object is the one read before the locks, and its zone binding
+    # may have been cleared by a zone delete this batch waited for: re-read it
+    # now, or the re-apply publishes into a zone that is gone, counts the
+    # rows as re-applied, and writes nothing.
+    subnet_obj = await db.get(Subnet, subnet_id, populate_existing=True)
+    if subnet_obj is None:
+        return 0, 0, 0, 0
+
+    reapplied = 0
+    if ddns_on and mirror_ids:
+        # #428 — eventual-consistency net (Q3): regenerate any lease DDNS
+        # record a swallowed inline apply missed.
+        reapplied, ddns_errors = await _reapply_ddns_for_active_leases(
+            db, subnet_obj, locked_ids=locked & mirror_ids
+        )
+        errors.extend(ddns_errors)
+
+    if not (body.create_for_ip_ids or body.update_record_ids or body.delete_stale_record_ids):
+        return 0, 0, 0, reapplied
+
+    created, updated, deleted, apply_errors = await _apply_dns_sync(
+        db,
+        body,
+        allowed_stale_ids=allowed_stale,
+        restrict_subnet_id=subnet_id,
+        prelocked=True,
+    )
+    errors.extend(apply_errors)
+    return created, updated, deleted, reapplied
+
+
 async def _run_auto_sync() -> dict[str, Any]:
     # Imports are intentionally deferred so loading this module from the
     # Celery worker doesn't drag in the full FastAPI router graph at import
     # time — the router has its own side-effectful imports.
-    from app.api.v1.ipam.router import (
-        DnsSyncCommitRequest,  # noqa: PLC0415
-        _apply_dns_sync,  # noqa: PLC0415
-        _resolve_effective_dns,  # noqa: PLC0415
-    )
-    from app.services.dns.ddns import resolve_effective_ddns  # noqa: PLC0415
-    from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
 
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -203,84 +382,52 @@ async def _run_auto_sync() -> dict[str, Any]:
             touched_subnet_ids: set[Any] = set()
 
             total_ddns_reapplied = 0
+            delete_stale = ps.dns_auto_sync_delete_stale
             for subnet_id in subnets:
-                subnet_obj = await db.get(Subnet, subnet_id)
-                if subnet_obj is None:
-                    continue
-                ddns_on = (await resolve_effective_ddns(db, subnet_obj)).enabled
-
+                # #3724 — plan the subnet read-only, then commit it in batches
+                # of SYNC_BATCH_SIZE addresses: a batch's row locks are held to
+                # its commit, so a zone delete waits at most one batch, and the
+                # next batch (or subnet) starts with none held (a lock taken
+                # after another's zone would break the global order). A batch
+                # that fails is rolled back alone, and only committed work is
+                # counted.
                 try:
-                    report = await compute_subnet_dns_drift(db, subnet_id)
-                except Exception as exc:  # noqa: BLE001 — never let one subnet poison the run
-                    errors.append(f"drift({subnet_id}): {exc}")
+                    units = await _plan_subnet(db, subnet_id, delete_stale=delete_stale)
+                    await db.commit()
+                except Exception as exc:  # noqa: BLE001 — one subnet must not poison the run
+                    await db.rollback()
+                    errors.append(f"subnet({subnet_id}): {_first_line(exc)}")
                     continue
-
-                # #428 — honor the DDNS opt-in (Q1): when a subnet's DDNS is
-                # OFF, the backstop must not publish lease-mirrored rows.
-                # Manual allocations still sync regardless. (When DDNS is ON,
-                # the re-apply pass below is the authority for lease rows.)
-                if not ddns_on and (report.missing or report.mismatched):
-                    lease_ip_ids = await _auto_from_lease_ip_ids(db, subnet_id)
-                    report.missing = [m for m in report.missing if m.ip_id not in lease_ip_ids]
-                    report.mismatched = [
-                        m for m in report.mismatched if m.ip_id not in lease_ip_ids
-                    ]
-
-                # #428 — eventual-consistency net (Q3): regenerate any lease
-                # DDNS record a swallowed inline apply missed.
-                if ddns_on:
-                    fired, ddns_errors = await _reapply_ddns_for_active_leases(db, subnet_obj)
-                    total_ddns_reapplied += fired
-                    errors.extend(ddns_errors)
-                    if fired:
-                        total_created += fired
+                n_batches = -(-len(units) // SYNC_BATCH_SIZE)
+                for k in range(n_batches):
+                    batch = units[k * SYNC_BATCH_SIZE : (k + 1) * SYNC_BATCH_SIZE]
+                    batch_errors: list[str] = []
+                    try:
+                        counts = await _sync_batch(db, subnet_id, batch, errors=batch_errors)
+                        await db.commit()
+                    except Exception as exc:  # noqa: BLE001 — one batch must not poison the run
+                        await db.rollback()
+                        errors.extend(batch_errors)
+                        errors.append(
+                            f"subnet({subnet_id}) batch {k + 1}/{n_batches} "
+                            f"({len(batch)} addresses): {_first_line(exc)}"
+                        )
+                        continue
+                    errors.extend(batch_errors)
+                    created, updated, deleted, reapplied = counts
+                    total_created += created + reapplied
+                    total_updated += updated
+                    total_deleted += deleted
+                    total_ddns_reapplied += reapplied
+                    if created or updated or deleted or reapplied:
                         touched_subnet_ids.add(subnet_id)
-
-                # A live address with no name publishes nothing, so its own
-                # host record and PTR are retracted whatever
-                # ``dns_auto_sync_delete_stale`` says: that setting governs
-                # records left behind by deleted or orphaned addresses, not
-                # the withdrawal an address's own blank name asks for (the
-                # edit path does the same when a name is cleared).
-                stale_to_delete = [
-                    s.record_id
-                    for s in report.stale
-                    if ps.dns_auto_sync_delete_stale or s.blank_name_host_record
-                ]
-                if not report.missing and not report.mismatched and not stale_to_delete:
-                    continue
-
-                body = DnsSyncCommitRequest(
-                    create_for_ip_ids=[m.ip_id for m in report.missing],
-                    update_record_ids=[m.record_id for m in report.mismatched],
-                    delete_stale_record_ids=stale_to_delete,
-                )
-                try:
-                    # #2577 — the report is this subnet's own, so its stale set
-                    # is both what is requested and what may be deleted: an
-                    # orphan in a zone the subnet shares is in it only when its
-                    # address lies inside the subnet.
-                    created, updated, deleted, subnet_errors = await _apply_dns_sync(
-                        db,
-                        body,
-                        allowed_stale_ids=[s.record_id for s in report.stale],
-                        restrict_subnet_id=subnet_id,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"apply({subnet_id}): {exc}")
-                    continue
-
-                total_created += created
-                total_updated += updated
-                total_deleted += deleted
-                errors.extend(subnet_errors)
-                if created or updated or deleted:
-                    touched_subnet_ids.add(subnet_id)
 
             # Dedup-accurate count (a subnet touched by both the drift sync
             # and the DDNS re-apply is one touched subnet, #428).
             subnets_touched = len(touched_subnet_ids)
-            ps.dns_auto_sync_last_run_at = now
+            ps = await db.get(PlatformSettings, _SINGLETON_ID)
+            if ps is not None:
+                ps.dns_auto_sync_last_run_at = now
 
             if total_created or total_updated or total_deleted or errors:
                 db.add(
