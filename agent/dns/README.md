@@ -13,7 +13,7 @@ the protocol specification.
 | `CONTROL_PLANE_URL` | e.g. `https://api.spatiumddi.example` |
 | `DNS_AGENT_KEY` | Bootstrap PSK, matches the control plane |
 | `SERVER_NAME` | Hostname reported to the control plane |
-| `SERVER_HOST` | Optional. Address the control plane reads zones back from (drift, pull-from-server): a name that resolves from the API, or an IP. Defaults to `SERVER_NAME`. The Helm chart sets it to the pod's headless-Service FQDN, because a StatefulSet pod's bare name resolves only inside the pod (#3757) |
+| `SERVER_HOST` | Optional. Address the control plane reads zones back from (drift, pull-from-server): `SERVER_NAME` itself or a qualified form of it (`<SERVER_NAME>.<domain>`) that resolves from the API; anything else is ignored. Defaults to `SERVER_NAME`. Re-registration updates it only while the stored host is still one registration wrote, so an operator's own edit stays. The Helm chart sets it to the pod's headless-Service FQDN, because a StatefulSet pod's bare name resolves only inside the pod (#3757) |
 | `AGENT_DRIVER` | `bind9` (only supported backend) |
 | `AGENT_GROUP` | Optional DNS server group to join |
 | `AGENT_ROLES` | Comma-separated: `authoritative,recursive,forwarder` |

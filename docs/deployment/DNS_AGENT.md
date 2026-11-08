@@ -1087,7 +1087,11 @@ dns-bind9-ns1:
 > set, is registered as `DNSServer.host` and updated on every re-registration.
 > A StatefulSet pod's bare name resolves only inside the pod, so the Helm chart
 > and `k8s/dns/` set it to `<pod>.<instance>-headless.<namespace>.svc.cluster.local`
-> (#3757). Without it the host is `SERVER_NAME`. As a backstop, an agent-managed
+> (#3757). It must be `SERVER_NAME` or a qualified form of it; anything else
+> (an IP, another name) is ignored with a `dns_agent_host_ignored` warning.
+> Re-registration moves the host only while it is still a value registration
+> wrote, never over an operator's edit and never while the server awaits
+> approval. Without it the host is `SERVER_NAME`. As a backstop, an agent-managed
 > server whose host does not resolve is read at its `last_seen_ip` instead, with
 > or without a DNS VIP.
 
