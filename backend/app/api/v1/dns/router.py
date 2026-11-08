@@ -3506,7 +3506,10 @@ async def _sync_single_server(
       4. Run the existing bi-directional per-zone sync for records.
     """
     from app.drivers.dns import get_driver  # noqa: PLC0415
-    from app.services.dns.pull_from_server import sync_zone_with_server  # noqa: PLC0415
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        non_authoritative_reason,
+        sync_zone_with_server,
+    )
 
     group_id = server.group_id
     # Agentless drivers that can list zones from the authoritative side:
@@ -3650,6 +3653,9 @@ async def _sync_single_server(
     total_push_errors = 0
 
     for zone in zones:
+        # #3758 — forward / stub zones aren't held authoritatively; skip.
+        if non_authoritative_reason(zone) is not None:
+            continue
         try:
             result = await sync_zone_with_server(db, zone, apply=True, server=server)
             zones_succeeded += 1

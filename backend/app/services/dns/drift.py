@@ -31,6 +31,7 @@ from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSServerZoneState, DNSZone
 from app.services.dns.pull_from_server import (
     _key,
+    non_authoritative_reason,
     targets_are_relative,
     without_agent_ns_glue,
     without_server_apex_ns,
@@ -372,6 +373,12 @@ async def compute_zone_drift(
             driver=srv.driver,
             status="ok",
         )
+        # #3758 — a forward / stub zone is not held authoritatively, so the
+        # transfer is refused by design: not applicable, not a failed pull.
+        if (na_reason := non_authoritative_reason(zone)) is not None:
+            entry.status = "unsupported"
+            entry.error = na_reason
+            return entry
         driver = get_driver(srv.driver)
         if not hasattr(driver, "pull_zone_records"):
             entry.status = "unsupported"

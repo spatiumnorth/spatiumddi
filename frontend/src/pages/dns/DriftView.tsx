@@ -60,7 +60,7 @@ function statusChip(server: ZoneDriftServer) {
     return {
       cls: "bg-muted text-muted-foreground",
       icon: ShieldQuestion,
-      label: "Not supported",
+      label: "Not applicable",
     };
   if (server.status === "error")
     return {
