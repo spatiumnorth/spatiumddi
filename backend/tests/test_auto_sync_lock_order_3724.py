@@ -647,3 +647,155 @@ async def test_batch_error_keeps_the_first_line_and_the_type() -> None:
     out = _first_line(exc)
     assert out == "RuntimeError: canceling statement due to statement timeout"
     assert _first_line(ValueError()) == "ValueError"
+
+
+async def _pid(db: AsyncSession) -> int:
+    return int((await db.execute(text("SELECT pg_backend_pid()"))).scalar_one())
+
+
+async def _wait_blocked_by(probe: AsyncSession, pid: int, by: int, deadline: float = 20.0) -> bool:
+    """Poll until ``pid`` is waiting with ``by`` among its blockers (a hard
+    block, or ``by`` ahead of it in a lock's wait queue)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline
+    while loop.time() < end:
+        blockers = (
+            await probe.execute(text("SELECT pg_blocking_pids(:p)"), {"p": pid})
+        ).scalar_one()
+        if by in (blockers or []):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_next_batch_queues_behind_a_zone_delete_waiting_on_this_batch(
+    db_session: AsyncSession,
+) -> None:
+    """The ddi-pg boundary, on three real connections: batch N holds the
+    zone's gate (shared) and its address row; a permanent zone delete waits
+    for it; batch N+1, on a DIFFERENT address of the zone, then asks for its
+    locks. Ungated, batch N+1 took its row at once and the delete, reaching
+    that row after batch N committed, waited a second whole batch. Gated,
+    batch N+1 queues behind the delete, which finishes first."""
+    import app.tasks.ipam_dns_sync as sync_mod
+    from app.core.security import hash_password
+    from app.models.auth import User
+    from app.models.dns import DNSZone
+    from app.services.ai.operations_risky import DeleteZoneArgs, _apply_delete_zone
+
+    await _auto_sync_subnet_with(db_session, 2, 81)
+    assert (await sync_mod._run_auto_sync())["created"] == 2
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.network == "10.93.81.0/24"))
+    ).scalar_one()
+    subnet_id = subnet.id
+    zone = await db_session.get(DNSZone, subnet.dns_zone_id)
+    assert zone is not None
+    zone_id, group_id = zone.id, zone.group_id
+    ids = sorted(
+        (
+            await db_session.execute(
+                select(IPAddress.id).where(
+                    IPAddress.subnet_id == subnet_id, IPAddress.forward_zone_id == zone_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ids) == 2, ids
+    user = User(
+        username="u3724-gate",
+        email="u3724-gate@example.test",
+        display_name="admin",
+        hashed_password=hash_password("password123"),
+        is_superadmin=True,
+    )
+    user.groups = []
+    db_session.add(user)
+    await db_session.commit()
+    user_id = user.id
+
+    order: list[str] = []
+    async with (
+        _TestSessionLocal() as a,
+        _TestSessionLocal() as b,
+        _TestSessionLocal() as d,
+        _TestSessionLocal() as probe,
+    ):
+        a_pid, b_pid, d_pid = await _pid(a), await _pid(b), await _pid(d)
+        await router_mod._lock_dns_sync_rows(
+            a, [ids[0]], restrict_subnet_id=subnet_id, gate_zones=True
+        )
+
+        async def delete() -> None:
+            u = await d.get(User, user_id)
+            assert u is not None
+            await _apply_delete_zone(
+                d, u, DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=True)
+            )
+            order.append("delete")
+
+        async def next_batch() -> None:
+            await router_mod._lock_dns_sync_rows(
+                b, [ids[1]], restrict_subnet_id=subnet_id, gate_zones=True
+            )
+            order.append("batch")
+            await b.commit()
+
+        dt = asyncio.create_task(delete())
+        try:
+            assert await _wait_blocked_by(probe, d_pid, a_pid), "the delete never waited on batch N"
+            bt = asyncio.create_task(next_batch())
+            try:
+                assert await _wait_blocked_by(
+                    probe, b_pid, d_pid
+                ), f"batch N+1 did not queue behind the delete: {order}"
+                assert order == [], order
+            finally:
+                await a.commit()
+                await asyncio.wait_for(asyncio.gather(dt, bt), timeout=60)
+        finally:
+            if not dt.done():
+                dt.cancel()
+    assert order == ["delete", "batch"], order
+    db_session.expire_all()
+    assert await db_session.get(DNSZone, zone_id) is None
+
+
+@pytest.mark.asyncio
+async def test_trash_sweep_takes_no_zone_gate(db_session: AsyncSession) -> None:
+    """The sweep purges many zones in one transaction, each after the last
+    one's rows; a gate taken per zone there would come after a row lock and
+    out of key order (a batch gating two of them deadlocks with it). So a
+    held shared gate does not stop the sweep."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models.dns import DNSServerGroup, DNSZone
+    from app.services.lock_order import lock_zone_gate
+    from app.tasks.trash_purge import _purge_dns_zones
+
+    group = DNSServerGroup(name="g3724-sweep")
+    db_session.add(group)
+    await db_session.flush()
+    zones = [
+        DNSZone(
+            group_id=group.id,
+            name=f"z{i}-3724.test.",
+            kind="forward",
+            deleted_at=datetime.now(UTC) - timedelta(days=40),
+        )
+        for i in range(2)
+    ]
+    db_session.add_all(zones)
+    await db_session.commit()
+    zone_ids = [z.id for z in zones]
+
+    async with _TestSessionLocal() as holder, _TestSessionLocal() as sweep:
+        await lock_zone_gate(holder, zone_ids, exclusive=False)
+        await sweep.execute(text("SET LOCAL lock_timeout = '3s'"))
+        purged, skipped = await _purge_dns_zones(sweep, datetime.now(UTC) - timedelta(days=30))
+        await sweep.commit()
+        await holder.rollback()
+    assert (purged, skipped) == (2, 0)

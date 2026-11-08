@@ -910,7 +910,11 @@ async def permanent_delete_from_trash(
             # untouched) when the provider refuses. Same helper as the 30-day sweep.
             from app.services.dns.reverse_zone import trashed_sharers  # noqa: PLC0415
             from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
+            from app.services.lock_order import lock_zone_gate  # noqa: PLC0415
 
+            # #3724 — the zone's sync gate, exclusive, before any row lock: an
+            # auto-sync run's next batch queues behind this delete.
+            await lock_zone_gate(db, [target.id], exclusive=True)
             # #3504 — a shared auto reverse zone still holding another trashed
             # subnet's PTRs (in that subnet's batch) is not ours to purge: its FK
             # cascade would take them, and that subnet's restore would come back

@@ -27,7 +27,8 @@ exclusion: Postgres queues a new shared request behind a waiting exclusive
 one, so a delete waiting for one batch's rows is not overtaken by the next
 batch at the commit boundary (which had it wait a second whole batch).
 Any new taker must take the gate before its first row lock, or it creates a
-cycle.
+cycle; so a writer that deletes several zones one after another in one
+transaction (the trash sweep, a subnet purge's reverse zones) takes none.
 
 Why this order: it is the one the hottest writer already had. A lease-events
 batch upserts its lease rows first (one flush, which writes the rows of one
@@ -271,10 +272,13 @@ async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> 
     ``zone_ids`` would rewrite (:func:`address_ids_of_zones`), ascending id,
     BEFORE the zone rows (#3691). Taken after the zone row, by the foreign
     key, that is step 3 before step 2, and a lease batch holding a mirror and
-    waiting for the zone deadlocks with it. The zones' sync gates come first,
-    exclusive (#3724)."""
-    zone_ids = list(zone_ids)
-    await lock_zone_gate(db, zone_ids, exclusive=True)
+    waiting for the zone deadlocks with it.
+
+    It takes no sync gate (#3724): the trash sweep purges many zones in one
+    transaction, each after the last one's rows, so a gate here would be
+    taken after a row lock, and in the sweep's order rather than by key. A
+    caller that deletes one zone and holds nothing yet takes the gate itself
+    first (the Trash page's permanent delete)."""
     ids = await address_ids_of_zones(db, zone_ids)
     await _lock_address_ids(db, ids)
     return sorted(ids)
