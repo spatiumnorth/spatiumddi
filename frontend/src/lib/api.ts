@@ -8497,7 +8497,15 @@ export const dnsBlocklistApi = {
 
   updateAssignments: (
     id: string,
-    data: { server_group_ids?: string[]; view_ids?: string[] },
+    data: {
+      server_group_ids?: string[];
+      view_ids?: string[];
+      // Deltas (#3737): change only the named ids, server-side.
+      add_server_group_ids?: string[];
+      remove_server_group_ids?: string[];
+      add_view_ids?: string[];
+      remove_view_ids?: string[];
+    },
   ) =>
     api
       .put<DNSBlockList>(`/dns/blocklists/${id}/assignments`, data)

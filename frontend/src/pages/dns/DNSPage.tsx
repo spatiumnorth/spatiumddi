@@ -10575,7 +10575,7 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
-function BlocklistScopeModal({
+export function BlocklistScopeModal({
   list,
   group,
   views,
@@ -10587,20 +10587,25 @@ function BlocklistScopeModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const [wholeGroup, setWholeGroup] = useState(
-    list.applied_group_ids.includes(group.id),
-  );
+  // What the dialog opened with: save sends only the DIFFERENCE from this,
+  // as add / remove deltas, so a group or view another client attached since
+  // the tab loaded is never dropped by a replace-the-set write (#3737).
+  const [initialWhole] = useState(list.applied_group_ids.includes(group.id));
+  const [wholeGroup, setWholeGroup] = useState(initialWhole);
   // Only THIS group's views — the checkbox list below renders no others, so
   // seeding from the raw ``applied_view_ids`` would park an un-unpickable
   // id in the state that the footer then counts ("Applies to 1 view" about a
   // view of some other group) and that ships duplicated in the PUT alongside
   // ``otherViews``.
-  const [picked, setPicked] = useState<Set<string>>(() => {
+  const [initialPicked] = useState<Set<string>>(() => {
     const thisGroups = new Set(views.map((v) => v.id));
     return new Set(
       (list.applied_view_ids ?? []).filter((v) => thisGroups.has(v)),
     );
   });
+  const [picked, setPicked] = useState<Set<string>>(
+    () => new Set(initialPicked),
+  );
   const [error, setError] = useState("");
 
   const { data: servers = [] } = useQuery({
@@ -10613,17 +10618,22 @@ function BlocklistScopeModal({
 
   const saveMut = useMutation({
     mutationFn: () => {
-      // Preserve assignments to OTHER groups and to views of other groups —
-      // this modal only speaks for the group it was opened from, and the
-      // endpoint replaces each list wholesale.
-      const otherGroups = list.applied_group_ids.filter((g) => g !== group.id);
-      const thisGroupsViews = new Set(views.map((v) => v.id));
-      const otherViews = (list.applied_view_ids ?? []).filter(
-        (v) => !thisGroupsViews.has(v),
+      // Deltas only: this modal speaks for THIS group and its views, and
+      // the server applies them to the stored sets, so assignments made
+      // elsewhere since the tab loaded survive.
+      const addViews = Array.from(picked).filter((v) => !initialPicked.has(v));
+      const removeViews = Array.from(initialPicked).filter(
+        (v) => !picked.has(v),
       );
       return dnsBlocklistApi.updateAssignments(list.id, {
-        server_group_ids: wholeGroup ? [...otherGroups, group.id] : otherGroups,
-        view_ids: [...otherViews, ...Array.from(picked)],
+        ...(wholeGroup && !initialWhole
+          ? { add_server_group_ids: [group.id] }
+          : {}),
+        ...(!wholeGroup && initialWhole
+          ? { remove_server_group_ids: [group.id] }
+          : {}),
+        ...(addViews.length ? { add_view_ids: addViews } : {}),
+        ...(removeViews.length ? { remove_view_ids: removeViews } : {}),
       });
     },
     onSuccess: () => {
@@ -10755,7 +10765,7 @@ function BlocklistScopeModal({
   );
 }
 
-function BlocklistsTab({ group }: { group: DNSServerGroup }) {
+export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const [selected, setSelected] = useState<DNSBlockList | null>(null);
@@ -10887,12 +10897,12 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       list: DNSBlockList;
       assign: boolean;
     }) => {
-      const ids = new Set(list.applied_group_ids);
-      if (assign) ids.add(group.id);
-      else ids.delete(group.id);
-      return dnsBlocklistApi.updateAssignments(list.id, {
-        server_group_ids: Array.from(ids),
-      });
+      return dnsBlocklistApi.updateAssignments(
+        list.id,
+        assign
+          ? { add_server_group_ids: [group.id] }
+          : { remove_server_group_ids: [group.id] },
+      );
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
   });
@@ -10926,7 +10936,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
-            server_group_ids: [...l.applied_group_ids, group.id],
+            add_server_group_ids: [group.id],
           }),
         ),
       );
@@ -10944,7 +10954,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
-            server_group_ids: l.applied_group_ids.filter((g) => g !== group.id),
+            remove_server_group_ids: [group.id],
           }),
         ),
       );
