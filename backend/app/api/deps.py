@@ -6,12 +6,12 @@ from typing import Annotated
 import structlog
 from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.token_binding import route_honours_token_binding
+from app.core.jwt_compat import JWTError
 from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.core.session_idle import (
     activity_write_interval,
