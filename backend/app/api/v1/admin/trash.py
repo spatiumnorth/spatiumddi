@@ -802,7 +802,10 @@ async def restore_row(
 
         try:
             republish_restored_lease_ddns_task.delay([str(i) for i in republish_subnet_ids])
-        except Exception as exc:  # noqa: BLE001 — the restore is committed; the sweep backstops
+        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+            # Broker down: no sweep re-publishes a lease mirror's records, so
+            # each lease gets its names back at its client's next renewal, or
+            # from the opt-in scheduled IPAM-DNS auto-sync.
             logger.warning("trash.restore_ddns_enqueue_failed", error=str(exc))
     # This router carries no wake_publishing dependency (see the purge below),
     # so the create ops queued above are announced here, after the commit.
