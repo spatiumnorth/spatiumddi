@@ -1287,6 +1287,10 @@ async def commit_subnet_resize(
                     IPAddress.description == "Gateway",
                     IPAddress.dns_record_id.is_(None),
                 )
+                # Locked before the sync takes its zones: an address row comes
+                # before a zone row (``app.services.lock_order``), as a
+                # permanent zone delete takes them (#3691).
+                .with_for_update()
             )
             if old_row is not None:
                 # Retract its auto A / PTR first, as Edit Subnet's gateway
