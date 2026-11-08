@@ -59,6 +59,25 @@ UPDATE``, the lock the serial-bump UPDATE takes anyway: a concurrent record
 insert's foreign-key check (``FOR KEY SHARE`` on its zone) is not blocked by
 it.
 
+A scope's **gate** (#3748, :func:`lock_scope_gates`) sits beside it at step 0,
+ahead of the zone gate: shared for a lease-events batch, exclusive for every
+delete that takes scope rows ``FOR UPDATE`` or deletes them — the scope delete,
+and the subnet, block and space deletes, for every live scope their cascade
+reaches (soft: before ``_lock_scope_batch_rows``; a permanent subnet delete:
+before its lease rows). It exists because Postgres lets a new ``FOR KEY
+SHARE`` join while another is held even when a ``FOR UPDATE`` is queued, so a
+Kea HA pair's overlapping batches starved the delete past the command timeout;
+a new shared advisory request does queue behind a waiting exclusive one. Taken
+in ascending key order, as each transaction's first lock (the deletes compute
+their scope ids with plain reads), by takers none of which takes a zone gate,
+with no row lock held that the other side waits for (a batch has inserted its
+ingest receipt, which no delete touches). A scope edit needs no gate: its
+UPDATE changes no key column, so it takes the row ``FOR NO KEY UPDATE``, which
+a ``FOR KEY SHARE`` does not block. A DHCP server-group delete needs none
+either: it refuses a group that still has servers, so no agent can post a
+batch for its scopes. Any new delete that takes scope rows ``FOR UPDATE`` must
+take their gates exclusive before its first row lock.
+
 A scope row (``dhcp_scope``) sits between steps 1 and 2 for the lease writers
 that must not write into a scope in the Trash and the delete that puts it there
 (#3733). A lease-events batch holds the scopes its events resolve to ``FOR KEY
@@ -175,6 +194,35 @@ async def lock_zone_gate(db: AsyncSession, zone_ids: Iterable[Any], *, exclusive
     fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
     for key in sorted({_zone_gate_key(z) for z in zone_ids if z is not None}):
         await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": ZONE_SYNC_GATE_NS, "key": key})
+
+
+#: Advisory-lock namespace of the per-scope gate (#3748), "DSCP".
+SCOPE_GATE_NS = 0x44534350
+
+
+def _scope_gate_key(scope_id: Any) -> int:
+    """Signed 32-bit crc32 of the scope id: the second int of the gate's key."""
+    key = zlib.crc32(str(scope_id).encode("utf-8"))
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def lock_scope_gates(db: AsyncSession, scope_ids: Iterable[Any], *, exclusive: bool) -> None:
+    """Step 0 (#3748): take the gate of each scope in ``scope_ids``, shared
+    (a lease-events batch) or ``exclusive`` (a delete that takes the scope row
+    ``FOR UPDATE``), in ascending key order, to the end of the transaction.
+    Call it before any row lock, and before :func:`lock_zone_gate` when a
+    transaction takes both (none does today).
+
+    A batch holds its scope ``FOR KEY SHARE`` and Postgres lets a new KEY
+    SHARE join while another is held, even with a ``FOR UPDATE`` queued, so
+    two agents (a Kea HA pair) posting overlapping batches kept the delete
+    waiting until the 30 s command timeout. Advisory locks queue a new shared
+    request behind a waiting exclusive one, so the delete waits only for the
+    batches already running. Two scopes whose ids collide on the crc32 share a
+    gate, which only costs a wait."""
+    fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+    for key in sorted({_scope_gate_key(s) for s in scope_ids if s is not None}):
+        await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": SCOPE_GATE_NS, "key": key})
 
 
 async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
