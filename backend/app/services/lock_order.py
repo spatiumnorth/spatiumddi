@@ -77,11 +77,12 @@ A scope row (``dhcp_scope``) sits between steps 1 and 2 for the lease writers
 that must not write into a scope in the Trash and the delete that puts it there
 (#3733). A lease-events batch holds the scopes its events resolve to ``FOR KEY
 SHARE`` after its lease rows, and reads them again there. A scope soft-delete
-takes its scope row ``FOR UPDATE`` before anything it writes, takes no lease
-row in that transaction, and tears the scope's leases down after its commit,
-one batch per transaction, each batch in the order above. So the stamp waits
-for a batch that already holds the scope, and a later batch waits for the stamp
-and finds the scope in the Trash.
+(and a subnet / block / space soft-delete, for every scope its cascade reaches,
+ascending id, #3744) takes its scope row ``FOR UPDATE`` before anything it
+writes, takes no lease row in that transaction, and tears the scope's leases
+down after its commit, one batch per transaction, each batch in the order
+above. So the stamp waits for a batch that already holds the scope, and a
+later batch waits for the stamp and finds the scope in the Trash.
 
 ``tests/_row_lock_order_guard.py`` asserts the order for the whole test suite.
 """
