@@ -143,7 +143,7 @@ async def _local_user(db: AsyncSession) -> User:
 
 
 def test_decode_refuses_a_token_without_a_session(production_token_rule: None) -> None:
-    from jose import JWTError
+    from app.core.jwt_compat import JWTError
 
     with pytest.raises(JWTError):
         decode_access_token(create_access_token(str(uuid.uuid4())))

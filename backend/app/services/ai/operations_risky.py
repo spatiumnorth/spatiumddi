@@ -1194,6 +1194,55 @@ async def _preview_delete_scope(
     )
 
 
+async def _tear_down_trashed_scope_leases(db: AsyncSession, scope_id: UUID) -> None:
+    """The leases of a scope the delete just put in the Trash, after its commit
+    (#3733).
+
+    Inside the delete's transaction their teardown held every one of the
+    scope's lease rows to the commit, about 100 ms a lease with DDNS on, so
+    each lease-events batch renewing one of them waited for the whole of it
+    (the API cut those waits at 30 s), and a delete of 1,000 leases ran past
+    the proxy's 60 s while it carried on. Now the scope is in the Trash first,
+    where the lease-events handler takes no event for it, and the leases go
+    in committed batches (``tear_down_scope_leases``) under the server
+    delete's time bound (#2290). What is left when it runs out is handed to
+    the background task; a lost enqueue is picked up by the lease sweep.
+    """
+    from app.services.dhcp.lease_cleanup import (
+        SCOPE_DELETE_INLINE_DEADLINE_S,
+        tear_down_scope_leases,
+    )
+
+    removed = 0
+    try:
+        removed, _mirrors, done = await tear_down_scope_leases(
+            db, scope_id, deadline_s=SCOPE_DELETE_INLINE_DEADLINE_S
+        )
+    except Exception as exc:  # noqa: BLE001 — #3748: the delete committed above; a
+        # failed batch (a statement timeout, say) must not answer 500 for it. Not
+        # BaseException: cancellation still propagates. The batches already
+        # committed stay; the task tears down the rest.
+        logger.warning(
+            "dhcp_scope_delete_lease_teardown_failed", scope=str(scope_id), error=str(exc)
+        )
+        await db.rollback()
+        done = False
+    if done:
+        return
+    logger.info(
+        "dhcp_scope_delete_lease_teardown_handed_on", scope=str(scope_id), torn_down=removed
+    )
+    try:
+        from app.tasks.dhcp_lease_cleanup import tear_down_trashed_scope_leases
+
+        tear_down_trashed_scope_leases.delay(str(scope_id))
+    except Exception as exc:  # noqa: BLE001 — broker unavailable: a lost enqueue is safe,
+        # the lease sweep tears down the leases of any scope in the Trash every 300 s.
+        logger.warning(
+            "dhcp_scope_delete_lease_teardown_enqueue_failed", scope=str(scope_id), error=str(exc)
+        )
+
+
 async def _apply_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> dict[str, Any]:
@@ -1201,9 +1250,9 @@ async def _apply_delete_scope(
     from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
-    from app.core.agent_wake import collect_wake, dhcp_group_channel
+    from app.core.agent_wake import collect_wake, dhcp_group_channel, publish_wake
     from app.models.dhcp import DHCPScope
-    from app.services.dhcp.lease_cleanup import delete_leases_for_scope
+    from app.services.dhcp.lease_cleanup import delete_leases_for_scope, scope_lease_counts
     from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
@@ -1220,7 +1269,21 @@ async def _apply_delete_scope(
     # #3388 — refused before any side effect: a phone class this scope keeps
     # rendering may be named by another scope's pool.
     await refuse_scope_removal_orphaning_classes(db, scope, "delete this scope")
-    collect_wake(dhcp_group_channel(scope.group_id))
+    if not args.permanent:
+        # #3733 — the scope row first, before anything this delete writes. A
+        # lease-events batch holds it ``FOR KEY SHARE`` from the moment it
+        # finds the scope live until it commits (``agent_lease_events``), so
+        # the stamp below waits for the batches that already took the scope's
+        # events, and every later batch waits for the stamp and then finds
+        # the scope in the Trash. A delete that waited here for another one
+        # finds the scope gone.
+        locked = (
+            await db.execute(select(DHCPScope.id).where(DHCPScope.id == scope.id).with_for_update())
+        ).scalar_one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+    group_id = scope.group_id  # read before anything can expire ``scope``
+    collect_wake(dhcp_group_channel(group_id))
 
     # Deleted means deleted on every backend (#616). Agent-based (Kea) members
     # converge by themselves — the soft-deleted scope drops straight out of the
@@ -1239,13 +1302,19 @@ async def _apply_delete_scope(
     # rows (which otherwise linger visibly in the subnet table and keep counting
     # toward utilization). Delete both — leases are ephemeral polled state
     # (re-populated from the next poll on restore), and freeing the IPs to a
-    # deleted row folds them back into free gaps. Runs on BOTH paths, before the
-    # stamp / CASCADE so the scope + subnet are still resolvable.
-    # The freed mirrors are recounted once, last, before the commit (#3354).
+    # deleted row folds them back into free gaps. The permanent path tears the
+    # leases down here, before the CASCADE, so the scope + subnet are still
+    # resolvable; the soft path after its stamp commits (#3733, below) and
+    # counts them here for the audit row. The reservations' mirrors go here
+    # on both. The freed mirrors are recounted once, last, before the commit
+    # (#3354).
     touched: set[UUID] = set()
-    leases_removed, lease_mirrors = await delete_leases_for_scope(
-        db, scope.id, touched_subnets=touched
-    )
+    if args.permanent:
+        leases_removed, lease_mirrors = await delete_leases_for_scope(
+            db, scope.id, touched_subnets=touched
+        )
+    else:
+        leases_removed, lease_mirrors = await scope_lease_counts(db, scope.id)
     statics_released = await remove_ipam_for_scope_statics(db, scope.id, touched_subnets=touched)
     cleanup_audit = {
         "leases_removed": leases_removed,
@@ -1268,6 +1337,11 @@ async def _apply_delete_scope(
             )
         await recount_subnets_and_blocks(db, touched)
         await db.commit()
+        # #3748 — Kea stops serving the trashed scope now, not after the teardown.
+        # Still collected above too, so the router's flush publishes it a second
+        # time: wakes are advisory and a duplicate only re-reads the same state.
+        await publish_wake(dhcp_group_channel(group_id))
+        await _tear_down_trashed_scope_leases(db, args.scope_id)
         return {"scope_id": str(args.scope_id), "mode": "soft_delete"}
 
     write_audit(

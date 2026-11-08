@@ -186,7 +186,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 | [structlog](https://www.structlog.org/) | MIT OR Apache 2.0 | Structured JSON logging |
 | [cryptography](https://cryptography.io/) | Apache 2.0 OR BSD 3-Clause | Fernet secrets at rest, cert handling |
 | [pyOpenSSL](https://www.pyopenssl.org/) | Apache 2.0 | TLS chain capture (stdlib `ssl` cannot on 3.12) |
-| [python-jose](https://github.com/mpdavis/python-jose) / [joserfc](https://jose.authlib.org/) | MIT / BSD 3-Clause | JWT issue + verify |
+| [joserfc](https://jose.authlib.org/) | BSD 3-Clause | JWT issue + verify (access / agent / flow tokens) and OIDC ID-token validation |
 | [bcrypt](https://github.com/pyca/bcrypt) | Apache 2.0 | Local password hashing |
 | [pyotp](https://github.com/pyauth/pyotp) | MIT | TOTP second factor |
 | [ldap3](https://github.com/cannatag/ldap3) | **LGPL v3** | LDAP authentication |

@@ -38,7 +38,7 @@ def test_needs_rotation_fresh_token_is_false() -> None:
 
 def test_rejects_non_agent_token() -> None:
     try:
-        from jose import jwt
+        from app.core import jwt_compat as jwt
 
         from app.config import settings
         from app.services.dns.agent_token import verify_agent_token
