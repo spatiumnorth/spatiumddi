@@ -44,7 +44,7 @@ from app.services.dns.tsig import (
     resolve_group_transfer_key,
     resolve_transfer_vip,
     resolve_view_transfer_key,
-    transfer_fallback_hosts,
+    transfer_fallback_kwargs,
     transfer_needs_tsig,
 )
 
@@ -409,8 +409,7 @@ async def compute_zone_drift(
         pull_kwargs: dict[str, Any] = (
             {"include_apex_ns": True} if _renders_apex_ns(srv, driver) else {}
         )
-        if fallback := transfer_fallback_hosts(srv, transfer_vip):
-            pull_kwargs["fallback_hosts"] = fallback
+        pull_kwargs.update(transfer_fallback_kwargs(srv, transfer_vip))
         try:
             on_wire, used = await pull_zone_records_signed(
                 driver, srv, zone.name, keys, view_name=view_name, **pull_kwargs

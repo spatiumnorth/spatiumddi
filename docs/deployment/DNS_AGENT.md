@@ -1077,10 +1077,19 @@ dns-bind9-ns1:
 ```
 
 > The agent reads `AGENT_ROLES` (default `authoritative`), `AGENT_GROUP`,
-> and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
+> `SERVER_HOST` and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
 > (`agent/dns/spatium_dns_agent/config.py`). The role is a label only —
 > the control plane fans record ops out to every enabled agent-based
 > server in the group regardless of role.
+>
+> **`SERVER_HOST` is where the control plane reads zones back from** (drift,
+> pull-from-server). `SERVER_NAME` stays the server's name; `SERVER_HOST`, when
+> set, is registered as `DNSServer.host` and updated on every re-registration.
+> A StatefulSet pod's bare name resolves only inside the pod, so the Helm chart
+> and `k8s/dns/` set it to `<pod>.<instance>-headless.<namespace>.svc.cluster.local`
+> (#3757). Without it the host is `SERVER_NAME`. As a backstop, an agent-managed
+> server whose host does not resolve is read at its `last_seen_ip` instead, with
+> or without a DNS VIP.
 
 > **`AGENT_GROUP` only decides where a BRAND-NEW agent lands.** On
 > re-registration the control plane resolves the existing row by `agent_id`

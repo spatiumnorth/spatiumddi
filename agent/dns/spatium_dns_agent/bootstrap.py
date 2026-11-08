@@ -69,6 +69,8 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
         "agent_id": agent_id,
         "version": __version__,
     }
+    if cfg.server_host:
+        body["host"] = cfg.server_host
     backoff = 2.0
     while True:
         try:

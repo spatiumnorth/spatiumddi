@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import ipaddress
 import json
 import os
 import uuid
@@ -34,6 +35,7 @@ from app.core.agent_wake import (
     dns_wake_channels,
     wake_subscription,
 )
+from app.core.dns_names import validate_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.core.jwt_compat import JWTError
 from app.core.redis_client import make_async_redis
@@ -162,6 +164,22 @@ class AgentRegisterRequestV2(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None  # persisted UUID from previous runs
+    # #3757 — an address the control plane can reach this agent's daemon on
+    # (a name that resolves from the API pod, or an IP). Optional: an older
+    # agent sends none and the row keeps its host (new rows use hostname).
+    host: str | None = Field(default=None, max_length=255)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        v = v.strip()
+        try:
+            return str(ipaddress.ip_address(v))
+        except ValueError:
+            pass
+        return validate_hostname(v, field="host")
 
     @field_validator("driver")
     @classmethod
@@ -551,7 +569,7 @@ async def agent_register(
             group_id=group.id,
             name=body.hostname,
             driver=body.driver,
-            host=body.hostname,
+            host=body.host or body.hostname,
             port=53,
             roles=body.roles,
             status="active",
@@ -584,6 +602,11 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # #3757 — heal rows an older chart registered with a bare pod name.
+        # Only when the agent sent one; this row is agent-managed (found by
+        # agent_id or by name in the agent's group), never an agentless one.
+        if body.host:
+            server.host = body.host
         # Only overwrite when the agent actually reported one: an older agent
         # sends the fixed literal (or nothing) and must not overwrite the real
         # version its own heartbeat already recorded.

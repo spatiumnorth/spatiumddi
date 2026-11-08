@@ -54,7 +54,7 @@ from app.services.dns.tsig import (
     resolve_group_transfer_key,
     resolve_transfer_vip,
     resolve_view_transfer_key,
-    transfer_fallback_hosts,
+    transfer_fallback_kwargs,
     transfer_needs_tsig,
 )
 from app.services.technitium.rdata import (
@@ -498,12 +498,11 @@ def without_server_apex_ns(
 
 async def _fallback_kwargs(db: AsyncSession, server: Any) -> dict[str, Any]:
     """``pull_zone_records`` kwargs naming the server's own pod address to retry
-    on a refused connection behind the appliance DNS VIP (#1470); empty when
-    it cannot apply."""
+    on a refused connection behind the appliance DNS VIP (#1470), or when its
+    ``host`` does not resolve (#3757); empty when neither applies."""
     if not transfer_needs_tsig(server):
         return {}
-    hosts = transfer_fallback_hosts(server, await resolve_transfer_vip(db))
-    return {"fallback_hosts": hosts} if hosts else {}
+    return dict(transfer_fallback_kwargs(server, await resolve_transfer_vip(db)))
 
 
 async def _resolve_primary_and_driver(

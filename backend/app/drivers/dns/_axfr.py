@@ -25,6 +25,12 @@ from app.drivers.dns.base import RecordData, TsigKey
 logger = structlog.get_logger(__name__)
 
 
+class UnresolvableHostError(RuntimeError):
+    """``host`` did not resolve (#3757). A RuntimeError so every caller that
+    surfaces the message verbatim keeps working; the type lets the AXFR helper
+    tell "no such name here" from every other failure."""
+
+
 def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
     """Return IP literals for ``host``, in the order to try them.
 
@@ -53,7 +59,7 @@ def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError as exc:
-        raise RuntimeError(
+        raise UnresolvableHostError(
             f"{what} from {host}:{port} failed: could not resolve {host!r} ({exc})."
         ) from exc
 
@@ -135,6 +141,7 @@ async def axfr_zone_records(
     tsig: TsigKey | None = None,
     include_apex_ns: bool = False,
     fallback_hosts: Sequence[str] = (),
+    unresolved_fallback_hosts: Sequence[str] = (),
 ) -> list[RecordData]:
     """AXFR ``zone_name`` from ``host:port`` and return neutral record dicts.
 
@@ -165,6 +172,11 @@ async def axfr_zone_records(
     trigger. Every fallback must address the SAME server as ``host`` — this
     is a per-server read, and an address that reaches another member would
     report that member's state as this one's.
+
+    ``unresolved_fallback_hosts`` (#3757) are tried, along with
+    ``fallback_hosts``, when ``host`` does not RESOLVE at all — a chart-deployed
+    agent that registered a bare pod name the API pod cannot look up. Same
+    rule: each must address the SAME server as ``host``.
 
     A key that cannot be turned into a keyring raises rather than falling
     back to an unsigned transfer: silently degrading would turn a
@@ -216,15 +228,21 @@ async def axfr_zone_records(
 
     def _axfr() -> dns.zone.Zone:
         nonlocal used_host
+        candidates: Sequence[str] = fallback_hosts
         try:
             return _axfr_host(host)
         except ConnectionRefusedError as exc:
             refused: Exception = exc
-        for fb in fallback_hosts:
+        except UnresolvableHostError as exc:
+            if not (fallback_hosts or unresolved_fallback_hosts):
+                raise
+            refused = exc
+            candidates = list(dict.fromkeys([*unresolved_fallback_hosts, *fallback_hosts]))
+        for fb in candidates:
             used_host = f"{host}:{port} (retried at {fb}:{port})"
             try:
                 zone = _axfr_host(fb)
-            except ConnectionRefusedError as exc:
+            except (ConnectionRefusedError, UnresolvableHostError) as exc:
                 refused = exc
                 continue
             logger.info(
