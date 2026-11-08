@@ -12,6 +12,7 @@ import hmac
 import ipaddress
 import os
 import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
@@ -1384,6 +1385,7 @@ async def agent_lease_events(
         _load_subnet_cache,
         _load_trashed_scope_nets,
     )
+    from app.services.dns.ddns import ddns_lease_writes_nothing
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
@@ -1724,10 +1726,15 @@ async def agent_lease_events(
         (row.subnet_id, norm_ip(str(row.address))): row for row in ipam_existing
     }
 
+    def _lease_row_hostname(row: IPAddress, ev: Any) -> str | None:
+        """The name a mirror row we own carries once ``ev`` is applied."""
+        if row.subnet_id in no_hostname_subnets:
+            return row.hostname
+        return (ev.hostname or row.hostname or "")[:253]
+
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
         """Stamp lease state onto a mirror row we own (auto/available)."""
-        if row.subnet_id not in no_hostname_subnets:
-            row.hostname = (ev.hostname or row.hostname or "")[:253]
+        row.hostname = _lease_row_hostname(row, ev)
         # A DHCPv6 lease usually has no MAC (#1141) — keep what the row has
         # rather than blanking it.
         row.mac_address = ev.mac_address or row.mac_address
@@ -1794,17 +1801,58 @@ async def agent_lease_events(
     # the first publish or revoke. Each one locks its own zones in order, but
     # one address's after another's are not, and a retraction took the
     # reverse zone before the forward zone (``app.services.lock_order``).
+    #
+    # #3773: a grant whose DDNS writes nothing (a renewal: its name already
+    # published, still free, and unchanged) locks no zone, and the pass skips
+    # its DDNS. Under Kea HA both peers report every renewal; with the zone
+    # held to each batch's commit, the two peers' batches ran one after the
+    # other, and at load stayed open past the agent's request timeout. Only
+    # for an address with one event in the batch: a later event's state is
+    # not this read's.
+    events_at: Counter[tuple[Any, str]] = Counter()
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx not in stale and subnet is not None:
+            events_at[(subnet.id, norm_ip(ev.ip_address))] += 1
+    ddns_quiet: set[int] = set()
+
+    async def _ddns_quiet(subnet: Any, row: IPAddress, ev: Any) -> bool:
+        # The check runs the reads the DDNS step runs, but outside its error
+        # boundary below: a bug in them is the same logged skip it is there
+        # (the grant takes the full path), never a 500 for the whole batch.
+        try:
+            return await ddns_lease_writes_nothing(
+                db,
+                subnet=subnet,
+                ipam_row=row,
+                client_hostname=ev.hostname,
+                row_hostname=_lease_row_hostname(row, ev),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=ev.ip_address,
+                error=str(exc),
+            )
+            return False
+
     publishing: list[tuple[Any, IPAddress]] = []
     retracting: list[IPAddress] = []
     for idx, ev in enumerate(events):
         subnet = subnet_for_ip.get(ev.ip_address)
-        row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address))) if subnet else None
+        key = (subnet.id, norm_ip(ev.ip_address)) if subnet is not None else None
+        row = ipam_by_key.get(key) if key is not None else None
         if idx in stale or row is None or not (row.auto_from_lease or row.status == "available"):
             continue
-        if ev.state == "active":
-            publishing.append((subnet, row))
-        else:
+        if ev.state != "active":
             retracting.append(row)
+            continue
+        if subnet is not None and events_at[key] == 1 and await _ddns_quiet(subnet, row, ev):
+            ddns_quiet.add(idx)
+            continue
+        publishing.append((subnet, row))
     # #3687: a mirror this pass creates later (an address whose first event is
     # a release, then a grant) is not in ``ipam_by_key`` yet, so its zones
     # were left out, and an earlier event's purge of a trashed record had
@@ -1877,7 +1925,7 @@ async def agent_lease_events(
             # auto-from-lease rows inside DDNS-enabled subnets; errors are
             # logged but never break the lease upsert pass (DNS will
             # reconcile on the next event or sweep).
-            if ipam_row is not None and ipam_row.auto_from_lease:
+            if ipam_row is not None and ipam_row.auto_from_lease and idx not in ddns_quiet:
                 try:
                     from app.services.dns.ddns import apply_ddns_for_lease
 

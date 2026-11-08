@@ -402,6 +402,36 @@ def _name_conflict_is_loud(subnet: Subnet, ipam_row: IPAddress, hostname: str) -
     return loud
 
 
+async def _name_zone_ids(
+    db: AsyncSession, subnet: Subnet, ipam_row: IPAddress, eff: EffectiveDDNS
+) -> list[Any]:
+    """The zones a lease's name is checked against (:func:`_name_holder`): the
+    ones the sync would write the forward record into — the DDNS override zone
+    or the subnet's, plus the address's extra zones."""
+    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415
+    from app.services.dns.sync_check import forward_zone_ids_in_order  # noqa: PLC0415
+
+    override_zone_id = await _resolve_override_zone_id(db, eff.domain_override)
+    primary = override_zone_id or await _resolve_effective_zone(db, subnet)
+    return forward_zone_ids_in_order(primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids)
+
+
+def _is_reserved_name(ipam_row: IPAddress, hostname: str) -> bool:
+    """Is ``hostname`` another address's generated name (#3362, #3364)?
+
+    An address's own legacy name is not reserved against it, but the legacy
+    IPv4 form is shared by every ``x.y.c.d`` with the same last two octets,
+    so whether it is free is decided by ``_name_holder`` - by whoever holds
+    the record - not here. Compared case-folded: a static assignment's name
+    is the operator's spelling, not sanitised to lower case."""
+    own_names = {
+        _generate_hostname(str(ipam_row.address)),
+        _legacy_generated_hostname(str(ipam_row.address)),
+    }
+    folded = hostname.lower()
+    return folded not in own_names and _GENERATED_NAME_RE.fullmatch(folded) is not None
+
+
 async def _name_or_generated(
     db: AsyncSession,
     subnet: Subnet,
@@ -426,23 +456,9 @@ async def _name_or_generated(
     autoflush would take the audit-chain lock before the sync bumps the
     zone's serial, which deadlocks against a record create on that zone.
     """
-    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415
-    from app.services.dns.sync_check import forward_zone_ids_in_order  # noqa: PLC0415
-
-    override_zone_id = await _resolve_override_zone_id(db, eff.domain_override)
-    primary = override_zone_id or await _resolve_effective_zone(db, subnet)
-    zone_ids = forward_zone_ids_in_order(
-        primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids
-    )
+    zone_ids = await _name_zone_ids(db, subnet, ipam_row, eff)
     fallback = _generate_hostname(str(ipam_row.address))
-    # An address's own legacy name is not reserved against it, but the legacy
-    # IPv4 form is shared by every ``x.y.c.d`` with the same last two octets,
-    # so whether it is free is decided by ``_name_holder`` - by whoever holds
-    # the record - not here. Compared case-folded: a static assignment's name
-    # is the operator's spelling, not sanitised to lower case.
-    own_names = {fallback, _legacy_generated_hostname(str(ipam_row.address))}
-    folded = hostname.lower()
-    reserved = folded not in own_names and _GENERATED_NAME_RE.fullmatch(folded) is not None
+    reserved = _is_reserved_name(ipam_row, hostname)
     holder = None if reserved else await _name_holder(db, ipam_row, zone_ids, hostname)
     if not reserved and holder is None:
         return hostname
@@ -548,6 +564,43 @@ async def apply_ddns_for_lease(
         db.add_all(audit_rows)
 
 
+async def ddns_lease_writes_nothing(
+    db: AsyncSession,
+    *,
+    subnet: Subnet,
+    ipam_row: IPAddress,
+    client_hostname: str | None,
+    row_hostname: str | None,
+) -> bool:
+    """Would :func:`apply_ddns_for_lease` write nothing for this lease? (#3773)
+
+    Read-only. ``row_hostname`` is the name ``ipam_row`` will carry when the
+    lease is applied (the ingest path stamps the client's name onto the row
+    before its DDNS runs). True only when the DDNS would end without a write:
+    DDNS off for the subnet, no name to publish beside a row that keeps one,
+    or the name already published for this address, still free, and already
+    on the row. A renewal is the last case: under Kea HA both peers report
+    every one, so a lease-events batch can skip its zone locks for it, which
+    otherwise hold the zone row to the batch's commit and serialise the two
+    peers' batches on it. False whenever a write may follow.
+    """
+    if not ipam_row.auto_from_lease:
+        return False
+    eff = await resolve_effective_ddns(db, subnet)
+    if not eff.enabled:
+        return True
+    hostname = await resolve_ddns_hostname(db, subnet, str(ipam_row.address), client_hostname)
+    if not hostname:
+        # A blank row retracts what an earlier name published.
+        return bool((row_hostname or "").strip())
+    if row_hostname != hostname or await _published_name(db, ipam_row) != hostname:
+        return False
+    if _is_reserved_name(ipam_row, hostname):
+        return False
+    zone_ids = await _name_zone_ids(db, subnet, ipam_row, eff)
+    return await _name_holder(db, ipam_row, zone_ids, hostname) is None
+
+
 async def _publish_ddns_name(
     db: AsyncSession,
     subnet: Subnet,
@@ -575,7 +628,9 @@ async def _publish_ddns_name(
     # Compare against the record, not just the row: both lease ingest paths
     # stamp the client's new hostname onto the row before calling us, so a
     # rename would otherwise look unchanged and the old A/PTR would stay
-    # (#1618).
+    # (#1618). #3773: ``ddns_lease_writes_nothing`` mirrors this no-write
+    # outcome to let a lease-events batch skip its zone locks; a condition
+    # added here must be added there too.
     if ipam_row.hostname == hostname and await _published_name(db, ipam_row) == hostname:
         return False
 
