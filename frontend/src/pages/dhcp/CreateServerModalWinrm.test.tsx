@@ -17,10 +17,13 @@ import type { DHCPServer } from "@/lib/api";
 
 const createServer = vi.fn();
 const updateServer = vi.fn();
+// Edit reads the server fresh on open (#3739).
+let stored: unknown;
 vi.mock("@/lib/api", () => ({
   formatApiError: (e: unknown) => String(e),
   dhcpApi: {
     listGroups: () => Promise.resolve([]),
+    getServer: () => Promise.resolve(stored),
     createServer: (...a: unknown[]) => createServer(...a),
     updateServer: (...a: unknown[]) => updateServer(...a),
   },
@@ -52,6 +55,7 @@ const STORED = {
 } as unknown as DHCPServer;
 
 function ui(server?: DHCPServer) {
+  stored = server;
   render(
     <QueryClientProvider client={new QueryClient()}>
       <CreateServerModal server={server} onClose={() => {}} />
@@ -60,33 +64,41 @@ function ui(server?: DHCPServer) {
 }
 const control = <T extends HTMLElement>(label: string) =>
   screen.getByLabelText(label) as T;
+const ready = () => screen.findByLabelText("WinRM Port");
 const port = () => control<HTMLInputElement>("WinRM Port");
 const transport = () => control<HTMLSelectElement>("Auth Transport");
 const useTls = () => control<HTMLInputElement>("Use HTTPS (port 5986)");
 const verifyTls = () => control<HTMLInputElement>("Verify TLS certificate");
 
 describe("Windows DHCP WinRM settings round-trip", () => {
-  it("the edit dialog shows the stored settings", () => {
+  it("the edit dialog shows the stored settings", async () => {
     ui(STORED);
+    await ready();
     expect(port().value).toBe("5986");
     expect(transport().value).toBe("credssp");
     expect(useTls().checked).toBe(true);
     expect(verifyTls().checked).toBe(true);
   });
 
-  it("an untouched save sends no WinRM block", async () => {
+  it("an untouched save sends nothing, so no WinRM block either", async () => {
     updateServer.mockResolvedValue({ id: "s1" });
-    ui(STORED);
-    fireEvent.submit(port().form!);
-    await waitFor(() => expect(updateServer).toHaveBeenCalled());
-    expect(updateServer.mock.calls[0][1]).not.toHaveProperty(
-      "windows_credentials",
+    const onClose = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CreateServerModal server={STORED} onClose={onClose} />
+      </QueryClientProvider>,
     );
+    stored = STORED;
+    await ready();
+    fireEvent.submit(port().form!);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateServer).not.toHaveBeenCalled();
   });
 
   it("an edit sends only the setting the operator changed", async () => {
     updateServer.mockResolvedValue({ id: "s1" });
     ui(STORED);
+    await ready();
     fireEvent.click(verifyTls());
     fireEvent.submit(port().form!);
     await waitFor(() => expect(updateServer).toHaveBeenCalled());
