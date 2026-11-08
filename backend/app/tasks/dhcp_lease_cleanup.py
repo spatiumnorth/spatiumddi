@@ -296,7 +296,7 @@ TRASHED_SCOPE_TEARDOWN_BUDGET_S = 240.0
 SWEEP_TRASHED_SCOPE_BUDGET_S = 60.0
 
 # The sweep leaves a scope in the Trash alone this long after its delete: past
-# the delete's inline 20 s (``SCOPE_DELETE_INLINE_DEADLINE_S``) and its task's
+# the delete's inline 10 s (``SCOPE_DELETE_INLINE_DEADLINE_S``) and its task's
 # 240 s, so the sweep never contends batch for batch with that teardown and
 # finds only what it left behind (the task's enqueue lost, or a scope larger
 # than one task run).

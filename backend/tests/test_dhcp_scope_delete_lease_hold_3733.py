@@ -190,7 +190,7 @@ async def test_the_wake_is_published_before_the_inline_teardown_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#3748: Kea must stop serving the trashed scope when the stamp commits,
-    not after the inline teardown (up to 20 s) has run."""
+    not after the inline teardown (up to 10 s) has run."""
     from app.core import agent_wake
 
     server, scope_id, _subnet, admin = await _seeded(concurrent_client, db_session)
@@ -309,3 +309,10 @@ async def test_a_failing_teardown_batch_leaves_the_copilot_apply_answering_ok(
 
     resp = await apply_proposal(row.id, admin, db_session, request)
     assert resp.ok is True, resp.detail
+
+
+def test_inline_deadline_is_ten_seconds_3772() -> None:
+    """#3772: the inline teardown stays well under the 30 s statement limit."""
+    from app.services.dhcp import lease_cleanup
+
+    assert lease_cleanup.SCOPE_DELETE_INLINE_DEADLINE_S == 10.0
