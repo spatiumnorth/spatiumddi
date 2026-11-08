@@ -66,11 +66,15 @@ class _Kea:
 
 
 @pytest.fixture
-def env(agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch) -> tuple[SyncLoop, _Kea]:
+def env(
+    agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+) -> tuple[SyncLoop, _Kea]:
     kea = _Kea(agent_cfg)
     monkeypatch.setattr(sync_mod, "config_check", lambda d, p: kea.checks.append(d))
     monkeypatch.setattr(sync_mod, "config_reload", kea.reload)
-    monkeypatch.setattr(sync_mod, "config_hash_get", kea.hash_get)
+    # ``raising=False`` so that on a tree without the fix these tests fail on
+    # their assertions (both daemons reloaded) rather than on the patch.
+    monkeypatch.setattr(sync_mod, "config_hash_get", kea.hash_get, raising=False)
     ensure_layout(agent_cfg.state_dir)
     return SyncLoop(agent_cfg, token_ref=[""], heartbeat=_FakeHeartbeat()), kea
 
@@ -163,11 +167,45 @@ def test_failed_reload_clears_baseline(
         sync_mod, "config_reload", lambda s: (_ for _ in ()).throw(OSError("down"))
     )
     loop._apply_bundle(_bundle(v4="198.51.100.0/24"), reload_kea=True)
-    assert "dhcp4" not in loop._applied
     monkeypatch.setattr(sync_mod, "config_reload", kea.reload)
     kea.reloads.clear()
     loop._apply_bundle(_bundle(v4="198.51.100.0/24"), reload_kea=True)
-    assert "dhcp4" in kea.reloads
+    # dhcp4 never confirmed this document, so it is reloaded; dhcp6 did and
+    # its document is unchanged, so it is left alone.
+    assert kea.reloads == ["dhcp4"]
+
+
+def test_refused_v6_re_render_does_not_reload_untouched_dhcp4(
+    env: tuple[SyncLoop, _Kea], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host IPv6 change re-renders only the dhcp6 document. When kea-dhcp6
+    refuses it, the restore must not reload dhcp4, which was skipped and never
+    loaded the refused render: that would reset v4 HA for a v6-only event."""
+    from spatium_dhcp_agent.kea_ctrl import KeaConfigRejected
+
+    loop, kea = env
+    b = _bundle()
+    assert loop._apply_with_revert(b, "A")
+    loop._current_etag = "A"
+    kea.reloads.clear()
+
+    def refuse_v6(daemon: str, path: Path) -> None:
+        if daemon == "dhcp6":
+            raise KeaConfigRejected("unicast address gone")
+        kea.checks.append(daemon)
+
+    monkeypatch.setattr(sync_mod, "config_check", refuse_v6)
+    monkeypatch.setattr(
+        sync_mod, "global_ipv6_addresses", lambda: [("eth0", "2001:db8::10")]
+    )
+    assert loop.reapply_current_bundle("dhcp6_unicast_addresses_changed") is False
+    assert "dhcp4" not in kea.reloads
+    # And the next control-plane apply that leaves dhcp4's document alone
+    # still does not reload it.
+    monkeypatch.setattr(sync_mod, "config_check", lambda d, p: kea.checks.append(d))
+    monkeypatch.setattr(sync_mod, "global_ipv6_addresses", list)
+    loop._apply_bundle(_bundle(v6="2001:db8:1::/64"), reload_kea=True)
+    assert "dhcp4" not in kea.reloads
 
 
 def test_ha_heartbeat_default_is_2s() -> None:
@@ -182,10 +220,16 @@ def test_ha_heartbeat_default_is_2s() -> None:
         ],
     }
     out = render(
-        {"server": {"name": "a", "interfaces": ["eth0"]}, "scopes": [], "failover": failover}
+        {
+            "server": {"name": "a", "interfaces": ["eth0"]},
+            "scopes": [],
+            "failover": failover,
+        }
     )
     hook = next(
-        h for h in out["Dhcp4"]["hooks-libraries"] if h["library"].endswith("libdhcp_ha.so")
+        h
+        for h in out["Dhcp4"]["hooks-libraries"]
+        if h["library"].endswith("libdhcp_ha.so")
     )
     rel = hook["parameters"]["high-availability"][0]
     assert rel["heartbeat-delay"] == 2000

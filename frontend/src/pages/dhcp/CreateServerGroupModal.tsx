@@ -131,7 +131,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
         }
         return n;
       };
-      const heartbeatMs = haTimer(heartbeat, "Heartbeat Delay", 1000, 10000);
+      const heartbeatMs = haTimer(heartbeat, "Heartbeat Delay", 1000, 2000);
       const maxResponseMs = haTimer(
         maxResponse,
         "Max Response Delay",

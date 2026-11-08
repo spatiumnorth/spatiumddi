@@ -175,9 +175,14 @@ def config_check(
         log.warning("kea_config_check_rejected", daemon=daemon, reason=reason)
         raise KeaConfigRejected(f"{binary} -t rejected the config: {reason}")
     log.warning(
-        "kea_config_check_failed", daemon=daemon, returncode=proc.returncode, reason=reason
+        "kea_config_check_failed",
+        daemon=daemon,
+        returncode=proc.returncode,
+        reason=reason,
     )
-    raise KeaCheckUnavailable(f"{binary} -t exited with code {proc.returncode}: {reason}")
+    raise KeaCheckUnavailable(
+        f"{binary} -t exited with code {proc.returncode}: {reason}"
+    )
 
 
 def version_get(socket_path: Path) -> str | None:

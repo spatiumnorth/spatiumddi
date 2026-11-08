@@ -216,6 +216,11 @@ class SyncLoop:
         # the HA hook's state machine, so a daemon whose document did not
         # change is left alone. Dropped on any non-OK result.
         self._applied: dict[str, tuple[str, str]] = {}
+        # Daemons this apply actually sent ``config-reload`` to, and that
+        # accepted it. A daemon skipped as unchanged is in
+        # ``_last_reload_results`` as OK but NOT here: it never loaded the
+        # render, so restoring the documents must not reload it.
+        self._reloaded: set[str] = set()
 
         # Preload cached bundle — offline-operation guarantee.
         #
@@ -588,7 +593,11 @@ class SyncLoop:
             if live is not None and live == base[1]:
                 log.info("kea_reload_skipped_unchanged", daemon=daemon)
                 return RELOAD_OK
-        result = self._reload_socket(socket_path, config_path, daemon, reload_retry_timeout)
+        result = self._reload_socket(
+            socket_path, config_path, daemon, reload_retry_timeout
+        )
+        if result == RELOAD_OK:
+            self._reloaded.add(daemon)
         live_hash = config_hash_get(socket_path) if result == RELOAD_OK else None
         if live_hash is not None:
             self._applied[daemon] = (fingerprint, live_hash)
@@ -621,6 +630,7 @@ class SyncLoop:
         """
         # #882 — reset per apply; set below once a daemon accepts the doc.
         self._reload_confirmed = False
+        self._reloaded = set()
         # Issue #258 — explicit narrowing. Pre-#258 the inline
         # ternary fell through to ``bundle`` for ANY non-dict value
         # of ``bundle["bundle"]`` (list, str, None, …) and the
@@ -1032,7 +1042,10 @@ class SyncLoop:
             doc = json.loads(text)
             self._atomic_write_json(path, doc)
             socket_path, daemon = sockets[path]
-            if self._last_reload_results.get(daemon) == RELOAD_OK:
+            # #3779 — a daemon skipped as unchanged never loaded the refused
+            # render (its document is the one being restored), so it is not
+            # reloaded: that would reset its HA state for nothing.
+            if daemon in self._reloaded:
                 self._applied.pop(daemon, None)
                 self._reload_socket(socket_path, path, daemon, 0.0)
 
