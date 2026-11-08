@@ -19,6 +19,7 @@ the two into the whole dict for callers that still want it.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import secrets
 import tempfile
@@ -456,6 +457,16 @@ def _master_host(master: Any) -> str:
     if "@" in text:
         text = text.rpartition("@")[0]
     return text.strip("[]").lower()
+
+
+def _producer_ip(producer: Any) -> str | None:
+    """An IP literal for the catalog producer, or None (#3764)."""
+    for cand in (producer.host, producer.last_seen_ip):
+        try:
+            return str(ipaddress.ip_address((cand or "").strip()))
+        except ValueError:
+            continue
+    return None
 
 
 async def _master_granted_keys(db: AsyncSession, group_id: Any) -> list[TsigKey]:
@@ -1899,8 +1910,19 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 catalog_block = {
                     "mode": "consumer",
                     "zone_name": grp.catalog_zone_name,
-                    "producer_addr": producer.host,
                 }
+                # #3764 — BIND's ``default-masters`` takes IPs only, and an
+                # agent's ``host`` is usually a hostname.
+                producer_ip = _producer_ip(producer)
+                if producer_ip:
+                    catalog_block["producer_addr"] = producer_ip
+                else:
+                    logger.warning(
+                        "dns_catalog_producer_addr_unresolved",
+                        producer=producer.name,
+                        host=producer.host,
+                        last_seen_ip=producer.last_seen_ip,
+                    )
 
     blocklists_payload: list[dict[str, Any]] = []
     streamed: list[_StreamedEntries] = []

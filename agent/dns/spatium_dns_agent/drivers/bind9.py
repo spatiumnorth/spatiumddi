@@ -3556,6 +3556,13 @@ class Bind9Driver(DriverBase):
             elif catalog and catalog.get("mode") == "consumer":
                 cname = catalog["zone_name"]
                 producer_addr = (catalog.get("producer_addr") or "").strip()
+                try:
+                    ipaddress.ip_address(producer_addr)
+                except ValueError:
+                    # #3764 — BIND rejects a hostname in default-masters.
+                    if producer_addr:
+                        log.warning("catalog_producer_addr_not_ip", producer_addr=producer_addr)
+                    producer_addr = ""
                 if producer_addr:
                     # `catalog-zones` lives inside options{}; inject before
                     # the closing brace of the options block. ``in-memory
