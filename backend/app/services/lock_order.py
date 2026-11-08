@@ -88,6 +88,16 @@ writes, takes no lease row in that transaction, and tears the scope's leases
 down after its commit, one batch per transaction, each batch in the order
 above. So the stamp waits for a batch that already holds the scope, and a
 later batch waits for the stamp and finds the scope in the Trash.
+Each teardown batch also reads its scope row ``FOR SHARE`` after its lease
+rows and holds it to its commit (#3777), so a Trash restore (an UPDATE of
+``deleted_at``) waits for the batch in flight and the next batch finds the
+scope live. After the lease rows, not before: a Trash purge locks the scope's
+lease rows and then deletes the scope row, which a batch holding the scope
+while it waited for those leases would deadlock with. The restore locks the
+scope rows it un-stamps (``FOR NO KEY UPDATE``, ascending id) before the zones
+it writes (#3627), since the batch goes on from the scope to its mirrors'
+zones. ``FOR SHARE`` and ``FOR NO KEY UPDATE`` both leave a lease-events
+batch's ``FOR KEY SHARE`` alone.
 
 ``tests/_row_lock_order_guard.py`` asserts the order for the whole test suite.
 """
