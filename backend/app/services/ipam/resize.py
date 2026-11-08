@@ -34,7 +34,8 @@ Side-effects committed atomically with the CIDR change:
   because they represent user intent (e.g. ``anycast-vip``). Rows with
   ``dns_record_id IS NOT NULL`` are classified as renamed by
   ``_load_boundary_placeholders`` and therefore never reach the delete
-  loop — no DNS cleanup is needed here.
+  loop — no DNS cleanup is needed here. The old default ``gateway`` row of
+  a moved gateway does carry an auto PTR, so it is retracted first (#3723).
 * Update ``Subnet.network``, ``total_ips``, ``utilization_percent``, and
   optionally ``gateway`` (via ``move_gateway_to_first_usable``).
 * Re-create default-named placeholder rows at the **new** boundaries.
@@ -1286,8 +1287,16 @@ async def commit_subnet_resize(
                     IPAddress.description == "Gateway",
                     IPAddress.dns_record_id.is_(None),
                 )
+                # Locked before the sync takes its zones: an address row comes
+                # before a zone row (``app.services.lock_order``), as a
+                # permanent zone delete takes them (#3691).
+                .with_for_update()
             )
             if old_row is not None:
+                # Retract its auto A / PTR first, as Edit Subnet's gateway
+                # move does (#3709): a bare delete leaves the PTR served.
+                # The sync takes the zones it writes in id order (#3617).
+                await _sync_dns_record(db, old_row, subnet, action="delete")
                 await db.delete(old_row)
         # None when a reserved row already holds the address: kept as the
         # gateway's. An available row is taken over (#3709).
