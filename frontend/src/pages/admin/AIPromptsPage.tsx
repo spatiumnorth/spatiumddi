@@ -346,7 +346,6 @@ export function AIPromptsPage() {
                       <div className="flex justify-end gap-1">
                         <button
                           disabled={!p.is_owner}
-                          aria-label="Edit"
                           title={
                             p.is_owner
                               ? "Edit"
@@ -356,19 +355,20 @@ export function AIPromptsPage() {
                             setError(undefined);
                             setEditing(p);
                           }}
+                          aria-label="Edit"
                           className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-30"
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
                           disabled={!p.is_owner}
-                          aria-label="Delete"
                           title={
                             p.is_owner
                               ? "Delete"
                               : "Only the creator (or a superadmin) can delete this prompt"
                           }
                           onClick={() => setConfirmDelete(p)}
+                          aria-label="Delete"
                           className="rounded p-1.5 text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-30 dark:hover:bg-red-950/30"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
