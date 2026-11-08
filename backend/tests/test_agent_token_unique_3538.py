@@ -14,12 +14,12 @@ from datetime import UTC, datetime
 
 import pytest
 from httpx import AsyncClient
-from jose import jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns import agents as dns_agents_api
 from app.config import settings
+from app.core import jwt_compat as jwt
 from app.models.dns import DNSServer
 from app.services.dhcp import agent_token as dhcp_tok
 from app.services.dns import agent_token as dns_tok

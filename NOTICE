@@ -119,8 +119,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - structlog — MIT / Apache 2.0 — https://www.structlog.org
 - cryptography — Apache 2.0 / BSD 3-Clause — https://cryptography.io
 - pyOpenSSL (TLS cert chain capture) — Apache 2.0 — https://www.pyopenssl.org
-- python-jose (JWT) — MIT — https://github.com/mpdavis/python-jose
-- joserfc (OIDC ID-token validation, JWKS) — BSD 3-Clause — https://jose.authlib.org
+- joserfc (JWT issue + verify, OIDC ID-token validation, JWKS) — BSD 3-Clause — https://jose.authlib.org
 - bcrypt — Apache 2.0 — https://github.com/pyca/bcrypt
 - pyotp (TOTP) — MIT — https://github.com/pyauth/pyotp
 - python-multipart — Apache 2.0 — https://github.com/Kludex/python-multipart
