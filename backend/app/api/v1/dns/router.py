@@ -7527,6 +7527,36 @@ async def replace_zone_update_acl(
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
     await _lock_acl_and_check_version(db, zone, body.expected_version)
+
+    # #3738 — audit only what changed; a save that changes nothing writes no
+    # audit row, no wake and no Windows push, and answers with the stored state.
+    old_entries = await _load_acl_out(db, zone.id)
+
+    def _canon(rows: Any) -> list[Any]:
+        return [
+            (
+                r.action,
+                r.match_kind,
+                r.ip_cidr,
+                str(r.tsig_key_id) if r.tsig_key_id else None,
+                r.name_scope,
+                r.name_pattern,
+                sorted(r.record_types) if r.record_types else None,
+            )
+            for r in rows
+        ]
+
+    changed_fields: list[str] = []
+    if _canon(old_entries) != _canon(body.entries):
+        changed_fields.append("update_acl")
+    if (
+        body.dynamic_update_enabled is not None
+        and body.dynamic_update_enabled != zone.dynamic_update_enabled
+    ):
+        changed_fields.append("dynamic_update_enabled")
+    if not changed_fields:
+        return await get_zone_update_acl(group_id, zone_id, db, current_user)
+
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
     db.add(
@@ -7538,7 +7568,7 @@ async def replace_zone_update_acl(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=f"{zone.name} dynamic-update ACL",
-            changed_fields=["update_acl", "dynamic_update_enabled"],
+            changed_fields=changed_fields,
             result="success",
         )
     )
