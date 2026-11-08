@@ -37,7 +37,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
   const [description, setDescription] = useState(group?.description ?? "");
   const [mode, setMode] = useState(group?.mode ?? "standalone");
   const [heartbeat, setHeartbeat] = useState(
-    String(group?.heartbeat_delay_ms ?? 10000),
+    String(group?.heartbeat_delay_ms ?? 2000),
   );
   const [maxResponse, setMaxResponse] = useState(
     String(group?.max_response_delay_ms ?? 60000),
@@ -167,7 +167,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
           description: group!.description ?? "",
           mode: group!.mode ?? "standalone",
           dhcp_socket_mode: group!.dhcp_socket_mode ?? "direct",
-          heartbeat_delay_ms: group!.heartbeat_delay_ms ?? 10000,
+          heartbeat_delay_ms: group!.heartbeat_delay_ms ?? 2000,
           max_response_delay_ms: group!.max_response_delay_ms ?? 60000,
           max_ack_delay_ms: group!.max_ack_delay_ms ?? 10000,
           max_unacked_clients: group!.max_unacked_clients ?? 5,

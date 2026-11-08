@@ -75,6 +75,24 @@ def config_reload(socket_path: Path) -> None:
     log.info("kea_config_reload_ok")
 
 
+def config_hash_get(socket_path: Path) -> str | None:
+    """Hash of the configuration the daemon is running right now (#3779).
+
+    Kea's ``config-hash-get`` (core command, no hook needed) answers with the
+    hash of the config the daemon currently holds. ``None`` when the daemon
+    does not answer or the command is unknown: the caller must read that as
+    "cannot prove it is unchanged" and reload.
+    """
+    try:
+        resp = send_command(socket_path, "config-hash-get", timeout=3.0)
+    except (KeaCtrlError, OSError) as e:
+        log.debug("kea_config_hash_get_failed", socket=str(socket_path), error=str(e))
+        return None
+    args = resp.get("arguments")
+    value = args.get("hash") if isinstance(args, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 class KeaConfigRejected(KeaCtrlError):
     """``kea-dhcp4 -t`` / ``kea-dhcp6 -t`` refused the config (exit 1)."""
 
