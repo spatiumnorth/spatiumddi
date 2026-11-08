@@ -509,16 +509,23 @@ async def tear_down_scope_leases(
         await db.commit()
 
 
-async def trashed_scopes_with_leases(db: AsyncSession, *, limit: int = 100) -> list[uuid.UUID]:
-    """Scopes in the Trash that still have lease rows, oldest delete first:
-    a scope delete whose request stopped at its deadline and whose follow-up
-    task was lost (#3733)."""
+async def trashed_scopes_with_leases(
+    db: AsyncSession, *, limit: int = 100, trashed_before: datetime | None = None
+) -> list[uuid.UUID]:
+    """Scopes in the Trash that still have lease rows, oldest delete first
+    (#3733): what a scope delete's own teardown left behind, its follow-up
+    task lost or the scope larger than one task run. ``trashed_before``
+    leaves out the scopes trashed since then, whose own teardown may still
+    be running."""
+    conditions = [
+        DHCPScope.deleted_at.is_not(None),
+        exists().where(DHCPLease.scope_id == DHCPScope.id),
+    ]
+    if trashed_before is not None:
+        conditions.append(DHCPScope.deleted_at < trashed_before)
     rows = await db.execute(
         select(DHCPScope.id)
-        .where(
-            DHCPScope.deleted_at.is_not(None),
-            exists().where(DHCPLease.scope_id == DHCPScope.id),
-        )
+        .where(*conditions)
         .order_by(DHCPScope.deleted_at, DHCPScope.id)
         .limit(limit)
         .execution_options(include_deleted=True)

@@ -290,26 +290,37 @@ async def _remirror_live_leases() -> int:
 
 # How long one run tears down the leases of scopes in the Trash (#3733): the
 # task a scope delete enqueues when its request stopped at its deadline, and
-# the sweep's own pass, which finds a scope whose enqueue was lost. What is left
-# goes on the next run; the teardown is idempotent.
+# the sweep's own pass, which finds what that teardown left behind. What is
+# left goes on the next run; the teardown is idempotent.
 TRASHED_SCOPE_TEARDOWN_BUDGET_S = 240.0
 SWEEP_TRASHED_SCOPE_BUDGET_S = 60.0
 
+# The sweep leaves a scope in the Trash alone this long after its delete: past
+# the delete's inline 20 s (``SCOPE_DELETE_INLINE_DEADLINE_S``) and its task's
+# 240 s, so the sweep never contends batch for batch with that teardown and
+# finds only what it left behind (the task's enqueue lost, or a scope larger
+# than one task run).
+SWEEP_TRASHED_SCOPE_GRACE = timedelta(minutes=10)
+
 
 async def _tear_down_trashed_scopes(
-    scope_id: str | None = None, *, budget_s: float = TRASHED_SCOPE_TEARDOWN_BUDGET_S
+    scope_id: str | None = None,
+    *,
+    budget_s: float = TRASHED_SCOPE_TEARDOWN_BUDGET_S,
+    trashed_before: datetime | None = None,
 ) -> tuple[int, int, bool]:
     """Tear down the leases still held by scopes in the Trash (#3733): the one
-    named, or every one that has any. Each batch commits on its own
-    (``tear_down_scope_leases``). Returns ``(leases_removed, mirrors_removed,
-    done)``; ``done`` is False when the budget ran out first."""
+    named, or every one that has any (trashed before ``trashed_before``, when
+    given). Each batch commits on its own (``tear_down_scope_leases``).
+    Returns ``(leases_removed, mirrors_removed, done)``; ``done`` is False when
+    the budget ran out first."""
     async with task_session() as db:
         if not await is_module_enabled(db, "core.dhcp"):
             return 0, 0, True
         if scope_id is not None:
             scope_ids = [uuid.UUID(str(scope_id))]
         else:
-            scope_ids = await trashed_scopes_with_leases(db)
+            scope_ids = await trashed_scopes_with_leases(db, trashed_before=trashed_before)
         await db.rollback()
         deadline = time.monotonic() + budget_s
         removed = mirrors = 0
@@ -368,9 +379,11 @@ def tear_down_trashed_scope_leases(scope_id: str | None = None) -> dict[str, int
 async def _run_both() -> tuple[tuple[int, int], int, int]:
     expiry = await _sweep()
     remirrored = await _remirror_live_leases()
-    # #3733 — and the leases of any scope in the Trash a lost enqueue left.
+    # #3733 — and the leases a scope delete's own teardown left behind, once
+    # it has had its time.
     left_behind, _mirrors, _done = await _tear_down_trashed_scopes(
-        budget_s=SWEEP_TRASHED_SCOPE_BUDGET_S
+        budget_s=SWEEP_TRASHED_SCOPE_BUDGET_S,
+        trashed_before=datetime.now(UTC) - SWEEP_TRASHED_SCOPE_GRACE,
     )
     return expiry, remirrored, left_behind
 
@@ -384,8 +397,10 @@ def sweep_expired_leases() -> dict[str, int]:
         # the agent dropped should leave an address here, which wants finding.
         logger.warning("dhcp_lease_sweep_remirrored_available_rows", rows=remirrored)
     if left_behind:
-        # Warning: a scope delete hands its rest to its own task, so only a
-        # lost enqueue should leave leases in a scope in the Trash (#3733).
+        # Warning: past its grace a scope in the Trash should have no leases
+        # left, since its delete hands the rest to its own task. Two things
+        # leave some (#3733): that task's enqueue was lost, or the scope is
+        # larger than one task run tears down.
         logger.warning("dhcp_lease_sweep_tore_down_trashed_scope_leases", leases=left_behind)
     logger.info(
         "dhcp_lease_sweep_complete",

@@ -11,8 +11,9 @@
   commit. The scope now goes to the Trash first, and its leases are torn
   down after, in batches that each commit, for up to 20 s in the
   request (the server delete's bound) and in a background task after
-  that. The lease sweep finishes any scope in the Trash whose task was
-  lost.
+  that. Ten minutes after the delete, the lease sweep finishes any
+  scope in the Trash whose task was lost or that one task run did not
+  finish.
 - **A lease-events batch no longer writes leases back into a deleted
   scope (#3733).** The agent resends the batches the API refused while
   a scope delete ran, and those, or a batch that read the scope before

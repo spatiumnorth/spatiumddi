@@ -23,7 +23,7 @@ shape; the tests force the interleave with a hold rather than hope for it.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -148,13 +148,36 @@ async def test_the_lease_sweep_tears_down_leases_a_trashed_scope_still_holds(
     concurrent_client: AsyncClient,  # noqa: F811
     db_session: AsyncSession,
 ) -> None:
-    """What a lost enqueue leaves: a scope in the Trash that still has leases,
-    mirrors and DDNS records. The lease sweep's next run tears them down."""
+    """What a lost enqueue leaves: a scope in the Trash, past the sweep's
+    grace, that still has leases, mirrors and DDNS records. The lease sweep's
+    next run tears them down."""
     server, scope_id, subnet, _admin = await _seeded(concurrent_client, db_session)
+    scope = await db_session.get(DHCPScope, scope_id)
+    assert scope is not None
+    scope.deleted_at = (
+        datetime.now(UTC) - lease_tasks.SWEEP_TRASHED_SCOPE_GRACE - timedelta(minutes=1)
+    )
+    await db_session.commit()
+
+    await lease_tasks._run_both()
+    assert await _counts(db_session, server, subnet) == _NOTHING
+
+
+@pytest.mark.asyncio
+async def test_the_lease_sweep_leaves_a_scope_trashed_within_its_grace_to_the_delete(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    """A scope trashed a moment ago still has its delete's own teardown
+    running, inline or in its task. The sweep must not take the same scope's
+    leases batch for batch beside it: it leaves the scope alone until its
+    grace has passed."""
+    server, scope_id, subnet, _admin = await _seeded(concurrent_client, db_session)
+    seeded = await _counts(db_session, server, subnet)
     scope = await db_session.get(DHCPScope, scope_id)
     assert scope is not None
     scope.deleted_at = datetime.now(UTC)
     await db_session.commit()
 
     await lease_tasks._run_both()
-    assert await _counts(db_session, server, subnet) == _NOTHING
+    assert await _counts(db_session, server, subnet) == seeded
