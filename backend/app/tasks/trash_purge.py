@@ -253,7 +253,17 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     )
     purged = 0
     skipped = 0
-    for zone in res.scalars().all():
+    zones = list(res.scalars().all())
+    # #3751 — every zone's address rows in ONE ascending pass, before any zone
+    # row: an auto-sync batch locks its rows in one ascending pass across zones
+    # (#3726), and a pass per zone interleaves with it into a 40P01. The sweep
+    # commits once at its end (never per zone), so these locks are held for all
+    # the purges below, whose own per-zone lock then re-takes rows already held.
+    # No sync gate here: #3726 found it deadlocks.
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [z.id for z in zones])
+    for zone in zones:
         try:
             # #3190 — a shared auto reverse zone holding the PTRs of a trashed
             # subnet that has NOT expired is handed to that subnet's batch, not

@@ -834,6 +834,12 @@ async def purge_auto_reverse_zones(
         .scalars()
         .all()
     )
+    # #3751 — all the zones' address rows in one ascending pass before any
+    # zone row (the caller's transaction holds them through every purge below),
+    # the order an auto-sync batch takes its rows in. No sync gate (#3726).
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [z.id for z in trashed])
     for zone in trashed:
         # #3190 — another trashed subnet's PTRs in a shared zone are not ours to take.
         heir = await hand_over_zone_to_trashed_sharer(db, zone, exclude_ids=going)
