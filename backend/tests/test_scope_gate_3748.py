@@ -115,8 +115,8 @@ async def test_lease_batch_takes_the_shared_gate_before_its_first_row_lock(
     server, _scope_id, _subnet, _admin = await _estate(db_session)
     with _statements() as seen:
         assert (await _post(concurrent_client, server, ["10.31.1.10"])).status_code == 200
-    gate = [s for s in seen if "pg_advisory_xact_lock_shared" in s]
-    assert gate, seen
+    # The gate is the batch's first lock: no row lock before it.
+    assert seen and "pg_advisory_xact_lock_shared" in seen[0], seen
     assert _first(seen, "pg_advisory_xact_lock_shared") < _first(seen, "FROM dhcp_lease")
     assert _first(seen, "pg_advisory_xact_lock_shared") < _first(seen, "FOR KEY SHARE")
 
@@ -136,3 +136,149 @@ async def test_scope_delete_takes_the_exclusive_gate_before_the_scope_row(
         if "pg_advisory_xact_lock(" in s and "pg_advisory_xact_lock_shared" not in s
     )
     assert i_gate < _first(seen, "FOR UPDATE")
+
+
+# ── The real paths: two agents' lease-events batches and the scope delete ──
+
+#: How long each batch holds its scope ``FOR KEY SHARE`` before it goes on:
+#: the zone wait the issue measured, made deterministic.
+_HOLD = 0.8
+#: The delete's budget. Gated, it waits for the batch already running (one
+#: ``_HOLD``) and then does its own work; ungated it never gets the row while
+#: the two agents keep posting.
+_BUDGET = 12.0
+_IPS = ["10.31.1.10", "10.31.1.11", "10.31.1.12"]
+
+
+async def _pair_estate(db: AsyncSession) -> tuple[list[Any], Any, Any, dict[str, str]]:
+    """Two Kea servers of one group (an HA pair) serving one DDNS scope, both
+    holding its leases, and an admin."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from tests.test_dhcp_scope_lease_teardown import _make_admin  # noqa: PLC0415
+    from tests.test_lease_events_insert_order_3480 import (  # noqa: PLC0415
+        _ddns_subnet,
+        _two_agents,
+    )
+
+    _, token = await _make_admin(db)
+    subnet, _block = await _ddns_subnet(db)
+    servers = await _two_agents(db, [subnet])
+    scope_id = (
+        await db.execute(select(DHCPScope.id).where(DHCPScope.subnet_id == subnet.id))
+    ).scalar_one()
+    return servers, scope_id, subnet, {"Authorization": f"Bearer {token}"}
+
+
+async def _batch(client: AsyncClient, server: Any) -> Any:
+    from tests.test_lease_events_insert_order_3480 import _lease  # noqa: PLC0415
+
+    return await client.post(
+        "/api/v1/dhcp/agents/lease-events",
+        headers={"x-test-server": str(server.id)},
+        json={"leases": [_lease(ip, n) for n, ip in enumerate(_IPS)]},
+    )
+
+
+async def _under_load(
+    client: AsyncClient,
+    servers: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    request: Any,
+) -> tuple[Any, float, list[tuple[float, int]], float]:
+    """Run ``request`` (a coroutine factory) while both agents post the
+    scope's leases back to back, each batch holding the scope for ``_HOLD``
+    after taking it, offset so a batch is always open: the reported shape.
+    Returns its response, how long it took, every batch's (end time, status),
+    and when it was answered. Fails if it is not answered within ``_BUDGET``."""
+    from app.api.v1.dhcp import agents  # noqa: PLC0415
+
+    for server in servers:  # both agents hold the leases, as an HA pair does
+        assert (await _batch(client, server)).status_code == 200
+
+    real = agents.lock_zones_for_addresses
+
+    async def _slow(db: AsyncSession, **kwargs: Any) -> Any:
+        await asyncio.sleep(_HOLD)
+        return await real(db, **kwargs)
+
+    monkeypatch.setattr(agents, "lock_zones_for_addresses", _slow)
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    answered: list[tuple[float, int]] = []
+
+    async def _agent(server: Any, offset: float) -> None:
+        await asyncio.sleep(offset)
+        while not stop.is_set():
+            r = await _batch(client, server)
+            answered.append((loop.time(), r.status_code))
+
+    running = [asyncio.create_task(_agent(s, off)) for s, off in zip(servers, (0.0, _HOLD / 2))]
+    task: asyncio.Task[Any] | None = None
+    try:
+        await asyncio.sleep(_HOLD * 1.5)  # both agents are in a batch
+        start = loop.time()
+        task = asyncio.create_task(request())
+        done, _ = await asyncio.wait({task}, timeout=_BUDGET)
+        took = loop.time() - start
+        assert task in done, f"the request was still waiting after {_BUDGET} s"
+        answered_at = loop.time()
+        # The batches that queued behind it run, and are answered.
+        await asyncio.sleep(_HOLD * 3)
+    finally:
+        stop.set()
+        await asyncio.wait_for(asyncio.gather(*running, return_exceptions=True), 60)
+        if task is not None and not task.done():
+            await asyncio.wait_for(task, 60)
+    return task.result(), took, answered, answered_at
+
+
+@pytest.mark.asyncio
+async def test_a_scope_delete_goes_through_while_both_agents_of_a_pair_post_its_leases(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real delete, against two agents' real batches: it must answer 204
+    well inside its budget (ungated it waits until the agents stop), and the
+    batches that queued behind it must then be answered 200 without writing
+    anything into the trashed scope (#3747)."""
+    from tests.test_lease_events_trashed_scope_3733 import _NOTHING, _counts  # noqa: PLC0415
+
+    servers, scope_id, subnet, admin = await _pair_estate(db_session)
+    resp, took, answered, answered_at = await _under_load(
+        concurrent_client,
+        servers,
+        monkeypatch,
+        lambda: concurrent_client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=admin),
+    )
+    assert resp.status_code == 204, resp.text
+    assert took < _BUDGET
+    assert answered and all(code == 200 for _t, code in answered), answered
+    assert any(t > answered_at for t, _c in answered), "no batch ran after the delete"
+    for server in servers:
+        assert await _counts(db_session, server, subnet) == _NOTHING
+
+
+@pytest.mark.asyncio
+async def test_a_scope_edit_needs_no_gate_under_the_same_load(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scope edit's UPDATE changes no key column, so it takes the row ``FOR
+    NO KEY UPDATE``, which a ``FOR KEY SHARE`` does not block: under the load
+    that starved the delete it answers at once, and the batches carry on."""
+    servers, scope_id, _subnet, admin = await _pair_estate(db_session)
+    resp, took, answered, _at = await _under_load(
+        concurrent_client,
+        servers,
+        monkeypatch,
+        lambda: concurrent_client.put(
+            f"/api/v1/dhcp/scopes/{scope_id}", headers=admin, json={"description": "edited"}
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    assert took < _HOLD, took
+    assert answered and all(code == 200 for _t, code in answered), answered

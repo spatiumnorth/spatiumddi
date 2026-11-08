@@ -65,8 +65,13 @@ scope delete that takes the row ``FOR UPDATE``. It exists because Postgres
 lets a new ``FOR KEY SHARE`` join while another is held even when a ``FOR
 UPDATE`` is queued, so a Kea HA pair's overlapping batches starved the delete
 past the command timeout; a new shared advisory request does queue behind a
-waiting exclusive one. Taken with no row lock held, in ascending key order, by
-the two takers that use it, neither of which takes a zone gate.
+waiting exclusive one. Taken in ascending key order, by the two takers that
+use it, neither of which takes a zone gate, with no row lock held that the
+other side waits for (a batch has inserted its ingest receipt, which no delete
+touches). A scope edit needs no gate: its UPDATE changes no key column, so it
+takes the row ``FOR NO KEY UPDATE``, which a ``FOR KEY SHARE`` does not block.
+Any other delete that takes scope rows ``FOR UPDATE`` (a subnet, block or space
+delete's cascade) must take their gates exclusive before its first row lock.
 
 A scope row (``dhcp_scope``) sits between steps 1 and 2 for the lease writers
 that must not write into a scope in the Trash and the delete that puts it there
