@@ -460,7 +460,15 @@ def _master_host(master: Any) -> str:
 
 
 def _producer_ip(producer: Any) -> str | None:
-    """An IP literal for the catalog producer, or None (#3764)."""
+    """An IP literal for a BIND9 catalog consumer's ``default-masters`` (#3764).
+
+    ``host`` when it is already an address; otherwise ``last_seen_ip``, the
+    address the producer's agent reaches the API from. That is where its
+    daemon listens on a single node and, behind the VIP, the pod's own
+    cluster address (the #1470 reasoning in ``tsig.transfer_fallback_hosts``).
+    Behind NAT it is the NAT's address, which a consumer may not reach; set
+    the producer's ``host`` to an IP in that case. None when neither is one.
+    """
     for cand in (producer.host, producer.last_seen_ip):
         try:
             return str(ipaddress.ip_address((cand or "").strip()))
@@ -1912,8 +1920,15 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                     "zone_name": grp.catalog_zone_name,
                 }
                 # #3764 — BIND's ``default-masters`` takes IPs only, and an
-                # agent's ``host`` is usually a hostname.
-                producer_ip = _producer_ip(producer)
+                # agent's ``host`` is usually a hostname. Technitium takes a
+                # hostname as a primary address, and
+                # ``_add_master_transfer_keys`` finds the producer's TSIG key
+                # by matching ``producer_addr`` against ``host``, so it keeps
+                # the host: swapping in an IP there loses the key and the
+                # producer refuses the unsigned catalog transfer.
+                producer_ip = (
+                    producer.host if server.driver == "technitium" else _producer_ip(producer)
+                )
                 if producer_ip:
                     catalog_block["producer_addr"] = producer_ip
                 else:

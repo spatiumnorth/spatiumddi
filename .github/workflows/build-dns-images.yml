@@ -188,6 +188,17 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_long_zone_check.py
 
+      # #3764: a catalog-zone consumer's rendered config passes the agent's
+      # real named-checkconf for an IPv4 and an IPv6 producer, and a hostname
+      # producer is left out rather than rendered. Runs as `spatium`.
+      - name: Catalog consumer check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_catalog_consumer_check.py
+
       # get.trivy.dev, which trivy-action's own setup downloads from,
       # is gone (#3464): install from the GitHub release instead.
       - name: Install Trivy

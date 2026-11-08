@@ -3567,14 +3567,27 @@ class Bind9Driver(DriverBase):
                     # `catalog-zones` lives inside options{}; inject before
                     # the closing brace of the options block. ``in-memory
                     # yes`` keeps member zones in RAM (no per-member files).
+                    # Member transfers are signed with the group key: the
+                    # producer grants ``allow-transfer`` to its group's keys
+                    # only (#734), and producer and consumer share a group.
+                    key = f' key "{tsig_key_name}"' if tsig_key_name else ""
                     injection = (
                         f"    catalog-zones {{ "
-                        f'zone "{cname}" default-masters {{ {producer_addr}; }} '
+                        f'zone "{cname}" default-masters {{ {producer_addr}{key}; }} '
                         f"in-memory yes; }};"
                     )
                     target = "    check-integrity no;"
                     if target in conf and injection not in conf:
                         conf = conf.replace(target, target + "\n" + injection, 1)
+                        # #3764 — BIND refuses a ``catalog-zones`` entry whose
+                        # zone is not itself declared as a primary or
+                        # secondary, so without this the consumer's whole
+                        # config failed ``named-checkconf``. The producer
+                        # serves the catalog zone with ``allow-transfer any``.
+                        conf += (
+                            f'zone "{cname}" {{ type secondary; '
+                            f"primaries {{ {producer_addr}; }}; }};\n"
+                        )
 
             for bl in blocklists:
                 conf += _rpz_stanza(bl, "")
