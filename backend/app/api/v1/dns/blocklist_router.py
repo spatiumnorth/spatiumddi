@@ -421,8 +421,17 @@ class ExceptionResponse(BaseModel):
 
 
 class AssignmentUpdate(BaseModel):
+    # Full sets REPLACE the stored membership (kept for existing clients).
     server_group_ids: list[uuid.UUID] | None = None
     view_ids: list[uuid.UUID] | None = None
+    # Deltas (#3737) change only the named ids, applied to the stored sets
+    # under a row lock, so a client that only speaks for one group / view
+    # cannot drop what another client attached since it last read. Applied
+    # after the full sets when both are sent; remove wins over add.
+    add_server_group_ids: list[uuid.UUID] | None = None
+    remove_server_group_ids: list[uuid.UUID] | None = None
+    add_view_ids: list[uuid.UUID] | None = None
+    remove_view_ids: list[uuid.UUID] | None = None
 
 
 class RefreshResponse(BaseModel):
@@ -1295,6 +1304,23 @@ async def update_assignments(
     db: DB,
     current_user: SuperAdmin,
 ) -> BlockListResponse:
+    has_delta = any(
+        v
+        for v in (
+            body.add_server_group_ids,
+            body.remove_server_group_ids,
+            body.add_view_ids,
+            body.remove_view_ids,
+        )
+    )
+    if has_delta:
+        # Serialise concurrent delta writers on this list: the relationships
+        # are read below and rewritten, so without the lock two deltas could
+        # each start from the same stored set and the later one drop the
+        # earlier one's change.
+        await db.execute(
+            select(DNSBlockList.id).where(DNSBlockList.id == list_id).with_for_update()
+        )
     bl = await _require_list(list_id, db)
 
     # Capture the pre-change affected groups so a de-assigned group also
@@ -1327,6 +1353,29 @@ async def update_assignments(
         bl.server_groups = groups
         changed.append("server_group_ids")
 
+    if body.add_server_group_ids or body.remove_server_group_ids:
+        current = {g.id: g for g in bl.server_groups}
+        remove = set(body.remove_server_group_ids or [])
+        add_ids = [i for i in (body.add_server_group_ids or []) if i not in current]
+        added = list(
+            (await db.execute(select(DNSServerGroup).where(DNSServerGroup.id.in_(add_ids))))
+            .scalars()
+            .all()
+        )
+        if len(added) != len(set(add_ids)):
+            raise HTTPException(status_code=404, detail="One or more server groups not found")
+        for g in added:
+            if g.id not in old_group_ids and await technitium_api_scope.group_is_technitium_api(
+                db, g.id
+            ):
+                raise technitium_api_scope.refusal(
+                    f"blocklists are not applied to the Technitium server " f"(group {g.name!r})."
+                )
+            current[g.id] = g
+        bl.server_groups = [g for gid, g in current.items() if gid not in remove]
+        if "server_group_ids" not in changed:
+            changed.append("server_group_ids")
+
     if body.view_ids is not None:
         views = list(
             (await db.execute(select(DNSView).where(DNSView.id.in_(body.view_ids)))).scalars().all()
@@ -1335,6 +1384,21 @@ async def update_assignments(
             raise HTTPException(status_code=404, detail="One or more views not found")
         bl.views = views
         changed.append("view_ids")
+
+    if body.add_view_ids or body.remove_view_ids:
+        vcurrent = {v.id: v for v in bl.views}
+        vremove = set(body.remove_view_ids or [])
+        vadd_ids = [i for i in (body.add_view_ids or []) if i not in vcurrent]
+        vadded = list(
+            (await db.execute(select(DNSView).where(DNSView.id.in_(vadd_ids)))).scalars().all()
+        )
+        if len(vadded) != len(set(vadd_ids)):
+            raise HTTPException(status_code=404, detail="One or more views not found")
+        for v in vadded:
+            vcurrent[v.id] = v
+        bl.views = [v for vid, v in vcurrent.items() if vid not in vremove]
+        if "view_ids" not in changed:
+            changed.append("view_ids")
 
     db.add(
         _audit(
