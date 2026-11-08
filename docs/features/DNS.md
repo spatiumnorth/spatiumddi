@@ -2144,7 +2144,9 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   bundle applies. An RPZ zone with no room for its hash sidecar (246 to
   248 characters) is still served, just rendered on every apply. The
   control plane does not refuse these names: PowerDNS and the agentless
-  drivers serve them.
+  drivers serve them. A DNSSEC-signed zone is held back from 215 characters
+  (issue #3750): BIND cannot write the key files it names after the zone, so
+  it would serve the zone unsigned with no key.
 
 ### Servers & server groups
 
