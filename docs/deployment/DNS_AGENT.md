@@ -1096,9 +1096,13 @@ dns-bind9-ns1:
 > (`registered_host`) and registers once more at startup when the configured
 > value differs. That is what heals an install upgraded from a chart that set
 > none: the upgrade restarts the agent pod, which registers once with the new
-> value. The startup registration makes one attempt; if the control plane does
-> not answer, the agent starts on its cached token and config and tries again
-> on its next start. Without `SERVER_HOST` the host is `SERVER_NAME`. As a
+> value. The value is recorded only when the response echoes the row's `host`,
+> which says the control plane read the field; `helm upgrade` restarts the
+> agent and the api together, and an api pod of the previous release answers
+> 200 while ignoring `host`. With no echo, or no answer at all, the agent keeps
+> serving on its cached token and config and repeats the registration from its
+> heartbeat loop every 5 minutes for up to an hour, then on its next start.
+> Without `SERVER_HOST` the host is `SERVER_NAME`. As a
 > backstop, an agent-managed server whose host does not resolve is read at its
 > `last_seen_ip` instead, with or without a DNS VIP.
 

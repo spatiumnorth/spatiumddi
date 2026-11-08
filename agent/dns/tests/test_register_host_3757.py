@@ -5,14 +5,15 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+
 from spatium_dns_agent import bootstrap as bootstrap_mod
-from spatium_dns_agent.config import AgentConfig
 from spatium_dns_agent.cache import ensure_layout
+from spatium_dns_agent.config import AgentConfig
 
 
 class _Resp:
     status_code = 200
-    headers: dict = {}
+    headers: dict = {}  # noqa: RUF012 — read-only stub
 
     def json(self) -> dict:
         return {"server_id": "s1", "agent_token": "t"}
@@ -94,13 +95,25 @@ def _token(cfg) -> str:
     return (cfg.state_dir / "agent_token.jwt").read_text().strip()
 
 
+class _EchoResp(_Resp):
+    """A control plane with #3757: the response carries the row's host."""
+
+    def __init__(self, host: str | None = None) -> None:
+        self.host = host
+
+    def json(self) -> dict:
+        return {"server_id": "s1", "agent_token": "t", "host": self.host}
+
+
 def _capture(monkeypatch, resp=None) -> list[dict]:
     sent: list[dict] = []
 
     class _C(_Client):
         def post(self, path, json=None, headers=None):
             self.sent.append(json)
-            return resp if resp is not None else _Resp()
+            if resp is not None:
+                return resp
+            return _EchoResp(json.get("host"))
 
     monkeypatch.setattr(bootstrap_mod, "_client", lambda c: _C(sent))
     monkeypatch.setattr(bootstrap_mod.time, "sleep", lambda s: pytest.fail("must not wait"))
@@ -172,7 +185,108 @@ def test_unreachable_control_plane_keeps_the_cached_token(agent_cfg, monkeypatch
 
 
 def test_register_records_the_host_it_sent(agent_cfg, monkeypatch) -> None:
-    _register(dataclasses.replace(agent_cfg, server_host=_FQDN), monkeypatch)
+    ensure_layout(agent_cfg.state_dir)
+    _capture(monkeypatch)
+    bootstrap_mod.register(dataclasses.replace(agent_cfg, server_host=_FQDN))
     assert _recorded(agent_cfg) == _FQDN
-    _register(agent_cfg, monkeypatch)
+    bootstrap_mod.register(agent_cfg)
     assert _recorded(agent_cfg) == ""
+
+
+# ── Only a control plane that read the host counts (#3757) ────────────────────
+# `helm upgrade` restarts the agent and the api together, so the agent can
+# register against the OLD api, which ignores `host` and still answers 200. The
+# response's echoed `host` is what says the field was read.
+
+
+class _Clock:
+    def __init__(self, monkeypatch) -> None:
+        self.now = 1000.0
+        monkeypatch.setattr(bootstrap_mod.time, "monotonic", lambda: self.now)
+
+
+def test_no_echo_is_not_recorded_and_arms_a_retry(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+    clock = _Clock(monkeypatch)
+    sent = _capture(monkeypatch, resp=_Resp())  # an old api: 200, no host
+    assert bootstrap_mod.ensure_token(cfg)[1] == "t"
+    assert _recorded(cfg) is None
+    token_ref = ["t"]
+    # Not due yet: the heartbeat hook does not register on every beat.
+    clock.now += 60
+    bootstrap_mod.retry_host_register(cfg, token_ref)
+    assert len(sent) == 1
+    # Due, and the api is new now: registers once, records, stops.
+    clock.now += bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS
+    sent2 = _capture(monkeypatch)
+    bootstrap_mod.retry_host_register(cfg, token_ref)
+    assert [b["host"] for b in sent2] == [_FQDN]
+    assert _recorded(cfg) == _FQDN and token_ref == ["t"]
+    clock.now += 10 * bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS
+    bootstrap_mod.retry_host_register(cfg, token_ref)
+    assert len(sent2) == 1
+
+
+def test_echoed_host_is_recorded(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+    _capture(monkeypatch, resp=_EchoResp(_FQDN))
+    bootstrap_mod.ensure_token(cfg)
+    assert _recorded(cfg) == _FQDN
+
+
+def test_a_different_echoed_host_is_still_recorded(agent_cfg, monkeypatch) -> None:
+    # The server read the field and kept its own value (an operator edit or the
+    # vetting rule): that is a decision, so nothing is retried.
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+    clock = _Clock(monkeypatch)
+    sent = _capture(monkeypatch, resp=_EchoResp("192.0.2.10"))
+    bootstrap_mod.ensure_token(cfg)
+    assert _recorded(cfg) == _FQDN
+    clock.now += bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS + 1
+    bootstrap_mod.retry_host_register(cfg, ["t"])
+    assert len(sent) == 1
+
+
+def test_a_failed_start_register_is_retried_in_process(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+    clock = _Clock(monkeypatch)
+    _capture(monkeypatch, resp=_FailResp())
+    assert bootstrap_mod.ensure_token(cfg)[1] == "cached"
+    clock.now += bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS
+    sent = _capture(monkeypatch)
+    token_ref = ["cached"]
+    bootstrap_mod.retry_host_register(cfg, token_ref)
+    assert [b["host"] for b in sent] == [_FQDN]
+    assert token_ref == ["t"] and _recorded(cfg) == _FQDN
+
+
+def test_the_retry_gives_up_after_its_window(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+    clock = _Clock(monkeypatch)
+    sent = _capture(monkeypatch, resp=_Resp())
+    bootstrap_mod.ensure_token(cfg)
+    token_ref = ["t"]
+    while clock.now < 1000.0 + 2 * bootstrap_mod.HOST_RETRY_WINDOW_SECONDS:
+        clock.now += bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS
+        bootstrap_mod.retry_host_register(cfg, token_ref)
+    attempts = len(sent) - 1
+    expected = bootstrap_mod.HOST_RETRY_WINDOW_SECONDS / bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS
+    assert 0 < attempts < expected
+    assert _recorded(cfg) is None
+
+
+def test_no_server_host_never_arms_a_retry(agent_cfg, monkeypatch) -> None:
+    # The appliance: nothing sent, nothing to confirm.
+    _seed(agent_cfg)
+    clock = _Clock(monkeypatch)
+    sent = _capture(monkeypatch, resp=_Resp())
+    (agent_cfg.state_dir / "agent_token.jwt").write_text("")
+    bootstrap_mod.ensure_token(agent_cfg)
+    clock.now += bootstrap_mod.HOST_RETRY_INTERVAL_SECONDS + 1
+    bootstrap_mod.retry_host_register(agent_cfg, ["t"])
+    assert len(sent) == 1

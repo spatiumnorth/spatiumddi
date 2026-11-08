@@ -243,6 +243,11 @@ class AgentRegisterResponseV2(BaseModel):
     token_expires_at: datetime
     config_etag: str | None
     pending_approval: bool
+    # #3757 — the row's stored host after this registration. Its presence tells
+    # the agent this control plane read the ``host`` it sent (a release before
+    # #3757 ignores the field and answers without it); its value may differ from
+    # what was sent when an operator edit or the vetting rule kept the row's own.
+    host: str | None = None
 
 
 class AgentHeartbeatRequest(BaseModel):
@@ -741,6 +746,7 @@ async def agent_register(
         token_expires_at=exp,
         config_etag=server.last_config_etag,
         pending_approval=pending_approval,
+        host=server.host,
     )
     # Before the agent's first poll: an agent of an older release joining a
     # group that serves the zones' own timers switches it to the literal here,

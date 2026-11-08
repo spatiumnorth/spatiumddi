@@ -103,7 +103,7 @@ def register(cfg: AgentConfig, *, max_attempts: int | None = None) -> tuple[str,
             if resp.status_code == 200:
                 data = resp.json()
                 save_token(cfg.state_dir, data["agent_token"])
-                save_registered_host(cfg.state_dir, cfg.server_host)
+                _note_host_outcome(cfg, data)
                 log.info(
                     "dns_agent_registered",
                     server_id=data["server_id"],
@@ -137,6 +137,79 @@ def register(cfg: AgentConfig, *, max_attempts: int | None = None) -> tuple[str,
         backoff = min(backoff * 2, 300.0)
 
 
+#: #3757 — when a registration carrying SERVER_HOST is answered by a control
+#: plane that does not echo ``host`` (a release before #3757: a rolling upgrade
+#: restarts this agent and the api together, so it can register against the
+#: old api pod), the host is not recorded and the registration is repeated in
+#: process every ``HOST_RETRY_INTERVAL_SECONDS`` for up to
+#: ``HOST_RETRY_WINDOW_SECONDS``, so the rollout heals without another restart.
+HOST_RETRY_INTERVAL_SECONDS = 300.0
+HOST_RETRY_WINDOW_SECONDS = 3600.0
+_host_retry_at: float | None = None
+_host_retry_until: float | None = None
+
+
+def _arm_host_retry() -> None:
+    global _host_retry_at, _host_retry_until
+    now = time.monotonic()
+    if _host_retry_until is None:
+        _host_retry_until = now + HOST_RETRY_WINDOW_SECONDS
+    _host_retry_at = now + HOST_RETRY_INTERVAL_SECONDS
+
+
+def _disarm_host_retry() -> None:
+    global _host_retry_at, _host_retry_until
+    _host_retry_at = None
+    _host_retry_until = None
+
+
+def _note_host_outcome(cfg: AgentConfig, data: dict) -> None:
+    """Record the SERVER_HOST a successful registration carried (#3757), but
+    only when the control plane says it read it: the response echoes the row's
+    stored ``host``. A different stored value is still recorded (an operator
+    edit or the vetting rule decided, on a server that knows the field). No
+    echo means an older control plane dropped the field, so the host stays
+    unrecorded and a later in-process retry is armed."""
+    if not cfg.server_host:
+        save_registered_host(cfg.state_dir, None)
+        return
+    if "host" in data:
+        save_registered_host(cfg.state_dir, cfg.server_host)
+        _disarm_host_retry()
+        return
+    log.warning("dns_agent_host_not_acknowledged", host=cfg.server_host)
+    _arm_host_retry()
+
+
+def retry_host_register(cfg: AgentConfig, token_ref: list[str]) -> None:
+    """Repeat an unacknowledged host registration once it is due (#3757).
+
+    Called from the heartbeat loop; a no-op unless a retry is armed and due,
+    so it does not register on every heartbeat. One attempt per call, never a
+    wait: serving never depends on it (non-negotiable #5).
+    """
+    if _host_retry_at is None:
+        return
+    now = time.monotonic()
+    if now < _host_retry_at:
+        return
+    if _host_retry_until is not None and now >= _host_retry_until:
+        log.warning("dns_agent_host_register_gave_up", host=cfg.server_host)
+        _disarm_host_retry()
+        return
+    with _reauth_lock:
+        if not _host_needs_registering(cfg):
+            _disarm_host_retry()
+            return
+        try:
+            _agent_id, token, _ = register(cfg, max_attempts=1)
+        except RegisterFailed as exc:
+            log.warning("dns_agent_host_register_deferred", host=cfg.server_host, reason=str(exc))
+            _arm_host_retry()
+            return
+        token_ref[0] = token
+
+
 def _host_needs_registering(cfg: AgentConfig) -> bool:
     """Whether ``SERVER_HOST`` is set and differs from the host this agent last
     registered (#3757). Unset never forces a registration: it sends no host, so
@@ -155,11 +228,12 @@ def ensure_token(cfg: AgentConfig) -> tuple[str, str]:
         # carry it; the control plane decides whether the row's host moves.
         # One attempt only: an unreachable control plane must not keep the
         # daemon from starting on its cached config (non-negotiable #5). The
-        # cached token stays valid and the next start tries again.
+        # cached token stays valid and the heartbeat loop retries later.
         try:
             agent_id, token, _ = register(cfg, max_attempts=1)
         except RegisterFailed as exc:
             log.warning("dns_agent_host_register_deferred", host=cfg.server_host, reason=str(exc))
+            _arm_host_retry()
         return agent_id, token
     if token:
         return agent_id, token
@@ -250,3 +324,4 @@ def _reset_reauth_state() -> None:
     _last_reauth_at = None
     _reauth_streak = 0
     _reauth_generation = 0
+    _disarm_host_retry()

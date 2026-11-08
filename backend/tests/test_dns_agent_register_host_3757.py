@@ -138,6 +138,25 @@ async def test_reregister_does_not_move_host_while_pending_approval(
     assert srv.host == "dns-bind9-ns1-0"
 
 
+@pytest.mark.asyncio
+async def test_register_response_echoes_the_stored_host(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The echo is how an agent tells this control plane read its ``host`` from
+    # an older one that dropped it (a rolling upgrade can answer from either).
+    r = await _register(client, monkeypatch)
+    assert r.json()["host"] == "dns-bind9-ns1-0"
+    r = await _register(client, monkeypatch, host=FQDN)
+    assert r.json()["host"] == FQDN
+    # Not what was sent but what the row holds: an operator edit is kept.
+    srv = await _server(db_session)
+    srv.host = "192.0.2.10"
+    await db_session.commit()
+    r = await _register(client, monkeypatch, host=FQDN)
+    assert r.status_code == 200, r.text
+    assert r.json()["host"] == "192.0.2.10"
+
+
 def _srv(driver: str, agent: bool, seen: str | None) -> SimpleNamespace:
     return SimpleNamespace(
         driver=driver, agent_id="a1" if agent else None, host="ns1-0", last_seen_ip=seen

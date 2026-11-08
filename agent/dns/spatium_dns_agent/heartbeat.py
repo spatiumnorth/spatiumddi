@@ -10,7 +10,7 @@ import httpx
 import structlog
 
 from . import __version__, features
-from .bootstrap import reauthenticate
+from .bootstrap import reauthenticate, retry_host_register
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
@@ -226,6 +226,12 @@ class HeartbeatClient:
     def run(self) -> None:
         while not self._stop.is_set():
             self.send_once()
+            try:
+                # #3757 — repeat a host registration an older control plane
+                # did not acknowledge; a no-op unless one is armed and due.
+                retry_host_register(self.cfg, self.token_ref)
+            except Exception as exc:  # noqa: BLE001 — never costs the heartbeat
+                log.warning("dns_agent_host_retry_failed", error=str(exc))
             # ±3s jitter on the 30s interval
             interval = self.cfg.heartbeat_interval + random.uniform(-3, 3)
             self._stop.wait(timeout=max(5.0, interval))
