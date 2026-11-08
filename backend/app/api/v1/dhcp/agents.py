@@ -97,7 +97,7 @@ from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.ipam.utilization import recount_subnets_and_blocks
-from app.services.lock_order import lock_zones_for_addresses
+from app.services.lock_order import lock_scope_gates, lock_zones_for_addresses
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -1458,6 +1458,16 @@ async def agent_lease_events(
         subnet = subnet_for_ip.get(ip)
         return scope_cache.get(subnet.id) if subnet is not None else None
 
+    # #3748 — the scopes' gates, shared, before the batch's first row lock:
+    # a delete waiting for the scope row ``FOR UPDATE`` is not starved by a
+    # second agent's batch joining the ``FOR KEY SHARE`` below.
+    live_scope_ids = {
+        scope_cache[sn.id]
+        for sn in subnet_for_ip.values()
+        if sn is not None and sn.id in scope_cache
+    }
+    await lock_scope_gates(db, live_scope_ids, exclusive=False)
+
     existing_leases = (
         (
             await db.execute(
@@ -1519,11 +1529,6 @@ async def agent_lease_events(
     # that holds the scope, and a batch that comes after it waits for the
     # stamp and finds the scope gone. An event of a scope in the Trash is
     # history, as a superseded grant is (#2391): acknowledged, never written.
-    live_scope_ids = {
-        scope_cache[sn.id]
-        for sn in subnet_for_ip.values()
-        if sn is not None and sn.id in scope_cache
-    }
     gone_scope_ids: set[Any] = set()
     if live_scope_ids:
         still_live = set(
