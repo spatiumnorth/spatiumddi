@@ -259,16 +259,35 @@ async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUI
 
 
 async def _lock_scope_batch_rows(db: AsyncSession, batch: Any) -> None:
-    """#3617: lock what a block / space delete's cascade will write, in the
-    mirror → zone order every lease-path writer takes
-    (``app.services.lock_order``): the lease mirrors of its subnets, then the
-    zones its subnets publish into or are linked to. Call before the first of
-    them is written: the reverse-zone retirement writes zones. The batch's
-    scopes' lease rows are not taken: their teardown runs after the commit, in
-    committed batches that take them in that order themselves (#3744)."""
+    """#3617: lock what a subnet / block / space delete's cascade will write,
+    in the scope → mirror → zone order every lease-path writer takes
+    (``app.services.lock_order``): the batch's scope rows, the lease mirrors
+    of its subnets, then the zones its subnets publish into or are linked to.
+    Call before the first of them is written: the reverse-zone retirement
+    writes zones.
+
+    The scope rows are taken ``FOR UPDATE``, ascending id, as the scope delete
+    takes its own (#3733): a lease-events batch holds the scopes its events
+    resolve to ``FOR KEY SHARE`` from its re-read until its commit, and the
+    stamp's plain UPDATE (``FOR NO KEY UPDATE``) does not wait for that. So a
+    batch that read a scope as live could write a lease, a mirror and a DDNS
+    record into it after this delete committed and its teardown had passed
+    (#3744). The batch's scopes' lease rows are not taken: their teardown runs
+    after the commit, in committed batches that take them in that order
+    themselves (#3744)."""
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
     from app.services.lock_order import lock_zones_for_subnets  # noqa: PLC0415
 
+    scope_ids = _batch_scope_ids(batch)
+    if scope_ids:
+        await db.execute(
+            select(DHCPScope.id)
+            .where(DHCPScope.id.in_(scope_ids))
+            .order_by(DHCPScope.id)
+            .with_for_update()
+            .execution_options(include_deleted=True)
+        )
     subnet_ids = sorted(row.obj.id for row in batch.rows if isinstance(row.obj, Subnet))
     if subnet_ids:
         await db.execute(
@@ -475,7 +494,7 @@ async def _apply_delete_subnet(
         from app.services.dns.reverse_zone import retire_auto_reverse_zones  # noqa: PLC0415
 
         batch = await collect_soft_delete_batch(db, subnet)
-        await _lock_scope_batch_rows(db, batch)  # #3617: mirrors, then zones
+        await _lock_scope_batch_rows(db, batch)  # #3617: scopes, mirrors, then zones
         # spatiumddi#1066 — the reverse zone this subnet auto-created rides
         # the same batch (restore brings both back) unless a sibling subnet
         # still lives in it, in which case it is re-linked and stays.
@@ -1213,9 +1232,7 @@ async def _preview_delete_scope(
     )
 
 
-async def _tear_down_trashed_scopes_leases(
-    db: AsyncSession, scope_ids: list[UUID], *, hand_on: bool = True
-) -> bool:
+async def _tear_down_trashed_scopes_leases(db: AsyncSession, scope_ids: list[UUID]) -> bool:
     """The leases of scopes a delete just put in the Trash, after its commit
     (#3733, #3744). Returns whether every one of them is torn down.
 
@@ -1226,10 +1243,10 @@ async def _tear_down_trashed_scopes_leases(
     the proxy's 60 s while it carried on. Now the scopes are in the Trash first,
     where the lease-events handler takes no event for them, and the leases go
     in committed batches (``tear_down_scope_leases``) under one time bound for
-    the request (the server delete's, #2290). With ``hand_on``, what is left
-    when it runs out is handed to the background task, scope by scope; a lost
-    enqueue is picked up by the lease sweep. A group delete, which takes the
-    scopes themselves away, finishes the rest in its own transaction instead.
+    the request (the server delete's, #2290). What is left when it runs out
+    is handed to the background task, scope by scope; a lost enqueue is picked
+    up by the lease sweep. A group delete, which takes the scopes themselves
+    away, is refused until that has finished.
     """
     import time  # noqa: PLC0415
 
@@ -1259,7 +1276,7 @@ async def _tear_down_trashed_scopes_leases(
                 "dhcp_scope_delete_lease_teardown_handed_on", scope=str(sid), torn_down=removed
             )
             left.append(sid)
-    if left and hand_on:
+    if left:
         try:
             from app.tasks.dhcp_lease_cleanup import tear_down_trashed_scope_leases
 
@@ -1593,15 +1610,20 @@ async def _apply_delete_group(
     # so the IPs fold back into free gaps. The scopes' dynamic leases (nullable
     # ON DELETE SET NULL backlink) would otherwise survive the group delete, so
     # tear those + their mirrors down too.
-    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.models.dhcp import DHCPLease, DHCPScope  # noqa: PLC0415
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope  # noqa: PLC0415
     from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics  # noqa: PLC0415
 
     # #3744 — the scopes are in the Trash already, so their leases go first, in
-    # committed batches, and the delete below finds few or none. Their teardown
-    # held to this transaction's commit kept every lease-events batch renewing
-    # one of them waiting. What the deadline leaves, the loop below tears down
-    # as before. The commit ends this transaction: read what the rest needs.
+    # committed batches, and the delete below finds none. Their teardown held
+    # to this transaction's commit kept every lease-events batch renewing one
+    # of them waiting, and ran the delete past the proxy's 60 s. What the
+    # deadline leaves is handed to the scopes' background task and the delete
+    # is refused until it has finished: torn down here instead, in this
+    # transaction, it would hold those leases' rows to the commit again, and
+    # left to the group's FK CASCADE the leases would outlive their scopes
+    # with no scope to find them by. The commit ends this transaction: read
+    # what the rest needs.
     group_id = g.id
     trashed_ids = (
         (
@@ -1616,7 +1638,24 @@ async def _apply_delete_group(
         .all()
     )
     if trashed_ids:
-        await _tear_down_trashed_scopes_leases(db, list(trashed_ids), hand_on=False)
+        if not await _tear_down_trashed_scopes_leases(db, list(trashed_ids)):
+            left = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(DHCPLease)
+                    .where(DHCPLease.scope_id.in_(list(trashed_ids)))
+                )
+            ).scalar_one()
+            await db.commit()  # ends the read
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"The DHCP server group's scopes in the Trash still hold {left} "
+                    "lease(s), which are being torn down in the background. Retry "
+                    "the delete in a minute."
+                ),
+                headers={"Retry-After": "60"},
+            )
         refreshed = await db.get(DHCPServerGroup, group_id)
         if refreshed is None:
             raise HTTPException(
