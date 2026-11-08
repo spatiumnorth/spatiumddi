@@ -1270,6 +1270,13 @@ async def _apply_delete_scope(
     if args.permanent:
         ensure_superadmin(user)
 
+    # #3748 — the scope's gate, exclusive, before any row lock: lease-events
+    # batches from both members of an HA pair hold the scope ``FOR KEY SHARE``
+    # in overlapping turns, which starves the ``FOR UPDATE`` below; the gate
+    # queues them behind this delete instead.
+    from app.services.lock_order import lock_scope_gates  # noqa: PLC0415
+
+    await lock_scope_gates(db, [args.scope_id], exclusive=True)
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
