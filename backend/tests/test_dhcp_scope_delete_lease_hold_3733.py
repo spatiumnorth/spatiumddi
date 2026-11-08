@@ -181,3 +181,84 @@ async def test_the_lease_sweep_leaves_a_scope_trashed_within_its_grace_to_the_de
 
     await lease_tasks._run_both()
     assert await _counts(db_session, server, subnet) == seeded
+
+
+@pytest.mark.asyncio
+async def test_the_wake_is_published_before_the_inline_teardown_runs(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3748: Kea must stop serving the trashed scope when the stamp commits,
+    not after the inline teardown (up to 20 s) has run."""
+    from app.core import agent_wake
+
+    server, scope_id, _subnet, admin = await _seeded(concurrent_client, db_session)
+    log: list[str] = []
+    real_publish = agent_wake.publish_wake
+
+    async def _publish(*channels: str) -> None:
+        log.append("wake")
+        await real_publish(*channels)
+
+    real_teardown = lease_cleanup.tear_down_scope_leases
+
+    async def _teardown(*args: Any, **kwargs: Any) -> Any:
+        log.append("teardown")
+        return await real_teardown(*args, **kwargs)
+
+    monkeypatch.setattr(agent_wake, "publish_wake", _publish)
+    monkeypatch.setattr(lease_cleanup, "tear_down_scope_leases", _teardown)
+
+    gone = await concurrent_client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=admin)
+    assert gone.status_code == 204, gone.text
+    assert "teardown" in log and "wake" in log, log
+    assert log.index("wake") < log.index("teardown"), log
+
+
+@pytest.mark.asyncio
+async def test_a_failing_teardown_batch_still_answers_the_committed_delete(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3748: a batch that raises after the stamp committed must not answer 500
+    for a delete that happened: 204, the scope in the Trash, the task enqueued,
+    and the delete's audit row there."""
+    from app.models.audit import AuditLog
+
+    async def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(lease_cleanup, "tear_down_scope_leases", _boom)
+    handed: list[str] = []
+
+    class _Task:
+        @staticmethod
+        def delay(scope_id: str) -> None:
+            handed.append(scope_id)
+
+    monkeypatch.setattr(lease_tasks, "tear_down_trashed_scope_leases", _Task, raising=False)
+    _server, scope_id, _subnet, admin = await _seeded(concurrent_client, db_session)
+
+    gone = await concurrent_client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=admin)
+    assert gone.status_code == 204, gone.text
+    assert handed == [str(scope_id)]
+    trashed = (
+        await db_session.execute(
+            select(DHCPScope.deleted_at)
+            .where(DHCPScope.id == scope_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    assert trashed is not None
+    audit = (
+        await db_session.execute(
+            select(AuditLog.result).where(
+                AuditLog.resource_type == "dhcp_scope",
+                AuditLog.resource_id == str(scope_id),
+                AuditLog.action == "soft_delete",
+            )
+        )
+    ).scalar_one()
+    assert audit == "success"

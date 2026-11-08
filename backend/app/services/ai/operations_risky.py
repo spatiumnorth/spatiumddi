@@ -1213,9 +1213,20 @@ async def _tear_down_trashed_scope_leases(db: AsyncSession, scope_id: UUID) -> N
         tear_down_scope_leases,
     )
 
-    removed, _mirrors, done = await tear_down_scope_leases(
-        db, scope_id, deadline_s=SCOPE_DELETE_INLINE_DEADLINE_S
-    )
+    removed = 0
+    try:
+        removed, _mirrors, done = await tear_down_scope_leases(
+            db, scope_id, deadline_s=SCOPE_DELETE_INLINE_DEADLINE_S
+        )
+    except Exception as exc:  # noqa: BLE001 — #3748: the delete committed above; a
+        # failed batch (a statement timeout, say) must not answer 500 for it. Not
+        # BaseException: cancellation still propagates. The batches already
+        # committed stay; the task tears down the rest.
+        logger.warning(
+            "dhcp_scope_delete_lease_teardown_failed", scope=str(scope_id), error=str(exc)
+        )
+        await db.rollback()
+        done = False
     if done:
         return
     logger.info(
@@ -1239,7 +1250,7 @@ async def _apply_delete_scope(
     from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
-    from app.core.agent_wake import collect_wake, dhcp_group_channel
+    from app.core.agent_wake import collect_wake, dhcp_group_channel, publish_wake
     from app.models.dhcp import DHCPScope
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope, scope_lease_counts
     from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
@@ -1271,7 +1282,8 @@ async def _apply_delete_scope(
         ).scalar_one_or_none()
         if locked is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
-    collect_wake(dhcp_group_channel(scope.group_id))
+    group_id = scope.group_id  # read now: the commit expires ``scope``
+    collect_wake(dhcp_group_channel(group_id))
 
     # Deleted means deleted on every backend (#616). Agent-based (Kea) members
     # converge by themselves — the soft-deleted scope drops straight out of the
@@ -1325,6 +1337,10 @@ async def _apply_delete_scope(
             )
         await recount_subnets_and_blocks(db, touched)
         await db.commit()
+        # #3748 — Kea stops serving the trashed scope now, not after the teardown.
+        # Still collected above too, so the router's flush publishes it a second
+        # time: wakes are advisory and a duplicate only re-reads the same state.
+        await publish_wake(dhcp_group_channel(group_id))
         await _tear_down_trashed_scope_leases(db, args.scope_id)
         return {"scope_id": str(args.scope_id), "mode": "soft_delete"}
 
