@@ -276,7 +276,13 @@ async def purge_lease(
             )
         ).scalar_one_or_none()
         if mirror is not None:
-            subnet = await db.get(Subnet, sid)
+            # Read in the Trash too: a subnet delete tears its scopes' leases
+            # down after the subnet is stamped (#3744).
+            subnet = (
+                await db.execute(
+                    select(Subnet).where(Subnet.id == sid).execution_options(include_deleted=True)
+                )
+            ).scalar_one_or_none()
             if subnet is not None:
                 # Revoke DDNS BEFORE deleting the mirror — it reads
                 # dns_record_id / hostname off the row. Best-effort.

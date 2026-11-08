@@ -1,0 +1,3 @@
+### Fixed
+
+- Deleting a subnet, block, space or DHCP server group no longer holds every lease row of its scopes until it commits. The delete now puts them in the Trash and commits first, then tears the leases down in committed batches (as the scope delete does since #3733), so lease-events batches renewing them keep answering and the DELETE no longer runs into the proxy timeout. A lease grant in flight when the subnet, block or space is deleted no longer leaves a lease, an IPAM address and a DNS record behind in the Trash. A server group delete whose scopes in the Trash still hold more leases than it can tear down in 20 s now answers 409 with `Retry-After` and finishes the teardown in the background, instead of holding them in its own transaction (#3744).
