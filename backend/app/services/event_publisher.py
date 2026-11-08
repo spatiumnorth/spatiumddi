@@ -232,6 +232,23 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
 _REFUSED_RESULTS = frozenset({"denied", "forbidden"})
 
 
+def _records_refusal(row: AuditLog) -> bool:
+    """True when ``row`` records a request that was refused, not an action.
+
+    Besides the ``denied`` / ``forbidden`` rows, a sign-in that did not
+    succeed is a refusal too: ``login`` rows carry ``failure`` (bad
+    credentials, locked account) or ``error`` (an external provider
+    answered no / could not be reached). Those are written for anonymous
+    callers, and would otherwise reach every subscribe-to-everything
+    webhook as ``auth.user.login`` / ``auth.provider.login``. ``failure``
+    cannot join the denylist itself: ``backup_target_run_failed`` writes
+    it for a run that really failed, which is ``system.backup_failed``.
+    """
+    if row.result in _REFUSED_RESULTS:
+        return True
+    return row.action == "login" and row.result != "success"
+
+
 def _audit_to_event_type(action: str, resource_type: str) -> str | None:
     """Translate ``(action, resource_type)`` → typed event name."""
     special = _SPECIAL_EVENT_MAP.get((action, resource_type))
@@ -384,7 +401,7 @@ def _register_session_listener() -> None:
             return
         snapshots = getattr(session, _PENDING_ATTR, None) or []
         for row in new_audits:
-            if row.result in _REFUSED_RESULTS:
+            if _records_refusal(row):
                 continue
             event_type = _audit_to_event_type(row.action, row.resource_type)
             if event_type is None:
