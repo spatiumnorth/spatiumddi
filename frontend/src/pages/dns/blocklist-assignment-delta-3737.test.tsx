@@ -4,7 +4,13 @@
  * #3737: Apply / Detach / bulk Apply / Save scope change only THIS group's
  * membership, sent as deltas — never the whole set built from the tab's copy.
  */
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -96,5 +102,84 @@ describe("blocklist assignment deltas (#3737)", () => {
     await userEvent.click(screen.getByRole("button", { name: /Save scope/ }));
     await waitFor(() => expect(updateAssignments).toHaveBeenCalled());
     expect(updateAssignments).toHaveBeenCalledWith("l1", {});
+  });
+
+  it("row Detach sends a remove delta for this group only", async () => {
+    // The tab's copy says g1 only; another client has since attached g2.
+    list.mockResolvedValue([mkList("l1", "ads-list", ["g1"])]);
+    updateAssignments.mockResolvedValue({});
+    wrap(<BlocklistsTab group={group} />);
+    await screen.findByText("ads-list");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: /^Detach$/ })[0],
+    );
+    await waitFor(() => expect(updateAssignments).toHaveBeenCalled());
+    expect(updateAssignments).toHaveBeenCalledWith("l1", {
+      remove_server_group_ids: ["g1"],
+    });
+  });
+
+  it("bulk Apply and bulk Detach send per-list deltas", async () => {
+    list.mockResolvedValue([
+      mkList("l1", "applied-list", ["g1", "g2"]),
+      mkList("l2", "other-list", ["g3"]),
+    ]);
+    updateAssignments.mockResolvedValue({});
+    wrap(<BlocklistsTab group={group} />);
+    await screen.findByText("applied-list");
+    for (const name of ["applied-list", "other-list"]) {
+      const row = screen.getByText(name).closest("div")!;
+      await userEvent.click(within(row).getByRole("checkbox"));
+    }
+    await userEvent.click(
+      screen.getByRole("button", { name: /^Apply \(1\)$/ }),
+    );
+    await waitFor(() => expect(updateAssignments).toHaveBeenCalledTimes(1));
+    expect(updateAssignments).toHaveBeenCalledWith("l2", {
+      add_server_group_ids: ["g1"],
+    });
+
+    updateAssignments.mockClear();
+    for (const name of ["applied-list", "other-list"]) {
+      const row = screen.getByText(name).closest("div")!;
+      const box = within(row).getByRole("checkbox") as HTMLInputElement;
+      if (!box.checked) await userEvent.click(box);
+    }
+    await userEvent.click(
+      screen.getByRole("button", { name: /^Detach \(1\)$/ }),
+    );
+    await waitFor(() => expect(updateAssignments).toHaveBeenCalledTimes(1));
+    expect(updateAssignments).toHaveBeenCalledWith("l1", {
+      remove_server_group_ids: ["g1"],
+    });
+  });
+
+  it("Save scope sends only the view ticks that changed", async () => {
+    updateAssignments.mockResolvedValue({});
+    const views = [
+      { id: "v1", name: "inside", group_id: "g1", match_clients: [] },
+      { id: "v2", name: "outside", group_id: "g1", match_clients: [] },
+    ];
+    wrap(
+      <BlocklistScopeModal
+        list={
+          {
+            ...mkList("l1", "ads-list", ["g2"]),
+            applied_view_ids: ["v1", "v-other-group"],
+          } as never
+        }
+        group={group}
+        views={views as never}
+        onClose={() => {}}
+      />,
+    );
+    await userEvent.click(screen.getByRole("checkbox", { name: /inside/ }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /outside/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Save scope/ }));
+    await waitFor(() => expect(updateAssignments).toHaveBeenCalled());
+    expect(updateAssignments).toHaveBeenCalledWith("l1", {
+      add_view_ids: ["v2"],
+      remove_view_ids: ["v1"],
+    });
   });
 });
