@@ -442,6 +442,13 @@ async def tear_down_scope_leases(
     their mirrors' records, ``lock_zones_for_lease_mirrors``), tears them down
     and commits.
 
+    Each batch holds the scope row ``FOR SHARE`` from its trashed check to its
+    commit (#3777): a Trash restore un-stamps the row (an UPDATE, which
+    conflicts with FOR SHARE but not with a lease-events batch's FOR KEY
+    SHARE), so it waits for the batch in flight, at most one, and the next
+    batch finds the scope live and stops. Without it a restore that committed
+    mid-batch still lost that batch's leases.
+
     Runs only while the scope is in the Trash, since the lease-events handler
     takes no event for a scope there: no batch can bring a lease back behind
     the teardown. It stops when the scope is restored (the next events
@@ -460,6 +467,7 @@ async def tear_down_scope_leases(
             await db.execute(
                 select(DHCPScope.subnet_id, DHCPScope.deleted_at)
                 .where(DHCPScope.id == scope_id)
+                .with_for_update(read=True, of=DHCPScope)  # #3777: held to the batch's commit
                 .execution_options(include_deleted=True)
             )
         ).one_or_none()

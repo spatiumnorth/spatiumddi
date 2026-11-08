@@ -69,6 +69,11 @@ writes, takes no lease row in that transaction, and tears the scope's leases
 down after its commit, one batch per transaction, each batch in the order
 above. So the stamp waits for a batch that already holds the scope, and a
 later batch waits for the stamp and finds the scope in the Trash.
+Each teardown batch also takes its scope row ``FOR SHARE`` before its lease
+rows (#3777), so a Trash restore (an UPDATE of ``deleted_at``) waits for the
+batch in flight and the next batch finds the scope live. ``FOR SHARE`` does
+not conflict with a lease-events batch's ``FOR KEY SHARE``, so the events
+path (scope after lease) cannot cycle with it.
 
 ``tests/_row_lock_order_guard.py`` asserts the order for the whole test suite.
 """
