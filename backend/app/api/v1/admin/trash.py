@@ -786,8 +786,24 @@ async def restore_row(
     }:
         await _update_block_utilization(db, bid)
 
+    # #3787 — the lease mirrors a restored subnet / scope brings back lost
+    # their A / PTR when the delete withdrew them; DDNS re-publishes them
+    # after the commit (chunked, idempotent), not 100 ms a lease in here.
+    republish_subnet_ids = {o.id for o in restored if isinstance(o, Subnet)} | {
+        o.subnet_id for o in restored if isinstance(o, DHCPScope)
+    }
+
     db.add_all(audit_rows)
     await db.commit()
+    if republish_subnet_ids:
+        from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            republish_restored_lease_ddns_task,
+        )
+
+        try:
+            republish_restored_lease_ddns_task.delay([str(i) for i in republish_subnet_ids])
+        except Exception as exc:  # noqa: BLE001 — the restore is committed; the sweep backstops
+            logger.warning("trash.restore_ddns_enqueue_failed", error=str(exc))
     # This router carries no wake_publishing dependency (see the purge below),
     # so the create ops queued above are announced here, after the commit.
     for gid in restore_wake_groups:
