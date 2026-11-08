@@ -60,18 +60,23 @@ insert's foreign-key check (``FOR KEY SHARE`` on its zone) is not blocked by
 it.
 
 A scope's **gate** (#3748, :func:`lock_scope_gates`) sits beside it at step 0,
-ahead of the zone gate: shared for a lease-events batch, exclusive for the
-scope delete that takes the row ``FOR UPDATE``. It exists because Postgres
-lets a new ``FOR KEY SHARE`` join while another is held even when a ``FOR
-UPDATE`` is queued, so a Kea HA pair's overlapping batches starved the delete
-past the command timeout; a new shared advisory request does queue behind a
-waiting exclusive one. Taken in ascending key order, by the two takers that
-use it, neither of which takes a zone gate, with no row lock held that the
-other side waits for (a batch has inserted its ingest receipt, which no delete
-touches). A scope edit needs no gate: its UPDATE changes no key column, so it
-takes the row ``FOR NO KEY UPDATE``, which a ``FOR KEY SHARE`` does not block.
-Any other delete that takes scope rows ``FOR UPDATE`` (a subnet, block or space
-delete's cascade) must take their gates exclusive before its first row lock.
+ahead of the zone gate: shared for a lease-events batch, exclusive for every
+delete that takes scope rows ``FOR UPDATE`` or deletes them — the scope delete,
+and the subnet, block and space deletes, for every live scope their cascade
+reaches (soft: before ``_lock_scope_batch_rows``; a permanent subnet delete:
+before its lease rows). It exists because Postgres lets a new ``FOR KEY
+SHARE`` join while another is held even when a ``FOR UPDATE`` is queued, so a
+Kea HA pair's overlapping batches starved the delete past the command timeout;
+a new shared advisory request does queue behind a waiting exclusive one. Taken
+in ascending key order, as each transaction's first lock (the deletes compute
+their scope ids with plain reads), by takers none of which takes a zone gate,
+with no row lock held that the other side waits for (a batch has inserted its
+ingest receipt, which no delete touches). A scope edit needs no gate: its
+UPDATE changes no key column, so it takes the row ``FOR NO KEY UPDATE``, which
+a ``FOR KEY SHARE`` does not block. A DHCP server-group delete needs none
+either: it refuses a group that still has servers, so no agent can post a
+batch for its scopes. Any new delete that takes scope rows ``FOR UPDATE`` must
+take their gates exclusive before its first row lock.
 
 A scope row (``dhcp_scope``) sits between steps 1 and 2 for the lease writers
 that must not write into a scope in the Trash and the delete that puts it there

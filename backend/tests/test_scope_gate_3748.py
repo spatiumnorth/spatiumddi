@@ -282,3 +282,98 @@ async def test_a_scope_edit_needs_no_gate_under_the_same_load(
     assert resp.status_code == 200, resp.text
     assert took < _HOLD, took
     assert answered and all(code == 200 for _t, code in answered), answered
+
+
+# ── The subnet, block and space deletes' cascades (#3744 locks their scopes) ──
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_delete_goes_through_while_both_agents_of_a_pair_post_its_leases(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subnet soft-delete takes its scopes ``FOR UPDATE`` (#3744), so it was
+    starved by the pair's batches exactly as the scope delete was: it must
+    answer 204 inside its budget, and the batches behind it 200, writing
+    nothing into the trashed scope."""
+    servers, _scope_id, subnet, admin = await _pair_estate(db_session)
+    resp, took, answered, answered_at = await _under_load(
+        concurrent_client,
+        servers,
+        monkeypatch,
+        lambda: concurrent_client.delete(f"/api/v1/ipam/subnets/{subnet.id}", headers=admin),
+    )
+    assert resp.status_code == 204, resp.text
+    assert took < _BUDGET
+    assert answered and all(code == 200 for _t, code in answered), answered
+    assert any(t > answered_at for t, _c in answered), "no batch ran after the delete"
+    from sqlalchemy import func, select  # noqa: PLC0415
+
+    from app.models.dhcp import DHCPLease  # noqa: PLC0415
+
+    for server in servers:
+        left = (
+            await db_session.execute(
+                select(func.count()).select_from(DHCPLease).where(DHCPLease.server_id == server.id)
+            )
+        ).scalar_one()
+        assert left == 0, (server.name, left)
+
+
+def _gate_first(seen: list[tuple[str, Any]]) -> None:
+    """The scope gate (exclusive, its namespace) comes before every row lock."""
+    from app.services.lock_order import SCOPE_GATE_NS  # noqa: PLC0415
+
+    def _is_gate(stmt: str, params: Any) -> bool:
+        values = params.values() if isinstance(params, dict) else (params or ())
+        return (
+            "pg_advisory_xact_lock(" in stmt
+            and "pg_advisory_xact_lock_shared" not in stmt
+            and SCOPE_GATE_NS in tuple(values)
+        )
+
+    i_gate = next((i for i, (s, p) in enumerate(seen) if _is_gate(s, p)), None)
+    assert i_gate is not None, "no exclusive scope gate taken"
+    i_row = next(
+        (i for i, (s, _p) in enumerate(seen) if " FOR " in s and "pg_advisory" not in s), None
+    )
+    assert i_row is not None and i_gate < i_row, (i_gate, i_row)
+
+
+@contextlib.contextmanager
+def _statements_with_params() -> Iterator[list[tuple[str, Any]]]:
+    seen: list[tuple[str, Any]] = []
+
+    def _record(conn: Any, cursor: Any, statement: str, params: Any, *a: Any) -> None:
+        if "pg_advisory_xact_lock" in statement or " FOR " in statement:
+            seen.append((statement, params))
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
+
+
+@pytest.mark.parametrize("kind", ["subnet", "subnet-permanent", "block", "space"])
+@pytest.mark.asyncio
+async def test_a_cascading_delete_takes_the_scope_gate_before_its_first_row_lock(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    kind: str,
+) -> None:
+    """Every delete that takes or deletes a live scope's row takes that scope's
+    gate exclusive as its first lock (step 0), or it waits behind a pair's
+    batches as the scope delete did."""
+    _server, _scope_id, subnet, admin = await _estate(db_session)
+    url = {
+        "subnet": f"/api/v1/ipam/subnets/{subnet.id}",
+        "subnet-permanent": f"/api/v1/ipam/subnets/{subnet.id}?permanent=true&force=true",
+        "block": f"/api/v1/ipam/blocks/{subnet.block_id}",
+        "space": f"/api/v1/ipam/spaces/{subnet.space_id}",
+    }[kind]
+    with _statements_with_params() as seen:
+        r = await concurrent_client.delete(url, headers=admin)
+    assert r.status_code == 204, r.text
+    _gate_first(seen)
