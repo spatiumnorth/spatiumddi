@@ -1282,7 +1282,7 @@ async def _apply_delete_scope(
         ).scalar_one_or_none()
         if locked is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
-    group_id = scope.group_id  # read now: the commit expires ``scope``
+    group_id = scope.group_id  # read before anything can expire ``scope``
     collect_wake(dhcp_group_channel(group_id))
 
     # Deleted means deleted on every backend (#616). Agent-based (Kea) members

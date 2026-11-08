@@ -227,7 +227,8 @@ async def test_a_failing_teardown_batch_still_answers_the_committed_delete(
     and the delete's audit row there."""
     from app.models.audit import AuditLog
 
-    async def _boom(*_a: Any, **_k: Any) -> Any:
+    async def _boom(db: AsyncSession, *_a: Any, **_k: Any) -> Any:
+        await db.execute(select(1))  # a real failure leaves a transaction open
         raise RuntimeError("canceling statement due to statement timeout")
 
     monkeypatch.setattr(lease_cleanup, "tear_down_scope_leases", _boom)
@@ -262,3 +263,49 @@ async def test_a_failing_teardown_batch_still_answers_the_committed_delete(
         )
     ).scalar_one()
     assert audit == "success"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_teardown_batch_leaves_the_copilot_apply_answering_ok(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3748: the Copilot apply keeps using the acting user after the operation
+    returns; the teardown's rollback expires it, so it must be reloaded or the
+    next attribute read raises MissingGreenlet and a delete that happened
+    answers as a failure."""
+    from fastapi import Request
+
+    from app.api.v1.ai.proposals import apply_proposal
+    from app.models.ai import AIOperationProposal
+    from app.services.ai import operations
+    from tests.test_dhcp_scope_lease_teardown import _make_admin, _make_scope
+
+    async def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(lease_cleanup, "tear_down_scope_leases", _boom)
+    monkeypatch.setattr(
+        lease_tasks,
+        "tear_down_trashed_scope_leases",
+        type("_T", (), {"delay": staticmethod(lambda _s: None)}),
+        raising=False,
+    )
+    admin, _token = await _make_admin(db_session)
+    scope, _subnet, _group = await _make_scope(db_session)
+    row = AIOperationProposal(
+        session_id=None,
+        user_id=admin.id,
+        operation="delete_scope",
+        args={"scope_id": str(scope.id), "permanent": False},
+        preview_text="preview",
+        expires_at=operations.expires_at_default(),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/api/v1/ai/proposals/apply", "headers": []}
+    )
+
+    resp = await apply_proposal(row.id, admin, db_session, request)
+    assert resp.ok is True, resp.detail
