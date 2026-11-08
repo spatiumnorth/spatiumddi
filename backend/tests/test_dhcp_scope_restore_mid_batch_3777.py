@@ -3,14 +3,16 @@
 ``tear_down_scope_leases`` checked the scope's ``deleted_at`` with a plain
 read, then purged up to ``SCOPE_DELETE_BATCH`` leases. A restore that
 committed between the check and the batch's commit still lost that batch. The
-batch now holds the scope row ``FOR SHARE``, so the restore (an UPDATE of the
-row) waits for it, and the next batch finds the scope live and stops.
+batch now holds the scope row ``FOR SHARE`` (after its lease rows), so the
+restore (an UPDATE of the row) waits for it, and the next batch finds the
+scope live and stops.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -43,7 +45,10 @@ async def test_a_restore_waits_for_the_teardown_batch_in_flight(
     ).scalar_one()
     scope = await db_session.get(DHCPScope, scope_id)
     assert scope is not None
+    # Stamped as a delete stamps it: with a batch id, or the restore's
+    # defensive stamp of one writes the scope row before anything else.
     scope.deleted_at = datetime.now(UTC)
+    scope.deletion_batch_id = uuid.uuid4()
     await db_session.commit()
 
     real = lease_cleanup.purge_lease

@@ -1,3 +1,3 @@
 ### Fixed
 
-- Restoring a DHCP scope from the Trash while its leases are being torn down no longer loses the batch in flight: the restore now waits for that batch (at most 25 leases) and the teardown then stops on the live scope (#3777).
+- Restoring a DHCP scope, or the subnet, block or space holding it, from the Trash while its leases are being torn down now waits for the teardown batch in flight (at most 25 leases) and answers only once the teardown has stopped; no lease goes after the restore answers (#3777).

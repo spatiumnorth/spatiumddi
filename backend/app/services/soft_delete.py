@@ -874,6 +874,23 @@ async def restore_batch(
         zone_ids_for_subnets,
     )
 
+    # #3777: the restored scopes' rows first, ascending id, ``FOR NO KEY
+    # UPDATE`` (the lock their un-stamp takes anyway, which a lease-events
+    # batch's ``FOR KEY SHARE`` does not block). A scope's lease teardown holds
+    # its row ``FOR SHARE`` and then locks the zones of its mirrors, so an
+    # un-stamp flushed after the zones below would wait for a batch that waits
+    # for those zones. The scope sits before the zones in the order
+    # (``app.services.lock_order``).
+    restored_scope_ids = sorted(o.id for o in result.restored if isinstance(o, DHCPScope))
+    if restored_scope_ids:
+        await db.execute(
+            select(DHCPScope.id)
+            .where(DHCPScope.id.in_(restored_scope_ids))
+            .order_by(DHCPScope.id)
+            .with_for_update(key_share=True, of=DHCPScope)
+            .execution_options(include_deleted=True)
+        )
+
     to_lock: set[Any] = set(zone_ids)
     to_lock.update(o.zone_id for o in result.restored if isinstance(o, DNSRecord))
     to_lock.update(
