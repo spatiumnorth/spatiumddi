@@ -9333,6 +9333,7 @@ async def _lock_dns_sync_rows(
     zone_ids: Iterable[uuid.UUID] = (),
     ddns: bool = False,
     restrict_subnet_id: uuid.UUID | None = None,
+    gate_zones: bool = False,
 ) -> list[uuid.UUID]:
     """Lock a DNS sync's rows in the global order (#3724): ``address_ids``
     ascending, then every zone their syncs may write plus ``zone_ids``,
@@ -9343,26 +9344,57 @@ async def _lock_dns_sync_rows(
     while it wrote the next address, which a permanent zone delete (address
     rows, then the zone, #3691) could hold: 40P01. ``ddns`` adds each
     subnet's DDNS override zone (the lease re-apply publishes into it);
-    ``restrict_subnet_id`` leaves out addresses the sync will not publish."""
+    ``restrict_subnet_id`` leaves out addresses the sync will not publish.
+
+    ``gate_zones`` first takes, shared, the sync gate of every zone the rows
+    may write (``lock_zone_gate``, before any row lock; the caller must hold
+    none): a permanent zone delete takes it exclusive, so it queues ahead of
+    the caller's next batch instead of losing to it at the commit boundary."""
     from app.services.lock_order import (  # noqa: PLC0415
         lock_address_rows,
+        lock_zone_gate,
         lock_zones_for_addresses,
+        zone_ids_for_addresses,
     )
 
-    ordered = await lock_address_rows(db, address_ids)
-    subnets: dict[uuid.UUID, Subnet | None] = {}
-    publishing: list[tuple[Subnet, IPAddress]] = []
-    for i in range(0, len(ordered), 1000):
-        q = select(IPAddress).where(IPAddress.id.in_(ordered[i : i + 1000]))
-        if restrict_subnet_id is not None:
-            q = q.where(IPAddress.subnet_id == restrict_subnet_id)
-        for ip in (await db.execute(q.order_by(IPAddress.id))).scalars().all():
-            if ip.subnet_id not in subnets:
-                subnets[ip.subnet_id] = await db.get(Subnet, ip.subnet_id)
-            sn = subnets[ip.subnet_id]
-            if sn is not None:
-                publishing.append((sn, ip))
-    await lock_zones_for_addresses(db, publishing=publishing, ddns=ddns, extra_zone_ids=zone_ids)
+    async def publishing_rows(
+        ids: list[uuid.UUID], *, refresh: bool = False
+    ) -> list[tuple[Subnet, IPAddress]]:
+        subnets: dict[uuid.UUID, Subnet | None] = {}
+        found: list[tuple[Subnet, IPAddress]] = []
+        for i in range(0, len(ids), 1000):
+            q = select(IPAddress).where(IPAddress.id.in_(ids[i : i + 1000]))
+            if restrict_subnet_id is not None:
+                q = q.where(IPAddress.subnet_id == restrict_subnet_id)
+            if refresh:
+                # Re-read under the lock: the rows are in the session already
+                # from the unlocked pass, and may have changed since.
+                q = q.execution_options(populate_existing=True)
+            for ip in (await db.execute(q.order_by(IPAddress.id))).scalars().all():
+                if ip.subnet_id not in subnets:
+                    subnets[ip.subnet_id] = await db.get(Subnet, ip.subnet_id)
+                sn = subnets[ip.subnet_id]
+                if sn is not None:
+                    found.append((sn, ip))
+        return found
+
+    wanted = sorted(set(address_ids))
+    extra = list(zone_ids)
+    if gate_zones:
+        await lock_zone_gate(
+            db,
+            await zone_ids_for_addresses(
+                db, publishing=await publishing_rows(wanted), ddns=ddns, extra_zone_ids=extra
+            ),
+            exclusive=False,
+        )
+    ordered = await lock_address_rows(db, wanted)
+    await lock_zones_for_addresses(
+        db,
+        publishing=await publishing_rows(ordered, refresh=gate_zones),
+        ddns=ddns,
+        extra_zone_ids=extra,
+    )
     return ordered
 
 

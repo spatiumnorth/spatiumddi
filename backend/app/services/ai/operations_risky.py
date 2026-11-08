@@ -1093,8 +1093,15 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # records' mirrors, forward / reverse links) come before the zone row, the
     # global order (``app.services.lock_order``): a lease batch holds a mirror
     # and waits for the zone.
-    from app.services.lock_order import address_ids_of_zones, lock_addresses_before
+    from app.services.lock_order import (
+        address_ids_of_zones,
+        lock_addresses_before,
+        lock_zone_gate,
+    )
 
+    # #3724: the zone's sync gate, exclusive, before any row: the next batch of
+    # an auto-sync run queues behind this delete rather than ahead of it.
+    await lock_zone_gate(db, [args.zone_id], exclusive=True)
     zone = await lock_addresses_before(
         db,
         lambda: address_ids_of_zones(db, [args.zone_id]),

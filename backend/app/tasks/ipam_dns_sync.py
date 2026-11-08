@@ -188,6 +188,14 @@ async def _reapply_ddns_for_active_leases(
 SYNC_BATCH_SIZE = 100
 
 
+def _first_line(exc: BaseException) -> str:
+    """``Type: first line`` of an exception. A cancelled statement's message
+    carries the whole SQL text and its parameters (~6 KB for a batch), which
+    would fill the run's audit row."""
+    lines = str(exc).strip().splitlines()
+    return f"{type(exc).__name__}: {lines[0]}" if lines else type(exc).__name__
+
+
 @dataclass
 class _Unit:
     """One address's share of a subnet's auto-sync, or one orphan record.
@@ -286,7 +294,9 @@ async def _sync_batch(
 
     # #3724 — lock every row this batch will write (the re-apply's mirrors
     # and the drift apply's addresses, ascending, then all their zones,
-    # ascending) before the first sync takes a zone.
+    # ascending) before the first sync takes a zone. The zones' sync gates
+    # go first (shared): a permanent zone delete takes them exclusive, so the
+    # batch after the one it waits for queues behind it.
     lock_ids, lock_zones = await _dns_sync_lock_targets(db, body, allowed_stale_ids=allowed_stale)
     locked = set(
         await _lock_dns_sync_rows(
@@ -295,8 +305,17 @@ async def _sync_batch(
             zone_ids=lock_zones,
             ddns=ddns_on,
             restrict_subnet_id=subnet_id,
+            gate_zones=True,
         )
     )
+
+    # The subnet object is the one read before the locks, and its zone binding
+    # may have been cleared by a zone delete this batch waited for: re-read it
+    # now, or the re-apply publishes into a zone that is gone, counts the
+    # rows as re-applied, and writes nothing.
+    subnet_obj = await db.get(Subnet, subnet_id, populate_existing=True)
+    if subnet_obj is None:
+        return 0, 0, 0, 0
 
     reapplied = 0
     if ddns_on and mirror_ids:
@@ -377,7 +396,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                     await db.commit()
                 except Exception as exc:  # noqa: BLE001 — one subnet must not poison the run
                     await db.rollback()
-                    errors.append(f"subnet({subnet_id}): {exc}")
+                    errors.append(f"subnet({subnet_id}): {_first_line(exc)}")
                     continue
                 n_batches = -(-len(units) // SYNC_BATCH_SIZE)
                 for k in range(n_batches):
@@ -391,7 +410,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                         errors.extend(batch_errors)
                         errors.append(
                             f"subnet({subnet_id}) batch {k + 1}/{n_batches} "
-                            f"({len(batch)} addresses): {exc}"
+                            f"({len(batch)} addresses): {_first_line(exc)}"
                         )
                         continue
                     errors.extend(batch_errors)

@@ -477,3 +477,173 @@ async def test_auto_sync_later_batch_publishes_the_live_name(
         assert host in fwd, (host, fwd)
     for host, recs in fwd.items():
         assert [n for n, _z in recs] == [host], fwd
+
+
+@contextlib.contextmanager
+def _capture_locks(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The order of zone-gate and address-row lock calls, as
+    ``(kind, exclusive)`` tuples; ``kind`` is ``"gate"`` or ``"rows"``."""
+    import app.services.lock_order as lo
+
+    seen: list[tuple[str, bool]] = []
+    real_gate, real_rows = lo.lock_zone_gate, lo._lock_address_ids
+
+    async def gate(db: Any, zone_ids: Any, *, exclusive: bool) -> None:
+        zone_ids = list(zone_ids)
+        if zone_ids:
+            seen.append(("gate", exclusive))
+        await real_gate(db, zone_ids, exclusive=exclusive)
+
+    async def rows(db: Any, ids: Any, **k: Any) -> None:
+        ids = list(ids)
+        if ids:
+            seen.append(("rows", False))
+        await real_rows(db, ids, **k)
+
+    monkeypatch.setattr(lo, "lock_zone_gate", gate)
+    monkeypatch.setattr(lo, "_lock_address_ids", rows)
+    yield seen
+
+
+@pytest.mark.asyncio
+async def test_each_batch_takes_the_shared_zone_gate_before_its_address_rows(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanent zone delete takes the zone's gate exclusive, and Postgres
+    queues a new shared request behind it: the batch after the one the delete
+    waits on waits for the delete, not the other way round. So every batch
+    takes the gate shared, before its first address row."""
+    import app.tasks.ipam_dns_sync as sync_mod
+
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 2)
+    await _auto_sync_subnet_with(db_session, 4, 78)
+    with _capture_locks(monkeypatch) as seen:
+        result = await sync_mod._run_auto_sync()
+    assert result["errors"] == 0, result
+    # Each batch: a shared gate first, then its address rows, never rows first.
+    assert seen[0] == ("gate", False), seen
+    gate_at = [i for i, e in enumerate(seen) if e[0] == "gate"]
+    assert len(gate_at) >= 2 and all(not seen[i][1] for i in gate_at), seen
+    for i, e in enumerate(seen):
+        if e[0] == "rows":
+            assert any(g < i for g in gate_at), seen
+    # The gate of every batch precedes that batch's rows: between two gates
+    # there is at least one row lock and never a row lock before the first.
+    for g, nxt in zip(gate_at, [*gate_at[1:], len(seen)], strict=True):
+        assert all(e[0] == "rows" for e in seen[g + 1 : nxt]), seen
+
+
+@pytest.mark.asyncio
+async def test_permanent_zone_delete_takes_the_exclusive_gate_before_address_rows(
+    client: Any, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.tasks.ipam_dns_sync as sync_mod
+    from app.models.dns import DNSZone
+    from tests.test_ipam_alias_cname_exclusive_2080 import _headers
+
+    await _auto_sync_subnet_with(db_session, 2, 79)
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.network == "10.93.79.0/24"))
+    ).scalar_one()
+    zone = await db_session.get(DNSZone, subnet.dns_zone_id)
+    assert zone is not None
+    zone_id, group_id = zone.id, zone.group_id
+    h = await _headers(db_session)
+    await db_session.commit()
+    # Publish first, so the addresses link to the zone and the delete has rows.
+    assert (await sync_mod._run_auto_sync())["created"] == 2
+    with _capture_locks(monkeypatch) as seen:
+        resp = await client.delete(
+            f"/api/v1/dns/groups/{group_id}/zones/{zone_id}?permanent=true", headers=h
+        )
+    assert resp.status_code == 204, resp.text
+    assert seen and seen[0] == ("gate", True), seen
+    assert ("rows", False) in seen, seen
+
+
+@pytest.mark.asyncio
+async def test_reapply_in_a_batch_whose_zone_was_deleted_counts_nothing(
+    client: Any, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch that waited on a zone delete and then writes nothing adds
+    nothing to the run's totals."""
+    import app.tasks.ipam_dns_sync as sync_mod
+    from app.models.dns import DNSZone
+    from app.models.settings import PlatformSettings
+    from tests.test_ipam_alias_cname_exclusive_2080 import _headers
+
+    monkeypatch.setattr(sync_mod, "SYNC_BATCH_SIZE", 2)
+    _server, subnet, zone, _ip = await _setup(db_session, 80)
+    for n in range(4):
+        db_session.add(
+            IPAddress(
+                subnet_id=subnet.id,
+                address=f"10.93.80.{100 + n}",
+                status="dhcp",
+                auto_from_lease=True,
+                hostname=f"m{n}",
+            )
+        )
+    ps = await db_session.get(PlatformSettings, 1)
+    if ps is None:
+        ps = PlatformSettings(id=1)
+        db_session.add(ps)
+    ps.dns_auto_sync_enabled = True
+    ps.dns_auto_sync_last_run_at = None
+    zone_id, group_id = zone.id, zone.group_id
+    h = await _headers(db_session)
+    await db_session.commit()
+
+    written_before: list[int] = []
+
+    async def purge() -> None:
+        from app.models.dns import DNSRecord
+
+        written_before.append(
+            len(
+                (
+                    await db_session.execute(
+                        select(DNSRecord.id).where(
+                            DNSRecord.record_type == "A", DNSRecord.auto_generated.is_(True)
+                        )
+                    )
+                ).all()
+            )
+        )
+        resp = await client.delete(
+            f"/api/v1/dns/groups/{group_id}/zones/{zone_id}?permanent=true", headers=h
+        )
+        assert resp.status_code == 204, resp.text
+
+    # The delete lands while the second batch waits for its locks: after the
+    # batch has read its subnet and DDNS state, before it writes anything.
+    real_lock = router_mod._lock_dns_sync_rows
+    calls = 0
+
+    async def purge_then_lock(db: Any, ids: Any, **k: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await purge()
+        return await real_lock(db, ids, **k)
+
+    monkeypatch.setattr(router_mod, "_lock_dns_sync_rows", purge_then_lock)
+    result = await sync_mod._run_auto_sync()
+    assert result["errors"] == 0, result
+    db_session.expire_all()
+    assert await db_session.get(DNSZone, zone_id) is None
+    # The run reports what it wrote: the first batch's records, none from the
+    # batch that found its zone gone.
+    assert written_before and written_before[0] > 0, written_before
+    assert result["ddns_reapplied"] == written_before[0], (result, written_before)
+    assert result["created"] == written_before[0], (result, written_before)
+
+
+@pytest.mark.asyncio
+async def test_batch_error_keeps_the_first_line_and_the_type() -> None:
+    from app.tasks.ipam_dns_sync import _first_line
+
+    exc = RuntimeError("canceling statement due to statement timeout\n[SQL: SELECT 1 ...]\n" * 50)
+    out = _first_line(exc)
+    assert out == "RuntimeError: canceling statement due to statement timeout"
+    assert _first_line(ValueError()) == "ValueError"
