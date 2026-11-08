@@ -173,6 +173,27 @@ describe("DNS group Options tab (#3739)", () => {
     });
   });
 
+  it("a Save whose edits cancel out sends nothing and says Saved", async () => {
+    const updateOptions = vi.fn(() => Promise.resolve(opts()));
+    answers.dnsApi = {
+      getOptions: () => Promise.resolve(opts()),
+      updateOptions,
+      listServers: () => Promise.resolve([]),
+    };
+    open(<OptionsTab groupId="g-1" />);
+    await screen.findByText(/minimal-responses/);
+    await waitFor(() => expect(screen.queryByText("Loading…")).toBeNull());
+    const minimal = screen
+      .getByText(/minimal-responses/)
+      .closest("label")!
+      .querySelector("input")!;
+    fireEvent.click(minimal);
+    fireEvent.click(minimal);
+    fireEvent.click(screen.getByRole("button", { name: /Save Changes/ }));
+    await screen.findByText("Saved");
+    expect(updateOptions).not.toHaveBeenCalled();
+  });
+
   it("a header Refresh re-fills an untouched form from the new read", async () => {
     let current = opts();
     const updateOptions = vi.fn(() => Promise.resolve(current));

@@ -8452,7 +8452,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
       body,
     );
     if (Object.keys(diff).length === 0) {
+      // Nothing differs from what is stored: say so rather than look broken.
       setDirty(false);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
       return;
     }
     saveMut.mutate(diff);
