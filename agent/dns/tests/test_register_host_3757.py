@@ -42,7 +42,9 @@ def _register(cfg, monkeypatch) -> dict:
 
 
 def test_host_sent_when_configured(agent_cfg, monkeypatch) -> None:
-    body = _register(dataclasses.replace(agent_cfg, server_host="p-0.h.ns.svc.cluster.local"), monkeypatch)
+    body = _register(
+        dataclasses.replace(agent_cfg, server_host="p-0.h.ns.svc.cluster.local"), monkeypatch
+    )
     assert body["host"] == "p-0.h.ns.svc.cluster.local"
     assert body["hostname"] == agent_cfg.server_name
 
@@ -58,3 +60,119 @@ def test_from_env_reads_server_host(monkeypatch) -> None:
     assert AgentConfig.from_env().server_host == "p-0.h.ns.svc.cluster.local"
     monkeypatch.delenv("SERVER_HOST")
     assert AgentConfig.from_env().server_host is None
+
+
+# ── An already-registered agent carries a new SERVER_HOST (#3757) ─────────────
+# A cached token means /register never runs on restart, so a chart upgrade that
+# adds SERVER_HOST never reached the server row. ensure_token registers once
+# when SERVER_HOST differs from the host it last registered.
+
+_FQDN = "p-0.h.ns.svc.cluster.local"
+
+
+class _FailResp:
+    status_code = 503
+    headers: dict = {}  # noqa: RUF012 — read-only stub
+    text = "unavailable"
+
+
+def _seed(cfg, *, token: str = "cached", recorded: str | None = None) -> None:
+    # Written as files, not through the new helpers, so the tests fail on an
+    # assertion (not an ImportError) against a build without the fix.
+    ensure_layout(cfg.state_dir)
+    (cfg.state_dir / "agent_token.jwt").write_text(token)
+    if recorded is not None:
+        (cfg.state_dir / "registered_host").write_text(recorded)
+
+
+def _recorded(cfg) -> str | None:
+    path = cfg.state_dir / "registered_host"
+    return path.read_text().strip() if path.exists() else None
+
+
+def _token(cfg) -> str:
+    return (cfg.state_dir / "agent_token.jwt").read_text().strip()
+
+
+def _capture(monkeypatch, resp=None) -> list[dict]:
+    sent: list[dict] = []
+
+    class _C(_Client):
+        def post(self, path, json=None, headers=None):
+            self.sent.append(json)
+            return resp if resp is not None else _Resp()
+
+    monkeypatch.setattr(bootstrap_mod, "_client", lambda c: _C(sent))
+    monkeypatch.setattr(bootstrap_mod.time, "sleep", lambda s: pytest.fail("must not wait"))
+    return sent
+
+
+def test_cached_token_registers_once_for_an_unregistered_host(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)  # an agent older than #3757: token cached, no host recorded
+    sent = _capture(monkeypatch)
+    _aid, token = bootstrap_mod.ensure_token(cfg)
+    assert [b["host"] for b in sent] == [_FQDN]
+    assert token == "t" and _token(cfg) == "t"
+    assert _recorded(cfg) == _FQDN
+    # The next start has nothing to carry.
+    sent.clear()
+    bootstrap_mod.ensure_token(cfg)
+    assert sent == []
+
+
+def test_cached_token_registers_when_the_host_changed(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg, recorded="old.h.ns.svc.cluster.local")
+    sent = _capture(monkeypatch)
+    bootstrap_mod.ensure_token(cfg)
+    assert [b["host"] for b in sent] == [_FQDN]
+
+
+def test_cached_token_and_same_host_does_not_register(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg, recorded=_FQDN)
+    sent = _capture(monkeypatch)
+    assert bootstrap_mod.ensure_token(cfg)[1] == "cached"
+    assert sent == []
+
+
+def test_cached_token_without_server_host_does_not_register(agent_cfg, monkeypatch) -> None:
+    # The appliance sets no SERVER_HOST: nothing to carry, so no registration.
+    _seed(agent_cfg)
+    sent = _capture(monkeypatch)
+    assert bootstrap_mod.ensure_token(agent_cfg)[1] == "cached"
+    assert sent == []
+
+
+def test_failed_host_register_keeps_the_cached_token(agent_cfg, monkeypatch) -> None:
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+    sent = _capture(monkeypatch, resp=_FailResp())
+    # One attempt, no wait: the daemon starts on its cached config.
+    assert bootstrap_mod.ensure_token(cfg)[1] == "cached"
+    assert len(sent) == 1
+    assert _token(cfg) == "cached"
+    assert _recorded(cfg) is None  # the next start retries
+
+
+def test_unreachable_control_plane_keeps_the_cached_token(agent_cfg, monkeypatch) -> None:
+    import httpx
+
+    cfg = dataclasses.replace(agent_cfg, server_host=_FQDN)
+    _seed(cfg)
+
+    class _Down(_Client):
+        def post(self, path, json=None, headers=None):
+            raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(bootstrap_mod, "_client", lambda c: _Down([]))
+    monkeypatch.setattr(bootstrap_mod.time, "sleep", lambda s: pytest.fail("must not wait"))
+    assert bootstrap_mod.ensure_token(cfg)[1] == "cached"
+
+
+def test_register_records_the_host_it_sent(agent_cfg, monkeypatch) -> None:
+    _register(dataclasses.replace(agent_cfg, server_host=_FQDN), monkeypatch)
+    assert _recorded(agent_cfg) == _FQDN
+    _register(agent_cfg, monkeypatch)
+    assert _recorded(agent_cfg) == ""

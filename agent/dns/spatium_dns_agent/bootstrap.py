@@ -24,7 +24,13 @@ import httpx
 import structlog
 
 from . import __version__, features
-from .cache import load_or_create_agent_id, load_token, save_token
+from .cache import (
+    load_or_create_agent_id,
+    load_registered_host,
+    load_token,
+    save_registered_host,
+    save_token,
+)
 from .config import AgentConfig
 from .instance import (
     AGENT_INSTANCE,
@@ -52,11 +58,17 @@ def _client(cfg: AgentConfig) -> httpx.Client:
     )
 
 
-def register(cfg: AgentConfig) -> tuple[str, str, dict]:
+class RegisterFailed(Exception):
+    """``register`` gave up after its ``max_attempts`` (#3757)."""
+
+
+def register(cfg: AgentConfig, *, max_attempts: int | None = None) -> tuple[str, str, dict]:
     """Perform PSK bootstrap. Returns (agent_id, token, response_body).
 
     Requires ``DNS_AGENT_KEY`` set in the environment (validated in
-    ``AgentConfig.from_env``).
+    ``AgentConfig.from_env``). Retries until the control plane answers, unless
+    ``max_attempts`` is given: then it raises :class:`RegisterFailed` after
+    that many failed attempts, without the wait that would follow the last.
     """
     agent_id = load_or_create_agent_id(cfg.state_dir)
     bootstrap_key = cfg.dns_agent_key
@@ -72,7 +84,9 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
     if cfg.server_host:
         body["host"] = cfg.server_host
     backoff = 2.0
+    attempts = 0
     while True:
+        attempts += 1
         try:
             with _client(cfg) as c:
                 resp = c.post(
@@ -89,6 +103,7 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
             if resp.status_code == 200:
                 data = resp.json()
                 save_token(cfg.state_dir, data["agent_token"])
+                save_registered_host(cfg.state_dir, cfg.server_host)
                 log.info(
                     "dns_agent_registered",
                     server_id=data["server_id"],
@@ -107,23 +122,45 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                     body=resp.text[:400],
                     retry_in_seconds=DUPLICATE_INSTANCE_BACKOFF,
                 )
+                if max_attempts is not None and attempts >= max_attempts:
+                    raise RegisterFailed("duplicate agent instance")
                 time.sleep(DUPLICATE_INSTANCE_BACKOFF + random.uniform(0, 2))
                 continue
-            log.warning(
-                "register_failed", status=resp.status_code, body=resp.text[:400]
-            )
+            log.warning("register_failed", status=resp.status_code, body=resp.text[:400])
         except httpx.HTTPError as e:
             log.warning("register_http_error", error=str(e))
+        if max_attempts is not None and attempts >= max_attempts:
+            raise RegisterFailed("control plane did not accept the registration")
         # jittered backoff, cap 5 min
         sleep_for = min(backoff + random.uniform(0, 2), 300.0)
         time.sleep(sleep_for)
         backoff = min(backoff * 2, 300.0)
 
 
+def _host_needs_registering(cfg: AgentConfig) -> bool:
+    """Whether ``SERVER_HOST`` is set and differs from the host this agent last
+    registered (#3757). Unset never forces a registration: it sends no host, so
+    the server row could not change."""
+    return bool(cfg.server_host) and load_registered_host(cfg.state_dir) != cfg.server_host
+
+
 def ensure_token(cfg: AgentConfig) -> tuple[str, str]:
     """Load cached token or re-register. Returns (agent_id, token)."""
     agent_id = load_or_create_agent_id(cfg.state_dir)
     token = load_token(cfg.state_dir)
+    if token and _host_needs_registering(cfg):
+        # #3757 — a cached token means /register never runs, so a SERVER_HOST
+        # this agent has not registered yet (a chart upgrade from a release
+        # that set none) would never reach the server row. Register once to
+        # carry it; the control plane decides whether the row's host moves.
+        # One attempt only: an unreachable control plane must not keep the
+        # daemon from starting on its cached config (non-negotiable #5). The
+        # cached token stays valid and the next start tries again.
+        try:
+            agent_id, token, _ = register(cfg, max_attempts=1)
+        except RegisterFailed as exc:
+            log.warning("dns_agent_host_register_deferred", host=cfg.server_host, reason=str(exc))
+        return agent_id, token
     if token:
         return agent_id, token
     agent_id, token, _ = register(cfg)
