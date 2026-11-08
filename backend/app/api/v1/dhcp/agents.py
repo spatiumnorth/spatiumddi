@@ -18,7 +18,6 @@ from typing import Annotated, Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
@@ -39,11 +38,13 @@ from app.core.celery_dispatch import dispatch
 from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
 from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
     DHCPLease,
+    DHCPScope,
     DHCPServer,
     DHCPServerGroup,
 )
@@ -1381,6 +1382,7 @@ async def agent_lease_events(
         _find_containing_subnet,
         _load_scope_cache,
         _load_subnet_cache,
+        _load_trashed_scope_nets,
     )
     from app.services.feature_modules import is_module_enabled
 
@@ -1419,6 +1421,8 @@ async def agent_lease_events(
     # subnet itself is resolved correctly.
     subnets = await _load_subnet_cache(db)
     scope_cache = await _load_scope_cache(db, server.server_group_id)
+    # #3733 — and the group's scopes in the Trash, whose addresses take no event.
+    trashed_scope_nets = await _load_trashed_scope_nets(db, server.server_group_id)
     # #2269 — scopes not set to ``on_lease`` keep the lease's hostname out of
     # IPAM; the mirror row itself is still written.
     no_hostname_subnets = await lease_hostname_suppressed_subnets(
@@ -1502,6 +1506,62 @@ async def agent_lease_events(
         for lease in existing_leases
     }
 
+    # #3733 — a scope in the Trash gets no lease, mirror or DDNS record back.
+    # A scope delete stamps the scope and commits, then tears its leases down
+    # in batches. A batch that read its caches before the stamp would insert
+    # the deleted leases again (the locked read above skips them), stamped with
+    # the trashed scope, with their mirrors and live A records; one that read
+    # them after would do the same with no scope, through the global subnet
+    # match. So the scopes the events resolve to are held FOR KEY SHARE to this
+    # commit and read again here, after the lease rows (dhcp_lease, then
+    # dhcp_scope, then ip_address: ``app.services.lock_order``): the delete
+    # takes the scope row FOR UPDATE before its stamp, so it waits for a batch
+    # that holds the scope, and a batch that comes after it waits for the
+    # stamp and finds the scope gone. An event of a scope in the Trash is
+    # history, as a superseded grant is (#2391): acknowledged, never written.
+    live_scope_ids = {
+        scope_cache[sn.id]
+        for sn in subnet_for_ip.values()
+        if sn is not None and sn.id in scope_cache
+    }
+    gone_scope_ids: set[Any] = set()
+    if live_scope_ids:
+        still_live = set(
+            (
+                await db.execute(
+                    select(DHCPScope.id)
+                    .where(DHCPScope.id.in_(live_scope_ids), DHCPScope.deleted_at.is_(None))
+                    .order_by(DHCPScope.id)
+                    .with_for_update(read=True, key_share=True)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        gone_scope_ids = live_scope_ids - still_live
+    trashed_scope_ids = gone_scope_ids | {scope_id for scope_id, _net in trashed_scope_nets}
+
+    def _in_trash(ip: str) -> bool:
+        """Is ``ip`` an address of a scope of this group in the Trash, and of
+        no live one?"""
+        subnet = subnet_for_ip.get(ip)
+        if subnet is not None and subnet.id in scope_cache:
+            return scope_cache[subnet.id] in gone_scope_ids
+        try:
+            addr = ipaddress.ip_address(norm_ip(ip))
+        except ValueError:
+            return False
+        return any(addr in net for _scope_id, net in trashed_scope_nets)
+
+    in_trash = {ip for ip in ips if _in_trash(ip)}
+    if in_trash:
+        logger.info(
+            "dhcp_lease_events_for_trashed_scope_skipped",
+            server=server_id,
+            addresses=len(in_trash),
+        )
+
     def _superseded(ev: Any, key: tuple[Any, ...]) -> bool:
         """Is this active event older than another client's live lease? (#2391)
 
@@ -1532,6 +1592,9 @@ async def agent_lease_events(
     upserted = 0
     stale: set[int] = set()
     for idx, ev in enumerate(events):
+        if ev.ip_address in in_trash:
+            stale.add(idx)  # #3733: its scope is in the Trash
+            continue
         key = _lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)
         if _superseded(ev, key):
             stale.add(idx)
@@ -1577,8 +1640,11 @@ async def agent_lease_events(
             lease.ends_at = ev.ends_at
             lease.expires_at = expires_at
             lease.last_seen_at = now
-            if lease.scope_id is None:
+            if lease.scope_id is None or lease.scope_id in trashed_scope_ids:
                 # Backfill legacy rows created before scope stamping (#844).
+                # #3733: and a row still naming a scope in the Trash goes to
+                # the live scope its address resolves to now (a new scope on
+                # the same subnet), which keeps the old scope's teardown off it.
                 lease.scope_id = _scope_for_ip(ev.ip_address)
         upserted += 1
     try:
@@ -1734,6 +1800,22 @@ async def agent_lease_events(
             publishing.append((subnet, row))
         else:
             retracting.append(row)
+    # #3687: a mirror this pass creates later (an address whose first event is
+    # a release, then a grant) is not in ``ipam_by_key`` yet, so its zones
+    # were left out, and an earlier event's purge of a trashed record had
+    # already run when its publish locked them. A transient row (never added
+    # to the session) names the zones its publish will write.
+    planned = set(ipam_by_key)
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx in stale or subnet is None or ev.state != "active":
+            continue
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
+        key = (subnet.id, norm_ip(ev.ip_address))
+        if lease.state != "active" or key in planned:
+            continue
+        planned.add(key)
+        publishing.append((subnet, _new_mirror_row(subnet, ev, lease)))
     await lock_zones_for_addresses(db, publishing=publishing, retracting=retracting, ddns=True)
 
     # ── IPAM mirror pass ────────────────────────────────────────────────

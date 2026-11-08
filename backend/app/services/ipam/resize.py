@@ -34,7 +34,8 @@ Side-effects committed atomically with the CIDR change:
   because they represent user intent (e.g. ``anycast-vip``). Rows with
   ``dns_record_id IS NOT NULL`` are classified as renamed by
   ``_load_boundary_placeholders`` and therefore never reach the delete
-  loop — no DNS cleanup is needed here.
+  loop — no DNS cleanup is needed here. The old default ``gateway`` row of
+  a moved gateway does carry an auto PTR, so it is retracted first (#3723).
 * Update ``Subnet.network``, ``total_ips``, ``utilization_percent``, and
   optionally ``gateway`` (via ``move_gateway_to_first_usable``).
 * Re-create default-named placeholder rows at the **new** boundaries.
@@ -97,6 +98,7 @@ from app.services.ipam.subnet_boundary import (
     boundary_host_conflicts,
     ensure_boundary_rows,
 )
+from app.services.ipam.subnet_placeholders import add_gateway_row, gateway_target_problem
 
 logger = structlog.get_logger(__name__)
 
@@ -643,14 +645,13 @@ async def _load_boundary_placeholders(
 async def _gateway_target_in_use(
     db: AsyncSession, subnet: Subnet, target: str, old_gateway: str | None
 ) -> bool:
-    """True when an address row other than the current gateway already sits
-    on ``target`` — the new gateway cannot be reserved over a host (#2413)."""
+    """True when the new gateway cannot sit on ``target``: a host, lease or
+    discovered row holds it (#2413). Same rule as Edit Subnet
+    (``gateway_target_problem``, #3709): no row, a ``reserved`` row (kept as the
+    gateway's) and an ``available`` row (a free slot, taken over) are fine."""
     if old_gateway is not None and str(ipaddress.ip_address(old_gateway)) == target:
         return False
-    row = await db.scalar(
-        select(IPAddress.id).where(IPAddress.subnet_id == subnet.id, IPAddress.address == target)
-    )
-    return row is not None
+    return await gateway_target_problem(db, subnet, target) is not None
 
 
 # ── Preview: subnets ─────────────────────────────────────────────────────────
@@ -1286,18 +1287,26 @@ async def commit_subnet_resize(
                     IPAddress.description == "Gateway",
                     IPAddress.dns_record_id.is_(None),
                 )
+                # Locked before the sync takes its zones: an address row comes
+                # before a zone row (``app.services.lock_order``), as a
+                # permanent zone delete takes them (#3691).
+                .with_for_update()
             )
             if old_row is not None:
+                # Retract its auto A / PTR first, as Edit Subnet's gateway
+                # move does (#3709): a bare delete leaves the PTR served.
+                # The sync takes the zones it writes in id order (#3617).
+                await _sync_dns_record(db, old_row, subnet, action="delete")
                 await db.delete(old_row)
-        gateway_row = IPAddress(
-            subnet_id=subnet.id,
-            address=new_gateway,
-            status="reserved",
-            description="Gateway",
-            hostname="gateway",
+        # None when a reserved row already holds the address: kept as the
+        # gateway's. An available row is taken over (#3709).
+        gateway_row = await add_gateway_row(
+            db,
+            subnet,
+            new_gateway,
             created_by_user_id=(current_user.id if current_user is not None else None),
+            user=current_user,
         )
-        db.add(gateway_row)
         await db.flush()
 
     # 4. Recompute utilization on this subnet and roll the parent block chain.

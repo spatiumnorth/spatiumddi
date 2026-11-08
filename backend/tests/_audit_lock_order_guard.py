@@ -138,7 +138,27 @@ def _do_orm_execute(state: Any) -> Any:
         # Every row it returns is now this transaction's until it ends.
         frozen = state.invoke_statement().freeze()
         held = state.session.info.setdefault(_HELD, set())
-        held.update((locked_table, row[0]) for row in frozen().all())
+        rows = frozen().all()
+        if state.session.info.get(_LOCKED):
+            # Locking a zone row while the chain lock is held is the same
+            # inversion as writing one (#3687): a zone delete holds the zone
+            # and waits for the chain lock.
+            fresh = sorted(
+                f"{locked_table}:{r[0]}" for r in rows if (locked_table, r[0]) not in held
+            )
+            frames = _caller_frames() if fresh else []
+            # ``compute_audit_hashes`` row-locks the zones its own flush writes,
+            # and does so before it takes the chain lock: safe, and issued while
+            # this guard already counts the transaction as locked.
+            own = any(
+                f.name == "_lock_rows_written_before_audit" for f in traceback.extract_stack()
+            )
+            if fresh and not own and not any(f.name in KNOWN_UNFIXED for f in frames):
+                violations.append(
+                    f"{', '.join(fresh)} row-locked after this transaction took the "
+                    f"audit-chain lock (for {state.session.info.get(_BY)}); at {_app_stack(frames)}"
+                )
+        held.update((locked_table, row[0]) for row in rows)
         return frozen()
     # ``lock_audit_chain`` takes the lock outside a flush.
     if (

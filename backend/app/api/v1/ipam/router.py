@@ -7899,7 +7899,8 @@ async def update_subnet(
     if manages_gateway_row:
         if body.gateway is not None:
             # A host, a lease or a discovered row already at the new address
-            # is refused, as Resize refuses it (#2413); a reserved row is kept.
+            # is refused, as Resize refuses it (#2413); a reserved row is kept
+            # and an available one (a free slot) is taken over (#3709).
             target_problem = await gateway_target_problem(
                 db, subnet, str(ipaddress.ip_address(body.gateway))
             )
@@ -8052,12 +8053,21 @@ async def update_subnet(
     # operator's and is kept, as is a reserved row already at the new address.
     if manages_gateway_row:
         if old_gateway_row is not None:
+            # The row before the zones the sync locks (``lock_order``, #3723):
+            # a permanent zone delete takes them in that order (#3691).
+            await db.execute(
+                select(IPAddress.id).where(IPAddress.id == old_gateway_row.id).with_for_update()
+            )
             await _sync_dns_record(db, old_gateway_row, subnet, action="delete")
             await db.delete(old_gateway_row)
             await db.flush()
         if subnet.gateway:
             gw_row = await add_gateway_row(
-                db, subnet, str(subnet.gateway), created_by_user_id=current_user.id
+                db,
+                subnet,
+                str(subnet.gateway),
+                created_by_user_id=current_user.id,
+                user=current_user,
             )
             if gw_row is not None:
                 # Same as create_subnet: the placeholder's PTR (spatiumddi#1150).

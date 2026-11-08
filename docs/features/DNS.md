@@ -1159,6 +1159,18 @@ everywhere" means in practice. It shipped with the split-horizon work in
 #876 the UI wrote only the group half, so per-subnet filtering was
 unreachable from the product despite being fully implemented underneath.
 
+Both relationships are written through
+`PUT /api/v1/dns/blocklists/{id}/assignments`. `server_group_ids` /
+`view_ids` replace the stored set; `add_server_group_ids` /
+`remove_server_group_ids` / `add_view_ids` / `remove_view_ids` change only
+the ids named, against the stored set under a row lock, so a client that
+speaks for one group cannot drop an assignment another client made since it
+last read the list (#3737) — the console's Apply, Detach and Save scope all
+send deltas. Adding an id already present or removing one that is not is a
+no-op. A request carrying both the full set and deltas for one relationship,
+or the same id in its add and remove, is refused with 422. An empty body
+changes nothing and writes no audit row.
+
 A **view** is a set of clients, identified by source address. `match_clients`
 is a BIND address-match-list: addresses, CIDR prefixes, a named ACL from
 the ACLs tab, or one of `any` / `none` / `localhost` / `localnets`, each

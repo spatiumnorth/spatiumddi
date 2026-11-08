@@ -12,8 +12,6 @@ from urllib.parse import urlencode
 import structlog
 from fastapi import APIRouter, Form, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from jose import JWTError
-from jose import jwt as jose_jwt
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +20,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
 from app.api.token_binding import honours_token_binding
 from app.config import settings
+from app.core import jwt_compat
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
 from app.core.auth.oidc import build_authorize_url as oidc_authorize_url
@@ -58,6 +57,7 @@ from app.core.auth_throttle import (
     refund_stepup_attempt,
 )
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.jwt_compat import JWTError
 from app.core.mfa_enrol_proof import (
     ProofUnavailable,
     claim_flow,
@@ -1721,12 +1721,12 @@ def _oidc_callback_url(base: str, provider_id: uuid.UUID) -> str:
 
 
 def _sign_flow_token(payload: dict) -> str:
-    return jose_jwt.encode(payload, settings.secret_key, algorithm="HS256")
+    return jwt_compat.encode(payload, settings.secret_key, algorithm="HS256")
 
 
 def _verify_flow_token(token: str) -> dict:
     try:
-        return jose_jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        return jwt_compat.decode(token, settings.secret_key, algorithms=["HS256"])
     except JWTError as exc:
         raise ValueError("invalid flow token") from exc
 

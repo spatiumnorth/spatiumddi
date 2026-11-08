@@ -349,3 +349,24 @@ def test_the_watchdog_waits_while_housekeeping_runs(
     assert seed.keeper.drain(5.0)
     seed.tick()
     assert len(checks) == 2
+
+
+class _SlowDoneLog(_Log):
+    """Writing housekeeping_done takes a while, which widens the window
+    between the worker's completion and its log line (#3735)."""
+
+    def info(self, event: str, **kw: object) -> None:
+        if event.endswith("housekeeping_done"):
+            time.sleep(0.3)
+        super().info(event, **kw)
+
+
+def test_drain_returns_only_after_the_done_line_is_written() -> None:
+    keeper, log = hb._Housekeeper(), _SlowDoneLog()
+    release = threading.Event()
+    try:
+        assert keeper.run(lambda: release.wait(10), 0.1, log) is False
+    finally:
+        release.set()
+    assert keeper.drain(5.0)
+    assert len(log.said("housekeeping_done")) == 1

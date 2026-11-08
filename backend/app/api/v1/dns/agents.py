@@ -19,7 +19,6 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
@@ -36,6 +35,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
 from app.core.redis_client import make_async_redis
 from app.core.versions import is_installed_target
 from app.drivers.dns import get_driver as get_dns_driver
