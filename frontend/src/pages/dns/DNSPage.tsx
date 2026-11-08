@@ -2657,6 +2657,7 @@ function DnssecCard({
                 value={policyId}
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
+                aria-label="DNSSEC signing policy"
                 title="DNSSEC signing policy (BIND9)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
@@ -12121,6 +12122,7 @@ export function BlocklistDetail({
                           value: ev.target.checked,
                         })
                       }
+                      aria-label={`Also block subdomains of ${e.domain}`}
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."

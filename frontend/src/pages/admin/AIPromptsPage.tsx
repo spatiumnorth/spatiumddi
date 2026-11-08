@@ -346,6 +346,7 @@ export function AIPromptsPage() {
                       <div className="flex justify-end gap-1">
                         <button
                           disabled={!p.is_owner}
+                          aria-label="Edit"
                           title={
                             p.is_owner
                               ? "Edit"
@@ -361,6 +362,7 @@ export function AIPromptsPage() {
                         </button>
                         <button
                           disabled={!p.is_owner}
+                          aria-label="Delete"
                           title={
                             p.is_owner
                               ? "Delete"
