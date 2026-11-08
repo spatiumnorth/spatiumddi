@@ -1810,6 +1810,29 @@ async def agent_lease_events(
         if idx not in stale and subnet is not None:
             events_at[(subnet.id, norm_ip(ev.ip_address))] += 1
     ddns_quiet: set[int] = set()
+
+    async def _ddns_quiet(subnet: Any, row: IPAddress, ev: Any) -> bool:
+        # The check runs the reads the DDNS step runs, but outside its error
+        # boundary below: a bug in them is the same logged skip it is there
+        # (the grant takes the full path), never a 500 for the whole batch.
+        try:
+            return await ddns_lease_writes_nothing(
+                db,
+                subnet=subnet,
+                ipam_row=row,
+                client_hostname=ev.hostname,
+                row_hostname=_lease_row_hostname(row, ev),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=ev.ip_address,
+                error=str(exc),
+            )
+            return False
+
     publishing: list[tuple[Any, IPAddress]] = []
     retracting: list[IPAddress] = []
     for idx, ev in enumerate(events):
@@ -1821,17 +1844,7 @@ async def agent_lease_events(
         if ev.state != "active":
             retracting.append(row)
             continue
-        if (
-            subnet is not None
-            and events_at[key] == 1
-            and await ddns_lease_writes_nothing(
-                db,
-                subnet=subnet,
-                ipam_row=row,
-                client_hostname=ev.hostname,
-                row_hostname=_lease_row_hostname(row, ev),
-            )
-        ):
+        if subnet is not None and events_at[key] == 1 and await _ddns_quiet(subnet, row, ev):
             ddns_quiet.add(idx)
             continue
         publishing.append((subnet, row))

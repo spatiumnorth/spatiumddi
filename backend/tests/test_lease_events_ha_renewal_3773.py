@@ -172,3 +172,112 @@ async def test_peer_batches_of_different_renewals_do_not_wait_on_each_other(
         release.set()
         resp_a = await asyncio.wait_for(batch_a, timeout=30)
     assert resp_a.status_code == 200, resp_a.text
+
+
+# ── The quiet path decides as apply_ddns_for_lease would (#3773) ──────────
+#
+# Each case below changes the DNS state behind a published lease and then has
+# the OTHER peer report the renewal. The quiet path must not swallow any
+# repair the full DDNS step makes: the expected outcome is what the batch did
+# before #3773, with every grant through ``apply_ddns_for_lease``.
+
+
+async def _a_records(db: AsyncSession, zone_id: uuid.UUID) -> dict[str, str]:
+    rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.value)
+            .where(DNSRecord.zone_id == zone_id, DNSRecord.record_type == "A")
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    return {n: v for n, v in rows}
+
+
+async def _record_at(db: AsyncSession, zone_id: uuid.UUID, name: str) -> DNSRecord:
+    return (
+        await db.execute(
+            select(DNSRecord).where(
+                DNSRecord.zone_id == zone_id,
+                DNSRecord.record_type == "A",
+                DNSRecord.name == name,
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_a_trashed_forward_record_is_republished_at_the_next_renewal(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    _peer_a, peer_b, _subnet, zone_id = await _pair(concurrent_client, db_session)
+    rec = await _record_at(db_session, zone_id, "renew-20")
+    rec.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    assert "renew-20" not in await _a_records(db_session, zone_id)
+
+    r = await _post(concurrent_client, peer_b, [_ev(ip) for ip in _IPS])
+    assert r.status_code == 200, r.text
+    assert (await _a_records(db_session, zone_id)).get("renew-20") == _IPS[0]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_forward_record_is_republished_at_the_next_renewal(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    _peer_a, peer_b, _subnet, zone_id = await _pair(concurrent_client, db_session)
+    await db_session.delete(await _record_at(db_session, zone_id, "renew-20"))
+    await db_session.commit()
+
+    r = await _post(concurrent_client, peer_b, [_ev(ip) for ip in _IPS])
+    assert r.status_code == 200, r.text
+    assert (await _a_records(db_session, zone_id)).get("renew-20") == _IPS[0]
+
+
+@pytest.mark.asyncio
+async def test_a_name_an_operator_took_moves_the_lease_to_its_generated_name(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    """An operator record at the published name holds it (#3362): the renewal
+    must move the lease off it, which a quiet skip would never do."""
+    _peer_a, peer_b, _subnet, zone_id = await _pair(concurrent_client, db_session)
+    db_session.add(
+        DNSRecord(
+            zone_id=zone_id,
+            name="renew-21",
+            fqdn="renew-21",
+            record_type="TXT",
+            value='"operator"',
+            auto_generated=False,
+        )
+    )
+    await db_session.commit()
+
+    r = await _post(concurrent_client, peer_b, [_ev(ip) for ip in _IPS])
+    assert r.status_code == 200, r.text
+    records = await _a_records(db_session, zone_id)
+    assert "renew-21" not in records, records
+    assert records.get("dhcp-10-31-1-21") == _IPS[1], records
+
+
+@pytest.mark.asyncio
+async def test_a_bug_in_the_quiet_check_does_not_fail_the_batch(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check runs the reads the DDNS step runs, outside the DDNS step's
+    error boundary: a bug in them must still be the logged skip it is there,
+    not a 500 for the whole batch that the agent resends into the same bug."""
+    _peer_a, peer_b, _subnet, _zone_id = await _pair(concurrent_client, db_session)
+    import app.services.dns.ddns as ddns
+
+    async def _bug(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ddns, "resolve_ddns_hostname", _bug)
+    r = await _post(concurrent_client, peer_b, [_ev(ip) for ip in _IPS])
+    assert r.status_code == 200, r.text
+    assert r.json()["upserted"] == len(_IPS)

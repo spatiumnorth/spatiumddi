@@ -628,7 +628,9 @@ async def _publish_ddns_name(
     # Compare against the record, not just the row: both lease ingest paths
     # stamp the client's new hostname onto the row before calling us, so a
     # rename would otherwise look unchanged and the old A/PTR would stay
-    # (#1618).
+    # (#1618). #3773: ``ddns_lease_writes_nothing`` mirrors this no-write
+    # outcome to let a lease-events batch skip its zone locks; a condition
+    # added here must be added there too.
     if ipam_row.hostname == hostname and await _published_name(db, ipam_row) == hostname:
         return False
 
