@@ -224,6 +224,14 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
 }
 
 
+# Audit rows recording a refused request (a route permission gate or a
+# handler invariant) — the action did not happen, so no event describes it.
+# A denylist rather than a ``== "success"`` allowlist: ``error`` / ``accepted``
+# / ``ok`` rows are written by paths that did commit a change (e.g. a DNS
+# write with a provider warning), and subscribers still need those.
+_REFUSED_RESULTS = frozenset({"denied", "forbidden"})
+
+
 def _audit_to_event_type(action: str, resource_type: str) -> str | None:
     """Translate ``(action, resource_type)`` → typed event name."""
     special = _SPECIAL_EVENT_MAP.get((action, resource_type))
@@ -376,6 +384,8 @@ def _register_session_listener() -> None:
             return
         snapshots = getattr(session, _PENDING_ATTR, None) or []
         for row in new_audits:
+            if row.result in _REFUSED_RESULTS:
+                continue
             event_type = _audit_to_event_type(row.action, row.resource_type)
             if event_type is None:
                 continue
