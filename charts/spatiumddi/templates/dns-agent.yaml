@@ -123,6 +123,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # #3757 — the address the control plane reads zones back from
+            # (drift, pull-from-server). The bare pod name resolves only
+            # inside the pod itself; the StatefulSet's pod DNS name under its
+            # headless Service resolves from every other pod. $(SERVER_NAME)
+            # expands because it is defined above this entry. The agent still
+            # registers SERVER_NAME as the server's name.
+            - name: SERVER_HOST
+              value: "$(SERVER_NAME).{{ $instance }}-headless.{{ $root.Release.Namespace }}.svc.cluster.local"
             - name: AGENT_GROUP
               value: {{ $server.group | default "default" | quote }}
             - name: AGENT_ROLES
