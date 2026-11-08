@@ -12,17 +12,40 @@ import {
   winrmFormFrom,
   winrmSettingsPayload,
 } from "@/lib/winrm";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
-export function CreateServerModal({
-  server,
-  defaultGroupId,
-  onClose,
-}: {
+type CreateServerModalProps = {
   server?: DHCPServer;
   defaultGroupId?: string | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the server fresh on open (#3739): the row the page holds comes
+// from a list polled every 30 s, and the form is seeded once.
+export function CreateServerModal(props: CreateServerModalProps) {
+  const fresh = useFreshRow(props.server, () =>
+    dhcpApi.getServer(props.server!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DHCP Server"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerModalForm {...props} server={fresh.row} />;
+}
+
+function ServerModalForm({
+  server,
+  defaultGroupId,
+  onClose,
+}: CreateServerModalProps) {
   const qc = useQueryClient();
   const editing = !!server;
   const [name, setName] = useState(server?.name ?? "");
@@ -134,7 +157,7 @@ export function CreateServerModal({
   });
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const data: Partial<DHCPServer> & {
         windows_credentials?: WindowsDHCPCredentials | Record<string, never>;
         cloud_credentials?: FortiGateCredentials | Record<string, never>;
@@ -202,9 +225,31 @@ export function CreateServerModal({
         }
       }
 
-      return editing
-        ? dhcpApi.updateServer(server!.id, data)
-        : dhcpApi.createServer(data);
+      if (!editing) return dhcpApi.createServer(data);
+      // Send only what changed (#3739): a field the operator did not touch
+      // stays as another client stored it. The credential blocks above are
+      // already partial, so they ride along as they are.
+      const {
+        windows_credentials: winCreds,
+        cloud_credentials: cloudCreds,
+        ...plain
+      } = data;
+      const diff: typeof data = changedFields(
+        {
+          name: server!.name,
+          driver: server!.driver,
+          host: server!.host,
+          port: server!.port,
+          server_group_id: server!.server_group_id ?? null,
+          ha_peer_url: server!.ha_peer_url ?? "",
+          description: server!.description ?? "",
+        },
+        plain,
+      );
+      if (winCreds) diff.windows_credentials = winCreds;
+      if (cloudCreds) diff.cloud_credentials = cloudCreds;
+      if (Object.keys(diff).length === 0) return server!;
+      return dhcpApi.updateServer(server!.id, diff);
     },
     onSuccess: (saved) => {
       // #3366 — the server page reads ["dhcp-server", id] on a 30 s poll and

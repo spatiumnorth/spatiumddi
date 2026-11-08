@@ -289,19 +289,18 @@ function splitProvenance(
 
 // Collapsed import-provenance chip with a dismiss (×) that clears the
 // netbox_*/import_* keys from the resource's custom_fields. `fields` is the
-// provenance subset (for the label/tooltip); `keep` is the custom_fields dict
-// WITHOUT the provenance keys (what we PUT back when the operator removes it).
-function ImportedChip({
+// provenance subset (for the label/tooltip). On removal the custom_fields dict
+// WITHOUT the provenance keys is PUT back, built from a read made at that
+// moment (#3739).
+export function ImportedChip({
   fields,
   kind,
   id,
-  keep,
   onUpdated,
 }: {
   fields: Record<string, unknown>;
   kind: "block" | "subnet";
   id: string;
-  keep: Record<string, unknown>;
   onUpdated: (updated: IPBlock | Subnet) => void;
 }) {
   const qc = useQueryClient();
@@ -317,10 +316,19 @@ function ImportedChip({
     .map(([k, v]) => `${k}: ${String(v)}`)
     .join(" · ");
   const clearMut = useMutation<IPBlock | Subnet, Error, void>({
-    mutationFn: () =>
-      kind === "block"
-        ? ipamApi.updateBlock(id, { custom_fields: keep })
-        : ipamApi.updateSubnet(id, { custom_fields: keep }),
+    // The API replaces the whole custom_fields dict, so the dict to send is
+    // taken from a read made now (#3739), not from the detail view's copy:
+    // a field another client set since that copy was taken would be erased.
+    mutationFn: async () => {
+      const current =
+        kind === "block"
+          ? await ipamApi.getBlock(id)
+          : await ipamApi.getSubnet(id);
+      const fresh = splitProvenance(current.custom_fields).keep;
+      return kind === "block"
+        ? ipamApi.updateBlock(id, { custom_fields: fresh })
+        : ipamApi.updateSubnet(id, { custom_fields: fresh });
+    },
     onSuccess: (updated) => {
       // Update the displayed detail object immediately. The chip renders
       // from the detail view's local copy of the block/subnet, which query
@@ -6114,7 +6122,6 @@ export function SubnetDetail({
                       fields={prov}
                       kind="subnet"
                       id={subnet.id}
-                      keep={keep}
                       onUpdated={(u) => onSubnetEdited(u as Subnet)}
                     />
                   </div>
@@ -14588,7 +14595,6 @@ export function BlockDetailView({
                     fields={prov}
                     kind="block"
                     id={block.id}
-                    keep={keep}
                     onUpdated={(u) => setBlock(u as IPBlock)}
                   />
                 )}
