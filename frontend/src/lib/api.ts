@@ -16549,12 +16549,64 @@ export interface ContainerStatsResponse {
   rows: ContainerStat[];
 }
 
+/** #3761 — which runtimes the Containers tab can see. */
+export interface ContainerBackendStatus {
+  available: boolean;
+  reason: string | null;
+  detail: string | null;
+}
+export interface ContainerBackends {
+  docker: ContainerBackendStatus;
+  kubernetes: ContainerBackendStatus;
+  appliance: boolean;
+}
+export interface PodRow {
+  name: string;
+  component: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string | null;
+  started_at: string | null;
+  containers: string[];
+}
+export interface PodListResponse {
+  available: boolean;
+  reason: string | null;
+  rows: PodRow[];
+}
+
 export const containersApi = {
   stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
     api
       .get<ContainerStatsResponse>("/admin/containers/stats", { params })
       .then((r) => r.data),
+  backends: () =>
+    api
+      .get<ContainerBackends>("/admin/containers/backends")
+      .then((r) => r.data),
+  pods: () =>
+    api.get<PodListResponse>("/admin/containers/pods").then((r) => r.data),
+  podLogs: (name: string, tail = 200) =>
+    api
+      .get<{
+        name: string;
+        tail: string;
+      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, { params: { tail } })
+      .then((r) => r.data),
 };
+
+/** Follow one release pod's logs (redacted server-side) — #3761. */
+export function streamPodLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/admin/containers/pods/${encodeURIComponent(name)}/logs/stream?tail=${tail}`,
+    signal,
+  );
+}
 
 // ── Service lifecycle control (issue #890) ────────────────────────────────────
 

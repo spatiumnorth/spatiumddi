@@ -1,0 +1,39 @@
+# Pod list + logs for Platform Insights > Containers (#3761) — opt-in.
+#
+# Read-only, namespace-scoped. The api lists only pods labelled
+# app.kubernetes.io/name=spatiumddi and resolves a log request's pod name
+# against that fresh listing, so an operator's own pod in this namespace is
+# neither shown nor readable. Binds the namespace's ``default`` ServiceAccount,
+# like k8s/service-control/rbac.yaml.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatiumddi-pod-logs
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: api
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spatiumddi-pod-logs
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: api
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: spatiumddi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spatiumddi-pod-logs

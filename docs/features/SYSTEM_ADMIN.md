@@ -54,7 +54,18 @@ control plane is doing without standing up a separate Prometheus
   `pg_stat_statements` if the extension is installed.
 - **Redis** — overview, keyspace breakdown, and the agent-wake
   pub/sub bus state.
-- **Containers** — per-container CPU% (computed the same way
+- **Containers** — detects what the deployment can see and reports each
+  backend (Docker socket, Kubernetes ServiceAccount, appliance) with the
+  toggle that enables the missing ones (`GET /admin/containers/backends`).
+  On Kubernetes (`api.serviceAccount.enabled`; manifests:
+  `k8s/pod-logs/rbac.yaml`) it lists the release's pods in the api pod's
+  namespace — only pods labelled as ours, narrowed to the api pod's own
+  `app.kubernetes.io/instance` — and tails or follows their logs through the
+  support-bundle redactor. A log request's pod name is checked against a fresh
+  listing; anything else is a 404. Superadmin only; each log read is audited
+  (`container_logs_read`). The appliance still sends you to Cluster → Pods.
+  No MCP tool: log text is a secrets surface, so it stays UI/REST only.
+  Docker view: per-container CPU% (computed the same way
   `docker stats` does), memory used / limit / %, network rx /
   tx, block-IO read / write. Default-filtered to the
   `spatiumddi-*` prefix; set the filter to empty to see every

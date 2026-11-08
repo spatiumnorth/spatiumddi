@@ -8,7 +8,8 @@ k8s/
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
 ├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)
-└── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+├── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+└── pod-logs/           # Opt-in pod list + log read RBAC for Platform Insights > Containers (#3761)
 ```
 
 ## Managed DHCP servers (Kea)

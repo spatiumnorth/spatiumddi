@@ -10,14 +10,17 @@ these helpers + add permission gates + audit-log rows. The public
 exception name + dataclass shape are unchanged so callers don't
 have to follow the rewrite.
 
-Gated on ``settings.appliance_mode`` + the ServiceAccount actually
-being mounted (``services/appliance/k8s.get_config()``). On docker-
+The appliance's Cluster -> Pods surface is gated on ``settings.appliance_mode``
++ the ServiceAccount actually being mounted (``services/appliance/k8s.get_config()``). On docker-
 compose / non-k8s deployments the gate fails fast + the endpoints
-log + 503 — same shape the docker path used.
+log + 503 — same shape the docker path used. Platform Insights >
+Containers (#3761) reuses the log helpers on any Kubernetes install via
+``release_pods`` / ``find_release_pod``, gated on the ServiceAccount only.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -175,8 +178,59 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
     )
 
 
-def list_containers() -> list[ContainerSummary]:
-    if not settings.appliance_mode:
+def release_pods() -> list[dict[str, Any]]:
+    """SpatiumDDI's own pods in the api pod's namespace -- the inventory the
+    Platform Insights Containers tab lists AND the allowlist its log routes
+    resolve a pod name against (#3761).
+
+    Scope is the namespace of the mounted ServiceAccount, narrowed to pods
+    labelled as ours (same rule as ``service_control.kube``) and, when the api
+    pod's own release label resolves (``HOSTNAME`` is the pod name, read off
+    the same listing), to that release, so a second SpatiumDDI install in the
+    namespace is not offered. Always a fresh listing: a pod name is never
+    trusted from the caller.
+    """
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        raise DockerUnavailableError(str(exc)) from exc
+    ours = [p for p in pods if _parse_pod_to_summary(p).is_spatium]
+    own_name = os.environ.get("HOSTNAME", "")
+    release = None
+    for p in pods:
+        meta = p.get("metadata") or {}
+        if own_name and meta.get("name") == own_name:
+            release = (meta.get("labels") or {}).get("app.kubernetes.io/instance")
+            break
+    if release:
+        ours = [
+            p
+            for p in ours
+            if ((p.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/instance")
+            == release
+        ]
+    return ours
+
+
+def list_release_containers() -> list[ContainerSummary]:
+    out = [_parse_pod_to_summary(p) for p in release_pods()]
+    out.sort(key=lambda c: (c.component, c.name))
+    return out
+
+
+def find_release_pod(name: str) -> tuple[ContainerSummary, str | None] | None:
+    """``(summary, default log container)`` for a current release pod, or None
+    when ``name`` is not one of them (the caller answers 404)."""
+    for p in release_pods():
+        if (p.get("metadata") or {}).get("name") == name:
+            return _parse_pod_to_summary(p), _pick_log_container(p)
+    return None
+
+
+def list_containers(*, appliance_only: bool = True) -> list[ContainerSummary]:
+    """``appliance_only`` keeps the appliance's own Cluster -> Pods behaviour
+    (empty off the appliance). Platform Insights uses ``release_pods()``."""
+    if appliance_only and not settings.appliance_mode:
         return []
     try:
         pods = k8s.list_pods()
@@ -286,14 +340,19 @@ def container_action(name: str, action: str) -> None:
     raise ValueError(f"unknown pod action: {action!r}")
 
 
-def get_container_logs(name: str, tail: int = 200, since_seconds: int | None = None) -> str:
+def get_container_logs(
+    name: str,
+    tail: int = 200,
+    since_seconds: int | None = None,
+    container: str | None = None,
+) -> str:
     """Return the last ``tail`` log lines (or lines since N seconds ago).
 
     Decoded UTF-8 with replacement for binary fragments. Truncated at
     ``tail`` lines server-side so response is bounded.
     """
     try:
-        body = k8s.get_pod_logs(name, tail=tail, since_seconds=since_seconds)
+        body = k8s.get_pod_logs(name, tail=tail, since_seconds=since_seconds, container=container)
     except k8s.KubeapiUnavailableError as exc:
         raise DockerUnavailableError(str(exc)) from exc
     return body
@@ -351,7 +410,10 @@ __all__ = [
     "DockerUnavailableError",
     "container_action",
     "get_container_logs",
+    "find_release_pod",
     "list_containers",
+    "list_release_containers",
+    "release_pods",
     "stream_container_logs",
 ]
 
