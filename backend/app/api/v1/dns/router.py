@@ -7412,18 +7412,15 @@ async def _push_windows_dynamic_update(
     return warnings
 
 
-async def _replace_update_acl_rows(
+async def _validate_update_acl_body(
     db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
 ) -> tuple[list[str], list[str]]:
-    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+    """Validate a full-replace ACL payload without writing (#3738).
 
-    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
-    apply. Verifies every referenced TSIG key belongs to the group, runs
-    the driver capability gate (raising ``HTTPException(422)`` on a
-    hard-unsupported entry), then drops + re-inserts the ordered set and
-    optionally flips ``dynamic_update_enabled``. Returns
-    ``(driver_names, warnings)``; the caller writes the audit row +
-    commits.
+    Verifies every referenced TSIG key belongs to the group and runs the
+    driver capability gate (422 on a hard-unsupported entry). Returns
+    ``(driver_names, warnings)``. Run before the no-op shortcut so an
+    unchanged save is refused exactly as it was before.
     """
     driver_names = await _group_driver_names(db, group_id)
 
@@ -7470,6 +7467,21 @@ async def _replace_update_acl_rows(
                 status_code=422,
                 detail={"code": "DYNAMIC_UPDATE_UNSUPPORTED", "message": str(exc)},
             ) from exc
+    return driver_names, warnings
+
+
+async def _replace_update_acl_rows(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+) -> tuple[list[str], list[str]]:
+    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+
+    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
+    apply. Validates (see ``_validate_update_acl_body``), then drops +
+    re-inserts the ordered set and optionally flips
+    ``dynamic_update_enabled``. Returns ``(driver_names, warnings)``; the
+    caller writes the audit row + commits.
+    """
+    driver_names, warnings = await _validate_update_acl_body(db, group_id, zone, body)
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
@@ -7530,8 +7542,11 @@ async def replace_zone_update_acl(
 
     # #3738 — audit only what changed; a save that changes nothing writes no
     # audit row, no wake and no Windows push, and answers with the stored state.
+    await _validate_update_acl_body(db, group_id, zone, body)
     old_entries = await _load_acl_out(db, zone.id)
 
+    # Entry order is meaningful (seq = first-match order in update-policy),
+    # so entries compare as an ordered list; only record_types is a set.
     def _canon(rows: Any) -> list[Any]:
         return [
             (
