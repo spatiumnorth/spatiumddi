@@ -207,16 +207,21 @@ So pass ``root`` (the chart root), ``deployment`` (the Deployment's name) and
 ``container`` (its main container) as well, and at one replica under ``hard``
 the helper surges first when the live ReplicaSets (``lookup``) say:
 
-  * a READY pod of this Deployment runs a SemVer release NEWER than this
-    render's image tag: this render is a rollback. It stays true on every
-    later render of the same release while the newer pod serves (the
-    template already carries the older tag by then), and stops being true
-    once the older pod is ready and the newer one retired; and
+  * a pod of this Deployment runs a SemVer release NEWER than this
+    render's image tag: this render is a rollback. Ready or not: after the
+    reboot onto the older slot, firstboot releases the control chart once
+    k3s and the CNPG webhook answer, which is routinely before the newer
+    pod has passed its readiness probe again, and a render that required
+    it ready would retire it first after all. It stays true on every later
+    render of the same release while the newer pod exists (the template
+    already carries the older tag by then), and stops being true once the
+    older pod is ready and the newer ReplicaSet scaled to 0; and
   * no ReplicaSet of it with pods carries a required anti-affinity term,
     so the #1541 wedge (a surviving 3-node pod) still retires first.
 
 Anything it cannot read (``helm template``, a tag that is not a 1.x+ SemVer
-release, a CalVer or nightly build, no live Deployment) retires first, as
+release, a CalVer or nightly build, an image pinned by digest, no live
+Deployment) retires first, as
 before. An ordinary upgrade is never a rollback, so it keeps #1659's
 strategy, and ``replicas > 1`` is untouched. ``replicaSets`` replaces the
 lookup with a given list (the chart tests, which have no cluster).
@@ -266,13 +271,11 @@ or "latest" is an unknown version, never an older one (core/versions.py).
       {{- if dig "affinity" "podAntiAffinity" "requiredDuringSchedulingIgnoredDuringExecution" (list) $podSpec -}}
         {{- $blocked = true -}}
       {{- end -}}
-      {{- if gt (int (dig "status" "readyReplicas" 0 $rs)) 0 -}}
-        {{- range $c := (default (list) $podSpec.containers) -}}
-          {{- if eq (toString $c.name) (toString $.container) -}}
-            {{- $tag := last (splitList ":" (last (splitList "/" (toString $c.image)))) -}}
-            {{- if and (regexMatch $release $tag) (gt ((semver $tag).Compare (semver $ours)) 0) -}}
-              {{- $newer = true -}}
-            {{- end -}}
+      {{- range $c := (default (list) $podSpec.containers) -}}
+        {{- if eq (toString $c.name) (toString $.container) -}}
+          {{- $tag := last (splitList ":" (last (splitList "/" (toString $c.image)))) -}}
+          {{- if and (regexMatch $release $tag) (gt ((semver $tag).Compare (semver $ours)) 0) -}}
+            {{- $newer = true -}}
           {{- end -}}
         {{- end -}}
       {{- end -}}

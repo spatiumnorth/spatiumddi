@@ -470,6 +470,87 @@ cases:
     rs:
       - {metadata: {ownerReferences: [{kind: Deployment, name: x-worker}]}, status: {replicas: 1, readyReplicas: 1},
          spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-after-reboot-newer-pod-not-ready-yet
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-rc10-to-rc9-numeric-order
+    expect: surge
+    ours: 1.0.0-rc.9
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.10"}]}}}}
+  - name: upgrade-rc9-to-rc10-numeric-order
+    expect: retire
+    ours: 1.0.0-rc.10
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.9"}]}}}}
+  - name: rollback-rc1-to-beta5
+    expect: surge
+    ours: 1.0.0-beta.5
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.1"}]}}}}
+  - name: upgrade-beta5-to-rc1
+    expect: retire
+    ours: 1.0.0-rc.1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-beta.5"}]}}}}
+  - name: rollback-final-to-rc
+    expect: surge
+    ours: 1.0.0-rc.2
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: upgrade-rc-to-final
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.2"}]}}}}
+  - name: rollback-1.10-to-1.9-numeric-order
+    expect: surge
+    ours: 1.9.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.10.0"}]}}}}
+  - name: same-release-rerender
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: newer-pod-pinned-by-digest-is-unknown
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1@sha256:0123456789abcdef"}]}}}}
+  - name: newer-pod-dev-tag-is-unknown
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:dev"}]}}}}
+  - name: newer-pod-nightly-is-unknown
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:0.0.0-nightly-20261108"}]}}}}
+  - name: rollback-from-semver-onto-calver-render-is-unknown
+    expect: retire
+    ours: 2026.11.03-1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.1"}]}}}}
+  - name: empty-lookup-hard-retires
+    expect: retire
+    ours: 1.0.0
   - name: soft-mode-always-surges
     expect: surge
     mode: soft
