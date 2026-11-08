@@ -5128,10 +5128,18 @@ export function SubnetDetail({
   // Address Sets panel) because the IP table's per-row gray-out derives
   // editability from "does the operator hold write/admin on a set whose
   // range contains this IP?" — computed client-side from these rows.
-  const { data: addressSets = [] } = useQuery({
+  // #3762 — address sets are a feature module; while it is off the list route
+  // answers 404, the tab goes, and "no sets" (nothing widens write access).
+  const addressSetsOn = useModuleOn("ipam.address_sets");
+  const { data: addressSetsData } = useQuery({
     queryKey: ["address-sets", subnet.id],
     queryFn: () => addressSetsApi.list({ subnet_id: subnet.id }),
+    enabled: addressSetsOn,
   });
+  const addressSets = useMemo(
+    () => (addressSetsOn ? (addressSetsData ?? []) : []),
+    [addressSetsOn, addressSetsData],
+  );
 
   // Subnet-wide write gate (one lookup, reused for every row).
   const subnetWritable = perms.can("write", "subnet", subnet.id);
@@ -5385,6 +5393,15 @@ export function SubnetDetail({
     if (dhcpFeatureReady && !dhcpOn && activeSubnetTab === "dhcp")
       setActiveSubnetTab("addresses");
   }, [dhcpFeatureReady, dhcpOn, activeSubnetTab]);
+  // Same for the Address Sets tab (#3762).
+  useEffect(() => {
+    if (
+      dhcpFeatureReady &&
+      !addressSetsOn &&
+      activeSubnetTab === "address-sets"
+    )
+      setActiveSubnetTab("addresses");
+  }, [dhcpFeatureReady, addressSetsOn, activeSubnetTab]);
   // Same for the Aliases tab (#2135): its records are DNS records.
   useEffect(() => {
     if (dhcpFeatureReady && !dnsOn && activeSubnetTab === "aliases")
@@ -6209,18 +6226,20 @@ export function SubnetDetail({
               Aliases
             </button>
           )}
-          <button
-            onClick={() => setActiveSubnetTab("address-sets")}
-            className={cn(
-              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
-              activeSubnetTab === "address-sets"
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-            title="Named, RBAC-scoped slices of this subnet's address space"
-          >
-            Address Sets
-          </button>
+          {addressSetsOn && (
+            <button
+              onClick={() => setActiveSubnetTab("address-sets")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "address-sets"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+              title="Named, RBAC-scoped slices of this subnet's address space"
+            >
+              Address Sets
+            </button>
+          )}
           {natOn && (
             <button
               onClick={() => setActiveSubnetTab("nat")}
@@ -6327,7 +6346,7 @@ export function SubnetDetail({
         </div>
       )}
 
-      {activeSubnetTab === "address-sets" && (
+      {activeSubnetTab === "address-sets" && addressSetsOn && (
         <div className="flex-1 overflow-auto">
           <AddressSetsSubnetPanel subnet={subnet} />
         </div>

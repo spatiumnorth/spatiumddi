@@ -103,6 +103,7 @@ from app.services.ipam.address_create_rules import (
     take_address_row,
 )
 from app.services.ipam.address_set_gate import (
+    ADDRESS_SETS_MODULE,
     WritableSetRanges,
     load_writable_set_ranges,
 )
@@ -1785,7 +1786,8 @@ async def _writable_subnet_ids(db: AsyncSession, user: Any) -> set[uuid.UUID] | 
                     set_ids.add(uuid.UUID(str(rid)))
                 except (ValueError, TypeError):
                     continue
-    if any_set or set_ids:
+    # Grants on a disabled address-sets module widen nothing (#3762).
+    if (any_set or set_ids) and await is_module_enabled(db, ADDRESS_SETS_MODULE):
         stmt = select(AddressSet.id, AddressSet.subnet_id)
         if not any_set:
             stmt = stmt.where(AddressSet.id.in_(set_ids))
