@@ -60,7 +60,8 @@ control plane is doing without standing up a separate Prometheus
   On Kubernetes (`api.serviceAccount.enabled`; manifests:
   `k8s/pod-logs/rbac.yaml`) it lists the release's pods in the api pod's
   namespace — only pods labelled as ours, narrowed to the api pod's own
-  `app.kubernetes.io/instance` — and tails or follows their logs through the
+  `app.kubernetes.io/instance` (it refuses, rather than widening, when it
+  cannot find its own pod) — and tails or follows their logs through the
   support-bundle redactor. A log request's pod name is checked against a fresh
   listing; anything else is a 404. Superadmin only; each log read is audited
   (`container_logs_read`). The appliance still sends you to Cluster → Pods.

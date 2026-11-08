@@ -16592,7 +16592,9 @@ export const containersApi = {
       .get<{
         name: string;
         tail: string;
-      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, { params: { tail } })
+      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, {
+        params: { tail },
+      })
       .then((r) => r.data),
 };
 

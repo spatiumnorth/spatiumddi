@@ -184,32 +184,35 @@ def release_pods() -> list[dict[str, Any]]:
     resolve a pod name against (#3761).
 
     Scope is the namespace of the mounted ServiceAccount, narrowed to pods
-    labelled as ours (same rule as ``service_control.kube``) and, when the api
-    pod's own release label resolves (``HOSTNAME`` is the pod name, read off
-    the same listing), to that release, so a second SpatiumDDI install in the
-    namespace is not offered. Always a fresh listing: a pod name is never
-    trusted from the caller.
+    labelled as ours (same rule as ``service_control.kube``) and then to the
+    api pod's own release: only pods whose ``app.kubernetes.io/instance``
+    equals the api pod's (both absent counts as equal, which is the raw
+    ``k8s/`` manifests' case), so a second SpatiumDDI install in the
+    namespace is not offered. The api pod is found by ``HOSTNAME`` (the pod
+    name) in the same listing; when it cannot be found the release is
+    unknown and this refuses rather than widening to every labelled pod.
+    Always a fresh listing: a pod name is never trusted from the caller.
     """
     try:
         pods = k8s.list_pods()
     except k8s.KubeapiUnavailableError as exc:
         raise DockerUnavailableError(str(exc)) from exc
-    ours = [p for p in pods if _parse_pod_to_summary(p).is_spatium]
+
+    def _instance(p: dict[str, Any]) -> str | None:
+        return ((p.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/instance")
+
     own_name = os.environ.get("HOSTNAME", "")
-    release = None
-    for p in pods:
-        meta = p.get("metadata") or {}
-        if own_name and meta.get("name") == own_name:
-            release = (meta.get("labels") or {}).get("app.kubernetes.io/instance")
-            break
-    if release:
-        ours = [
-            p
-            for p in ours
-            if ((p.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/instance")
-            == release
-        ]
-    return ours
+    own = next(
+        (p for p in pods if own_name and (p.get("metadata") or {}).get("name") == own_name),
+        None,
+    )
+    if own is None:
+        raise DockerUnavailableError(
+            f"cannot find the api's own pod ({own_name or 'HOSTNAME unset'}) in the "
+            "namespace, so the release to scope to is unknown"
+        )
+    release = _instance(own)
+    return [p for p in pods if _parse_pod_to_summary(p).is_spatium and _instance(p) == release]
 
 
 def list_release_containers() -> list[ContainerSummary]:

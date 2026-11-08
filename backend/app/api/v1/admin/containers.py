@@ -36,6 +36,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.v1.appliance.containers import _sse_log_response
 from app.config import settings
 from app.core.exc_text import describe_exc
+from app.core.responses import EventStreamResponse
 from app.models.audit import AuditLog
 from app.services.appliance import containers as pod_svc
 from app.services.appliance import k8s
@@ -290,6 +291,11 @@ class PodRow(BaseModel):
     containers: list[str]
 
 
+class PodLogsResponse(BaseModel):
+    name: str
+    tail: str
+
+
 class PodListResponse(BaseModel):
     available: bool
     reason: str | None = None
@@ -309,7 +315,7 @@ def _kube_probe() -> tuple[bool, str | None]:
                 "kubeapi refused to list pods; the api ServiceAccount lacks the pod "
                 "read Role. Set api.serviceAccount.enabled=true in the Helm values."
             )
-        return False, f"kubeapi unreachable: {text}"
+        return False, f"kubeapi: {text}"
     return True, None
 
 
@@ -394,13 +400,13 @@ def _audit_log_read(db: DB, user: Any, name: str, how: str) -> None:
     )
 
 
-@router.get("/containers/pods/{name}/logs")
+@router.get("/containers/pods/{name}/logs", response_model=PodLogsResponse)
 async def pod_logs(
     name: str,
     user: SuperAdmin,
     db: DB,
     tail: int = Query(200, ge=1, le=5000),
-) -> dict[str, str]:
+) -> PodLogsResponse:
     default_container = await _resolve_pod(name)
     requested = tail + LOG_CONTEXT_LINES
     try:
@@ -411,10 +417,10 @@ async def pod_logs(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
     _audit_log_read(db, user, name, "tail")
     await db.commit()
-    return {"name": name, "tail": redact_log_tail(text, tail, requested=requested)}
+    return PodLogsResponse(name=name, tail=redact_log_tail(text, tail, requested=requested))
 
 
-@router.get("/containers/pods/{name}/logs/stream")
+@router.get("/containers/pods/{name}/logs/stream", response_class=EventStreamResponse)
 async def pod_logs_stream(
     name: str,
     request: Request,
@@ -426,4 +432,4 @@ async def pod_logs_stream(
     _audit_log_read(db, user, name, "stream")
     await db.commit()
     gen = pod_svc.stream_container_logs(name, tail=tail, container=default_container)
-    return _sse_log_response(gen, request)
+    return _sse_log_response(gen, request, superadmin_only=True)

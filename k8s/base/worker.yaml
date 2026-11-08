@@ -15,6 +15,7 @@ spec:
     metadata:
       labels:
         app: spatiumddi-worker
+        app.kubernetes.io/name: spatiumddi
         app.kubernetes.io/component: worker
     spec:
       # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
@@ -190,6 +191,7 @@ spec:
     metadata:
       labels:
         app: spatiumddi-beat
+        app.kubernetes.io/name: spatiumddi
         app.kubernetes.io/component: beat
     spec:
       # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is

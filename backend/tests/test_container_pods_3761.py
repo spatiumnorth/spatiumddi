@@ -186,3 +186,81 @@ def test_appliance_listing_still_gated_on_appliance_mode(monkeypatch: pytest.Mon
     monkeypatch.setattr(svc.settings, "appliance_mode", True)
     with patch.object(k8s, "list_pods", return_value=list(_PODS)):
         assert len(svc.list_containers()) == 4
+
+
+# ── Validation follow-ups (#3761) ──────────────────────────────────────
+
+
+def test_release_unknown_refuses_rather_than_widening(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The api pod not in the listing (HOSTNAME unset or not a pod name) means
+    the release is unknown; listing every labelled pod in the namespace would
+    offer a second install's pods, so it refuses instead."""
+    for host in ("", "not-a-pod"):
+        monkeypatch.setenv("HOSTNAME", host)
+        with patch.object(k8s, "list_pods", return_value=list(_PODS)):
+            with pytest.raises(svc.DockerUnavailableError):
+                svc.release_pods()
+
+
+def test_unlabelled_release_matches_only_unlabelled_pods(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raw k8s/ manifests carry no instance label: the api pod's release is
+    "absent", which must not match a Helm release's pods."""
+    raw_api = _pod("spatiumddi-api-1", "api")
+    del raw_api["metadata"]["labels"]["app.kubernetes.io/instance"]
+    raw_worker = _pod("spatiumddi-worker-1", "worker")
+    del raw_worker["metadata"]["labels"]["app.kubernetes.io/instance"]
+    monkeypatch.setenv("HOSTNAME", "spatiumddi-api-1")
+    with patch.object(k8s, "list_pods", return_value=[raw_api, raw_worker, *_PODS]):
+        names = {p["metadata"]["name"] for p in svc.release_pods()}
+    assert names == {"spatiumddi-api-1", "spatiumddi-worker-1"}
+
+
+@pytest.mark.asyncio
+async def test_stream_is_redacted_and_audited_once(
+    client: AsyncClient, db_session: AsyncSession, kube_ok
+) -> None:
+    h = await _token(db_session)
+    secret = "postgresql://spatium:hunter2supersecret@db:5432/spatium"
+    lines = ["start", f"connecting {secret}", "ok", "more", "done"]
+    with patch.object(k8s, "stream_pod_logs", return_value=iter(lines)):
+        r = await client.get("/api/v1/admin/containers/pods/rel-api-1/logs/stream", headers=h)
+    assert r.status_code == 200
+    assert "hunter2supersecret" not in r.text
+    assert "connecting" in r.text and "done" in r.text
+    rows = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.action == "container_logs_read")))
+        .scalars()
+        .all()
+    )
+    assert [(a.resource_id, a.new_value) for a in rows] == [("pod/rel-api-1", {"mode": "stream"})]
+
+
+@pytest.mark.asyncio
+async def test_superadmin_only_stream_recheck_ignores_role_grants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller demoted from superadmin mid-stream loses the pod stream even
+    when a role still grants the appliance log permission."""
+    from contextlib import asynccontextmanager
+
+    from app.api import stream_auth
+
+    @asynccontextmanager
+    async def _session():
+        yield None
+
+    async def _auth(*_a: Any, **_k: Any) -> Any:
+        return SimpleNamespace(is_superadmin=False)
+
+    monkeypatch.setattr(stream_auth, "AsyncSessionLocal", _session)
+    monkeypatch.setattr(stream_auth, "authenticate_bearer", _auth)
+    monkeypatch.setattr(stream_auth, "user_has_permission", lambda *_a: True)
+    req = SimpleNamespace(headers={"authorization": "Bearer t"}, url=SimpleNamespace(path="/x"))
+
+    async def _verdict(**kw: Any) -> bool:
+        g = stream_auth.StreamAuthGuard(req, permission=("admin", "appliance"), **kw)  # type: ignore[arg-type]
+        g._checked_at -= stream_auth.STREAM_AUTH_RECHECK_SECONDS + 1
+        return await g.still_authorized()
+
+    assert await _verdict() is True
+    assert await _verdict(superadmin_only=True) is False
