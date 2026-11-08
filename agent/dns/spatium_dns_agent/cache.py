@@ -3,6 +3,7 @@
 Layout under /var/lib/spatium-dns-agent/:
     agent-id                       # UUID, 0600
     agent_token.jwt                # current JWT, 0600
+    registered_host                # SERVER_HOST last registered (#3757)
     config/current.json            # last bundle FETCHED from the control plane
     config/current.etag
     config/previous.json           # last bundle that APPLIED cleanly (#882)
@@ -519,3 +520,20 @@ def load_held_bundle(path: Path) -> dict[str, Any] | None:
 
 def drop_held_bundle(state_dir: Path) -> None:
     (state_dir / HELD_BUNDLE).unlink(missing_ok=True)
+
+
+def load_registered_host(state_dir: Path) -> str | None:
+    """The ``host`` this agent last sent to a successful registration (#3757):
+    ``""`` when it sent none, ``None`` when no registration recorded one (an
+    agent older than #3757 wrote no such file)."""
+    path = state_dir / "registered_host"
+    if not path.exists():
+        return None
+    return path.read_text().strip()
+
+
+def save_registered_host(state_dir: Path, host: str | None) -> None:
+    path = state_dir / "registered_host"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(host or "")
+    tmp.replace(path)

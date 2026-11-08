@@ -258,6 +258,20 @@ async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUI
     return group_ids
 
 
+async def _gate_batch_scopes(db: AsyncSession, batch: Any) -> None:
+    """#3748: the gates of the live scopes a subnet / block / space delete will
+    trash, exclusive, before the transaction's first row lock (step 0 of
+    ``app.services.lock_order``). :func:`_lock_scope_batch_rows` takes those
+    scope rows ``FOR UPDATE``, which an HA pair's overlapping lease-events
+    batches (each holding the scope ``FOR KEY SHARE``) starved past the command
+    timeout, as they did the scope delete; the gate queues new batches behind
+    this delete instead. The batch is collected with plain reads, so no row
+    lock is held here."""
+    from app.services.lock_order import lock_scope_gates  # noqa: PLC0415
+
+    await lock_scope_gates(db, _batch_scope_ids(batch), exclusive=True)
+
+
 async def _lock_scope_batch_rows(db: AsyncSession, batch: Any) -> None:
     """#3617: lock what a subnet / block / space delete's cascade will write,
     in the scope → mirror → zone order every lease-path writer takes
@@ -494,6 +508,7 @@ async def _apply_delete_subnet(
         from app.services.dns.reverse_zone import retire_auto_reverse_zones  # noqa: PLC0415
 
         batch = await collect_soft_delete_batch(db, subnet)
+        await _gate_batch_scopes(db, batch)  # #3748: before any row lock
         await _lock_scope_batch_rows(db, batch)  # #3617: scopes, mirrors, then zones
         # spatiumddi#1066 — the reverse zone this subnet auto-created rides
         # the same batch (restore brings both back) unless a sibling subnet
@@ -567,8 +582,12 @@ async def _apply_delete_subnet(
     # its second scope's leases locked after the first's mirrors.
     if scope_rows:
         from app.models.dhcp import DHCPLease  # noqa: PLC0415
-        from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+        from app.services.lock_order import lock_lease_rows, lock_scope_gates  # noqa: PLC0415
 
+        # #3748: the scopes' gates, exclusive, before the first row lock — the
+        # cascade below deletes the scope rows, which an HA pair's lease-events
+        # batches (each holding a scope ``FOR KEY SHARE``) would otherwise starve.
+        await lock_scope_gates(db, [s.id for s in scope_rows], exclusive=True)
         await lock_lease_rows(db, DHCPLease.scope_id.in_([s.id for s in scope_rows]))
     for scope in scope_rows:
         await push_scope_delete(db, scope)
@@ -778,6 +797,7 @@ async def _apply_delete_block(
         retire_auto_reverse_zones_for_batch,
     )
 
+    await _gate_batch_scopes(db, batch)  # #3748: before any row lock
     await _lock_scope_batch_rows(db, batch)  # #3617
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
@@ -944,6 +964,7 @@ async def _apply_delete_space(
         retire_auto_reverse_zones_for_batch,
     )
 
+    await _gate_batch_scopes(db, batch)  # #3748: before any row lock
     await _lock_scope_batch_rows(db, batch)  # #3617
     zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
@@ -1380,6 +1401,13 @@ async def _apply_delete_scope(
     if args.permanent:
         ensure_superadmin(user)
 
+    # #3748 — the scope's gate, exclusive, before any row lock: lease-events
+    # batches from both members of an HA pair hold the scope ``FOR KEY SHARE``
+    # in overlapping turns, which starves the ``FOR UPDATE`` below; the gate
+    # queues them behind this delete instead.
+    from app.services.lock_order import lock_scope_gates  # noqa: PLC0415
+
+    await lock_scope_gates(db, [args.scope_id], exclusive=True)
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")

@@ -427,6 +427,8 @@ def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
     is where the daemon listens, so a refusal there is a real answer) and
     only to an agent-managed server: Windows, cloud and an operator's own
     BIND9 are reached at their own address and must not be redirected.
+    A ``host`` that does not resolve is a separate case with its own,
+    VIP-independent fallback: :func:`transfer_unresolved_fallback_hosts`.
     """
     if not vip or not transfer_needs_tsig(server):
         return []
@@ -434,6 +436,34 @@ def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
     if not own or own in {server.host, vip}:
         return []
     return [own]
+
+
+def transfer_unresolved_fallback_hosts(server: DNSServer) -> list[str]:
+    """Where to AXFR ``server`` from when its ``host`` does not RESOLVE (#3757).
+
+    A chart-deployed agent registered its bare pod name, which only resolves
+    inside that pod. Its heartbeat source address (``last_seen_ip``) is where
+    its daemon listens, and unlike :func:`transfer_fallback_hosts` this needs
+    no VIP: it is only dialled after ``host`` failed to resolve, so a server
+    whose name works is never redirected. Same eligibility: agent-managed
+    only, so Windows, cloud and an operator's own BIND9 are never redirected.
+    """
+    if not transfer_needs_tsig(server):
+        return []
+    own = (getattr(server, "last_seen_ip", None) or "").strip()
+    if not own or own == server.host:
+        return []
+    return [own]
+
+
+def transfer_fallback_kwargs(server: DNSServer, vip: str) -> dict[str, list[str]]:
+    """``pull_zone_records`` kwargs for both fallbacks; empty when neither applies."""
+    out: dict[str, list[str]] = {}
+    if hosts := transfer_fallback_hosts(server, vip):
+        out["fallback_hosts"] = hosts
+    if unresolved := transfer_unresolved_fallback_hosts(server):
+        out["unresolved_fallback_hosts"] = unresolved
+    return out
 
 
 async def pull_zone_records_signed(
@@ -491,6 +521,8 @@ __all__ = [
     "pull_zone_records_signed",
     "resolve_transfer_vip",
     "transfer_fallback_hosts",
+    "transfer_fallback_kwargs",
+    "transfer_unresolved_fallback_hosts",
     "resolve_group_transfer_key",
     "resolve_view_transfer_key",
     "rotate_group_tsig_key",
