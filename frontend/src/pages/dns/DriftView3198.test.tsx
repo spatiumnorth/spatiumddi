@@ -137,4 +137,16 @@ describe("DriftView server status", () => {
     expect(screen.getByText(/DNS views can explain/)).toBeTruthy();
     expect(screen.queryByText(/Everything saved is being served/)).toBeNull();
   });
+
+  it("reads an unsupported server as not applicable, not as a failed pull (#3758)", async () => {
+    show(
+      server({
+        status: "unsupported",
+        error: "This is a conditional forwarder: nothing to compare.",
+      }),
+    );
+    expect(await screen.findByText("Not applicable")).toBeTruthy();
+    expect(screen.queryByText("Pull failed")).toBeNull();
+    expect(screen.getByText(/conditional forwarder/)).toBeTruthy();
+  });
 });
