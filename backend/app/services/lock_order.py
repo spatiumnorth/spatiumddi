@@ -46,6 +46,16 @@ UPDATE``, the lock the serial-bump UPDATE takes anyway: a concurrent record
 insert's foreign-key check (``FOR KEY SHARE`` on its zone) is not blocked by
 it.
 
+A scope row (``dhcp_scope``) sits between steps 1 and 2 for the lease writers
+that must not write into a scope in the Trash and the delete that puts it there
+(#3733). A lease-events batch holds the scopes its events resolve to ``FOR KEY
+SHARE`` after its lease rows, and reads them again there. A scope soft-delete
+takes its scope row ``FOR UPDATE`` before anything it writes, takes no lease
+row in that transaction, and tears the scope's leases down after its commit,
+one batch per transaction, each batch in the order above. So the stamp waits
+for a batch that already holds the scope, and a later batch waits for the stamp
+and finds the scope in the Trash.
+
 ``tests/_row_lock_order_guard.py`` asserts the order for the whole test suite.
 """
 

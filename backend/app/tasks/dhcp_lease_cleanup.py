@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,6 +35,8 @@ from app.services.dhcp.lease_cleanup import (
     _load_subnet_cache,
     _resolve_lease_subnet_id,
     address_still_held,
+    tear_down_scope_leases,
+    trashed_scopes_with_leases,
 )
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dhcp.normalize import norm_ip
@@ -284,26 +288,130 @@ async def _remirror_live_leases() -> int:
         return len(handovers)
 
 
-async def _run_both() -> tuple[tuple[int, int], int]:
-    return await _sweep(), await _remirror_live_leases()
+# How long one run tears down the leases of scopes in the Trash (#3733): the
+# task a scope delete enqueues when its request stopped at its deadline, and
+# the sweep's own pass, which finds what that teardown left behind. What is
+# left goes on the next run; the teardown is idempotent.
+TRASHED_SCOPE_TEARDOWN_BUDGET_S = 240.0
+SWEEP_TRASHED_SCOPE_BUDGET_S = 60.0
+
+# The sweep leaves a scope in the Trash alone this long after its delete: past
+# the delete's inline 20 s (``SCOPE_DELETE_INLINE_DEADLINE_S``) and its task's
+# 240 s, so the sweep never contends batch for batch with that teardown and
+# finds only what it left behind (the task's enqueue lost, or a scope larger
+# than one task run).
+SWEEP_TRASHED_SCOPE_GRACE = timedelta(minutes=10)
+
+
+async def _tear_down_trashed_scopes(
+    scope_id: str | None = None,
+    *,
+    budget_s: float = TRASHED_SCOPE_TEARDOWN_BUDGET_S,
+    trashed_before: datetime | None = None,
+) -> tuple[int, int, bool]:
+    """Tear down the leases still held by scopes in the Trash (#3733): the one
+    named, or every one that has any (trashed before ``trashed_before``, when
+    given). Each batch commits on its own (``tear_down_scope_leases``).
+    Returns ``(leases_removed, mirrors_removed, done)``; ``done`` is False when
+    the budget ran out first."""
+    async with task_session() as db:
+        if not await is_module_enabled(db, "core.dhcp"):
+            return 0, 0, True
+        if scope_id is not None:
+            scope_ids = [uuid.UUID(str(scope_id))]
+        else:
+            scope_ids = await trashed_scopes_with_leases(db, trashed_before=trashed_before)
+        await db.rollback()
+        deadline = time.monotonic() + budget_s
+        removed = mirrors = 0
+        done = True
+        for sid in scope_ids:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                done = False
+                break
+            r, m, finished = await tear_down_scope_leases(db, sid, deadline_s=left)
+            removed += r
+            mirrors += m
+            if not finished:
+                done = False
+                break
+        if removed:
+            # Removing leases and freeing their addresses is a mutation, and
+            # mutations are audited (non-negotiable #4): one row per run.
+            db.add(
+                AuditLog(
+                    user_display_name="<system>",
+                    auth_source="system",
+                    action="dhcp-scope-lease-teardown",
+                    resource_type="platform",
+                    resource_id="dhcp-scope-lease-teardown",
+                    resource_display="leases of DHCP scopes in the Trash",
+                    result="success",
+                    new_value={
+                        "leases_removed": removed,
+                        "lease_mirrors_removed": mirrors,
+                        "scopes": [str(sid) for sid in scope_ids[:50]],
+                        "capped": not done,
+                    },
+                )
+            )
+            await db.commit()
+        return removed, mirrors, done
+
+
+@celery_app.task(name="app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases")
+@module_gated("core.dhcp")
+def tear_down_trashed_scope_leases(scope_id: str | None = None) -> dict[str, int]:
+    """The rest of a scope delete's lease teardown, past its request's deadline
+    (#3733)."""
+    removed, mirrors, done = asyncio.run(_tear_down_trashed_scopes(scope_id))
+    logger.info(
+        "dhcp_trashed_scope_lease_teardown",
+        scope=scope_id,
+        leases_removed=removed,
+        lease_mirrors_removed=mirrors,
+        done=done,
+    )
+    return {"leases_removed": removed, "lease_mirrors_removed": mirrors, "done": int(done)}
+
+
+async def _run_both() -> tuple[tuple[int, int], int, int]:
+    expiry = await _sweep()
+    remirrored = await _remirror_live_leases()
+    # #3733 — and the leases a scope delete's own teardown left behind, once
+    # it has had its time.
+    left_behind, _mirrors, _done = await _tear_down_trashed_scopes(
+        budget_s=SWEEP_TRASHED_SCOPE_BUDGET_S,
+        trashed_before=datetime.now(UTC) - SWEEP_TRASHED_SCOPE_GRACE,
+    )
+    return expiry, remirrored, left_behind
 
 
 @celery_app.task(name="app.tasks.dhcp_lease_cleanup.sweep_expired_leases")
 @module_gated("core.dhcp")
 def sweep_expired_leases() -> dict[str, int]:
-    (cleaned, deleted), remirrored = asyncio.run(_run_both())
+    (cleaned, deleted), remirrored, left_behind = asyncio.run(_run_both())
     if remirrored:
         # Warning, not info: since the row locks of #2580 only a lease batch
         # the agent dropped should leave an address here, which wants finding.
         logger.warning("dhcp_lease_sweep_remirrored_available_rows", rows=remirrored)
+    if left_behind:
+        # Warning: past its grace a scope in the Trash should have no leases
+        # left, since its delete hands the rest to its own task. Two things
+        # leave some (#3733): that task's enqueue was lost, or the scope is
+        # larger than one task run tears down.
+        logger.warning("dhcp_lease_sweep_tore_down_trashed_scope_leases", leases=left_behind)
     logger.info(
         "dhcp_lease_sweep_complete",
         ipam_rows_removed=cleaned,
         expired_leases_deleted=deleted,
         ipam_rows_remirrored=remirrored,
+        trashed_scope_leases_removed=left_behind,
     )
     return {
         "ipam_rows_removed": cleaned,
         "expired_leases_deleted": deleted,
         "ipam_rows_remirrored": remirrored,
+        "trashed_scope_leases_removed": left_behind,
     }
