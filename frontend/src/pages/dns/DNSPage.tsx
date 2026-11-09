@@ -2553,7 +2553,7 @@ function DnssecCard({
   const signingServers = info.data?.signing_servers ?? 0;
   const signingUnmanaged = info.data?.signing_unmanaged ?? false;
   const unmanagedNote =
-    "SpatiumDDI does not sign zones on Technitium: it signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
+    "DNSSEC is not supported on Technitium in 1.0: SpatiumDDI signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
