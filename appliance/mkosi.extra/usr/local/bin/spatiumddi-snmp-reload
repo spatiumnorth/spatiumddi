@@ -373,7 +373,10 @@ case "$MARKER" in
         # firewall rule could). Staged and dry-run BEFORE snmpd is touched,
         # so a refusal changes nothing; opening a port before the daemon
         # listens is harmless.
-        SRC_LINE=$(grep -m1 -F "$SOURCES_MARKER" "$TMP_BODY" || true)
+        # Anchored at the start of the line: sysContact / sysLocation are
+        # free text rendered ABOVE the marker, and an unanchored match would
+        # read a value that merely contains the marker text as the list.
+        SRC_LINE=$(grep -m1 -e "^${SOURCES_MARKER}" "$TMP_BODY" || true)
         if [ -n "$SRC_LINE" ]; then
             SRC_LIST=${SRC_LINE#"$SOURCES_MARKER"}
         else

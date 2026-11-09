@@ -572,5 +572,17 @@ def test_unparseable_stored_source_is_published_as_invalid_not_dropped() -> None
 
 
 def test_v3_comment_no_longer_claims_sources_are_ignored() -> None:
-    text = render_snmpd_conf(_scoped(["10.0.0.0/8"], "v3"))
+    s = _scoped(["10.0.0.0/8"], "v3")
+    s.snmp_v3_users = [
+        {
+            "username": "noauth_user",
+            "auth_protocol": "none",
+            "auth_pass_enc": None,
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+    text = render_snmpd_conf(s)
+    assert "rouser noauth_user" in text  # the note is only emitted with users
     assert "ignores snmp_allowed_sources" not in text
+    assert "enforced by the host firewall" in text

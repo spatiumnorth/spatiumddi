@@ -381,11 +381,9 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
         out.append(f"rouser {username} {access_level} .1")
 
     if sources:
-        # Inert reminder — first cut doesn't restrict v3 by source
-        # CIDR. snmpd's USM model authenticates by user+pass, not
-        # source IP; operators wanting source filtering on top of
-        # USM should add a host firewall rule. Surface this clearly
-        # so they don't think the field is silently honoured.
+        # snmpd's USM model authenticates by user+pass, not source IP, so
+        # the source list is not rendered into any v3 line; the host
+        # runner's UDP 161 firewall rule enforces it instead (#2153).
         out.append("")
         out.append("# Note: snmpd itself does not filter v3 by source (USM authenticates by")
         out.append("# user+password); snmp_allowed_sources is enforced by the host firewall")
