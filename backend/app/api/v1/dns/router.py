@@ -8350,13 +8350,13 @@ async def move_zone_commit(
     # The create gives each NEW target server an empty zone (SOA + NS), so the
     # zone's saved records are pushed too (#3815) — or every one of them
     # answers NXDOMAIN while SpatiumDDI lists it as served. A server that
-    # ADOPTED an existing copy is skipped on purpose: that copy already holds
-    # the records (it is the shared-provider case, #3805), and re-pushing
-    # would only write what is there. The push sends the zone's live rows as
-    # they stand now, so a record op still queued against the old group is
-    # already reflected: a pending add / update is in the rows, and a pending
-    # delete's record is soft-deleted and is not resurrected.
-    await _push_moved_zone_records(db, zone, target_group.id, set(adopted_on))
+    # ADOPTED an existing copy is pushed to as well: the push is additive, so
+    # it sends only what that copy lacks — on a shared provider (#3805),
+    # exactly the record whose write was still queued for retry against the
+    # source group. The push sends the zone's live rows as they stand now, so
+    # a queued add / update is in the rows, and a queued delete's record is
+    # soft-deleted and is not resurrected.
+    pushed = await _push_moved_zone_records(db, zone, target_group.id, set(adopted_on))
     shared = await shared_provider_sources(
         db, source_group_id, target_group.id, adopted_on=adopted_on
     )
@@ -8387,6 +8387,8 @@ async def move_zone_commit(
                 "acknowledgements": sorted(body.acknowledgements),
                 "adopted_existing_on": adopted_on,
                 "source_copies_kept": shared.notes,
+                "records_pushed": pushed["pushed"],
+                "record_types_not_served": pushed["unsupported_types"],
             },
             result="success",
         )
@@ -8400,6 +8402,11 @@ async def move_zone_commit(
     # before the create, when whether the target already held the zone
     # was not yet known.
     resp.warnings.extend(n for n in shared.notes if n not in resp.warnings)
+    for name, types in pushed["unsupported_types"].items():
+        resp.warnings.append(
+            f"{name} cannot serve record type(s) {', '.join(types)}; those records of the zone "
+            "were not written there."
+        )
     return resp
 
 
@@ -9082,15 +9089,33 @@ async def _push_zone_to_agentless_servers(
 
 async def _push_moved_zone_records(
     db: DB, zone: DNSZone, group_id: uuid.UUID, adopted_names: set[str]
-) -> None:
+) -> dict[str, Any]:
     """Push a moved zone's saved records to the target group's agentless
-    servers whose create made a fresh zone (#3815). Reuses the additive push
-    the create rollback and Sync with Servers use. A record that cannot be
-    written is a 502 naming it, like a failed create, so the move is never
-    reported clean while the target answers NXDOMAIN; the zone then exists
-    in both groups' providers (visible, fixable with Sync with Servers)."""
+    servers (#3815), through the additive push the create rollback and Sync
+    with Servers use: each server's copy is read first and only what it
+    lacks is sent.
+
+    Every target server is pushed to, including one whose create ADOPTED an
+    existing copy: that copy is usually the source's own (one provider, #3805)
+    and already holds the records, so the push sends nothing — except a
+    record whose write was still queued for retry against the source group,
+    which the move drops and which only this push delivers.
+
+    A record that cannot be written is a 502 naming it, like a failed create,
+    so the move is never reported clean while the target answers NXDOMAIN.
+    Before raising, the zone is deleted again from each server whose create
+    made a FRESH copy — the compensation a failed create gets — so a retry
+    does not adopt a half-filled copy. An adopted copy is never deleted: the
+    move did not create it.
+
+    Returns what was pushed, per server, and the record types a target
+    driver cannot serve (those rows are not sent and are reported, not
+    failed: the move preview's driver-change warning already names it)."""
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+    from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
     from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        _PUSHABLE_TYPES,
+        _syncable_types,
         restore_zone_records_to_server,
     )
 
@@ -9101,16 +9126,32 @@ async def _push_moved_zone_records(
             DNSServer.is_enabled.is_(True),
         )
     )
+    servers = [s for s in res.scalars().all() if is_agentless(s.driver)]
+    summary: dict[str, Any] = {"pushed": {}, "unsupported_types": {}}
+    if not servers:
+        return summary
+    live_types = {
+        t.upper()
+        for t in (
+            await db.execute(
+                select(DNSRecord.record_type).where(DNSRecord.zone_id == zone.id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    }
     failures: list[str] = []
-    for server in res.scalars().all():
-        if not is_agentless(server.driver) or server.name in adopted_names:
-            continue
+    for server in servers:
         driver = get_driver(server.driver)
+        unsupported = sorted(live_types - _syncable_types(driver, _PUSHABLE_TYPES))
+        if unsupported:
+            summary["unsupported_types"][server.name] = unsupported
         try:
             restored = await restore_zone_records_to_server(db, server, driver, zone)
             problems = list(restored.push_errors)
             if restored.pushed < restored.candidates and not problems:
                 problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
+            summary["pushed"][server.name] = restored.pushed
         except Exception as exc:  # noqa: BLE001 — reported below
             problems = [_exc_text(exc)]
         if problems:
@@ -9121,15 +9162,51 @@ async def _push_moved_zone_records(
                 zone=zone.name,
                 errors=problems,
             )
-    if failures:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Zone {zone.name} was created on the target group's provider, but its records "
-                f"could not all be written to {'; '.join(failures)}. The move was not saved in "
-                "SpatiumDDI — run Sync with Servers on the zone, then retry."
-            ),
+    if not failures:
+        return summary
+
+    removed: list[str] = []
+    left: list[str] = []
+    for server in servers:
+        if server.name in adopted_names:
+            continue
+        driver = get_driver(server.driver)
+        try:
+            if isinstance(driver, CloudDNSDriverBase):
+                await driver.apply_zone_change(
+                    server,
+                    zone,
+                    "delete",
+                    managed_records=await _managed_zone_records(db, zone),
+                )
+            else:
+                await driver.apply_zone_change(server, zone, "delete")
+            removed.append(server.name)
+        except Exception as exc:  # noqa: BLE001 — best effort; reported below
+            left.append(f"{server.name}: {_exc_text(exc)}")
+            logger.warning(
+                "dns.zone.move_record_push_compensation_failed",
+                server=str(server.id),
+                zone=zone.name,
+                error=_exc_text(exc),
+            )
+    detail = (
+        f"Zone {zone.name}'s records could not all be written to the target group: "
+        f"{'; '.join(failures)}. The move was not saved in SpatiumDDI."
+    )
+    if removed:
+        detail += f" The zone created for the move was removed again from: {', '.join(removed)}."
+    if adopted_names:
+        detail += (
+            f" Left as found on: {', '.join(sorted(adopted_names))} "
+            "(those servers already held the zone)."
         )
+    if left:
+        detail += (
+            f" Removing the zone created for the move failed on: {'; '.join(left)} — "
+            "those servers may still hold a partial copy; delete it there before retrying."
+        )
+    raise HTTPException(status_code=502, detail=detail)
 
 
 async def _managed_zone_records(db: DB, zone: DNSZone) -> list[Any]:

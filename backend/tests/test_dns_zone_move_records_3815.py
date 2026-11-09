@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns.base import RecordChangeResult, RecordData
+from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from tests.test_dns_zone_move_same_provider_3805 import (
     _A,
@@ -116,21 +117,34 @@ async def test_move_to_another_provider_pushes_live_records_only(
     held = prov.records[("route53:key:AKIA-TWO", zone.name)]
     assert {n for n, _t, _v in held} == {"www", "pending"}  # the pending add arrived
     assert "gone" not in {w[1] for w in prov.writes}  # the pending delete did not resurrect
+    audit = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == "move", AuditLog.resource_id == str(zone.id))
+        )
+    ).scalar_one()
+    assert audit.new_value["records_pushed"] == {"dst-ns": 2}
 
 
 @pytest.mark.asyncio
-async def test_adopted_copy_is_not_pushed_again(
+async def test_adopted_copy_gets_only_the_record_still_queued_for_retry(
     client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
 ) -> None:
+    """One provider behind both groups (#3805): the target adopts the source's
+    copy, which holds every record but the one whose write was waiting for its
+    retry. The move drops that op, so the push must deliver it — and nothing
+    else, since the rest is already there."""
     token = await _token(db_session)
     zone, dst = await _setup(db_session, _A, _A)
     await _seed(db_session, zone)
-    prov.zones.add(("route53:key:AKIA-ONE", zone.name))
+    key = ("route53:key:AKIA-ONE", zone.name)
+    prov.zones.add(key)
+    prov.records[key] = {("www", "A", "192.0.2.1")}
 
     resp = await _move(client, token, zone, dst)
 
     assert resp.status_code == 200, resp.text
-    assert prov.writes == []
+    assert prov.writes == [("dst-ns", "pending", "A", "192.0.2.2")]
+    assert key in prov.zones  # the shared copy is still there
 
 
 @pytest.mark.asyncio
@@ -146,3 +160,45 @@ async def test_failed_record_push_is_not_a_clean_move(
 
     assert resp.status_code == 502, resp.text
     assert "records" in resp.json()["detail"]
+    # The fresh copy the move created is removed again, so a retry does not
+    # adopt a half-filled zone and skip filling it.
+    assert ("route53:key:AKIA-TWO", zone.name) not in prov.zones
+    assert ("dst-ns", "delete") in prov.calls
+    assert "removed again" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_failed_record_push_never_deletes_an_adopted_copy(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    await _seed(db_session, zone)
+    key = ("route53:key:AKIA-ONE", zone.name)
+    prov.zones.add(key)
+    prov.fail = True
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 502, resp.text
+    assert key in prov.zones
+    assert ("dst-ns", "delete") not in prov.calls
+    assert ("src-ns", "delete") not in prov.calls
+
+
+@pytest.mark.asyncio
+async def test_record_type_the_target_cannot_serve_is_reported(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    prov: _RecordProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _B)
+    await _seed(db_session, zone)
+    monkeypatch.setattr(prov, "capabilities", lambda: {"record_types": ["CNAME"]})
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    assert any("cannot serve record type(s) A" in w for w in resp.json()["warnings"])
