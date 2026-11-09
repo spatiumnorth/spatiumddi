@@ -261,6 +261,82 @@ async def _group_has_views(db: AsyncSession, group_id: uuid.UUID) -> bool:
     return bool((await build_geo_steering(db, group_id)).active)
 
 
+@dataclass
+class SharedProviderResult:
+    """Source-group agentless servers whose zone copy a move must NOT delete."""
+
+    #: Server ids to leave out of the source-group delete.
+    keep_ids: set[uuid.UUID] = field(default_factory=set)
+    #: Operator-readable reason per kept server.
+    notes: list[str] = field(default_factory=list)
+
+
+async def shared_provider_sources(
+    db: AsyncSession, source_group_id: uuid.UUID, target_group_id: uuid.UUID
+) -> SharedProviderResult:
+    """Find source servers that reach the same provider as a target server (#3805).
+
+    The move pushes a create into the target, then a delete into the source.
+    When one provider sits behind a server on each side the create adopts the
+    existing zone and the delete then removes the only copy. A source server
+    is therefore kept (not deleted) when its provider identity equals a
+    target server's, and ALSO when either identity cannot be determined:
+    delete is the destructive direction, so unknown fails safe.
+    """
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+
+    async def _agentless(group_id: uuid.UUID) -> list[DNSServer]:
+        rows = (
+            (
+                await db.execute(
+                    select(DNSServer).where(
+                        DNSServer.group_id == group_id,
+                        DNSServer.credentials_encrypted.isnot(None),
+                        DNSServer.is_enabled.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [r for r in rows if is_agentless(r.driver)]
+
+    result = SharedProviderResult()
+    targets = await _agentless(target_group_id)
+    if not targets:
+        return result
+    sources = await _agentless(source_group_id)
+
+    def _identity(server: DNSServer) -> str | None:
+        return get_driver(server.driver).provider_identity(server)
+
+    target_ids = {t.name: _identity(t) for t in targets}
+    unknown_target = next((n for n, i in target_ids.items() if i is None), None)
+    by_identity = {i: n for n, i in target_ids.items() if i is not None}
+    for src in sources:
+        ident = _identity(src)
+        if ident is not None and ident in by_identity:
+            other = by_identity[ident]
+            result.keep_ids.add(src.id)
+            result.notes.append(
+                f"Source copy kept on '{src.name}': it reaches the same provider as "
+                f"target server '{other}', so deleting it would remove the zone the "
+                f"target now serves."
+            )
+        elif ident is None or unknown_target is not None:
+            result.keep_ids.add(src.id)
+            logger.warning(
+                "dns.zone_move.provider_identity_unknown",
+                source_server=src.name,
+                target_server=unknown_target,
+            )
+            result.notes.append(
+                f"Source copy kept on '{src.name}': whether it shares a provider with a "
+                f"target server could not be determined, so the zone is not deleted there."
+            )
+    return result
+
+
 async def _drivers_of(db: AsyncSession, group_id: uuid.UUID) -> list[str]:
     rows = (
         (
@@ -564,6 +640,7 @@ async def assemble_move_plan(
             plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
 
     _fill_warnings(plan)
+    plan.warnings.extend((await shared_provider_sources(db, zone.group_id, target_group.id)).notes)
     return plan
 
 

@@ -263,6 +263,7 @@ from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
+    shared_provider_sources,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
@@ -8339,8 +8340,15 @@ async def move_zone_commit(
     # fail leaves the zone existing in both places (visible, fixable) where
     # delete-then-fail would have removed it from the old server with the
     # database still saying it lives there.
+    #
+    # A source server that reaches the same provider as a target server
+    # is NOT deleted from (#3805): the create adopted the provider's one copy,
+    # and deleting through the source would remove it.
+    shared = await shared_provider_sources(db, source_group_id, target_group.id)
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
-    await _push_zone_to_agentless_servers(db, zone, "delete", group_id=source_group_id)
+    await _push_zone_to_agentless_servers(
+        db, zone, "delete", group_id=source_group_id, skip_server_ids=shared.keep_ids
+    )
 
     db.add(
         AuditLog(
@@ -8822,7 +8830,11 @@ async def apply_delegation(
 
 
 async def _push_zone_to_agentless_servers(
-    db: DB, zone: DNSZone, op: str, group_id: uuid.UUID | None = None
+    db: DB,
+    zone: DNSZone,
+    op: str,
+    group_id: uuid.UUID | None = None,
+    skip_server_ids: set[uuid.UUID] | None = None,
 ) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
 
@@ -8877,7 +8889,13 @@ async def _push_zone_to_agentless_servers(
             DNSServer.is_enabled.is_(True),
         )
     )
-    targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
+    # ``skip_server_ids``: servers the caller has decided not to drive (the
+    # move keeps a source copy that shares a provider with the target, #3805).
+    targets = [
+        s
+        for s in servers_res.scalars().all()
+        if is_agentless(s.driver) and s.id not in (skip_server_ids or set())
+    ]
     if not targets:
         return []
 

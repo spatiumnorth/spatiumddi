@@ -465,6 +465,20 @@ class DNSDriver(ABC):
 
     name: str = "abstract"
 
+    def provider_identity(self, server: Any) -> str | None:
+        """Identify the external system an AGENTLESS server drives (#3805).
+
+        Two server rows can reach the same provider zone store (two
+        Technitium rows with one API URL, two cloud rows with one account).
+        A zone move pushes a create to the target group and a delete to the
+        source group; when both reach one provider the delete removes the
+        only copy. Equal identities mean "same provider". ``None`` means
+        unknown, and callers must treat unknown as "might be the same":
+        delete is the destructive direction. Agent-managed drivers have no
+        provider to share, so the default is ``None``.
+        """
+        return None
+
     # ── Rendering ─────────────────────────────────────────────────────────
 
     @abstractmethod

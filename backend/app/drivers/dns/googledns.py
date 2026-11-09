@@ -99,6 +99,11 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
     """Agentless driver for Google Cloud DNS managed zones."""
 
     name: str = "google_dns"
+
+    def _account_identity(self, creds: dict[str, Any]) -> str | None:
+        project = str(creds.get("project_id") or "").strip().lower()
+        return project or None
+
     # Ordered credential fields the Add-DNS-server modal renders + the
     # probe validates as required.
     credential_fields: tuple[str, ...] = ("service_account_json", "project_id")

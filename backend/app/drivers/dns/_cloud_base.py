@@ -257,6 +257,17 @@ class CloudDNSDriverBase(DNSDriver):
         # informational. Accept anything so upstream validators don't block.
         return (True, [])
 
+    def _account_identity(self, creds: dict[str, Any]) -> str | None:
+        """The provider account these credentials reach; None when unknown."""
+        return None
+
+    def provider_identity(self, server: Any) -> str | None:
+        try:
+            account = self._account_identity(self._load_credentials(server))
+        except Exception:  # noqa: BLE001 — unknown identity, caller fails safe
+            return None
+        return f"{self.name}:{account}" if account else None
+
     # ── Credential handling ─────────────────────────────────────────────
     def _load_credentials(self, server: Any) -> dict[str, Any]:
         """Decrypt the provider credential dict from the server row.

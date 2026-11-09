@@ -162,6 +162,16 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Technitium api_url {url!r} has no host.")
         return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
 
+    def provider_identity(self, server: Any) -> str | None:
+        """Normalised API root: two rows with one URL are one Technitium."""
+        try:
+            creds = self._load_credentials(server)
+            return (
+                "technitium_api:" + self.normalize_api_url(str(creds.get("api_url") or "")).lower()
+            )
+        except Exception:  # noqa: BLE001 — unknown identity, caller fails safe
+            return None
+
     def _creds(self, creds: dict[str, Any]) -> tuple[str, str, bool]:
         """Return ``(api_url_root, token, verify_tls)`` or raise."""
         api_url = self.normalize_api_url(str((creds or {}).get("api_url") or ""))
