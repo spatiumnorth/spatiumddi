@@ -155,6 +155,15 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     lines.append(_AGENT_ADDRESS_LINE)
     lines.append("")
 
+    # Source scope for the host firewall rule (#2153), read by the host runner
+    # (spatiumddi-snmp-reload) — it is part of the body, so the config_hash
+    # covers it and a changed list re-fires the runner. Empty = any source.
+    # A stored entry that does not parse is published as the sentinel
+    # "!invalid", which the runner refuses, rather than being dropped (which
+    # would widen the rule).
+    lines.append(_sources_marker(list(settings.snmp_allowed_sources or [])))
+    lines.append("")
+
     # View that exposes the whole MIB tree to authorised queries.
     # Per-OID restrictions are out of scope for the first cut.
     lines.append("view all included .1")
@@ -174,6 +183,17 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     # Trailing newline so editors don't add a "no newline at end of
     # file" diff when an operator inspects the file directly.
     return "\n".join(lines) + "\n"
+
+
+SOURCES_MARKER = "# spatium-snmp-sources:"
+
+
+def _sources_marker(raw_sources: list[Any]) -> str:
+    entries = [str(s).strip() for s in raw_sources if str(s).strip()]
+    canon = _valid_sources(entries)
+    if len(canon) != len(entries):
+        return f"{SOURCES_MARKER} !invalid"
+    return f"{SOURCES_MARKER} {','.join(canon)}".rstrip()
 
 
 def _quote(s: str) -> str:
@@ -256,11 +276,10 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
 
     # v3 source filters are implemented per-rouser via the OID arg's
     # source-filter sibling — net-snmp's ``rouser`` itself doesn't
-    # carry a CIDR arg, but ``access`` does. For the first cut, if
-    # ``snmp_allowed_sources`` is set we add a single ``com2sec6`` /
-    # ``com2sec`` line per source linking to a dummy community-name
-    # context so the v3 access table inherits the filter. If empty,
-    # v3 users are reachable from any source the OS firewall lets in.
+    # carry a CIDR arg, but ``access`` does. snmpd gets no source filter
+    # for v3; ``snmp_allowed_sources`` is enforced by the host firewall rule
+    # the runner renders (#2153). If empty, v3 users are reachable from any
+    # source.
     out: list[str] = []
     for u in raw_users:
         username = (u.get("username") or "").strip()
@@ -368,9 +387,9 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
         # USM should add a host firewall rule. Surface this clearly
         # so they don't think the field is silently honoured.
         out.append("")
-        out.append("# Note: SNMP v3 ignores snmp_allowed_sources — USM authenticates by")
-        out.append("# user+password, not source IP. Use the host firewall (nftables) to")
-        out.append("# restrict by CIDR if needed.")
+        out.append("# Note: snmpd itself does not filter v3 by source (USM authenticates by")
+        out.append("# user+password); snmp_allowed_sources is enforced by the host firewall")
+        out.append("# rule that opens UDP 161.")
 
     return out
 

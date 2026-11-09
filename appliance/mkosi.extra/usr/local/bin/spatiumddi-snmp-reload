@@ -106,6 +106,11 @@ LOCK=/run/spatiumddi-snmp-reload.lock
 # /etc/nftables.conf includes /etc/nftables.d/*.nft so a reload picks
 # the file up without editing the main config.
 NFT_DROPIN=/etc/nftables.d/50-spatium-snmp.nft
+NFT_MAIN=/etc/nftables.conf
+# The control plane states the source scope for the firewall rule on one
+# comment line of the body it renders (#2153); the hash covers the body, so a
+# changed list re-fires this runner.
+SOURCES_MARKER='# spatium-snmp-sources:'
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
 exec >> "$LOG" 2>&1
@@ -123,6 +128,16 @@ nft_reload() {
         systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
     fi
 }
+# Put back the firewall fragment that was live before this apply (staged
+# below). No reload: the kernel still has the old ruleset unless the
+# success path ran, and then nothing calls this.
+restore_nft_fragment() {
+    if [ -n "${PREV_NFT:-}" ] && [ -f "$PREV_NFT" ]; then
+        install -o root -g root -m 0644 "$PREV_NFT" "$NFT_DROPIN"
+    elif [ "${HAD_NFT:-0}" = 0 ]; then
+        rm -f "$NFT_DROPIN"
+    fi
+}
 # A staged config that passed the probe but would not START: put back
 # what was live before this apply (#2376 case 5) — the config file, the
 # USM state, the enable state, and snmpd itself if it was running — so a
@@ -130,6 +145,7 @@ nft_reload() {
 # actually true afterwards, not what the failed apply hoped for.
 restore_previous() {
     echo "  ↺ restoring the previous snmpd config"
+    restore_nft_fragment
     systemctl stop snmpd >/dev/null 2>&1 || true
     if [ -n "$PREV_CONF" ]; then
         install -o root -g root -m 0640 "$PREV_CONF" "$ETC_CONF"
@@ -343,6 +359,79 @@ case "$MARKER" in
             cp -p "$USM_STATE" "$PREV_USM"
         fi
 
+        # Open UDP 161 in the host firewall, scoped to snmp_allowed_sources
+        # (#2153). Before this the rule was an unconditional ``udp dport 161
+        # accept`` and the list was ignored on v3, where snmpd has no source
+        # filter of its own. The list arrives on a comment line of the body.
+        # Empty list = open to any source (stated in the UI). A list that does
+        # not parse is a REFUSAL, never "open" (the #1001 lesson): this
+        # fragment is the enforcement. The CIDRs go to python3 as ARGV (#1001:
+        # ``python3 -`` reads the program from stdin). The include in
+        # /etc/nftables.conf sits INSIDE the input chain, so this is a
+        # chain-rule fragment, not a top-level ``add rule``. Nothing in the
+        # base config accepts 161 ahead of it (only an operator-written
+        # firewall rule could). Staged and dry-run BEFORE snmpd is touched,
+        # so a refusal changes nothing; opening a port before the daemon
+        # listens is harmless.
+        SRC_LINE=$(grep -m1 -F "$SOURCES_MARKER" "$TMP_BODY" || true)
+        if [ -n "$SRC_LINE" ]; then
+            SRC_LIST=${SRC_LINE#"$SOURCES_MARKER"}
+        else
+            SRC_LIST=""
+            echo "  ! no source-scope line in the body (older control plane) — UDP 161 stays open to any source"
+        fi
+        NFT_TMP=$(mktemp /tmp/spatium-snmp-nft.XXXXXX)
+        trap 'rm -f "$TMP_BODY" "$PREV_CONF" "$PREV_USM" "$NFT_TMP" "${PREV_NFT:-}"' EXIT
+        if ! python3 - "$SRC_LIST" > "$NFT_TMP" <<'PYEOF'
+import ipaddress
+import sys
+
+raw = sys.argv[1].strip()
+entries = [e.strip() for e in raw.replace(",", " ").split() if e.strip()]
+v4, v6 = [], []
+for e in entries:
+    try:
+        net = ipaddress.ip_network(e, strict=False)
+    except ValueError:
+        print(f"snmp source {e!r} is not a CIDR or address", file=sys.stderr)
+        sys.exit(1)
+    (v4 if net.version == 4 else v6).append(str(net))
+
+print("# Managed by spatiumddi-snmp-reload — do not edit manually.")
+print("# SpatiumDDI SNMP is enabled; this opens UDP 161 inbound, scoped to")
+print("# snmp_allowed_sources (empty list = any source). Removed automatically")
+print("# when SNMP is disabled via the UI.")
+if not v4 and not v6:
+    print('udp dport 161 accept comment "spatium-snmp"')
+else:
+    if v4:
+        print(f'ip saddr {{ {", ".join(v4)} }} udp dport 161 accept comment "spatium-snmp"')
+    if v6:
+        print(f'ip6 saddr {{ {", ".join(v6)} }} udp dport 161 accept comment "spatium-snmp6"')
+PYEOF
+        then
+            echo "  ✗ snmp source list refused — not rendering the firewall rule (snmpd untouched)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        HAD_NFT=0
+        PREV_NFT=""
+        if [ -f "$NFT_DROPIN" ]; then
+            HAD_NFT=1
+            PREV_NFT=$(mktemp /tmp/spatium-snmp-nft.prev.XXXXXX)
+            cp -p "$NFT_DROPIN" "$PREV_NFT"
+        fi
+        install -o root -g root -m 0644 "$NFT_TMP" "$NFT_DROPIN"
+        if ! nft -c -f "$NFT_MAIN" 2>/tmp/spatium-snmp-nft-check.err; then
+            sed 's/^/      /' /tmp/spatium-snmp-nft-check.err
+            restore_nft_fragment
+            echo "  ✗ rendered snmp nft drop-in failed nft -c -f — previous fragment restored, snmpd untouched"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+
         # Stop snmpd cleanly so the createUser lines we're about to
         # ship are read fresh on next start. Ignore failure when the
         # service was never enabled — first-time apply.
@@ -372,26 +461,8 @@ case "$MARKER" in
         sleep 2
         if systemctl is-active --quiet snmpd; then
             echo "  ✓ snmpd is active"
-            # Open UDP 161 in the host firewall. snmpd does its own
-            # source-CIDR filtering (rocommunity <comm> <CIDR>); the
-            # firewall rule is intentionally not source-restricted
-            # here so v3 + v2c share the same plumbing. Operators
-            # who want extra defence-in-depth can drop a more-
-            # restrictive *.nft in /etc/nftables.d/ themselves.
-            # Note: /etc/nftables.conf's ``include "/etc/nftables.d/*.nft"``
-            # lives INSIDE the input chain definition, so this file
-            # must contain a chain-rule fragment (``udp dport 161
-            # accept``), not a top-level ``add rule …`` directive.
-            # Verified on Debian trixie: ``add rule inet filter
-            # input …`` 422s the reload with
-            # ``syntax error, unexpected rule, expecting @ or '$'``.
-            cat > "$NFT_DROPIN" <<'EOF'
-# Managed by spatiumddi-snmp-reload — do not edit manually.
-# SpatiumDDI SNMP is currently enabled; this rule opens UDP 161
-# inbound. Removed automatically when SNMP is disabled via the UI.
-udp dport 161 accept
-EOF
-            chmod 0644 "$NFT_DROPIN"
+            # The UDP 161 drop-in was staged, dry-run and installed before
+            # snmpd was stopped (see above); load it now.
             nft_reload
             echo "running" | state_write "$STATUS_SIDECAR"
             echo "$HASH" | state_write "$HASH_SIDECAR"
