@@ -200,7 +200,14 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         if creds.get("account_id"):
             return "account:" + str(creds["account_id"]).strip().lower()
         token = str(creds.get("api_token") or "")
-        return "token:" + hashlib.sha256(token.encode()).hexdigest()[:16] if token else None
+        if not token:
+            return None
+        # Only ever compared, never logged or returned; a key-derivation
+        # function rather than a bare hash because the input is a credential.
+        digest = hashlib.scrypt(
+            token.encode(), salt=b"spatiumddi-provider-identity", n=2**14, r=8, p=1, dklen=16
+        )
+        return "token:" + digest.hex()
 
     # The Add-DNS-server modal renders + the probe requires only the token.
     # ``account_id`` is optional (zone create / delete only), so it is not listed here.
