@@ -755,7 +755,7 @@ behaves the same way for its zones.
 
 The leases of those scopes in Trash are torn down first, in committed
 batches, before the group goes (#3744). When more of them are left than the
-request can tear down in 20 s (a scope trashed moments before, with its own
+request can tear down in 10 s (a scope trashed moments before, with its own
 background teardown still running), the delete answers `409` with
 `Retry-After: 60` and hands the rest to that teardown; retry once it has
 finished.

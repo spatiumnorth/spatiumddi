@@ -185,12 +185,12 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(50), nullable=False, default="hmac-sha256"
     )
 
-    # ── BIND9 catalog zones (RFC 9432) — distribute zones across the
-    # group via one catalog instead of per-server config push. BIND 9.18+
-    # only. The producer is the group's `is_primary=True` server; every
-    # other bind9 member joins as a consumer. ``catalog_zone_serial`` is
-    # bumped by the bundle builder whenever the membership list changes,
-    # so a NOTIFY fires automatically on add/remove.
+    # ── BIND9 catalog zones (RFC 9432) — the group's `is_primary=True`
+    # server publishes one catalog of the group's primary zones, for
+    # secondaries OUTSIDE the group. BIND 9.18+ only. Other members never
+    # consume it: each already gets every zone in its bundle, and consuming
+    # would load every zone twice (#3764). The agent stamps the catalog's
+    # serial each time the membership in its bundle changes.
     catalog_zones_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )

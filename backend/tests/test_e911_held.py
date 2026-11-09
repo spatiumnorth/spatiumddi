@@ -17,6 +17,7 @@ HOW TO RUN:
 
 from __future__ import annotations
 
+import itertools
 import uuid
 from xml.etree import ElementTree as ET
 
@@ -372,6 +373,9 @@ def test_an_error_document_escapes_its_message() -> None:
 HELD_CT = {"Content-Type": "application/held+xml"}
 
 
+_OCTETS = itertools.cycle(range(1, 250))
+
+
 async def _estate_with_location(db: AsyncSession) -> tuple[str, str]:
     """A voice subnet with an ERL bound to it. Returns (ip, room)."""
     site = Site(name=f"hq-{uuid.uuid4().hex[:6]}", kind="office")
@@ -383,7 +387,10 @@ async def _estate_with_location(db: AsyncSession) -> tuple[str, str]:
     block = IPBlock(space_id=space.id, network="10.77.0.0/16", name="b")
     db.add(block)
     await db.flush()
-    octet = uuid.uuid4().int % 250
+    # Sequential, not random: two estates in one test must never share a
+    # subnet octet (a 1-in-250 collision made the decoy and the target one
+    # address, which tripped the budget test's per-address assertion, #3781).
+    octet = next(_OCTETS)
     subnet = Subnet(
         space_id=space.id,
         block_id=block.id,
@@ -769,10 +776,10 @@ async def test_a_lookup_past_the_budget_is_never_answered_unrecorded(client, db_
     _FakeRedis.keys = {}
     with patch.object(auth_throttle, "make_async_redis", lambda *a, **k: _FakeRedis()):
         codes = []
-        for addr in (decoy, decoy, target, decoy):
+        for i, addr in enumerate((decoy, decoy, target, decoy)):
             res = await client.post("/held", content=body(addr), headers=hdr)
             codes.append(res.status_code)
-            if addr == target:
+            if i == 2:
                 assert room not in res.text and target not in res.text
                 assert res.headers.get("retry-after") == "37"
     assert codes == [200, 200, 429, 429]
