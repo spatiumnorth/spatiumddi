@@ -21,6 +21,7 @@ and keeps serving from cache.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -64,6 +65,7 @@ from .kea_ctrl import (
     KeaConfigRejected,
     KeaCtrlError,
     config_check,
+    config_hash_get,
     config_reload,
 )
 from .radvd_apply import apply_radvd
@@ -139,6 +141,12 @@ RELOAD_UNVALIDATED = "unvalidated"
 RELOAD_UNREACHABLE = "unreachable"
 
 
+def _doc_fingerprint(doc: dict[str, Any], extra: str) -> str:
+    return hashlib.sha256(
+        (json.dumps(doc, sort_keys=True) + "\0" + extra).encode()
+    ).hexdigest()
+
+
 class SyncLoop:
     def __init__(
         self,
@@ -202,6 +210,17 @@ class SyncLoop:
         # does not retry the same refusal every loop.
         self._last_reload_results: dict[str, str] = {}
         self._v6_refused: tuple[str, tuple[tuple[str, str], ...]] | None = None
+        # #3779 — per daemon, what it last CONFIRMED loading: (fingerprint of
+        # its rendered document + the HA TLS files it references, the daemon's
+        # own ``config-hash-get`` right after that reload). A reload restarts
+        # the HA hook's state machine, so a daemon whose document did not
+        # change is left alone. Dropped on any non-OK result.
+        self._applied: dict[str, tuple[str, str]] = {}
+        # Daemons this apply actually sent ``config-reload`` to, and that
+        # accepted it. A daemon skipped as unchanged is in
+        # ``_last_reload_results`` as OK but NOT here: it never loaded the
+        # render, so restoring the documents must not reload it.
+        self._reloaded: set[str] = set()
 
         # Preload cached bundle — offline-operation guarantee.
         #
@@ -544,6 +563,48 @@ class SyncLoop:
         self._last_reload_error = f"{daemon}: {last_err}"
         return RELOAD_UNREACHABLE
 
+    @staticmethod
+    def _tls_fingerprint(tls_dir: Path) -> str:
+        """Digest of the HA TLS credential files the dhcp4 document points at:
+        a rotation rewrites them without touching the document."""
+        h = hashlib.sha256()
+        if tls_dir.is_dir():
+            for f in sorted(tls_dir.iterdir()):
+                if f.is_file():
+                    h.update(f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+        return h.hexdigest()
+
+    def _reload_if_changed(
+        self,
+        socket_path: Path,
+        config_path: Path,
+        daemon: str,
+        reload_retry_timeout: float,
+        fingerprint: str,
+    ) -> str:
+        """``_reload_socket``, skipped when this daemon already runs this
+        document (#3779). Skipping needs proof: the fingerprint matches what
+        the daemon last confirmed AND its live ``config-hash-get`` still
+        equals the hash recorded then, so a restarted or unreachable daemon is
+        reloaded. A skipped daemon counts as applied OK."""
+        base = self._applied.get(daemon)
+        if base is not None and base[0] == fingerprint:
+            live = config_hash_get(socket_path)
+            if live is not None and live == base[1]:
+                log.info("kea_reload_skipped_unchanged", daemon=daemon)
+                return RELOAD_OK
+        result = self._reload_socket(
+            socket_path, config_path, daemon, reload_retry_timeout
+        )
+        if result == RELOAD_OK:
+            self._reloaded.add(daemon)
+        live_hash = config_hash_get(socket_path) if result == RELOAD_OK else None
+        if live_hash is not None:
+            self._applied[daemon] = (fingerprint, live_hash)
+        else:
+            self._applied.pop(daemon, None)
+        return result
+
     def _report_rejected(self, daemon: str, err: Exception) -> str:
         log.warning("kea_config_rejected", daemon=daemon, error=str(err))
         self.heartbeat.daemon_status = {
@@ -569,6 +630,7 @@ class SyncLoop:
         """
         # #882 — reset per apply; set below once a daemon accepts the doc.
         self._reload_confirmed = False
+        self._reloaded = set()
         # Issue #258 — explicit narrowing. Pre-#258 the inline
         # ternary fell through to ``bundle`` for ANY non-dict value
         # of ``bundle["bundle"]`` (list, str, None, …) and the
@@ -653,17 +715,20 @@ class SyncLoop:
             # the same retry / tolerate-missing-socket logic, and the
             # heartbeat daemon_status reflects the worst of the two.
             self._last_reload_error = None
-            r4 = self._reload_socket(
+            tls_fp = self._tls_fingerprint(ha_tls_dir)
+            r4 = self._reload_if_changed(
                 self.cfg.kea_control_socket,
                 self.cfg.kea_config_path,
                 "dhcp4",
                 reload_retry_timeout,
+                _doc_fingerprint(dhcp4_doc, tls_fp),
             )
-            r6 = self._reload_socket(
+            r6 = self._reload_if_changed(
                 self.cfg.kea_control_socket_v6,
                 self.cfg.kea_config_path_v6,
                 "dhcp6",
                 reload_retry_timeout,
+                _doc_fingerprint(dhcp6_doc, ""),
             )
             # At least one daemon checked this document and accepted it,
             # which is what makes it a legitimate revert target.
@@ -977,7 +1042,11 @@ class SyncLoop:
             doc = json.loads(text)
             self._atomic_write_json(path, doc)
             socket_path, daemon = sockets[path]
-            if self._last_reload_results.get(daemon) == RELOAD_OK:
+            # #3779 — a daemon skipped as unchanged never loaded the refused
+            # render (its document is the one being restored), so it is not
+            # reloaded: that would reset its HA state for nothing.
+            if daemon in self._reloaded:
+                self._applied.pop(daemon, None)
                 self._reload_socket(socket_path, path, daemon, 0.0)
 
     def _recheck_v6_unicast(self) -> None:
