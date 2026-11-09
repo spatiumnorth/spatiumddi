@@ -98,7 +98,11 @@ from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.ipam.utilization import recount_subnets_and_blocks
-from app.services.lock_order import lock_scope_gates, lock_zones_for_addresses
+from app.services.lock_order import (
+    claim_mirror_inserts,
+    lock_scope_gates,
+    lock_zones_for_addresses,
+)
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -1385,7 +1389,7 @@ async def agent_lease_events(
         _load_subnet_cache,
         _load_trashed_scope_nets,
     )
-    from app.services.dns.ddns import ddns_lease_writes_nothing
+    from app.services.dns.ddns import DDNSReadCache, ddns_lease_writes_nothing
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
@@ -1677,6 +1681,95 @@ async def agent_lease_events(
             headers={"Retry-After": "1"},
         ) from exc
 
+    mirror_subnet_ids = {sn.id for sn in subnet_for_ip.values() if sn is not None}
+
+    def _lease_row_hostname(row: IPAddress, ev: Any) -> str | None:
+        """The name a mirror row we own carries once ``ev`` is applied."""
+        if row.subnet_id in no_hostname_subnets:
+            return row.hostname
+        return (ev.hostname or row.hostname or "")[:253]
+
+    # #3789 — read before locking, to find the renewals that change nothing.
+    # Under Kea HA both members report every renewal, and each batch held all
+    # its mirror rows to its commit, so the second member's batch of the same
+    # renewals waited out the first one's whole batch (39 to 53% of its time
+    # at 10 renewals a second). A grant whose mirror row already carries what
+    # the event would write, and whose DDNS writes nothing (#3773), takes its
+    # row ``SKIP LOCKED`` below instead: if another transaction holds it (the
+    # other member's batch, writing the same values), this batch leaves the
+    # address to it. A row this batch does get is re-read and goes through the
+    # full pass as before. Only for an address with one event in the batch.
+    seen_rows = (
+        (
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(
+                        IPAddress.address.in_(ips),
+                        IPAddress.subnet_id.in_(mirror_subnet_ids),
+                    )
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if mirror_subnet_ids
+        else []
+    )
+    seen_by_key = {(row.subnet_id, norm_ip(str(row.address))): row for row in seen_rows}
+    grants_at: Counter[tuple[Any, str]] = Counter()
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx not in stale and subnet is not None:
+            grants_at[(subnet.id, norm_ip(ev.ip_address))] += 1
+
+    def _mirror_unchanged(row: IPAddress, ev: Any) -> bool:
+        """Would applying ``ev`` leave ``row`` as it is, but for the sighting
+        stamp and the lease id (each member's own lease)?"""
+        if not row.auto_from_lease or row.status != "dhcp" or row.last_seen_method != "dhcp":
+            return False
+        if row.hostname != _lease_row_hostname(row, ev):
+            return False
+        if ev.mac_address and (
+            row.mac_address is None or norm_mac(str(row.mac_address)) != norm_mac(ev.mac_address)
+        ):
+            return False
+        return True
+
+    quiet_rows: dict[Any, list[int]] = {}
+    for idx, ev in enumerate(events):
+        subnet = subnet_for_ip.get(ev.ip_address)
+        if idx in stale or subnet is None or ev.state != "active":
+            continue
+        key = (subnet.id, norm_ip(ev.ip_address))
+        seen = seen_by_key.get(key)
+        if seen is None or grants_at[key] != 1:
+            continue
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
+        if lease.state != "active" or not _mirror_unchanged(seen, ev):
+            continue
+        try:
+            quiet = await ddns_lease_writes_nothing(
+                db,
+                subnet=subnet,
+                ipam_row=seen,
+                client_hostname=ev.hostname,
+                row_hostname=_lease_row_hostname(seen, ev),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # As ``_ddns_quiet`` below: a bug in the reads is the full path.
+            _reraise_if_database_gone(exc)
+            logger.warning(
+                "dhcp_agent_lease_ddns_check_failed",
+                server=server_id,
+                ip=ev.ip_address,
+                error=str(exc),
+            )
+            quiet = False
+        if quiet:
+            quiet_rows.setdefault(seen.id, []).append(idx)
+
     # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
     # so overlapping ranges across spaces stay disambiguated (subnets were
     # resolved space-aware above).
@@ -1693,16 +1786,18 @@ async def agent_lease_events(
     # Ordered by id, like ``static_ipam.lock_static_rows``, so concurrent
     # lockers never wait on each other in a cycle. Narrowed to the subnets
     # the events resolved to, so another space's row at the same address is
-    # not locked for nothing.
-    mirror_subnet_ids = {sn.id for sn in subnet_for_ip.values() if sn is not None}
+    # not locked for nothing. The #3789 renewals are not waited for (a
+    # ``static_dhcp`` row is never one): taken after every waiting lock, so
+    # this batch holds no row it took out of id order while it waits.
     ipam_existing = (
-        (
+        list(
             (
                 await db.execute(
                     select(IPAddress)
                     .where(
                         IPAddress.address.in_(ips),
                         IPAddress.subnet_id.in_(mirror_subnet_ids),
+                        IPAddress.id.not_in(list(quiet_rows)),
                     )
                     .order_by(IPAddress.id)
                     .with_for_update()
@@ -1715,6 +1810,43 @@ async def agent_lease_events(
         if mirror_subnet_ids
         else []
     )
+    if quiet_rows:
+        got = (
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(IPAddress.id.in_(list(quiet_rows)))
+                    .order_by(IPAddress.id)
+                    # FOR NO KEY UPDATE: a renewal changes no key, and a
+                    # foreign key's FOR KEY SHARE on the row is no holder.
+                    .with_for_update(skip_locked=True, key_share=True)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        ipam_existing.extend(got)
+        skipped = set(quiet_rows) - {row.id for row in got}
+        # A row skipped above is held, or was deleted since the read. A
+        # deleted one is no longer a renewal: its grant inserts it as usual.
+        held = (
+            set(
+                (await db.execute(select(IPAddress.id).where(IPAddress.id.in_(list(skipped)))))
+                .scalars()
+                .all()
+            )
+            if skipped
+            else set()
+        )
+        for row_id in held:
+            stale.update(quiet_rows[row_id])
+        if held:
+            logger.debug(
+                "dhcp_lease_events_renewals_left_to_holder",
+                server=server_id,
+                addresses=len(held),
+            )
     # Normalised for the same reason as ``lease_by_key`` above (#1110): the
     # stored ``address`` is an ``IPv4Address``, the event's is a string. Raw
     # keys never matched a stored row, so a release / expiry event found no
@@ -1725,12 +1857,6 @@ async def agent_lease_events(
     ipam_by_key: dict[tuple[Any, str], IPAddress] = {
         (row.subnet_id, norm_ip(str(row.address))): row for row in ipam_existing
     }
-
-    def _lease_row_hostname(row: IPAddress, ev: Any) -> str | None:
-        """The name a mirror row we own carries once ``ev`` is applied."""
-        if row.subnet_id in no_hostname_subnets:
-            return row.hostname
-        return (ev.hostname or row.hostname or "")[:253]
 
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
         """Stamp lease state onto a mirror row we own (auto/available)."""
@@ -1773,6 +1899,7 @@ async def agent_lease_events(
     # meets no row there, and is inserted in the pass as before.
     created_for: dict[int, IPAddress] = {}
     visited: set[tuple[Any, str]] = set()
+    to_create: list[tuple[int, tuple[Any, str], Any, Any, Any]] = []
     for idx, ev in enumerate(events):
         subnet = subnet_for_ip.get(ev.ip_address)
         if idx in stale or subnet is None:
@@ -1785,6 +1912,19 @@ async def agent_lease_events(
             continue
         visited.add(key)
         if ev.state != "active" or key in ipam_by_key:
+            continue
+        to_create.append((idx, key, subnet, ev, lease))
+    # #3789 — a new row the other member's batch is inserting right now is
+    # left to it (its claim is held): this batch's INSERT would wait for that
+    # batch's commit, seconds at load, and the second member's batch of a
+    # first acquisition hit the 30 s command timeout. Only for an address
+    # with one event in the batch, so no later event of it here is lost.
+    claimed = await claim_mirror_inserts(
+        db, {key for _i, key, *_rest in to_create if grants_at[key] == 1}
+    )
+    for idx, key, subnet, ev, lease in to_create:
+        if grants_at[key] == 1 and key not in claimed:
+            stale.add(idx)
             continue
         # #564: a concurrent Sync-DHCP / static-reservation writer may have
         # already committed this (subnet_id, address) pair. Insert inside a
@@ -1827,6 +1967,7 @@ async def agent_lease_events(
                 ipam_row=row,
                 client_hostname=ev.hostname,
                 row_hostname=_lease_row_hostname(row, ev),
+                cache=ddns_reads,
             )
         except Exception as exc:  # noqa: BLE001
             _reraise_if_database_gone(exc)
@@ -1838,6 +1979,13 @@ async def agent_lease_events(
             )
             return False
 
+    # #3776 — the checks below write nothing between them, so the reads they
+    # share (each address's generated records, each subnet's reverse zones)
+    # are made once for the batch, not once per lease.
+    ddns_reads = DDNSReadCache()
+    await ddns_reads.prefetch_generated(
+        db, [row.id for row in ipam_by_key.values() if row.auto_from_lease]
+    )
     publishing: list[tuple[Any, IPAddress]] = []
     retracting: list[IPAddress] = []
     for idx, ev in enumerate(events):
