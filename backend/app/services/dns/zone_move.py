@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 import zlib
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -272,16 +273,35 @@ class SharedProviderResult:
 
 
 async def shared_provider_sources(
-    db: AsyncSession, source_group_id: uuid.UUID, target_group_id: uuid.UUID
+    db: AsyncSession,
+    source_group_id: uuid.UUID,
+    target_group_id: uuid.UUID,
+    adopted_on: Collection[str] | None = None,
 ) -> SharedProviderResult:
-    """Find source servers that reach the same provider as a target server (#3805).
+    """Find source servers that may reach the same provider as a target server (#3805).
 
     The move pushes a create into the target, then a delete into the source.
     When one provider sits behind a server on each side the create adopts the
-    existing zone and the delete then removes the only copy. A source server
-    is therefore kept (not deleted) when its provider identity equals a
-    target server's, and ALSO when either identity cannot be determined:
-    delete is the destructive direction, so unknown fails safe.
+    existing zone and the delete then removes the only copy. Delete is the
+    destructive direction, so a source server is kept (not deleted) when ANY
+    of these says it might share a store with a target server of its driver:
+
+    * its provider identity equals a target server's;
+    * its identity, or a same-driver target's, cannot be determined;
+    * ``adopted_on`` (the commit passes the target servers whose create found
+      the zone already there) names a target server of the same driver.
+
+    The last rule is the one that does not depend on the identity being
+    right. An identity is only what the credentials say: two Route 53 keys
+    can belong to one AWS account, two Cloudflare tokens to one account, two
+    Technitium URLs (an IP and a hostname) to one daemon, and two domain
+    controllers share every AD-integrated zone by replication. In each of
+    those the target's create finds the zone already present, and that is
+    the evidence the identities cannot give.
+
+    ``adopted_on=None`` is the preview, which cannot know the create's
+    outcome yet: it says the copy WILL be kept if the target already holds
+    the zone, rather than promising a delete it may not do.
     """
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
@@ -310,30 +330,46 @@ async def shared_provider_sources(
     def _identity(server: DNSServer) -> str | None:
         return get_driver(server.driver).provider_identity(server)
 
-    target_ids = {t.name: _identity(t) for t in targets}
-    unknown_target = next((n for n, i in target_ids.items() if i is None), None)
-    by_identity = {i: n for n, i in target_ids.items() if i is not None}
+    adopted = set(adopted_on or ())
+    # Per target: (name, driver, identity). Only a same-driver target can
+    # share a provider with a source server.
+    tgt = [(t.name, t.driver, _identity(t)) for t in targets]
     for src in sources:
+        same_driver = [(n, i) for n, d, i in tgt if d == src.driver]
+        if not same_driver:
+            continue
         ident = _identity(src)
-        if ident is not None and ident in by_identity:
-            other = by_identity[ident]
-            result.keep_ids.add(src.id)
-            result.notes.append(
-                f"Source copy kept on '{src.name}': it reaches the same provider as "
-                f"target server '{other}', so deleting it would remove the zone the "
-                f"target now serves."
+        match = next((n for n, i in same_driver if ident is not None and i == ident), None)
+        adopted_by = next((n for n, _ in same_driver if n in adopted), None)
+        unknown = ident is None or any(i is None for _, i in same_driver)
+        if match is not None:
+            reason = f"it reaches the same provider as target server '{match}'"
+        elif adopted_by is not None:
+            reason = (
+                f"target server '{adopted_by}' already held the zone, so the two "
+                "may be one provider"
             )
-        elif ident is None or unknown_target is not None:
-            result.keep_ids.add(src.id)
+        elif unknown:
             logger.warning(
                 "dns.zone_move.provider_identity_unknown",
                 source_server=src.name,
-                target_server=unknown_target,
+                target_servers=[n for n, _ in same_driver],
             )
-            result.notes.append(
-                f"Source copy kept on '{src.name}': whether it shares a provider with a "
-                f"target server could not be determined, so the zone is not deleted there."
-            )
+            reason = "whether it shares a provider with a target server could not be determined"
+        else:
+            if adopted_on is None:
+                result.notes.append(
+                    f"Source copy on '{src.name}' is deleted unless a target "
+                    f"{src.driver} server already holds the zone when the move "
+                    "runs; then it is kept, because the two may be one provider."
+                )
+            continue
+        result.keep_ids.add(src.id)
+        result.notes.append(
+            f"Source copy kept on '{src.name}': {reason}, so deleting it there could "
+            "remove the zone the target now serves. Remove it by hand if it is a "
+            "separate copy."
+        )
     return result
 
 

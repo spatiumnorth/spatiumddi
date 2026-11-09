@@ -190,3 +190,94 @@ async def test_unknown_identity_does_not_delete_and_warns(
         w["event"] == "dns.zone_move.provider_identity_unknown" and w["source_server"] == "src-ns"
         for w in warned
     )
+
+
+class _OneAccount(_FakeProvider):
+    """Two different keys on ONE account: the store ignores the identity.
+
+    This is the case the identity cannot see — two IAM keys on one AWS
+    account, two Cloudflare tokens, an IP and a hostname for one Technitium,
+    two domain controllers sharing an AD-integrated zone.
+    """
+
+    async def apply_zone_change(self, server: Any, zone: Any, op: str, **_: Any) -> bool:
+        self.calls.append((server.name, op))
+        key = (None, zone.name)
+        if op == "create":
+            if key in self.zones:
+                return False
+            self.zones.add(key)
+            return True
+        if key not in self.zones:
+            return False
+        self.zones.discard(key)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_one_account_behind_two_identities_keeps_the_zone(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _OneAccount()
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _B)
+    fake.zones.add((None, zone.name))
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    # The target found the zone already there, so the source delete would
+    # have removed the copy it just adopted.
+    assert fake.zones == {(None, zone.name)}
+    assert ("src-ns", "delete") not in fake.calls
+    assert any("already held the zone" in w for w in resp.json()["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_preview_with_distinct_identities_says_the_delete_is_conditional(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _B)
+    resp = await client.post(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/move/preview",
+        json={"target_group_id": str(dst.id)},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert any("Source copy on 'src-ns' is deleted unless" in w for w in resp.json()["warnings"])
+
+
+def _row(host: str, creds: dict[str, Any]) -> DNSServer:
+    return DNSServer(name="x", host=host, credentials_encrypted=encrypt_dict(creds))
+
+
+def test_technitium_identity_is_the_normalised_api_root() -> None:
+    from app.drivers.dns.technitium_api import TechnitiumAPIDriver
+
+    d = TechnitiumAPIDriver()
+    a = d.provider_identity(_row("a", {"api_url": "http://DNS.example.com:5380/", "token": "t1"}))
+    b = d.provider_identity(
+        _row("b", {"api_url": "http://dns.example.com:5380/api/zones", "token": "t2"})
+    )
+    c = d.provider_identity(_row("c", {"api_url": "http://other.example.com:5380", "token": "t"}))
+    assert a is not None and a == b
+    assert c is not None and c != a
+    # The token never takes part in (or leaks into) the identity.
+    assert "t1" not in a
+    assert d.provider_identity(_row("d", {"token": "t"})) is None
+
+
+def test_windows_identity_is_host_and_winrm_port() -> None:
+    from app.drivers.dns.windows import WindowsDNSDriver
+
+    d = WindowsDNSDriver()
+    creds = {"username": "u", "password": "secret-pw"}
+    a = d.provider_identity(_row("DC1.corp.example.", creds))
+    b = d.provider_identity(_row("dc1.corp.example", {**creds, "winrm_port": 5985}))
+    tls = d.provider_identity(_row("dc1.corp.example", {**creds, "use_tls": True}))
+    assert a == b == "windows_dns:dc1.corp.example:5985"
+    assert tls == "windows_dns:dc1.corp.example:5986"
+    assert "secret-pw" not in (a or "")
+    assert d.provider_identity(_row("", creds)) is None

@@ -8341,11 +8341,15 @@ async def move_zone_commit(
     # delete-then-fail would have removed it from the old server with the
     # database still saying it lives there.
     #
-    # A source server that reaches the same provider as a target server
+    # A source server that may reach the same provider as a target server
     # is NOT deleted from (#3805): the create adopted the provider's one copy,
-    # and deleting through the source would remove it.
-    shared = await shared_provider_sources(db, source_group_id, target_group.id)
+    # and deleting through the source would remove it. Decided AFTER the
+    # create, because a target that already held the zone is the evidence
+    # that does not depend on the credentials naming the provider correctly.
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
+    shared = await shared_provider_sources(
+        db, source_group_id, target_group.id, adopted_on=adopted_on
+    )
     await _push_zone_to_agentless_servers(
         db, zone, "delete", group_id=source_group_id, skip_server_ids=shared.keep_ids
     )
@@ -8372,6 +8376,7 @@ async def move_zone_commit(
                 "dnssec_signed": plan.dnssec_signed,
                 "acknowledgements": sorted(body.acknowledgements),
                 "adopted_existing_on": adopted_on,
+                "source_copies_kept": shared.notes,
             },
             result="success",
         )
@@ -8381,6 +8386,10 @@ async def move_zone_commit(
     # lock runs right after it, and the response is built from the plan.
     resp = ZoneMoveCommitResponse.from_plan(plan)
     resp.target_tsig_key_generated = plan.target_tsig_key_generated
+    # What the move actually kept (#3805) — the plan's notes were written
+    # before the create, when whether the target already held the zone
+    # was not yet known.
+    resp.warnings.extend(n for n in shared.notes if n not in resp.warnings)
     return resp
 
 
