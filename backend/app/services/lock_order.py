@@ -99,6 +99,19 @@ it writes (#3627), since the batch goes on from the scope to its mirrors'
 zones. ``FOR SHARE`` and ``FOR NO KEY UPDATE`` both leave a lease-events
 batch's ``FOR KEY SHARE`` alone.
 
+Two things a lease-events batch takes WITHOUT waiting, so neither has a place
+in the order (#3789). Under Kea HA both members report every lease, so the
+two agents' batches carry the same addresses. A renewal whose mirror row
+already says what the event would write, and whose DDNS writes nothing, takes
+its ``ip_address`` row ``FOR UPDATE SKIP LOCKED``, after the batch's waiting
+step-2 locks: a row another transaction holds is left to it (the other
+member's batch, writing the same values) and the next report repairs anything
+it did not. And before inserting a new mirror row, a batch takes the row's
+insert claim (:func:`claim_mirror_inserts`) with ``pg_try_advisory_xact_lock``:
+a claim another batch holds means that batch is inserting the same row, and
+this one leaves the address to it rather than wait on its uncommitted insert
+until its commit.
+
 ``tests/_row_lock_order_guard.py`` asserts the order for the whole test suite.
 """
 
@@ -233,6 +246,49 @@ async def lock_scope_gates(db: AsyncSession, scope_ids: Iterable[Any], *, exclus
     fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
     for key in sorted({_scope_gate_key(s) for s in scope_ids if s is not None}):
         await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": SCOPE_GATE_NS, "key": key})
+
+
+#: Advisory-lock namespace of a new lease mirror's insert claim (#3789), "DMIR".
+MIRROR_INSERT_NS = 0x444D4952
+
+
+def _mirror_insert_key(subnet_id: Any, address: str) -> int:
+    """Signed 32-bit crc32 of (subnet id, normalised address)."""
+    key = zlib.crc32(f"{subnet_id}|{address}".encode())
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def claim_mirror_inserts(
+    db: AsyncSession, keys: Iterable[tuple[Any, str]]
+) -> set[tuple[Any, str]]:
+    """Try the insert claim of each new mirror row at ``keys`` ((subnet id,
+    normalised address)) to the end of the transaction, never waiting, and
+    return the keys claimed (#3789).
+
+    Under Kea HA the two members' batches insert the same new mirror rows on
+    a first acquisition. An INSERT that meets another transaction's
+    uncommitted row with the same unique key waits for that transaction to
+    end (``ON CONFLICT DO NOTHING`` waits just the same), and a batch runs
+    for seconds: the second member's batch waited out the first one's and
+    hit the 30 s command timeout. A key another batch has claimed is being
+    inserted by it, with the same values; the caller leaves that address to
+    it. Two keys whose crc32 collide share a claim, which at worst leaves an
+    address's mirror to the next report."""
+    by_key: dict[int, list[tuple[Any, str]]] = {}
+    for subnet_id, address in keys:
+        by_key.setdefault(_mirror_insert_key(subnet_id, address), []).append((subnet_id, address))
+    if not by_key:
+        return set()
+    got = (
+        await db.execute(
+            text(
+                "SELECT k FROM unnest(CAST(:keys AS integer[])) AS k "
+                "WHERE pg_try_advisory_xact_lock(:ns, k)"
+            ),
+            {"ns": MIRROR_INSERT_NS, "keys": sorted(by_key)},
+        )
+    ).scalars()
+    return {key for k in got for key in by_key[k]}
 
 
 async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
