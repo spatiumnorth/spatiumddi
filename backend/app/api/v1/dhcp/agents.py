@@ -1737,7 +1737,7 @@ async def agent_lease_events(
             return False
         return True
 
-    quiet_rows: dict[Any, list[int]] = {}
+    candidates: list[tuple[int, Any, Any, IPAddress]] = []
     for idx, ev in enumerate(events):
         subnet = subnet_for_ip.get(ev.ip_address)
         if idx in stale or subnet is None or ev.state != "active":
@@ -1749,6 +1749,15 @@ async def agent_lease_events(
         lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
         if lease.state != "active" or not _mirror_unchanged(seen, ev):
             continue
+        candidates.append((idx, subnet, ev, seen))
+    # #3776 — these checks write nothing between them, so they share one
+    # read cache, as the under-lock checks below share theirs. Not the same
+    # cache: the rows may change between this read and the lock, and the
+    # under-lock checks must judge what they hold.
+    seen_reads = DDNSReadCache()
+    await seen_reads.prefetch_generated(db, [seen.id for *_x, seen in candidates])
+    quiet_rows: dict[Any, list[int]] = {}
+    for idx, subnet, ev, seen in candidates:
         try:
             quiet = await ddns_lease_writes_nothing(
                 db,
@@ -1756,6 +1765,7 @@ async def agent_lease_events(
                 ipam_row=seen,
                 client_hostname=ev.hostname,
                 row_hostname=_lease_row_hostname(seen, ev),
+                cache=seen_reads,
             )
         except Exception as exc:  # noqa: BLE001
             # As ``_ddns_quiet`` below: a bug in the reads is the full path.
