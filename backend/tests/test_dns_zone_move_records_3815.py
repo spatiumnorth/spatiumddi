@@ -1,0 +1,148 @@
+"""#3815 — a zone moved to a different agentless provider arrived with SOA +
+NS only: the create made an empty zone and nothing pushed the saved records,
+so every one answered NXDOMAIN while SpatiumDDI listed it as served."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.drivers.dns.base import RecordChangeResult, RecordData
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from tests.test_dns_zone_move_same_provider_3805 import (
+    _A,
+    _B,
+    _FakeProvider,
+    _move,
+    _setup,
+    _token,
+)
+
+
+class _RecordProvider(_FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: dict[tuple[str | None, str], set[tuple[str, str, str]]] = {}
+        self.writes: list[tuple[str, str, str, str]] = []
+        self.fail = False
+
+    async def pull_zone_records(self, server: Any, zone_name: str, **_: Any) -> list[RecordData]:
+        held = self.records.get((self.provider_identity(server), zone_name), set())
+        return [RecordData(name=n, record_type=t, value=v) for n, t, v in held]
+
+    async def apply_record_changes(self, server: Any, changes: list[Any]) -> list[Any]:
+        out = []
+        for c in changes:
+            if self.fail:
+                out.append(RecordChangeResult(ok=False, change=c, error="boom"))
+                continue
+            r = c.record
+            key = (self.provider_identity(server), c.zone_name)
+            self.records.setdefault(key, set()).add((r.name, r.record_type, r.value))
+            self.writes.append((server.name, r.name, r.record_type, r.value))
+            out.append(RecordChangeResult(ok=True, change=c))
+        return out
+
+
+@pytest.fixture
+def prov(monkeypatch: pytest.MonkeyPatch) -> _RecordProvider:
+    fake = _RecordProvider()
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    return fake
+
+
+def _rec(zone: DNSZone, name: str, value: str, **kw: Any) -> DNSRecord:
+    return DNSRecord(
+        zone_id=zone.id,
+        name=name,
+        fqdn=f"{name}.{zone.name}",
+        record_type="A",
+        value=value,
+        ttl=300,
+        **kw,
+    )
+
+
+async def _seed(db: AsyncSession, zone: DNSZone) -> None:
+    src_srv = (
+        await db.execute(select(DNSServer).where(DNSServer.group_id == zone.group_id))
+    ).scalar_one()
+    db.add_all(
+        [
+            _rec(zone, "www", "192.0.2.1"),
+            _rec(zone, "pending", "192.0.2.2"),
+            _rec(zone, "gone", "192.0.2.3", deleted_at=datetime.now(UTC)),
+        ]
+    )
+    db.add(
+        DNSRecordOp(
+            server_id=src_srv.id,
+            zone_name=zone.name,
+            zone_id=zone.id,
+            op="create",
+            record={"name": "pending", "type": "A", "value": "192.0.2.2"},
+            state="pending",
+        )
+    )
+    db.add(
+        DNSRecordOp(
+            server_id=src_srv.id,
+            zone_name=zone.name,
+            zone_id=zone.id,
+            op="delete",
+            record={"name": "gone", "type": "A", "value": "192.0.2.3"},
+            state="pending",
+        )
+    )
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_move_to_another_provider_pushes_live_records_only(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _B)
+    await _seed(db_session, zone)
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    held = prov.records[("route53:key:AKIA-TWO", zone.name)]
+    assert {n for n, _t, _v in held} == {"www", "pending"}  # the pending add arrived
+    assert "gone" not in {w[1] for w in prov.writes}  # the pending delete did not resurrect
+
+
+@pytest.mark.asyncio
+async def test_adopted_copy_is_not_pushed_again(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    await _seed(db_session, zone)
+    prov.zones.add(("route53:key:AKIA-ONE", zone.name))
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    assert prov.writes == []
+
+
+@pytest.mark.asyncio
+async def test_failed_record_push_is_not_a_clean_move(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _B)
+    await _seed(db_session, zone)
+    prov.fail = True
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 502, resp.text
+    assert "records" in resp.json()["detail"]

@@ -8347,6 +8347,16 @@ async def move_zone_commit(
     # create, because a target that already held the zone is the evidence
     # that does not depend on the credentials naming the provider correctly.
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
+    # The create gives each NEW target server an empty zone (SOA + NS), so the
+    # zone's saved records are pushed too (#3815) — or every one of them
+    # answers NXDOMAIN while SpatiumDDI lists it as served. A server that
+    # ADOPTED an existing copy is skipped on purpose: that copy already holds
+    # the records (it is the shared-provider case, #3805), and re-pushing
+    # would only write what is there. The push sends the zone's live rows as
+    # they stand now, so a record op still queued against the old group is
+    # already reflected: a pending add / update is in the rows, and a pending
+    # delete's record is soft-deleted and is not resurrected.
+    await _push_moved_zone_records(db, zone, target_group.id, set(adopted_on))
     shared = await shared_provider_sources(
         db, source_group_id, target_group.id, adopted_on=adopted_on
     )
@@ -9068,6 +9078,58 @@ async def _push_zone_to_agentless_servers(
     # resolving it alone would not make a retry succeed.
     status_code = 409 if conflicts == len(errors) else 502
     raise HTTPException(status_code=status_code, detail=detail)
+
+
+async def _push_moved_zone_records(
+    db: DB, zone: DNSZone, group_id: uuid.UUID, adopted_names: set[str]
+) -> None:
+    """Push a moved zone's saved records to the target group's agentless
+    servers whose create made a fresh zone (#3815). Reuses the additive push
+    the create rollback and Sync with Servers use. A record that cannot be
+    written is a 502 naming it, like a failed create, so the move is never
+    reported clean while the target answers NXDOMAIN; the zone then exists
+    in both groups' providers (visible, fixable with Sync with Servers)."""
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        restore_zone_records_to_server,
+    )
+
+    res = await db.execute(
+        select(DNSServer).where(
+            DNSServer.group_id == group_id,
+            DNSServer.credentials_encrypted.isnot(None),
+            DNSServer.is_enabled.is_(True),
+        )
+    )
+    failures: list[str] = []
+    for server in res.scalars().all():
+        if not is_agentless(server.driver) or server.name in adopted_names:
+            continue
+        driver = get_driver(server.driver)
+        try:
+            restored = await restore_zone_records_to_server(db, server, driver, zone)
+            problems = list(restored.push_errors)
+            if restored.pushed < restored.candidates and not problems:
+                problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
+        except Exception as exc:  # noqa: BLE001 — reported below
+            problems = [_exc_text(exc)]
+        if problems:
+            failures.append(f"{server.name} ({'; '.join(problems)})")
+            logger.warning(
+                "dns.zone.move_record_push_failed",
+                server=str(server.id),
+                zone=zone.name,
+                errors=problems,
+            )
+    if failures:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Zone {zone.name} was created on the target group's provider, but its records "
+                f"could not all be written to {'; '.join(failures)}. The move was not saved in "
+                "SpatiumDDI — run Sync with Servers on the zone, then retry."
+            ),
+        )
 
 
 async def _managed_zone_records(db: DB, zone: DNSZone) -> list[Any]:
