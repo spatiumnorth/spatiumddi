@@ -276,7 +276,13 @@ async def purge_lease(
             )
         ).scalar_one_or_none()
         if mirror is not None:
-            subnet = await db.get(Subnet, sid)
+            # Read in the Trash too: a subnet delete tears its scopes' leases
+            # down after the subnet is stamped (#3744).
+            subnet = (
+                await db.execute(
+                    select(Subnet).where(Subnet.id == sid).execution_options(include_deleted=True)
+                )
+            ).scalar_one_or_none()
             if subnet is not None:
                 # Revoke DDNS BEFORE deleting the mirror — it reads
                 # dns_record_id / hostname off the row. Best-effort.
@@ -378,11 +384,13 @@ async def delete_leases_for_scope(
 SCOPE_DELETE_BATCH = 25
 
 # Wall-clock budget for the teardown a scope soft-delete runs in its request,
-# once the scope is in the Trash: the server delete's bound (#2290), for the
-# same reason. ``app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases``
+# once the scope is in the Trash. Kept well under the 30 s statement limit
+# (asyncpg ``command_timeout``) and typical proxy timeouts: at 20 s the walked
+# deletes answered in 23-30 s (#3772). Unlike the server delete's bound
+# (#2290, whose remainder cascades away), the rest here goes to a task. ``app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases``
 # tears the rest down, enqueued when the request stops short and run again by
 # the lease sweep for any scope in the Trash that still has leases.
-SCOPE_DELETE_INLINE_DEADLINE_S = 20.0
+SCOPE_DELETE_INLINE_DEADLINE_S = 10.0
 
 
 async def scope_lease_counts(db: AsyncSession, scope_id: uuid.UUID) -> tuple[int, int]:
@@ -436,6 +444,15 @@ async def tear_down_scope_leases(
     their mirrors' records, ``lock_zones_for_lease_mirrors``), tears them down
     and commits.
 
+    Each batch reads the scope row ``FOR SHARE`` after its lease rows and
+    holds it to its commit (#3777): a Trash restore un-stamps the row (an
+    UPDATE, which conflicts with FOR SHARE but not with a lease-events batch's
+    FOR KEY SHARE), so it waits for the batch in flight, at most one, and the
+    next batch finds the scope live and stops. Without it a restore that
+    committed mid-batch still lost that batch's leases. The restore takes its
+    scope rows before the zones it writes, so it never holds a zone this batch
+    waits for.
+
     Runs only while the scope is in the Trash, since the lease-events handler
     takes no event for a scope there: no batch can bring a lease back behind
     the teardown. It stops when the scope is restored (the next events
@@ -449,14 +466,18 @@ async def tear_down_scope_leases(
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
     leases_removed = 0
     mirrors_removed = 0
+
+    def _scope_state() -> Any:
+        return (
+            select(DHCPScope.subnet_id, DHCPScope.deleted_at)
+            .where(DHCPScope.id == scope_id)
+            .execution_options(include_deleted=True)
+        )
+
     while True:
-        scope = (
-            await db.execute(
-                select(DHCPScope.subnet_id, DHCPScope.deleted_at)
-                .where(DHCPScope.id == scope_id)
-                .execution_options(include_deleted=True)
-            )
-        ).one_or_none()
+        # A plain read first, so a restored or purged scope stops the loop
+        # without locking any of its lease rows; re-read under the lock below.
+        scope = (await db.execute(_scope_state())).one_or_none()
         if scope is None or scope.deleted_at is None:
             await db.commit()  # ends the read; a rollback would expire the caller's rows
             return leases_removed, mirrors_removed, True
@@ -478,6 +499,17 @@ async def tear_down_scope_leases(
         )
         if not ids:
             await db.commit()  # ends the read; a rollback would expire the caller's rows
+            return leases_removed, mirrors_removed, True
+        # #3777: the scope row FOR SHARE, after the lease rows (step 1, then the
+        # scope, as a lease-events batch takes it) and held to the commit. A
+        # restore's un-stamp waits for this batch, or this batch waits for the
+        # restore and reads the scope live. Taken before the lease rows it would
+        # deadlock with a Trash purge, which locks them and then deletes the row.
+        scope = (
+            await db.execute(_scope_state().with_for_update(read=True, of=DHCPScope))
+        ).one_or_none()
+        if scope is None or scope.deleted_at is None:
+            await db.commit()  # nothing written; ends the locks
             return leases_removed, mirrors_removed, True
         await lock_zones_for_lease_mirrors(db, ids)
         batch = list(

@@ -54,7 +54,7 @@ from app.services.dns.tsig import (
     resolve_group_transfer_key,
     resolve_transfer_vip,
     resolve_view_transfer_key,
-    transfer_fallback_hosts,
+    transfer_fallback_kwargs,
     transfer_needs_tsig,
 )
 from app.services.technitium.rdata import (
@@ -498,12 +498,30 @@ def without_server_apex_ns(
 
 async def _fallback_kwargs(db: AsyncSession, server: Any) -> dict[str, Any]:
     """``pull_zone_records`` kwargs naming the server's own pod address to retry
-    on a refused connection behind the appliance DNS VIP (#1470); empty when
-    it cannot apply."""
+    on a refused connection behind the appliance DNS VIP (#1470), or when its
+    ``host`` does not resolve (#3757); empty when neither applies."""
     if not transfer_needs_tsig(server):
         return {}
-    hosts = transfer_fallback_hosts(server, await resolve_transfer_vip(db))
-    return {"fallback_hosts": hosts} if hosts else {}
+    return dict(transfer_fallback_kwargs(server, await resolve_transfer_vip(db)))
+
+
+# Zone types a server does not hold authoritatively (#3758). A forward zone is
+# a conditional forwarder and a stub holds only the delegation's NS / SOA, so
+# an AXFR of either is refused (NOTAUTH) — not a fault, there is simply no zone
+# data to read, diff or import.
+NON_AUTHORITATIVE_ZONE_TYPES = frozenset({"forward", "stub"})
+
+
+def non_authoritative_reason(zone: DNSZone) -> str | None:
+    """Why ``zone`` can't be read from a server, or None when it can."""
+    zone_type = zone.zone_type or "primary"
+    if zone_type not in NON_AUTHORITATIVE_ZONE_TYPES:
+        return None
+    what = "a conditional forwarder" if zone_type == "forward" else "a stub zone"
+    return (
+        f"This is {what}: the server does not hold it authoritatively, so there is "
+        "no zone data to transfer and nothing to compare."
+    )
 
 
 async def _resolve_primary_and_driver(
@@ -528,6 +546,8 @@ async def _resolve_primary_and_driver(
     walking a group's servers; it takes the primary's place for everything
     below. Without it the zone's primary is used.
     """
+    if (reason := non_authoritative_reason(zone)) is not None:
+        raise ValueError(reason)
     primary = server if server is not None else await resolve_primary_server(db, zone)
     if primary is None:
         raise ValueError(

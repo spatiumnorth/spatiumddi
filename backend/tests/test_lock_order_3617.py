@@ -370,7 +370,10 @@ async def test_subnet_soft_delete_and_expiry_sweep_do_not_deadlock(
     db_session: AsyncSession, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The delete removed the lease mirror first and purged the scope's lease
-    after; the sweep held that lapsed lease and wanted the mirror."""
+    after; the sweep held that lapsed lease and wanted the mirror. Since #3744
+    the delete tears the lease down after its commit, in a batch that takes the
+    lease row, then the mirror, as the sweep does: held mid-batch, the sweep
+    waits for it and neither is left deadlocked."""
     from app.services.ai.operations_risky import DeleteSubnetArgs, _apply_delete_subnet
     from app.services.dhcp import lease_cleanup
     from app.tasks.dhcp_lease_cleanup import _sweep
@@ -411,7 +414,7 @@ async def test_subnet_soft_delete_and_expiry_sweep_do_not_deadlock(
     reached = asyncio.Event()
     log: list[str] = []
     # Unfixed, the delete reaches the lease purge holding the deleted mirror.
-    _hold_first_call(monkeypatch, lease_cleanup, "delete_leases_for_scope", holder, reached, log)
+    _hold_first_call(monkeypatch, lease_cleanup, "purge_lease", holder, reached, log)
 
     async def _delete() -> None:
         async with AsyncSession(engine, expire_on_commit=False) as db:

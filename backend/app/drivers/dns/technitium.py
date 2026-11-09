@@ -280,6 +280,7 @@ class TechnitiumDriver(DNSDriver):
         tsig: TsigKey | None = None,
         include_apex_ns: bool = False,
         fallback_hosts: Sequence[str] = (),
+        unresolved_fallback_hosts: Sequence[str] = (),
     ) -> list[RecordData]:
         """AXFR the zone off the Technitium host, for the #61 drift report.
 
@@ -318,6 +319,7 @@ class TechnitiumDriver(DNSDriver):
                 tsig=tsig,
                 include_apex_ns=include_apex_ns,
                 fallback_hosts=fallback_hosts,
+                unresolved_fallback_hosts=unresolved_fallback_hosts,
             )
         except Exception as exc:
             # A bare "REFUSED" tells the operator nothing about what to do.

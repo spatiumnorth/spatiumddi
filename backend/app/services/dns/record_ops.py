@@ -2286,6 +2286,23 @@ async def retract_address_records(
     return count, wake
 
 
+async def retract_records_of_addresses(
+    db: AsyncSession, *address_where: Any
+) -> tuple[int, set[uuid.UUID]]:
+    """Withdraw the auto-generated DNS records of the addresses ``address_where``
+    selects, the way :func:`retract_address_records` does a subnet's (#3744).
+
+    A subnet / block / space soft delete calls it for the DHCP lease mirrors
+    its scopes' leases leave behind: their teardown runs after the delete's
+    commit, in committed batches, so their records are withdrawn here, set-based,
+    before the stamp, or the stamp would take them into the batch for a restore
+    to bring back. Returns ``(records_retracted, dns_group_ids)``."""
+    count, wake, _zones = await _retract_auto_records(
+        db, [DNSRecord.ip_address_id.in_(select(IPAddress.id).where(*address_where))]
+    )
+    return count, wake
+
+
 async def _retract_auto_records(
     db: AsyncSession, owned_by: list[Any]
 ) -> tuple[int, set[uuid.UUID], int]:
