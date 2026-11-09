@@ -395,3 +395,48 @@ async def test_technitium_plain_create_onto_a_non_empty_zone_still_refuses(
 
     assert resp.status_code == 409, resp.text
     assert "did not create" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_technitium_unknown_identity_still_refuses_foreign_records(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tech: _TechStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same URL, but the identity cannot be derived: the guard still runs."""
+    token = await _token(db_session)
+    zone, dst = await _tech_setup(db_session, _T_URL, _T_URL)
+    tech.zones["example.com"] = list(_REC_OF_OURS)
+    monkeypatch.setattr(tech, "provider_identity", lambda server: None)
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 409, resp.text
+    assert "did not create" in resp.text
+    assert tech.deleted == []
+    assert tech.zones["example.com"] == _REC_OF_OURS
+
+
+@pytest.mark.asyncio
+async def test_technitium_disabled_source_server_does_not_vouch_for_the_records(
+    client: AsyncClient, db_session: AsyncSession, tech: _TechStore
+) -> None:
+    """A paused source server serves nothing, so it is no evidence the
+    daemon's copy is SpatiumDDI's own: the target create keeps the guard."""
+    from sqlalchemy import select
+
+    token = await _token(db_session)
+    zone, dst = await _tech_setup(db_session, _T_URL, _T_URL)
+    src = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == zone.group_id))
+    ).scalar_one()
+    src.is_enabled = False
+    await db_session.flush()
+    tech.zones["example.com"] = list(_REC_OF_OURS)
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 409, resp.text
+    assert "did not create" in resp.text
+    assert tech.zones["example.com"] == _REC_OF_OURS
