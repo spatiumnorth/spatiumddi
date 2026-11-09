@@ -1365,6 +1365,10 @@ DHCPLease (not persisted long-term — cached in Redis, written to DB for histor
   `dhcp_pull_leases_interval_seconds` (see §15)
 - Leases are used to update `IPAddress.status`, `IPAddress.last_seen`, and trigger DDNS
 
+### DDNS on renewal (#3776)
+
+A renewal with an unchanged hostname writes nothing when the published records are already right. Otherwise it repairs them: a deleted A/AAAA or PTR is republished, and a changed effective `ddns_ttl` (subnet, block or space) is applied to the existing records. The TTL of a DDNS-generated record follows `ddns_ttl`, so a TTL hand-edited on such a record is reset to the effective `ddns_ttl` at the next renewal. To pin a TTL, change `ddns_ttl` on the subnet, block or space, or replace the record with a manual one; an operator's own record keeps its TTL. See [DNS.md §7](DNS.md) for the rest of the DDNS pipeline.
+
 ### Lease History (forensic trail)
 
 Landed in `2026.04.26-1` via migration

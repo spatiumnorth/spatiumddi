@@ -280,12 +280,59 @@ async def resolve_ddns_hostname(
     return client_name or _generate_hostname(ip_str)
 
 
+class DDNSReadCache:
+    """Per-batch memo for :func:`ddns_lease_writes_nothing` (#3776).
+
+    A lease-events batch runs the read-only check for every grant before it
+    writes anything, so the reads that depend only on the subnet (its
+    reverse-zone candidates) or that can be made for every row at once (the
+    records DDNS generated for each address) are made once per batch instead
+    of once per lease. Valid only while nothing is written: the batch builds
+    one for its read-only pass and drops it before the DDNS step runs, which
+    reads fresh state through the same predicate without a cache.
+    """
+
+    __slots__ = ("generated", "reverse")
+
+    def __init__(self) -> None:
+        # Subnet id -> reverse-zone candidates (``load_reverse_candidates``).
+        self.reverse: dict[Any, list[Any]] = {}
+        # IPAM row id -> its DDNS-generated A/AAAA/PTR records, for the rows
+        # ``prefetch_generated`` loaded; a row not in here is read on its own.
+        self.generated: dict[Any, list[Any]] = {}
+
+    async def prefetch_generated(self, db: AsyncSession, row_ids: list[Any]) -> None:
+        """Load the generated records of every row in ``row_ids`` in one query."""
+        from app.models.dns import DNSRecord  # noqa: PLC0415 — lazy, avoid cycle
+
+        ids = [rid for rid in dict.fromkeys(row_ids) if rid is not None]
+        if not ids:
+            return
+        for rid in ids:
+            self.generated.setdefault(rid, [])
+        rows = (await db.execute(_generated_records_query(DNSRecord, ids))).scalars().all()
+        for rec in rows:
+            self.generated[rec.ip_address_id].append(rec)
+
+
+def _generated_records_query(record_cls: Any, row_ids: list[Any]) -> Any:
+    """The records DDNS generated for ``row_ids``: what the TTL and PTR
+    checks of :func:`_ddns_records_current` judge (an alias is not one)."""
+    return select(record_cls).where(
+        record_cls.ip_address_id.in_(row_ids),
+        record_cls.auto_generated.is_(True),
+        record_cls.ip_alias.is_(False),
+        record_cls.record_type.in_(["A", "AAAA", "PTR"]),
+    )
+
+
 async def _ddns_records_current(
     db: AsyncSession,
     subnet: Subnet,
     ipam_row: IPAddress,
     hostname: str,
     eff: EffectiveDDNS,
+    cache: DDNSReadCache | None = None,
 ) -> bool:
     """Is everything DDNS publishes for this row already as the sync would
     write it?
@@ -305,7 +352,8 @@ async def _ddns_records_current(
       published name: ours, or an operator's the sync would adopt (#3776).
       An address no reverse zone covers needs none.
 
-    False means the sync may write, and the full path runs it.
+    False means the sync may write, and the full path runs it. ``cache`` (a
+    read-only batch pass only) serves the per-subnet and per-batch reads.
     """
     from app.models.dns import DNSRecord, DNSZone  # noqa: PLC0415 — lazy, avoid cycle
 
@@ -314,20 +362,12 @@ async def _ddns_records_current(
     published = await db.get(DNSRecord, ipam_row.dns_record_id)
     if published is None or published.name != hostname:
         return False
-    generated = (
-        (
-            await db.execute(
-                select(DNSRecord).where(
-                    DNSRecord.ip_address_id == ipam_row.id,
-                    DNSRecord.auto_generated.is_(True),
-                    DNSRecord.ip_alias.is_(False),
-                    DNSRecord.record_type.in_(["A", "AAAA", "PTR"]),
-                )
-            )
+    if cache is not None and ipam_row.id in cache.generated:
+        generated = cache.generated[ipam_row.id]
+    else:
+        generated = (
+            (await db.execute(_generated_records_query(DNSRecord, [ipam_row.id]))).scalars().all()
         )
-        .scalars()
-        .all()
-    )
     if any(rec.ttl != eff.ttl for rec in generated):
         return False
 
@@ -336,14 +376,25 @@ async def _ddns_records_current(
     # forward FQDN as its value.
     from app.api.v1.ipam.router import (  # noqa: PLC0415 — lazy, avoid cycle
         _operator_record_twin,
-        _resolve_reverse_zone,
+        _resolve_effective_dns,
+    )
+    from app.services.dns.sync_check import (  # noqa: PLC0415 — lazy, avoid cycle
+        load_reverse_candidates,
+        pick_reverse_zone,
     )
 
     try:
         ip_obj = ipaddress.ip_address(str(ipam_row.address))
     except ValueError:
         return True
-    rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+    # ``_resolve_reverse_zone``, with the subnet's candidates memoised per batch.
+    cands = cache.reverse.get(subnet.id) if cache is not None else None
+    if cands is None:
+        group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+        cands = await load_reverse_candidates(db, subnet, group_ids)
+        if cache is not None:
+            cache.reverse[subnet.id] = cands
+    rev_zone = pick_reverse_zone(subnet, ip_obj, cands)
     if rev_zone is None:
         return True
     fwd_zone = await db.get(DNSZone, published.zone_id)
@@ -651,6 +702,7 @@ async def ddns_lease_writes_nothing(
     ipam_row: IPAddress,
     client_hostname: str | None,
     row_hostname: str | None,
+    cache: DDNSReadCache | None = None,
 ) -> bool:
     """Would :func:`apply_ddns_for_lease` write nothing for this lease? (#3773)
 
@@ -663,6 +715,8 @@ async def ddns_lease_writes_nothing(
     every one, so a lease-events batch can skip its zone locks for it, which
     otherwise hold the zone row to the batch's commit and serialise the two
     peers' batches on it. False whenever a write may follow.
+    ``cache`` is the batch's :class:`DDNSReadCache`, for a pass that writes
+    nothing between its checks.
     """
     if not ipam_row.auto_from_lease:
         return False
@@ -675,7 +729,7 @@ async def ddns_lease_writes_nothing(
         return bool((row_hostname or "").strip())
     if row_hostname != hostname:
         return False
-    if not await _ddns_records_current(db, subnet, ipam_row, hostname, eff):
+    if not await _ddns_records_current(db, subnet, ipam_row, hostname, eff, cache):
         return False
     if _is_reserved_name(ipam_row, hostname):
         return False

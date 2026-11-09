@@ -134,7 +134,8 @@ async def _reapply_ddns_for_active_leases(
     swallowed inline ``apply_ddns_for_lease`` failure missed — including a
     generated ``dhcp-<a-b-c-d>`` name the hostname-driven drift check can't
     see — gets regenerated. Idempotent: ``apply_ddns_for_lease`` skips a
-    row whose hostname is unchanged and already published under that name.
+    row whose hostname is unchanged and whose records are already published
+    as it would write them (name, PTR, effective ``ddns_ttl`` — #3776).
     ``locked_ids`` are the rows the caller has already locked, addresses
     then zones (#3724); only those are re-applied, so a mirror created since
     is not written after a zone is held. Without it the subnet's mirrors are

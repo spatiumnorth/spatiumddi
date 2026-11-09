@@ -17,7 +17,8 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import event, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
@@ -216,3 +217,37 @@ async def test_an_unchanged_renewal_with_a_ttl_set_locks_no_zone(
             r = await _post(concurrent_client, peer_b, [_ev(ip) for ip in _IPS])
             assert r.status_code == 200, r.text
     assert seen == [], seen
+
+
+@pytest.mark.asyncio
+async def test_the_renewal_check_reads_per_batch_not_per_lease(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    """The PTR and TTL reads the check gained are made once per batch (each
+    address's generated records) or once per subnet (its reverse zones), so
+    an unchanged renewal of three leases reads them as often as one does."""
+    _peer_a, peer_b, _subnet, _zone_id = await _pair(concurrent_client, db_session)
+
+    async def _reads(ips: list[str]) -> tuple[int, int]:
+        seen: list[str] = []
+
+        def _record(conn: Any, cursor: Any, statement: str, *a: Any) -> None:
+            seen.append(statement)
+
+        event.listen(Engine, "before_cursor_execute", _record)
+        try:
+            r = await _post(concurrent_client, peer_b, [_ev(ip) for ip in ips])
+            assert r.status_code == 200, r.text
+        finally:
+            event.remove(Engine, "before_cursor_execute", _record)
+        generated = sum(
+            1 for s in seen if "FROM dns_record" in s and "dns_record.ip_alias IS false" in s
+        )
+        reverse = sum(1 for s in seen if "dns_zone.linked_subnet_id =" in s)
+        return generated, reverse
+
+    one = await _reads(_IPS[:1])
+    three = await _reads(_IPS)
+    assert one == three, (one, three)
+    assert three[0] >= 1 and three[1] >= 1, three
