@@ -796,12 +796,16 @@ async def restore_row(
     db.add_all(audit_rows)
     await db.commit()
     if republish_subnet_ids:
+        from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
             republish_restored_lease_ddns_task,
         )
 
         try:
-            republish_restored_lease_ddns_task.delay([str(i) for i in republish_subnet_ids])
+            await dispatch(
+                republish_restored_lease_ddns_task,
+                [str(i) for i in republish_subnet_ids],
+            )
         except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
             # Broker down: no sweep re-publishes a lease mirror's records, so
             # each lease gets its names back at its client's next renewal, or
