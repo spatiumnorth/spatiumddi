@@ -263,6 +263,7 @@ from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
+    same_provider_target_ids,
     shared_provider_sources,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
@@ -8346,7 +8347,15 @@ async def move_zone_commit(
     # and deleting through the source would remove it. Decided AFTER the
     # create, because a target that already held the zone is the evidence
     # that does not depend on the credentials naming the provider correctly.
-    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
+    adopted_on = await _push_zone_to_agentless_servers(
+        db,
+        zone,
+        "create",
+        group_id=target_group.id,
+        adopt_existing_server_ids=await same_provider_target_ids(
+            db, source_group_id, target_group.id
+        ),
+    )
     # The create gives each NEW target server an empty zone (SOA + NS), so the
     # zone's saved records are pushed too (#3815) — or every one of them
     # answers NXDOMAIN while SpatiumDDI lists it as served. A server that
@@ -8861,8 +8870,15 @@ async def _push_zone_to_agentless_servers(
     op: str,
     group_id: uuid.UUID | None = None,
     skip_server_ids: set[uuid.UUID] | None = None,
+    adopt_existing_server_ids: set[uuid.UUID] | None = None,
 ) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    ``adopt_existing_server_ids`` (create only): servers whose existing copy
+    of the zone is SpatiumDDI's own, reached through the source group's server
+    of the same provider (#3805). Their driver adopts it without refusing for
+    the records it holds. Every other caller leaves it empty, so the
+    foreign-records guard still runs.
 
     Returns the names of the servers that were already in the requested
     state (#1537): on a create, the servers that already held a zone of
@@ -8953,7 +8969,15 @@ async def _push_zone_to_agentless_servers(
             records = managed_records
             if this_op == "delete" and records is None:
                 records = await _managed_zone_records(db, zone)
-            result = await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+            result = await driver.apply_zone_change(
+                server,
+                zone,
+                this_op,
+                managed_records=records,
+                adopt_existing=(
+                    this_op == "create" and server.id in (adopt_existing_server_ids or set())
+                ),
+            )
         else:
             result = await driver.apply_zone_change(server, zone, this_op)
         return result is not False
@@ -9057,7 +9081,7 @@ async def _push_zone_to_agentless_servers(
 
     kinds = ", ".join(sorted(_agentless_driver_label(d) for d in failed_drivers))
     detail = (
-        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors)}. "
+        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors).rstrip('. ')}. "
         "The change was not saved in SpatiumDDI."
     )
     if compensated:

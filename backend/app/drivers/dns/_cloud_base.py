@@ -306,6 +306,10 @@ class CloudDNSDriverBase(DNSDriver):
             rtype=change.record.record_type,
         )
 
+    #: True on a driver whose ``_apply_zone`` takes ``adopt_existing`` (it guards
+    #: adoption of an existing zone). The others never see the keyword.
+    honours_adopt_existing: bool = False
+
     async def apply_zone_change(
         self,
         server: Any,
@@ -313,6 +317,7 @@ class CloudDNSDriverBase(DNSDriver):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
+        adopt_existing: bool = False,
     ) -> bool:
         """Create / delete a hosted zone on the provider.
 
@@ -331,6 +336,12 @@ class CloudDNSDriverBase(DNSDriver):
         not delete ANY record on the way out, only attempt the zone
         delete itself.
 
+        ``adopt_existing`` (create only) tells a driver that guards adoption
+        of an existing zone that the zone it finds is SpatiumDDI's own, held
+        through another server of the same provider (a same-provider zone
+        move, #3805), so its records are not foreign. Only drivers that
+        set ``honours_adopt_existing`` receive it; the rest never see it.
+
         Returns whether the call CHANGED the provider (#1537). ``False``
         means the provider was already in the requested state — the zone
         already existed on create, or was already gone on delete — and
@@ -342,7 +353,12 @@ class CloudDNSDriverBase(DNSDriver):
         if op not in {"create", "delete"}:
             raise ValueError(f"{self.name}.apply_zone_change: unsupported op {op!r}")
         creds = self._load_credentials(server)
-        result = await self._apply_zone(server, creds, zone, op, managed_records=managed_records)
+        extra: dict[str, Any] = (
+            {"adopt_existing": True} if adopt_existing and self.honours_adopt_existing else {}
+        )
+        result = await self._apply_zone(
+            server, creds, zone, op, managed_records=managed_records, **extra
+        )
         # ``None`` = a driver that does not report the distinction; treat
         # it as a change, which is what every driver did before #1537.
         changed = result is not False

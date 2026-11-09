@@ -272,6 +272,52 @@ class SharedProviderResult:
     notes: list[str] = field(default_factory=list)
 
 
+async def same_provider_target_ids(
+    db: AsyncSession, source_group_id: uuid.UUID, target_group_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """Target agentless servers whose provider identity KNOWN-equals a source server's.
+
+    Such a target's create finds the zone the source group already holds,
+    through the same provider, with SpatiumDDI's own records in it. The driver
+    may then adopt it without the foreign-records refusal (#3805). An unknown
+    identity on either side never qualifies: the refusal then still runs.
+    """
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+
+    sources = await _agentless_servers(db, source_group_id)
+    targets = await _agentless_servers(db, target_group_id)
+    known: set[tuple[str, str]] = set()
+    for src in sources:
+        ident = get_driver(src.driver).provider_identity(src)
+        if ident is not None:
+            known.add((src.driver, ident))
+    out: set[uuid.UUID] = set()
+    for tgt in targets:
+        ident = get_driver(tgt.driver).provider_identity(tgt)
+        if ident is not None and (tgt.driver, ident) in known:
+            out.add(tgt.id)
+    return out
+
+
+async def _agentless_servers(db: AsyncSession, group_id: uuid.UUID) -> list[DNSServer]:
+    from app.drivers.dns import is_agentless  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == group_id,
+                    DNSServer.credentials_encrypted.isnot(None),
+                    DNSServer.is_enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if is_agentless(r.driver)]
+
+
 async def shared_provider_sources(
     db: AsyncSession,
     source_group_id: uuid.UUID,
@@ -303,29 +349,13 @@ async def shared_provider_sources(
     outcome yet: it says the copy WILL be kept if the target already holds
     the zone, rather than promising a delete it may not do.
     """
-    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
-
-    async def _agentless(group_id: uuid.UUID) -> list[DNSServer]:
-        rows = (
-            (
-                await db.execute(
-                    select(DNSServer).where(
-                        DNSServer.group_id == group_id,
-                        DNSServer.credentials_encrypted.isnot(None),
-                        DNSServer.is_enabled.is_(True),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        return [r for r in rows if is_agentless(r.driver)]
+    from app.drivers.dns import get_driver  # noqa: PLC0415
 
     result = SharedProviderResult()
-    targets = await _agentless(target_group_id)
+    targets = await _agentless_servers(db, target_group_id)
     if not targets:
         return result
-    sources = await _agentless(source_group_id)
+    sources = await _agentless_servers(db, source_group_id)
 
     def _identity(server: DNSServer) -> str | None:
         return get_driver(server.driver).provider_identity(server)
@@ -346,8 +376,8 @@ async def shared_provider_sources(
             reason = f"it reaches the same provider as target server '{match}'"
         elif adopted_by is not None:
             reason = (
-                f"target server '{adopted_by}' already held the zone, so the two "
-                "may be one provider"
+                f"target server '{adopted_by}' already held the zone, which means the "
+                "two may be one provider"
             )
         elif unknown:
             logger.warning(
