@@ -16,7 +16,9 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
@@ -140,3 +142,131 @@ async def test_a_dropped_outcome_leaves_a_zone_that_still_exists_alone(
     )
     assert provider.zone_calls == []
     assert zone.name in provider.zones
+
+
+async def _claim_then_sweep(
+    db: AsyncSession, op_id: uuid.UUID
+) -> tuple[datetime, list[DNSRecordOp]]:
+    """Claim the op, then drop the claimed row as every sweep does."""
+    claimed_at = datetime.now(UTC)
+    rows = await record_ops._claim(db, [op_id], now=claimed_at)
+    await db.commit()
+    assert len(rows) == 1
+    await db.execute(sa_delete(DNSRecordOp).where(DNSRecordOp.id == op_id))
+    await db.commit()
+    return claimed_at, rows
+
+
+@pytest.mark.asyncio
+async def test_a_zone_moved_to_another_group_is_not_deleted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zone move (#935) sweeps the old group's ops and keeps the zone row. No
+    zone of that name is left in the server's group, but the zone was moved, not
+    deleted, and a provider shared with the target group still serves it."""
+    provider = _Provider()
+    monkeypatch.setattr(record_ops, "get_driver", lambda _name: provider)
+    _headers, server, zone, op_id = await _seed(db_session)
+    provider.zones[zone.name] = []
+    claimed_at, rows = await _claim_then_sweep(db_session, op_id)
+    target = DNSServerGroup(name=f"t3688-{uuid.uuid4().hex[:6]}")
+    db_session.add(target)
+    await db_session.flush()
+    await db_session.execute(
+        sa_update(DNSZone).where(DNSZone.id == zone.id).values(group_id=target.id)
+    )
+    await db_session.commit()
+
+    await record_ops._dispatch_claimed(
+        _test_engine, server, rows, batched=False, claimed_at=claimed_at
+    )
+    assert provider.zone_calls == []
+    assert zone.name in provider.zones
+
+
+@pytest.mark.asyncio
+async def test_a_server_moved_away_keeps_its_new_groups_same_named_zone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server move (#934) between claim and dispatch drops the op. If the old
+    group's zone is then permanently deleted, the server now serves its NEW
+    group, which can hold a live zone of the same name: no delete may reach it."""
+    provider = _Provider()
+    monkeypatch.setattr(record_ops, "get_driver", lambda _name: provider)
+    _headers, server, zone, op_id = await _seed(db_session)
+    provider.zones[zone.name] = []
+    claimed_at, rows = await _claim_then_sweep(db_session, op_id)
+    new_group = DNSServerGroup(name=f"n3688-{uuid.uuid4().hex[:6]}")
+    db_session.add(new_group)
+    await db_session.flush()
+    db_session.add(
+        DNSZone(group_id=new_group.id, name=zone.name, zone_type="primary", kind="forward")
+    )
+    await db_session.execute(
+        sa_update(DNSServer)
+        .where(DNSServer.id == server.id)
+        .values(group_id=new_group.id)
+        # The dispatch holds the server as it was loaded at claim time.
+        .execution_options(synchronize_session=False)
+    )
+    await db_session.execute(
+        sa_delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
+    )
+    await db_session.commit()
+
+    await record_ops._dispatch_claimed(
+        _test_engine, server, rows, batched=False, claimed_at=claimed_at
+    )
+    assert provider.zone_calls == []
+    assert zone.name in provider.zones
+
+
+@pytest.mark.asyncio
+async def test_an_op_without_a_zone_id_never_triggers_a_delete(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An op queued before ``zone_id`` existed carries no proof of which zone
+    it was for, so a name match alone never sends a zone delete."""
+    provider = _Provider()
+    monkeypatch.setattr(record_ops, "get_driver", lambda _name: provider)
+    _headers, server, zone, op_id = await _seed(db_session)
+    await db_session.execute(
+        sa_update(DNSRecordOp).where(DNSRecordOp.id == op_id).values(zone_id=None)
+    )
+    await db_session.commit()
+    provider.zones[zone.name] = []
+    claimed_at, rows = await _claim_then_sweep(db_session, op_id)
+    await db_session.execute(
+        sa_delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
+    )
+    await db_session.commit()
+
+    await record_ops._dispatch_claimed(
+        _test_engine, server, rows, batched=False, claimed_at=claimed_at
+    )
+    assert provider.zone_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_zone_recreated_after_the_delete_is_not_deleted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The zone was permanently deleted, then created again under the same name
+    in the same group before the in-flight call returned: the new zone stays."""
+    provider = _Provider()
+    monkeypatch.setattr(record_ops, "get_driver", lambda _name: provider)
+    _headers, server, zone, op_id = await _seed(db_session)
+    provider.zones[zone.name] = []
+    claimed_at, rows = await _claim_then_sweep(db_session, op_id)
+    await db_session.execute(
+        sa_delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
+    )
+    db_session.add(
+        DNSZone(group_id=server.group_id, name=zone.name, zone_type="primary", kind="forward")
+    )
+    await db_session.commit()
+
+    await record_ops._dispatch_claimed(
+        _test_engine, server, rows, batched=False, claimed_at=claimed_at
+    )
+    assert provider.zone_calls == []
