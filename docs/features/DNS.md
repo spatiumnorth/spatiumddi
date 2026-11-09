@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status:** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
+> **Implementation status:** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** published by the group's primary for external secondaries; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -33,13 +33,13 @@ SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — se
 | Native DoT / DoH (no sidecar) | ✅ (issue #50) | — (needs dnsdist sidecar) | ✅ + DoQ (issue #741) | — |
 | Encrypted *upstream* forwarding | DoT only (no client-side HTTP) | — | DoT / DoH / DoQ (#741) | — |
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | ❌ (broken, refused — #1782, fix #1766) | — |
-| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | ❌ (broken, refused — #1782, fix #1766) | — |
+| Catalog zones (RFC 9432) — consumer | — (producer-only in a group, #3764; external BIND secondaries consume, §1) | — | ❌ (refused — #1782) | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
 | RPZ blocklists | ✅ | — (recursor feature only) | native blocking, not RPZ (#744) | — |
 | AD-integrated zones | — | — | — | ✅ |
 | Agent shape | sidecar agent + named | sidecar agent + pdns_server | sidecar agent + DnsServerApp.dll | agentless (control plane → WinRM) |
 
-**Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone consumer + RPZ paths SpatiumDDI ships.
+**Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone producer + RPZ paths SpatiumDDI ships.
 
 **Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumnorth/spatiumddi/issues/127) for the full driver rationale.
 
@@ -299,6 +299,56 @@ group writes through the server the election would pick, and a 60 s beat
 sweep marks that server primary. Only a group with no servers at all queues
 nothing, and nothing is lost there: a server added later receives the zone's
 records in its bundle.
+
+### Catalog zones (RFC 9432) — published for external secondaries (#3764)
+
+With **Use BIND9 catalog zones** on, the group's primary (`is_primary`)
+publishes an RFC 9432 catalog zone (default name `catalog.spatium.invalid.`)
+listing every primary zone in the group. BIND9 and PowerDNS producers render
+the same records.
+
+**Members of the group do not consume it.** Every agent in a group already
+receives every zone in its own config bundle and serves it as its own
+primary, so a member that also loaded the catalog held each zone twice, and
+BIND then refused the next `rndc reconfig` ("zone … already exists"). Before
+#3764 the other members were sent a consumer block; now only the primary gets
+a catalog block at all. An agent that still receives a consumer block from an
+older control plane ignores it and logs `bind9_catalog_consumer_ignored` (or
+`technitium_catalog_consumer_ignored`).
+
+The catalog exists for **BIND secondaries outside the group**, an operator's
+own servers that should pick up every zone SpatiumDDI adds without per-zone
+config. On BIND9 the catalog zone itself is transferable by any client (on
+PowerDNS it carries the group's transfer grant); its member zones keep the
+group's transfer grant (§3.6), so the external secondary signs
+member transfers with the group's TSIG key (shown under **Group TSIG key** in
+the group editor) or with a key or address the operator adds to the group's
+or zone's `allow_transfer`. On the external BIND (9.18 or later):
+
+```
+key "<group key name>" { algorithm hmac-sha256; secret "<group key secret>"; };
+
+options {
+    catalog-zones {
+        zone "catalog.spatium.invalid."
+            default-masters { 192.0.2.10 key "<group key name>"; }
+            in-memory yes;
+    };
+};
+
+zone "catalog.spatium.invalid." {
+    type secondary;
+    primaries { 192.0.2.10 key "<group key name>"; };
+};
+```
+
+`192.0.2.10` is the primary's address as the external server reaches it;
+`default-masters` takes addresses only, not hostnames. The producer sends no
+NOTIFY for the catalog zone (its only NS is `invalid.`), so the external
+server sees new zones at the catalog's SOA refresh (24 h) or on
+`rndc refresh catalog.spatium.invalid.`. Catalog zones are skipped on a BIND9
+group with views (the flat render only), and are refused on Technitium
+(#1782).
 
 ### Control-plane memory for large groups (#2227)
 

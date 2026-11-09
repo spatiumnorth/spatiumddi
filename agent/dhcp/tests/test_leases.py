@@ -93,3 +93,25 @@ def test_flush_body_uses_leases_key(monkeypatch) -> None:
     # #1077 — every lease batch carries a batch_id the server dedupes on.
     assert len(captured["json"]["batch_id"]) == 32
     assert hb.lease_count_since_start == 1
+
+
+def test_lease_client_waits_out_a_slow_batch_but_not_a_dead_connect() -> None:
+    # #3773 — a batch a busy control plane is still committing must not be
+    # given up on at 15 s and resent (the resend only waits on the original's
+    # receipt, holding a server connection); an unreachable control plane
+    # must still fail fast so the batch spools.
+    import types
+
+    from spatium_dhcp_agent import leases as leases_mod
+
+    cfg = types.SimpleNamespace(
+        control_plane_url="http://cp",
+        httpx_verify=lambda: True,
+        kea_lease_file="/tmp/x",
+        kea_control_socket="/tmp/x-sock",
+        kea_control_socket_v6="/tmp/x6-sock",
+    )
+    w = leases_mod.LeaseWatcher(cfg, ["tok"], types.SimpleNamespace(lease_count_since_start=0))
+    with w._client() as client:
+        assert client.timeout.read == 60.0
+        assert client.timeout.connect == 5.0
