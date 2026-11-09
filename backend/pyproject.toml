@@ -14,7 +14,7 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     # Below 2.1 until #1187: 2.1.0's new type annotations fail mypy in 23
     # files (#1186). The test suite itself passes on 2.1.
-    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "sqlalchemy[asyncio]>=2.1.8,<2.2",
     "asyncpg>=0.30.0",
     "alembic>=1.14.0",
     # Below 7 until re-measured (#3693): redis-py 7.4.1 / 8.1.0 cost ~10 % /
