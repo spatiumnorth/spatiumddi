@@ -103,10 +103,10 @@ Two things a lease-events batch takes WITHOUT waiting, so neither has a place
 in the order (#3789). Under Kea HA both members report every lease, so the
 two agents' batches carry the same addresses. A renewal whose mirror row
 already says what the event would write, and whose DDNS writes nothing, takes
-its ``ip_address`` row ``FOR UPDATE SKIP LOCKED``, after the batch's waiting
-step-2 locks: a row another transaction holds is left to it (the other
-member's batch, writing the same values) and the next report repairs anything
-it did not. And before inserting a new mirror row, a batch takes the row's
+its ``ip_address`` row ``FOR NO KEY UPDATE SKIP LOCKED``, after the batch's
+waiting step-2 locks: a row another transaction holds is left to it (the
+other member's batch, writing the same values) and the next report repairs
+anything it did not. And before inserting a new mirror row, a batch takes the row's
 insert claim (:func:`claim_mirror_inserts`) with ``pg_try_advisory_xact_lock``:
 a claim another batch holds means that batch is inserting the same row, and
 this one leaves the address to it rather than wait on its uncommitted insert

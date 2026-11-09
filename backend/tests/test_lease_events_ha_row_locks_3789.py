@@ -11,15 +11,15 @@ uncommitted insert of the same row until the 30 s command timeout.
 A renewal whose mirror row already carries what it would write, and whose
 DDNS writes nothing, now takes its row ``SKIP LOCKED`` and leaves a held one
 to its holder; a new mirror row another batch is inserting is left to that
-batch. Each test holds peer A's batch open before its commit and times peer
-B's batch of the same addresses; before the fix B waited for A's commit.
+batch. Each test holds peer A's batch open before its commit and asserts that peer
+B's batch of the same addresses answers while A is still held; before the
+fix B could only answer once A committed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -42,12 +42,15 @@ from tests.test_lease_events_trashed_scope_3733 import (
 )
 
 # Twenty leases, so a batch that waits for the other member's rows waits for
-# all of them, and the pass threshold below is far from both outcomes.
+# all of them.
 _IPS = [f"10.31.1.{n}" for n in range(30, 50)]
-#: How long peer A's batch is held open before its commit.
-_HOLD_S = 8.0
-#: Peer B must answer within this while A is held (it took _HOLD_S before).
-_MAX_B_S = 3.0
+#: Safety cap on how long peer A's batch is held open before its commit; the
+#: tests release it as soon as peer B has answered (or run out of time).
+_HOLD_S = 90.0
+#: How long peer B gets to answer while A is still held. No wall-clock bound
+#: on B itself: the assertion is that B answered BEFORE A was let go, which a
+#: B waiting on A's rows or inserts cannot do however slow the runner is.
+_B_BUDGET_S = 30.0
 
 
 @asynccontextmanager
@@ -78,17 +81,19 @@ async def _b_while_a_held(
     peer_a: DHCPServer,
     peer_b: DHCPServer,
     events: list[dict[str, Any]],
-) -> tuple[Response, Response, float]:
+) -> tuple[Response, Response, bool]:
     """Post A's batch, hold it open, post B's batch of the same events, and
-    return both responses and how long B took."""
+    return both responses and whether B answered while A was still held."""
     async with _held_open(monkeypatch) as held:
         batch_a = asyncio.create_task(_post(client, peer_a, events))
         await asyncio.wait_for(held.wait(), timeout=30)
-        started = time.monotonic()
-        resp_b = await asyncio.wait_for(_post(client, peer_b, events), timeout=_HOLD_S + 20)
-        elapsed = time.monotonic() - started
-    resp_a = await asyncio.wait_for(batch_a, timeout=30)
-    return resp_a, resp_b, elapsed
+        batch_b = asyncio.create_task(_post(client, peer_b, events))
+        await asyncio.wait({batch_b}, timeout=_B_BUDGET_S)
+        answered_while_held = batch_b.done() and not batch_a.done()
+    # Leaving the block lets A commit; a B that was waiting on it finishes now.
+    resp_b = await asyncio.wait_for(batch_b, timeout=60)
+    resp_a = await asyncio.wait_for(batch_a, timeout=60)
+    return resp_a, resp_b, answered_while_held
 
 
 async def _mirrors(db: AsyncSession) -> dict[str, IPAddress]:
@@ -133,13 +138,13 @@ async def test_a_peers_unchanged_renewals_do_not_wait_for_the_other_members_batc
     published = await _a_records(db_session, zone_id)
     assert len(published) == len(_IPS), published
 
-    resp_a, resp_b, elapsed = await _b_while_a_held(
+    resp_a, resp_b, answered_while_held = await _b_while_a_held(
         concurrent_client, monkeypatch, peer_a, peer_b, [_ev(ip) for ip in _IPS]
     )
     assert resp_b.status_code == 200, resp_b.text
     assert resp_a.status_code == 200, resp_a.text
     assert resp_b.json()["upserted"] == len(_IPS)
-    assert elapsed < _MAX_B_S, f"peer B waited {elapsed:.1f} s for peer A's address rows"
+    assert answered_while_held, "peer B waited for peer A's address rows"
 
     # Nothing changed but A's sighting stamp: one row each, same names, same
     # records, and B's own leases recorded.
@@ -168,12 +173,12 @@ async def test_a_peers_first_acquisition_does_not_wait_on_the_other_members_inse
     peer_a, peer_b = await _two_agents(db_session, [subnet])
     zone_id = uuid.UUID(str(subnet.dns_zone_id))
 
-    resp_a, resp_b, elapsed = await _b_while_a_held(
+    resp_a, resp_b, answered_while_held = await _b_while_a_held(
         concurrent_client, monkeypatch, peer_a, peer_b, [_ev(ip) for ip in _IPS]
     )
     assert resp_b.status_code == 200, resp_b.text
     assert resp_a.status_code == 200, resp_a.text
-    assert elapsed < _MAX_B_S, f"peer B waited {elapsed:.1f} s on peer A's inserts"
+    assert answered_while_held, "peer B waited on peer A's mirror inserts"
 
     mirrors = await _mirrors(db_session)
     assert sorted(mirrors) == sorted(_IPS)
