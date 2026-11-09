@@ -967,12 +967,16 @@ codebase and the same `spatium-dns-entrypoint`, and exposes the same
 
 The `dns-technitium` image follows the same agent/entrypoint shape too,
 but has no config file for the agent to render at all — Technitium is
-configured entirely over its own HTTP API (`http://127.0.0.1:5380`), so
+configured entirely over its own HTTP API (the agent calls
+`http://127.0.0.1:5380`; the daemon listens on every interface, see the note
+below), so
 `render()`/`validate()`/`swap_and_reload()` collapse into "stash the
 desired zone/record state as JSON, then reconcile it against the live
 API." The agent provisions a permanent API bearer token on first-ever
 boot (via `DNS_SERVER_ADMIN_PASSWORD` + `/api/user/createToken`) the same
 way the PowerDNS driver provisions its local API key.
+
+**Technitium console reachability (#1776).** The daemon's web console and API listen on `0.0.0.0` / `[::]:5380` over plaintext HTTP, not on loopback ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776); the bind change is planned for 1.1.0). The agent itself calls it over `127.0.0.1`. Who can reach it from outside depends on the deployment: on the default appliance path it is not reachable from the LAN or from pods; in Docker Compose, the umbrella chart and DNS-VIP mode every other container or pod on the same network can reach it; and in the host-network standalone compose it is reachable from the LAN. The `admin` account carries a random 192-bit password generated at first boot (there is no `admin`/`admin` window). For the host-network standalone compose, add a host firewall rule that drops inbound TCP 5380 from anything but the host itself.
 
 
 ### Volumes

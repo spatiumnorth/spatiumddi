@@ -768,7 +768,7 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 ## 4B. Technitium Driver (v1)
 
-Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated shape as PowerDNS (control-plane driver is a thin/no-op translator; the real work — reconcile, auth, lifecycle — lives in the agent-side driver talking to the daemon over loopback), but even thinner: Technitium has **no config file for zone/record state at all**. The daemon persists its own config under `/etc/dns` and is configured entirely through its HTTP API (`http://127.0.0.1:5380/api/...`).
+Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated shape as PowerDNS (control-plane driver is a thin/no-op translator; the real work — reconcile, auth, lifecycle — lives in the agent-side driver talking to the daemon over `127.0.0.1`), but even thinner: Technitium has **no config file for zone/record state at all**. The daemon persists its own config under `/etc/dns` and is configured entirely through its HTTP API (`http://127.0.0.1:5380/api/...`, called by the agent; the daemon itself listens on every interface, see §4B.3b below).
 
 ### 4B.1 Update Strategy: REST API, full-zone diff reconcile
 
@@ -846,8 +846,10 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 
 ### 4B.3b DNSSEC (issue #740, withdrawn in #1783)
 
-> **SpatiumDDI does not support DNSSEC signing on Technitium (#1783).** `technitium` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign endpoint, `dnssec_enabled` on zone create or update, and the Copilot all answer 422 naming #1767, and `capabilities()` reports `dnssec_inline_signing: False`. The reason: signing here is one-shot. The sign op is sent once, so a zone is not re-signed when a server joins the group, when the zone is re-created or restored, or when a data volume is lost; the zone's `DNSSECPolicy` is ignored (always ECDSA P256 / NSEC); and key state is re-reported only while the zone is signed. The zone then shows signed in SpatiumDDI while being unsigned on the wire. Full support is tracked in [#1767](https://github.com/spatiumnorth/spatiumddi/issues/1767) (1.1.0).
+> **SpatiumDDI does not support DNSSEC signing on Technitium (#1783).** `technitium` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign endpoint, `dnssec_enabled` on zone create or update, and the Copilot all answer 422 naming #1767 (the same for `technitium_api`, #3806), and `capabilities()` reports `dnssec_inline_signing: False`. The reason: signing here is one-shot. The sign op is sent once, so a zone is not re-signed when a server joins the group, when the zone is re-created or restored, or when a data volume is lost; the zone's `DNSSECPolicy` is ignored (always ECDSA P256 / NSEC); and key state is re-reported only while the zone is signed. The zone then shows signed in SpatiumDDI while being unsigned on the wire. Full support is tracked in [#1767](https://github.com/spatiumnorth/spatiumddi/issues/1767) (1.1.0).
 >
+> **Console reachability (#1776).** The daemon's web console and API listen on `0.0.0.0` / `[::]:5380` over plaintext HTTP, not on loopback ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776); the bind change is planned for 1.1.0). The agent itself calls it over `127.0.0.1`. Who can reach it from outside depends on the deployment: on the default appliance path it is not reachable from the LAN or from pods; in Docker Compose, the umbrella chart and DNS-VIP mode every other container or pod on the same network can reach it; and in the host-network standalone compose it is reachable from the LAN. The `admin` account carries a random 192-bit password generated at first boot (there is no `admin`/`admin` window). For the host-network standalone compose, add a host firewall rule that drops inbound TCP 5380 from anything but the host itself.
+
 > **Zones already signed on Technitium are left alone.** The agent does not unsign them and they keep serving signed. Their zone response carries `dnssec_unmanaged_warning: true` and the UI shows a "DNSSEC not managed" badge. `dnssec_unsign` stays allowed on `technitium`, so an operator can still turn DNSSEC off.
 >
 > The rest of this section describes the agent mechanism that remains for those zones. Disregard its claims of sign-on-demand and of rollover being left to the daemon: Technitium's own key rollover is not surfaced here.
@@ -879,7 +881,7 @@ Unlike the PowerDNS agent, this driver reports `keys` as well as `ds_records` �
 
 > ⚠️ A signed zone serves DNSKEY / RRSIG / NSEC / NSEC3 / NSEC3PARAM records that **no bundle describes**. `_DNSSEC_RECORD_TYPES` filters them out of `_get_zone_records`; without that, the full-zone reconcile treats every signing artefact as an extra record and tries to delete the zone's own signatures on every single pass. There is a regression test for exactly this.
 
-Manual key rollover stays BIND9-only. Technitium rolls on its own schedule — `dnssecPrivateKeys` carries `rolloverDays` per key — so `dnssec_rollover` is deliberately *not* widened to technitium.
+Manual key rollover stays BIND9-only. Technitium DNSSEC is unsupported in 1.0 (#1783), so `dnssec_rollover` is not widened to technitium. Its KSK `rolloverDays` defaults to 0, which means never roll; nothing in SpatiumDDI sets or reads it.
 
 ### 4B.3c Encrypted transports (issue #741)
 
@@ -942,7 +944,7 @@ Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are re
 
 ### 4B.3e Config drift (issue #61)
 
-`pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on loopback `:5380` inside the agent's container and only the co-located agent can reach it, so the control plane goes over DNS.
+`pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on `:5380` inside the agent's container and the control plane is not expected to reach it (reachability varies by deployment, #1776), so the control plane goes over DNS.
 
 **Behind the appliance DNS VIP ([#1470](https://github.com/spatiumnorth/spatiumddi/issues/1470)).** With `dns_vip` set the DNS pods drop hostNetwork and sit behind a MetalLB LoadBalancer, so the node address in `DNSServer.host` accepts nothing on `:53`. For an agent-managed server (BIND9 or Technitium), a transfer whose TCP connection is *refused* is retried once at that server's own pod address, on the same port and with the same key (`axfr_zone_records(fallback_hosts=…)`, fed by `transfer_fallback_hosts`). The pod address is `DNSServer.last_seen_ip`: the agent heartbeats the in-cluster API Service from its pod, so the heartbeat's source is exactly where that member's daemon listens. The VIP itself is never dialled: in-cluster traffic to it is balanced across every pod labelled `spatium.io/dns-vip`, every member of every DNS group, so a per-server drift row read through it would describe an arbitrary member, and a member whose daemon is down would read as in sync. Only a refusal triggers the retry (a timeout or no-route is reported as it is), and nothing is retried when `dns_vip` is unset. A pod that restarted takes a new address, so a transfer in the seconds before its next heartbeat can fail; the next run succeeds. Windows, cloud and operator-run servers are never redirected.
 
@@ -988,7 +990,7 @@ Two Technitium drivers ship, and the difference is **who owns the daemon**:
 | | `technitium` (§4B) | `technitium_api` (this section) |
 |---|---|---|
 | Who runs the daemon | SpatiumDDI — we deploy the container | The operator, wherever they already have it |
-| Who talks to the API | The co-located agent, over loopback `:5380` | The control plane, over the network |
+| Who talks to the API | The co-located agent, over `127.0.0.1:5380` (the daemon listens on every interface, #1776) | The control plane, over the network |
 | Auth | Agent mints its own token on first boot | Operator pastes a permanent token |
 | Config channel | ConfigBundle long-poll | None — writes are synchronous |
 | Deploy step | Run a container | None |
@@ -1101,7 +1103,7 @@ The UI hides what it would refuse on such a group: the zone dialog offers Primar
 
 ### 4C.8 Not in scope for this driver
 
-DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign/unsign endpoints refuse it rather than half-working. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumnorth/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.
+DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign endpoint refuses it with the same Technitium 422 as the agent driver (#3806); DNSSEC is unsupported on Technitium in 1.0. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumnorth/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.
 
 ---
 

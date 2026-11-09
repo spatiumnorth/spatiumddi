@@ -321,8 +321,10 @@ services:
   # Third DNS driver, alongside bind9/powerdns. Distinct profile + host
   # port (6053, avoiding 1053/5453) so all three can run side-by-side in
   # a dev/migration setup. Technitium's web console + API listen on
-  # loopback :5380 inside the container only — the agent is the only
-  # caller (same trust boundary as PowerDNS's local API key).
+  # 0.0.0.0 / [::]:5380 (plain HTTP, #1776), not loopback: every container
+  # on this network can reach it, and with host networking so can the LAN
+  # (firewall TCP 5380). The agent calls it over 127.0.0.1; the admin
+  # password is random per install.
   dns-technitium:
     profiles: ["dns-technitium"]
     image: ghcr.io/spatiumnorth/dns-technitium:${SPATIUMDDI_VERSION:-latest}
