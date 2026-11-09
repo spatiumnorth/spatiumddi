@@ -488,7 +488,6 @@ async def _master_granted_keys(db: AsyncSession, group_id: Any) -> list[TsigKey]
 async def _add_master_transfer_keys(
     db: AsyncSession,
     zone_payload: list[dict[str, Any]],
-    catalog_block: dict[str, Any] | None,
     tsig_keys: list[dict[str, Any]],
 ) -> None:
     """Name the TSIG key a Technitium secondary signs its transfers with (#1765).
@@ -514,15 +513,14 @@ async def _add_master_transfer_keys(
     creating a zone that silently expires.
 
     Sets ``masters_tsig_key`` (or ``masters_tsig_unresolved``) on each
-    secondary zone and ``producer_tsig_key`` on a consumer catalog block.
+    secondary zone.
     """
     secondaries = [
         zp
         for zp in zone_payload
         if str(zp.get("type") or "").lower() in ("secondary", "slave") and zp.get("masters")
     ]
-    consumer = catalog_block if (catalog_block or {}).get("mode") == "consumer" else None
-    if not secondaries and consumer is None:
+    if not secondaries:
         return
     managed = {
         _master_host(row.host): row
@@ -562,10 +560,6 @@ async def _add_master_transfer_keys(
         elif found:
             logger.warning("dns_secondary_master_shares_no_tsig_key", zone=zp.get("name"))
             zp["masters_tsig_unresolved"] = True
-    if consumer is not None and consumer.get("producer_addr"):
-        name, _ = await key_for([consumer["producer_addr"]])
-        if name:
-            consumer["producer_tsig_key"] = name
 
 
 def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1848,10 +1842,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         ]
 
     # ── Catalog zones (RFC 9432) ──
-    # When the group has the feature toggled on, build a producer or
-    # consumer block depending on whether this server is the primary
-    # (is_primary=True). Both BIND9 and PowerDNS (Phase 3d) consume
-    # the same producer payload — the catalog zone format is RFC 9432
+    # When the group has the feature toggled on, the group's primary
+    # (is_primary=True) gets a producer block; nobody gets a consumer block
+    # (#3764, see below). Both BIND9 and PowerDNS (Phase 3d) render the
+    # same producer payload — the catalog zone format is RFC 9432
     # canonical, so the rendering driver doesn't need to fork.
     catalog_block: dict[str, Any] | None = None
     if (
@@ -1884,23 +1878,24 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             )
         ).scalar_one_or_none()
 
-        if producer is not None:
+        if producer is not None and server.id == producer.id:
             # Members are every primary zone in the group. Forward / stub
             # zones don't belong in a catalog (they're lookups, not
-            # served data); secondaries are the consumer's responsibility.
+            # served data); secondaries are left to the external consumer.
             member_names = sorted(z.name for z in zones if z.zone_type in ("primary", "master"))
-            if server.id == producer.id:
-                catalog_block = {
-                    "mode": "producer",
-                    "zone_name": grp.catalog_zone_name,
-                    "members": [{"zone_name": n} for n in member_names],
-                }
-            else:
-                catalog_block = {
-                    "mode": "consumer",
-                    "zone_name": grp.catalog_zone_name,
-                    "producer_addr": producer.host,
-                }
+            catalog_block = {
+                "mode": "producer",
+                "zone_name": grp.catalog_zone_name,
+                "members": [{"zone_name": n} for n in member_names],
+            }
+        # #3764 — every other member gets NO catalog block. Since #170
+        # each agent in a group already receives every zone in its own
+        # bundle and serves it as its own primary, so a consumer would
+        # only load each member a second time: BIND then refuses the next
+        # ``rndc reconfig`` with "zone … already exists" (and its revert
+        # the same way), and new zones stop being served. The catalog is
+        # published for secondaries OUTSIDE the group — an operator's own
+        # BIND pointing ``catalog-zones`` at the producer.
 
     blocklists_payload: list[dict[str, Any]] = []
     streamed: list[_StreamedEntries] = []
@@ -2149,7 +2144,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 }
                 for z in zones
             ]
-            await _add_master_transfer_keys(db, probes, catalog_block, tsig_keys)
+            await _add_master_transfer_keys(db, probes, tsig_keys)
             for i, probe in enumerate(probes):
                 added = {k: v for k, v in probe.items() if k not in ("name", "type", "masters")}
                 if added:
@@ -2167,7 +2162,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             has_views=has_views,
         )
     elif server.driver == "technitium":
-        await _add_master_transfer_keys(db, zone_payload, catalog_block, tsig_keys)
+        await _add_master_transfer_keys(db, zone_payload, tsig_keys)
 
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),

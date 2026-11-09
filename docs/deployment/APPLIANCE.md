@@ -2946,8 +2946,8 @@ installer excludes both paths from the live-root copy.
    containerd's unfinished content writes (`spatium-k3s-images
    clear-ingests`), so a write an earlier import left behind
    cannot fail this boot's imports (#1630). k3s imports the new
-   tarballs. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200. It then waits until k3s holds
+   tarballs. `spatiumddi-firstboot.service` waits for k3s's
+   `/readyz` to answer `ok`. It then waits until k3s holds
    none of the tarballs open, which is how long each import
    lasts (#2109), checks that k3s imported every baked tarball
    and that every image is in containerd, and has k3s
@@ -2997,7 +2997,7 @@ sudo spatium-upgrade-slot set-next-boot
 sudo reboot
 
 # Emergency: durably commit without waiting for firstboot
-sudo spatium-upgrade-slot commit slot_b
+sudo spatium-upgrade-slot set-default slot_b
 
 # Refresh /var/lib/spatiumddi/release-state/slot-versions.json
 # (called automatically by spatiumddi-firstboot at every boot + at
@@ -3058,8 +3058,21 @@ migrate step moves the schema forward, and the release you left cannot
 run on that schema afterwards. Alembic cannot migrate backwards from a
 revision it has never heard of. Its migrate Job fails with
 `Can't locate revision`, its api / worker / beat wait for migrate
-forever, and on a single node the newer release's api keeps serving
-behind the older UI. Nothing retries.
+forever, and nothing retries. Whether the newer release's api keeps
+serving meanwhile is decided by the chart of the release you go back
+TO:
+
+- **1.0.0-rc.1 and later** (#3780): at one replica, a rollback from a
+  newer release that is still serving rolls the api and the worker out
+  surge-first, so the newer release's pods keep serving behind the older
+  UI, and re-applying the newer release through the API works (below).
+  Beat stops either way: it can only be replaced, not surged.
+- **1.0.0-beta.1 to 1.0.0-beta.5** (#1659): on a single node the rollout
+  retires the newer release's only api and worker pods first, so the API
+  and the web UI answer `502` until the newer release is booted again
+  from the console (below). The Fleet UI cannot reach the node either.
+- **2026.10.02-1 and earlier**: the newer api keeps serving, as for
+  1.0.0-rc.1.
 
 **What is checked before you go back.** Every path that moves a
 control-plane node to an older release first compares the database's
@@ -3140,11 +3153,28 @@ logging `current=<written by a newer release, see above>`:
 kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
 ```
 
-Re-applying the newer release recovers it. Its migrate step finds
-nothing to do, and every workload rolls out:
+Booting the newer release again recovers it. Its migrate step finds
+nothing to do, and every workload rolls out. While the newer api still
+serves (see the list above), re-apply it through the API:
 `POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
-**Schedule OS upgrade** in the Fleet UI. The only other way out is to
-restore a pre-upgrade copy of the database by hand.
+**Schedule OS upgrade** in the Fleet UI.
+
+When the API answers `502` (a rollback onto a 1.0.0 beta on a single
+node), it cannot take that request, so boot the newer release from the
+console, or over SSH, as root. The inactive slot still holds it:
+
+```bash
+sudo spatium-upgrade-slot status          # the inactive slot holds the newer release
+sudo spatium-upgrade-slot set-next-boot   # re-copies its images, arms ONE boot of it
+sudo reboot
+```
+
+No api is needed: firstboot commits the slot as the durable default once
+k3s's `/readyz` answers and every baked image is in containerd, as for an
+upgrade (step 7 above), and the database is left as it is. If that boot
+fails, the next reboot falls back to the older slot, as any trial boot
+does. The only other way out is to restore a pre-upgrade copy of the
+database by hand.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 

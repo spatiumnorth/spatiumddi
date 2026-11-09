@@ -1,0 +1,3 @@
+### Fixed
+
+- On a single-node appliance, rolling back across a migration no longer leaves the appliance with no API: from this release, the control chart of the release you go back to rolls the api and worker out surge-first when a newer release is still serving, so the newer api keeps answering and re-applying it through the API or Fleet works again. A rollback onto a 1.0.0 beta still takes the API away; `docs/deployment/APPLIANCE.md` and the `schema_rollback_unsafe` refusal now name the console way back (`spatium-upgrade-slot set-next-boot`, then reboot), and the CLI section names `set-default`, the command that exists, instead of `commit` (#3780).

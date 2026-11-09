@@ -855,6 +855,40 @@ async def test_signed_zone_refused_on_a_group_that_cannot_sign(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["technitium", "technitium_api"])
+async def test_signed_zone_refused_into_a_technitium_group(
+    client: AsyncClient, db_session: AsyncSession, driver: str
+) -> None:
+    """#3806: consistent with the sign gate, a signed zone cannot be moved
+    into a group whose servers cannot keep it signed. Not waivable."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    await _server(db_session, src, "ns1")
+    db_session.add(
+        DNSServer(
+            group_id=dst.id,
+            name="tn1",
+            driver=driver,
+            host="tn1",
+            port=53,
+            roles=["authoritative"],
+            status="active",
+        )
+    )
+    await db_session.flush()
+    zone = await _zone(db_session, src, dnssec_enabled=True)
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["dnssec_unsupported_drivers"] == [driver]
+    resp = await _commit(client, token, zone, dst, acks=["dnssec_rollover"])
+    assert resp.status_code == 422
+    assert "cannot sign" in resp.json()["detail"]
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
 async def test_signed_zone_moves_to_a_signing_capable_group(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

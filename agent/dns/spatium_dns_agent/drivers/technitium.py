@@ -2544,13 +2544,6 @@ class TechnitiumDriver(DriverBase):
         # Written to its own file, and 0600: unlike zones.json this one
         # carries TSIG shared secrets.
         catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
-        if catalog and catalog.get("producer_tsig_key"):
-            catalog = {
-                **catalog,
-                "producer_tsig_key": _signing_key(
-                    catalog.get("producer_tsig_key"), "catalog consumer"
-                ),
-            }
         server_payload = {
             # Encrypted transports + forwarders (#741). Carried verbatim so
             # swap_and_reload can apply them without re-reading the bundle.
@@ -2877,10 +2870,11 @@ class TechnitiumDriver(DriverBase):
         **Producer** creates the ``Catalog`` zone and stamps
         ``catalog=<name>`` onto each primary this server owns.
 
-        **Consumer** creates a ``SecondaryCatalog`` zone pointed at the
-        producer. That zone is NOT in the bundle's zone list — the control
-        plane ships it as a catalog block, not as a zone row — so it has to
-        be created here or a consumer silently does nothing at all.
+        **Consumer** is not a role (#3764). Every agent in a group already
+        gets every zone in its bundle, so a ``SecondaryCatalog`` would only
+        duplicate zones this server holds as primaries. Only a control plane
+        older than #3764 sends ``mode="consumer"``; it is treated as catalog
+        off, which also deletes a ``SecondaryCatalog`` an earlier agent made.
 
         **Neither** (catalog turned off) clears membership. Without that,
         disabling catalog zones would leave every member permanently
@@ -2888,10 +2882,7 @@ class TechnitiumDriver(DriverBase):
 
         The catalog zone itself is also deleted whenever it stops
         being the desired one (issue #1519): catalog off, a renamed
-        catalog zone, or a producer↔consumer flip. A flip has to delete
-        first — creating the new role under the same name answers
-        "already exists", which the create path treats as success, so
-        the zone would silently keep its old type. The previously
+        catalog zone, or a role change. The previously
         applied role is read from agent state (``_CATALOG_STATE_FILE``)
         because a disabled catalog block carries no zone name at all.
         """
@@ -2900,27 +2891,12 @@ class TechnitiumDriver(DriverBase):
         mode = (catalog or {}).get("mode")
 
         if mode == "consumer":
-            producer = (catalog or {}).get("producer_addr")
-            if not (cat_name and producer):
-                log.warning(
-                    "technitium_catalog_consumer_incomplete",
-                    zone=cat_name or None,
-                    producer=producer,
-                )
-                self._note_apply_failure("catalog consumer: incomplete catalog block")
-                return
-            self._retire_stale_catalog_zone(token, cat_name, mode)
-            self._ensure_zone_exists(
-                token,
-                {
-                    "zone": cat_name,
-                    "type": "SecondaryCatalog",
-                    "masters": [str(producer)],
-                    "tsig_key": (catalog or {}).get("producer_tsig_key"),
-                },
+            log.warning(
+                "technitium_catalog_consumer_ignored",
+                zone=cat_name or None,
+                reason="agent group members get every zone in their bundle",
             )
-            self._save_catalog_state({"zone_name": cat_name, "mode": mode})
-            return
+            cat_name, mode = "", None
 
         desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
         self._retire_stale_catalog_zone(token, cat_name, mode)
