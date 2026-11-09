@@ -1102,6 +1102,11 @@ async def _dispatch_claimed(
                     )
                 )
         await s.commit()
+    if len(current) < len(ids):
+        kept_ids = {r.id for r in current}
+        await _retract_zone_removed_mid_dispatch(
+            bind, server, [r for r in rows if r.id not in kept_ids]
+        )
     if applied or failures:
         logger.info(
             "record_op_applied_agentless",
@@ -1111,6 +1116,76 @@ async def _dispatch_claimed(
             failed=len(failures),
         )
     return {r.id: r for r in current}
+
+
+async def _retract_zone_removed_mid_dispatch(
+    bind: Any, server: DNSServer, dropped: list[DNSRecordOp]
+) -> None:
+    """Re-send a permanent zone delete's removal to ``server`` when a dispatch
+    that was already in flight outlived it (#3688).
+
+    A record write claims its op row, then calls the provider with no lock. A
+    permanent zone delete that commits in between sweeps the claimed row and
+    pushes the zone's removal; the in-flight call then reaches the provider
+    AFTER it, re-creating the zone or leaving the record there, and its outcome
+    is dropped with the row. So for each dropped row's zone that no longer
+    exists in SpatiumDDI at all, the removal is sent again. A soft-deleted zone
+    still exists (only the permanent delete retracts it from a provider), and a
+    zone that is still there means the sweep merely reclaimed an expired lease,
+    so neither is touched. The zone delete is idempotent at the provider (an
+    absent zone reports unchanged), and no database session is open across the
+    calls. Best effort: a failure is logged, never raised.
+    """
+    names = sorted({r.zone_name for r in dropped})
+    if not names:
+        return
+    try:
+        async with AsyncSession(bind) as s:
+            present = set(
+                (
+                    await s.execute(
+                        select(DNSZone.name)
+                        .where(DNSZone.group_id == server.group_id, DNSZone.name.in_(names))
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
+
+        driver = get_driver(server.driver)
+        for name in names:
+            if name in present:
+                continue
+            # The leaked records, for a cloud provider that must empty a zone
+            # before deleting it.
+            managed = [
+                c.record
+                for r in dropped
+                if r.zone_name == name and (c := _change_from_op_row(r)) is not None
+            ]
+            zone = DNSZone(id=uuid.uuid4(), group_id=server.group_id, name=name)
+            if isinstance(driver, CloudDNSDriverBase):
+                changed = await driver.apply_zone_change(
+                    server, zone, "delete", managed_records=managed
+                )
+            else:
+                changed = await driver.apply_zone_change(server, zone, "delete")
+            logger.warning(
+                "agentless_dispatch_after_zone_delete_retracted",
+                server=str(server.id),
+                driver=server.driver,
+                zone=name,
+                changed=changed is not False,
+            )
+    except Exception as exc:  # noqa: BLE001 — the dispatch itself already finished
+        logger.warning(
+            "agentless_dispatch_after_zone_delete_retract_failed",
+            server=str(server.id),
+            driver=server.driver,
+            error=str(exc),
+        )
 
 
 # #1932 — a zone SpatiumDDI auto-creates (a subnet's reverse zone, from IPAM
