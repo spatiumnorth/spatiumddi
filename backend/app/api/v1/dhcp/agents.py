@@ -1385,7 +1385,7 @@ async def agent_lease_events(
         _load_subnet_cache,
         _load_trashed_scope_nets,
     )
-    from app.services.dns.ddns import ddns_lease_writes_nothing
+    from app.services.dns.ddns import DDNSReadCache, ddns_lease_writes_nothing
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
@@ -1827,6 +1827,7 @@ async def agent_lease_events(
                 ipam_row=row,
                 client_hostname=ev.hostname,
                 row_hostname=_lease_row_hostname(row, ev),
+                cache=ddns_reads,
             )
         except Exception as exc:  # noqa: BLE001
             _reraise_if_database_gone(exc)
@@ -1838,6 +1839,13 @@ async def agent_lease_events(
             )
             return False
 
+    # #3776 — the checks below write nothing between them, so the reads they
+    # share (each address's generated records, each subnet's reverse zones)
+    # are made once for the batch, not once per lease.
+    ddns_reads = DDNSReadCache()
+    await ddns_reads.prefetch_generated(
+        db, [row.id for row in ipam_by_key.values() if row.auto_from_lease]
+    )
     publishing: list[tuple[Any, IPAddress]] = []
     retracting: list[IPAddress] = []
     for idx, ev in enumerate(events):

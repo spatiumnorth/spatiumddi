@@ -1068,7 +1068,7 @@ The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle l
 
 ### Idempotency
 
-DDNS is safe to call repeatedly. If the resolved hostname matches what's already on the `IPAddress` row and there's already a linked auto-generated DNS record, no ops are enqueued. The agentless lease-pull loop hits this path every poll; post-steady-state it's effectively a no-op.
+DDNS is safe to call repeatedly. If the resolved hostname matches what's already on the `IPAddress` row, the linked forward record carries it, the PTR exists in the address's reverse zone, and the DDNS-generated records carry the effective `ddns_ttl`, no ops are enqueued and no zone is locked. Otherwise the renewal repairs what drifted (#3776): a deleted PTR is republished and a changed `ddns_ttl` is applied as an update. A TTL hand-edited on a DDNS-generated record is therefore reset to the effective `ddns_ttl` at the next renewal; to pin one, change `ddns_ttl` on the subnet, block or space, or replace the record with a manual one. The agentless lease-pull loop hits this path every poll; post-steady-state it's effectively a no-op.
 
 ### Security
 
