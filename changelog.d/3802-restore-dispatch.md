@@ -1,0 +1,1 @@
+- A Trash restore queues its DDNS republish task through the async dispatch helper, so a slow message broker can't stall the API's event loop (#3802).
