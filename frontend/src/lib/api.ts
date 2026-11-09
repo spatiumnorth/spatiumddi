@@ -5286,9 +5286,9 @@ export interface DNSServerGroup {
   group_type: string;
   default_view: string | null;
   is_recursive: boolean;
-  // RFC 9432 BIND9 catalog zones — distribute zones via one catalog
-  // instead of per-server config push. Producer is the group's primary
-  // bind9 server; consumers auto-pull members.
+  // RFC 9432 BIND9 catalog zones — the group's primary publishes a
+  // catalog for secondaries outside the group; members never consume it
+  // (#3764).
   catalog_zones_enabled: boolean;
   catalog_zone_name: string;
   // Issue #25 — flag this group as exposed to the public internet.
