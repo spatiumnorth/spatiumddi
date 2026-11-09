@@ -288,8 +288,9 @@ class DDNSReadCache:
     reverse-zone candidates) or that can be made for every row at once (the
     records DDNS generated for each address) are made once per batch instead
     of once per lease. Valid only while nothing is written: the batch builds
-    one for its read-only pass and drops it before the DDNS step runs, which
-    reads fresh state through the same predicate without a cache.
+    one for each read-only pass (the #3789 pre-lock read, then the check
+    under its row locks) and drops it before the DDNS step runs, which reads
+    fresh state through the same predicate without a cache.
     """
 
     __slots__ = ("generated", "reverse")
