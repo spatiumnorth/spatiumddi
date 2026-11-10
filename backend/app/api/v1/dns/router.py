@@ -9139,13 +9139,26 @@ async def _queued_delete_changes(db: DB, zone: DNSZone, group_id: uuid.UUID) -> 
         .scalars()
         .all()
     )
-    out: dict[tuple[str, str, str], Any] = {}
+    out: dict[tuple[Any, ...], Any] = {}
     for row in rows:
         change = _change_from_op_row(row)
         if change is not None:
             r = change.record
-            out[(r.name, r.record_type.upper(), r.value)] = change
+            out[_record_identity(r.name, r.record_type, r.value, r.priority, r.weight, r.port)] = (
+                change
+            )
     return list(out.values())
+
+
+def _record_identity(
+    name: str, rtype: str, value: str, priority: Any, weight: Any, port: Any
+) -> tuple[Any, ...]:
+    """The fields that tell one RR from another (#3805). ``priority`` /
+    ``weight`` / ``port`` are part of it: ``MX 10 mail`` and ``MX 20 mail``
+    share a value and are two records, so a key without them would collapse
+    two queued deletes into one, or skip a delete because its sibling is live.
+    """
+    return (name, rtype.upper(), value, priority, weight, port)
 
 
 async def _push_moved_zone_records(
@@ -9212,11 +9225,10 @@ async def _push_moved_zone_records(
         .scalars()
         .all()
     }
-    live_keys: set[tuple[str, str, str]] = set()
     stale = list(queued_deletes or [])
     if stale and adopted_names:
         live_keys = {
-            (r.name, r.record_type.upper(), r.value)
+            _record_identity(r.name, r.record_type, r.value, r.priority, r.weight, r.port)
             for r in (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
             .scalars()
             .all()
@@ -9224,8 +9236,17 @@ async def _push_moved_zone_records(
         stale = [
             c
             for c in stale
-            if (c.record.name, c.record.record_type.upper(), c.record.value) not in live_keys
+            if _record_identity(
+                c.record.name,
+                c.record.record_type,
+                c.record.value,
+                c.record.priority,
+                c.record.weight,
+                c.record.port,
+            )
+            not in live_keys
         ]
+    deletes_applied_on: list[str] = []
     failures: list[str] = []
     for server in servers:
         driver = get_driver(server.driver)
@@ -9242,6 +9263,8 @@ async def _push_moved_zone_records(
                     for res in results
                     if not res.ok
                 ]
+                if any(res.ok for res in results):
+                    deletes_applied_on.append(server.name)
             restored = await restore_zone_records_to_server(db, server, driver, zone)
             problems += list(restored.push_errors)
             if restored.pushed < restored.candidates and not problems:
@@ -9296,6 +9319,11 @@ async def _push_moved_zone_records(
             f" Left as found on: {', '.join(sorted(adopted_names))} "
             "(those servers already held the zone)."
         )
+        if deletes_applied_on:
+            detail += (
+                " Except that the record deletes still queued for this zone, for records "
+                f"SpatiumDDI no longer holds, were applied on: {', '.join(deletes_applied_on)}."
+            )
     if left:
         detail += (
             f" Removing the zone created for the move failed on: {'; '.join(left)} — "

@@ -221,6 +221,69 @@ async def test_undeliverable_queued_delete_fails_the_move(
     assert key in prov.zones  # the adopted copy is left as found
 
 
+def _mx_delete_op(server_id: Any, zone: DNSZone, priority: int) -> DNSRecordOp:
+    return DNSRecordOp(
+        server_id=server_id,
+        zone_name=zone.name,
+        zone_id=zone.id,
+        op="delete",
+        record={"name": "@", "type": "MX", "value": "mail.example.", "priority": priority},
+        state="pending",
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_deletes_differing_only_in_priority_are_both_applied(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    """``MX 10 mail`` and ``MX 20 mail`` share a value and are two records: a
+    key of name + type + value collapsed their two queued deletes into one."""
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    src_srv = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == zone.group_id))
+    ).scalar_one()
+    db_session.add_all([_mx_delete_op(src_srv.id, zone, 10), _mx_delete_op(src_srv.id, zone, 20)])
+    await db_session.flush()
+    prov.zones.add(("route53:key:AKIA-ONE", zone.name))
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    assert len(prov.deletes) == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_delete_is_not_skipped_for_a_live_sibling_of_another_priority(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    """``MX 20 mail`` live does not mean the deleted ``MX 10 mail`` is."""
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    src_srv = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == zone.group_id))
+    ).scalar_one()
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="@",
+            fqdn=zone.name,
+            record_type="MX",
+            value="mail.example.",
+            priority=20,
+            ttl=300,
+        )
+    )
+    db_session.add(_mx_delete_op(src_srv.id, zone, 10))
+    await db_session.flush()
+    prov.zones.add(("route53:key:AKIA-ONE", zone.name))
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    assert [d[1:] for d in prov.deletes] == [("@", "MX", "mail.example.")]
+
+
 @pytest.mark.asyncio
 async def test_failed_record_push_is_not_a_clean_move(
     client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
