@@ -9,6 +9,7 @@ down, is described in [`GOVERNANCE.md`](GOVERNANCE.md).
 | GitHub | Organisation | Areas |
 |---|---|---|
 | [@mzac](https://github.com/mzac) | Spatium North | Project lead; all areas |
+| [@amoona6](https://github.com/amoona6) | Spatium North | All areas |
 
 ## Emeritus maintainers
 
