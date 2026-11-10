@@ -20,7 +20,7 @@ spec:
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
-  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas) | nindent 2 }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas "root" $ "deployment" (printf "%s-api" (include "spatiumddi.fullname" .)) "container" "api") | nindent 2 }}
   template:
     metadata:
       labels:

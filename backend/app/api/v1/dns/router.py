@@ -12085,11 +12085,12 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
     if not drivers:
         return
     incompatible = drivers - allowed
-    if op == "dnssec_sign" and incompatible & dnssec_signers.UNMANAGED_SIGNING_DRIVERS:
+    if op == "dnssec_sign" and incompatible & dnssec_signers.SIGN_REFUSED_TECHNITIUM_DRIVERS:
         raise HTTPException(
             status_code=422,
             detail=(
-                "DNSSEC signing is not supported on Technitium servers: "
+                "DNSSEC signing is not supported on Technitium servers "
+                "(agent-managed or agentless API) in 1.0: "
                 "SpatiumDDI cannot keep a Technitium zone signed (it is signed "
                 "once and never re-signed on a new server, a re-created zone "
                 "or a lost volume, and the zone's DNSSEC policy is ignored). "

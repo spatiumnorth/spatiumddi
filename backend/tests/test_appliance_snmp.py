@@ -538,3 +538,51 @@ def test_settings_validator_still_trims_and_accepts_normal_names() -> None:
     from app.api.v1.settings.router import SNMPV3UserUpdate
 
     assert SNMPV3UserUpdate(username="  monitoring-ro_1  ").username == "monitoring-ro_1"
+
+
+# ── #2153: the firewall source scope rides the body, so the hash covers it ──
+
+
+def _scoped(sources: list[str], version: str = "v2c") -> PlatformSettings:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = version
+    s.snmp_community_encrypted = encrypt_str("s3cret")
+    s.snmp_v3_users = []
+    s.snmp_allowed_sources = sources
+    return s
+
+
+def test_sources_marker_is_rendered_for_v2c_and_v3() -> None:
+    for version in ("v2c", "v3"):
+        text = render_snmpd_conf(_scoped(["10.0.0.0/8", "fd00::/8"], version))
+        assert "# spatium-snmp-sources: 10.0.0.0/8,fd00::/8\n" in text
+    assert "# spatium-snmp-sources:\n" in render_snmpd_conf(_scoped([]))
+
+
+def test_config_hash_changes_when_only_the_source_list_changes() -> None:
+    a = snmp_bundle(_scoped(["10.0.0.0/8"], "v3"))
+    b = snmp_bundle(_scoped(["10.0.0.0/8", "192.0.2.0/24"], "v3"))
+    assert a["config_hash"] != b["config_hash"]
+
+
+def test_unparseable_stored_source_is_published_as_invalid_not_dropped() -> None:
+    text = render_snmpd_conf(_scoped(["10.0.0.0/8", "garbage"]))
+    assert "# spatium-snmp-sources: !invalid\n" in text
+
+
+def test_v3_comment_no_longer_claims_sources_are_ignored() -> None:
+    s = _scoped(["10.0.0.0/8"], "v3")
+    s.snmp_v3_users = [
+        {
+            "username": "noauth_user",
+            "auth_protocol": "none",
+            "auth_pass_enc": None,
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+    text = render_snmpd_conf(s)
+    assert "rouser noauth_user" in text  # the note is only emitted with users
+    assert "ignores snmp_allowed_sources" not in text
+    assert "enforced by the host firewall" in text
