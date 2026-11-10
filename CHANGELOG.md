@@ -25,6 +25,149 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 1.0.0-rc.1 — 2026-11-10
+
+**The first 1.0.0 release candidate, and the code freeze for 1.0.0.**
+31 commits since 1.0.0-beta.5, all of them fixes, most found by the
+QA proving ground and the beta installs. From here to 1.0.0 only fixes
+for P0 and P1 issues land. A further rc.N follows until a clean soak.
+**Wrong-answer and data fixes:** moving a DNS zone between server
+groups that reach the same agentless provider no longer deletes the
+zone there, a move to a different provider carries the zone's records
+instead of only SOA and NS, a same-provider Technitium move that holds
+records now commits, and a record delete still queued at the move is
+applied to the adopted copy (#3805, #3815); DNSSEC signing is refused
+on both Technitium drivers instead of leaving a zone unsigned while
+the UI shows it signed (#3806); DNS catalog zones are producer-only
+inside a group, so a member no longer loads every zone twice and has
+its next reload refused (#3764); zone drift and Sync with Servers skip
+forward and stub zones instead of reporting a failed pull (#3758);
+a lease renewal now republishes a deleted PTR and applies a changed
+DDNS TTL (#3776); a Trash restore of a subnet, block, space or scope
+republishes the A and PTR records of the leases that come back
+(#3787); and a refused request no longer queues a webhook event
+(#3754). **Deadlocks and slow deletes:** deleting a DHCP scope, subnet,
+block, space or server group no longer holds every lease row until it
+commits, so it stops answering 503 or 504 while a Kea HA pair reports
+renewals (#3733, #3744, #3748, #3772); a Kea HA pair's second member
+no longer waits on the first's lease batch or on the zone row
+(#3773, #3789); and the IPAM to DNS auto-sync, a resize with Move
+gateway, and a late record write to a deleted zone no longer deadlock
+with a permanent zone delete (#3723, #3724, #3688). **Also:** a scope
+change on a Kea HA group resets the pair for about 4 s instead of
+about 21 s (#3779); the appliance SNMP port accepts only the allowed
+sources, v3 included (#2153); a single-node rollback across a
+migration keeps the newer api answering (#3780); edit surfaces read
+the object when they open instead of putting back another admin's
+change (#3739, #3737); the Helm chart's DNS agents register a host
+the API can resolve (#3757); and `python-jose` is replaced by
+`joserfc` (#3725).
+
+**Before you upgrade:** this release adds 1 database migration
+(listed under Migrations): it moves DHCP server groups still at the
+old 10 s HA heartbeat to 2 s, and the downgrade leaves the values as
+they are. Take a database backup first. **SNMP:** with an "Allowed
+source CIDRs" list set, UDP 161 now accepts only those sources; an
+empty list still leaves the port open to any source (#2153).
+**Helm:** DNS agents get a new `SERVER_HOST`, the pod's headless
+Service name (#3757). **Tokens:** issued tokens stay valid across the
+`joserfc` switch (#3725).
+
+### Fixed
+
+- DNSSEC signing is refused with a clear 422 on both Technitium drivers (agent-managed and agentless API), and the zone's DNSSEC card disables Sign for them, because signing there is one-shot and a zone would come back unsigned while SpatiumDDI showed it signed (#3806). Already-signed zones are untouched. The DNS docs now say Technitium DNSSEC is unsupported in 1.0, and the Technitium console notes describe that it listens on every interface at `:5380` (with a firewall recommendation for host-network standalone compose) instead of loopback.
+
+- Moving a DNS zone between two server groups whose agentless servers (Technitium API, Windows DNS, Route 53, Cloudflare, Azure DNS, Google Cloud DNS) reach the same provider no longer deletes the zone at that provider. The source-group delete now skips any server of the same driver that shares a provider with a target server, whose provider cannot be identified, or whose target counterpart already held the zone when the move created it there (two keys on one cloud account, an IP and a hostname for one Technitium, two domain controllers replicating one AD-integrated zone). The move preview and the move response list each source copy kept, and the audit entry records them.
+- Moving a DNS zone to a group on a different agentless provider (Route 53, Cloudflare, Windows DNS and the like) now writes the zone's saved records to the new provider, not just SOA and NS, so the records no longer answer NXDOMAIN after the move. A record write still waiting for its retry at move time is delivered too, including when both groups reach the same provider, because the zone's current rows are pushed (only what the target copy lacks is sent); a queued delete does not bring its record back. A failed record write is reported as a 502 instead of a clean move, and the zone the move created on the target provider is removed again so a retry starts clean; a copy the target already held is never removed. Record types the target provider cannot serve are listed in the move's warnings (#3815).
+- A same-provider move of a Technitium zone that holds records (two groups whose servers point at one Technitium) now commits. The target's create finds the zone the source group already serves, and the records in it are SpatiumDDI's own, so the adoption guard no longer refuses them; a zone on a different or unidentifiable Technitium, and a plain zone create onto a non-empty zone, are still refused. The guard's 409 message no longer ends in a doubled period, and a kept-copy note no longer reads "so ... so".
+- Moving a zone to a group on the same provider no longer leaves a deleted record live there: a record delete still queued for retry against the source group when the zone moves is now applied to the adopted provider copy (skipped if the record is live again), and a delete that cannot be delivered fails the move instead of being dropped.
+
+- A Trash restore queues its DDNS republish task through the async dispatch helper, so a slow message broker can't stall the API's event loop (#3802).
+
+- On a Kea HA pair, the second member's report of a renewal that changes nothing no longer waits for the first member's whole lease batch on the shared IPAM address rows, and on a first acquisition the second member no longer waits on the first's uncommitted insert of the same address (which could hit the 30 s timeout and answer 503); the member already writing the row is left to finish it (#3789).
+
+- Restoring a subnet, block, space or DHCP scope from the Trash now re-publishes the A and PTR records of the active DHCP lease mirrors that come back with it (when the subnet's DDNS is on), instead of leaving them without names until each client renews (#3787).
+
+- On a single-node appliance, rolling back across a migration no longer leaves the appliance with no API: from this release, the control chart of the release you go back to rolls the api and worker out surge-first when a newer release is still serving, so the newer api keeps answering and re-applying it through the API or Fleet works again. A rollback onto a 1.0.0 beta still takes the API away; `docs/deployment/APPLIANCE.md` and the `schema_rollback_unsafe` refusal now name the console way back (`spatium-upgrade-slot set-next-boot`, then reboot), and the CLI section names `set-default`, the command that exists, instead of `commit` (#3780).
+
+- **A scope change on a Kea HA group resets the HA pair for less time
+  (#3779).** The DHCP agent now reloads only the Kea daemon whose
+  configuration changed, so a v6-only change leaves dhcp4 and its HA
+  state alone. The HA heartbeat delay defaults to 2 s instead of 10 s,
+  which cuts the hot-standby outage of a reload from about 21 s to about
+  4 s; existing groups still at 10 s move to 2 s on upgrade, and any
+  other value is kept.
+
+- Restoring a DHCP scope, or the subnet, block or space holding it, from the Trash while its leases are being torn down now waits for the teardown batch in flight (at most 25 leases) and answers only once the teardown has stopped; no lease goes after the restore answers (#3777).
+
+- DHCP dynamic DNS: a lease renewal with an unchanged hostname now republishes a deleted PTR record and applies a changed DDNS TTL (subnet, block or space `ddns_ttl`) to the existing A/AAAA and PTR records, and a renamed lease is published with the current TTL instead of the old one. The TTL is only rewritten on records DDNS generated, so a TTL hand-edited on such a record is reset to the effective `ddns_ttl` at the next renewal; to pin one, change `ddns_ttl` on the subnet, block or space, or replace the record with a manual one, which keeps its TTL. An unchanged renewal still writes nothing and takes no zone lock (#3776).
+
+- A DHCP lease renewal whose DNS name is already published and unchanged no longer locks its DNS zones while its lease-events batch runs. On a Kea HA pair both members report every renewal, and their batches used to queue behind each other on the zone row until, at load, they ran past the agent's 15 s request timeout and were sent again (#3773).
+- The DHCP agent now waits up to 60 s, rather than 15 s, for the control plane to answer a lease-events batch or lease snapshot page before sending it again. Connection attempts still give up after 5 s (#3773).
+
+- Scope, subnet, block, space and server-group deletes spend at most 10 s (was 20 s) tearing down leases inside the request and hand the rest to the background task, so they no longer answer in 23 to 30 s, close to the 30 s statement limit (#3772).
+
+- DNS catalog zones are now producer-only inside a server group. Each agent in a group already receives every zone in its own config, so a member that also consumed the catalog loaded every zone twice: BIND refused the next reload with "zone already exists", the revert failed the same way, and zones added afterwards were not served. Group members other than the primary no longer get a consumer catalog; the primary still publishes the catalog zone for BIND secondaries outside the group, which consume it with `catalog-zones` pointed at the primary's address and sign member transfers with the group's TSIG key. A BIND9 or Technitium agent that still receives a consumer block from an older control plane ignores it and logs a warning. An existing `catalog_zones_enabled` setting is kept and needs no change (#3764).
+
+- With the Address sets module off, the subnet view no longer shows the Address Sets tab or asks for the (404ing) address-set list, and address-set grants no longer widen allocation write access on the IPAM routes (#3762).
+
+- DNS zone drift, Sync with Servers and the scheduled pull no longer attempt a zone transfer of forward and stub zones, which a server does not hold authoritatively. Drift reports them as "Not applicable" with a reason instead of a failed pull (NOTAUTH), and the group-level sync and scheduled pull skip them.
+
+- DNS agents deployed by the Helm chart (and `k8s/dns/`) now register a host the API can resolve, so zone drift and pull-from-server work on them. The chart passes the agent a new `SERVER_HOST` (the pod's headless-Service FQDN), which registration stores as the server's host and refreshes on re-registration unless an operator has edited it. An agent already registered under an older chart registers once more when it restarts with a new `SERVER_HOST`, and keeps retrying for up to an hour if it reached an api pod of the previous release mid-rollout, so `helm upgrade` heals the existing server row; the name stays the pod name. As a backstop, an agent-managed server whose host does not resolve is read at its last-seen address, with or without a DNS VIP (#3757).
+
+- A request that is refused (a permission gate, an in-handler refusal, or a sign-in that does not succeed) no longer queues a typed webhook event: only audit rows recording an action that happened are published, so a refused subnet delete no longer delivers `subnet.deleted` and a wrong password no longer delivers `auth.user.login`.
+
+- Deleting a DHCP scope, or a subnet, block or space that holds DHCP scopes, no longer answers 503 while both members of a Kea HA pair report lease renewals for those scopes. The delete used to wait behind an endless line of overlapping lease batches; it now waits only for the batches already running, and later ones queue behind it and find the scope in the Trash (#3748).
+
+- A DHCP scope delete now wakes its Kea servers as soon as the scope is in the Trash, instead of after the lease teardown, and a lease teardown batch that fails after the delete has committed no longer answers 500: the rest is handed to the background teardown task and the delete answers as it succeeded (#3748).
+
+- Deleting a subnet, block, space or DHCP server group no longer holds every lease row of its scopes until it commits. The delete now puts them in the Trash and commits first, then tears the leases down in committed batches (as the scope delete does since #3733), so lease-events batches renewing them keep answering and the DELETE no longer runs into the proxy timeout. A lease grant in flight when the subnet, block or space is deleted no longer leaves a lease, an IPAM address and a DNS record behind in the Trash. A server group delete whose scopes in the Trash still hold more leases than it can tear down in 20 s now answers 409 with `Retry-After` and finishes the teardown in the background, instead of holding them in its own transaction (#3744).
+
+- The DNS group Options tab, Edit DHCP Server, Edit Blocked Domain, Edit Exception and the IPAM Imported chip's dismiss no longer put back a change another admin made since the page loaded. They read the object when they open (the Options tab also re-fills on Refresh) and a Save sends only what you changed (#3739).
+
+- DNS server group, Blocking Lists tab: Apply, Detach, the bulk Apply / Detach and Save scope no longer overwrite a list's assignments with the tab's possibly stale copy, so a group or view another operator attached in the meantime keeps the list. They now send add / remove changes for this group only, which the server applies under a row lock; `PUT /api/v1/dns/blocklists/{id}/assignments` gains `add_*` / `remove_*` fields for this, refuses a full set mixed with changes for the same relationship with 422, and treats an empty body as a no-op (#3737).
+
+- The supervisor's `housekeeping_done` log line is written for every heartbeat housekeeping job that outlived its wait, and before a shutdown drain returns. It used to be decided by comparing the job's own run time with the wait, so a job that ended just after the heartbeat stopped waiting could go unlogged, and the line could be written after the drain had already returned. ([#3735](https://github.com/spatiumnorth/spatiumddi/issues/3735))
+
+- **Deleting a DHCP scope no longer holds up its leases' lease events
+  (#3733).** The delete tore the scope's leases down inside its own
+  transaction, which locks every lease row of the scope first, then
+  purges them one by one, revoking each lease's DDNS records: about
+  100 ms a lease. Every lease-events batch renewing one of those leases
+  waited for the whole delete, so with about 1,000 leases the API
+  refused those batches with a 503 at its 30 s statement timeout, and
+  the delete answered 504 at the proxy's 60 s while it went on to
+  commit. The scope now goes to the Trash first, and its leases are torn
+  down after, in batches that each commit, for up to 20 s in the
+  request (the server delete's bound) and in a background task after
+  that. Ten minutes after the delete, the lease sweep finishes any
+  scope in the Trash whose task was lost or that one task run did not
+  finish.
+- **A lease-events batch no longer writes leases back into a deleted
+  scope (#3733).** The agent resends the batches the API refused while
+  a scope delete ran, and those, or a batch that read the scope before
+  the delete committed, inserted the deleted leases again, with their
+  IPAM mirrors and live DDNS records, since the subnet itself stays
+  live. Events for an address of a scope in the Trash are now
+  acknowledged and not written.
+
+- Replaced the unmaintained `python-jose` (and its `ecdsa` / `rsa` dependencies) with `joserfc` for every JWT the control plane signs and verifies (access, agent and SSO flow tokens). Tokens issued before the upgrade stay valid byte-for-byte, so nobody is logged out and no agent re-bootstraps. (#3725)
+
+- The IPAM to DNS auto-sync and the Sync DNS commit (subnet, block and space) no longer deadlock with a permanent DNS zone delete: they now lock the address rows they will write (ascending id) before any zone. The auto-sync also commits each subnet in batches of 100 addresses, so a zone delete waits for one batch rather than a whole large subnet, and a batch that fails is rolled back alone (and named in the run's errors, with the first line of its error only) instead of failing the whole run. Each batch takes a per-zone advisory gate before its rows, shared, and a permanent zone delete takes it exclusive, so the delete is never overtaken by the next batch and waits for one batch at most. A batch that waited for a zone delete no longer counts re-applies it did not write (#3724).
+
+- Resize with "Move gateway" now retracts the old gateway placeholder's PTR, as Edit Subnet's gateway move does, instead of leaving it served from the reverse zone (#3723).
+- Resize and Edit Subnet's gateway move lock the old gateway row before the DNS zones they retract its PTR from, so a move running alongside a permanent delete of that reverse zone no longer deadlocks and answers 500 (#3723).
+
+- A record write to a Windows DNS or cloud-DNS zone whose provider call was still in flight when the zone was permanently deleted could reach the provider after the zone's removal, with no retry. The dispatch now re-sends the zone removal to that server, but only when the zone it was queued for no longer exists at all, the server is still in that zone's group, and no zone of that name is in the group now. A zone move, a server move, a soft delete or a re-created zone never triggers it (#3688).
+
+- Appliance SNMP: the UDP 161 firewall rule is now limited to the "Allowed source CIDRs" list, for v2c and v3 alike, instead of accepting every source whenever SNMP is on. An empty list still leaves the port open to any source (the Settings text now says so), and a malformed entry refuses the apply rather than opening the port. (#2153)
+
+### Migrations
+
+- `ede3bcd2aff4` — #3779, sets `dhcp_server_group.heartbeat_delay_ms`
+  to 2000 on rows still at the old 10000 default. The downgrade leaves
+  the values as they are.
+
 ## 1.0.0-beta.5 — 2026-11-07
 
 **The fifth 1.0.0 beta, and the feature freeze for 1.0.0.** 104
