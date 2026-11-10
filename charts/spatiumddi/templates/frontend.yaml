@@ -1,4 +1,7 @@
 {{- $cmp := "frontend" -}}
+{{- if and (include "spatiumddi.isOpenShift" .) .Values.frontend.tls.enabled -}}
+{{- fail "frontend.tls.enabled is the appliance's :80/:443 nginx and needs to bind privileged ports, which OpenShift's restricted SCC refuses. On OpenShift leave it off and let the Route terminate TLS (openshift.route)." -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -77,7 +80,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 80
+              containerPort: {{ include "spatiumddi.frontendHttpPort" . }}
               {{- if .Values.frontend.hostNetwork }}
               hostPort: 80
               {{- end }}
@@ -122,6 +125,12 @@ spec:
               value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api.%s.svc.cluster.local" (include "spatiumddi.fullname" .) .Release.Namespace) | quote }}
             - name: API_UPSTREAM_PORT
               value: {{ .Values.frontend.apiUpstream.port | default .Values.api.service.port | quote }}
+            {{- if include "spatiumddi.isOpenShift" . }}
+            # #3852 — a random unprivileged uid cannot bind :80. The Service
+            # keeps its port and reaches this one through the port name.
+            - name: FRONTEND_HTTP_PORT
+              value: {{ include "spatiumddi.frontendHttpPort" . | quote }}
+            {{- end }}
             {{- with .Values.frontend.nginxLocalResolvers }}
             # Explicit DNS resolver override. Leave unset to let the
             # image's 15-local-resolvers.envsh auto-detect from

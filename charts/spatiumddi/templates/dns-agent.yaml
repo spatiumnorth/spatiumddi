@@ -32,6 +32,14 @@ stringData:
 {{- if and (eq $flavor "powerdns") (or $server.dotPort $server.dohPort) }}
 {{- fail (printf "dnsAgents server %q: dotPort/dohPort are not supported with flavor: powerdns — PowerDNS needs a dnsdist front for DoT/DoH, which has no Kubernetes deployment yet; remove dotPort/dohPort" $server.name) }}
 {{- end }}
+{{- /* #3852 — on OpenShift the BIND9 image is the one that runs as an arbitrary
+       uid in group 0 (its entrypoint skips chown + su-exec when not root, and
+       named keeps CAP_NET_BIND_SERVICE as a file capability). PowerDNS and
+       Technitium do not yet: their entrypoints still chown and drop, which a
+       random uid cannot do. Refuse rather than render pods that crash-loop. */ -}}
+{{- if and (include "spatiumddi.isOpenShift" $root) (ne $flavor "bind9") }}
+{{- fail (printf "dnsAgents server %q: flavor %s does not yet run under OpenShift's restricted SCC (only bind9 does, #3852) — use flavor: bind9, or set global.platform=kubernetes if you have granted a permissive SCC yourself" $server.name $flavor) }}
+{{- end }}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
 {{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
@@ -90,6 +98,9 @@ spec:
         seccompProfile:
           type: {{ . }}
       {{- end }}
+      {{- if include "spatiumddi.isOpenShift" $root }}
+      serviceAccountName: {{ include "spatiumddi.fullname" $root }}-dns-agent
+      {{- end }}
       {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
       {{- /* Per-server placement. The spread above is only preferred, so
              after a node drain an agent moves and stays co-located; pin a
@@ -112,6 +123,18 @@ spec:
         - name: dns
           image: "{{ $repo }}:{{ $imgTag }}"
           imagePullPolicy: {{ $root.Values.dnsAgents.image.pullPolicy }}
+          {{- if include "spatiumddi.isOpenShift" $root }}
+          # #3852 — no runAsUser: the SCC assigns one. ``named`` binds :53
+          # through a file capability, which only works when the capability is
+          # in the bounding set, so it is added explicitly (CRI-O's default set
+          # differs from containerd's; do not rely on either). Allowed by the
+          # agents' SCC (openshift-scc.yaml).
+          securityContext:
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+          {{- end }}
           env:
             - name: CONTROL_PLANE_URL
               # Trailing dot on the Service name: the pod inherits the node's

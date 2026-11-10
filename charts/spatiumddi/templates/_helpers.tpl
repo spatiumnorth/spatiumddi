@@ -1121,3 +1121,146 @@ render that changes nothing.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+#3852 — are we installing onto OpenShift?
+
+``global.platform`` is ``auto`` (the default), ``kubernetes`` or ``openshift``.
+``auto`` asks the cluster: OpenShift serves ``security.openshift.io/v1``
+(SecurityContextConstraints), which no other distribution does. Without a
+cluster — ``helm template``, Argo CD, a CI render — nothing answers, so those
+pass ``--api-versions security.openshift.io/v1`` or set the value outright.
+
+Renders ``true`` or nothing, so call sites read
+``{{ if include "spatiumddi.isOpenShift" . }}``. Pass the ROOT context (``$``
+inside a ``range``).
+
+Everything OpenShift-specific hangs off this one answer, and every branch it
+opens is additive or removes a pinned uid / gid / fsGroup: with it false the
+render is byte-identical to a chart that never heard of OpenShift.
+*/}}
+{{- define "spatiumddi.isOpenShift" -}}
+{{- $p := default "auto" (.Values.global).platform -}}
+{{- if not (has $p (list "auto" "kubernetes" "openshift")) -}}
+{{- fail (printf "global.platform=%q is not valid: use auto, kubernetes or openshift" $p) -}}
+{{- end -}}
+{{- if or (eq $p "openshift") (and (eq $p "auto") (.Capabilities.APIVersions.Has "security.openshift.io/v1")) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — the port the frontend's nginx listens on. :80 everywhere except
+OpenShift, where the pod runs as a random unprivileged uid and cannot bind it.
+The Service keeps its own port and reaches this one by the container port's
+name (``http``), so nothing else has to know.
+*/}}
+{{- define "spatiumddi.frontendHttpPort" -}}
+{{- if include "spatiumddi.isOpenShift" . -}}8080{{- else -}}80{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — one SecurityContextConstraints + the Role / RoleBinding that lets a
+fixed set of ServiceAccounts ``use`` it, and nobody else.
+
+Args: ``root``, ``name`` (the SCC's name; also the Role / RoleBinding's),
+``component``, ``serviceAccounts`` (list of names), ``capabilities`` (list),
+``hostNetwork`` (bool), ``why`` (text, rendered as the SCC's description
+annotation).
+
+It is the ``restricted-v2`` SCC with exactly three differences, each of which
+the workload needs and cannot get from any built-in SCC:
+
+  * ``allowedCapabilities`` — the file capabilities on the daemon binaries
+    (``named``, ``kea-dhcp4`` ...) only work when the capability is in the
+    container's bounding set, so the pod has to be allowed to add it.
+  * ``allowPrivilegeEscalation: true`` — the kernel ignores file capabilities
+    for a process with ``no_new_privs`` set, and ``restricted-v2``'s ``false``
+    sets it. The pod does not escalate to root: it stays a non-root uid.
+  * ``allowHostNetwork`` / ``allowHostPorts`` — only when a server asks for
+    ``hostNetwork: true``.
+
+Everything else is kept at ``restricted-v2``'s values: a uid from the
+namespace's range, an SELinux level from the namespace, an fsGroup from its
+range, ``runtime/default`` seccomp, no privileged containers, and the
+volume types the workload uses. ``anyuid`` is NOT a substitute: it has no
+``seccompProfiles``, so it rejects every pod this chart gives a seccomp
+profile.
+*/}}
+{{- define "spatiumddi.openshiftScc" -}}
+{{- $root := .root -}}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+  annotations:
+    kubernetes.io/description: {{ .why | quote }}
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: {{ .hostNetwork | default false }}
+allowHostPID: false
+allowHostPorts: {{ .hostNetwork | default false }}
+allowPrivilegeEscalation: true
+allowPrivilegedContainer: false
+allowedCapabilities:
+  {{- range .capabilities }}
+  - {{ . }}
+  {{- end }}
+defaultAddCapabilities: null
+requiredDropCapabilities:
+  - ALL
+readOnlyRootFilesystem: false
+fsGroup:
+  type: MustRunAs
+runAsUser:
+  type: MustRunAsRange
+seLinuxContext:
+  type: MustRunAs
+supplementalGroups:
+  type: MustRunAs
+seccompProfiles:
+  - runtime/default
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - ephemeral
+  - persistentVolumeClaim
+  - projected
+  - secret
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .name }}-scc
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: [{{ .name | quote }}]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .name }}-scc
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .name }}-scc
+subjects:
+  {{- range .serviceAccounts }}
+  - kind: ServiceAccount
+    name: {{ . }}
+    namespace: {{ $root.Release.Namespace }}
+  {{- end }}
+{{- end -}}

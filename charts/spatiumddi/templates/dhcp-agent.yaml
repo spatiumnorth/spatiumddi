@@ -58,6 +58,9 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
+      {{- if include "spatiumddi.isOpenShift" $root }}
+      serviceAccountName: {{ include "spatiumddi.fullname" $root }}-dhcp-agent
+      {{- end }}
       {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dhcp-agent" "override" $server.affinity) | nindent 6 }}
       {{- with $server.nodeSelector }}
       nodeSelector:
@@ -75,6 +78,19 @@ spec:
         - name: dhcp
           image: "{{ $root.Values.dhcpAgents.image.repository }}:{{ $tag }}"
           imagePullPolicy: {{ $root.Values.dhcpAgents.image.pullPolicy }}
+          {{- if include "spatiumddi.isOpenShift" $root }}
+          # #3852 — no runAsUser: the SCC assigns one. kea-dhcp4/6 get :67 and
+          # their raw sockets from FILE capabilities (net_bind_service,
+          # net_raw), which only work when both are in the bounding set — so
+          # both are added explicitly. containerd's default set happens to
+          # carry NET_RAW; CRI-O's does not (measured on OpenShift 5.0). Allowed
+          # by the agents' SCC (openshift-scc.yaml).
+          securityContext:
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE", "NET_RAW"]
+          {{- end }}
           env:
             - name: SPATIUM_API_URL
               # Trailing dot on the Service name: the pod inherits the node's
