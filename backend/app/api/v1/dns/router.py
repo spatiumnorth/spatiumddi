@@ -8320,6 +8320,12 @@ async def move_zone_commit(
         # (``forward_transport_refusal``), so the preview reports the same
         # refusal commit_zone_move raises below.
     source_group_id = zone.group_id
+    # The deletes still queued for retry against the source group's servers.
+    # The move discards those ops (``sweep_zone_ops``), so they are read first:
+    # a server that adopts the provider's existing copy (#3805) may still hold
+    # the records they were to remove, and the additive record push never
+    # removes anything.
+    queued_deletes = await _queued_delete_changes(db, zone, source_group_id)
     try:
         plan = await commit_zone_move(
             db,
@@ -8363,9 +8369,11 @@ async def move_zone_commit(
     # it sends only what that copy lacks — on a shared provider (#3805),
     # exactly the record whose write was still queued for retry against the
     # source group. The push sends the zone's live rows as they stand now, so
-    # a queued add / update is in the rows, and a queued delete's record is
-    # soft-deleted and is not resurrected.
-    pushed = await _push_moved_zone_records(db, zone, target_group.id, set(adopted_on))
+    # a queued add / update is in the rows; a queued delete is applied to an
+    # adopted copy first (and its record is soft-deleted, so never resurrected).
+    pushed = await _push_moved_zone_records(
+        db, zone, target_group.id, set(adopted_on), queued_deletes
+    )
     shared = await shared_provider_sources(
         db, source_group_id, target_group.id, adopted_on=adopted_on
     )
@@ -9111,8 +9119,41 @@ async def _push_zone_to_agentless_servers(
     raise HTTPException(status_code=status_code, detail=detail)
 
 
+async def _queued_delete_changes(db: DB, zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
+    """The record deletes still queued for ``zone`` on ``group_id``'s servers,
+    as driver changes, deduplicated by record (#3805)."""
+    from app.models.dns import DNSRecordOp  # noqa: PLC0415
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        _change_from_op_row,
+        queued_zone_ops_where,
+    )
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecordOp).where(
+                    *queued_zone_ops_where(zone, group_id), DNSRecordOp.op == "delete"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: dict[tuple[str, str, str], Any] = {}
+    for row in rows:
+        change = _change_from_op_row(row)
+        if change is not None:
+            r = change.record
+            out[(r.name, r.record_type.upper(), r.value)] = change
+    return list(out.values())
+
+
 async def _push_moved_zone_records(
-    db: DB, zone: DNSZone, group_id: uuid.UUID, adopted_names: set[str]
+    db: DB,
+    zone: DNSZone,
+    group_id: uuid.UUID,
+    adopted_names: set[str],
+    queued_deletes: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Push a moved zone's saved records to the target group's agentless
     servers (#3815), through the additive push the create rollback and Sync
@@ -9124,6 +9165,13 @@ async def _push_moved_zone_records(
     and already holds the records, so the push sends nothing — except a
     record whose write was still queued for retry against the source group,
     which the move drops and which only this push delivers.
+
+    The push never removes anything, so a record DELETE still queued against
+    the source group (``queued_deletes``) is applied to an adopted copy first
+    (#3805): the provider answered the caller's delete as queued, and the move
+    discards that op, so without this the record stays live there for good.
+    A delete is skipped when SpatiumDDI holds the same record live again, and
+    a failure to deliver one fails the move like a failed record write.
 
     A record that cannot be written is a 502 naming it, like a failed create,
     so the move is never reported clean while the target answers NXDOMAIN.
@@ -9164,6 +9212,20 @@ async def _push_moved_zone_records(
         .scalars()
         .all()
     }
+    live_keys: set[tuple[str, str, str]] = set()
+    stale = list(queued_deletes or [])
+    if stale and adopted_names:
+        live_keys = {
+            (r.name, r.record_type.upper(), r.value)
+            for r in (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
+            .scalars()
+            .all()
+        }
+        stale = [
+            c
+            for c in stale
+            if (c.record.name, c.record.record_type.upper(), c.record.value) not in live_keys
+        ]
     failures: list[str] = []
     for server in servers:
         driver = get_driver(server.driver)
@@ -9171,8 +9233,17 @@ async def _push_moved_zone_records(
         if unsupported:
             summary["unsupported_types"][server.name] = unsupported
         try:
+            problems = []
+            if stale and server.name in adopted_names:
+                results = await driver.apply_record_changes(server, stale)
+                problems = [
+                    f"delete of {res.change.record.name} {res.change.record.record_type} "
+                    f"failed: {res.error or 'unknown'}"
+                    for res in results
+                    if not res.ok
+                ]
             restored = await restore_zone_records_to_server(db, server, driver, zone)
-            problems = list(restored.push_errors)
+            problems += list(restored.push_errors)
             if restored.pushed < restored.candidates and not problems:
                 problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
             summary["pushed"][server.name] = restored.pushed

@@ -906,7 +906,9 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
         plan.warnings.append(
             f"{plan.pending_ops} queued record update(s) for this zone target the current "
             f"group's servers and are dropped by the move; agentless target servers are given "
-            f"the zone's records as they stand now, which already include them."
+            f"the zone's records as they stand now, which already include every queued add or "
+            f"update, and a queued delete is applied to a target server that already held the "
+            f"zone (a provider shared with the source group)."
         )
 
 

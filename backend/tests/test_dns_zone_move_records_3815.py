@@ -31,6 +31,7 @@ class _RecordProvider(_FakeProvider):
         self.records: dict[tuple[str | None, str], set[tuple[str, str, str]]] = {}
         self.writes: list[tuple[str, str, str, str]] = []
         self.fail = False
+        self.deletes: list[tuple[str, str, str, str]] = []
 
     async def pull_zone_records(self, server: Any, zone_name: str, **_: Any) -> list[RecordData]:
         held = self.records.get((self.provider_identity(server), zone_name), set())
@@ -44,6 +45,11 @@ class _RecordProvider(_FakeProvider):
                 continue
             r = c.record
             key = (self.provider_identity(server), c.zone_name)
+            if c.op == "delete":
+                self.records.get(key, set()).discard((r.name, r.record_type, r.value))
+                self.deletes.append((server.name, r.name, r.record_type, r.value))
+                out.append(RecordChangeResult(ok=True, change=c))
+                continue
             self.records.setdefault(key, set()).add((r.name, r.record_type, r.value))
             self.writes.append((server.name, r.name, r.record_type, r.value))
             out.append(RecordChangeResult(ok=True, change=c))
@@ -145,6 +151,74 @@ async def test_adopted_copy_gets_only_the_record_still_queued_for_retry(
     assert resp.status_code == 200, resp.text
     assert prov.writes == [("dst-ns", "pending", "A", "192.0.2.2")]
     assert key in prov.zones  # the shared copy is still there
+
+
+@pytest.mark.asyncio
+async def test_adopted_copy_loses_the_record_whose_delete_was_queued(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    """The provider was unreachable when the record was deleted, so its delete
+    is still queued when the zone moves to a group on the SAME provider. The
+    move drops the op and the push is additive, so the adopted copy kept the
+    record for good. A live record, and a queued update, are untouched."""
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    await _seed(db_session, zone)
+    key = ("route53:key:AKIA-ONE", zone.name)
+    prov.zones.add(key)
+    prov.records[key] = {
+        ("www", "A", "192.0.2.1"),
+        ("gone", "A", "192.0.2.3"),  # the record whose delete is queued
+        ("pending", "A", "192.0.2.9"),  # stale value; the queued update sets .2
+    }
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    held = prov.records[key]
+    assert ("gone", "A", "192.0.2.3") not in held
+    assert ("www", "A", "192.0.2.1") in held
+    assert [d[1:] for d in prov.deletes] == [("gone", "A", "192.0.2.3")]
+    assert ("pending", "A", "192.0.2.2") in held
+
+
+@pytest.mark.asyncio
+async def test_queued_delete_is_skipped_when_the_record_is_live_again(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    await _seed(db_session, zone)
+    db_session.add(_rec(zone, "gone", "192.0.2.3"))  # re-created after the delete
+    await db_session.flush()
+    key = ("route53:key:AKIA-ONE", zone.name)
+    prov.zones.add(key)
+    prov.records[key] = {("www", "A", "192.0.2.1"), ("gone", "A", "192.0.2.3")}
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 200, resp.text
+    assert prov.deletes == []
+    assert ("gone", "A", "192.0.2.3") in prov.records[key]
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_queued_delete_fails_the_move(
+    client: AsyncClient, db_session: AsyncSession, prov: _RecordProvider
+) -> None:
+    token = await _token(db_session)
+    zone, dst = await _setup(db_session, _A, _A)
+    await _seed(db_session, zone)
+    key = ("route53:key:AKIA-ONE", zone.name)
+    prov.zones.add(key)
+    prov.records[key] = {("www", "A", "192.0.2.1"), ("gone", "A", "192.0.2.3")}
+    prov.fail = True
+
+    resp = await _move(client, token, zone, dst)
+
+    assert resp.status_code == 502, resp.text
+    assert "delete of gone" in resp.text
+    assert key in prov.zones  # the adopted copy is left as found
 
 
 @pytest.mark.asyncio
