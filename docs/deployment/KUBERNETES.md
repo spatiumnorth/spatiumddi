@@ -61,22 +61,73 @@ resolves as the latest on its own (#1182).
 - An Ingress controller or `LoadBalancer` for external access (optional —
   you can `port-forward` for a quick look)
 
-### OpenShift / OKD
+### OpenShift
 
-Not tested yet. The chart has never been installed on OpenShift, and
-several of its defaults will not run under the default `restricted-v2`
-SecurityContextConstraints as they stand:
+The chart installs on OpenShift under its **default** SecurityContextConstraints:
+the control plane runs under plain `restricted-v2`, with no grant. It is the
+same chart, not a fork. Tested on OpenShift 4.22 and 5.0 (OpenShift Local).
+OKD is not tested.
 
-- The api pins `runAsUser: 1000`, and the in-chart Postgres and Redis pin
-  their `fsGroup`s.
-- The frontend listens on `:80`, BIND9 on `:53` and Kea on `:67`.
-- The worker adds `NET_RAW`, and the Kea agent uses `hostNetwork`.
-- No `Route` is rendered.
+```bash
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+  --version <CHART_VERSION> \
+  --namespace spatiumddi --create-namespace
+```
 
-You can try it by granting the workloads a less restrictive SCC, but
-that is unsupported. A tested install path, with SCC-compatible defaults
-and a Route, is tracked in
-[#3852](https://github.com/spatiumnorth/spatiumddi/issues/3852).
+The platform is detected from the cluster (`security.openshift.io/v1`). Where
+there is no cluster to ask (`helm template`, Argo CD), say so with
+`--api-versions security.openshift.io/v1 --api-versions route.openshift.io/v1`,
+or set `global.platform: openshift` (the values are `auto`, `kubernetes` and
+`openshift`). On any other platform nothing below applies and the chart renders
+exactly as before.
+
+**What the chart does differently on OpenShift**
+
+- `restricted-v2` assigns each pod a random uid and fsGroup from the namespace's
+  range and refuses a pinned one, so the api's `runAsUser`, the cnpg-ca-publisher
+  Job's `runAsUser`, and the in-chart Postgres and Redis `fsGroup`s are omitted.
+  `seccompProfile: RuntimeDefault` is kept.
+- The images run as any uid in group 0: every path they write is group-0 owned
+  and group-writable. The frontend nginx listens on `:8080` (`FRONTEND_HTTP_PORT`;
+  the Service keeps its own port) because a random uid cannot bind `:80`.
+- A `Route` in front of the frontend Service (`openshift.route`): edge TLS with
+  the router's certificate, plain HTTP redirected, a 1 h timeout for the
+  streaming pages. Set `openshift.route.host` for a fixed hostname, or
+  `openshift.route.enabled: false` to bring your own. Behind the router, set
+  `frontend.trustedProxyCidrs` to the router's network so the api sees the real
+  client address and `https` (see the reverse-proxy page).
+- **SecurityContextConstraints for the DNS and DHCP agents only**
+  (`openshift.scc.create`). BIND9 binds `:53` and Kea binds `:67` and opens raw
+  sockets through *file capabilities* on the daemon binaries. Those work only
+  when the capability is in the container's bounding set and `no_new_privs` is
+  off, which `restricted-v2` forbids (`allowPrivilegeEscalation: false`, and
+  `NET_RAW` is not allowed). The chart therefore renders, per agent kind, a
+  ServiceAccount, a SCC, and a Role + RoleBinding letting only that
+  ServiceAccount `use` it. Each SCC is `restricted-v2` with three differences:
+  the capabilities it allows (`NET_BIND_SERVICE`; plus `NET_RAW` for Kea),
+  `allowPrivilegeEscalation: true`, and `allowHostNetwork` / `allowHostPorts`
+  only if a DHCP server sets `hostNetwork: true`. The pods still run as a
+  non-root uid from the namespace range with `runtime/default` seccomp; the SCC
+  is not privileged. The containers add their capabilities explicitly, because
+  CRI-O's default set differs from containerd's (it has no `NET_RAW`). Where
+  cluster admins manage SCCs, set `openshift.scc.create: false` and grant an
+  equivalent SCC to the `<release>-dns-agent` / `-dhcp-agent` ServiceAccounts
+  yourself. `anyuid` is not a substitute: it has no `seccompProfiles`, so it
+  rejects every pod that sets `seccompProfile: RuntimeDefault`.
+- The worker adds nothing: under `restricted-v2` there is no `NET_RAW`, so `nmap`
+  raw scans and the `tcpdump` capture on the Tools page fall back to what an
+  unprivileged process can do. To keep them, set `openshift.workerNetRaw: true`
+  with `worker.serviceAccount.enabled: true`; the chart then renders a SCC for
+  the worker's own ServiceAccount.
+
+**Limits.** Only the `bind9` DNS flavor and Kea DHCP run under these SCCs; a
+PowerDNS or Technitium server is refused at render time (their images still
+chown and drop privileges at start). `frontend.tls.enabled` (the appliance's
+`:80` / `:443` nginx) is refused: let the Route terminate TLS. Kea's opt-in
+rogue-DHCP probe and fingerprint sniffer need `NET_RAW` in a process that is not
+Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
+false`; set the per-workload `hostUsers` values where the chart offers them
+(api, worker, beat, redis).
 
 ---
 
