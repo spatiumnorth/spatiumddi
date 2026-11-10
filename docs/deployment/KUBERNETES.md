@@ -61,6 +61,23 @@ resolves as the latest on its own (#1182).
 - An Ingress controller or `LoadBalancer` for external access (optional —
   you can `port-forward` for a quick look)
 
+### OpenShift / OKD
+
+Not tested yet. The chart has never been installed on OpenShift, and
+several of its defaults will not run under the default `restricted-v2`
+SecurityContextConstraints as they stand:
+
+- The api pins `runAsUser: 1000`, and the in-chart Postgres and Redis pin
+  their `fsGroup`s.
+- The frontend listens on `:80`, BIND9 on `:53` and Kea on `:67`.
+- The worker adds `NET_RAW`, and the Kea agent uses `hostNetwork`.
+- No `Route` is rendered.
+
+You can try it by granting the workloads a less restrictive SCC, but
+that is unsupported. A tested install path, with SCC-compatible defaults
+and a Route, is tracked in
+[#3852](https://github.com/spatiumnorth/spatiumddi/issues/3852).
+
 ---
 
 ## 2. Install
