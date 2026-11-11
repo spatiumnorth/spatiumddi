@@ -65,8 +65,8 @@ resolves as the latest on its own (#1182).
 
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
-same chart, not a fork. Tested on OpenShift 4.22 and 5.0 (OpenShift Local).
-OKD is not tested.
+same chart, not a fork. Written against the SCCs of OpenShift 4.22 and 5.0;
+the install on both (OpenShift Local) is being verified. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
@@ -109,10 +109,14 @@ exactly as before.
   only if a DHCP server sets `hostNetwork: true`. The pods still run as a
   non-root uid from the namespace range with `runtime/default` seccomp; the SCC
   is not privileged. The containers add their capabilities explicitly, because
-  CRI-O's default set differs from containerd's (it has no `NET_RAW`). Where
-  cluster admins manage SCCs, set `openshift.scc.create: false` and grant an
-  equivalent SCC to the `<release>-dns-agent` / `-dhcp-agent` ServiceAccounts
-  yourself. `anyuid` is not a substitute: it has no `seccompProfiles`, so it
+  CRI-O's default set differs from containerd's (it has no `NET_RAW`), and set
+  `allowPrivilegeEscalation: true` explicitly, so `restricted-v2` (which also
+  allows `NET_BIND_SERVICE`) can never be the SCC that admits them. Where
+  cluster admins manage SCCs, set `openshift.scc.create: false`: the chart
+  still creates the ServiceAccounts, and you grant an equivalent SCC to
+  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (`<fullname>` is
+  `<release>-spatiumddi`, or the release name when it already contains
+  `spatiumddi`). `anyuid` is not a substitute: it has no `seccompProfiles`, so it
   rejects every pod that sets `seccompProfile: RuntimeDefault`.
 - The worker adds nothing: under `restricted-v2` there is no `NET_RAW`, so `nmap`
   raw scans and the `tcpdump` capture on the Tools page fall back to what an
@@ -123,7 +127,8 @@ exactly as before.
 **Limits.** Only the `bind9` DNS flavor and Kea DHCP run under these SCCs; a
 PowerDNS or Technitium server is refused at render time (their images still
 chown and drop privileges at start). `frontend.tls.enabled` (the appliance's
-`:80` / `:443` nginx) is refused: let the Route terminate TLS. Kea's opt-in
+`:80` / `:443` nginx) and `frontend.hostNetwork` are refused: let the Route
+terminate TLS. Kea's opt-in
 rogue-DHCP probe and fingerprint sniffer need `NET_RAW` in a process that is not
 Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
 false`; set the per-workload `hostUsers` values where the chart offers them
