@@ -19,6 +19,11 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
+  {{- if not .Values.dnsAgents.agentKey.value }}
+  annotations:
+    # A generated key must survive an uninstall/reinstall (#1042), or agents lose their PSK.
+    "helm.sh/resource-policy": keep
+  {{- end }}
 type: Opaque
 stringData:
   DNS_AGENT_KEY: {{ $agentKey | quote }}

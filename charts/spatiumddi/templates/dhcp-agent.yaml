@@ -19,6 +19,11 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
+  {{- if not .Values.dhcpAgents.agentKey.value }}
+  annotations:
+    # A generated key must survive an uninstall/reinstall (#1042), or agents lose their PSK.
+    "helm.sh/resource-policy": keep
+  {{- end }}
 type: Opaque
 stringData:
   SPATIUM_AGENT_KEY: {{ $agentKey | quote }}
