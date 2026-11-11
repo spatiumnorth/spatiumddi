@@ -322,3 +322,31 @@ async def test_sweep_keeps_bound_subnet_purges_the_rest_and_says_why(
     assert await _bindings(db_session) == 1
     held = [w for w in warnings if w["event"] == "trash_purge.held_back_live_children"]
     assert held and "E911" in held[0]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_bound_permanent_address_delete_refuses_before_any_dhcp_write_through(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """The refusal must come before ``_remove_linked_statics``: that call pushes a
+    reservation removal to Windows / FortiGate members, which a 409's DB rollback
+    cannot undo (ddi-pg's note on PR #3898)."""
+    import app.api.v1.ipam.router as ipam_router
+
+    calls: list[object] = []
+
+    async def _record(*args: object, **kwargs: object) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(ipam_router, "_remove_linked_statics", _record)
+    h = await _admin(db_session)
+    erl = await _erl(db_session)
+    sub = await _subnet(db_session)
+    ip = IPAddress(subnet_id=sub.id, address="10.47.1.10", status="allocated")
+    db_session.add(ip)
+    await db_session.flush()
+    db_session.add(ERLBinding(erl_id=erl.id, rule_kind="ip", ip_address_id=ip.id))
+    await db_session.flush()
+    r = await client.delete(f"/api/v1/ipam/addresses/{ip.id}?permanent=true", headers=h)
+    assert r.status_code == 409, r.text
+    assert calls == [], "the DHCP write-through ran before the E911 refusal"

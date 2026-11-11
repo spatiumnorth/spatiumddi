@@ -11541,10 +11541,14 @@ async def delete_address(
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
     # Kea / ISC. Typically one row — the batch overhead is negligible.
+    # #3891 — refuse a bound permanent delete BEFORE any DHCP write-through:
+    # the 409 rolls the DB back, but a Windows / FortiGate reservation removal
+    # would already have left the process.
+    if permanent:
+        await refuse_if_e911_bound(db, f"address {ip.address}", ip_ids=[ip.id])
     await _remove_linked_statics(db, current_user, statics_rows)
 
     if permanent:
-        await refuse_if_e911_bound(db, f"address {ip.address}", ip_ids=[ip.id])  # #3891
         subnet_id = ip.subnet_id
         # Remove auto-generated DNS record before deleting the IP (FK would null it anyway,
         # but we want a clean delete and fqdn cleared)
