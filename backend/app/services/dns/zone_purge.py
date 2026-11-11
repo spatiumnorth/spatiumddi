@@ -26,7 +26,7 @@ from app.models.dns import DNSRecord, DNSZone
 from app.services.ipam.zone_binding import prune_zone_ids
 
 
-async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
+async def purge_trashed_zone(db: Any, zone: DNSZone) -> list[str]:
     """Retract ``zone`` from every agentless server, then delete its row.
 
     Raises (an ``HTTPException`` 409/502 from the push, or whatever the driver
@@ -36,6 +36,9 @@ async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
 
     The row is removed with a Core DELETE and the FK ``ON DELETE CASCADE`` takes
     its records, so the delete is atomic with the teardown that gated it.
+
+    Returns a note per provider copy kept because another group's live zone of
+    the same name shares it (#3812), for the caller's audit row.
     """
     # #3691: the ``ip_address`` rows the delete nulls out come before the zone
     # row, as the lease path takes them (``app.services.lock_order``).
@@ -66,7 +69,8 @@ async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
     from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
     from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
 
-    await _push_zone_to_agentless_servers(db, zone, "delete")
+    kept: list[str] = []
+    await _push_zone_to_agentless_servers(db, zone, "delete", kept_notes=kept)
     # Ops queued before the soft-delete started sweeping them have no zone FK to
     # cascade through; sweep defensively so a pre-fix trash row leaves no failed
     # queue behind.
@@ -76,3 +80,4 @@ async def purge_trashed_zone(db: Any, zone: DNSZone) -> None:
     )
     # IPAM names zones in text / JSONB columns with no foreign key (#3443).
     await prune_zone_ids(db, [zone.id])
+    return kept

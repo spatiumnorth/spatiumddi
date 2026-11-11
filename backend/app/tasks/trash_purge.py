@@ -278,7 +278,23 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
                     )
                 )
                 continue
-            await purge_trashed_zone(db, zone)
+            kept = await purge_trashed_zone(db, zone)
+            if kept:
+                # #3812: the copy another zone of the same name may use stays at
+                # the provider; say so where an operator will look for it.
+                db.add(
+                    AuditLog(
+                        user_id=None,
+                        user_display_name="system",
+                        auth_source="system",
+                        action="permanent_delete",
+                        resource_type="dns_zone",
+                        resource_id=str(zone.id),
+                        resource_display=zone.name,
+                        new_value={"provider_copies_kept": kept},
+                        result="success",
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
