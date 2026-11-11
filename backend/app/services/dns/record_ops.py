@@ -1142,7 +1142,9 @@ async def _retract_zone_removed_mid_dispatch(
       zone of the same name in its new group;
     - no zone of that name exists in that group now, live or in the Trash (a
       zone re-created since, or a sibling view's same-named zone, is what the
-      provider's zone of that name is for).
+      provider's zone of that name is for);
+    - no other group's zone of that name may share the server's provider copy,
+      which the delete kept for that reason (#3812).
 
     The zone delete is idempotent at the provider (an absent zone reports
     unchanged), and no database session is open across the calls. Best
@@ -1199,6 +1201,16 @@ async def _retract_zone_removed_mid_dispatch(
                 .scalars()
                 .all()
             )
+            # #3812: a provider copy another group's zone of that name may use
+            # was kept by the delete; re-sending the removal would take it.
+            from app.services.dns.zone_move import shared_zone_copy_servers  # noqa: PLC0415
+
+            for name in names:
+                if name in present:
+                    continue
+                probe = DNSZone(id=uuid.uuid4(), group_id=claimed_group_id, name=name)
+                if server.id in (await shared_zone_copy_servers(s, probe)).keep_ids:
+                    present.add(name)
         from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
 
         driver = get_driver(server.driver)

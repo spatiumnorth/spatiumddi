@@ -60,6 +60,15 @@ ARG APK_SNAPSHOT=dev
 RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && apk upgrade --no-cache
 
+# #3852 — OpenShift (and any PodSecurity-restricted cluster that assigns a
+# random UID) runs this image as an arbitrary uid in group 0, never as the
+# ``nginx`` user. Everything nginx or its entrypoint WRITES must therefore be
+# owned by group 0 and group-writable: the temp dirs under /var/cache/nginx
+# (``client_temp`` is created at startup), the rendered conf.d, and /run (the
+# pid file; /var/run is a symlink to it). A no-op for the usual root start.
+RUN chgrp -R 0 /var/cache/nginx /etc/nginx/conf.d /run \
+ && chmod -R g=u /var/cache/nginx /etc/nginx/conf.d /run
+
 COPY --from=builder /app/dist /usr/share/nginx/html
 # #2895 — NOTICE, LICENSE and the npm notice list, OUTSIDE the web root: they
 # are for signed-in users only, and nginx serves them at /legal/ behind an
@@ -83,6 +92,10 @@ COPY frontend/16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.e
 # container has IPv6 at all (#2308), so one image serves IPv4-only, dual-stack
 # and IPv6-only clusters.
 COPY frontend/17-ipv6.envsh /docker-entrypoint.d/17-ipv6.envsh
+# Resolves the listen port from FRONTEND_HTTP_PORT (default 80) so the same
+# image can bind an unprivileged port where the pod may not use :80 (#3852).
+# Numbered below 17 because that script renders the ``listen [::]`` line.
+COPY frontend/14-http-port.envsh /docker-entrypoint.d/14-http-port.envsh
 # Reloads nginx in place when the mounted TLS certificate changes, so a new
 # Web UI certificate never needs the frontend pods replaced (#1173). Without a
 # mounted certificate (Docker Compose) it exits and watches nothing.
@@ -98,4 +111,4 @@ ENV API_UPSTREAM_HOST=api \
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD wget -qO- http://127.0.0.1/nginx-health || exit 1
+    CMD wget -qO- "http://127.0.0.1:${FRONTEND_HTTP_PORT:-80}/nginx-health" || exit 1

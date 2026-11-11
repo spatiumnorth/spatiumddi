@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, select, union_all
 from sqlalchemy import delete as sa_delete
@@ -837,7 +837,7 @@ async def permanent_delete_from_trash(
     row_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
-) -> None:
+) -> Response:
     """Hard-delete a soft-deleted row from the trash.
 
     The agentless write-through for a Windows DHCP scope already fired at
@@ -884,7 +884,8 @@ async def permanent_delete_from_trash(
 
     label = _row_label(target)
     records_retracted = 0
-    purged_extra: dict[str, int] = {}
+    purged_extra: dict[str, Any] = {}
+    kept_provider_copies: list[str] = []
     dns_wake_group_ids: set[uuid.UUID] = set()
     # Subnets whose DHCP mirrors the purge frees; recounted once, last, just
     # before the commit (#3354).
@@ -947,7 +948,10 @@ async def permanent_delete_from_trash(
             if sharers:
                 await _refuse_shared_zone(db, target, label, sharers)
             # Refuses (409) while a LIVE record sits under the trashed zone (#1957).
-            await purge_trashed_zone(db, target)
+            kept_provider_copies = await purge_trashed_zone(db, target)
+            if kept_provider_copies:
+                # #3812: shared with another group's live zone; left at the provider.
+                purged_extra = {"provider_copies_kept": kept_provider_copies}
             dns_wake_group_ids.add(target.group_id)
         elif isinstance(target, Subnet):
             live = await _live_children(db, [target], [], [])
@@ -1047,3 +1051,12 @@ async def permanent_delete_from_trash(
     # instead of leaving them to the safety tick.
     for gid in dns_wake_group_ids:
         await publish_wake(dns_group_channel(gid))
+    if kept_provider_copies:
+        # #3812: 204 has no body; say so in a header, as the zone delete does.
+        from app.services.dns.zone_move import provider_copies_kept_header  # noqa: PLC0415
+
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept_provider_copies)},
+        )
+    return Response(status_code=204)

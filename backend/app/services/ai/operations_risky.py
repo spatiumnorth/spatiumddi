@@ -1183,7 +1183,8 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # Pushed before the lock, the removal reached them while a record write
     # that held the zone row was still under way, and that write's record
     # then went to a server that had just lost the zone.
-    await _push_zone_to_agentless_servers(db, zone, "delete")
+    kept: list[str] = []
+    await _push_zone_to_agentless_servers(db, zone, "delete", kept_notes=kept)
     await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
     await db.delete(zone)
     # IPAM names zones in text / JSONB columns with no foreign key (#3443).
@@ -1200,11 +1201,17 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=zone.name,
+            # #3812: provider copies left in place because another group's live
+            # zone of the same name shares them.
+            new_value={"provider_copies_kept": kept} if kept else None,
             result="success",
         )
     )
     await db.commit()
-    return {"zone_id": str(args.zone_id), "mode": "delete"}
+    out: dict[str, Any] = {"zone_id": str(args.zone_id), "mode": "delete"}
+    if kept:
+        out["provider_copies_kept"] = kept
+    return out
 
 
 _OP_DELETE_ZONE = Operation(

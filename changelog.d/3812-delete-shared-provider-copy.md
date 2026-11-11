@@ -1,0 +1,3 @@
+### Fixed
+
+- Deleting a DNS zone permanently, purging it from Trash (by hand or by the scheduled expiry), or moving it to another group no longer deletes the provider's copy when another zone of the same name may still use it: one in another group whose Technitium, Windows DNS or cloud server reaches the same provider (or whose provider cannot be told apart), even if that zone is in the Trash or that server is paused, or one in another view of the same group. Names are compared without case or trailing dot. The copy is left in place and listed in the audit row; the zone delete and the Trash delete also return it in an `X-Provider-Copies-Kept` header.

@@ -5199,6 +5199,8 @@ export const customFieldsApi = {
         params: resource_type ? { resource_type } : undefined,
       })
       .then((r) => r.data),
+  get: (id: string) =>
+    api.get<CustomField>(`/custom-fields/${id}`).then((r) => r.data),
   create: (data: Omit<CustomField, "id">) =>
     api.post<CustomField>("/custom-fields", data).then((r) => r.data),
   update: (

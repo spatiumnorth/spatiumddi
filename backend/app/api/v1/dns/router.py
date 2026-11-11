@@ -263,8 +263,10 @@ from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
+    provider_copies_kept_header,
     same_provider_target_ids,
     shared_provider_sources,
+    shared_zone_copy_servers,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
@@ -6911,6 +6913,7 @@ async def update_zone(
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
+        await _enforce_no_records_in_other_view(db, zone.id, changes["view_id"])  # #3839
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -8377,6 +8380,11 @@ async def move_zone_commit(
     shared = await shared_provider_sources(
         db, source_group_id, target_group.id, adopted_on=adopted_on
     )
+    # A THIRD group's zone of the same name (or a sibling view's in the source
+    # group) may use the same provider copy too (#3812).
+    others = await shared_zone_copy_servers(db, zone, group_id=source_group_id)
+    shared.keep_ids |= others.keep_ids
+    shared.notes.extend(n for n in others.notes if n not in shared.notes)
     await _push_zone_to_agentless_servers(
         db, zone, "delete", group_id=source_group_id, skip_server_ids=shared.keep_ids
     )
@@ -8473,7 +8481,14 @@ async def delete_zone(
     pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
     if pending is not None:
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
-    await op.apply(db, current_user, args)
+    result = await op.apply(db, current_user, args)
+    kept = result.get("provider_copies_kept") if isinstance(result, dict) else None
+    if kept:
+        # #3812: 204 has no body; say so in a header.
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept)},
+        )
     return None
 
 
@@ -8879,8 +8894,14 @@ async def _push_zone_to_agentless_servers(
     group_id: uuid.UUID | None = None,
     skip_server_ids: set[uuid.UUID] | None = None,
     adopt_existing_server_ids: set[uuid.UUID] | None = None,
+    kept_notes: list[str] | None = None,
 ) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    ``kept_notes`` (delete, no ``group_id`` override): a delete leaves out the
+    servers whose provider copy another group's live zone of the same name
+    still uses (#3812); the reasons are appended here for the caller's audit
+    row and response.
 
     ``adopt_existing_server_ids`` (create only): servers whose existing copy
     of the zone is SpatiumDDI's own, reached through the source group's server
@@ -8941,10 +8962,18 @@ async def _push_zone_to_agentless_servers(
     )
     # ``skip_server_ids``: servers the caller has decided not to drive (the
     # move keeps a source copy that shares a provider with the target, #3805).
+    skip = set(skip_server_ids or set())
+    if op == "delete" and group_id is None:
+        # #3812: the zone's own group is being deleted from; the move passes
+        # ``group_id`` and decides its keeps itself (#3805).
+        shared = await shared_zone_copy_servers(db, zone)
+        skip |= shared.keep_ids
+        if kept_notes is not None:
+            kept_notes.extend(shared.notes)
+        for note in shared.notes:
+            logger.warning("dns.zone.delete_kept_shared_provider_copy", zone=zone.name, note=note)
     targets = [
-        s
-        for s in servers_res.scalars().all()
-        if is_agentless(s.driver) and s.id not in (skip_server_ids or set())
+        s for s in servers_res.scalars().all() if is_agentless(s.driver) and s.id not in skip
     ]
     if not targets:
         return []
@@ -9675,6 +9704,37 @@ async def _enforce_zone_view_in_group(
             status_code=422,
             detail="view_id does not name a view in this zone's server group",
         )
+
+
+async def _enforce_no_records_in_other_view(db: DB, zone_id: uuid.UUID, pin: uuid.UUID) -> None:
+    """422 pinning a zone while it holds a record scoped to another view (#3839).
+
+    A pinned zone renders into its pin alone, so a record scoped to a different
+    view is served in no view. The record API refuses writing that state
+    (``_enforce_views_in_zone_group``); a change of the zone's pin is held to
+    the same rule, naming the records and their views.
+    """
+    rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value, DNSView.name)
+            .join(DNSView, DNSView.id == DNSRecord.view_id)
+            .where(DNSRecord.zone_id == zone_id, DNSRecord.view_id != pin)
+            .order_by(DNSRecord.name, DNSRecord.record_type)
+            .limit(6)
+        )
+    ).all()
+    if not rows:
+        return
+    shown = ", ".join(f"{n} {t} {v} (view '{vn}')" for n, t, v, vn in rows[:5])
+    more = ", and more" if len(rows) > 5 else ""
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "Cannot pin this zone to that view: it holds records scoped to another "
+            f"view, which would then be rendered in no view: {shown}{more}. Move "
+            "those records to the new view or remove their view first."
+        ),
+    )
 
 
 async def _enforce_views_in_zone_group(
