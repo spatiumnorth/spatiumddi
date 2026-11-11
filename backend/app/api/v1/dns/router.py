@@ -263,8 +263,10 @@ from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
+    provider_copies_kept_header,
     same_provider_target_ids,
     shared_provider_sources,
+    shared_zone_copy_servers,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
@@ -8377,6 +8379,11 @@ async def move_zone_commit(
     shared = await shared_provider_sources(
         db, source_group_id, target_group.id, adopted_on=adopted_on
     )
+    # A THIRD group's zone of the same name (or a sibling view's in the source
+    # group) may use the same provider copy too (#3812).
+    others = await shared_zone_copy_servers(db, zone, group_id=source_group_id)
+    shared.keep_ids |= others.keep_ids
+    shared.notes.extend(n for n in others.notes if n not in shared.notes)
     await _push_zone_to_agentless_servers(
         db, zone, "delete", group_id=source_group_id, skip_server_ids=shared.keep_ids
     )
@@ -8479,7 +8486,7 @@ async def delete_zone(
         # #3812: 204 has no body; say so in a header.
         return Response(
             status_code=204,
-            headers={"X-Provider-Copies-Kept": " | ".join(kept).replace("\n", " ")},
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept)},
         )
     return None
 
@@ -8958,8 +8965,6 @@ async def _push_zone_to_agentless_servers(
     if op == "delete" and group_id is None:
         # #3812: the zone's own group is being deleted from; the move passes
         # ``group_id`` and decides its keeps itself (#3805).
-        from app.services.dns.zone_move import shared_zone_copy_servers  # noqa: PLC0415
-
         shared = await shared_zone_copy_servers(db, zone)
         skip |= shared.keep_ids
         if kept_notes is not None:

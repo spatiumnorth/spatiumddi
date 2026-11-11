@@ -144,3 +144,216 @@ async def test_trash_purge_unknown_identity_counts_as_shared(
     kept = await purge_trashed_zone(db_session, za)
     assert ("ns-a", "delete") not in provider.calls
     assert kept
+
+
+# ── Validation follow-ups ──────────────────────────────────────────────────
+
+
+async def _delete(client: AsyncClient, token: str, zone: DNSZone) -> Any:
+    return await client.delete(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}?permanent=true",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_differently_spelled_name_still_counts_as_shared(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    """A Windows pull keeps the provider's case; the provider compares without it."""
+    token = await _token(db_session)
+    za, zb = await _two_groups(db_session, _A, _A)
+    zb.name = "Example.COM"
+    await db_session.flush()
+    resp = await _delete(client, token, za)
+    assert resp.status_code == 204, resp.text
+    assert ("ns-a", "delete") not in provider.calls
+
+
+@pytest.mark.asyncio
+async def test_a_sharing_zone_in_the_trash_still_counts(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    """A restore does not re-create the provider copy, so a trashed zone needs it."""
+    token = await _token(db_session)
+    za, zb = await _two_groups(db_session, _A, _A)
+    zb.deleted_at = datetime.now(UTC)
+    await db_session.flush()
+    resp = await _delete(client, token, za)
+    assert resp.status_code == 204, resp.text
+    assert ("ns-a", "delete") not in provider.calls
+
+
+@pytest.mark.asyncio
+async def test_a_paused_sharing_server_still_counts(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    from sqlalchemy import update as sa_update
+
+    token = await _token(db_session)
+    za, zb = await _two_groups(db_session, _A, _A)
+    await db_session.execute(
+        sa_update(DNSServer).where(DNSServer.group_id == zb.group_id).values(is_enabled=False)
+    )
+    resp = await _delete(client, token, za)
+    assert resp.status_code == 204, resp.text
+    assert ("ns-a", "delete") not in provider.calls
+
+
+@pytest.mark.asyncio
+async def test_a_sibling_views_zone_in_the_same_group_counts(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    from app.models.dns import DNSView
+
+    token = await _token(db_session)
+    za, _zb = await _two_groups(db_session, _A, _B)
+    view = DNSView(group_id=za.group_id, name=f"v{uuid.uuid4().hex[:6]}")
+    db_session.add(view)
+    await db_session.flush()
+    db_session.add(
+        DNSZone(group_id=za.group_id, view_id=view.id, name="example.com.", zone_type="primary")
+    )
+    await db_session.flush()
+    resp = await _delete(client, token, za)
+    assert resp.status_code == 204, resp.text
+    assert ("ns-a", "delete") not in provider.calls
+
+
+@pytest.mark.asyncio
+async def test_trash_api_purge_names_the_kept_copy(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+
+    token = await _token(db_session)
+    za, _zb = await _two_groups(db_session, _A, _A, trashed=True)
+    resp = await client.delete(
+        f"/api/v1/admin/trash/dns_zone/{za.id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 204, resp.text
+    assert ("ns-a", "delete") not in provider.calls
+    assert "ns-a" in resp.headers["x-provider-copies-kept"]
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.resource_id == str(za.id), AuditLog.action == "permanent_delete"
+            )
+        )
+    ).scalar_one()
+    assert row.new_value and row.new_value["provider_copies_kept"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_purge_audits_the_kept_copy(
+    db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+    from app.tasks.trash_purge import _purge_dns_zones
+
+    za, _zb = await _two_groups(db_session, _A, _A, trashed=True)
+    za.deleted_at = datetime.now(UTC) - timedelta(days=400)
+    await db_session.flush()
+    purged, skipped = await _purge_dns_zones(db_session, datetime.now(UTC))
+    assert (purged, skipped) == (1, 0)
+    assert ("ns-a", "delete") not in provider.calls
+    rows = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.resource_id == str(za.id))))
+        .scalars()
+        .all()
+    )
+    assert any((r.new_value or {}).get("provider_copies_kept") for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_move_keeps_a_copy_a_third_group_uses(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    """Source and target reach different providers; a third group shares the source's."""
+    token = await _token(db_session)
+    za, _zc = await _two_groups(db_session, _A, _A)
+    dst = DNSServerGroup(name=f"dst-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(dst)
+    await db_session.flush()
+    db_session.add(
+        DNSServer(
+            group_id=dst.id,
+            name="ns-dst",
+            driver="route53",
+            host="ns-dst",
+            port=53,
+            roles=["authoritative"],
+            status="active",
+            credentials_encrypted=encrypt_dict(_B),
+        )
+    )
+    await db_session.flush()
+    resp = await client.post(
+        f"/api/v1/dns/groups/{za.group_id}/zones/{za.id}/move/commit",
+        json={
+            "target_group_id": str(dst.id),
+            "confirmation_zone_name": za.name,
+            "acknowledgements": [],
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert ("ns-dst", "create") in provider.calls
+    assert ("ns-a", "delete") not in provider.calls
+
+
+@pytest.mark.asyncio
+async def test_a_late_dispatch_does_not_resend_the_removal_of_a_kept_copy(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider
+) -> None:
+    """#3688's retraction re-sends a delete when a dispatch outlives the zone;
+    it must honour the copy the delete kept for another group."""
+    from sqlalchemy import select
+
+    from app.models.dns import DNSRecordOp
+    from app.services.dns import record_ops
+    from tests.conftest import _test_engine
+
+    token = await _token(db_session)
+    za, _zb = await _two_groups(db_session, _A, _A)
+    server = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == za.group_id))
+    ).scalar_one()
+    op = DNSRecordOp(
+        server_id=server.id,
+        zone_id=za.id,
+        zone_name=za.name,
+        op="create",
+        record={"name": "www", "type": "A", "value": "192.0.2.10"},
+        state="pending",
+    )
+    db_session.add(op)
+    await db_session.flush()
+    op_id = op.id
+    await db_session.commit()
+
+    async def _rec(_server: Any, _change: Any) -> None:
+        return None
+
+    provider.apply_record_change = _rec  # type: ignore[method-assign]
+    mp = pytest.MonkeyPatch()
+    mp.setattr(record_ops, "get_driver", lambda _name: provider)
+    try:
+        claimed_at = datetime.now(UTC)
+        rows = await record_ops._claim(db_session, [op_id], now=claimed_at)
+        await db_session.commit()
+        resp = await _delete(client, token, za)
+        assert resp.status_code == 204, resp.text
+        await record_ops._dispatch_claimed(
+            _test_engine, server, rows, batched=False, claimed_at=claimed_at
+        )
+    finally:
+        mp.undo()
+    assert ("ns-a", "delete") not in provider.calls

@@ -403,37 +403,84 @@ async def shared_provider_sources(
     return result
 
 
-async def shared_zone_copy_servers(db: AsyncSession, zone: DNSZone) -> SharedProviderResult:
-    """Servers of ``zone``'s group whose provider copy another live zone still uses (#3812).
+def provider_copies_kept_header(notes: Collection[str]) -> str:
+    """The ``X-Provider-Copies-Kept`` header value for ``notes`` (#3812).
 
-    A delete (permanent, Trash purge, reverse-zone retirement) pushes ``delete`` to
-    every agentless server of the zone's group. When another group holds a LIVE zone
-    of the same name and has an agentless server of the same driver that shares the
-    provider (same identity, or either identity unreadable: unknown counts as shared,
-    as in #3805), the provider holds one copy for both. Deleting it removes the other
-    group's zone. Such a server is kept out of the delete.
+    A header must be latin-1 with no line breaks, and a server or zone name
+    may be neither; escape rather than fail a delete that has already
+    committed.
     """
-    from app.drivers.dns import get_driver  # noqa: PLC0415
+    joined = " | ".join(" ".join(n.split()) for n in notes)
+    return joined.encode("ascii", "backslashreplace").decode("ascii")
+
+
+async def shared_zone_copy_servers(
+    db: AsyncSession, zone: DNSZone, group_id: uuid.UUID | None = None
+) -> SharedProviderResult:
+    """Servers of ``zone``'s group whose provider copy another zone still uses (#3812).
+
+    A delete (permanent, Trash purge, reverse-zone retirement, a move's source
+    delete) pushes ``delete`` to every agentless server of the group it leaves
+    (``group_id``, default the zone's own). A provider holds ONE copy of a zone
+    name, so the copy is kept on a server when another zone of the same name
+    may use it:
+
+    - a zone in another view of the same group (the same servers push it);
+    - a zone in another group that has an agentless server of the same driver
+      sharing the provider (same identity, or either identity unreadable:
+      unknown counts as shared, as in #3805). That server counts while paused
+      and the zone counts while in the Trash, because neither re-creates the
+      copy on resume or restore.
+
+    Names compare without case or the trailing dot, as the provider compares
+    them. Erring towards keeping is deliberate: a kept copy is named in the
+    caller's audit row; a wrong delete removes a zone another group serves.
+    """
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
     result = SharedProviderResult()
-    sources = await _agentless_servers(db, zone.group_id)
+    source_group_id = group_id if group_id is not None else zone.group_id
+    sources = await _agentless_servers(db, source_group_id)
     if not sources:
         return result
-    other_group_ids = (
+    bare = zone.name.rstrip(".").lower()
+    other_group_ids = set(
         (
             await db.execute(
-                select(DNSZone.group_id).where(
-                    DNSZone.name == zone.name,
-                    DNSZone.group_id != zone.group_id,
+                select(DNSZone.group_id)
+                .where(
+                    func.lower(func.rtrim(DNSZone.name, ".")) == bare,
                     DNSZone.id != zone.id,
                 )
+                .execution_options(include_deleted=True)
             )
         )
         .scalars()
         .all()
     )
-    for gid in set(other_group_ids):
-        others = await _agentless_servers(db, gid)
+    if source_group_id in other_group_ids:
+        for src in sources:
+            result.keep_ids.add(src.id)
+            result.notes.append(
+                f"Provider copy kept on '{src.name}': another zone '{zone.name}' in the "
+                "same server group (another view) uses the same provider copy."
+            )
+        return result
+    for gid in other_group_ids:
+        others = [
+            r
+            for r in (
+                await db.execute(
+                    select(DNSServer).where(
+                        DNSServer.group_id == gid,
+                        DNSServer.credentials_encrypted.isnot(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if is_agentless(r.driver)
+        ]
         for src in sources:
             if src.id in result.keep_ids:
                 continue
@@ -446,7 +493,7 @@ async def shared_zone_copy_servers(db: AsyncSession, zone: DNSZone) -> SharedPro
                     result.keep_ids.add(src.id)
                     result.notes.append(
                         f"Provider copy kept on '{src.name}': another group still has a "
-                        f"live zone '{zone.name}' that may use the same provider copy "
+                        f"zone '{zone.name}' that may use the same provider copy "
                         f"(via '{oth.name}'). Remove it there by hand if it is separate."
                     )
                     break

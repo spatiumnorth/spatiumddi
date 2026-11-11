@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, select, union_all
 from sqlalchemy import delete as sa_delete
@@ -837,7 +837,7 @@ async def permanent_delete_from_trash(
     row_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
-) -> None:
+) -> Response:
     """Hard-delete a soft-deleted row from the trash.
 
     The agentless write-through for a Windows DHCP scope already fired at
@@ -1051,3 +1051,12 @@ async def permanent_delete_from_trash(
     # instead of leaving them to the safety tick.
     for gid in dns_wake_group_ids:
         await publish_wake(dns_group_channel(gid))
+    if kept_provider_copies:
+        # #3812: 204 has no body; say so in a header, as the zone delete does.
+        from app.services.dns.zone_move import provider_copies_kept_header  # noqa: PLC0415
+
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept_provider_copies)},
+        )
+    return Response(status_code=204)
