@@ -81,6 +81,19 @@ the chart does ([KUBERNETES.md, OpenShift](KUBERNETES.md#openshift)); the
 control plane runs under `restricted-v2`. Check the install the way that page
 describes. The default login is `admin` / `admin`, changed at first login.
 
+## Agent keys
+
+The DNS and DHCP agents authenticate to the API with a pre-shared key held in a
+Secret that the api, beat, worker and migrate pods read too. Under the Operator
+the chart generates a random key for each agent kind, kept across upgrades, when
+the resource gives neither `dnsAgents.agentKey.value` / `dhcpAgents.agentKey.value`
+nor an `existingSecret` (the Operator sets `agentKey.generate`). To own the key,
+set `existingSecret` to a Secret holding `DNS_AGENT_KEY` or `SPATIUM_AGENT_KEY`.
+Outside the Operator `generate` is off, so a plain `helm install` with agents
+enabled and no key still renders no Secret and fails. Without it, every pod
+that reads the Secret stays in `CreateContainerConfigError` while the resource
+reports `Deployed`.
+
 ## Upgrades
 
 Subscribing to a channel with automatic approval follows new Operator versions.
@@ -136,6 +149,10 @@ Operator starts at 1.0.0.
   `openshift.scc.create: false` stops the chart creating them; OLM still grants
   the rights, because a CSV cannot make them optional. On clusters without the
   `security.openshift.io` API the grant matches nothing.
+- **Uninstall by deleting the resource first.** The chart's SecurityContextConstraints
+  are cluster-scoped, so deleting the namespace without deleting the `SpatiumDDI`
+  resource leaves them behind. Delete the resource, wait for it to go, then the
+  namespace.
 - The bundle has no `relatedImages` yet, so disconnected (mirrored) clusters
   have to mirror the chart's images by hand.
 - `migrate.ttlSecondsAfterFinished` has no effect under the Operator (see

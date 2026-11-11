@@ -11,7 +11,10 @@
   `migrate.nameByContent` (default `false`), which names the migrate
   Job after a hash of its inputs instead of the Helm revision; the
   Operator sets it so its periodic reconcile does not upgrade the
-  release, and re-run the migration, every time. Nothing changes for
+  release, and re-run the migration, every time. The chart also gains
+  `dnsAgents.agentKey.generate` and `dhcpAgents.agentKey.generate`
+  (default `false`), which mint and keep a random agent key when none
+  is given; the Operator sets them. Nothing changes for
   existing installs, and the image is published only when the
   repository variable `OPERATOR_PUBLISH` is `true`. Not yet tested
   through OLM on a real cluster. See `docs/deployment/OPERATOR.md`.

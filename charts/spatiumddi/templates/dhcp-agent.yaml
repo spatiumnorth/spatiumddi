@@ -4,7 +4,14 @@
 {{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dhcpAgents.image.tag | default .Chart.AppVersion -}}
 {{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
-{{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}
+{{- if and (not .Values.dhcpAgents.agentKey.existingSecret) (or .Values.dhcpAgents.agentKey.value .Values.dhcpAgents.agentKey.generate) }}
+{{- /* agentKey.generate (#3862): no key given, so mint one and keep it across upgrades via lookup (as secret.yaml does). Off by default; the Operator turns it on. */ -}}
+{{- $prevAgentKey := "" -}}
+{{- $existingAgentSecret := lookup "v1" "Secret" .Release.Namespace $secretName -}}
+{{- if and .Values.dhcpAgents.agentKey.generate (not .Values.dhcpAgents.agentKey.value) $existingAgentSecret }}
+{{- $prevAgentKey = index $existingAgentSecret.data "SPATIUM_AGENT_KEY" | default "" | b64dec -}}
+{{- end }}
+{{- $agentKey := .Values.dhcpAgents.agentKey.value | default $prevAgentKey | default (randAlphaNum 48) -}}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -14,7 +21,7 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
 type: Opaque
 stringData:
-  SPATIUM_AGENT_KEY: {{ .Values.dhcpAgents.agentKey.value | quote }}
+  SPATIUM_AGENT_KEY: {{ $agentKey | quote }}
 ---
 {{- end }}
 {{- range $server := .Values.dhcpAgents.servers }}

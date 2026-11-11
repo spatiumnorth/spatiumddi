@@ -37,5 +37,11 @@
   dryRunOption: server
   overrideValues:
     migrate.nameByContent: "true"
+    # A CR that names no agent key would render no agent-key Secret, and every
+    # pod reading it (agents, api, beat, worker, migrate) would sit in
+    # CreateContainerConfigError while the CR still reported Deployed. Generate
+    # one when the CR gives neither ``value`` nor ``existingSecret``.
+    dnsAgents.agentKey.generate: "true"
+    dhcpAgents.agentKey.generate: "true"
   reconcilePeriod: 10m
   watchDependentResources: true

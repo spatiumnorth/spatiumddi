@@ -1251,6 +1251,9 @@ dnsAgents:
   agentKey:
     existingSecret: ""           # external secret with key DNS_AGENT_KEY
     value: ""
+    # Neither value nor existingSecret: render a Secret with a random key,
+    # kept across upgrades by lookup. Off by default; the Operator sets it.
+    generate: false
   # #2223 — how long a server may take to start listening on :53 before it
   # is restarted; the liveness probe (:53, 3 x 30 s) only starts after it.
   # A cold start renders and checks every zone before the daemon starts:
@@ -1350,6 +1353,9 @@ dhcpAgents:
   agentKey:
     existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY
     value: ""
+    # Neither value nor existingSecret: render a Secret with a random key,
+    # kept across upgrades by lookup. Off by default; the Operator sets it.
+    generate: false
   servers: []
     # - name: dhcp1
     #   role: primary
