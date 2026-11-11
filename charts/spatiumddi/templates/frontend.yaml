@@ -2,6 +2,9 @@
 {{- if and (include "spatiumddi.isOpenShift" .) .Values.frontend.tls.enabled -}}
 {{- fail "frontend.tls.enabled is the appliance's :80/:443 nginx and needs to bind privileged ports, which OpenShift's restricted SCC refuses. On OpenShift leave it off and let the Route terminate TLS (openshift.route)." -}}
 {{- end -}}
+{{- if and (include "spatiumddi.isOpenShift" .) .Values.frontend.hostNetwork -}}
+{{- fail "frontend.hostNetwork is the appliance's node-port :80 nginx: OpenShift's restricted SCC refuses host networking, and on OpenShift nginx listens on :8080, which the :80 hostPort would not match. On OpenShift leave it off and use the Route (openshift.route)." -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

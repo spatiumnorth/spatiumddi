@@ -72,12 +72,18 @@ spec:
           # nmap carries net_raw + net_bind_service as FILE capabilities, and
           # the kernel refuses to exec it unless BOTH are in the bounding set,
           # so both are added. The pod is bound to a SCC that allows exactly
-          # these (openshift-scc.yaml); without ``openshift.workerNetRaw`` the
+          # these (openshift.yaml); without ``openshift.workerNetRaw`` the
           # worker runs under plain restricted-v2 and nmap raw scans are off.
           securityContext:
             capabilities:
               drop: ["ALL"]
               add: ["NET_RAW", "NET_BIND_SERVICE"]
+            # Explicit, not left to the SCC: restricted-v2 also allows
+            # NET_BIND_SERVICE, and if admission picked it, its default
+            # (false) would set no_new_privs and the kernel would ignore the
+            # file capabilities. ``true`` makes restricted-v2 refuse the pod, so
+            # only the agents' SCC admits it. The uid stays non-root.
+            allowPrivilegeEscalation: true
           {{- end }}
           {{- else if .Values.worker.netRawCapability }}
           # NET_RAW unlocks nmap raw-socket scans (SYN, ``-O`` OS

@@ -348,12 +348,28 @@ render umbrella-openshift "$UMBRELLA" "${UMBRELLA_OPENSHIFT[@]}"
 render umbrella-openshift-ha "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" "${UMBRELLA_HA[@]}"
 render umbrella-openshift-defaults "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}"
 render umbrella-openshift-forced "$UMBRELLA" --set global.platform=openshift
+# SCCs managed by the cluster admins: the agents' ServiceAccounts must still be
+# rendered, or the pods that name them are never created.
+render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set openshift.scc.create=false \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
     || failures=$((failures + 1))
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
     "$OUT/umbrella-openshift-forced.yaml" || failures=$((failures + 1))
+if grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-no-scc.yaml"; then
+    echo "   FAIL #3852: openshift.scc.create=false still renders an SCC" >&2
+    failures=$((failures + 1))
+fi
+for sa in dns-agent dhcp-agent; do
+    if ! grep -qE "^  name: [a-z0-9-]+-spatiumddi-$sa$" "$OUT/umbrella-openshift-no-scc.yaml"; then
+        echo "   FAIL #3852: openshift.scc.create=false drops the $sa ServiceAccount the pods name" >&2
+        failures=$((failures + 1))
+    fi
+done
 # Negative control: the same check on a Kubernetes render, where the pins are
 # deliberately still present, must SEE them — or every pass above could be the
 # check parsing nothing. And the Kubernetes render must carry no OpenShift object.
@@ -381,6 +397,8 @@ neg3852() { # label expected-substring [helm --set args...]
 neg3852 "an unknown platform" "is not valid" --set global.platform=bogus
 neg3852 "the appliance TLS frontend on OpenShift" "frontend.tls.enabled" \
     --set global.platform=openshift --set frontend.tls.enabled=true
+neg3852 "the appliance hostNetwork frontend on OpenShift" "frontend.hostNetwork" \
+    --set global.platform=openshift --set frontend.hostNetwork=true
 neg3852 "a PowerDNS agent on OpenShift" "does not yet run under OpenShift" \
     --set global.platform=openshift --set dnsAgents.enabled=true \
     --set dnsAgents.servers[0].name=p --set dnsAgents.servers[0].flavor=powerdns

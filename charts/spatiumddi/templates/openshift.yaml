@@ -53,8 +53,10 @@ spec:
 ---
 {{- end }}
 
-{{- /* ── SCCs + the ServiceAccounts that may use them ── */ -}}
-{{- if .Values.openshift.scc.create }}
+{{- /* ── The agents' own ServiceAccounts ──
+       Rendered whether or not the chart creates the SCCs: the agent pods name
+       them on OpenShift either way, and with ``openshift.scc.create=false`` they
+       are what the cluster admins grant their own SCC to. */ -}}
 {{- if .Values.dnsAgents.enabled }}
 apiVersion: v1
 kind: ServiceAccount
@@ -64,6 +66,21 @@ metadata:
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
 ---
+{{- end }}
+{{- if .Values.dhcpAgents.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-dhcp-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
+---
+{{- end }}
+
+{{- /* ── SCCs, each usable only by the ServiceAccounts above ── */ -}}
+{{- if .Values.openshift.scc.create }}
+{{- if .Values.dnsAgents.enabled }}
 {{ include "spatiumddi.openshiftScc" (dict
     "root" .
     "name" (printf "%s-dns-agent" $sccPrefix)
@@ -77,14 +94,6 @@ metadata:
 {{- if .Values.dhcpAgents.enabled }}
 {{- $hostNet := false -}}
 {{- range .Values.dhcpAgents.servers }}{{ if .hostNetwork }}{{ $hostNet = true }}{{ end }}{{ end }}
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ $fullname }}-dhcp-agent
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
----
 {{ include "spatiumddi.openshiftScc" (dict
     "root" .
     "name" (printf "%s-dhcp-agent" $sccPrefix)

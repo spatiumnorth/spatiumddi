@@ -19,6 +19,9 @@ Asserts, on an OpenShift render:
     each is granted (``use``) only to ServiceAccounts that exist in the render,
     none is privileged, and none is granted to the namespace ``default``
     account or to a control-plane workload's ServiceAccount;
+  * every container that adds a capability sets ``allowPrivilegeEscalation:
+    true`` (the capabilities are for file capabilities, which no_new_privs
+    voids), and every ServiceAccount a pod names is rendered;
   * the control plane adds no capability but what an SCC it is bound to allows
     (so api / beat / frontend / migrate / postgres / redis, which are bound to
     none, add nothing at all).
@@ -70,6 +73,7 @@ def main(argv: list[str]) -> int:
         pins: list[str] = []
         sa_of: dict[str, str] = {}  # workload name -> ServiceAccount
         adds: dict[str, set[str]] = {}
+        esc: list[str] = []
         for kind in POD_KINDS:
             for d in by_kind.get(kind, []):
                 spec = pod_spec(d)
@@ -86,9 +90,16 @@ def main(argv: list[str]) -> int:
                     for k in PINS:
                         if k in csc:
                             pins.append(f"{kind}/{name} container {c['name']} {k}")
-                    adds.setdefault(name, set()).update(
-                        (csc.get("capabilities") or {}).get("add") or []
-                    )
+                    added = (csc.get("capabilities") or {}).get("add") or []
+                    adds.setdefault(name, set()).update(added)
+                    # Every capability this chart adds is for a FILE capability
+                    # on a daemon binary, which no_new_privs makes the kernel
+                    # ignore. restricted-v2 defaults allowPrivilegeEscalation to
+                    # false and allows NET_BIND_SERVICE, so a container that
+                    # leaves it unset can be admitted there and then fail to
+                    # bind. ``true`` makes restricted-v2 refuse it.
+                    if added and csc.get("allowPrivilegeEscalation") is not True:
+                        esc.append(f"{kind}/{name} container {c['name']}")
         if expect_pins:
             if pins:
                 print(f"ok: {path}: negative control sees {len(pins)} pin(s), e.g. {pins[0]}")
@@ -97,6 +108,11 @@ def main(argv: list[str]) -> int:
             continue
         for p in pins:
             failures.append(f"{path}: {p} is pinned; OpenShift's restricted SCC refuses it (#3852)")
+        for e in esc:
+            failures.append(
+                f"{path}: {e} adds a capability without allowPrivilegeEscalation: true; "
+                "restricted-v2 could admit it with no_new_privs set (#3852)"
+            )
 
         routes = by_kind.get("Route", [])
         frontend_svcs = {
@@ -134,6 +150,12 @@ def main(argv: list[str]) -> int:
         if require_scc and not sccs:
             failures.append(f"{path}: no SecurityContextConstraints rendered")
         sas = {d["metadata"]["name"] for d in by_kind.get("ServiceAccount", [])}
+        for name, sa in sa_of.items():
+            if sa != "default" and sa not in sas:
+                failures.append(
+                    f"{path}: {name} runs as ServiceAccount {sa!r}, which the render does "
+                    "not create — the pod is never created"
+                )
         for sa, names in granted.items():
             if sa == "default" or sa not in sas:
                 failures.append(
