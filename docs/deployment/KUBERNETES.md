@@ -852,18 +852,50 @@ new release's schema, as long as every table and column it uses is still there
 plane the only api pod is replaced first, so that install still takes its brief
 api outage on every rollout.
 
-### Upgrading to 1.0.0 from 2026.10.02-1
+### Upgrading from CalVer on Helm with DHCP agents
 
-Coming from the last CalVer release, 2026.10.02-1, with DHCP agents
-enabled: its Kea pod can be never Ready under that release's readiness
-probe, so the StatefulSet will not roll to the new image and `helm upgrade
---wait` times out (#1589, #3907). #3907 adds a `pre-upgrade` hook for
-this, and a site with no outbound access must load the new api image into
-its nodes before running the upgrade, since the hook runs it. Where your
-chart does not have the hook, delete the stuck `dhcp-kea-*` pod by hand
-after the upgrade and it comes back on the new image. See also
-[Upgrading to 1.0.0](APPLIANCE.md#upgrading-to-100) for the version path,
-and for the appliance and Compose shapes.
+A Helm install of `2026.10.02-1` or older with `dhcpAgents.enabled` cannot roll
+its Kea pod to a newer chart by itself (#3907). That release's readiness probe
+was a `tcpSocket` on `:8000`, which a standalone Kea never binds (#1589), so
+the pod is never Ready. The `dhcp-kea-*` StatefulSet is `OrderedReady` +
+`RollingUpdate`, and Kubernetes does not roll a StatefulSet whose pod is
+unready, so the pod stays on the old image and `helm upgrade --wait` times out.
+
+The chart handles this with a `pre-upgrade` hook (a Job, plus a ServiceAccount,
+a namespaced Role and a RoleBinding that exist only for the hook). It lists the
+DHCP agent StatefulSets of the release and, for one whose pod is Running but
+has not been Ready for 2 minutes, deletes the StatefulSet and that pod. Deleting
+only the pod would not help, because the hook runs before Helm updates the
+StatefulSet and the controller would recreate the pod from the old template.
+The volume claims are kept, and `helm upgrade` then creates the StatefulSet from
+the new template, so the new pod starts on the new image and probe. A
+StatefulSet whose pods are Ready is never touched, a fresh install never runs it, and an
+error in the hook is logged without failing the upgrade. DNS agents are not
+covered: their probe is the `:53` listener, which no release shipped in a form
+that could never pass.
+
+The hook Job runs the **new** release's api image, so an air-gapped site must
+load that image into the cluster (or its mirror registry) **before** `helm
+upgrade`, as it must for every other pod of the release. If the image cannot be
+pulled the Job hits its 120 s deadline and, because Helm waits for hooks, the
+upgrade fails; set `dhcpAgents.upgradeUnstickPods=false` to skip the hook.
+The hook runs on `helm upgrade` only, not on `helm rollback`: a rollback
+re-applies the old template, which cannot be rolled any better than before.
+A Job that starts but cannot reach the API server logs the error and exits 0,
+leaving the upgrade to proceed (a stuck pod then needs the manual step below);
+the hook never fails an upgrade on a cluster error, only on a missing image.
+
+To turn the hook off (`dhcpAgents.upgradeUnstickPods: false`), delete the pod
+by hand once `helm upgrade` has applied the new template; the StatefulSet
+recreates it from that template, on the new image and probe (the upgrade itself
+times out with `--wait`, or run it without):
+
+```bash
+kubectl -n <namespace> delete pod <dhcp-kea-name>-0
+```
+
+For the version path from 2026.10.02-1 to 1.0.0, and for the appliance and
+Compose shapes, see [Upgrading to 1.0.0](APPLIANCE.md#upgrading-to-100).
 
 ### Manual (manifest) upgrades
 
