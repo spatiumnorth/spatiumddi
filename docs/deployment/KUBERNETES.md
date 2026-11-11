@@ -65,8 +65,10 @@ resolves as the latest on its own (#1182).
 
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
-same chart, not a fork. Written against the SCCs of OpenShift 4.22 and 5.0;
-the install on both (OpenShift Local) is being verified. OKD is not tested.
+same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36, OpenShift
+Local): every control-plane pod admitted by `restricted-v2`, the BIND9 and Kea
+agents by the chart's own SCCs, DNS and DHCP serving. OpenShift 4.22 has the
+same SCCs and is being verified. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
@@ -80,6 +82,22 @@ there is no cluster to ask (`helm template`, Argo CD), say so with
 or set `global.platform: openshift` (the values are `auto`, `kubernetes` and
 `openshift`). On any other platform nothing below applies and the chart renders
 exactly as before.
+
+**Checking an install.** Every pod should be Ready, and the SCC that admitted
+each one is on its `openshift.io/scc` annotation:
+
+```bash
+oc get pods -n spatiumddi \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[*].ready,SCC:.metadata.annotations.openshift\.io/scc'
+oc get route -n spatiumddi        # the UI's hostname
+```
+
+The api, worker, beat, frontend, migrate Job, Postgres and Redis should show
+`restricted-v2` (or `restricted-v3`); the DNS and DHCP agents show the chart's
+`<fullname>-<namespace>-dns-agent` / `-dhcp-agent`. An agent shown under
+`restricted-v2` means the chart's SCC was not created or not granted (see
+`openshift.scc.create` below). Log in at the Route's hostname as `admin` /
+`admin`; you are asked to change the password at once.
 
 **What the chart does differently on OpenShift**
 
