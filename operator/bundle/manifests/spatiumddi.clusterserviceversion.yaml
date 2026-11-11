@@ -117,6 +117,10 @@ spec:
     - One SpatiumDDI per namespace. The Operator supports the OwnNamespace and
       SingleNamespace install modes only.
     - You need a StorageClass for the PostgreSQL, Redis and agent volumes.
+    - On OpenShift the Operator may create, change and delete any
+      SecurityContextConstraints in the cluster (it creates one per agent kind,
+      whose names it cannot know in advance). Treat that as cluster-admin-level
+      trust.
     - The default login is `admin` / `admin`; you must change it at first login.
     - The appliance-only chart options (`api.serviceAccount`,
       `api.upgradeOrchestratorRBAC`, `worker.serviceAccount`,
@@ -237,6 +241,14 @@ spec:
           - update
           - patch
           - delete
+        - apiGroups:
+          - apps
+          resources:
+          - replicasets
+          verbs:
+          - get
+          - list
+          - watch
         - apiGroups:
           - batch
           resources:

@@ -131,9 +131,13 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       # Fails (loudly) on a CalVer tag: OLM cannot order those.
+      # The version reaches the shell through env, never interpolated into the
+      # script: a tag name or a dispatch input is text a writer chose.
       - name: Build the community layout
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          operator/hack/build-bundle.sh "${{ steps.v.outputs.version }}" \
+          operator/hack/build-bundle.sh "$VERSION" \
             --community "$RUNNER_TEMP/community" --validate
 
       - uses: actions/upload-artifact@v7

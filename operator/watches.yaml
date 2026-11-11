@@ -12,15 +12,30 @@
   version: v1alpha1
   kind: SpatiumDDI
   chart: helm-charts/spatiumddi
-  # The chart's migrate Job is named per Helm revision and is not a hook, so an
-  # upgrade (a new operator version carrying a new chart) creates a fresh Job
-  # and the api / worker / beat pods wait for it in their wait-for-migrate init
-  # containers. Nothing to order here.
+  # helm-operator decides whether to upgrade by dry-running ``helm upgrade``
+  # on every reconcile and comparing that manifest with the deployed one. Two
+  # things in the chart would make the two ALWAYS differ, and so upgrade on
+  # every reconcile (#3862 validation):
   #
-  # KNOWN RISK, to verify on a real cluster: the Job is garbage-collected by
-  # ttlSecondsAfterFinished (600 s), and helm-operator re-creates a release
-  # resource that vanishes, so a finished migrate Job may reappear and re-run
-  # ``alembic upgrade head`` (idempotent) every reconcile. docs/deployment/
-  # OPERATOR.md names the mitigation (a long migrate.ttlSecondsAfterFinished).
+  #   * ``lookup``. The chart preserves its generated Secrets (SECRET_KEY, the
+  #     PostgreSQL and Redis passwords) by looking up the live ones. Helm only
+  #     runs lookup in a dry-run when the dry-run talks to the server, so the
+  #     default (client) dry-run mints fresh random values every time.
+  #     ``server`` fixes that; the operator's Role covers every lookup the
+  #     chart makes (hack/check_rbac.py asserts it).
+  #   * The migrate Job's name. By default it carries .Release.Revision, which a
+  #     dry-run upgrade always renders one higher than the deployed release.
+  #     Each such upgrade also deletes the previous Job, mid-migration, and the
+  #     delete event triggers the next reconcile: a loop. ``nameByContent``
+  #     names it after a hash of its inputs instead, and keeps it after it
+  #     finishes (no TTL), so it is neither re-created nor re-run until the
+  #     values, the chart or the Kubernetes version change.
+  #
+  # An Operator upgrade carries a new chart version, so the hash changes: a new
+  # migrate Job runs ``alembic upgrade head``, and the api / worker / beat pods
+  # wait for the schema in their wait-for-migrate init containers.
+  dryRunOption: server
+  overrideValues:
+    migrate.nameByContent: "true"
   reconcilePeriod: 10m
   watchDependentResources: true

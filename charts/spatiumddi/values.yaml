@@ -730,6 +730,13 @@ migrate:
   # Without a TTL the cluster would slowly accumulate one completed Job
   # per Helm revision.
   ttlSecondsAfterFinished: 600
+  # #3862 — name the Job after a hash of its inputs (values, chart version,
+  # Kubernetes version) instead of the Helm revision, and keep it once it has
+  # finished (ttlSecondsAfterFinished is then not rendered). For controllers
+  # that re-render the chart on a timer and act on any difference, such as
+  # the SpatiumDDI OLM Operator, which sets it. A plain ``helm upgrade``
+  # leaves it false.
+  nameByContent: false
   # Annotations on the Job object (not its pod). For GitOps controllers that
   # render the chart with ``helm template``, where ``.Release.Revision`` is
   # always 1: the Job is then ``<release>-migrate-r1`` on every sync, and a

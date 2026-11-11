@@ -27,6 +27,13 @@ rules:
 - apiGroups: [apps]
   resources: [deployments, statefulsets]
   verbs: [get, list, watch, create, update, patch, delete]
+# Read-only: the chart's ``lookup`` of the live ReplicaSets (the rollback-safe
+# rollout strategy, spatiumddi.newerReleaseServing). watches.yaml runs every
+# dry-run with lookup enabled, and a lookup the operator may not make fails
+# the whole render.
+- apiGroups: [apps]
+  resources: [replicasets]
+  verbs: [get, list, watch]
 - apiGroups: [batch]
   resources: [jobs, cronjobs]
   verbs: [get, list, watch, create, update, patch, delete]

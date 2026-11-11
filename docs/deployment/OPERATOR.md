@@ -86,10 +86,30 @@ describes. The default login is `admin` / `admin`, changed at first login.
 Subscribing to a channel with automatic approval follows new Operator versions.
 An Operator upgrade swaps the Operator pod, whose image carries the new chart.
 For each `SpatiumDDI` it then runs the equivalent of `helm upgrade` with the
-resource's unchanged values: the image tags move to the new version, the chart's
-migrate Job (named per Helm revision) runs `alembic upgrade head`, and the api,
-worker and beat pods wait for it in their `wait-for-migrate` init containers.
-Take a PostgreSQL backup before every upgrade; the Operator does not.
+resource's unchanged values: the image tags move to the new version, a new
+migrate Job runs `alembic upgrade head`, and the api, worker and beat pods wait
+for the schema in their `wait-for-migrate` init containers. Take a PostgreSQL
+backup before every upgrade; the Operator does not.
+
+How the Operator decides to upgrade matters here. helm-operator dry-runs
+`helm upgrade` on every reconcile (every 10 minutes, and whenever a resource of
+the release changes) and runs a real upgrade only when that manifest differs
+from the deployed one. The Operator therefore sets two things in
+`operator/watches.yaml`:
+
+- `dryRunOption: server`, so the chart's `lookup` calls run in the dry-run.
+  Without it the generated Secrets (SECRET_KEY, the PostgreSQL and Redis
+  passwords) render fresh random values in every dry-run, and every reconcile
+  looks like a change.
+- `migrate.nameByContent: "true"` as an override value. The migrate Job is then
+  named after a hash of the values, the chart version and the Kubernetes
+  version instead of the Helm revision, and the finished Job is kept rather than
+  expired after 600 s. A revision in the name differs in every dry-run, and an
+  expired Job would be re-created and re-run. A change to the resource's spec,
+  a new Operator version or a cluster upgrade gives a new name, so the Job is
+  replaced, never patched (its pod template is immutable). One finished
+  `-migrate-<hash>` Job per release stays in the namespace; this setting is
+  forced and the resource cannot turn it off.
 
 OLM orders versions as SemVer (`updateGraph: semver-mode`): `1.0.0-rc.1` <
 `1.0.0` < `1.0.1`. CalVer releases (`2026.09.04-1`) are not SemVer, so the
@@ -104,16 +124,26 @@ Operator starts at 1.0.0.
   error on the resource's status.
 - The CRD has no field schema: the chart validates at render time and the
   Operator shows the error on the resource's status.
-- The Operator creates SecurityContextConstraints (cluster-scoped) when running
-  on OpenShift; that is its one cluster-scoped grant. `openshift.scc.create:
-  false` avoids using it.
+- **The SecurityContextConstraints grant is a cluster-admin-level trust.** On
+  OpenShift the chart creates one SCC per agent kind, named after the release
+  and namespace, so OLM grants the Operator create / update / patch / delete on
+  every SCC in the cluster (the names cannot be listed in advance), and `use`
+  on any SCC in the namespaces it watches. Anything holding those verbs can
+  write a privileged SCC, or loosen a built-in one, and so run privileged pods.
+  The chart's own SCCs are `restricted-v2` plus the agents' capabilities (no
+  privileged containers, no host paths), and the Operator holds no `bind` or
+  `escalate`, but install it only where you would let it administer SCCs.
+  `openshift.scc.create: false` stops the chart creating them; OLM still grants
+  the rights, because a CSV cannot make them optional. On clusters without the
+  `security.openshift.io` API the grant matches nothing.
 - The bundle has no `relatedImages` yet, so disconnected (mirrored) clusters
   have to mirror the chart's images by hand.
-- **To verify on a cluster:** the migrate Job is garbage-collected by
-  `ttlSecondsAfterFinished` (default 600 s) and the Operator may recreate a
-  vanished release resource, re-running the (idempotent) migration. If finished
-  `-migrate-r*` Jobs reappear, set `migrate.ttlSecondsAfterFinished` to a large
-  value in the resource.
+- `migrate.ttlSecondsAfterFinished` has no effect under the Operator (see
+  Upgrades).
+- **Not yet verified on a real cluster through OLM:** install, the upgrade loop
+  being absent (the release revision stays put across reconciles), and an
+  Operator upgrade. The behaviour above is from helm-operator's source
+  (operator-sdk v1.42.3, Helm 3.18) and chart renders.
 
 ## For maintainers
 
@@ -143,7 +173,10 @@ and
 as a PR to each. Publishing the image is off until the repository variable
 `OPERATOR_PUBLISH` is `true`; the workflow then pushes
 `ghcr.io/spatiumnorth/spatiumddi-operator:<version>` (amd64 and arm64) on a
-release tag and uploads the community layout as an artifact.
+SemVer release tag and uploads the community layout as an artifact. Unlike
+`release.yml`, that job does not wait for CI on the tagged commit and runs no
+Trivy scan (the PR check's scan is advisory, because the open findings are inside
+upstream's helm-operator binary), so check both before turning it on.
 
 **Trying a bundle.** Build the image (`make operator-image VERSION=...`), push
 it somewhere the cluster can pull, generate the bundle with

@@ -7,6 +7,11 @@ config/rbac/{role,cluster_role}.yaml, and every Role / ClusterRole the chart
 renders must be a subset of what the operator itself holds (the API refuses to
 create a Role granting more than its creator has: RBAC escalation prevention).
 
+It also covers every ``lookup`` in the chart (the operator dry-runs with
+lookup on, and a Forbidden lookup fails the render), renders with the watch's
+overrideValues applied, and checks the migrate Job is not named per Helm
+revision under them (that would make helm-operator upgrade on every reconcile).
+
 A chart change that adds a template, or widens one of its Roles, would
 otherwise pass every chart test and fail only on a cluster, as a Helm error on
 the custom resource. This renders the chart in each supported shape and checks.
@@ -20,6 +25,7 @@ has been bitten by before).
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -29,6 +35,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 CHART = ROOT / "charts" / "spatiumddi"
 RBAC = ROOT / "operator" / "config" / "rbac"
 SAMPLE = ROOT / "operator" / "config" / "samples" / "ddi_v1alpha1_spatiumddi.yaml"
+WATCHES = ROOT / "operator" / "watches.yaml"
 
 # kind -> (apiGroup, resource, namespaced)
 KINDS = {
@@ -50,6 +57,13 @@ KINDS = {
     "SecurityContextConstraints": ("security.openshift.io", "securitycontextconstraints", False),
 }
 WRITE = ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Kinds the chart reads with ``lookup`` but never renders.
+LOOKUP_ONLY = {"ReplicaSet": ("apps", "replicasets", True)}
+# ``lookup "<apiVersion>" "<Kind>" <namespace> <name>``. The operator dry-runs
+# with lookup enabled (watches.yaml dryRunOption: server), and Helm fails the
+# render on a Forbidden lookup, so each one needs get (a named lookup) or list
+# (an empty name lists).
+LOOKUP = re.compile(r'lookup\s+"([^"]*)"\s+"([A-Za-z]+)"')
 
 AGENTS = [
     "--set", "dnsAgents.enabled=true", "--set", "dnsAgents.servers[0].name=ns1",
@@ -102,6 +116,23 @@ def render(args: list[str]) -> list[dict]:
     return docs
 
 
+def lookups() -> set[str]:
+    kinds: set[str] = set()
+    for tpl in (CHART / "templates").rglob("*"):
+        if tpl.is_file():
+            kinds.update(m.group(2) for m in LOOKUP.finditer(tpl.read_text()))
+    return kinds
+
+
+def override_args() -> list[str]:
+    """The watch's overrideValues, as helm-operator applies them (strings)."""
+    watch = yaml.safe_load(WATCHES.read_text())[0]
+    out: list[str] = []
+    for k, v in (watch.get("overrideValues") or {}).items():
+        out += ["--set-string", f"{k}={v}"]
+    return out
+
+
 def main() -> int:
     role = load_rules("role.yaml")
     cluster = load_rules("cluster_role.yaml")
@@ -113,8 +144,24 @@ def main() -> int:
     profiles["sample-cr-kubernetes"] = ["--set", "global.platform=kubernetes", "-f", str(sample_file)]
     profiles["sample-cr-openshift"] = ["--set", "global.platform=openshift", "-f", str(sample_file)]
 
+    overrides = override_args()
+    profiles = {name: args + overrides for name, args in profiles.items()}
+
     problems: list[str] = []
     checked = 0
+    found = lookups()
+    if not found:
+        print("check_rbac: found no lookup in the chart, so the scan is broken", file=sys.stderr)
+        return 2
+    for kind in sorted(found):
+        if kind not in KINDS and kind not in LOOKUP_ONLY:
+            problems.append(f"chart looks up kind {kind}, unknown to check_rbac.py")
+            continue
+        group, resource, namespaced = KINDS.get(kind) or LOOKUP_ONLY[kind]
+        for verb in ("get", "list"):
+            checked += 1
+            if (group, resource, verb) not in (role if namespaced else cluster):
+                problems.append(f"chart looks up {kind}: operator lacks {verb} on {group or 'core'}/{resource}")
     for name, args in profiles.items():
         for doc in render(args):
             kind = doc["kind"]
@@ -128,6 +175,14 @@ def main() -> int:
                 checked += 1
                 if (group, resource, verb) not in held:
                     problems.append(f"[{name}] {kind}: operator lacks {verb} on {group or 'core'}/{resource}")
+            if kind == "Job" and "-migrate-" in doc["metadata"]["name"]:
+                # helm-operator upgrades whenever a dry-run differs from the
+                # deployed manifest (watches.yaml). A revision-numbered or
+                # expiring migrate Job always differs: an upgrade loop.
+                checked += 1
+                if re.search(r"-migrate-r[0-9]+$", doc["metadata"]["name"]) or "ttlSecondsAfterFinished" in doc["spec"]:
+                    problems.append(f"[{name}] migrate Job {doc['metadata']['name']} is named per revision or "
+                                    "expires: watches.yaml must set migrate.nameByContent")
             if kind == "Route" and doc["spec"].get("host") and ("route.openshift.io", "routes/custom-host", "create") not in role:
                 problems.append(f"[{name}] Route sets spec.host: operator lacks create on routes/custom-host")
             if kind in ("Role", "ClusterRole"):
