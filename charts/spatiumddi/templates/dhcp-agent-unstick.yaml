@@ -6,8 +6,11 @@
        RollingUpdate and Kubernetes will not roll one whose pod is unready, so
        the pod stayed on the old image and ``helm upgrade --wait`` timed out.
        This pre-upgrade hook deletes such a pod (Running, not Ready for 2+
-       minutes) before the rollout; a Ready pod is never touched. Fresh installs
-       never run it. DNS agents are not included: their readiness probe is the
+       minutes) together with its StatefulSet, so ``helm upgrade`` recreates the
+       StatefulSet from the NEW template (deleting only the pod would bring it
+       back from the OLD one, still unready); PVCs are kept. A StatefulSet whose
+       pods are Ready is never touched. Fresh installs never run it. DNS agents
+       are not included: their readiness probe is the
        :53 listener, which a healthy daemon always binds, so no release shipped
        a probe that could never pass; a DNS pod that is unready for a real
        reason (no bundle yet) is not cured by deleting it. */ -}}
@@ -37,7 +40,7 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "delete"]

@@ -1,16 +1,21 @@
-"""Delete the stuck, never-Ready pods of this release's DHCP agent StatefulSets (#3907).
+"""Delete the DHCP agent StatefulSets of this release that hold a stuck pod (#3907).
 
 Run by the ``pre-upgrade`` hook in templates/dhcp-agent-unstick.yaml, stdlib
 only. A StatefulSet with ``OrderedReady`` + ``RollingUpdate`` will not replace a
 pod that is not Ready, so a pod that was never Ready on the old release (the
 old readiness probe could never pass) keeps the new image from ever rolling
-out. Deleting such a pod lets the controller recreate it from the new revision.
+out. Deleting just the pod does not help: this hook runs BEFORE Helm updates
+the StatefulSet, so the controller would recreate the pod from the OLD
+template, unready again. So the StatefulSet object itself is deleted (with its
+stuck pods; the PVCs from volumeClaimTemplates are kept), and ``helm upgrade``
+then creates it from the NEW template, because a release resource that is
+missing from the cluster is created.
 
-Only a pod that is Running, not Ready, and has been not Ready for at least
-MIN_UNREADY_SECONDS is deleted, and only if a StatefulSet carrying the
-release's DHCP agent labels owns it. A Ready pod is never touched. Best
-effort: any error is logged and the hook still exits 0, so this can never be
-the reason an upgrade fails.
+A StatefulSet is only touched if one of its pods is Running, not Ready, and has
+been not Ready for at least MIN_UNREADY_SECONDS, and only if it carries the
+release's DHCP agent labels. A StatefulSet whose pods are Ready is never
+touched. Best effort: any error is logged and the hook still exits 0, so this
+can never be the reason an upgrade fails.
 """
 
 import datetime
@@ -18,6 +23,7 @@ import json
 import os
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,7 +75,19 @@ def select_stuck_pods(statefulsets, pods_by_sts, now, min_unready):
     return out
 
 
-def run(call, ns, selector, min_unready, now):
+def _wait_gone(call, path, sleep, tries=30):
+    for _ in range(tries):
+        try:
+            call("GET", path)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return True
+            raise
+        sleep(2)
+    return False
+
+
+def run(call, ns, selector, min_unready, now, sleep=time.sleep):
     stss = call("GET", f"/apis/apps/v1/namespaces/{ns}/statefulsets", {"labelSelector": selector})[
         "items"
     ]
@@ -83,9 +101,22 @@ def run(call, ns, selector, min_unready, now):
             "GET", f"/api/v1/namespaces/{ns}/pods", {"labelSelector": sel}
         )["items"]
     stuck = select_stuck_pods(stss, pods_by_sts, now, min_unready)
+    by_sts = {}
     for sts_name, pod_name in stuck:
-        print(f"dhcp-unstick: deleting not-Ready pod {pod_name} of {sts_name}")
-        call("DELETE", f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+        by_sts.setdefault(sts_name, []).append(pod_name)
+    background = {"kind": "DeleteOptions", "apiVersion": "v1", "propagationPolicy": "Background"}
+    for sts_name, pod_names in by_sts.items():
+        sts_path = f"/apis/apps/v1/namespaces/{ns}/statefulsets/{sts_name}"
+        print(f"dhcp-unstick: deleting StatefulSet {sts_name} (not-Ready pod {pod_names})")
+        call("DELETE", sts_path, None, background)
+        for pod_name in pod_names:
+            try:
+                call("DELETE", f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:  # already collected with its StatefulSet
+                    raise
+        if not _wait_gone(call, sts_path, sleep):
+            print(f"dhcp-unstick: StatefulSet {sts_name} still present after 60s")
     if not stuck:
         print(f"dhcp-unstick: nothing to do ({len(stss)} DHCP StatefulSet(s), no stuck pod)")
     return stuck
@@ -100,10 +131,14 @@ def main():
     api = "https://" + host + ":" + os.environ["KUBERNETES_SERVICE_PORT"]
     ctx = ssl.create_default_context(cafile=SA + "ca.crt")
 
-    def call(method, path, query=None):
+    def call(method, path, query=None, body=None):
         url = api + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        req = urllib.request.Request(url, method=method)
+        req = urllib.request.Request(
+            url, method=method, data=json.dumps(body).encode() if body else None
+        )
         req.add_header("Authorization", "Bearer " + token)
+        if body:
+            req.add_header("Content-Type", "application/json")
         with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
             return json.loads(resp.read())
 

@@ -1,4 +1,4 @@
-"""The DHCP unstick hook deletes only stuck pods of the release's DHCP StatefulSets (#3907).
+"""The DHCP unstick hook deletes only StatefulSets holding a stuck pod, of the release's DHCP StatefulSets (#3907).
 
 ``charts/spatiumddi/files/dhcp-unstick-pods.py`` is what the chart's
 pre-upgrade hook runs. Lives in ``appliance/tests`` because that is the
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import urllib.error
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,20 +60,31 @@ class FakeApi:
     def __init__(self, stss, pods):
         self.stss, self.pods = stss, pods
         self.calls = []
+        self.gone = set()
 
-    def __call__(self, method, path, query=None):
-        self.calls.append((method, path, query))
+    def __call__(self, method, path, query=None, body=None):
+        self.calls.append((method, path, query, body))
         if method == "DELETE":
+            if "/statefulsets/" in path:
+                self.gone.add(path.rsplit("/", 1)[1])
             return {}
         if path.endswith("/statefulsets"):
             # The API filters by label; the script must ask for the release's DHCP agents.
             assert query == {"labelSelector": SELECTOR}
             return {"items": self.stss}
+        if "/statefulsets/" in path:
+            if path.rsplit("/", 1)[1] in self.gone:
+                raise urllib.error.HTTPError(path, 404, "gone", {}, None)
+            return {}
         name = query["labelSelector"].split("=", 1)[1]
         return {"items": self.pods.get(name, [])}
 
-    def deleted(self):
-        return [p.rsplit("/", 1)[1] for m, p, _ in self.calls if m == "DELETE"]
+    def deleted(self, kind):
+        return [p.rsplit("/", 1)[1] for m, p, _, _ in self.calls if m == "DELETE" and kind in p]
+
+
+def no_sleep(_):
+    pass
 
 
 def test_deletes_only_the_unready_pod_and_leaves_ready_ones():
@@ -83,8 +95,12 @@ def test_deletes_only_the_unready_pod_and_leaves_ready_ones():
             "dhcp-kea-b": [pod("dhcp-kea-b-0", "dhcp-kea-b", ready=True)],
         },
     )
-    mod.run(api, "ns", SELECTOR, 120, NOW)
-    assert api.deleted() == ["dhcp-kea-a-0"]
+    mod.run(api, "ns", SELECTOR, 120, NOW, no_sleep)
+    # The StatefulSet goes too: a pod deleted alone is recreated from the OLD template.
+    assert api.deleted("/statefulsets/") == ["dhcp-kea-a"]
+    assert api.deleted("/pods/") == ["dhcp-kea-a-0"]
+    delete = [c for c in api.calls if c[0] == "DELETE" and "/statefulsets/" in c[1]][0]
+    assert delete[3]["propagationPolicy"] == "Background"  # PVCs are never touched
 
 
 def test_a_recently_unready_or_not_running_pod_is_left_alone():
@@ -97,8 +113,8 @@ def test_a_recently_unready_or_not_running_pod_is_left_alone():
             ]
         },
     )
-    mod.run(api, "ns", SELECTOR, 120, NOW)
-    assert api.deleted() == []
+    mod.run(api, "ns", SELECTOR, 120, NOW, no_sleep)
+    assert api.deleted("/") == []
 
 
 def test_a_pod_not_owned_by_the_statefulset_is_left_alone():
@@ -106,19 +122,19 @@ def test_a_pod_not_owned_by_the_statefulset_is_left_alone():
         [sts("dhcp-kea-a")],
         {"dhcp-kea-a": [pod("stray", "someone-else", ready=False)]},
     )
-    mod.run(api, "ns", SELECTOR, 120, NOW)
-    assert api.deleted() == []
+    mod.run(api, "ns", SELECTOR, 120, NOW, no_sleep)
+    assert api.deleted("/") == []
 
 
 def test_no_statefulsets_means_no_pod_listing_and_no_delete():
     api = FakeApi([], {})
-    assert mod.run(api, "ns", SELECTOR, 120, NOW) == []
-    assert [m for m, _, _ in api.calls] == ["GET"]
+    assert mod.run(api, "ns", SELECTOR, 120, NOW, no_sleep) == []
+    assert [c[0] for c in api.calls] == ["GET"]
 
 
 def test_a_pod_with_no_ready_condition_uses_its_start_time():
     p = pod("dhcp-kea-a-0", "dhcp-kea-a", ready=False, age=900)
     p["status"]["conditions"] = []
     api = FakeApi([sts("dhcp-kea-a")], {"dhcp-kea-a": [p]})
-    mod.run(api, "ns", SELECTOR, 120, NOW)
-    assert api.deleted() == ["dhcp-kea-a-0"]
+    mod.run(api, "ns", SELECTOR, 120, NOW, no_sleep)
+    assert api.deleted("/statefulsets/") == ["dhcp-kea-a"]

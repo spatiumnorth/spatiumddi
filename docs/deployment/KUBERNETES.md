@@ -863,16 +863,21 @@ unready, so the pod stays on the old image and `helm upgrade --wait` times out.
 
 The chart handles this with a `pre-upgrade` hook (a Job, plus a ServiceAccount,
 a namespaced Role and a RoleBinding that exist only for the hook). It lists the
-DHCP agent StatefulSets of the release and deletes a pod that is Running but
-has not been Ready for 2 minutes, so the controller recreates it from the new
-revision. A Ready pod is never touched, a fresh install never runs it, and an
+DHCP agent StatefulSets of the release and, for one whose pod is Running but
+has not been Ready for 2 minutes, deletes the StatefulSet and that pod. Deleting
+only the pod would not help, because the hook runs before Helm updates the
+StatefulSet and the controller would recreate the pod from the old template.
+The volume claims are kept, and `helm upgrade` then creates the StatefulSet from
+the new template, so the new pod starts on the new image and probe. A
+StatefulSet whose pods are Ready is never touched, a fresh install never runs it, and an
 error in the hook is logged without failing the upgrade. DNS agents are not
 covered: their probe is the `:53` listener, which no release shipped in a form
 that could never pass.
 
 To turn the hook off (`dhcpAgents.upgradeUnstickPods: false`), delete the pod
-by hand once the upgrade has been applied; the StatefulSet recreates it on the
-new image:
+by hand once `helm upgrade` has applied the new template; the StatefulSet
+recreates it from that template, on the new image and probe (the upgrade itself
+times out with `--wait`, or run it without):
 
 ```bash
 kubectl -n <namespace> delete pod <dhcp-kea-name>-0

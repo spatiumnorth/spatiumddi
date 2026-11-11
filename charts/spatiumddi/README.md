@@ -375,7 +375,7 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
 | `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
-| `dhcpAgents.upgradeUnstickPods` | `true` | #3907 — a `pre-upgrade` hook deletes a DHCP agent pod that is Running but has not been Ready for 2+ minutes, so its OrderedReady StatefulSet can roll (needed coming from `2026.10.02-1` or older). Ready pods are never touched; `false` turns the hook off |
+| `dhcpAgents.upgradeUnstickPods` | `true` | #3907 — a `pre-upgrade` hook deletes a DHCP agent StatefulSet (PVCs kept) holding a pod that is Running but not Ready for 2+ minutes, so Helm recreates it from the new template (needed coming from `2026.10.02-1` or older). Ready pods are never touched; `false` turns the hook off |
 | `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dhcpAgents.servers` | `[]` |  |
 

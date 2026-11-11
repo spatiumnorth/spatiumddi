@@ -1337,8 +1337,8 @@ dhcpAgents:
   # StatefulSet with new PVCs and a new pod name (the server's identity).
   prefixWithFullname: false
   # #3907 — a ``helm upgrade`` runs a pre-upgrade hook that deletes a DHCP agent
-  # pod that is Running but has not been Ready for 2+ minutes, so the
-  # StatefulSet (OrderedReady) can roll it onto the new image. Needed coming
+  # StatefulSet (PVCs kept) holding a pod that is Running but not Ready for 2+
+  # minutes, so Helm recreates it from the new template (OrderedReady blocks a roll). Needed coming
   # from 2026.10.02-1 or older, whose readiness probe could never pass (#1589).
   # Ready pods are never touched; fresh installs never run it. false = delete
   # such a pod by hand (docs/deployment/KUBERNETES.md, "Upgrading from CalVer on Helm with DHCP agents").

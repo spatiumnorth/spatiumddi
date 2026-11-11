@@ -354,12 +354,20 @@ render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
     --set openshift.scc.create=false \
     --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
     --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+# #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
+# here too (no pinned uid, its ServiceAccount exists).
+render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
     || failures=$((failures + 1))
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
-    "$OUT/umbrella-openshift-forced.yaml" || failures=$((failures + 1))
+    "$OUT/umbrella-openshift-forced.yaml" "$OUT/umbrella-openshift-upgrade.yaml" \
+    || failures=$((failures + 1))
+if ! grep -q 'component: dhcp-unstick' "$OUT/umbrella-openshift-upgrade.yaml"; then
+    echo "   FAIL #3907: the OpenShift upgrade render has no unstick hook" >&2
+    failures=$((failures + 1))
+fi
 if grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-no-scc.yaml"; then
     echo "   FAIL #3852: openshift.scc.create=false still renders an SCC" >&2
     failures=$((failures + 1))
@@ -1212,7 +1220,7 @@ grants = sorted(
     (r["resources"][0], tuple(sorted(r["verbs"])))
     for ro in objs if ro["kind"] == "Role" for r in ro["rules"]
 )
-if grants != [("pods", ("delete", "get", "list")), ("statefulsets", ("get", "list"))]:
+if grants != [("pods", ("delete", "get", "list")), ("statefulsets", ("delete", "get", "list"))]:
     print(f"FAIL unstick Role grants {grants} (#3907)", file=sys.stderr); rc = 1
 for d in docs:
     if d["kind"] in ("ClusterRole", "ClusterRoleBinding") and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick":
