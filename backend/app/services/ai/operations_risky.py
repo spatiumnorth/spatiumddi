@@ -1159,6 +1159,11 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         lambda: address_ids_of_zones(db, [args.zone_id]),
         lambda: _require_zone(args.group_id, args.zone_id, db, lock="delete"),
     )
+    # #3826: refused while another trashed subnet's records sit in a shared auto
+    # reverse zone, as the Trash purge of the zone refuses (#3504). Before anything is swept or pushed.
+    from app.services.dns.reverse_zone import refuse_delete_with_trashed_sharers
+
+    await refuse_delete_with_trashed_sharers(db, zone)
     # The queued ops once the zone row is held, as on the soft branch: a record
     # write that held the row first has committed its op by now. Swept before
     # the lock, that op outlived the zone with a NULL ``zone_id``.
