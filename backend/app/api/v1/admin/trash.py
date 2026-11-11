@@ -884,7 +884,8 @@ async def permanent_delete_from_trash(
 
     label = _row_label(target)
     records_retracted = 0
-    purged_extra: dict[str, int] = {}
+    purged_extra: dict[str, Any] = {}
+    kept_provider_copies: list[str] = []
     dns_wake_group_ids: set[uuid.UUID] = set()
     # Subnets whose DHCP mirrors the purge frees; recounted once, last, just
     # before the commit (#3354).
@@ -947,7 +948,10 @@ async def permanent_delete_from_trash(
             if sharers:
                 await _refuse_shared_zone(db, target, label, sharers)
             # Refuses (409) while a LIVE record sits under the trashed zone (#1957).
-            await purge_trashed_zone(db, target)
+            kept_provider_copies = await purge_trashed_zone(db, target)
+            if kept_provider_copies:
+                # #3812: shared with another group's live zone; left at the provider.
+                purged_extra = {"provider_copies_kept": kept_provider_copies}
             dns_wake_group_ids.add(target.group_id)
         elif isinstance(target, Subnet):
             live = await _live_children(db, [target], [], [])

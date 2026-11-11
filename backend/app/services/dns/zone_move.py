@@ -403,6 +403,56 @@ async def shared_provider_sources(
     return result
 
 
+async def shared_zone_copy_servers(db: AsyncSession, zone: DNSZone) -> SharedProviderResult:
+    """Servers of ``zone``'s group whose provider copy another live zone still uses (#3812).
+
+    A delete (permanent, Trash purge, reverse-zone retirement) pushes ``delete`` to
+    every agentless server of the zone's group. When another group holds a LIVE zone
+    of the same name and has an agentless server of the same driver that shares the
+    provider (same identity, or either identity unreadable: unknown counts as shared,
+    as in #3805), the provider holds one copy for both. Deleting it removes the other
+    group's zone. Such a server is kept out of the delete.
+    """
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+
+    result = SharedProviderResult()
+    sources = await _agentless_servers(db, zone.group_id)
+    if not sources:
+        return result
+    other_group_ids = (
+        (
+            await db.execute(
+                select(DNSZone.group_id).where(
+                    DNSZone.name == zone.name,
+                    DNSZone.group_id != zone.group_id,
+                    DNSZone.id != zone.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for gid in set(other_group_ids):
+        others = await _agentless_servers(db, gid)
+        for src in sources:
+            if src.id in result.keep_ids:
+                continue
+            ident = get_driver(src.driver).provider_identity(src)
+            for oth in others:
+                if oth.driver != src.driver:
+                    continue
+                oident = get_driver(oth.driver).provider_identity(oth)
+                if ident is None or oident is None or ident == oident:
+                    result.keep_ids.add(src.id)
+                    result.notes.append(
+                        f"Provider copy kept on '{src.name}': another group still has a "
+                        f"live zone '{zone.name}' that may use the same provider copy "
+                        f"(via '{oth.name}'). Remove it there by hand if it is separate."
+                    )
+                    break
+    return result
+
+
 async def _drivers_of(db: AsyncSession, group_id: uuid.UUID) -> list[str]:
     rows = (
         (

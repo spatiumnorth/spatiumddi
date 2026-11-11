@@ -8473,7 +8473,14 @@ async def delete_zone(
     pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
     if pending is not None:
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
-    await op.apply(db, current_user, args)
+    result = await op.apply(db, current_user, args)
+    kept = result.get("provider_copies_kept") if isinstance(result, dict) else None
+    if kept:
+        # #3812: 204 has no body; say so in a header.
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": " | ".join(kept).replace("\n", " ")},
+        )
     return None
 
 
@@ -8879,8 +8886,14 @@ async def _push_zone_to_agentless_servers(
     group_id: uuid.UUID | None = None,
     skip_server_ids: set[uuid.UUID] | None = None,
     adopt_existing_server_ids: set[uuid.UUID] | None = None,
+    kept_notes: list[str] | None = None,
 ) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    ``kept_notes`` (delete, no ``group_id`` override): a delete leaves out the
+    servers whose provider copy another group's live zone of the same name
+    still uses (#3812); the reasons are appended here for the caller's audit
+    row and response.
 
     ``adopt_existing_server_ids`` (create only): servers whose existing copy
     of the zone is SpatiumDDI's own, reached through the source group's server
@@ -8941,10 +8954,20 @@ async def _push_zone_to_agentless_servers(
     )
     # ``skip_server_ids``: servers the caller has decided not to drive (the
     # move keeps a source copy that shares a provider with the target, #3805).
+    skip = set(skip_server_ids or set())
+    if op == "delete" and group_id is None:
+        # #3812: the zone's own group is being deleted from; the move passes
+        # ``group_id`` and decides its keeps itself (#3805).
+        from app.services.dns.zone_move import shared_zone_copy_servers  # noqa: PLC0415
+
+        shared = await shared_zone_copy_servers(db, zone)
+        skip |= shared.keep_ids
+        if kept_notes is not None:
+            kept_notes.extend(shared.notes)
+        for note in shared.notes:
+            logger.warning("dns.zone.delete_kept_shared_provider_copy", zone=zone.name, note=note)
     targets = [
-        s
-        for s in servers_res.scalars().all()
-        if is_agentless(s.driver) and s.id not in (skip_server_ids or set())
+        s for s in servers_res.scalars().all() if is_agentless(s.driver) and s.id not in skip
     ]
     if not targets:
         return []
