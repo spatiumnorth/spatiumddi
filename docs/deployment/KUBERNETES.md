@@ -83,6 +83,9 @@ or set `global.platform: openshift` (the values are `auto`, `kubernetes` and
 `openshift`). On any other platform nothing below applies and the chart renders
 exactly as before.
 
+**Operator.** An OLM Operator wrapping this chart (OperatorHub, upgrades
+through OLM) is in progress: [OPERATOR.md](OPERATOR.md).
+
 **Checking an install.** Every pod should be Ready, and the SCC that admitted
 each one is on its `openshift.io/scc` annotation:
 

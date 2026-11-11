@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spatiumddi-operator
+  labels:
+    app.kubernetes.io/name: spatiumddi-operator
+    app.kubernetes.io/part-of: spatiumddi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spatiumddi-operator
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/name: spatiumddi-operator
+        app.kubernetes.io/part-of: spatiumddi
+    spec:
+      serviceAccountName: spatiumddi-operator
+      # Restricted-v2 / Pod Security "restricted" compatible, and any uid: no
+      # runAsUser is pinned (OpenShift assigns one; the image's own user 1001
+      # and group 0 work elsewhere).
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: manager
+        image: ghcr.io/spatiumnorth/spatiumddi-operator:0.0.0-dev
+        args:
+        - --leader-elect
+        - --leader-election-id=spatiumddi-operator
+        - --health-probe-bind-address=:8081
+        # Metrics stay on the loopback listener: nothing scrapes them in v1,
+        # and the default 0.0.0.0 bind would need a Service + RBAC to protect.
+        - --metrics-bind-address=127.0.0.1:8080
+        env:
+        # OLM puts the OperatorGroup's target namespace here for the
+        # OwnNamespace / SingleNamespace install modes. helm-operator reads
+        # WATCH_NAMESPACE; unset it would watch the whole cluster, which the
+        # Role above (namespaced) would not permit.
+        - name: WATCH_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['olm.targetNamespaces']
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop: [ALL]
+        livenessProbe:
+          httpGet: {path: /healthz, port: 8081}
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet: {path: /readyz, port: 8081}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 10m
+            memory: 128Mi

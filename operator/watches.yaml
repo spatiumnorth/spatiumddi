@@ -1,0 +1,26 @@
+# One watch: a SpatiumDDI custom resource IS a Helm release of the umbrella
+# chart, and the CR's spec is that chart's values.yaml.
+#
+# ``chart`` points at the copy the Dockerfile vendors from charts/spatiumddi at
+# image build time (and stamps with the release version). There is no second
+# copy of the chart in this directory and there must not be one: it would
+# drift, and every chart fix would then need a second edit here.
+#
+# The release name is the CR's metadata.name, so a CR called ``spatiumddi``
+# renders the same object names as ``helm install spatiumddi``.
+- group: ddi.spatiumddi.com
+  version: v1alpha1
+  kind: SpatiumDDI
+  chart: helm-charts/spatiumddi
+  # The chart's migrate Job is named per Helm revision and is not a hook, so an
+  # upgrade (a new operator version carrying a new chart) creates a fresh Job
+  # and the api / worker / beat pods wait for it in their wait-for-migrate init
+  # containers. Nothing to order here.
+  #
+  # KNOWN RISK, to verify on a real cluster: the Job is garbage-collected by
+  # ttlSecondsAfterFinished (600 s), and helm-operator re-creates a release
+  # resource that vanishes, so a finished migrate Job may reappear and re-run
+  # ``alembic upgrade head`` (idempotent) every reconcile. docs/deployment/
+  # OPERATOR.md names the mitigation (a long migrate.ttlSecondsAfterFinished).
+  reconcilePeriod: 10m
+  watchDependentResources: true

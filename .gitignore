@@ -79,3 +79,4 @@ docs/.jekyll-metadata
 
 # Local `make charts-lint` renders (#966)
 .charts-render/
+operator/.stage.*/

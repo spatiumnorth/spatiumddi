@@ -1,0 +1,120 @@
+# The hand-written part of the ClusterServiceVersion. ``operator-sdk generate
+# bundle`` (run by hack/build-bundle.sh) fills in the version, the deployment,
+# the permissions, the CRD and ``alm-examples``; the script also replaces the
+# @ICON@ placeholder with the base64 of docs/assets/logo-icon.svg, so the logo
+# has one source.
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: spatiumddi.v0.0.0
+  namespace: placeholder
+  annotations:
+    alm-examples: "[]"
+    capabilities: Seamless Upgrades
+    categories: Networking
+    containerImage: ghcr.io/spatiumnorth/spatiumddi-operator:0.0.0-dev
+    createdAt: "1970-01-01T00:00:00Z"
+    description: Install and upgrade SpatiumDDI, the open-source all-in-one DNS, DHCP and IPAM platform, with managed BIND9, PowerDNS, Technitium and Kea servers.
+    repository: https://github.com/spatiumnorth/spatiumddi
+    support: Spatium North
+    operatorframework.io/suggested-namespace: spatiumddi
+    operators.openshift.io/valid-subscription: '["None (open source, Apache 2.0)"]'
+    features.operators.openshift.io/disconnected: "false"
+    features.operators.openshift.io/fips-compliant: "false"
+    features.operators.openshift.io/proxy-aware: "false"
+    features.operators.openshift.io/tls-profiles: "false"
+    features.operators.openshift.io/token-auth-aws: "false"
+    features.operators.openshift.io/token-auth-azure: "false"
+    features.operators.openshift.io/token-auth-gcp: "false"
+    features.operators.openshift.io/cnf: "false"
+    features.operators.openshift.io/cni: "false"
+    features.operators.openshift.io/csi: "false"
+spec:
+  displayName: SpatiumDDI
+  description: |
+    SpatiumDDI is a self-hosted DNS, DHCP and IPAM platform: one control plane
+    over real servers. It does not just render configuration for DNS and DHCP
+    servers someone else runs. It deploys and operates BIND9, PowerDNS,
+    Technitium and Kea itself, and manages Windows DNS and DHCP over WinRM.
+
+    It brings group-based RBAC over LDAP, OIDC, SAML, RADIUS or TACACS+, an
+    append-only audit log, importers for existing BIND, Windows, PowerDNS,
+    Technitium, Kea, ISC and NetBox estates, a REST API behind every click, and
+    no telemetry of any kind, so it runs air-gapped. Everything is Apache 2.0,
+    with no licence to count against.
+
+    ## What this Operator does
+
+    One `SpatiumDDI` resource installs one SpatiumDDI stack in a namespace: the
+    API, web UI, Celery worker and scheduler, the database migration, an
+    in-cluster PostgreSQL and Redis (or CloudNativePG and Redis Sentinel, or
+    your own), and optionally managed BIND9 / PowerDNS / Technitium DNS agents
+    and Kea DHCP agents. The resource's `spec` is the values of the SpatiumDDI
+    Helm chart, so every chart option is available and every chart fix is
+    inherited. On OpenShift the Operator also creates the Route and the
+    SecurityContextConstraints the DNS and DHCP agents need; the control plane
+    itself runs under the default `restricted-v2` SCC.
+
+    Upgrading the Operator upgrades the stack: each Operator version carries one
+    chart version, and the database migration runs as part of the rollout.
+    Back up PostgreSQL before every upgrade.
+
+    ## Before you install
+
+    - This is Capability Level II (seamless upgrades). Backups, scaling
+      automation, metrics and auto-tuning are not part of it yet.
+    - One SpatiumDDI per namespace. The Operator supports the OwnNamespace and
+      SingleNamespace install modes only.
+    - You need a StorageClass for the PostgreSQL, Redis and agent volumes.
+    - The default login is `admin` / `admin`; you must change it at first login.
+    - The appliance-only chart options (`api.serviceAccount`,
+      `api.upgradeOrchestratorRBAC`, `worker.serviceAccount`,
+      `api.serviceControlRBAC`, `api.applianceHostMounts`) need cluster-scoped
+      rights the Operator does not hold and are not supported through it.
+  icon:
+  - base64data: "@ICON@"
+    mediatype: image/svg+xml
+  keywords:
+  - ddi
+  - dns
+  - dhcp
+  - ipam
+  - bind9
+  - kea
+  - networking
+  maintainers:
+  - name: mzac
+    email: "mzac@users.noreply.github.com"
+  - name: amoona6
+    email: "amoona6@users.noreply.github.com"
+  maturity: alpha
+  provider:
+    name: Spatium North
+  links:
+  - name: Website
+    url: https://www.spatiumddi.com
+  - name: Documentation
+    url: https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/OPERATOR.md
+  - name: Source
+    url: https://github.com/spatiumnorth/spatiumddi
+  minKubeVersion: 1.31.0
+  installModes:
+  - supported: true
+    type: OwnNamespace
+  - supported: true
+    type: SingleNamespace
+  - supported: false
+    type: MultiNamespace
+  - supported: false
+    type: AllNamespaces
+  customresourcedefinitions:
+    owned:
+    - name: spatiumddis.ddi.spatiumddi.com
+      kind: SpatiumDDI
+      version: v1alpha1
+      displayName: SpatiumDDI
+      description: One SpatiumDDI install (control plane and optional DNS / DHCP agents). The spec is the SpatiumDDI Helm chart's values.
+  install:
+    strategy: deployment
+    spec:
+      deployments: []

@@ -316,6 +316,9 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "perf/generators/orchestrator/tests/test_relay_sockets.py",
         "perf/requirements.txt",
         "perf/README.md",
+        # #3862 — the OperatorHub Operator has its own operator.yml workflow.
+        "operator/Dockerfile",
+        "operator/bundle/manifests/spatiumddi-operator.clusterserviceversion.yaml",
         "CHANGELOG.md",
         # #2431 — a PR's changelog fragment is prose, like CHANGELOG.md.
         "changelog.d/2431-merge-queue.md",

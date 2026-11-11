@@ -80,12 +80,16 @@ set -euo pipefail
 #               through to "unrecognised → run" and spent all 8 shards on
 #               tests that could not be affected, while running none that
 #               could — exactly inverted.
+#   operator/   The OperatorHub Operator (#3862): a Dockerfile, a watches file,
+#               OLM manifests and shell. Nothing in backend/ imports it; its
+#               own workflow (operator.yml) builds the image and validates the
+#               bundle.
 #   changelog.d/  CHANGELOG fragments (#2431): one per PR, folded into
 #               CHANGELOG.md at release prep. Prose, like CHANGELOG.md itself;
 #               the fold script they feed lives in scripts/, which runs.
 #   NOTICE      Third-party attribution.
 #   LICENSE     Apache 2.0 text.
-IRRELEVANT='^(docs/|website/|frontend/|charts/|k8s/|agent/|appliance/|perf/|changelog\.d/|\.github/|[^/]+\.md$|NOTICE$|LICENSE$)'
+IRRELEVANT='^(docs/|website/|frontend/|charts/|k8s/|agent/|appliance/|perf/|operator/|changelog\.d/|\.github/|[^/]+\.md$|NOTICE$|LICENSE$)'
 
 # Load the must-run carve-outs. A missing or unreadable manifest fails toward
 # running the suite — same direction as every other failure here.

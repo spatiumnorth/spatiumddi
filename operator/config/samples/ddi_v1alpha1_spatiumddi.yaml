@@ -1,0 +1,30 @@
+# Smallest useful install: one replica of each control-plane workload, the
+# chart's own standalone PostgreSQL and Redis, one BIND9 agent and one Kea
+# agent. Every key is a key of the chart's values.yaml; anything omitted keeps
+# the chart default. Name it "spatiumddi" to get object names without a
+# doubled prefix.
+apiVersion: ddi.spatiumddi.com/v1alpha1
+kind: SpatiumDDI
+metadata:
+  name: spatiumddi
+spec:
+  api:
+    replicas: 1
+    autoscaling:
+      enabled: false
+  worker:
+    replicas: 1
+  frontend:
+    replicas: 1
+  postgresql:
+    kind: standalone
+  redis:
+    kind: standalone
+  dnsAgents:
+    enabled: true
+    servers:
+    - name: ns1
+  dhcpAgents:
+    enabled: true
+    servers:
+    - name: dhcp1

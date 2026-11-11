@@ -1,0 +1,394 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  annotations:
+    alm-examples: |-
+      [
+        {
+          "apiVersion": "ddi.spatiumddi.com/v1alpha1",
+          "kind": "SpatiumDDI",
+          "metadata": {
+            "name": "spatiumddi"
+          },
+          "spec": {
+            "api": {
+              "autoscaling": {
+                "enabled": false
+              },
+              "replicas": 1
+            },
+            "dhcpAgents": {
+              "enabled": true,
+              "servers": [
+                {
+                  "name": "dhcp1"
+                }
+              ]
+            },
+            "dnsAgents": {
+              "enabled": true,
+              "servers": [
+                {
+                  "name": "ns1"
+                }
+              ]
+            },
+            "frontend": {
+              "replicas": 1
+            },
+            "postgresql": {
+              "kind": "standalone"
+            },
+            "redis": {
+              "kind": "standalone"
+            },
+            "worker": {
+              "replicas": 1
+            }
+          }
+        }
+      ]
+    capabilities: Seamless Upgrades
+    categories: Networking
+    containerImage: ghcr.io/spatiumnorth/spatiumddi-operator:0.0.0-dev
+    createdAt: "1970-01-01T00:00:00Z"
+    description: Install and upgrade SpatiumDDI, the open-source all-in-one DNS, DHCP
+      and IPAM platform, with managed BIND9, PowerDNS, Technitium and Kea servers.
+    features.operators.openshift.io/cnf: "false"
+    features.operators.openshift.io/cni: "false"
+    features.operators.openshift.io/csi: "false"
+    features.operators.openshift.io/disconnected: "false"
+    features.operators.openshift.io/fips-compliant: "false"
+    features.operators.openshift.io/proxy-aware: "false"
+    features.operators.openshift.io/tls-profiles: "false"
+    features.operators.openshift.io/token-auth-aws: "false"
+    features.operators.openshift.io/token-auth-azure: "false"
+    features.operators.openshift.io/token-auth-gcp: "false"
+    operatorframework.io/suggested-namespace: spatiumddi
+    operators.openshift.io/valid-subscription: '["None (open source, Apache 2.0)"]'
+    operators.operatorframework.io/builder: operator-sdk-v1.42.3
+    operators.operatorframework.io/project_layout: helm.sdk.operatorframework.io/v1
+    repository: https://github.com/spatiumnorth/spatiumddi
+    support: Spatium North
+  name: spatiumddi.v0.0.0-dev
+  namespace: placeholder
+spec:
+  apiservicedefinitions: {}
+  customresourcedefinitions:
+    owned:
+    - description: One SpatiumDDI install (control plane and optional DNS / DHCP agents).
+        The spec is the SpatiumDDI Helm chart's values.
+      displayName: SpatiumDDI
+      kind: SpatiumDDI
+      name: spatiumddis.ddi.spatiumddi.com
+      version: v1alpha1
+  description: |
+    SpatiumDDI is a self-hosted DNS, DHCP and IPAM platform: one control plane
+    over real servers. It does not just render configuration for DNS and DHCP
+    servers someone else runs. It deploys and operates BIND9, PowerDNS,
+    Technitium and Kea itself, and manages Windows DNS and DHCP over WinRM.
+
+    It brings group-based RBAC over LDAP, OIDC, SAML, RADIUS or TACACS+, an
+    append-only audit log, importers for existing BIND, Windows, PowerDNS,
+    Technitium, Kea, ISC and NetBox estates, a REST API behind every click, and
+    no telemetry of any kind, so it runs air-gapped. Everything is Apache 2.0,
+    with no licence to count against.
+
+    ## What this Operator does
+
+    One `SpatiumDDI` resource installs one SpatiumDDI stack in a namespace: the
+    API, web UI, Celery worker and scheduler, the database migration, an
+    in-cluster PostgreSQL and Redis (or CloudNativePG and Redis Sentinel, or
+    your own), and optionally managed BIND9 / PowerDNS / Technitium DNS agents
+    and Kea DHCP agents. The resource's `spec` is the values of the SpatiumDDI
+    Helm chart, so every chart option is available and every chart fix is
+    inherited. On OpenShift the Operator also creates the Route and the
+    SecurityContextConstraints the DNS and DHCP agents need; the control plane
+    itself runs under the default `restricted-v2` SCC.
+
+    Upgrading the Operator upgrades the stack: each Operator version carries one
+    chart version, and the database migration runs as part of the rollout.
+    Back up PostgreSQL before every upgrade.
+
+    ## Before you install
+
+    - This is Capability Level II (seamless upgrades). Backups, scaling
+      automation, metrics and auto-tuning are not part of it yet.
+    - One SpatiumDDI per namespace. The Operator supports the OwnNamespace and
+      SingleNamespace install modes only.
+    - You need a StorageClass for the PostgreSQL, Redis and agent volumes.
+    - The default login is `admin` / `admin`; you must change it at first login.
+    - The appliance-only chart options (`api.serviceAccount`,
+      `api.upgradeOrchestratorRBAC`, `worker.serviceAccount`,
+      `api.serviceControlRBAC`, `api.applianceHostMounts`) need cluster-scoped
+      rights the Operator does not hold and are not supported through it.
+  displayName: SpatiumDDI
+  icon:
+  - base64data: PHN2ZyB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgdmlld0JveD0iMCAwIDEyMCAxMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CiAgPHJlY3Qgd2lkdGg9IjEyMCIgaGVpZ2h0PSIxMjAiIHJ4PSIyMiIgZmlsbD0iIzBmMTcyYSIvPgogIDxyZWN0IHg9IjE0IiB5PSIxNCIgd2lkdGg9IjkyIiBoZWlnaHQ9IjkyIiByeD0iMTMiIGZpbGw9IiMxMzRlNGEiLz4KICA8cmVjdCB4PSIyOCIgeT0iMjgiIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjkiIGZpbGw9IiMwZDk0ODgiLz4KICA8cmVjdCB4PSI0MiIgeT0iNDIiIHdpZHRoPSIzNiIgaGVpZ2h0PSIzNiIgcng9IjUiIGZpbGw9IiMyZGQ0YmYiLz4KICA8Y2lyY2xlIGN4PSI2MCIgY3k9IjYwIiByPSI5IiBmaWxsPSIjZmZmZmZmIi8+Cjwvc3ZnPgo=
+    mediatype: image/svg+xml
+  install:
+    spec:
+      clusterPermissions:
+      - rules:
+        - apiGroups:
+          - security.openshift.io
+          resources:
+          - securitycontextconstraints
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        serviceAccountName: spatiumddi-operator
+      deployments:
+      - label:
+          app.kubernetes.io/name: spatiumddi-operator
+          app.kubernetes.io/part-of: spatiumddi
+        name: spatiumddi-operator
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: spatiumddi-operator
+          strategy: {}
+          template:
+            metadata:
+              annotations:
+                kubectl.kubernetes.io/default-container: manager
+              labels:
+                app.kubernetes.io/name: spatiumddi-operator
+                app.kubernetes.io/part-of: spatiumddi
+            spec:
+              containers:
+              - args:
+                - --leader-elect
+                - --leader-election-id=spatiumddi-operator
+                - --health-probe-bind-address=:8081
+                - --metrics-bind-address=127.0.0.1:8080
+                env:
+                - name: WATCH_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['olm.targetNamespaces']
+                image: ghcr.io/spatiumnorth/spatiumddi-operator:0.0.0-dev
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8081
+                  initialDelaySeconds: 15
+                  periodSeconds: 20
+                name: manager
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: 8081
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+                  requests:
+                    cpu: 10m
+                    memory: 128Mi
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                    - ALL
+                  readOnlyRootFilesystem: false
+              securityContext:
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
+              serviceAccountName: spatiumddi-operator
+              terminationGracePeriodSeconds: 10
+      permissions:
+      - rules:
+        - apiGroups:
+          - ""
+          resources:
+          - services
+          - serviceaccounts
+          - configmaps
+          - persistentvolumeclaims
+          - secrets
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - apps
+          resources:
+          - deployments
+          - statefulsets
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - batch
+          resources:
+          - jobs
+          - cronjobs
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - autoscaling
+          resources:
+          - horizontalpodautoscalers
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - networking.k8s.io
+          resources:
+          - ingresses
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - route.openshift.io
+          resources:
+          - routes
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - route.openshift.io
+          resources:
+          - routes/custom-host
+          verbs:
+          - create
+        - apiGroups:
+          - postgresql.cnpg.io
+          resources:
+          - clusters
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - rbac.authorization.k8s.io
+          resources:
+          - roles
+          - rolebindings
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - security.openshift.io
+          resources:
+          - securitycontextconstraints
+          verbs:
+          - use
+        - apiGroups:
+          - ""
+          resources:
+          - events
+          verbs:
+          - create
+          - patch
+        - apiGroups:
+          - ddi.spatiumddi.com
+          resources:
+          - spatiumddis
+          - spatiumddis/status
+          - spatiumddis/finalizers
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - coordination.k8s.io
+          resources:
+          - leases
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        serviceAccountName: spatiumddi-operator
+    strategy: deployment
+  installModes:
+  - supported: true
+    type: OwnNamespace
+  - supported: true
+    type: SingleNamespace
+  - supported: false
+    type: MultiNamespace
+  - supported: false
+    type: AllNamespaces
+  keywords:
+  - ddi
+  - dns
+  - dhcp
+  - ipam
+  - bind9
+  - kea
+  - networking
+  links:
+  - name: Website
+    url: https://www.spatiumddi.com
+  - name: Documentation
+    url: https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/OPERATOR.md
+  - name: Source
+    url: https://github.com/spatiumnorth/spatiumddi
+  maintainers:
+  - email: mzac@users.noreply.github.com
+    name: mzac
+  - email: amoona6@users.noreply.github.com
+    name: amoona6
+  maturity: alpha
+  minKubeVersion: 1.31.0
+  provider:
+    name: Spatium North
+  version: 0.0.0-dev
