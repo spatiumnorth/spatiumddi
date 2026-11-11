@@ -27,6 +27,15 @@ image:
 # Chart-wide settings the appliance + multi-node HA work consume.
 # Plain K8s / docker-compose installs leave these at defaults.
 global:
+  # #3852 — ``auto`` (the default) detects OpenShift from the cluster serving
+  # ``security.openshift.io/v1``; ``openshift`` / ``kubernetes`` force it.
+  # ``helm template`` has no cluster to ask, so pass ``--api-versions
+  # security.openshift.io/v1`` or set this. On OpenShift the chart omits the
+  # pinned uid / gid / fsGroup values its restricted SCC refuses, runs the
+  # frontend on :8080, and renders the ``openshift`` objects below. Everywhere
+  # else it renders exactly as before.
+  platform: auto
+
   # #272 Phase 1 — every control-plane workload (api / frontend /
   # worker / beat / postgres / redis) merges this map into its
   # nodeSelector block on top of any per-component override. The
@@ -62,6 +71,40 @@ global:
   # answering the LAN should outrank the API that configures it when a node
   # runs out of memory.
   servicePriorityClassName: ""
+
+# ── OpenShift (#3852) ────────────────────────────────────────────────────────
+# Read ONLY when the platform is OpenShift (``global.platform``). See
+# docs/deployment/KUBERNETES.md, "OpenShift".
+openshift:
+  # A ``route.openshift.io/v1`` Route in front of the frontend Service.
+  route:
+    enabled: true
+    # Empty lets the router pick ``<name>-<namespace>.<apps domain>``.
+    host: ""
+    # ``edge`` (the router terminates TLS with its default certificate unless
+    # you add one) or ``none`` (plain HTTP). passthrough / reencrypt need TLS
+    # inside the frontend pod and are refused.
+    termination: edge
+    # What the router does with plain HTTP when ``termination: edge``:
+    # Redirect | Allow | None.
+    insecureEdgeTerminationPolicy: Redirect
+    # The Web UI streams (AI chat, logs, cluster health); the router's 30 s
+    # default drops an idle stream.
+    annotations:
+      haproxy.router.openshift.io/timeout: 1h
+  scc:
+    # Create the SecurityContextConstraints, ServiceAccounts and RBAC the DNS /
+    # DHCP agents need to bind :53 / :67. Set false where SCCs are managed by
+    # the cluster admins: then grant an SCC allowing NET_BIND_SERVICE (and
+    # NET_RAW for Kea) with allowPrivilegeEscalation true to the
+    # ``<fullname>-dns-agent`` / ``-dhcp-agent`` ServiceAccounts yourself.
+    create: true
+  # Give the worker NET_RAW + NET_BIND_SERVICE (and its own SCC) so nmap raw
+  # scans work. OFF by default: the control plane then runs under plain
+  # restricted-v2 with no grant at all, and nmap / tcpdump fall back to what an
+  # unprivileged process can do. Needs ``worker.serviceAccount.enabled`` and
+  # ``worker.netRawCapability`` (the default).
+  workerNetRaw: false
 
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
 fullnameOverride: ""

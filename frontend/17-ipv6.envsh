@@ -44,8 +44,8 @@ case "$_spatium_v6" in
 esac
 
 if [ "$_spatium_v6" = "on" ]; then
-    SPATIUM_LISTEN6_80="listen [::]:80;"
-    SPATIUM_LISTEN6_80_DS="listen [::]:80 default_server;"
+    SPATIUM_LISTEN6_80="listen [::]:${SPATIUM_HTTP_PORT:-80};"
+    SPATIUM_LISTEN6_80_DS="listen [::]:${SPATIUM_HTTP_PORT:-80} default_server;"
     SPATIUM_LISTEN6_443_DS="listen [::]:443 ssl default_server;"
 else
     SPATIUM_LISTEN6_80=""
