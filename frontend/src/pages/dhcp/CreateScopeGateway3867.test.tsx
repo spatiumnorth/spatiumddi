@@ -85,6 +85,13 @@ describe("New DHCP Scope pool suggestion (#3867)", () => {
     expect(control("End IP").value).toBe("10.0.20.254");
   });
 
+  it("keeps the larger side when the gateway is mid-range", async () => {
+    getSubnet.mockResolvedValue(subnet("10.0.20.200"));
+    open();
+    await waitFor(() => expect(control("End IP").value).toBe("10.0.20.199"));
+    expect(control("Start IP").value).toBe("10.0.20.10");
+  });
+
   it("leaves the usual .1 gateway alone", async () => {
     getSubnet.mockResolvedValue(subnet("10.0.20.1"));
     open();
@@ -108,6 +115,9 @@ describe("New DHCP Scope pool suggestion (#3867)", () => {
     await screen.findByText(/existing IP/);
     expect(screen.getByText(/10\.0\.20\.50/)).toBeTruthy();
     expect(onClose).not.toHaveBeenCalled();
+    // Enter in a field while the notice is up must not create a second scope.
+    fireEvent.submit(control("Name").form!);
+    expect(createScope).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText("OK"));
     expect(onClose).toHaveBeenCalled();
   });

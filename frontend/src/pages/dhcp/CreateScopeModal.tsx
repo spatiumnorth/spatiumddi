@@ -661,6 +661,9 @@ function ScopeModalForm({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // The scope exists once the notice is up; Enter must not create a
+          // second one (#3867).
+          if (poolNotice) return;
           // Always try without adopting first; the 409 banner below offers
           // the explicit adopt-and-retry (#865).
           mut.mutate(false);
