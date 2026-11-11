@@ -23,7 +23,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
   <dl class="idx-facts">
     <div class="idx-fact"><dt>DNS engines</dt><dd>BIND9 · PowerDNS · Technitium · Windows DNS · Cloudflare · Route 53 · Azure · Google</dd></div>
     <div class="idx-fact"><dt>DHCP engines</dt><dd>Kea · Windows DHCP</dd></div>
-    <div class="idx-fact"><dt>Deploy as</dt><dd>OS appliance · Docker Compose · Kubernetes</dd></div>
+    <div class="idx-fact"><dt>Deploy as</dt><dd>OS appliance · Docker Compose · Kubernetes · OpenShift</dd></div>
     <div class="idx-fact"><dt>Telemetry</dt><dd><a href="PRIVACY.html">None — ever</a></dd></div>
     <div class="idx-fact"><dt>License</dt><dd>Apache 2.0 · <a href="{{ site.links.github }}">source on GitHub</a></dd></div>
   </dl>
@@ -210,7 +210,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
     </a>
     <a class="idx-card" href="deployment/KUBERNETES.html">
       <span class="idx-card-title">Kubernetes</span>
-      <span class="idx-card-desc">Umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA</span>
+      <span class="idx-card-desc">Umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA; installs on OpenShift under its default SCCs</span>
     </a>
     <a class="idx-card" href="deployment/SIZING.html">
       <span class="idx-card-title">Sizing</span>
