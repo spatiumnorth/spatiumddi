@@ -685,6 +685,30 @@ async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple
                 "restore_zone_reconcile_plan_failed", subnet=str(subnet_id), error=_first_line(exc)
             )
             continue
+        # A freed address (a reservation deleted while the zone sat in the
+        # Trash keeps its row, status "available", and its old name) is not one
+        # the restore publishes: #3186 took its record out of the zone's batch
+        # on purpose, and this must not put it back.
+        create_ids = [i for u in units for i in u.create_ip_ids]
+        if create_ids:
+            freed = set(
+                (
+                    await db.execute(
+                        select(IPAddress.id).where(
+                            IPAddress.id.in_(create_ids), IPAddress.status == "available"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for u in units:
+                u.create_ip_ids = [i for i in u.create_ip_ids if i not in freed]
+            units = [
+                u
+                for u in units
+                if u.create_ip_ids or u.update_record_ids or u.delete_record_ids or u.mirror_ip_ids
+            ]
         for i in range(0, len(units), SYNC_BATCH_SIZE):
             batch = units[i : i + SYNC_BATCH_SIZE]
             errors: list[str] = []
