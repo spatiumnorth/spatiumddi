@@ -1098,6 +1098,20 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active zone {obj.name!r} already exists in this group/view"
+        # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
+        # not counted when a second server joins its group, so the restore must
+        # hold it to the same rule the direct sign does, or the group ends up
+        # with two servers each signing it with keys of their own.
+        if obj.dnssec_enabled:
+            from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
+
+            refusal = await sign_refusal(db, obj.group_id, lock=False)
+            if refusal:
+                return (
+                    f"Zone {obj.name!r} is DNSSEC-signed and cannot be restored: "
+                    f"{refusal.removeprefix('Refusing to enable DNSSEC: ')} "
+                    "Remove the extra server first, then restore the zone."
+                )
 
     # DNSRecord is checked set-based for the whole batch by
     # ``_record_conflicts`` (#1389), which ``restore_batch`` runs itself.
