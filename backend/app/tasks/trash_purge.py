@@ -538,7 +538,11 @@ async def _sweep() -> dict[str, Any]:
             logger.warning(
                 "trash_purge.held_back_live_children",
                 counts=held_back,
-                hint="expired rows with a live row under them are kept; restore or move the live row",
+                hint=(
+                    "expired rows with a live row under them, or a subnet an E911 location "
+                    "binding names (its own or on an address), are kept; restore or move the "
+                    "live row, or remove the binding under Network > E911 > Bindings"
+                ),
             )
 
         refused: dict[str, int] = {}

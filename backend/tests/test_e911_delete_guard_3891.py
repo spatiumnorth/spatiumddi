@@ -241,3 +241,84 @@ async def test_copilot_permanent_subnet_delete_refused_even_with_force(db_sessio
         )
     assert ei.value.status_code == 409
     assert "HQ-3F" in ei.value.detail
+
+
+@pytest.mark.asyncio
+async def test_trash_purge_of_block_refused_while_a_trashed_subnet_is_bound(
+    client: AsyncClient, db_session: AsyncSession
+):
+    h = await _admin(db_session)
+    sub = await _trashed_bound_subnet(db_session)
+    block = await db_session.get(IPBlock, sub.block_id)
+    block.deleted_at = datetime.now(UTC) - timedelta(days=60)
+    await db_session.flush()
+    r = await client.delete(f"/api/v1/admin/trash/ip_block/{block.id}", headers=h)
+    assert r.status_code == 409, r.text
+    assert "HQ-3F" in r.json()["detail"]
+    assert await _bindings(db_session) == 1
+
+
+@pytest.mark.asyncio
+async def test_copilot_preview_refuses_permanent_delete_of_a_bound_subnet(
+    db_session: AsyncSession,
+):
+    from app.services.ai.operations_risky import DeleteSubnetArgs, _preview_delete_subnet
+
+    erl = await _erl(db_session)
+    sub = await _subnet(db_session)
+    db_session.add(ERLBinding(erl_id=erl.id, rule_kind="subnet", subnet_id=sub.id))
+    user = User(
+        username="su2",
+        email="su2@example.com",
+        display_name="su2",
+        hashed_password="x",
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    res = await _preview_delete_subnet(
+        db_session, user, DeleteSubnetArgs(subnet_id=sub.id, permanent=True, force=True)
+    )
+    assert res.ok is False and "HQ-3F" in res.detail
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_bound_subnet_purges_the_rest_and_says_why(
+    db_session: AsyncSession, monkeypatch
+):
+    """The whole sweep: the bound subnet stays, its sibling goes, the log names E911."""
+    from contextlib import asynccontextmanager
+
+    from app.tasks import trash_purge
+
+    sub = await _trashed_bound_subnet(db_session)
+    other = await _subnet_in_same_block(db_session, sub)
+    other_id, sub_id = other.id, sub.id
+
+    @asynccontextmanager
+    async def _session(**_kw):
+        yield db_session
+
+    monkeypatch.setattr(trash_purge, "task_session", _session)
+    monkeypatch.setattr(db_session, "commit", db_session.flush)
+    warnings: list[dict] = []
+    monkeypatch.setattr(
+        trash_purge.logger, "warning", lambda event, **kw: warnings.append({"event": event, **kw})
+    )
+    out = await trash_purge._sweep()
+    assert out["held_back_live_children"].get("subnet") == 1
+    remaining = (
+        (
+            await db_session.execute(
+                select(Subnet.id)
+                .where(Subnet.id.in_([sub_id, other_id]))
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert remaining == [sub_id]
+    assert await _bindings(db_session) == 1
+    held = [w for w in warnings if w["event"] == "trash_purge.held_back_live_children"]
+    assert held and "E911" in held[0]["hint"]
