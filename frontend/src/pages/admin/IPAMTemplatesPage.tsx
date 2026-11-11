@@ -16,6 +16,8 @@ import { Modal } from "@/components/ui/modal";
 import { parseTtlInput } from "@/lib/dnsNames";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -143,6 +145,48 @@ export function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
     ddns_ttl: ttl,
     child_layout,
   };
+}
+
+// Edit reads the template when it opens (#3863): the row the page holds is
+// from a list that may predate another client's change, and the form is
+// seeded once.
+function EditTemplate({
+  tpl,
+  error,
+  saving,
+  onClose,
+  onSave,
+}: {
+  tpl: IPAMTemplate;
+  error?: string;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (form: TemplateForm, base: IPAMTemplate) => void;
+}) {
+  const fresh = useFreshRow<IPAMTemplate>(tpl, () =>
+    ipamApi.getTemplate(tpl.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit IPAM Template"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
+  return (
+    <TemplateEditor
+      mode="edit"
+      initial={formFromTemplate(base)}
+      error={error}
+      saving={saving}
+      onClose={onClose}
+      onSave={(f) => onSave(f, base)}
+    />
+  );
 }
 
 type TabKey = "general" | "stamp" | "ddns" | "children";
@@ -612,7 +656,7 @@ export function IPAMTemplatesPage() {
   const [editor, setEditor] = useState<
     | null
     | { mode: "create"; initial: TemplateForm }
-    | { mode: "edit"; tpl: IPAMTemplate; initial: TemplateForm }
+    | { mode: "edit"; tpl: IPAMTemplate }
   >(null);
   const [editorErr, setEditorErr] = useState<string>("");
   const [reapplyTarget, setReapplyTarget] = useState<IPAMTemplate | null>(null);
@@ -670,7 +714,10 @@ export function IPAMTemplatesPage() {
     },
   });
 
-  function handleSave(form: TemplateForm) {
+  // `base` is the template as read when the editor opened (#3863): the Save
+  // sends only what the operator changed against it, so a field another
+  // client set since the list loaded is not put back.
+  function handleSave(form: TemplateForm, base?: IPAMTemplate) {
     setEditorErr("");
     let payload: IPAMTemplateCreate;
     try {
@@ -679,29 +726,43 @@ export function IPAMTemplatesPage() {
       setEditorErr(e instanceof Error ? e.message : String(e));
       return;
     }
-    if (editor?.mode === "edit") {
-      const { id } = editor.tpl;
-      const update: IPAMTemplateUpdate = {
-        name: payload.name,
-        description: payload.description,
-        tags: payload.tags,
-        custom_fields: payload.custom_fields,
-        dns_group_id: payload.dns_group_id ?? null,
-        dns_zone_id: payload.dns_zone_id ?? null,
-        dhcp_group_id: payload.dhcp_group_id ?? null,
-        ddns_enabled: payload.ddns_enabled,
-        ddns_hostname_policy: payload.ddns_hostname_policy,
-        ddns_domain_override: payload.ddns_domain_override ?? null,
-        ddns_ttl: payload.ddns_ttl ?? null,
-        child_layout: payload.child_layout ?? null,
-        clear_dns_group_id: payload.dns_group_id == null,
-        clear_dhcp_group_id: payload.dhcp_group_id == null,
-        clear_dns_zone_id: payload.dns_zone_id == null,
-        clear_child_layout: payload.child_layout == null,
-        clear_ddns_domain_override: payload.ddns_domain_override == null,
-        clear_ddns_ttl: payload.ddns_ttl == null,
-      };
-      updateMut.mutate({ id, body: update });
+    if (editor?.mode === "edit" && base) {
+      const before = toCreatePayload(formFromTemplate(base));
+      const diff: IPAMTemplateUpdate = changedFields(
+        before as unknown as Record<string, unknown>,
+        {
+          name: payload.name,
+          description: payload.description,
+          tags: payload.tags,
+          custom_fields: payload.custom_fields,
+          dns_group_id: payload.dns_group_id ?? null,
+          dns_zone_id: payload.dns_zone_id ?? null,
+          dhcp_group_id: payload.dhcp_group_id ?? null,
+          ddns_enabled: payload.ddns_enabled,
+          ddns_hostname_policy: payload.ddns_hostname_policy,
+          ddns_domain_override: payload.ddns_domain_override ?? null,
+          ddns_ttl: payload.ddns_ttl ?? null,
+          child_layout: payload.child_layout ?? null,
+        },
+      );
+      // A changed field that is now empty is a clear, not a no-op.
+      if ("dns_group_id" in diff && diff.dns_group_id == null)
+        diff.clear_dns_group_id = true;
+      if ("dhcp_group_id" in diff && diff.dhcp_group_id == null)
+        diff.clear_dhcp_group_id = true;
+      if ("dns_zone_id" in diff && diff.dns_zone_id == null)
+        diff.clear_dns_zone_id = true;
+      if ("child_layout" in diff && diff.child_layout == null)
+        diff.clear_child_layout = true;
+      if ("ddns_domain_override" in diff && diff.ddns_domain_override == null)
+        diff.clear_ddns_domain_override = true;
+      if ("ddns_ttl" in diff && diff.ddns_ttl == null)
+        diff.clear_ddns_ttl = true;
+      if (Object.keys(diff).length === 0) {
+        setEditor(null);
+        return;
+      }
+      updateMut.mutate({ id: base.id, body: diff });
       return;
     }
     createMut.mutate(payload);
@@ -838,11 +899,7 @@ export function IPAMTemplatesPage() {
                     <button
                       onClick={() => {
                         setEditorErr("");
-                        setEditor({
-                          mode: "edit",
-                          tpl: t,
-                          initial: formFromTemplate(t),
-                        });
+                        setEditor({ mode: "edit", tpl: t });
                       }}
                       className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label={`Edit template ${t.name}`}
@@ -874,9 +931,21 @@ export function IPAMTemplatesPage() {
           </table>
         </div>
 
-        {editor && (
+        {editor?.mode === "edit" && (
+          <EditTemplate
+            tpl={editor.tpl}
+            error={editorErr}
+            saving={updateMut.isPending}
+            onClose={() => {
+              setEditor(null);
+              setEditorErr("");
+            }}
+            onSave={handleSave}
+          />
+        )}
+        {editor?.mode === "create" && (
           <TemplateEditor
-            mode={editor.mode}
+            mode="create"
             initial={editor.initial}
             error={editorErr}
             saving={createMut.isPending || updateMut.isPending}

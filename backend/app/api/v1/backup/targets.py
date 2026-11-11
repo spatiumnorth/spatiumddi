@@ -66,7 +66,7 @@ from app.services.backup.targets import (
     safe_filename,
     secret_field_names,
 )
-from app.services.backup.targets.secrets_config import ENC_PREFIX
+from app.services.backup.targets.secrets_config import ENC_PREFIX, REDACTED_SENTINEL
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
 # so every body here is authorised from its headers before it is read
@@ -395,6 +395,14 @@ async def create_target(
     # treat it as an already-validated stored secret) and be stored unwrapped.
     for name in sorted(secret_field_names(driver)):
         value = body.config.get(name)
+        # ``<set>`` is what a read shows for a stored secret. On Edit it means
+        # "keep the stored one"; on Add nothing is stored, so it would be saved
+        # as the secret itself (#3846).
+        if value == REDACTED_SENTINEL:
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not the '<set>' placeholder",
+            )
         if isinstance(value, str) and value.startswith(ENC_PREFIX):
             raise HTTPException(
                 status_code=422,
