@@ -1179,6 +1179,51 @@ if not svcs or any(
     sys.exit(1)
 print("   DHCP nodePort implies NodePort")
 PYEOF
+# #3907 — the DHCP unstick pre-upgrade hook: a hook-annotated, namespaced Role
+# and Job only when DHCP agents are on and the opt-out is not set.
+# ``helm template`` renders a pre-upgrade hook only with --is-upgrade.
+render umbrella-dhcp-unstick-on "$UMBRELLA" --is-upgrade \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+render umbrella-dhcp-unstick-off "$UMBRELLA" --is-upgrade \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.upgradeUnstickPods=false
+render umbrella-dhcp-unstick-noagents "$UMBRELLA" --is-upgrade
+echo "── DHCP unstick pre-upgrade hook (umbrella, #3907)"
+python3 - "$OUT/umbrella-dhcp-unstick-on.yaml" "$OUT/umbrella-dhcp-unstick-off.yaml" \
+    "$OUT/umbrella-dhcp-unstick-noagents.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+def hook_objs(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    return docs, [d for d in docs if (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick"]
+rc = 0
+docs, objs = hook_objs(sys.argv[1])
+kinds = sorted(d["kind"] for d in objs)
+if kinds != ["Job", "Role", "RoleBinding", "ServiceAccount"]:
+    print(f"FAIL unstick hook objects: {kinds} (#3907)", file=sys.stderr); rc = 1
+for d in objs:
+    a = d["metadata"].get("annotations") or {}
+    if a.get("helm.sh/hook") != "pre-upgrade" or "hook-succeeded" not in a.get("helm.sh/hook-delete-policy", ""):
+        print(f"FAIL {d['kind']} is not a pre-upgrade hook with a delete policy (#3907)", file=sys.stderr); rc = 1
+    if d["kind"] in ("Role", "RoleBinding") and not d["metadata"].get("namespace"):
+        print(f"FAIL {d['kind']} is not namespaced (#3907)", file=sys.stderr); rc = 1
+grants = sorted(
+    (r["resources"][0], tuple(sorted(r["verbs"])))
+    for ro in objs if ro["kind"] == "Role" for r in ro["rules"]
+)
+if grants != [("pods", ("delete", "get", "list")), ("statefulsets", ("get", "list"))]:
+    print(f"FAIL unstick Role grants {grants} (#3907)", file=sys.stderr); rc = 1
+for d in docs:
+    if d["kind"] in ("ClusterRole", "ClusterRoleBinding") and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick":
+        print("FAIL cluster-scoped unstick object (#3907)", file=sys.stderr); rc = 1
+for p in sys.argv[2:]:
+    if hook_objs(p)[1]:
+        print(f"FAIL unstick hook rendered in {p} (#3907)", file=sys.stderr); rc = 1
+if rc == 0:
+    print("   hook renders with DHCP agents, not with the opt-out or without agents")
+sys.exit(rc)
+PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))

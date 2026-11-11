@@ -1336,6 +1336,13 @@ dhcpAgents:
   # ``dhcp-<flavor>-<name>``; flipping it on a live install recreates the
   # StatefulSet with new PVCs and a new pod name (the server's identity).
   prefixWithFullname: false
+  # #3907 — a ``helm upgrade`` runs a pre-upgrade hook that deletes a DHCP agent
+  # pod that is Running but has not been Ready for 2+ minutes, so the
+  # StatefulSet (OrderedReady) can roll it onto the new image. Needed coming
+  # from 2026.10.02-1 or older, whose readiness probe could never pass (#1589).
+  # Ready pods are never touched; fresh installs never run it. false = delete
+  # such a pod by hand (docs/deployment/KUBERNETES.md, "Upgrading from CalVer on Helm with DHCP agents").
+  upgradeUnstickPods: true
   # #3206 — StorageClass of both volume claims; unset = the cluster default.
   # Per server: ``servers[].storageClass``. On an existing install see README
   # "Adopting storageClass on an existing install" (orphan-delete the sts first).

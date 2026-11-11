@@ -852,6 +852,32 @@ new release's schema, as long as every table and column it uses is still there
 plane the only api pod is replaced first, so that install still takes its brief
 api outage on every rollout.
 
+### Upgrading from CalVer on Helm with DHCP agents
+
+A Helm install of `2026.10.02-1` or older with `dhcpAgents.enabled` cannot roll
+its Kea pod to a newer chart by itself (#3907). That release's readiness probe
+was a `tcpSocket` on `:8000`, which a standalone Kea never binds (#1589), so
+the pod is never Ready. The `dhcp-kea-*` StatefulSet is `OrderedReady` +
+`RollingUpdate`, and Kubernetes does not roll a StatefulSet whose pod is
+unready, so the pod stays on the old image and `helm upgrade --wait` times out.
+
+The chart handles this with a `pre-upgrade` hook (a Job, plus a ServiceAccount,
+a namespaced Role and a RoleBinding that exist only for the hook). It lists the
+DHCP agent StatefulSets of the release and deletes a pod that is Running but
+has not been Ready for 2 minutes, so the controller recreates it from the new
+revision. A Ready pod is never touched, a fresh install never runs it, and an
+error in the hook is logged without failing the upgrade. DNS agents are not
+covered: their probe is the `:53` listener, which no release shipped in a form
+that could never pass.
+
+To turn the hook off (`dhcpAgents.upgradeUnstickPods: false`), delete the pod
+by hand once the upgrade has been applied; the StatefulSet recreates it on the
+new image:
+
+```bash
+kubectl -n <namespace> delete pod <dhcp-kea-name>-0
+```
+
 ### Manual (manifest) upgrades
 
 If you're running the raw `k8s/base/` manifests instead of the chart, pin the

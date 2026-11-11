@@ -1,0 +1,125 @@
+{{- if and .Values.dhcpAgents.enabled .Values.dhcpAgents.upgradeUnstickPods }}
+{{- $name := printf "%s-dhcp-unstick" (include "spatiumddi.fullname" .) -}}
+{{- /* #3907 — an install of 2026.10.02-1 or older has a DHCP pod that was never
+       Ready (#1589: its readiness probe was a tcpSocket on :8000, which a
+       standalone Kea never binds). The StatefulSet is OrderedReady +
+       RollingUpdate and Kubernetes will not roll one whose pod is unready, so
+       the pod stayed on the old image and ``helm upgrade --wait`` timed out.
+       This pre-upgrade hook deletes such a pod (Running, not Ready for 2+
+       minutes) before the rollout; a Ready pod is never touched. Fresh installs
+       never run it. DNS agents are not included: their readiness probe is the
+       :53 listener, which a healthy daemon always binds, so no release shipped
+       a probe that could never pass; a DNS pod that is unready for a real
+       reason (no bundle yet) is not cured by deleting it. */ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-unstick") .) | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-unstick") .) | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-unstick") .) | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-unstick") .) | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-unstick") .) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      restartPolicy: Never
+      {{- with (include "spatiumddi.priorityClassName" (dict "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        {{- if not (include "spatiumddi.isOpenShift" $) }}
+        runAsUser: 1000
+        runAsGroup: 1000
+        {{- end }}
+        {{- with (include "spatiumddi.seccompProfileType" $) }}
+        seccompProfile:
+          type: {{ . }}
+        {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" (dict)) .) | nindent 6 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: unstick
+          # The api image for its Python; the script is stdlib only.
+          image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SELECTOR
+              value: {{ printf "app.kubernetes.io/instance=%s,app.kubernetes.io/component=dhcp-agent" .Release.Name | quote }}
+          command: ["python3", "-I", "-c"]
+          args:
+            - |
+              {{- .Files.Get "files/dhcp-unstick-pods.py" | nindent 14 }}
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 96Mi }
+{{- end }}
