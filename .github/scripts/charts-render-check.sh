@@ -172,11 +172,13 @@ render() { # name chart [helm --set args...]
     # CNPG operator's, vendored from upstream via the subchart — not ours to
     # validate, and the upstream schema set carries no strict variant for
     # the kind. Every CR *instance* (the ``Cluster``) is still checked.
+    # Route and SecurityContextConstraints (#3852, OpenShift only) have no schema
+    # in either location above; chart-openshift.py asserts on them instead.
     kubeconform -strict -summary \
         -kubernetes-version "$K8S_VERSION" \
         -schema-location default \
         -schema-location "$CRD_SCHEMAS" \
-        -skip CustomResourceDefinition \
+        -skip CustomResourceDefinition,Route,SecurityContextConstraints \
         -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
@@ -321,6 +323,89 @@ if missing:
     sys.exit(1)
 print("ok #2873: sentinel.conf.tmpl requires the password")
 PYEOF
+# #3852 — OpenShift. ``helm template`` has no cluster to detect the platform
+# from, so the render is told with --api-versions (the same answer a real
+# cluster gives ``.Capabilities.APIVersions.Has``). Everything the restricted
+# SCC refuses — a pinned runAsUser / fsGroup, an added capability, :80 — must be
+# gone from the render, and the Route + the agents' SCCs must be there.
+# chart-openshift.py reads the RENDER; see its docstring.
+UMBRELLA_OPENSHIFT_API=(
+    --api-versions security.openshift.io/v1
+    --api-versions route.openshift.io/v1
+)
+UMBRELLA_OPENSHIFT=(
+    "${UMBRELLA_OPENSHIFT_API[@]}"
+    --set dnsAgents.enabled=true
+    --set dnsAgents.servers[0].name=ns1
+    --set dhcpAgents.enabled=true
+    --set dhcpAgents.servers[0].name=dhcp1
+    --set dhcpAgents.servers[0].hostNetwork=true
+    --set ingress.enabled=true
+    --set worker.serviceAccount.enabled=true
+    --set openshift.workerNetRaw=true
+)
+render umbrella-openshift "$UMBRELLA" "${UMBRELLA_OPENSHIFT[@]}"
+render umbrella-openshift-ha "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" "${UMBRELLA_HA[@]}"
+render umbrella-openshift-defaults "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}"
+render umbrella-openshift-forced "$UMBRELLA" --set global.platform=openshift
+# SCCs managed by the cluster admins: the agents' ServiceAccounts must still be
+# rendered, or the pods that name them are never created.
+render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set openshift.scc.create=false \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
+python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-openshift.py" \
+    "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
+    "$OUT/umbrella-openshift-forced.yaml" || failures=$((failures + 1))
+if grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-no-scc.yaml"; then
+    echo "   FAIL #3852: openshift.scc.create=false still renders an SCC" >&2
+    failures=$((failures + 1))
+fi
+for sa in dns-agent dhcp-agent; do
+    if ! grep -qE "^  name: [a-z0-9-]+-spatiumddi-$sa$" "$OUT/umbrella-openshift-no-scc.yaml"; then
+        echo "   FAIL #3852: openshift.scc.create=false drops the $sa ServiceAccount the pods name" >&2
+        failures=$((failures + 1))
+    fi
+done
+# Negative control: the same check on a Kubernetes render, where the pins are
+# deliberately still present, must SEE them — or every pass above could be the
+# check parsing nothing. And the Kubernetes render must carry no OpenShift object.
+python3 "$ROOT/.github/scripts/chart-openshift.py" --expect-pins "$OUT/umbrella-defaults.yaml" \
+    || failures=$((failures + 1))
+if grep -qE '^kind: (Route|SecurityContextConstraints)$' "$OUT/umbrella-defaults.yaml" "$OUT/umbrella-all-on.yaml"; then
+    echo "   FAIL #3852: a Kubernetes render carries an OpenShift object" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: no Route / SCC on a Kubernetes render"
+fi
+# Refusals that exist so a render never produces a pod OpenShift cannot start.
+echo "── OpenShift: refusals (#3852)"
+neg3852() { # label expected-substring [helm --set args...]
+    local label="$1" want="$2"; shift 2
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "$@" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$want"; then
+        echo "   ok: $label refused"
+    else
+        echo "   FAIL: expected $label to be refused with '$want' (rc=$rc)" >&2
+        failures=$((failures + 1))
+    fi
+}
+neg3852 "an unknown platform" "is not valid" --set global.platform=bogus
+neg3852 "the appliance TLS frontend on OpenShift" "frontend.tls.enabled" \
+    --set global.platform=openshift --set frontend.tls.enabled=true
+neg3852 "the appliance hostNetwork frontend on OpenShift" "frontend.hostNetwork" \
+    --set global.platform=openshift --set frontend.hostNetwork=true
+neg3852 "a PowerDNS agent on OpenShift" "does not yet run under OpenShift" \
+    --set global.platform=openshift --set dnsAgents.enabled=true \
+    --set dnsAgents.servers[0].name=p --set dnsAgents.servers[0].flavor=powerdns
+neg3852 "workerNetRaw without the worker ServiceAccount" "worker.serviceAccount.enabled" \
+    --set global.platform=openshift --set openshift.workerNetRaw=true
+neg3852 "an unsupported Route termination" "not supported" \
+    --set global.platform=openshift --set openshift.route.termination=passthrough
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
 # #1174 — the shape the slot-image mirror actually runs in: an appliance

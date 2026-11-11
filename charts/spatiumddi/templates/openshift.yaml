@@ -1,0 +1,122 @@
+{{/*
+#3852 — the OpenShift-only objects. Everything below renders ONLY when
+``spatiumddi.isOpenShift`` says so (``global.platform`` / the cluster's
+``security.openshift.io/v1``); on every other platform this file renders
+nothing, and the rest of the chart differs from its non-OpenShift render only
+by omitted uid / gid / fsGroup pins (see the helper's comment).
+
+WHAT OPENSHIFT DOES DIFFERENTLY. Its default ``restricted-v2`` SCC gives each
+pod a random uid from the namespace's range, with group 0 as a supplementary
+group, and REFUSES a pinned ``runAsUser`` / ``fsGroup`` and any added
+capability. So the control plane — api, worker (without NET_RAW), beat,
+frontend, migrate, postgres, redis — needs NO grant here and runs under plain
+``restricted-v2``. Only the pods that must bind a privileged port or open a
+raw socket get a SCC, and only their own ServiceAccounts may use it.
+*/}}
+{{- if include "spatiumddi.isOpenShift" . }}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $sccPrefix := printf "%s-%s" $fullname .Release.Namespace -}}
+
+{{- /* ── Route for the frontend ── */ -}}
+{{- if .Values.openshift.route.enabled }}
+{{- $term := .Values.openshift.route.termination | default "edge" -}}
+{{- if not (has $term (list "edge" "none")) }}
+{{- fail (printf "openshift.route.termination=%q is not supported: use edge (the router terminates TLS) or none (plain HTTP). passthrough and reencrypt need TLS inside the frontend pod, which only the appliance's frontend.tls does, and that cannot run on OpenShift." $term) }}
+{{- end }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ $fullname }}-frontend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "frontend") .) | nindent 4 }}
+  {{- with .Values.openshift.route.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.openshift.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ $fullname }}-frontend
+    weight: 100
+  port:
+    targetPort: http
+  {{- if eq $term "edge" }}
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: {{ .Values.openshift.route.insecureEdgeTerminationPolicy | default "Redirect" }}
+  {{- end }}
+  wildcardPolicy: None
+---
+{{- end }}
+
+{{- /* ── The agents' own ServiceAccounts ──
+       Rendered whether or not the chart creates the SCCs: the agent pods name
+       them on OpenShift either way, and with ``openshift.scc.create=false`` they
+       are what the cluster admins grant their own SCC to. */ -}}
+{{- if .Values.dnsAgents.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-dns-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
+---
+{{- end }}
+{{- if .Values.dhcpAgents.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-dhcp-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
+---
+{{- end }}
+
+{{- /* ── SCCs, each usable only by the ServiceAccounts above ── */ -}}
+{{- if .Values.openshift.scc.create }}
+{{- if .Values.dnsAgents.enabled }}
+{{ include "spatiumddi.openshiftScc" (dict
+    "root" .
+    "name" (printf "%s-dns-agent" $sccPrefix)
+    "component" "dns-agent"
+    "serviceAccounts" (list (printf "%s-dns-agent" $fullname))
+    "capabilities" (list "NET_BIND_SERVICE")
+    "hostNetwork" false
+    "why" "DNS agent (BIND9): named binds :53 through a file capability, which needs NET_BIND_SERVICE in the bounding set and no_new_privs off. Runs as a uid from the namespace range, never root.") }}
+---
+{{- end }}
+{{- if .Values.dhcpAgents.enabled }}
+{{- $hostNet := false -}}
+{{- range .Values.dhcpAgents.servers }}{{ if .hostNetwork }}{{ $hostNet = true }}{{ end }}{{ end }}
+{{ include "spatiumddi.openshiftScc" (dict
+    "root" .
+    "name" (printf "%s-dhcp-agent" $sccPrefix)
+    "component" "dhcp-agent"
+    "serviceAccounts" (list (printf "%s-dhcp-agent" $fullname))
+    "capabilities" (list "NET_BIND_SERVICE" "NET_RAW")
+    "hostNetwork" $hostNet
+    "why" "DHCP agent (Kea): kea-dhcp4/6 bind :67 and open raw (LPF) sockets through file capabilities, which need NET_BIND_SERVICE and NET_RAW in the bounding set and no_new_privs off. Host networking only when a server sets hostNetwork. Runs as a uid from the namespace range, never root.") }}
+---
+{{- end }}
+{{- if and .Values.worker.netRawCapability .Values.openshift.workerNetRaw }}
+{{- if not .Values.worker.serviceAccount.enabled }}
+{{- fail "openshift.workerNetRaw needs worker.serviceAccount.enabled=true: the SCC is granted to the worker's own ServiceAccount, and binding it to the namespace's default one would hand it to every pod that uses that." }}
+{{- end }}
+{{ include "spatiumddi.openshiftScc" (dict
+    "root" .
+    "name" (printf "%s-worker" $sccPrefix)
+    "component" "worker"
+    "serviceAccounts" (list (printf "%s-worker" $fullname))
+    "capabilities" (list "NET_BIND_SERVICE" "NET_RAW")
+    "hostNetwork" false
+    "why" "Celery worker with raw sockets for nmap SYN/OS scans: the image's nmap carries net_raw and net_bind_service as file capabilities, so both must be in the bounding set, with no_new_privs off. Opt-in (openshift.workerNetRaw). Runs as a uid from the namespace range, never root.") }}
+---
+{{- end }}
+{{- end }}
+{{- end }}
