@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -27,10 +27,12 @@ import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
 class ScopeFormError extends Error {}
 
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
-// (reserve for infra / static) and the last host (broadcast). Returns null
-// for IPv6 or subnets too small to be useful.
+// (reserve for infra / static) and the last host (broadcast). The subnet's
+// gateway is kept out of the range (#3867): when it falls inside, the range
+// keeps its larger side. Returns null for IPv6 or subnets too small to be
+// useful.
 function suggestRange(
-  subnet: { network?: string | null } | undefined,
+  subnet: { network?: string | null; gateway?: string | null } | undefined,
 ): { start: string; end: string } | null {
   if (!subnet?.network) return null;
   const [cidr, prefixStr] = subnet.network.split("/");
@@ -46,8 +48,24 @@ function suggestRange(
   const hostBits = 32 - prefix;
   const total = 1 << hostBits;
   if (total < 16) return null;
-  const startInt = (base + 10) >>> 0;
-  const endInt = (base + total - 2) >>> 0;
+  let startInt = (base + 10) >>> 0;
+  let endInt = (base + total - 2) >>> 0;
+  const gwParts = subnet.gateway?.split(".").map((n) => parseInt(n, 10));
+  if (
+    gwParts?.length === 4 &&
+    gwParts.every((n) => n >= 0 && n <= 255) // NaN fails both comparisons
+  ) {
+    const gw =
+      ((gwParts[0] << 24) |
+        (gwParts[1] << 16) |
+        (gwParts[2] << 8) |
+        gwParts[3]) >>>
+      0;
+    if (gw >= startInt && gw <= endInt) {
+      if (gw === endInt || gw - startInt >= endInt - gw) endInt = gw - 1;
+      else startInt = gw + 1;
+    }
+  }
   const fmt = (n: number) =>
     `${(n >>> 24) & 0xff}.${(n >>> 16) & 0xff}.${(n >>> 8) & 0xff}.${n & 0xff}`;
   return { start: fmt(startInt), end: fmt(endInt) };
@@ -174,6 +192,12 @@ function ScopeModalForm({
   // "srv:<server id>". Creating it on every member is the outage.
   const [placement, setPlacement] = useState("");
   const [error, setError] = useState("");
+  // IPAM addresses the API found inside the dynamic pool it just created (the
+  // notice New Pool shows); the dialog stays open on it (#3867).
+  const [poolNotice, setPoolNotice] = useState<
+    { address: string; status: string; hostname: string }[] | null
+  >(null);
+  const poolNoticeRef = useRef<typeof poolNotice>(null);
   // 409 + X-Adoption-Required from a cloud (FortiGate) group member: a DHCP
   // server already exists on the interface that SpatiumDDI didn't create
   // (#865). Holds the provider detail so we can offer an adopt-and-retry —
@@ -193,10 +217,15 @@ function ScopeModalForm({
   // (subnet → block ancestry → space). If set, we default the scope's
   // group to it, so scopes land on whatever DHCP was configured at the
   // IPAM level.
-  const { data: effectiveDhcp } = useQuery({
+  // Read fresh on every open (#3865): the subnet's group may have moved since
+  // a cached answer was taken, and a scope saved in the old group is pushed to
+  // the wrong servers.
+  const { data: effectiveDhcp, isFetching: effectiveReading } = useQuery({
     queryKey: ["subnet-effective-dhcp", subnetId],
     queryFn: () => ipamApi.getEffectiveSubnetDhcp(subnetId),
     enabled: !editing && !defaultGroupId && !!subnetId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const effectiveGroupId = effectiveDhcp?.dhcp_server_group_id ?? null;
   const effectiveGroup = dhcpGroups.find((g) => g.id === effectiveGroupId);
@@ -206,16 +235,22 @@ function ScopeModalForm({
       ? "the space"
       : "this subnet";
 
-  // Auto-select the inherited group on first load, unless the user has
-  // already picked one explicitly.
+  // Follow the inherited group until the operator picks one explicitly. Only a
+  // settled read counts: a cached answer is still on screen while the fresh
+  // one is on its way (#3865).
   const [groupAutoPicked, setGroupAutoPicked] = useState(!!groupId);
   useEffect(() => {
     if (editing || defaultGroupId) return;
     if (groupAutoPicked) return;
-    if (!effectiveGroupId) return;
-    setGroupId(effectiveGroupId);
-    setGroupAutoPicked(true);
-  }, [editing, defaultGroupId, groupAutoPicked, effectiveGroupId]);
+    if (effectiveReading) return;
+    setGroupId(effectiveGroupId ?? "");
+  }, [
+    editing,
+    defaultGroupId,
+    groupAutoPicked,
+    effectiveReading,
+    effectiveGroupId,
+  ]);
 
   // When the parent already chose the subnet (the "+ New Scope on subnet"
   // dropdown), the modal hides the subnet picker but we still need the
@@ -236,10 +271,14 @@ function ScopeModalForm({
     queryFn: settingsApi.get,
     enabled: !editing,
   });
-  const { data: subnetDetail } = useQuery({
+  const { data: subnetDetail, isFetching: subnetReading } = useQuery({
     queryKey: ["subnet", subnetId],
     queryFn: () => ipamApi.getSubnet(subnetId),
     enabled: !editing && !!subnetId,
+    // Gateway + suggested pool come from here: read it fresh on open, and
+    // pre-fill only from that answer (#3865).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // Is this an IPv6 scope? On edit we trust the stored family; on create
@@ -356,7 +395,12 @@ function ScopeModalForm({
     pool: { start: string; end: string } | null;
   } | null>(null);
   useEffect(() => {
-    if (editing || !subnetDetail || subnetPrefill?.subnetId === subnetId)
+    if (
+      editing ||
+      !subnetDetail ||
+      subnetReading ||
+      subnetPrefill?.subnetId === subnetId
+    )
       return;
     const prev = subnetPrefill;
     // Option 3 is DHCPv4-only (a v6 client learns its router from RAs), as
@@ -391,7 +435,15 @@ function ScopeModalForm({
     }
     setSubnetPrefill({ subnetId, routers, pool });
     setPrefillGeneration((g) => g + 1);
-  }, [editing, subnetDetail, subnetId, subnetPrefill, poolStart, poolEnd]);
+  }, [
+    editing,
+    subnetDetail,
+    subnetReading,
+    subnetId,
+    subnetPrefill,
+    poolStart,
+    poolEnd,
+  ]);
 
   const mut = useMutation({
     mutationFn: async (adoptExisting: boolean) => {
@@ -568,16 +620,19 @@ function ScopeModalForm({
       // pass it true when the operator picked "(none)" on an
       // existing scope that previously had a profile bound.
       if (pxeProfileId) data.pxe_profile_id = pxeProfileId;
+      poolNoticeRef.current = null;
       return dhcpApi
         .createScope(subnetId, data, adoptExisting)
         .then(async (created) => {
           if (poolStart && poolEnd) {
-            await dhcpApi.createPool(created.id, {
+            const pool = await dhcpApi.createPool(created.id, {
               name: "default",
               start_ip: poolStart,
               end_ip: poolEnd,
               pool_type: "dynamic",
             });
+            const existing = pool.existing_ips_in_range;
+            poolNoticeRef.current = existing?.length ? existing : null;
           }
           return created;
         });
@@ -600,7 +655,8 @@ function ScopeModalForm({
           queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
         });
       }
-      onClose();
+      if (poolNoticeRef.current) setPoolNotice(poolNoticeRef.current);
+      else onClose();
     },
     onError: (e) => {
       if (isAdoptionRequired(e)) {
@@ -633,6 +689,9 @@ function ScopeModalForm({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // The scope exists once the notice is up; Enter must not create a
+          // second one (#3867).
+          if (poolNotice) return;
           // Always try without adopting first; the 409 banner below offers
           // the explicit adopt-and-retry (#865).
           mut.mutate(false);
@@ -711,11 +770,13 @@ function ScopeModalForm({
             <Field
               label="DHCP Server Group"
               hint={
-                effectiveGroupId && effectiveGroup
-                  ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
-                  : effectiveGroupId === null && subnetId && !editing
-                    ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any group below."
-                    : undefined
+                effectiveReading && subnetId && !editing
+                  ? "Reading this subnet's DHCP group…"
+                  : effectiveGroupId && effectiveGroup
+                    ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
+                    : effectiveGroupId === null && subnetId && !editing
+                      ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any group below."
+                      : undefined
               }
             >
               <select
@@ -1144,7 +1205,36 @@ function ScopeModalForm({
             </div>
           </div>
         )}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        {poolNotice && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              Scope and pool created — {poolNotice.length} existing IP
+              {poolNotice.length !== 1 ? "s" : ""} in the pool's range:
+            </p>
+            <ul className="text-xs space-y-0.5 max-h-32 overflow-y-auto">
+              {poolNotice.map((ip) => (
+                <li key={ip.address} className="font-mono">
+                  {ip.address}{" "}
+                  <span className="text-muted-foreground">
+                    ({ip.status}){ip.hostname ? ` — ${ip.hostname}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              These IPs may conflict with dynamic DHCP leases. Edit the pool, or
+              mark them as excluded or reserved.
+            </p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+            >
+              OK
+            </button>
+          </div>
+        )}
+        {!poolNotice && <Btns onClose={onClose} pending={mut.isPending} />}
       </form>
     </Modal>
   );

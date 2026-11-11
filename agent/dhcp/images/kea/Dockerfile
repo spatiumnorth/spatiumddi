@@ -115,6 +115,18 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
       /etc/radvd /run/radvd \
  && chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
       /etc/radvd /run/radvd \
+ # #3852 — OpenShift's restricted SCC starts the container as a random uid in
+ # group 0 and no other, so every path written at run time is group-0 owned and
+ # group-writable. NOT /run/kea: Kea 3.0 refuses a control-socket directory more
+ # permissive than 0750 (measured: a 0770 /run/kea fails with "more relaxed
+ # permissions than 750"), and a 0750 directory is writable only by its owner —
+ # so the entrypoint recreates it owned by the uid it runs as, and /run itself
+ # is group-writable to allow that. All a no-op when started as root.
+ && chgrp -R 0 /var/lib/spatium-dhcp-agent /var/lib/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chmod -R g=u /var/lib/spatium-dhcp-agent /var/lib/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chmod g+w /run \
  && { \
       echo "alpine_release=$(cat /etc/alpine-release)"; \
       apk info -v 2>/dev/null \
@@ -129,7 +141,9 @@ COPY agent/dhcp/images/kea/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
 COPY agent/dhcp/images/kea/entrypoint.sh /usr/local/bin/spatium-dhcp-entrypoint
 RUN chmod +x /usr/local/bin/spatium-dhcp-entrypoint \
  && chown spatium:spatium \
-      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
+      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf \
+ && chgrp 0 /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf \
+ && chmod g=u /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
 
 ARG PYTHON_VERSION
 ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
