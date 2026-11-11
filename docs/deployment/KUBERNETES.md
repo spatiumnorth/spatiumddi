@@ -86,7 +86,9 @@ exactly as before.
 - `restricted-v2` assigns each pod a random uid and fsGroup from the namespace's
   range and refuses a pinned one, so the api's `runAsUser`, the cnpg-ca-publisher
   Job's `runAsUser`, and the in-chart Postgres and Redis `fsGroup`s are omitted.
-  `seccompProfile: RuntimeDefault` is kept.
+  `seccompProfile: RuntimeDefault` is kept. Celery beat keeps its schedule file
+  in `/tmp` instead of its working directory, which only the image's own user
+  may write.
 - The images run as any uid in group 0: every path they write is group-0 owned
   and group-writable. The frontend nginx listens on `:8080` (`FRONTEND_HTTP_PORT`;
   the Service keeps its own port) because a random uid cannot bind `:80`.

@@ -22,6 +22,7 @@ Asserts, on an OpenShift render:
   * every container that adds a capability sets ``allowPrivilegeEscalation:
     true`` (the capabilities are for file capabilities, which no_new_privs
     voids), and every ServiceAccount a pod names is rendered;
+  * celery beat keeps its schedule db under /tmp, not in the unwritable cwd;
   * the control plane adds no capability but what an SCC it is bound to allows
     (so api / beat / frontend / migrate / postgres / redis, which are bound to
     none, add nothing at all).
@@ -74,6 +75,7 @@ def main(argv: list[str]) -> int:
         sa_of: dict[str, str] = {}  # workload name -> ServiceAccount
         adds: dict[str, set[str]] = {}
         esc: list[str] = []
+        beat_cwd: list[str] = []
         for kind in POD_KINDS:
             for d in by_kind.get(kind, []):
                 spec = pod_spec(d)
@@ -90,6 +92,12 @@ def main(argv: list[str]) -> int:
                     for k in PINS:
                         if k in csc:
                             pins.append(f"{kind}/{name} container {c['name']} {k}")
+                    cmd = [str(a) for a in (c.get("command") or []) + (c.get("args") or [])]
+                    # celery beat writes ``celerybeat-schedule`` to its cwd
+                    # (/app, owned by the image's ``app`` user) unless told
+                    # otherwise; a random uid gets EACCES and beat crash-loops.
+                    if "beat" in cmd and not any(a.startswith("--schedule=/tmp/") for a in cmd):
+                        beat_cwd.append(f"{kind}/{name} container {c['name']}")
                     added = (csc.get("capabilities") or {}).get("add") or []
                     adds.setdefault(name, set()).update(added)
                     # Every capability this chart adds is for a FILE capability
@@ -108,6 +116,11 @@ def main(argv: list[str]) -> int:
             continue
         for p in pins:
             failures.append(f"{path}: {p} is pinned; OpenShift's restricted SCC refuses it (#3852)")
+        for b in beat_cwd:
+            failures.append(
+                f"{path}: {b} runs celery beat with its schedule in the working "
+                "directory, which a random uid cannot write (#3852)"
+            )
         for e in esc:
             failures.append(
                 f"{path}: {e} adds a capability without allowPrivilegeEscalation: true; "
