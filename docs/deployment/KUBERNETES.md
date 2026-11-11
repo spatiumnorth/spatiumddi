@@ -874,6 +874,17 @@ error in the hook is logged without failing the upgrade. DNS agents are not
 covered: their probe is the `:53` listener, which no release shipped in a form
 that could never pass.
 
+The hook Job runs the **new** release's api image, so an air-gapped site must
+load that image into the cluster (or its mirror registry) **before** `helm
+upgrade`, as it must for every other pod of the release. If the image cannot be
+pulled the Job hits its 120 s deadline and, because Helm waits for hooks, the
+upgrade fails; set `dhcpAgents.upgradeUnstickPods=false` to skip the hook.
+The hook runs on `helm upgrade` only, not on `helm rollback`: a rollback
+re-applies the old template, which cannot be rolled any better than before.
+A Job that starts but cannot reach the API server logs the error and exits 0,
+leaving the upgrade to proceed (a stuck pod then needs the manual step below);
+the hook never fails an upgrade on a cluster error, only on a missing image.
+
 To turn the hook off (`dhcpAgents.upgradeUnstickPods: false`), delete the pod
 by hand once `helm upgrade` has applied the new template; the StatefulSet
 recreates it from that template, on the new image and probe (the upgrade itself
