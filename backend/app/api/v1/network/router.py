@@ -38,6 +38,7 @@ from app.models.network import (
     NetworkInterface,
     NetworkNeighbour,
 )
+from app.services.e911.delete_guard import refuse_if_e911_bound
 from app.services.snmp.errors import (
     SNMPAuthError,
     SNMPProtocolError,
@@ -351,6 +352,8 @@ async def delete_device(device_id: uuid.UUID, db: DB, current_user: CurrentUser)
     dev = await db.get(NetworkDevice, device_id)
     if dev is None:
         raise HTTPException(status_code=404, detail="Network device not found")
+    # Its interfaces go with it, and so do the switch-port E911 bindings (#3891).
+    await refuse_if_e911_bound(db, f"network device '{dev.name}'", device_ids=[dev.id])
     await _audit(
         db,
         user=current_user,

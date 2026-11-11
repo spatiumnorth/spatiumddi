@@ -38,6 +38,7 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
+from app.services.e911.delete_guard import refuse_if_e911_bound
 from app.services.ipam.orphan_aliases import (
     is_withdrawn_alias,
     orphan_record_owners,
@@ -957,6 +958,8 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], [], [])
             if live:
                 _refuse_live_children(label, live)
+            # #3891: the purge takes the subnet's E911 binding (and those on its addresses).
+            await refuse_if_e911_bound(db, label, subnet_ids=[target.id])
             records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
                 db, [target], current_user
             )
@@ -971,6 +974,7 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], blocks, subnets)
             if live:
                 _refuse_live_children(label, live)
+            await refuse_if_e911_bound(db, label, subnet_ids=[sub.id for sub in subnets])  # #3891
             records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
                 db, subnets, current_user
             )

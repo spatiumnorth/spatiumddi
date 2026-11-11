@@ -93,6 +93,11 @@ from app.services.dns.sync_check import (
     ipam_authors_zone,
     resolve_reverse_zone,
 )
+from app.services.e911.delete_guard import (
+    e911_bindings_blocking,
+    e911_refusal_detail,
+    refuse_if_e911_bound,
+)
 from app.services.feature_modules import is_module_enabled, require_module
 from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
@@ -11539,6 +11544,7 @@ async def delete_address(
     await _remove_linked_statics(db, current_user, statics_rows)
 
     if permanent:
+        await refuse_if_e911_bound(db, f"address {ip.address}", ip_ids=[ip.id])  # #3891
         subnet_id = ip.subnet_id
         # Remove auto-generated DNS record before deleting the IP (FK would null it anyway,
         # but we want a clean delete and fqdn cleared)
@@ -11624,6 +11630,7 @@ async def purge_orphans(
         )
     )
     rows = list(res.scalars().all())
+    await refuse_if_e911_bound(db, "these orphan addresses", ip_ids=[ip.id for ip in rows])  # #3891
     # Gather any lingering DHCP reservations across all orphan IPs in one
     # query, then push-delete them in one batched WinRM round trip per
     # server (versus one round trip per IP × one per static). Normally
@@ -13160,6 +13167,14 @@ async def bulk_delete_addresses(
     # half-done.
     to_delete: list[IPAddress] = []
     removed_statics: dict[uuid.UUID, DHCPStaticAssignment] = {}
+    # A permanent delete takes an address's E911 binding with it (#3891): skip
+    # those rows, with the reason, the way the other refusals here do.
+    e911_bound: dict[uuid.UUID, list[str]] = {}
+    if body.permanent:
+        for ip in rows:
+            lines = await e911_bindings_blocking(db, ip_ids=[ip.id])
+            if lines:
+                e911_bound[ip.id] = lines
     for ip in rows:
         if ip.status in ("network", "broadcast"):
             skipped.append(ip.id)
@@ -13198,6 +13213,12 @@ async def bulk_delete_addresses(
             skipped.append(ip.id)
             skipped_reasons[str(ip.id)] = (
                 f"No delete permission on subnet or any address set covering {ip.address}"
+            )
+            continue
+        if body.permanent and ip.id in e911_bound:
+            skipped.append(ip.id)
+            skipped_reasons[str(ip.id)] = e911_refusal_detail(
+                f"address {ip.address}", e911_bound[ip.id]
             )
             continue
         row_statics = statics_by_ip.get(ip.id, [])
