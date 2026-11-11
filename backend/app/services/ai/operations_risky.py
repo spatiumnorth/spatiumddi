@@ -1033,6 +1033,16 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
 
     mode = "Permanently delete" if args.permanent else "Soft-delete"
     if args.permanent:
+        # #3826: the refusal the apply makes, said at preview time, so a change
+        # request is not filed for a delete its approval will refuse.
+        from app.services.dns.reverse_zone import (
+            refuse_delete_with_trashed_sharers,
+        )  # noqa: PLC0415
+
+        try:
+            await refuse_delete_with_trashed_sharers(db, zone)
+        except HTTPException as exc:
+            return PreviewResult(ok=False, detail=str(exc.detail))
         # #3a: count the records this zone holds so a permanent delete of a
         # zone that grew records since request is caught by the drift check.
         from app.models.dns import DNSRecord  # noqa: PLC0415
@@ -1159,6 +1169,12 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         lambda: address_ids_of_zones(db, [args.zone_id]),
         lambda: _require_zone(args.group_id, args.zone_id, db, lock="delete"),
     )
+    # #3826: refused while another trashed subnet's records sit in a shared auto
+    # reverse zone, as the Trash purge of the zone refuses (#3504). Before
+    # anything is swept or pushed.
+    from app.services.dns.reverse_zone import refuse_delete_with_trashed_sharers  # noqa: PLC0415
+
+    await refuse_delete_with_trashed_sharers(db, zone)
     # The queued ops once the zone row is held, as on the soft branch: a record
     # write that held the row first has committed its op by now. Swept before
     # the lock, that op outlived the zone with a NULL ``zone_id``.
