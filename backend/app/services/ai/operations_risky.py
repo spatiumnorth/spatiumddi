@@ -428,6 +428,18 @@ async def _preview_delete_subnet(
     # Per-row API-token binding — mirrors the inline handler.
     _enforce_subnet_token_scope(user, args.subnet_id)
 
+    if args.permanent:
+        from app.services.e911.delete_guard import (  # noqa: PLC0415
+            e911_bindings_blocking,
+            e911_refusal_detail,
+        )
+
+        lines = await e911_bindings_blocking(db, subnet_ids=[args.subnet_id])
+        if lines:
+            return PreviewResult(
+                ok=False, detail=e911_refusal_detail(f"subnet {subnet.network}", lines)
+            )
+
     if args.permanent and not args.force:
         # Re-run the non-empty 409 the inline permanent path raises.
         detail = await _subnet_not_empty_detail(db, args.subnet_id)
@@ -560,6 +572,12 @@ async def _apply_delete_subnet(
         return {"subnet_id": str(args.subnet_id), "mode": "soft_delete"}
 
     ensure_superadmin(user)
+
+    # An E911 binding on the subnet or an address in it would go with the
+    # cascade; ``force`` skips the non-empty check, never this (#3891).
+    from app.services.e911.delete_guard import refuse_if_e911_bound  # noqa: PLC0415
+
+    await refuse_if_e911_bound(db, f"subnet {subnet.network}", subnet_ids=[args.subnet_id])
 
     if not args.force:
         detail = await _subnet_not_empty_detail(db, args.subnet_id)
