@@ -217,10 +217,15 @@ function ScopeModalForm({
   // (subnet → block ancestry → space). If set, we default the scope's
   // group to it, so scopes land on whatever DHCP was configured at the
   // IPAM level.
-  const { data: effectiveDhcp } = useQuery({
+  // Read fresh on every open (#3865): the subnet's group may have moved since
+  // a cached answer was taken, and a scope saved in the old group is pushed to
+  // the wrong servers.
+  const { data: effectiveDhcp, isFetching: effectiveReading } = useQuery({
     queryKey: ["subnet-effective-dhcp", subnetId],
     queryFn: () => ipamApi.getEffectiveSubnetDhcp(subnetId),
     enabled: !editing && !defaultGroupId && !!subnetId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const effectiveGroupId = effectiveDhcp?.dhcp_server_group_id ?? null;
   const effectiveGroup = dhcpGroups.find((g) => g.id === effectiveGroupId);
@@ -230,16 +235,22 @@ function ScopeModalForm({
       ? "the space"
       : "this subnet";
 
-  // Auto-select the inherited group on first load, unless the user has
-  // already picked one explicitly.
+  // Follow the inherited group until the operator picks one explicitly. Only a
+  // settled read counts: a cached answer is still on screen while the fresh
+  // one is on its way (#3865).
   const [groupAutoPicked, setGroupAutoPicked] = useState(!!groupId);
   useEffect(() => {
     if (editing || defaultGroupId) return;
     if (groupAutoPicked) return;
-    if (!effectiveGroupId) return;
-    setGroupId(effectiveGroupId);
-    setGroupAutoPicked(true);
-  }, [editing, defaultGroupId, groupAutoPicked, effectiveGroupId]);
+    if (effectiveReading) return;
+    setGroupId(effectiveGroupId ?? "");
+  }, [
+    editing,
+    defaultGroupId,
+    groupAutoPicked,
+    effectiveReading,
+    effectiveGroupId,
+  ]);
 
   // When the parent already chose the subnet (the "+ New Scope on subnet"
   // dropdown), the modal hides the subnet picker but we still need the
@@ -260,10 +271,14 @@ function ScopeModalForm({
     queryFn: settingsApi.get,
     enabled: !editing,
   });
-  const { data: subnetDetail } = useQuery({
+  const { data: subnetDetail, isFetching: subnetReading } = useQuery({
     queryKey: ["subnet", subnetId],
     queryFn: () => ipamApi.getSubnet(subnetId),
     enabled: !editing && !!subnetId,
+    // Gateway + suggested pool come from here: read it fresh on open, and
+    // pre-fill only from that answer (#3865).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // Is this an IPv6 scope? On edit we trust the stored family; on create
@@ -380,7 +395,12 @@ function ScopeModalForm({
     pool: { start: string; end: string } | null;
   } | null>(null);
   useEffect(() => {
-    if (editing || !subnetDetail || subnetPrefill?.subnetId === subnetId)
+    if (
+      editing ||
+      !subnetDetail ||
+      subnetReading ||
+      subnetPrefill?.subnetId === subnetId
+    )
       return;
     const prev = subnetPrefill;
     // Option 3 is DHCPv4-only (a v6 client learns its router from RAs), as
@@ -415,7 +435,15 @@ function ScopeModalForm({
     }
     setSubnetPrefill({ subnetId, routers, pool });
     setPrefillGeneration((g) => g + 1);
-  }, [editing, subnetDetail, subnetId, subnetPrefill, poolStart, poolEnd]);
+  }, [
+    editing,
+    subnetDetail,
+    subnetReading,
+    subnetId,
+    subnetPrefill,
+    poolStart,
+    poolEnd,
+  ]);
 
   const mut = useMutation({
     mutationFn: async (adoptExisting: boolean) => {
@@ -742,11 +770,13 @@ function ScopeModalForm({
             <Field
               label="DHCP Server Group"
               hint={
-                effectiveGroupId && effectiveGroup
-                  ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
-                  : effectiveGroupId === null && subnetId && !editing
-                    ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any group below."
-                    : undefined
+                effectiveReading && subnetId && !editing
+                  ? "Reading this subnet's DHCP group…"
+                  : effectiveGroupId && effectiveGroup
+                    ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
+                    : effectiveGroupId === null && subnetId && !editing
+                      ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any group below."
+                      : undefined
               }
             >
               <select
