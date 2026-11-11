@@ -271,6 +271,9 @@ The Kubernetes flavour of Topology 4. The umbrella Helm chart
 (`charts/spatiumddi`) ships every component — api / worker / beat /
 frontend / migrate / Postgres + Redis (in-chart StatefulSets, or
 CloudNativePG, or external endpoints) / optional DNS+DHCP agent StatefulSets.
+The same chart installs on Red Hat OpenShift under its default security
+context constraints, with a Route for the UI; see
+[KUBERNETES.md → OpenShift](KUBERNETES.md#openshift).
 
 <p align="center">
   <img src="../assets/topologies/topology-6-kubernetes.svg" alt="Topology 6 — Kubernetes via the umbrella Helm chart" width="900"/>
