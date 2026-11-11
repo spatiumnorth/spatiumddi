@@ -207,7 +207,7 @@ Reverse DNS stores IP-to-name mappings in ordinary zones under the special domai
 
 Same pattern as DNS. Do this before you start pinning subnets to DHCP servers.
 
-1. **Use the auto-created group, or make your own.** The Kea agent creates a group named `default` when it registers, so don't create that name by hand (409). For another name, open **DHCP**, click **Create Group** in the groups panel, and move the server into it afterwards from the server's edit form (**Server group**).
+1. **Use the auto-created group, or make your own.** The Kea agent creates a group named `default` when it registers, so don't create that name by hand (409). For another name, open **DHCP**, click **Create Group** in the groups panel, and move the server into it afterwards from the server's edit form (**Server Group**).
 2. **Start the server** (or add it, for Windows DHCP). Agent-based servers appear in their group by themselves.
 
    **Choosing a backend — two questions.** The matrix follows below unchanged.
