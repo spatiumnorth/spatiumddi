@@ -2831,6 +2831,108 @@ After completion, the appliance reboots into normal operation.
 
 ---
 
+## Upgrading to 1.0.0
+
+SpatiumDDI 1.0.0 is the first SemVer release. Every SemVer release ranks
+above every CalVer one, but only a release that carries that ranking can
+tell (`backend/app/core/versions.py`, #1182). So **2026.10.02-1, the last
+CalVer release, is the bridge**: an install on anything older upgrades to
+2026.10.02-1 first, then to 1.0.0 (#1195, #1207, #1286). Take a database
+backup before you upgrade, and do not roll back to a CalVer release
+afterwards: 1.0.0 adds migrations the CalVer releases cannot run on
+(#1227; see [Rolling back](#rolling-back-the-database-stays-on-var-1227)).
+The 1.0.0 release notes carry the full upgrade checklist; this section
+covers how to get off 2026.10.02-1 on each deployment shape (#3915).
+
+### Single appliance, from 2026.10.02-1
+
+The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
+works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
+images (#1181).
+
+### Multi-node cluster, from 2026.10.02-1
+
+**Do not use the Rolling Upgrade tab on a cluster still on
+2026.10.02-1.** Both ways it can start are refused, for reasons already
+fixed in 1.0.0 but not in the release you are running:
+
+- **Upload** answers 502, `Mirror upload failed: All connection attempts
+  failed`. The slot-image mirror pod runs out of memory at its 256Mi limit
+  and crash-loops (#1174, fixed by #1738).
+- **By URL**, Plan answers 409, `preflight failed; refusing to plan:
+  replication_lag`, naming replicas "not streaming" while
+  `pg_stat_replication` shows them streaming and CNPG reports every
+  instance healthy. It is a false alarm (#1445, item 6).
+
+Nothing is harmed by either refusal: no run is created and no node is
+touched. The way off 2026.10.02-1 is **Fleet, node by node**. The same
+procedure converged a three-node cluster on 1.0.0-rc.2 with every
+reservation, record and address unchanged.
+
+1. Wait until the cluster is healthy: every node Ready, CNPG healthy with
+   its replicas streaming.
+2. On the node's page in **Fleet**, press **Upgrade**, choose **From
+   external URL**, and give the 1.0.0 slot asset's release URL for your
+   architecture. The node fetches the image itself (about 1.8 GB) and
+   stages it in a few minutes. Its runner ends with `next-boot armed.
+   Operator needs to reboot to switch slots.`
+3. Press **Reboot** once that node has staged. **The reboot is your
+   step.** The Upgrade form in 2026.10.02-1 says the runner "reboots into
+   it", but the runner only writes the inactive slot and arms the next
+   boot. (1.0.0's form says "Reboot to boot the new slot".) The node boots
+   the new slot and commits it.
+4. If a node is still up a few minutes after its **Reboot**, reboot it
+   from its console or its hypervisor (#1445, item 7).
+5. Go to the next node only when the cluster is healthy again. **Members
+   first, the seed last.** The seed's first boot on 1.0.0 moves the
+   control plane to 1.0.0's images; the supervisor and every control-plane
+   Deployment moved within about 2 minutes of it.
+
+<!-- #3915-order -->
+The order proven so far is to stage and reboot each node in turn: finish
+one node's Upgrade and Reboot before starting the next, members first and
+the seed last. Staging every node first and rebooting them afterwards may
+shorten the DNS and DHCP gap below, and is being drilled on a fresh
+2026.10.02-1 cluster; this paragraph will be replaced with the result,
+which may recommend that order instead.
+<!-- #3915-order -->
+
+What to expect:
+
+- **DNS and DHCP drop on nodes not yet upgraded (#3136).** From the
+  moment the first node reboots into 1.0.0, each node still on
+  2026.10.02-1 stops serving DNS and DHCP until its own Upgrade has
+  staged: the shared appliance chart is moved to 1.0.0's image tag, and
+  the agent pods there cannot start until those images are present. In
+  the three-node run the seed answered no DNS for almost 18 minutes, and
+  the DHCP agents were each down about 5 minutes. **Arrange another
+  resolver and another DHCP path for the whole upgrade**, not only for
+  each reboot. At least one node answered DNS at every sample, and no
+  client lost its lease.
+- **No drain at each reboot (#1976).** A node goes down with its pods
+  still Ready, so API requests through the other nodes can fail for up to
+  about a minute at each reboot. Its k3s can also restart while the new
+  slot is being written (#1804).
+- **Time.** About 47 minutes for three nodes: about 10 minutes for each
+  member and 18 for the seed.
+
+A cluster already on 1.0.0 or later uses the Rolling Upgrade tab as
+normal.
+
+### Helm, from 2026.10.02-1
+
+A Helm install with DHCP agents can stall on the old Kea pod, which was
+never Ready under the 2026.10.02-1 probe, so its StatefulSet will not roll
+(#1589, #3907). The recovery, and what the chart now does about it, are in
+[`KUBERNETES.md` → Upgrading](KUBERNETES.md#8-upgrading); an air-gapped
+site must load the new api image before upgrading (#3907).
+
+### Docker Compose, from 2026.10.02-1
+
+The normal pull, migrate and `up -d` works (verified, #1181).
+
+---
+
 ## 5. Appliance Update Mechanism
 
 Two update paths exist, addressing different operator workflows.

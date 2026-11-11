@@ -852,6 +852,19 @@ new release's schema, as long as every table and column it uses is still there
 plane the only api pod is replaced first, so that install still takes its brief
 api outage on every rollout.
 
+### Upgrading to 1.0.0 from 2026.10.02-1
+
+Coming from the last CalVer release, 2026.10.02-1, with DHCP agents
+enabled: its Kea pod can be never Ready under that release's readiness
+probe, so the StatefulSet will not roll to the new image and `helm upgrade
+--wait` times out (#1589, #3907). #3907 adds a `pre-upgrade` hook for
+this, and a site with no outbound access must load the new api image into
+its nodes before running the upgrade, since the hook runs it. Where your
+chart does not have the hook, delete the stuck `dhcp-kea-*` pod by hand
+after the upgrade and it comes back on the new image. See also
+[Upgrading to 1.0.0](APPLIANCE.md#upgrading-to-100) for the version path,
+and for the appliance and Compose shapes.
+
 ### Manual (manifest) upgrades
 
 If you're running the raw `k8s/base/` manifests instead of the chart, pin the
