@@ -45,7 +45,14 @@ HELD_BUNDLE = "config/held.json"
 def ensure_layout(state_dir: Path) -> None:
     for sub in ("config", "rendered", "tsig", "ops/inflight", "ops/failed"):
         (state_dir / sub).mkdir(parents=True, exist_ok=True)
-    os.chmod(state_dir, 0o700)
+    try:
+        os.chmod(state_dir, 0o700)
+    except PermissionError:
+        # Not the directory's owner (#3852): under OpenShift's restricted SCC the
+        # agent runs as a random uid and the volume is owned by root with the
+        # pod's fsGroup. Only the owner may chmod; the files written here are
+        # 0600 themselves. (The DHCP agent's ensure_layout already tolerates it.)
+        pass
     # A spool left by a process killed mid-download or mid-parse (an OOM kill
     # is the case #2029 is about) is up to a whole bundle of dead disk. The
     # next fetch would truncate it anyway; dropping it at start means a
