@@ -55,6 +55,7 @@ from app.services.backup.targets import (
     InvalidArchiveNameError,
     SecretFieldError,
     UnsupportedOperationError,
+    check_config_value_types,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
@@ -401,6 +402,7 @@ async def create_target(
                 detail=f"'{name}' must be the secret itself, not a stored '{ENC_PREFIX}' value",
             )
     try:
+        check_config_value_types(driver, body.config)
         # Same auth-mode rules as Edit (#3696): one mode, no unused credential.
         body.config = normalize_config_for_create(driver, body.config)
         driver.validate_config(body.config)
@@ -557,6 +559,7 @@ async def update_target(
         # (#3289). Validation runs on the merged dict so shape checks see
         # all fields.
         try:
+            check_config_value_types(driver, payload["config"])
             merged = merge_config_for_update(
                 driver, incoming=payload["config"], existing=row.config
             )
