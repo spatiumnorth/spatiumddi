@@ -796,6 +796,22 @@ async def restore_row(
 
     db.add_all(audit_rows)
     await db.commit()
+    # #3924 — a restored zone's IPAM-generated records are as the Trash held
+    # them; the addresses they belong to went on changing while it sat there.
+    if restored_zone_ids:
+        from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
+        from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            reconcile_restored_zone_records_task,
+        )
+
+        try:
+            await _dispatch(
+                reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+            )
+        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+            # Broker down: the zone answers what the Trash held until the next
+            # IPAM-DNS sync (Sync DNS on the subnet, or the opt-in auto-sync).
+            logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc))
     if republish_subnet_ids:
         from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
