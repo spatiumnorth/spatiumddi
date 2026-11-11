@@ -51,6 +51,8 @@ from app.core.mac import canonicalize_mac
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
+from app.services.dhcp.normalize import canonical_duid
+from app.services.dhcp.static_conflicts import resolve_static_identity
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
 from app.services.ipam.address_create_rules import (
@@ -407,7 +409,8 @@ class CreateIPAddressArgs(BaseModel):
         default="allocated",
         description=(
             "IP status: 'allocated' (default), 'reserved', or "
-            "'static_dhcp'. Static_dhcp requires mac_address."
+            "'static_dhcp'. Static_dhcp requires mac_address, or duid on an "
+            "IPv6 address."
         ),
     )
     hostname: str | None = Field(default=None, description="Hostname (e.g. web01)")
@@ -419,6 +422,13 @@ class CreateIPAddressArgs(BaseModel):
         ),
     )
     mac_address: str | None = Field(default=None, description="MAC address in any standard format")
+    duid: str | None = Field(
+        default=None,
+        description=(
+            "DHCPv6 DUID (hex octets, ':' separated) for a static_dhcp IPv6 "
+            "address; the reservation is keyed on it and needs no MAC"
+        ),
+    )
     description: str = Field(default="", description="Free-form description")
 
     # The same field rules as the REST create (``IPAddressCreate``): the
@@ -452,6 +462,13 @@ class CreateIPAddressArgs(BaseModel):
         if v is None or v.strip() == "":
             return None
         return canonicalize_mac(v)
+
+    @field_validator("duid")
+    @classmethod
+    def _duid(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return canonical_duid(v)
 
 
 async def _hostname_from_fqdn(
@@ -576,6 +593,8 @@ async def _preview_create_ip_address(
         parts.append(f"fqdn={args.fqdn}")
     if args.mac_address:
         parts.append(f"mac={args.mac_address}")
+    if args.duid:
+        parts.append(f"duid={args.duid}")
     if args.description:
         # Truncate to keep the preview readable.
         d = args.description if len(args.description) < 80 else args.description[:77] + "..."
@@ -728,7 +747,7 @@ async def _validate_submit_create_ip_address(
     if fqdn_err is not None:  # preview already refused; defensive
         raise HTTPException(status_code=422, detail=fqdn_err)
     assert_subnet_takes_addresses(subnet)
-    assert_static_dhcp_has_mac(args.status, args.mac_address)
+    assert_static_dhcp_has_mac(args.status, args.mac_address, args.duid, args.address)
     assert_not_boundary_address(subnet, args.address)
     await assert_address_unallocated(db, subnet.id, args.address)
     reason = await _static_dhcp_scope_error(db, subnet, args)
@@ -812,14 +831,20 @@ async def _apply_create_ip_address(
             f"(status={existing.status})"
         )
 
-    if args.status == "static_dhcp" and not args.mac_address:
-        raise ValueError("mac_address is required when status is 'static_dhcp'")
+    if args.duid and ":" not in args.address:
+        raise ValueError("duid is only valid on an IPv6 address")
+    if args.status == "static_dhcp" and not args.mac_address and not args.duid:
+        raise ValueError(
+            "mac_address or duid is required when status is 'static_dhcp'"
+            if ":" in args.address
+            else "mac_address is required when status is 'static_dhcp'"
+        )
 
     # #3646 — an approver who may not write reservations is refused as a
     # permission error, which leaves the request pending for one who may. A
     # plain ValueError would end it ``failed`` for good over a refusal that is
     # about THIS approver, not the request.
-    if args.status == "static_dhcp" and args.mac_address:
+    if args.status == "static_dhcp" and (args.mac_address or args.duid):
         from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
 
         if not user_has_permission(user, "write", "dhcp_static"):
@@ -868,6 +893,7 @@ async def _apply_create_ip_address(
                 status=args.status,
                 hostname=args.hostname,
                 mac_address=args.mac_address,
+                duid=args.duid,
                 description=args.description or "",
             ),
             user,
@@ -906,6 +932,7 @@ async def _apply_create_ip_address(
         hostname=args.hostname,
         fqdn=args.fqdn,
         mac_address=args.mac_address,
+        duid=args.duid,
         description=args.description or "",
         created_by_user_id=user.id,
     )
@@ -3656,7 +3683,20 @@ class CreateDHCPStaticArgs(BaseModel):
         json_schema_extra={"x-resource": "dhcp_scope"},
     )
     ip_address: str = Field(description="IP to reserve (must fall inside the scope).")
-    mac_address: str = Field(description="MAC address (any standard format).")
+    mac_address: str | None = Field(
+        default=None,
+        description=(
+            "MAC address (any standard format). Required on an IPv4 scope; on an "
+            "IPv6 scope give this or a duid."
+        ),
+    )
+    duid: str | None = Field(
+        default=None,
+        description=(
+            "DHCPv6 DUID (hex octets, ':' separated) for a reservation on an "
+            "IPv6 scope. When set, the reservation is keyed on it instead of the MAC."
+        ),
+    )
     hostname: str | None = Field(default=None, description="Optional hostname.")
     description: str = Field(default="", description="Free-form description.")
 
@@ -3669,8 +3709,17 @@ class CreateDHCPStaticArgs(BaseModel):
 
     @field_validator("mac_address")
     @classmethod
-    def _mac(cls, v: str) -> str:
+    def _mac(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
         return canonicalize_mac(v)
+
+    @field_validator("duid")
+    @classmethod
+    def _duid(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return canonical_duid(v)
 
 
 async def _preview_create_dhcp_static(
@@ -3718,16 +3767,25 @@ async def _preview_create_dhcp_static(
             detail=(f"IP {args.ip_address} is outside scope subnet {subnet.network}."),
         )
 
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    try:
+        resolve_static_identity(scope, args.mac_address, args.duid)
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=str(exc.detail))
+
     # Conflict probe — do NOT reject in preview; surface as a hint so
     # the operator can decide whether to abort or replace.
+    identity_conds = []
+    if args.mac_address:
+        identity_conds.append(DHCPStaticAssignment.mac_address == args.mac_address.lower())
+    if args.duid:
+        identity_conds.append(DHCPStaticAssignment.duid == args.duid)
     existing = (
         await db.execute(
             select(DHCPStaticAssignment).where(
                 DHCPStaticAssignment.scope_id == scope.id,
-                or_(
-                    DHCPStaticAssignment.ip_address == args.ip_address,
-                    DHCPStaticAssignment.mac_address == args.mac_address.lower(),
-                ),
+                or_(DHCPStaticAssignment.ip_address == args.ip_address, *identity_conds),
             )
         )
     ).first()
@@ -3738,8 +3796,11 @@ async def _preview_create_dhcp_static(
     parts = [
         f"Create DHCP static reservation in scope `{scope.name or subnet.network}`",
         f"ip={args.ip_address}",
-        f"mac={args.mac_address}",
     ]
+    if args.mac_address:
+        parts.append(f"mac={args.mac_address}")
+    if args.duid:
+        parts.append(f"duid={args.duid}")
     if args.hostname:
         parts.append(f"hostname={args.hostname}")
     if args.description:
@@ -3760,9 +3821,8 @@ async def _validate_submit_create_dhcp_static(
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:  # preview already refused; defensive
         return
-    await check_static_conflicts(
-        db, scope, args.ip_address, args.mac_address.lower(), name_other_scope=False
-    )
+    mac, duid = resolve_static_identity(scope, args.mac_address, args.duid)
+    await check_static_conflicts(db, scope, args.ip_address, mac, name_other_scope=False, duid=duid)
 
 
 async def _apply_create_dhcp_static(
@@ -3799,12 +3859,14 @@ async def _apply_create_dhcp_static(
     # group, a malformed IP). Raises a 4xx HTTPException; both callers roll
     # back on it. An approve records the request ``failed`` with the detail
     # (#2911); a proposal apply reports it as the proposal's error.
-    await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
+    mac, duid = resolve_static_identity(scope, args.mac_address, args.duid)
+    await check_static_conflicts(db, scope, args.ip_address, mac, duid=duid)
 
     row = DHCPStaticAssignment(
         scope_id=scope.id,
         ip_address=args.ip_address,
-        mac_address=args.mac_address.lower(),
+        mac_address=mac,
+        duid=duid,
         hostname=args.hostname or "",
         description=args.description or "",
         created_by_user_id=user.id,
@@ -3826,11 +3888,12 @@ async def _apply_create_dhcp_static(
         action="create",
         resource_type="dhcp.static_assignment",
         resource_id=str(row.id),
-        resource_display=f"{args.ip_address} ({args.mac_address})",
+        resource_display=f"{args.ip_address} ({mac or duid})",
         new_value={
             "scope_id": str(scope.id),
             "ip_address": args.ip_address,
-            "mac_address": args.mac_address.lower(),
+            "mac_address": mac,
+            "duid": duid,
             "hostname": args.hostname,
             "via": "ai_proposal",
         },
@@ -3841,7 +3904,8 @@ async def _apply_create_dhcp_static(
         "id": str(row.id),
         "scope_id": str(scope.id),
         "ip_address": args.ip_address,
-        "mac_address": args.mac_address.lower(),
+        "mac_address": mac,
+        "duid": duid,
     }
 
 
@@ -3849,7 +3913,7 @@ register(
     Operation(
         name="create_dhcp_static",
         description=(
-            "Create a DHCP static reservation (MAC → IP) inside a "
+            "Create a DHCP static reservation (MAC or, for DHCPv6, DUID → IP) inside a "
             "scope. Always route via propose_create_dhcp_static — the "
             "reservation propagates to the Kea / Windows DHCP backend "
             "on apply, so operator approval is required."

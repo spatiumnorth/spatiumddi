@@ -52,6 +52,7 @@ ADDRESS_COLUMNS = [
     "hostname",
     "fqdn",
     "mac_address",
+    "duid",
     "description",
     "last_seen_at",
 ]
@@ -189,6 +190,7 @@ async def _collect(
                     "hostname": a.hostname,
                     "fqdn": current_fqdn(a.hostname, a.fqdn),
                     "mac_address": str(a.mac_address) if a.mac_address else None,
+                    "duid": a.duid,
                     "description": a.description,
                     "last_seen_at": _dt(a.last_seen_at),
                     "custom_fields": a.custom_fields or {},

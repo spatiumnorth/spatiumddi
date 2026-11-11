@@ -77,6 +77,7 @@ from app.services.api_token_scopes import read_only_post
 from app.services.approvals.gate import gate_or_execute
 from app.services.audit_chain import lock_audit_chain
 from app.services.dhcp.agent_wake_targets import dhcp_group_channels_for_subnets
+from app.services.dhcp.normalize import canonical_duid
 from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
@@ -4895,11 +4896,21 @@ def _validate_role(v: Any) -> Any:
     return v
 
 
+def _validate_duid(v: str | None) -> str | None:
+    """Canonical colon-hex DUID, or ``None`` when blank (#3900)."""
+    if v is None or not v.strip():
+        return None
+    return canonical_duid(v)
+
+
 class IPAddressCreate(BaseModel):
     address: str
     status: str = "allocated"
     hostname: str
     mac_address: str | None = None
+    # DHCPv6 DUID (#3900) — identifies a ``static_dhcp`` IPv6 address that has
+    # no MAC. Canonicalised; IPv6 addresses only.
+    duid: str | None = None
     description: str = ""
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] = {}
@@ -4929,6 +4940,8 @@ class IPAddressCreate(BaseModel):
     # collides with another IP's FQDN or MAC. Clients re-submit with True
     # after the user confirms the warning.
     force: bool = False
+
+    _duid = field_validator("duid")(_validate_duid)
 
     @field_validator("hostname")
     @classmethod
@@ -4975,10 +4988,12 @@ class IPAddressUpdate(BaseModel):
     status: str | None = None
     hostname: str | None = None
     mac_address: str | None = None
+    duid: str | None = None  # DHCPv6 DUID (#3900); explicit null clears it
     description: str | None = None
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] | None = None
     tags: dict[str, Any] | None = None
+    _duid = field_validator("duid")(_validate_duid)
     dns_zone_id: str | None = None  # explicit zone override for DNS record
     # See IPAddressCreate. Pass ``[]`` to explicitly clear; omit
     # the field to leave the existing list untouched.
@@ -5047,6 +5062,7 @@ class IPAddressResponse(BaseModel):
     hostname: str | None
     fqdn: str | None
     mac_address: str | None
+    duid: str | None = None
     description: str
     owner_user_id: uuid.UUID | None
     last_seen_at: datetime | None
@@ -5165,6 +5181,7 @@ class NextIPRequest(BaseModel):
     status: str = "allocated"
     hostname: str
     mac_address: str | None = None
+    duid: str | None = None  # DHCPv6 DUID (#3900), see IPAddressCreate
     description: str = ""
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
@@ -5184,6 +5201,8 @@ class NextIPRequest(BaseModel):
     decom_date: date | None = None
     # See IPAddressCreate.force.
     force: bool = False
+
+    _duid = field_validator("duid")(_validate_duid)
 
     @field_validator("hostname")
     @classmethod
@@ -10483,7 +10502,7 @@ async def create_address(
     )
 
     # MAC address required for static_dhcp
-    assert_static_dhcp_has_mac(body.status, body.mac_address)
+    assert_static_dhcp_has_mac(body.status, body.mac_address, body.duid, body.address)
 
     # Check address not already in use
     assert_not_boundary_address(subnet, body.address)
@@ -10874,11 +10893,10 @@ async def update_address(
         new_mac = body.mac_address
     else:
         new_mac = ip.mac_address
-    if new_status == "static_dhcp" and not new_mac:
-        raise HTTPException(
-            status_code=422,
-            detail="mac_address is required when status is 'static_dhcp'",
-        )
+    new_duid = body.duid if "duid" in body.model_fields_set else ip.duid
+    assert_static_dhcp_has_mac(
+        new_status, str(new_mac) if new_mac else None, new_duid, str(ip.address)
+    )
 
     old = {
         "status": ip.status,
@@ -10993,7 +11011,7 @@ async def update_address(
     # Track whether any integration-relevant soft field is genuinely
     # changing — used to decide if we stamp ``user_modified_at`` so
     # the reconcilers know to skip overwrites of those fields.
-    soft_fields = {"hostname", "description", "status", "mac_address"}
+    soft_fields = {"hostname", "description", "status", "mac_address", "duid"}
     soft_field_actually_changed = False
     for field, value in changes.items():
         if field in soft_fields and getattr(ip, field) != value:
@@ -12431,11 +12449,13 @@ async def allocate_next_ip(
             ),
         )
 
-    if body.status == "static_dhcp" and not body.mac_address:
-        raise HTTPException(
-            status_code=422,
-            detail="mac_address is required when status is 'static_dhcp'",
-        )
+    assert_static_dhcp_has_mac(
+        body.status,
+        body.mac_address,
+        body.duid,
+        # The address is picked below; its family is the subnet's.
+        "::" if ":" in str(subnet.network) else None,
+    )
 
     # A zone named in the body must be one the caller may publish into: the
     # subnet's own zones or one it holds write on (#2438), as create_address.
@@ -12531,6 +12551,7 @@ async def allocate_next_ip(
         status=body.status,
         hostname=body.hostname,
         mac_address=body.mac_address,
+        duid=body.duid,
         description=body.description,
         custom_fields=body.custom_fields,
         tags=body.tags,

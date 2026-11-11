@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
+from app.services.dhcp.normalize import canonical_duid
 from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
 from app.services.ipam.subnet_placeholders import (
@@ -841,6 +842,16 @@ def _row_address_fields(
             if not _MAC_RE.match(m):
                 return None, {}, f"Invalid MAC address {m!r}"
             fields["mac_address"] = m
+    if (du := row.get("duid")) is not None:
+        du = str(du).strip() or None
+        if du:
+            # DHCPv6 DUID (#3900): identifies a static_dhcp IPv6 address.
+            if ipaddress.ip_address(canonical).version != 6:
+                return None, {}, f"DUID {du!r} is only valid on an IPv6 address"
+            try:
+                fields["duid"] = canonical_duid(du)
+            except ValueError as exc:
+                return None, {}, f"Invalid DUID {du!r}: {exc}"
     if (d := row.get("description")) is not None:
         d = str(d).strip()
         fields["description"] = d
@@ -894,7 +905,8 @@ async def preview_address_import(
             if existing_ip is not None and existing_ip.mac_address
             else None
         )
-        if status != "static_dhcp" or not mac:
+        duid = fields.get("duid") or (existing_ip.duid if existing_ip is not None else None)
+        if status != "static_dhcp" or not (mac or duid):
             return {}
         # #1629 (GHSA-44ph) — the commit-side sync gates on the acting
         # user's ``dhcp_static`` grant; preview the same outcome when
@@ -1297,6 +1309,7 @@ async def commit_address_import(
             status=ip_status,
             hostname=fields.get("hostname"),
             mac_address=fields.get("mac_address"),
+            duid=fields.get("duid"),
             description=fields.get("description") or "",
             tags=fields.get("tags") or {},
             custom_fields=fields.get("custom_fields") or {},
@@ -1328,7 +1341,7 @@ async def commit_address_import(
             except Exception as exc:  # noqa: BLE001
                 # Don't fail the whole import — user can re-run DNS Sync after.
                 result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
-        if ip_status == "static_dhcp" and new_ip.mac_address:
+        if ip_status == "static_dhcp" and (new_ip.mac_address or new_ip.duid):
             await _sync_dhcp(new_ip, canonical)
         result_obj.created += 1
 

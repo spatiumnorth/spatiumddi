@@ -442,6 +442,11 @@ export function IPDetailModal({
                 dash(null)
               )}
             </Field>
+            {addr.duid && (
+              <Field label="DHCPv6 DUID" mono>
+                {addr.duid}
+              </Field>
+            )}
             <Field label="Subnet" mono>
               {subnet ? (
                 <span>

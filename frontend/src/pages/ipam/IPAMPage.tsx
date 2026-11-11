@@ -3555,6 +3555,8 @@ export function AddAddressModal({
   );
   const [hostname, setHostname] = useState("");
   const [mac, setMac] = useState("");
+  // DHCPv6 DUID (#3900) — keys a static_dhcp IPv6 reservation instead of a MAC.
+  const [duid, setDuid] = useState("");
   const [description, setDescription] = useState("");
   const [ipStatus, setIpStatus] = useState("allocated");
   const [role, setRole] = useState<string>("");
@@ -3676,6 +3678,13 @@ export function AddAddressModal({
     staleTime: 30_000,
   });
   const splitHorizon = subnetDetailForSplit?.dns_split_horizon ?? false;
+  // A DUID only identifies a DHCPv6 client, so the field belongs to an IPv6
+  // subnet / address (#3900).
+  const isV6Target =
+    mode === "manual" && address
+      ? address.includes(":")
+      : (subnetDetailForSplit?.network ?? "").includes(":");
+  const showDuid = ipStatus === "static_dhcp" && isV6Target;
 
   // Load zones from all effective group IDs
   // #2135 — no zone reads while core.dns is off, so no zone picker either.
@@ -3757,6 +3766,7 @@ export function AddAddressModal({
               hostname,
               status: ipStatus,
               mac_address: mac || undefined,
+              duid: showDuid && duid.trim() ? duid.trim() : undefined,
               description: description || undefined,
               custom_fields: shownCustomFields,
               dns_zone_id: zoneParam,
@@ -3771,6 +3781,7 @@ export function AddAddressModal({
               address,
               hostname,
               mac_address: mac || undefined,
+              duid: showDuid && duid.trim() ? duid.trim() : undefined,
               description: description || undefined,
               status: ipStatus,
               custom_fields: shownCustomFields,
@@ -4096,6 +4107,16 @@ export function AddAddressModal({
               placeholder="e.g. aa:bb:cc:dd:ee:ff"
             />
           </Field>
+          {showDuid && (
+            <Field label="DHCPv6 DUID (optional with a MAC)">
+              <input
+                className={`${inputCls} font-mono`}
+                value={duid}
+                onChange={(e) => setDuid(e.target.value)}
+                placeholder="e.g. 00:01:00:01:2a:3b:4c:5d:aa:bb:cc:dd:ee:ff"
+              />
+            </Field>
+          )}
           <Field label="Type / Status">
             <select
               className={inputCls}
@@ -9575,6 +9596,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const [hostname, setHostname] = useState(address.hostname ?? "");
   const [description, setDescription] = useState(address.description ?? "");
   const [macAddress, setMacAddress] = useState(address.mac_address ?? "");
+  // DHCPv6 DUID (#3900): an IPv6 static_dhcp row may be keyed on it alone.
+  const [duid, setDuid] = useState(address.duid ?? "");
+  const isV6Address = address.address.includes(":");
   const [status, setStatus] = useState(address.status);
   const [role, setRole] = useState<string>(address.role ?? "");
   // datetime-local needs ``YYYY-MM-DDTHH:MM`` in *local* wall-clock (#500).
@@ -9780,6 +9804,8 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
         hostname: hostname || null,
         description,
         mac_address: macAddress || null,
+        // Only an IPv6 row has a DUID; the field is not even shown on IPv4.
+        ...(isV6Address ? { duid: duid.trim() || null } : {}),
         status,
         custom_fields: customFields,
         role: (role || null) as IPRole | null,
@@ -9795,6 +9821,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           hostname: address.hostname ?? null,
           description: address.description ?? "",
           mac_address: address.mac_address ?? null,
+          ...(isV6Address ? { duid: address.duid ?? null } : {}),
           status: address.status,
           custom_fields: address.custom_fields ?? {},
           role: address.role ?? null,
@@ -10040,6 +10067,16 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             placeholder="e.g. 00:1a:2b:3c:4d:5e"
           />
         </Field>
+        {isV6Address && (
+          <Field label="DHCPv6 DUID">
+            <input
+              className={`${inputCls} font-mono`}
+              value={duid}
+              onChange={(e) => setDuid(e.target.value)}
+              placeholder="e.g. 00:01:00:01:2a:3b:4c:5d:aa:bb:cc:dd:ee:ff"
+            />
+          </Field>
+        )}
         <Field label="Status">
           <select
             className={inputCls}
@@ -10080,11 +10117,15 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             )}
           </div>
         )}
-        {status === "static_dhcp" && !macAddress && (
-          <p className="text-xs text-amber-600">
-            MAC address required to create a static DHCP reservation.
-          </p>
-        )}
+        {status === "static_dhcp" &&
+          !macAddress &&
+          !(isV6Address && duid.trim()) && (
+            <p className="text-xs text-amber-600">
+              {isV6Address
+                ? "A MAC address or a DHCPv6 DUID is required to create a static DHCP reservation."
+                : "MAC address required to create a static DHCP reservation."}
+            </p>
+          )}
         {status === "static_dhcp" && address.static_assignment_id && (
           <p className="text-[11px] text-muted-foreground">
             A DHCP reservation is linked to this address. Saving keeps it in

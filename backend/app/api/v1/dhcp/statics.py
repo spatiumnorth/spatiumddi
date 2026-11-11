@@ -20,9 +20,10 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
-from app.services.dhcp.normalize import norm_duid, norm_ip, norm_mac
+from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.static_conflicts import check_static_conflicts as _conflict_check
+from app.services.dhcp.static_conflicts import resolve_static_identity
 from app.services.dhcp.static_ipam import (
     detach_ipam_for_static,
     publish_handover_ddns,
@@ -47,6 +48,18 @@ def _validate_optional_hostname(v: str | None) -> str | None:
     return validate_optional_hostname(v)
 
 
+def _validate_duid(v: str | None) -> str | None:
+    """Canonical colon-hex DUID, or ``None`` for blank / not sent (#3900).
+
+    RFC 8415 §11.1 bounds it to 3-130 octets (a 2-octet type plus up to 128);
+    the stored form is what Kea reports on a lease, so a reservation and the
+    lease it matches compare equal.
+    """
+    if v is None or not v.strip():
+        return None
+    return canonical_duid(v)
+
+
 def _no_scope_move(v: uuid.UUID | None) -> uuid.UUID | None:
     """Reject a body-supplied ``scope_id`` on reservation create/update (#619).
 
@@ -66,12 +79,14 @@ def _no_scope_move(v: uuid.UUID | None) -> uuid.UUID | None:
 
 class StaticCreate(BaseModel):
     ip_address: str
-    mac_address: str
+    # A MAC is required on an IPv4 scope; a DHCPv6 reservation needs a DUID or
+    # a MAC (#3900) — ``resolve_static_identity`` enforces it against the scope.
+    mac_address: str | None = None
     hostname: str = ""
     description: str = ""
     client_id: str | None = None
-    # DHCPv6 DUID (issue #368) — on a v6 scope the reservation is keyed on
-    # this instead of the MAC. The MAC stays required at the model level.
+    # DHCPv6 DUID (issues #368, #3900) — on a v6 scope the reservation is keyed
+    # on this instead of the MAC, which may then be left out.
     duid: str | None = None
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
@@ -93,9 +108,13 @@ class StaticCreate(BaseModel):
     def _hostname(cls, v: str) -> str:
         return _validate_optional_hostname(v) or ""
 
+    _duid = field_validator("duid")(_validate_duid)
+
     @field_validator("mac_address")
     @classmethod
-    def _mac(cls, v: str) -> str:
+    def _mac(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
         # The column is MACADDR and ``_conflict_check`` compares against it, so
         # an unvalidated value reached Postgres as a cast failure and surfaced
         # to the operator as a 500 "Internal Server Error" in the reservation
@@ -131,18 +150,21 @@ class StaticUpdate(BaseModel):
     def _hostname(cls, v: str | None) -> str | None:
         return _validate_optional_hostname(v)
 
+    _duid = field_validator("duid")(_validate_duid)
+
     @field_validator("mac_address")
     @classmethod
     def _mac(cls, v: str | None) -> str | None:
-        # ``None`` means "not being changed" on a PATCH-shaped update body.
-        return canonicalize_mac(v) if v is not None else None
+        # ``None`` means "not being changed" (or, sent explicitly, cleared —
+        # allowed only when the reservation keeps a DUID, #3900).
+        return canonicalize_mac(v) if v else None
 
 
 class StaticResponse(BaseModel):
     id: uuid.UUID
     scope_id: uuid.UUID
     ip_address: str
-    mac_address: str
+    mac_address: str | None = None
     hostname: str
     description: str
     client_id: str | None
@@ -244,7 +266,8 @@ async def create_static(
             group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=scope.address_family or "ipv4",
         )
-    await _conflict_check(db, scope, body.ip_address, body.mac_address)
+    body.mac_address, body.duid = resolve_static_identity(scope, body.mac_address, body.duid)
+    await _conflict_check(db, scope, body.ip_address, body.mac_address, duid=body.duid)
     st = DHCPStaticAssignment(
         scope_id=scope_id,
         created_by_user_id=user.id,
@@ -262,7 +285,7 @@ async def create_static(
         action="create",
         resource_type="dhcp_static_assignment",
         resource_id=str(st.id),
-        resource_display=f"{body.mac_address}->{body.ip_address}",
+        resource_display=f"{body.mac_address or body.duid}->{body.ip_address}",
         new_value=body.model_dump(mode="json"),
     )
     await db.commit()
@@ -283,14 +306,14 @@ async def update_static(
     # Capture the old MAC + IP before mutating so the write-through can
     # remove-then-add on Windows if either changed (#426 — Windows can't
     # relocate a reservation's IP via Set-).
-    prev_mac = str(st.mac_address)
+    prev_mac = str(st.mac_address) if st.mac_address else None
     prev_ip = str(st.ip_address)
     # #1563 — explicit null clears client_id / duid / options_override /
     # ip_address_id; null for a NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
-        clearable={"client_id", "duid", "options_override", "ip_address_id"},
-        non_nullable={"ip_address", "mac_address", "hostname", "description", "tags"},
+        clearable={"client_id", "duid", "mac_address", "options_override", "ip_address_id"},
+        non_nullable={"ip_address", "hostname", "description", "tags"},
     )
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
@@ -307,9 +330,21 @@ async def update_static(
     # edit) stored since.
     changes = {k: v for k, v in changes.items() if not _same_value(k, getattr(st, k), v)}
     new_ip = changes.get("ip_address", str(st.ip_address))
-    new_mac = changes.get("mac_address", str(st.mac_address))
-    if "ip_address" in changes or "mac_address" in changes:
-        await _conflict_check(db, scope, new_ip, new_mac, exclude_id=st.id)
+    new_mac = changes["mac_address"] if "mac_address" in changes else st.mac_address
+    new_duid = changes["duid"] if "duid" in changes else st.duid
+    if "mac_address" in changes or "duid" in changes:
+        # The reservation must still carry an identifier its scope accepts —
+        # clearing the MAC is fine on a v6 one that keeps its DUID (#3900).
+        resolve_static_identity(scope, new_mac, new_duid)
+    if {"ip_address", "mac_address", "duid"} & changes.keys():
+        await _conflict_check(
+            db,
+            scope,
+            new_ip,
+            str(new_mac) if new_mac else None,
+            exclude_id=st.id,
+            duid=new_duid,
+        )
     before = snapshot(st, changes)
     for k, v in changes.items():
         setattr(st, k, v)
@@ -328,7 +363,7 @@ async def update_static(
         action="update",
         resource_type="dhcp_static_assignment",
         resource_id=str(st.id),
-        resource_display=f"{st.mac_address}->{st.ip_address}",
+        resource_display=f"{st.mac_address or st.duid}->{st.ip_address}",
         changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
@@ -353,7 +388,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
         action="delete",
         resource_type="dhcp_static_assignment",
         resource_id=str(st.id),
-        resource_display=f"{st.mac_address}->{st.ip_address}",
+        resource_display=f"{st.mac_address or st.duid}->{st.ip_address}",
     )
     await db.delete(st)
     # #1274 — a row handed to a live lease gets its DDNS back, but only once

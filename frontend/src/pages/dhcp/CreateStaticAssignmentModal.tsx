@@ -9,7 +9,11 @@ import {
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { hostnameError } from "@/lib/dnsNames";
-import { staticDuidField } from "@/lib/formPayloads";
+import {
+  staticDuidField,
+  staticIdentityMissing,
+  staticMacField,
+} from "@/lib/formPayloads";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
 type StaticModalProps = {
@@ -78,7 +82,7 @@ function StaticModalForm({
   const mut = useMutation({
     mutationFn: () => {
       const data: DHCPStaticAssignmentWrite = {
-        mac_address: mac,
+        ...staticMacField({ isV6, mac }),
         ip_address: ip,
         hostname,
         description,
@@ -90,7 +94,7 @@ function StaticModalForm({
       // the reservation, its IPAM address or DNS.
       const st = staticAssignment!;
       const was = {
-        mac_address: st.mac_address,
+        mac_address: st.mac_address || (isV6 ? null : ""),
         ip_address: st.ip_address,
         hostname: st.hostname ?? "",
         description: st.description ?? "",
@@ -131,12 +135,19 @@ function StaticModalForm({
         className="space-y-3"
       >
         <div className="grid grid-cols-2 gap-3">
-          <Field label="MAC Address" hint="Format: aa:bb:cc:dd:ee:ff">
+          <Field
+            label="MAC Address"
+            hint={
+              isV6
+                ? "Optional on IPv6 when a DUID is set. Format: aa:bb:cc:dd:ee:ff"
+                : "Format: aa:bb:cc:dd:ee:ff"
+            }
+          >
             <input
               className={`${inputCls} font-mono`}
               value={mac}
               onChange={(e) => setMac(e.target.value)}
-              required
+              required={!isV6}
             />
           </Field>
           <Field
@@ -188,7 +199,7 @@ function StaticModalForm({
           {isV6 && (
             <Field
               label="DUID"
-              hint="DHCPv6 identifier — keys the reservation instead of the MAC"
+              hint="DHCPv6 identifier (hex octets, 3-130) — keys the reservation instead of the MAC, so the MAC may be left empty"
             >
               <input
                 className={`${inputCls} font-mono`}
@@ -214,7 +225,7 @@ function StaticModalForm({
         <Btns
           onClose={onClose}
           pending={mut.isPending}
-          disabled={!!hostnameErr}
+          disabled={!!hostnameErr || staticIdentityMissing({ isV6, mac, duid })}
         />
       </form>
     </Modal>

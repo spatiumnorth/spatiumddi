@@ -949,6 +949,17 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin,
             unique=True,
             postgresql_where=sa_text("deleted_at IS NULL"),
         ),
+        # DHCPv6 DUID-keyed reservations (#3900): unique per scope while live.
+        Index(
+            "uq_dhcp_static_scope_duid",
+            "scope_id",
+            "duid",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL AND duid IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "mac_address IS NOT NULL OR duid IS NOT NULL", name="ck_dhcp_static_identity"
+        ),
         Index("ix_dhcp_static_scope", "scope_id"),
         Index("ix_dhcp_static_mac", "mac_address"),
     )
@@ -959,11 +970,15 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin,
         nullable=False,
     )
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
-    mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
+    # Nullable since #3900: a DHCPv6 reservation may be keyed on ``duid``
+    # alone (the CHECK requires a MAC or a DUID). A v4 reservation still
+    # needs a MAC; the API refuses one without.
+    mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # DHCPv6 DUID identifier (issue #368). When set on a v6 scope's
     # reservation, the Kea driver keys the host reservation on ``duid``
     # instead of ``hw-address`` (DHCPv6 clients are identified by DUID).
+    # Stored in canonical colon-hex form (``canonical_duid``).
     duid: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hostname: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")

@@ -6,6 +6,8 @@ import {
   poolHealthCheckFields,
   serverApiPortField,
   staticDuidField,
+  staticIdentityMissing,
+  staticMacField,
   type CustomFieldForm,
 } from "./formPayloads";
 
@@ -203,5 +205,29 @@ describe("customField payloads", () => {
 
   it("sends null options on create of a non-select field", () => {
     expect(customFieldCreatePayload(textField).options).toBeNull();
+  });
+});
+
+describe("static reservation identity (#3900)", () => {
+  it("requires a MAC on v4, a MAC or a DUID on v6", () => {
+    expect(staticIdentityMissing({ isV6: false, mac: "", duid: "x" })).toBe(
+      true,
+    );
+    expect(staticIdentityMissing({ isV6: false, mac: "aa", duid: "" })).toBe(
+      false,
+    );
+    expect(staticIdentityMissing({ isV6: true, mac: "", duid: "" })).toBe(true);
+    expect(staticIdentityMissing({ isV6: true, mac: "", duid: "00:01" })).toBe(
+      false,
+    );
+  });
+
+  it("sends a blank v6 MAC as null and a v4 MAC as typed", () => {
+    expect(staticMacField({ isV6: true, mac: " " })).toEqual({
+      mac_address: null,
+    });
+    expect(staticMacField({ isV6: false, mac: "aa:bb" })).toEqual({
+      mac_address: "aa:bb",
+    });
   });
 });

@@ -1035,6 +1035,9 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     fqdn: Mapped[str | None] = mapped_column(String(512), nullable=True)
     mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    # DHCPv6 DUID (#3900) — the reservation identifier for a ``static_dhcp``
+    # IPv6 address that has no MAC. Canonical colon-hex; IPv6 rows only.
+    duid: Mapped[str | None] = mapped_column(String(400), nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     # Ownership

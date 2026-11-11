@@ -935,6 +935,8 @@ export interface IPAddress {
   fqdn: string | null;
   description: string;
   mac_address: string | null;
+  /** DHCPv6 DUID (#3900) — identifies a static_dhcp IPv6 address with no MAC. */
+  duid?: string | null;
   owner_user_id?: string | null;
   last_seen_at?: string | null;
   last_seen_method?: string | null;
@@ -2157,6 +2159,8 @@ export const ipamApi = {
       hostname: string;
       status?: string;
       mac_address?: string;
+      /** DHCPv6 DUID (#3900) for a static_dhcp IPv6 address. */
+      duid?: string;
       description?: string;
       custom_fields?: Record<string, unknown>;
       dns_zone_id?: string | null;
@@ -10094,7 +10098,8 @@ export interface DHCPStaticAssignment {
   id: string;
   scope_id: string;
   ip_address: string;
-  mac_address: string;
+  // null on a DHCPv6 reservation keyed on its DUID alone (#3900).
+  mac_address: string | null;
   hostname: string;
   description: string;
   client_id: string | null;

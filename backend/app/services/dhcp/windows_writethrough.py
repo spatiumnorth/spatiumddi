@@ -1007,6 +1007,11 @@ async def push_static_change(
         db, scope, exclude_static_ids={static.id} if action == "delete" else None
     )
 
+    # Windows keys a reservation by ClientId (MAC). A DUID-only DHCPv6
+    # reservation (#3900) has none to push, and Windows DHCP scopes here are v4.
+    if static.mac_address is None:
+        return
+
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:
         return
@@ -1131,7 +1136,10 @@ async def push_statics_bulk_delete(
                 mac_address=str(st.mac_address),
             )
             for st in rows
+            if st.mac_address is not None  # DUID-only rows (#3900) are not on Windows
         ]
+        if not items:
+            continue
         try:
             results = await driver.remove_reservations(server, items=items)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 — whole-batch failure
