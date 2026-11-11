@@ -25,6 +25,45 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 1.0.0-rc.2 — 2026-11-11
+
+### Fixed
+
+- New DHCP Scope no longer suggests a dynamic pool that contains the subnet's gateway (a gateway at the subnet's last host used to land inside the pool), and it now shows the API's notice about existing addresses in a pool it just created instead of closing without a word (#3867).
+
+- New DHCP Scope now reads the subnet's DHCP group and gateway fresh each time it opens, selects the group the subnet has now (it used to keep a cached one and create the scope there), and says it is reading the group instead of claiming none is set (#3865).
+
+- **Edit template and Edit custom field no longer put back another
+  client's changes (#3863).** Both dialogs filled the form from the
+  list's copy and saved every field, so a template's tags, server
+  groups or DDNS settings, or a custom field's options, Searchable or
+  Required, set elsewhere since the list loaded were silently reverted
+  by an unrelated edit. They now read the object when they open and
+  send only the fields you changed.
+
+- Restoring a DNSSEC-signed zone from the Trash is refused, with the single-signer reason, when its group has gained a second DNS server since the zone was deleted. Before, the zone came back signed into a two-server group, which resolvers see as mismatched DNSKEYs (SERVFAIL). Remove the extra server, then restore. (#3855)
+
+- **The Helm chart and images install on OpenShift (#3852).** On
+  OpenShift (detected from the cluster, or `global.platform:
+  openshift`) the chart drops the pinned `runAsUser` and `fsGroup`
+  values its restricted SCC refuses, runs the frontend on :8080,
+  renders a Route, and creates a minimal SCC for the DNS and DHCP
+  agents only; the control plane runs under plain `restricted-v2`.
+  The api, frontend, BIND9 and Kea images now also run as any uid in
+  group 0; started as root or as their usual user they behave as
+  before. Off OpenShift the chart's renders are byte-identical. Tested on
+  OpenShift 5.0.0 (OpenShift Local); 4.22 is being verified. See `docs/deployment/KUBERNETES.md`.
+
+- Adding a backup destination with the `<set>` placeholder as a secret now answers 422 instead of saving the placeholder as the secret. Edit still reads it as "keep the stored secret".
+
+- A backup destination setting that is not text (an FTP mode, an HTTPS PUT auth mode, an S3 object lock mode, an SCP host key check) now answers 422 naming the field on Add and Edit, instead of a 500.
+
+- Edit Zone no longer pins a zone to one view while it holds records scoped to another view. The change is refused with a 422 naming those records, the same rule the record API already applies; before, it answered 200 and those records were served in no view. (#3839)
+
+- Deleting a live shared auto reverse zone for good (`?permanent=true`, or the copilot's `delete_dns_zone`) is now refused with a 409 naming the subnets whose trashed PTR records sit in it, instead of destroying them and leaving that subnet's restore without its PTRs and reverse zone.
+
+- Deleting a DNS zone permanently, purging it from Trash (by hand or by the scheduled expiry), or moving it to another group no longer deletes the provider's copy when another zone of the same name may still use it: one in another group whose Technitium, Windows DNS or cloud server reaches the same provider (or whose provider cannot be told apart), even if that zone is in the Trash or that server is paused, or one in another view of the same group. Names are compared without case or trailing dot. The copy is left in place and listed in the audit row; the zone delete and the Trash delete also return it in an `X-Provider-Copies-Kept` header.
+
 ## 1.0.0-rc.1 — 2026-11-10
 
 **The first 1.0.0 release candidate, and the code freeze for 1.0.0.**
