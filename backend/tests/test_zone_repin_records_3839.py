@@ -83,3 +83,38 @@ async def test_repin_allowed_when_records_match_or_are_unscoped(
         json={"view_id": str(v1.id)},
     )
     assert resp.status_code == 200, resp.text
+
+
+async def test_clearing_the_pin_is_allowed_and_shared_records_never_block(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers, grp, zone, v1, v2 = await _setup(db_session)
+    # A shared (view_id NULL) record plus a v1 record; the zone already pinned to v1.
+    await db_session.execute(DNSRecord.__table__.delete().where(DNSRecord.value == "192.0.2.42"))
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            view_id=None,
+            name="shared",
+            fqdn="shared.pin.example.test.",
+            record_type="A",
+            value="192.0.2.43",
+        )
+    )
+    zone.view_id = v1.id
+    await db_session.commit()
+    # Re-pinning to the same view and clearing the pin are not re-pins to another view.
+    resp = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}",
+        headers=headers,
+        json={"view_id": str(v1.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}",
+        headers=headers,
+        json={"view_id": None},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(zone)
+    assert zone.view_id is None
