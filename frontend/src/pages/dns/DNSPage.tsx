@@ -18,6 +18,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { ZoneSerialsLine } from "./ZoneSerialsLine";
+import { servedApexWords } from "./servedApexWords";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -3846,13 +3847,22 @@ function RecordModalForm({
             value={viewId}
             onChange={(e) => setViewId(e.target.value)}
           >
-            <option value="">All views (default)</option>
+            <option value="">No view (unscoped, default)</option>
             {views.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
+          <p
+            className="mt-1 text-xs text-muted-foreground"
+            data-testid="record-view-rule"
+          >
+            A zone with no view of its own is served in the views its records
+            are scoped to. Scoping any record to a view limits the zone, with
+            every unscoped record in it, to the views its records name; only
+            while no record is scoped does the zone serve in every view.
+          </p>
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
@@ -4517,6 +4527,9 @@ export function ZoneDetailView({
   // listed forwarders. The detail surface below swaps the records table
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
+  // #3841 — a stub zone holds no zone data, so Sync with server does not apply
+  // (the API answers 400); it is not offered rather than shown as a failure.
+  const isStub = zone.zone_type === "stub";
 
   // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
   // stub's data is its masters', so the server refuses a record written into
@@ -4794,10 +4807,11 @@ export function ZoneDetailView({
                         : "Sync with server",
                       icon: RefreshCw,
                       iconClassName: syncMut.isPending ? "animate-spin" : "",
-                      disabled: syncMut.isPending,
+                      disabled: syncMut.isPending || isStub,
                       onSelect: () => syncMut.mutate(),
-                      title:
-                        "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
+                      title: isStub
+                        ? "This is a stub zone: the server does not hold it authoritatively, so there is no zone data to transfer and nothing to compare. Sync with server does not apply."
+                        : "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
                       ...permissionGate(canWriteRecords, NEEDS_DNS_WRITE),
                     },
                     {
@@ -6189,29 +6203,11 @@ function ServedApexRows({
   // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
   // holds its own address for ns1), or ``invalid.`` for a zone whose name is
   // not a host name, which never resolves.
-  const unaddressedPrimary = apex.unaddressed_primary_ns;
-  const warning =
-    apex.placeholder_glue_loopback && unaddressedPrimary
-      ? `The Primary NS ${unaddressedPrimary} is inside the zone, but the zone holds no A or AAAA record for it, and BIND will not load a zone whose NS has no address. This placeholder name server, glued to 127.0.0.1, is served instead, so resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for ${unaddressedPrimary}.`
-      : apex.placeholder_glue_loopback && apex.source === "declared"
-        ? `The apex NS record ${apex.ns.join(", ")} has no A or AAAA record in the zone, so it is served glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for it.`
-        : apex.placeholder_glue_loopback
-          ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-          : apex.source === "placeholder" && apex.ns.includes("invalid.")
-            ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-            : apex.source === "placeholder"
-              ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
-              : null;
+  const { warning, unaddressed } = servedApexWords(apex, zoneName);
   // A declared apex draws no NS rows of ours, so its warning gets its own row.
-  const unaddressedNs = apex.unaddressed_ns ?? [];
   const declaredWarning =
     apex.source === "declared"
-      ? [
-          warning,
-          unaddressedNs.length > 0
-            ? `The apex NS ${unaddressedNs.join(", ")} lies inside the zone with no A or AAAA record, and BIND will not load a zone whose NS has no address. Add the address record.`
-            : null,
-        ].filter((w): w is string => !!w)
+      ? [warning, unaddressed].filter((w): w is string => !!w)
       : [];
   const nameCell = (
     <td className="py-1.5 pl-5 font-mono text-xs font-medium">
@@ -6815,7 +6811,9 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           <p className="mt-1">
             Note that once any view exists, <em>every</em> zone in this group is
             served from inside a view — zones with no view of their own are
-            rendered into all of them.
+            rendered into all of them, until a record of the zone is scoped to a
+            view: the zone, with its unscoped records, is then limited to the
+            views its records name.
           </p>
         </div>
       ) : views.length === 0 ? null : (
