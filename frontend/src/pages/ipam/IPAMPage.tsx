@@ -83,6 +83,7 @@ import {
   type EffectiveDdns,
   type FreeCidrRange,
   type Router as NetworkRouter,
+  type SubnetVLANRef,
   type VLAN,
   type DHCPLeaseSyncResult,
   type DnsSyncCommitResult,
@@ -2467,9 +2468,15 @@ function AdditionalZonesPicker({
 function VlanPicker({
   vlanRefId,
   onChange,
+  current,
 }: {
   vlanRefId: string | null;
   onChange: (vlanRefId: string | null) => void;
+  /** The VLAN the record already carries, as its own row names it (router
+   *  and VLAN). The router and VLAN lists are reads a grant scoped to one
+   *  subnet lacks, so the picker names this link itself rather than drawing
+   *  "None" over it (#3904). */
+  current?: SubnetVLANRef | null;
 }) {
   const qc = useQueryClient();
   const { data: routers = [] } = useQuery({
@@ -2477,8 +2484,10 @@ function VlanPicker({
     queryFn: vlansApi.listRouters,
   });
 
-  // Seed the router from the selected VLAN, if any.
-  const [routerId, setRouterId] = useState<string>("");
+  // Seed the router from the selected VLAN, if any (the record's own VLAN
+  // names it, so that read is skipped).
+  const known = current && current.id === vlanRefId ? current : null;
+  const [routerId, setRouterId] = useState<string>(known?.router_id ?? "");
   const { data: selectedVlan } = useQuery({
     queryKey: ["vlans", "vlan", vlanRefId],
     queryFn: () => vlansApi.getVlan(vlanRefId as string),
@@ -2543,6 +2552,13 @@ function VlanPicker({
             }}
           >
             <option value="">— None —</option>
+            {known &&
+              routerId === known.router_id &&
+              !routers.some((r: NetworkRouter) => r.id === routerId) && (
+                <option value={routerId}>
+                  {known.router_name ?? "(current router)"}
+                </option>
+              )}
             {routers.map((r: NetworkRouter) => (
               <option key={r.id} value={r.id}>
                 {r.name}
@@ -2558,6 +2574,13 @@ function VlanPicker({
             disabled={!routerId}
           >
             <option value="">— None —</option>
+            {known &&
+              routerId === known.router_id &&
+              !vlans.some((v: VLAN) => v.id === known.id) && (
+                <option value={known.id}>
+                  {known.vlan_id} — {known.name}
+                </option>
+              )}
             {vlans.map((v: VLAN) => (
               <option key={v.id} value={v.id}>
                 {v.vlan_id} — {v.name}
@@ -8976,7 +8999,11 @@ function EditSubnetModalForm({
               placeholder="e.g. 10.0.1.1"
             />
           </Field>
-          <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+          <VlanPicker
+            vlanRefId={vlanRefId}
+            onChange={setVlanRefId}
+            current={subnet.vlan}
+          />
           {subnet.vlan_id != null && !vlanRefId && (
             <p className="text-[11px] text-muted-foreground italic">
               Current VLAN tag: {subnet.vlan_id} (unassigned — create a Router /
