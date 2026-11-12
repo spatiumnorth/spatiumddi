@@ -1446,8 +1446,10 @@ export function ServicesPage() {
                           setCustomerFilter("");
                           setTagFilters([]);
                         }}
+                        gate={writeGate}
+                        hint={`Click "New service" to add one.`}
                       >
-                        No services yet — click "New service" to add one.
+                        No services yet.
                       </ListEmpty>
                     )}
                   </td>
