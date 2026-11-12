@@ -10997,6 +10997,15 @@ export interface ApiToken {
   /** False when the owner is disabled: the token is refused (403) whatever
    *  its own flag says (#3431). Set by the list endpoint. */
   owner_is_active?: boolean | null;
+  owner_password_change_required?: boolean | null;
+  /** Effective state at auth (#3784); older servers omit it. */
+  status?:
+    | "active"
+    | "revoked"
+    | "expired"
+    | "owner_disabled"
+    | "password_change_required";
+  blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
