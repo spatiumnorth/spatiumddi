@@ -618,6 +618,10 @@ async def list_nat_mappings_for_subnet(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
+    # Keyed on a subnet: a caller who cannot read it is refused, as the
+    # subnet routes do, rather than handed its address-side mappings (#3641).
+    if not user_has_permission(user, "read", "subnet", subnet_id):
+        raise HTTPException(status_code=403, detail="Permission denied: read on subnet")
 
     cidr_lit = cast(str(subnet.network), INET)
     rows = (

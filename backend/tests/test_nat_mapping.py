@@ -436,7 +436,6 @@ async def test_internal_subnet_labels_redacted_without_subnet_read(
     for path in (
         "/api/v1/ipam/nat-mappings",
         f"/api/v1/ipam/nat-mappings/{m.id}",
-        f"/api/v1/ipam/nat-mappings/by-subnet/{sub.id}",
     ):
         for tok, visible in ((low, False), (full, True), (admin, True)):
             r = await client.get(path, headers={"Authorization": f"Bearer {tok}"})
@@ -452,3 +451,27 @@ async def test_internal_subnet_labels_redacted_without_subnet_read(
                 assert row["internal_subnet_name"] is None
                 assert row["internal_subnet_cidr"] is None
                 assert row["internal_subnet_redacted"] is True
+
+
+@pytest.mark.asyncio
+async def test_by_subnet_refused_without_subnet_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    sub = await _make_subnet(db_session)
+    m = NATMapping(name="hide-2", kind="hide", internal_subnet_id=sub.id, external_ip="203.0.113.6")
+    db_session.add(m)
+    low = await _user_with(db_session, [{"action": "read", "resource_type": "nat_mapping"}])
+    full = await _user_with(
+        db_session,
+        [
+            {"action": "read", "resource_type": "nat_mapping"},
+            {"action": "read", "resource_type": "subnet"},
+        ],
+    )
+    await db_session.commit()
+    path = f"/api/v1/ipam/nat-mappings/by-subnet/{sub.id}"
+    r = await client.get(path, headers={"Authorization": f"Bearer {low}"})
+    assert r.status_code == 403
+    r = await client.get(path, headers={"Authorization": f"Bearer {full}"})
+    assert r.status_code == 200
+    assert r.json()[0]["internal_subnet_name"] == "s"
