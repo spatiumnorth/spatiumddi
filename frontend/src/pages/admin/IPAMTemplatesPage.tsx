@@ -9,6 +9,7 @@ import {
   type IPAMTemplate,
   type IPAMTemplateAppliesTo,
   type IPAMTemplateCreate,
+  type TemplateReapplyAllResponse,
   type IPAMTemplateUpdate,
   formatApiError,
 } from "@/lib/api";
@@ -580,25 +581,70 @@ function TemplateEditor({
   );
 }
 
-function ReapplyConfirmModal({
+export function ReapplyConfirmModal({
   template,
   onClose,
   onConfirm,
   busy,
+  result,
+  error,
 }: {
   template: IPAMTemplate;
   onClose: () => void;
   onConfirm: () => void;
   busy: boolean;
+  result: TemplateReapplyAllResponse | null;
+  error: string;
 }) {
   const [typed, setTyped] = useState("");
+  if (result) {
+    return (
+      <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
+        <div className="space-y-3 text-sm" role="status">
+          <p>
+            Reapplied {result.instances_processed} of {result.instances_total}{" "}
+            instance{result.instances_total === 1 ? "" : "s"}
+            {result.instances_skipped > 0
+              ? `; skipped ${result.instances_skipped}, each left as it was`
+              : ""}
+            .
+          </p>
+          {result.cap_reached && (
+            <p className="text-amber-600">
+              More instances exist than the 200 handled per call; run Reapply
+              again for the rest.
+            </p>
+          )}
+          {result.skipped.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5">
+              {result.skipped.map((sk) => (
+                <li key={sk.target_id}>
+                  <span className="font-mono text-xs">{sk.network}</span>:{" "}
+                  {sk.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex justify-end border-t pt-3">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
       <div className="space-y-3 text-sm">
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call.
+          overrides. Capped at 200 instances per call. An instance whose child
+          layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}
@@ -609,6 +655,11 @@ function ReapplyConfirmModal({
           onChange={(e) => setTyped(e.target.value)}
           className={inputCls}
         />
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
             onClick={onClose}
@@ -709,7 +760,6 @@ export function IPAMTemplatesPage() {
   const reapplyMut = useMutation({
     mutationFn: (id: string) => ipamApi.reapplyAllTemplate(id),
     onSuccess: () => {
-      setReapplyTarget(null);
       qc.invalidateQueries({ queryKey: ["ipam-templates"] });
     },
   });
@@ -960,9 +1010,18 @@ export function IPAMTemplatesPage() {
         {reapplyTarget && (
           <ReapplyConfirmModal
             template={reapplyTarget}
-            onClose={() => setReapplyTarget(null)}
+            onClose={() => {
+              setReapplyTarget(null);
+              reapplyMut.reset();
+            }}
             onConfirm={() => reapplyMut.mutate(reapplyTarget.id)}
             busy={reapplyMut.isPending}
+            result={reapplyMut.data ?? null}
+            error={
+              reapplyMut.isError
+                ? formatApiError(reapplyMut.error, "Reapply failed")
+                : ""
+            }
           />
         )}
       </div>
