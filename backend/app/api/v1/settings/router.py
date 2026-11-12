@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 import uuid
 from datetime import UTC, datetime
@@ -444,6 +445,127 @@ def _redact_syslog_target(t: Any) -> dict[str, Any]:
         "protocol": t.get("protocol") or "udp",
         "format": t.get("format") or "rfc5424",
         "ca_cert_set": bool(t.get("ca_cert_pem")),
+    }
+
+
+# ── Section audit rows: changed fields only (#3995, follow-up to #3847) ───────
+#
+# SSH / resolver / syslog / APT write a row naming only the fields that
+# changed, with old and new values, and no row when nothing changed. The
+# snapshots below carry NO secret: SSH keys and APT GPG keys / mirror auth
+# appear as digests of the stored value, a syslog CA as a digest, never the
+# material. Reusable for any section: snapshot before, snapshot after, then
+# ``_section_audit_diff``.
+
+
+def _digest(value: Any) -> str:
+    """Short, non-reversible digest of a stored secret-bearing value."""
+    if not value:
+        return ""
+    raw = value if isinstance(value, bytes) else str(value).encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _ssh_key_fingerprint(public_key: str) -> str:
+    """OpenSSH-style ``SHA256:`` fingerprint of a public key line."""
+    import base64
+
+    parts = (public_key or "").split()
+    if len(parts) < 2:
+        return _digest(public_key)
+    try:
+        blob = base64.b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+    except ValueError:
+        return _digest(public_key)
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def _section_audit_diff(
+    old: dict[str, Any], new: dict[str, Any]
+) -> tuple[list[str], dict[str, Any], dict[str, Any]] | None:
+    """``(changed_fields, old_value, new_value)`` for the keys that differ,
+    or None when nothing changed (so the caller writes no row)."""
+    changed = sorted(k for k in new if old.get(k) != new[k])
+    if not changed:
+        return None
+    return changed, {k: old.get(k) for k in changed}, {k: new[k] for k in changed}
+
+
+def _ssh_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "password_auth_enabled": bool(st.ssh_password_auth_enabled),
+        "allow_root_login": bool(st.ssh_allow_root_login),
+        "port": int(st.ssh_port or 22),
+        "allowed_source_networks": list(st.ssh_allowed_source_networks or []),
+        "lockdown": bool(st.ssh_lockdown),
+        "authorized_keys": [
+            {
+                "name": (k.get("name") or "") if isinstance(k, dict) else "",
+                "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
+                "fingerprint": (
+                    _ssh_key_fingerprint(k.get("public_key") or "") if isinstance(k, dict) else ""
+                ),
+            }
+            for k in (st.ssh_authorized_keys or [])
+        ],
+    }
+
+
+def _resolver_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "mode": st.resolver_mode,
+        "servers": list(st.resolver_servers or []),
+        "fallback_servers": list(st.resolver_fallback_servers or []),
+        "search_domains": list(st.resolver_search_domains or []),
+        "dnssec": st.resolver_dnssec,
+        "dns_over_tls": st.resolver_dns_over_tls,
+    }
+
+
+def _syslog_audit_snapshot(st: Any) -> dict[str, Any]:
+    targets = []
+    for t in st.syslog_targets or []:
+        red = _redact_syslog_target(t)
+        red["ca_fingerprint"] = _digest(t.get("ca_cert_pem")) if isinstance(t, dict) else ""
+        targets.append(red)
+    return {
+        "enabled": bool(st.syslog_enabled),
+        "targets": targets,
+        "filter": st.syslog_filter or "",
+        "buffer_disk": bool(st.syslog_buffer_disk),
+    }
+
+
+def _apt_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "managed": bool(st.apt_managed),
+        "source_count": len(st.apt_sources or []),
+        # Source URIs can embed credentials: digest only.
+        "sources_digest": _digest(json.dumps(st.apt_sources or [], sort_keys=True, default=str)),
+        "gpg_keys": [
+            (
+                {**_redact_apt_gpg_key(k), "digest": _digest(k.get("armoured_text_enc"))}
+                if isinstance(k, dict)
+                else _redact_apt_gpg_key(k)
+            )
+            for k in (st.apt_gpg_keys or [])
+        ],
+        "auth_entries": [
+            (
+                {**_redact_apt_auth(a), "digest": _digest(a.get("password_enc"))}
+                if isinstance(a, dict)
+                else _redact_apt_auth(a)
+            )
+            for a in (st.apt_auth or [])
+        ],
+        "proxy_http_set": bool(st.apt_proxy_http),
+        "proxy_https_set": bool(st.apt_proxy_https),
+        "unattended_upgrades_enabled": bool(st.apt_unattended_upgrades_enabled),
+        "no_proxy": st.apt_proxy_no_proxy or "",
+        "unattended_origins": list(st.apt_unattended_origins or []),
+        "unattended_blocklist": list(st.apt_unattended_blocklist or []),
+        "unattended_automatic_reboot": bool(st.apt_unattended_automatic_reboot),
+        "unattended_reboot_time": st.apt_unattended_reboot_time or "",
     }
 
 
@@ -2198,6 +2320,13 @@ async def update_settings(
                 detail="resolver override mode requires at least one DNS server",
             )
 
+    # #3995 — section snapshots, taken before ANY write (the SSH key list is
+    # assigned directly further down, ahead of the generic setattr loop).
+    _ssh_old = _ssh_audit_snapshot(settings)
+    _resolver_old = _resolver_audit_snapshot(settings)
+    _syslog_old = _syslog_audit_snapshot(settings)
+    _apt_old = _apt_audit_snapshot(settings)
+
     # Old values of the fields the generic audit row below covers, taken before
     # anything is popped or written. Secrets are reduced to set / unset and
     # ``snmp_v3_users`` to its redacted shape.
@@ -2227,12 +2356,6 @@ async def update_settings(
     # loop so we can detect an actual flip and write a dedicated audit row.
     _supervisor_reg_prev = bool(settings.supervisor_registration_enabled)
     _supervisor_reg_requested = changes.get("supervisor_registration_enabled")
-
-    # Issue #155 — whether this request touched any APT field. Computed here
-    # (before the secret-bearing apt_sources / apt_gpg_keys / apt_auth get
-    # popped out of ``changes`` during processing) so an apt_sources-only
-    # change still triggers the dedicated audit row below (NN #4).
-    _apt_touched = any(f.startswith("apt_") for f in changes)
 
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
@@ -2622,10 +2745,10 @@ async def update_settings(
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who
     # can log into every appliance host), so a durable audit entry is
-    # required. Public keys are NOT secrets, so the full key list is
-    # recorded (no redaction). Fires whenever this request touched any
+    # required. Keys are recorded by fingerprint only (#3995). Fires whenever this request touched any
     # ``ssh_*`` field.
-    if _ssh_field_in_request:
+    _diff = _section_audit_diff(_ssh_old, _ssh_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2636,23 +2759,9 @@ async def update_settings(
                 resource_id="ssh",
                 resource_display="SSH access",
                 result="success",
-                new_value={
-                    "password_auth_enabled": bool(settings.ssh_password_auth_enabled),
-                    "allow_root_login": bool(settings.ssh_allow_root_login),
-                    "port": int(settings.ssh_port or 22),
-                    "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
-                    "lockdown": bool(settings.ssh_lockdown),
-                    "authorized_keys": [
-                        {
-                            "name": (k.get("name") or "") if isinstance(k, dict) else "",
-                            "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
-                            "public_key": (
-                                (k.get("public_key") or "") if isinstance(k, dict) else ""
-                            ),
-                        }
-                        for k in (settings.ssh_authorized_keys or [])
-                    ],
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2664,8 +2773,8 @@ async def update_settings(
     # whenever this request touched any ``resolver_*`` field. Computed off
     # ``changes`` which still carries the resolver keys (they go through
     # the generic setattr loop, no special pop like ssh/syslog).
-    _resolver_touched = any(f.startswith("resolver_") for f in changes)
-    if _resolver_touched:
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2676,14 +2785,9 @@ async def update_settings(
                 resource_id="resolver",
                 resource_display="DNS resolver",
                 result="success",
-                new_value={
-                    "mode": settings.resolver_mode,
-                    "servers": list(settings.resolver_servers or []),
-                    "fallback_servers": list(settings.resolver_fallback_servers or []),
-                    "search_domains": list(settings.resolver_search_domains or []),
-                    "dnssec": settings.resolver_dnssec,
-                    "dns_over_tls": settings.resolver_dns_over_tls,
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2713,8 +2817,8 @@ async def update_settings(
     # secret CA PEM, so a durable, redacted audit entry is required. Fires
     # whenever this request touched any ``syslog_*`` field (the targets
     # list shows only the redacted shape — no CA PEM bytes).
-    _syslog_touched = any(f.startswith("syslog_") for f in changes)
-    if _syslog_touched:
+    _diff = _section_audit_diff(_syslog_old, _syslog_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2725,12 +2829,9 @@ async def update_settings(
                 resource_id="syslog",
                 resource_display="Syslog forwarding",
                 result="success",
-                new_value={
-                    "enabled": bool(settings.syslog_enabled),
-                    "targets": [_redact_syslog_target(t) for t in (settings.syslog_targets or [])],
-                    "filter": settings.syslog_filter or "",
-                    "buffer_disk": bool(settings.syslog_buffer_disk),
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2741,7 +2842,8 @@ async def update_settings(
     # generic ``logger.info`` below is not an ``audit_log`` row. The shape
     # records counts + presence only (never the armoured key / password,
     # and not the raw proxy URL which may embed credentials).
-    if _apt_touched:
+    _diff = _section_audit_diff(_apt_old, _apt_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2752,20 +2854,9 @@ async def update_settings(
                 resource_id="apt",
                 resource_display="APT sources",
                 result="success",
-                new_value={
-                    "managed": bool(settings.apt_managed),
-                    "source_count": len(settings.apt_sources or []),
-                    "gpg_key_count": len(settings.apt_gpg_keys or []),
-                    "auth_entry_count": len(settings.apt_auth or []),
-                    "proxy_http_set": bool(settings.apt_proxy_http),
-                    "proxy_https_set": bool(settings.apt_proxy_https),
-                    "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
-                    # Issue #164 — unattended-upgrades policy summary.
-                    "unattended_origin_count": len(settings.apt_unattended_origins or []),
-                    "unattended_blocklist_count": len(settings.apt_unattended_blocklist or []),
-                    "unattended_automatic_reboot": bool(settings.apt_unattended_automatic_reboot),
-                    "unattended_reboot_time": settings.apt_unattended_reboot_time or "",
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2999,32 +3090,30 @@ async def update_resolver_settings(
             detail="resolver override mode requires at least one DNS server",
         )
 
+    _resolver_old = _resolver_audit_snapshot(settings)
     for field, value in changes.items():
         setattr(settings, field, value)
 
     # Dedicated audit row (non-negotiable #4) — resolver config steers every
-    # appliance host's DNS lookups. Resolver IPs / domains are not secrets,
-    # so the full shape is recorded.
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="update",
-            resource_type="platform_settings",
-            resource_id="resolver",
-            resource_display="DNS resolver",
-            result="success",
-            new_value={
-                "mode": settings.resolver_mode,
-                "servers": list(settings.resolver_servers or []),
-                "fallback_servers": list(settings.resolver_fallback_servers or []),
-                "search_domains": list(settings.resolver_search_domains or []),
-                "dnssec": settings.resolver_dnssec,
-                "dns_over_tls": settings.resolver_dns_over_tls,
-            },
+    # appliance host's DNS lookups. Resolver IPs / domains are not secrets.
+    # Names only the changed fields (#3995); no row when nothing changed.
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="resolver",
+                resource_display="DNS resolver",
+                result="success",
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
+            )
         )
-    )
 
     await db.commit()
     await db.refresh(settings)
