@@ -768,7 +768,11 @@ function ReenableTokenModal({
               <strong className="text-foreground">{ownerLabel(token)}</strong>)
             </>
           )}
-          ? It starts authenticating again immediately. Confirm it's you.
+          ?{" "}
+          {token.owner_password_change_required
+            ? "Its owner must still change their password, so it will keep being refused (403) until they do."
+            : "It starts authenticating again immediately."}{" "}
+          Confirm it's you.
         </p>
         <ReauthFields
           password={stepPassword}
@@ -922,11 +926,13 @@ export function ApiTokensPage() {
                     </td>
                     <td className="px-3 py-2">
                       <span
+                        title={t.blocked_reason ?? undefined}
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
                           t.is_active &&
                             !isExpired(t.expires_at) &&
-                            t.owner_is_active !== false
+                            t.owner_is_active !== false &&
+                            !t.owner_password_change_required
                             ? "bg-emerald-500/15 text-emerald-600"
                             : "bg-muted text-muted-foreground",
                         )}
@@ -937,7 +943,9 @@ export function ApiTokensPage() {
                             ? "Expired"
                             : t.owner_is_active === false
                               ? "Owner disabled"
-                              : "Active"}
+                              : t.owner_password_change_required
+                                ? "Blocked: password change required"
+                                : "Active"}
                       </span>
                     </td>
                     <td className="px-3 py-2">
