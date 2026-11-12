@@ -454,3 +454,42 @@ async def test_delegate_still_edits_addresses_inside_its_set(
     assert r.status_code == 200, r.text
     r = await client.delete(f"/api/v1/ipam/addresses/{w['inside'].id}", headers=_h(token))
     assert r.status_code == 204, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_address_sets_module_widens_nothing_3762(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.services import feature_modules
+
+    w = await _world(db_session)
+    token = await _delegate(db_session, w)
+    await feature_modules.set_module_enabled(db_session, "ipam.address_sets", False, user_id=None)
+    await db_session.commit()
+    feature_modules.invalidate_cache()
+
+    r = await client.put(
+        f"/api/v1/ipam/addresses/{w['inside'].id}",
+        headers=_h(token),
+        json={"description": "mine"},
+    )
+    assert r.status_code == 403, r.text
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{w['subnet'].id}/addresses",
+        headers=_h(token),
+        json={"address": "10.0.5.70", "hostname": "new-in"},
+    )
+    assert r.status_code == 403, r.text
+    r = await client.delete(f"/api/v1/ipam/addresses/{w['inside'].id}", headers=_h(token))
+    assert r.status_code == 403, r.text
+
+    # Back on: the same grant works again.
+    await feature_modules.set_module_enabled(db_session, "ipam.address_sets", True, user_id=None)
+    await db_session.commit()
+    feature_modules.invalidate_cache()
+    r = await client.put(
+        f"/api/v1/ipam/addresses/{w['inside'].id}",
+        headers=_h(token),
+        json={"description": "mine"},
+    )
+    assert r.status_code == 200, r.text

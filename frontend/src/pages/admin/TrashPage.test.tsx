@@ -606,6 +606,7 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
     const t = await openDelete("subnet", 4);
     expect(t).toMatch(/DHCP scopes \(with their pools and static/);
     expect(t).toMatch(/addresses and the DNS records published for them/);
+    expect(t).toMatch(/E911 location binding names it/);
     expect(t).not.toMatch(/other row/);
   });
 

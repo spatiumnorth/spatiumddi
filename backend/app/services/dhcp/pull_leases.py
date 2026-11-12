@@ -906,6 +906,36 @@ async def _load_scope_cache(db: AsyncSession, group_id: Any) -> dict[Any, Any]:
     return {subnet_id: scope_id for subnet_id, scope_id in res.all()}
 
 
+async def _load_trashed_scope_nets(
+    db: AsyncSession, group_id: Any
+) -> list[tuple[Any, ipaddress._BaseNetwork]]:
+    """``[(scope_id, network)]`` for this group's scopes in the Trash (#3733),
+    each with its subnet's network, read even when the subnet is in the Trash
+    with it (a subnet delete trashes its scopes).
+
+    ``_load_scope_cache`` leaves these out, so an address of a trashed scope
+    no longer ranks its subnet first and falls back to the global
+    longest-prefix match. The lease-events handler matches such an address
+    against these networks and takes no event for it: a scope in the Trash
+    gets no lease, mirror or DDNS record back.
+    """
+    if group_id is None:
+        return []
+    res = await db.execute(
+        select(DHCPScope.id, Subnet.network)
+        .join(Subnet, Subnet.id == DHCPScope.subnet_id)
+        .where(DHCPScope.group_id == group_id, DHCPScope.deleted_at.is_not(None))
+        .execution_options(include_deleted=True)
+    )
+    out: list[tuple[Any, ipaddress._BaseNetwork]] = []
+    for scope_id, network in res.all():
+        try:
+            out.append((scope_id, ipaddress.ip_network(str(network), strict=False)))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def _find_containing_subnet(
     ip: str,
     subnets: list[tuple[Subnet, ipaddress._BaseNetwork]],

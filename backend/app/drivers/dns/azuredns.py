@@ -96,6 +96,12 @@ class AzureDNSDriver(CloudDNSDriverBase):
     """Agentless Azure DNS driver via the ``azure-mgmt-dns`` SDK."""
 
     name = "azure_dns"
+
+    def _account_identity(self, creds: dict[str, Any]) -> str | None:
+        sub_id = str(creds.get("subscription_id") or "").strip().lower()
+        rg = str(creds.get("resource_group") or "").strip().lower()
+        return f"{sub_id}/{rg}" if sub_id and rg else None
+
     credential_fields = (
         "tenant_id",
         "client_id",

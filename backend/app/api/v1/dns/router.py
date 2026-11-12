@@ -263,6 +263,10 @@ from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
+    provider_copies_kept_header,
+    same_provider_target_ids,
+    shared_provider_sources,
+    shared_zone_copy_servers,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
@@ -3506,7 +3510,10 @@ async def _sync_single_server(
       4. Run the existing bi-directional per-zone sync for records.
     """
     from app.drivers.dns import get_driver  # noqa: PLC0415
-    from app.services.dns.pull_from_server import sync_zone_with_server  # noqa: PLC0415
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        non_authoritative_reason,
+        sync_zone_with_server,
+    )
 
     group_id = server.group_id
     # Agentless drivers that can list zones from the authoritative side:
@@ -3650,6 +3657,9 @@ async def _sync_single_server(
     total_push_errors = 0
 
     for zone in zones:
+        # #3758 — forward / stub zones aren't held authoritatively; skip.
+        if non_authoritative_reason(zone) is not None:
+            continue
         try:
             result = await sync_zone_with_server(db, zone, apply=True, server=server)
             zones_succeeded += 1
@@ -6903,6 +6913,7 @@ async def update_zone(
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
+        await _enforce_no_records_in_other_view(db, zone.id, changes["view_id"])  # #3839
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -8357,6 +8368,12 @@ async def move_zone_commit(
         # (``forward_transport_refusal``), so the preview reports the same
         # refusal commit_zone_move raises below.
     source_group_id = zone.group_id
+    # The deletes still queued for retry against the source group's servers.
+    # The move discards those ops (``sweep_zone_ops``), so they are read first:
+    # a server that adopts the provider's existing copy (#3805) may still hold
+    # the records they were to remove, and the additive record push never
+    # removes anything.
+    queued_deletes = await _queued_delete_changes(db, zone, source_group_id)
     try:
         plan = await commit_zone_move(
             db,
@@ -8378,8 +8395,44 @@ async def move_zone_commit(
     # fail leaves the zone existing in both places (visible, fixable) where
     # delete-then-fail would have removed it from the old server with the
     # database still saying it lives there.
-    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
-    await _push_zone_to_agentless_servers(db, zone, "delete", group_id=source_group_id)
+    #
+    # A source server that may reach the same provider as a target server
+    # is NOT deleted from (#3805): the create adopted the provider's one copy,
+    # and deleting through the source would remove it. Decided AFTER the
+    # create, because a target that already held the zone is the evidence
+    # that does not depend on the credentials naming the provider correctly.
+    adopted_on = await _push_zone_to_agentless_servers(
+        db,
+        zone,
+        "create",
+        group_id=target_group.id,
+        adopt_existing_server_ids=await same_provider_target_ids(
+            db, source_group_id, target_group.id
+        ),
+    )
+    # The create gives each NEW target server an empty zone (SOA + NS), so the
+    # zone's saved records are pushed too (#3815) — or every one of them
+    # answers NXDOMAIN while SpatiumDDI lists it as served. A server that
+    # ADOPTED an existing copy is pushed to as well: the push is additive, so
+    # it sends only what that copy lacks — on a shared provider (#3805),
+    # exactly the record whose write was still queued for retry against the
+    # source group. The push sends the zone's live rows as they stand now, so
+    # a queued add / update is in the rows; a queued delete is applied to an
+    # adopted copy first (and its record is soft-deleted, so never resurrected).
+    pushed = await _push_moved_zone_records(
+        db, zone, target_group.id, set(adopted_on), queued_deletes
+    )
+    shared = await shared_provider_sources(
+        db, source_group_id, target_group.id, adopted_on=adopted_on
+    )
+    # A THIRD group's zone of the same name (or a sibling view's in the source
+    # group) may use the same provider copy too (#3812).
+    others = await shared_zone_copy_servers(db, zone, group_id=source_group_id)
+    shared.keep_ids |= others.keep_ids
+    shared.notes.extend(n for n in others.notes if n not in shared.notes)
+    await _push_zone_to_agentless_servers(
+        db, zone, "delete", group_id=source_group_id, skip_server_ids=shared.keep_ids
+    )
 
     db.add(
         AuditLog(
@@ -8403,6 +8456,9 @@ async def move_zone_commit(
                 "dnssec_signed": plan.dnssec_signed,
                 "acknowledgements": sorted(body.acknowledgements),
                 "adopted_existing_on": adopted_on,
+                "source_copies_kept": shared.notes,
+                "records_pushed": pushed["pushed"],
+                "record_types_not_served": pushed["unsupported_types"],
             },
             result="success",
         )
@@ -8412,6 +8468,15 @@ async def move_zone_commit(
     # lock runs right after it, and the response is built from the plan.
     resp = ZoneMoveCommitResponse.from_plan(plan)
     resp.target_tsig_key_generated = plan.target_tsig_key_generated
+    # What the move actually kept (#3805) — the plan's notes were written
+    # before the create, when whether the target already held the zone
+    # was not yet known.
+    resp.warnings.extend(n for n in shared.notes if n not in resp.warnings)
+    for name, types in pushed["unsupported_types"].items():
+        resp.warnings.append(
+            f"{name} cannot serve record type(s) {', '.join(types)}; those records of the zone "
+            "were not written there."
+        )
     return resp
 
 
@@ -8461,7 +8526,14 @@ async def delete_zone(
     pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
     if pending is not None:
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
-    await op.apply(db, current_user, args)
+    result = await op.apply(db, current_user, args)
+    kept = result.get("provider_copies_kept") if isinstance(result, dict) else None
+    if kept:
+        # #3812: 204 has no body; say so in a header.
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept)},
+        )
     return None
 
 
@@ -8861,9 +8933,26 @@ async def apply_delegation(
 
 
 async def _push_zone_to_agentless_servers(
-    db: DB, zone: DNSZone, op: str, group_id: uuid.UUID | None = None
+    db: DB,
+    zone: DNSZone,
+    op: str,
+    group_id: uuid.UUID | None = None,
+    skip_server_ids: set[uuid.UUID] | None = None,
+    adopt_existing_server_ids: set[uuid.UUID] | None = None,
+    kept_notes: list[str] | None = None,
 ) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    ``kept_notes`` (delete, no ``group_id`` override): a delete leaves out the
+    servers whose provider copy another group's live zone of the same name
+    still uses (#3812); the reasons are appended here for the caller's audit
+    row and response.
+
+    ``adopt_existing_server_ids`` (create only): servers whose existing copy
+    of the zone is SpatiumDDI's own, reached through the source group's server
+    of the same provider (#3805). Their driver adopts it without refusing for
+    the records it holds. Every other caller leaves it empty, so the
+    foreign-records guard still runs.
 
     Returns the names of the servers that were already in the requested
     state (#1537): on a create, the servers that already held a zone of
@@ -8916,7 +9005,21 @@ async def _push_zone_to_agentless_servers(
             DNSServer.is_enabled.is_(True),
         )
     )
-    targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
+    # ``skip_server_ids``: servers the caller has decided not to drive (the
+    # move keeps a source copy that shares a provider with the target, #3805).
+    skip = set(skip_server_ids or set())
+    if op == "delete" and group_id is None:
+        # #3812: the zone's own group is being deleted from; the move passes
+        # ``group_id`` and decides its keeps itself (#3805).
+        shared = await shared_zone_copy_servers(db, zone)
+        skip |= shared.keep_ids
+        if kept_notes is not None:
+            kept_notes.extend(shared.notes)
+        for note in shared.notes:
+            logger.warning("dns.zone.delete_kept_shared_provider_copy", zone=zone.name, note=note)
+    targets = [
+        s for s in servers_res.scalars().all() if is_agentless(s.driver) and s.id not in skip
+    ]
     if not targets:
         return []
 
@@ -8948,7 +9051,15 @@ async def _push_zone_to_agentless_servers(
             records = managed_records
             if this_op == "delete" and records is None:
                 records = await _managed_zone_records(db, zone)
-            result = await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+            result = await driver.apply_zone_change(
+                server,
+                zone,
+                this_op,
+                managed_records=records,
+                adopt_existing=(
+                    this_op == "create" and server.id in (adopt_existing_server_ids or set())
+                ),
+            )
         else:
             result = await driver.apply_zone_change(server, zone, this_op)
         return result is not False
@@ -9052,7 +9163,7 @@ async def _push_zone_to_agentless_servers(
 
     kinds = ", ".join(sorted(_agentless_driver_label(d) for d in failed_drivers))
     detail = (
-        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors)}. "
+        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors).rstrip('. ')}. "
         "The change was not saved in SpatiumDDI."
     )
     if compensated:
@@ -9080,6 +9191,219 @@ async def _push_zone_to_agentless_servers(
     # resolving it alone would not make a retry succeed.
     status_code = 409 if conflicts == len(errors) else 502
     raise HTTPException(status_code=status_code, detail=detail)
+
+
+async def _queued_delete_changes(db: DB, zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
+    """The record deletes still queued for ``zone`` on ``group_id``'s servers,
+    as driver changes, deduplicated by record (#3805)."""
+    from app.models.dns import DNSRecordOp  # noqa: PLC0415
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        _change_from_op_row,
+        queued_zone_ops_where,
+    )
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecordOp).where(
+                    *queued_zone_ops_where(zone, group_id), DNSRecordOp.op == "delete"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: dict[tuple[Any, ...], Any] = {}
+    for row in rows:
+        change = _change_from_op_row(row)
+        if change is not None:
+            r = change.record
+            out[_record_identity(r.name, r.record_type, r.value, r.priority, r.weight, r.port)] = (
+                change
+            )
+    return list(out.values())
+
+
+def _record_identity(
+    name: str, rtype: str, value: str, priority: Any, weight: Any, port: Any
+) -> tuple[Any, ...]:
+    """The fields that tell one RR from another (#3805). ``priority`` /
+    ``weight`` / ``port`` are part of it: ``MX 10 mail`` and ``MX 20 mail``
+    share a value and are two records, so a key without them would collapse
+    two queued deletes into one, or skip a delete because its sibling is live.
+    """
+    return (name, rtype.upper(), value, priority, weight, port)
+
+
+async def _push_moved_zone_records(
+    db: DB,
+    zone: DNSZone,
+    group_id: uuid.UUID,
+    adopted_names: set[str],
+    queued_deletes: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Push a moved zone's saved records to the target group's agentless
+    servers (#3815), through the additive push the create rollback and Sync
+    with Servers use: each server's copy is read first and only what it
+    lacks is sent.
+
+    Every target server is pushed to, including one whose create ADOPTED an
+    existing copy: that copy is usually the source's own (one provider, #3805)
+    and already holds the records, so the push sends nothing — except a
+    record whose write was still queued for retry against the source group,
+    which the move drops and which only this push delivers.
+
+    The push never removes anything, so a record DELETE still queued against
+    the source group (``queued_deletes``) is applied to an adopted copy first
+    (#3805): the provider answered the caller's delete as queued, and the move
+    discards that op, so without this the record stays live there for good.
+    A delete is skipped when SpatiumDDI holds the same record live again, and
+    a failure to deliver one fails the move like a failed record write.
+
+    A record that cannot be written is a 502 naming it, like a failed create,
+    so the move is never reported clean while the target answers NXDOMAIN.
+    Before raising, the zone is deleted again from each server whose create
+    made a FRESH copy — the compensation a failed create gets — so a retry
+    does not adopt a half-filled copy. An adopted copy is never deleted: the
+    move did not create it.
+
+    Returns what was pushed, per server, and the record types a target
+    driver cannot serve (those rows are not sent and are reported, not
+    failed: the move preview's driver-change warning already names it)."""
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+    from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        _PUSHABLE_TYPES,
+        _syncable_types,
+        restore_zone_records_to_server,
+    )
+
+    res = await db.execute(
+        select(DNSServer).where(
+            DNSServer.group_id == group_id,
+            DNSServer.credentials_encrypted.isnot(None),
+            DNSServer.is_enabled.is_(True),
+        )
+    )
+    servers = [s for s in res.scalars().all() if is_agentless(s.driver)]
+    summary: dict[str, Any] = {"pushed": {}, "unsupported_types": {}}
+    if not servers:
+        return summary
+    live_types = {
+        t.upper()
+        for t in (
+            await db.execute(
+                select(DNSRecord.record_type).where(DNSRecord.zone_id == zone.id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    }
+    stale = list(queued_deletes or [])
+    if stale and adopted_names:
+        live_keys = {
+            _record_identity(r.name, r.record_type, r.value, r.priority, r.weight, r.port)
+            for r in (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
+            .scalars()
+            .all()
+        }
+        stale = [
+            c
+            for c in stale
+            if _record_identity(
+                c.record.name,
+                c.record.record_type,
+                c.record.value,
+                c.record.priority,
+                c.record.weight,
+                c.record.port,
+            )
+            not in live_keys
+        ]
+    deletes_applied_on: list[str] = []
+    failures: list[str] = []
+    for server in servers:
+        driver = get_driver(server.driver)
+        unsupported = sorted(live_types - _syncable_types(driver, _PUSHABLE_TYPES))
+        if unsupported:
+            summary["unsupported_types"][server.name] = unsupported
+        try:
+            problems = []
+            if stale and server.name in adopted_names:
+                results = await driver.apply_record_changes(server, stale)
+                problems = [
+                    f"delete of {res.change.record.name} {res.change.record.record_type} "
+                    f"failed: {res.error or 'unknown'}"
+                    for res in results
+                    if not res.ok
+                ]
+                if any(res.ok for res in results):
+                    deletes_applied_on.append(server.name)
+            restored = await restore_zone_records_to_server(db, server, driver, zone)
+            problems += list(restored.push_errors)
+            if restored.pushed < restored.candidates and not problems:
+                problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
+            summary["pushed"][server.name] = restored.pushed
+        except Exception as exc:  # noqa: BLE001 — reported below
+            problems = [_exc_text(exc)]
+        if problems:
+            failures.append(f"{server.name} ({'; '.join(problems)})")
+            logger.warning(
+                "dns.zone.move_record_push_failed",
+                server=str(server.id),
+                zone=zone.name,
+                errors=problems,
+            )
+    if not failures:
+        return summary
+
+    removed: list[str] = []
+    left: list[str] = []
+    for server in servers:
+        if server.name in adopted_names:
+            continue
+        driver = get_driver(server.driver)
+        try:
+            if isinstance(driver, CloudDNSDriverBase):
+                await driver.apply_zone_change(
+                    server,
+                    zone,
+                    "delete",
+                    managed_records=await _managed_zone_records(db, zone),
+                )
+            else:
+                await driver.apply_zone_change(server, zone, "delete")
+            removed.append(server.name)
+        except Exception as exc:  # noqa: BLE001 — best effort; reported below
+            left.append(f"{server.name}: {_exc_text(exc)}")
+            logger.warning(
+                "dns.zone.move_record_push_compensation_failed",
+                server=str(server.id),
+                zone=zone.name,
+                error=_exc_text(exc),
+            )
+    detail = (
+        f"Zone {zone.name}'s records could not all be written to the target group: "
+        f"{'; '.join(failures)}. The move was not saved in SpatiumDDI."
+    )
+    if removed:
+        detail += f" The zone created for the move was removed again from: {', '.join(removed)}."
+    if adopted_names:
+        detail += (
+            f" Left as found on: {', '.join(sorted(adopted_names))} "
+            "(those servers already held the zone)."
+        )
+        if deletes_applied_on:
+            detail += (
+                " Except that the record deletes still queued for this zone, for records "
+                f"SpatiumDDI no longer holds, were applied on: {', '.join(deletes_applied_on)}."
+            )
+    if left:
+        detail += (
+            f" Removing the zone created for the move failed on: {'; '.join(left)} — "
+            "those servers may still hold a partial copy; delete it there before retrying."
+        )
+    raise HTTPException(status_code=502, detail=detail)
 
 
 async def _managed_zone_records(db: DB, zone: DNSZone) -> list[Any]:
@@ -9425,6 +9749,37 @@ async def _enforce_zone_view_in_group(
             status_code=422,
             detail="view_id does not name a view in this zone's server group",
         )
+
+
+async def _enforce_no_records_in_other_view(db: DB, zone_id: uuid.UUID, pin: uuid.UUID) -> None:
+    """422 pinning a zone while it holds a record scoped to another view (#3839).
+
+    A pinned zone renders into its pin alone, so a record scoped to a different
+    view is served in no view. The record API refuses writing that state
+    (``_enforce_views_in_zone_group``); a change of the zone's pin is held to
+    the same rule, naming the records and their views.
+    """
+    rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value, DNSView.name)
+            .join(DNSView, DNSView.id == DNSRecord.view_id)
+            .where(DNSRecord.zone_id == zone_id, DNSRecord.view_id != pin)
+            .order_by(DNSRecord.name, DNSRecord.record_type)
+            .limit(6)
+        )
+    ).all()
+    if not rows:
+        return
+    shown = ", ".join(f"{n} {t} {v} (view '{vn}')" for n, t, v, vn in rows[:5])
+    more = ", and more" if len(rows) > 5 else ""
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "Cannot pin this zone to that view: it holds records scoped to another "
+            f"view, which would then be rendered in no view: {shown}{more}. Move "
+            "those records to the new view or remove their view first."
+        ),
+    )
 
 
 async def _enforce_views_in_zone_group(
@@ -11835,11 +12190,12 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
     if not drivers:
         return
     incompatible = drivers - allowed
-    if op == "dnssec_sign" and incompatible & dnssec_signers.UNMANAGED_SIGNING_DRIVERS:
+    if op == "dnssec_sign" and incompatible & dnssec_signers.SIGN_REFUSED_TECHNITIUM_DRIVERS:
         raise HTTPException(
             status_code=422,
             detail=(
-                "DNSSEC signing is not supported on Technitium servers: "
+                "DNSSEC signing is not supported on Technitium servers "
+                "(agent-managed or agentless API) in 1.0: "
                 "SpatiumDDI cannot keep a Technitium zone signed (it is signed "
                 "once and never re-signed on a new server, a re-created zone "
                 "or a lost volume, and the zone's DNSSEC policy is ignored). "
