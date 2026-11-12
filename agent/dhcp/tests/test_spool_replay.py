@@ -485,12 +485,46 @@ def test_one_read_timeout_does_not_request_a_full_snapshot_3811(agent_cfg, cp, c
 
 
 def test_run_of_timeouts_still_counts_as_an_outage_3811(agent_cfg, cp, clock, tmp_path):
+    """A sustained slow API (every post times out) is an outage after 5 failed
+    posts: the spool keeps the batch, and once the API answers there is exactly
+    one full snapshot and the batch lands exactly once."""
     kea = FakeKea([_kea_lease("10.6.0.1")])
     w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), kea, clock)
     w.tick()
-    for _ in range(5):
-        w._note_slow_failure()
+    assert w.snapshot.runs_completed == 1
+
+    real_post = cp.post
+    timeouts = {"n": 0}
+
+    def slow_post(path, json, headers=None):
+        timeouts["n"] += 1
+        raise httpx.ReadTimeout("slow")
+
+    cp.post = slow_post
+    agent_cfg.kea_lease_file.write_text(_csv_rows(["10.6.0.2"]))
+    clock.advance(6)
+    w.tick()
+    assert not w._degraded  # one timeout alone is not an outage
+    for _ in range(40):
+        clock.advance(400)
+        w.tick()
+        if w._degraded:
+            break
     assert w._degraded
+    assert len(w._shipper.spool) == 1  # nothing lost
+
+    cp.post = real_post
+    for _ in range(10):
+        clock.advance(400)
+        w.tick()
+    assert len(w._shipper.spool) == 0
+    assert w.snapshot.runs_completed == 2  # start + exactly one recovery
+    ids = [
+        b["batch_id"]
+        for b in cp.bodies("/lease-events")
+        if b["leases"][0]["ip_address"] == "10.6.0.2"
+    ]
+    assert len(ids) == 1
 
 
 def test_snapshot_waits_for_the_backlog(agent_cfg, cp, clock, tmp_path):

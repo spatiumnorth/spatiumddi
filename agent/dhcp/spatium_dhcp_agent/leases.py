@@ -99,7 +99,9 @@ def _times(expire_epoch: int, valid_lifetime: int) -> tuple[str | None, str | No
         else None
     )
     ends_at = (
-        datetime.fromtimestamp(expire_epoch, tz=timezone.utc).isoformat() if expire_epoch else None
+        datetime.fromtimestamp(expire_epoch, tz=timezone.utc).isoformat()
+        if expire_epoch
+        else None
     )
     return starts_at, ends_at
 
