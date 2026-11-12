@@ -161,6 +161,19 @@ function field(container: HTMLElement, name: string): HTMLTextAreaElement {
   return el as HTMLTextAreaElement;
 }
 
+function secretUpload(container: HTMLElement, name: string, text: string) {
+  expect(
+    container.querySelector(`textarea[name="${name}"]`),
+    `${name} must not be a text control (#3643)`,
+  ).toBeNull();
+  const input = container.querySelector(
+    `[data-secret-file="${name}"]`,
+  ) as HTMLInputElement;
+  const file = new File([text], "key", { type: "text/plain" });
+  Object.defineProperty(file, "text", { value: async () => text });
+  fireEvent.change(input, { target: { files: [file] } });
+}
+
 async function submit(container: HTMLElement) {
   fireEvent.change(container.querySelector('input[type="text"]')!, {
     target: { value: "t1" },
@@ -175,28 +188,16 @@ async function submit(container: HTMLElement) {
 }
 
 describe("backup target form keeps line breaks (#2199)", () => {
-  it("SCP private key and known_hosts are textareas and go out unchanged", async () => {
+  it("SCP private key is a hidden file/paste field, known_hosts a textarea, both go out unchanged", async () => {
     const { container } = await openCreate("scp");
-    await waitFor(() => field(container, "private_key"));
-    const key = field(container, "private_key");
     const hosts = field(container, "known_hosts");
-    fireEvent.change(key, { target: { value: PEM } });
     fireEvent.change(hosts, { target: { value: KNOWN_HOSTS } });
-    // Read back with the line breaks.
-    expect(key.value).toBe(PEM);
     expect(hosts.value).toBe(KNOWN_HOSTS);
-    // The secret one is masked, and only the secret one.
-    expect(key.dataset.masked).toBe("true");
-    expect(hosts.dataset.masked).toBe("false");
-    // Masked like a password input: copying it out is refused, and the
-    // Show toggle reveals it (and copying is then allowed again).
-    expect(fireEvent.copy(key)).toBe(false);
-    expect(fireEvent.copy(hosts)).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Show" }));
-    expect(key.dataset.masked).toBe("false");
-    expect(fireEvent.copy(key)).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Hide" }));
-    expect(key.dataset.masked).toBe("true");
+    secretUpload(container, "private_key", PEM);
+    // The secret never appears in the DOM or the accessibility tree.
+    await screen.findByText(/New value ready/);
+    expect(container.innerHTML).not.toContain("BEGIN");
+    expect(container.innerHTML).not.toContain("OPENSSH");
     const body = await submit(container);
     expect(body.config.private_key).toBe(PEM);
     expect(body.config.known_hosts).toBe(KNOWN_HOSTS);
@@ -212,19 +213,19 @@ describe("backup target form keeps line breaks (#2199)", () => {
     expect(body.config.extra_headers).toBe(HEADERS);
   });
 
-  it("GCS service-account JSON is a masked textarea", async () => {
+  it("GCS service-account JSON is never rendered in the DOM", async () => {
     const { container } = await openCreate("gcs");
-    await waitFor(() => field(container, "service_account_json"));
-    const sa = field(container, "service_account_json");
-    expect(sa.dataset.masked).toBe("true");
-    fireEvent.change(sa, { target: { value: SA_JSON } });
+    await screen.findByText("Not set");
+    secretUpload(container, "service_account_json", SA_JSON);
+    await screen.findByText(/New value ready/);
+    expect(container.innerHTML).not.toContain("project_id");
     const body = await submit(container);
     expect(body.config.service_account_json).toBe(SA_JSON);
   });
 
   it("a one-line field stays an input", async () => {
     const { container } = await openCreate("scp");
-    await waitFor(() => field(container, "private_key"));
+    await waitFor(() => field(container, "known_hosts"));
     expect(container.querySelector("textarea[name=host]")).toBeNull();
   });
 
@@ -272,8 +273,11 @@ describe("backup target form keeps line breaks (#2199)", () => {
     update.mockResolvedValue({});
     const { container } = withClient(<BackupTargetsSection />);
     fireEvent.click(await screen.findByTitle("Edit"));
-    await waitFor(() => field(container, "private_key"));
-    await waitFor(() => expect(field(container, "private_key").value).toBe(""));
+    await waitFor(() => field(container, "known_hosts"));
+    // #3643: a stored secret has no textarea at all, so no secret text (or
+    // masked stand-in) sits in the DOM; Replace opens an empty one.
+    expect(container.querySelector('[name="private_key"]')).toBeNull();
+    expect(screen.getByText(/Set — stored encrypted/)).toBeTruthy();
     expect(field(container, "known_hosts").value).toBe(KNOWN_HOSTS);
     fireEvent.change(container.querySelector('input[type="text"]')!, {
       target: { value: "scp1-renamed" },
@@ -283,5 +287,32 @@ describe("backup target form keeps line breaks (#2199)", () => {
     const body = update.mock.calls[0][1] as { config: Record<string, string> };
     expect(body.config.private_key).toBe("");
     expect(body.config.known_hosts).toBe(KNOWN_HOSTS);
+  });
+
+  it("Replace from file sends the new value; Clear goes back to keeping (#3643)", async () => {
+    list.mockResolvedValue([
+      {
+        id: "t-1",
+        name: "scp1",
+        description: "",
+        kind: "scp",
+        enabled: true,
+        config: { host: "h", private_key: "<set>", known_hosts: "" },
+        passphrase_set: true,
+      } as unknown as BackupTarget,
+    ]);
+    listKinds.mockResolvedValue(KINDS);
+    update.mockResolvedValue({});
+    const { container } = withClient(<BackupTargetsSection />);
+    fireEvent.click(await screen.findByTitle("Edit"));
+    await screen.findByText(/Set — stored encrypted/);
+    secretUpload(container, "private_key", PEM);
+    await screen.findByText(/New value ready/);
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    await screen.findByText(/Set — stored encrypted/);
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    const body = update.mock.calls[0][1] as { config: Record<string, string> };
+    expect(body.config.private_key).toBe("");
   });
 });
