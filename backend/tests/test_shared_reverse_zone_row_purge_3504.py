@@ -232,3 +232,48 @@ async def test_permanent_delete_of_a_live_zone_with_no_trashed_sharer_still_work
     r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}?permanent=true", headers=headers)
     assert r.status_code == 204, r.text
     assert await _zone(db_session, zid) is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_of_an_operator_made_zone_is_refused_3889(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An operator-made forward zone holding a trashed subnet's A record: the
+    permanent delete is refused too (#3889), and that subnet's restore keeps it."""
+    from app.models.dns import DNSRecord
+    from tests.test_subnet_delete_reverse_zone_1066 import _bound_subnet, _fixture
+    from tests.test_subnet_trash_retracts_dns_1906 import _address
+
+    headers = await _admin_headers(db_session)
+    ids = await _fixture(db_session)
+    _space, _block, gid, zid = ids
+    sid = await _bound_subnet(client, headers, ids, "10.67.9.0/25")
+    await _address(client, headers, sid, "10.67.9.10", "hz")
+    r = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert r.status_code == 204, r.text
+    zone_id = uuid.UUID(zid)
+
+    async def _fwd() -> list[tuple[str, bool]]:
+        rows = (
+            await db_session.execute(
+                select(DNSRecord.name, DNSRecord.deleted_at)
+                .where(DNSRecord.zone_id == zone_id, DNSRecord.record_type == "A")
+                .execution_options(include_deleted=True, populate_existing=True)
+            )
+        ).all()
+        return sorted((n, d is None) for n, d in rows)
+
+    before = await _fwd()
+    assert before == [("hz", False)]
+
+    r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}?permanent=true", headers=headers)
+    assert r.status_code == 409, r.text
+    assert "10.67.9.0/25" in r.json()["detail"]
+    zone = await _zone(db_session, zone_id)
+    assert zone is not None and zone.deleted_at is None
+    assert await _fwd() == before
+
+    await db_session.rollback()
+    r = await client.post(f"/api/v1/admin/trash/subnet/{sid}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert await _fwd() == [("hz", True)]
