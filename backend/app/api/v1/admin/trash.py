@@ -787,6 +787,16 @@ async def restore_row(
     }:
         await _update_block_utilization(db, bid)
 
+    # #3827: a restored scope's reservation mirrors are back in its subnet
+    # (``remirror_scope_statics``), which counts them again, and so does the
+    # block above; the delete recounted both when it freed them. Subnets
+    # restored in the same batch are recounted above.
+    scope_subnets = {o.subnet_id for o in restored if isinstance(o, DHCPScope)} - {
+        sn.id for sn in restored_subnets
+    }
+    if scope_subnets:
+        await recount_subnets_and_blocks(db, scope_subnets)
+
     # #3787 — the lease mirrors a restored subnet / scope brings back lost
     # their A / PTR when the delete withdrew them; DDNS re-publishes them
     # after the commit (chunked, idempotent), not 100 ms a lease in here.
