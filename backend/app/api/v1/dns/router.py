@@ -270,7 +270,7 @@ from app.services.dns.zone_move import (
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
-from app.services.dns.zone_synthesis import synthesised_zone_error
+from app.services.dns.zone_synthesis import synthesised_zone_error, unauthored_zone_error
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -9835,6 +9835,7 @@ async def create_record(
     zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
     await _require_superadmin_for_lua(
         db, current_user, [body.record_type], what="create a LUA record"
     )
@@ -9953,6 +9954,8 @@ async def update_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
+    if zone is not None:
+        _reject_if_unauthored_zone(zone, "edit")
     # #1563 — explicit null clears view_id and ttl (ttl null = inherit
     # the zone TTL; exclude_none dropped both, so the clear never
     # landed); null for a NOT NULL column is a 422.
@@ -10564,6 +10567,7 @@ async def bulk_create_records(
     zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
 
     await _require_superadmin_for_lua(
         db, current_user, [r.record_type for r in body.records], what="create a LUA record"
@@ -11025,6 +11029,8 @@ async def import_zone_preview(
     Non-mutating: this endpoint never writes to the database.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3838 — preview and commit agree: the commit refuses this zone.
+    _reject_if_unauthored_zone(zone, "import")
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11091,6 +11097,7 @@ async def import_zone_commit(
     # the deleted row (a 500). With a view, its record edits went out before
     # the bump and could deadlock with a delete that took the zone row first.
     zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    _reject_if_unauthored_zone(zone, "import")  # #3838, before any parsing
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11754,6 +11761,7 @@ async def import_zone_spreadsheet_preview(
     for the columns and the match rule.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    _reject_if_unauthored_zone(zone, "import")  # #3838, as the commit
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     return SheetImportPreviewResponse(
         zone_id=zone.id,
@@ -11831,6 +11839,7 @@ async def import_zone_spreadsheet_commit(
             ),
         )
     _reject_if_synthesised_zone(zone, "import")
+    _reject_if_unauthored_zone(zone, "import")
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     if plan.errors:
         raise HTTPException(
@@ -12389,6 +12398,13 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
     the operator can manage the zone manually.
     """
     msg = synthesised_zone_error(zone, op)
+    if msg is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
+
+
+def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
+    """Refuse a record write into a secondary, stub or forward zone (#3838)."""
+    msg = unauthored_zone_error(zone, op)
     if msg is not None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
