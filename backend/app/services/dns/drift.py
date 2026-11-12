@@ -67,15 +67,14 @@ def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) ->
     A primary zone is in sync when the server serves our serial
     (``last_serial``). A secondary / stub zone's serial is its primary's, not
     ours to number, so it is never compared with ``last_serial`` (0 for a
-    secondary): a server that holds the zone is in sync. That is how BIND9
-    secondaries have always read — the BIND9 agent reports the bundle's serial,
-    0, which equals the target 0 — and it is kept for every driver that does
-    not read back what it serves. PowerDNS reports the serial it serves, so a
-    secondary there is in sync once it has transferred (a transferred zone
-    never serves 0) and not before: at 0 it holds no data and answers REFUSED
-    (#1967)."""
+    secondary): a server that holds the zone is in sync. PowerDNS and BIND9
+    report the serial they serve, so a secondary there is in sync once it has
+    transferred (a transferred zone never serves 0) and not before: at 0 it
+    holds no data and answers REFUSED / SERVFAIL (#1967, #3940). A BIND9 agent
+    that cannot read the zone back reports nothing, which is not in sync
+    either. Other drivers compare with the target."""
     if (zone.zone_type or "primary") in ("secondary", "stub"):
-        if driver == "powerdns":
+        if driver in ("powerdns", "bind9"):
             return current != 0
         return current == target
     return current == target

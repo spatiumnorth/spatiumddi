@@ -222,11 +222,10 @@ async def test_a_secondary_that_never_transferred_is_not_in_sync(
 
 
 @pytest.mark.asyncio
-async def test_a_bind9_secondary_reporting_zero_is_left_as_it_was(
+async def test_a_bind9_secondary_reporting_zero_holds_no_copy_3940(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """BIND9 agents report the bundle's serial (0 for a secondary), so 0 says
-    nothing about a transfer there."""
+    """BIND9 agents report what named serves (#3940): 0 is no copy held."""
     token = await _token(db_session)
     _, srv, zone = await _setup(db_session, "bind9", zone_type="secondary", serial=0)
     srv_id = srv.id
@@ -236,7 +235,7 @@ async def test_a_bind9_secondary_reporting_zero_is_left_as_it_was(
         f"/api/v1/dns/servers/{srv_id}/zone-state", headers={"Authorization": f"Bearer {token}"}
     )
     (entry,) = r.json()["zones"]
-    assert entry["in_sync"] is True
+    assert entry["in_sync"] is False
 
 
 def test_the_control_plane_pdns_conf_mirror_declares_primary_and_secondary() -> None:
