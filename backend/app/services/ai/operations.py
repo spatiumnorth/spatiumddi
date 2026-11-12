@@ -2771,7 +2771,10 @@ async def _preview_create_dns_record(
         find_cname_conflict,
         is_apex,
     )
-    from app.services.dns.zone_synthesis import synthesised_zone_error
+    from app.services.dns.zone_synthesis import (
+        synthesised_zone_error,
+        unauthored_zone_error,
+    )
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2811,7 +2814,7 @@ async def _preview_create_dns_record(
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
     # #2653 — the REST create's refusal; the reconciler would revert the row.
-    synth_err = synthesised_zone_error(zone, "edit")
+    synth_err = synthesised_zone_error(zone, "edit") or unauthored_zone_error(zone, "add")
     if synth_err is not None:
         return PreviewResult(ok=False, detail=synth_err)
 
@@ -2886,8 +2889,16 @@ async def _validate_submit_create_dns_record(
     is still present rather than at approve (#2903)."""
     from fastapi import HTTPException  # noqa: PLC0415
 
+    from app.models.dns import DNSZone  # noqa: PLC0415
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
+    from app.services.dns.zone_synthesis import unauthored_zone_error  # noqa: PLC0415
 
+    zone = await db.get(DNSZone, UUID(args.zone_id))
+    if zone is not None:
+        # #3838 — a secondary / stub / forward zone serves none of our records.
+        err = unauthored_zone_error(zone, "add")
+        if err is not None:
+            raise HTTPException(status_code=422, detail=err)
     rtype = args.record_type.strip().upper()
     # The create's per-type priority / weight / port rules (#3245): 422 in its
     # words for a field the type does not take.
@@ -2932,7 +2943,10 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
-    from app.services.dns.zone_synthesis import synthesised_zone_error
+    from app.services.dns.zone_synthesis import (
+        synthesised_zone_error,
+        unauthored_zone_error,
+    )
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2962,7 +2976,7 @@ async def _apply_create_dns_record(
     # propose and apply must not receive records.
     if getattr(zone, "deleted_at", None) is not None:
         raise ValueError(f"Zone {args.zone_id} is deleted.")
-    synth_err = synthesised_zone_error(zone, "edit")
+    synth_err = synthesised_zone_error(zone, "edit") or unauthored_zone_error(zone, "add")
     if synth_err is not None:
         raise ValueError(synth_err)
 
