@@ -494,7 +494,9 @@ function RouterDetail({
               All {vlans.length} VLAN
               {vlans.length === 1 ? "" : "s"} under this router will be removed.
               Deletion is blocked if any subnet still references a VLAN on this
-              router — reassign those subnets first.
+              router — reassign those subnets first. It is also blocked while an
+              E911 location binding names one of its VLANs: remove the binding
+              first.
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -787,7 +789,8 @@ function VLANDetail({
             ) : (
               <p className="text-sm">
                 Delete VLAN <strong>{vlan.vlan_id}</strong> ({vlan.name})? No
-                subnets currently reference it.
+                subnets currently reference it. It cannot be deleted while an
+                E911 location binding names it.
               </p>
             )}
             {deleteError && (

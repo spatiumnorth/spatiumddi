@@ -65,7 +65,7 @@ The analogy stops there; desks don't expire, but DHCP [leases](#dhcp-lease) do.
 
 Have these in hand before step 1:
 
-- **A running SpatiumDDI.** The quickest path is the [OS appliance ISO](deployment/APPLIANCE_INSTALL.md): boot it, answer the installer, and the full stack is on HTTPS a few minutes after the reboot with nothing to install by hand. Prefer containers you manage yourself? A Docker host with Docker Engine 25+ and Docker Compose v2.20+, 2 GB RAM minimum (4 GB recommended), ports 8077 (frontend) and optionally 8000 (API) free — see the [Docker prerequisites](deployment/DOCKER.md#prerequisites). Kubernetes is the third option; see the [deployment topologies](deployment/TOPOLOGIES.md).
+- **A running SpatiumDDI.** The quickest path is the [OS appliance ISO](deployment/APPLIANCE_INSTALL.md): boot it, answer the installer, and the full stack is on HTTPS a few minutes after the reboot with nothing to install by hand. Prefer containers you manage yourself? A Docker host with Docker Engine 25+ and Docker Compose v2.20+, 2 vCPU and 4 GiB RAM minimum (4 vCPU and 8 GiB recommended), ports 8077 (frontend) and optionally 8000 (API) free — see the [Docker prerequisites](deployment/DOCKER.md#prerequisites). Kubernetes is the third option; see the [deployment topologies](deployment/TOPOLOGIES.md).
 - **Admin access** to that host, and credentials to log in to SpatiumDDI (`admin` / `admin` on first boot; you will be forced to change it).
 - **Your list of subnets and [VLANs](#vlan)**, even a rough one, in [CIDR](#cidr) notation (`10.20.21.0/24`). You will enter these in steps 6–8, and a written plan beats improvising in the create form.
 - **Whether you have existing Windows DNS or DHCP.** This decides your backend choice in steps 3 and 5. If yes, you will need [WinRM](#winrm) enabled and a service account on the Windows side — read [WINDOWS.md](deployment/WINDOWS.md) first, since those prerequisites need Windows-admin time. If no, the built-in [agent](#agent-and-agentless) containers cover everything.
@@ -111,7 +111,7 @@ After logging in as `admin` / `admin` and changing your password:
 4. Leave the two sync jobs **off** for now:
    - *IPAM → DNS Reconciliation* — turn this on once you have zones + subnets.
    - *Zone ↔ Server Reconciliation* — turn this on once at least one Windows DNS server with credentials is registered.
-5. **Utilization thresholds** are cosmetic — set them if you care about the colour of the bars.
+5. **Utilization Thresholds** are cosmetic — set them if you care about the colour of the bars.
 
 Each section has a **Reset to defaults** button at the top. It populates the section with the built-in defaults but still requires **Save** — you can back out by navigating away.
 
@@ -142,13 +142,13 @@ See [AUTH.md](features/AUTH.md) for the full provider matrix.
 
 Zones live under server groups, so this has to come before zones.
 
-1. **DNS → Server Groups → New Group**. Give it a name (`default`, `internal`, `corp`, whatever) and pick the [recursion](#recursion) / DNSSEC defaults.
-2. **Add a server** to the group.
+1. **Check which group your servers will land in.** A built-in agent creates a group named `default` the first time it registers, so you normally do not create that group by hand (creating a second one named `default` is refused with a 409). If you want a different name, open **DNS**, click **Create Group** in the groups panel, give it a name (`internal`, `corp`, whatever) and pick the [recursion](#recursion) / DNSSEC defaults, then move the server into it after it registers: **Edit Server** and change **Server group**. Servers that don't register themselves (Windows DNS, cloud and API-managed providers) are added to a group by hand instead.
+2. **Start the server** (or add it, for an agentless backend). Agent-based servers appear in their group by themselves.
 
    **Choosing a backend — two questions.** If you'd rather read the full matrix, it follows below unchanged.
 
    1. **Does your org already run DNS on Windows Server / Active Directory?** If yes, keep it — register the DC as a `windows_dns` server rather than migrating anything. Provide WinRM credentials if your Windows admins allow it (**Path B** — full experience: zone create/delete, server-side reads without [AXFR](#axfr)); without credentials you still get record-level writes via [RFC 2136](#rfc-2136) dynamic updates (**Path A**). If no, use a built-in container — question 2.
-   2. **Using the built-in stack: which of the three?** Take **PowerDNS** if you need ALIAS records (CNAME-at-apex) or LUA computed records — nothing else serves them. Take **Technitium** if you want to serve or forward encrypted DNS without a sidecar; it is the only backend that forwards over DoH and DoQ, not just DoT. Otherwise take **BIND9**, the default — it is the only one with split-horizon views and RPZ blocklists. All three do online DNSSEC, so that no longer picks for you. Catalog zones still do: BIND9 runs them in both roles, PowerDNS as producer only, and Technitium not at all until [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)).
+   2. **Using the built-in stack: which of the three?** Take **PowerDNS** if you need ALIAS records (CNAME-at-apex) or LUA computed records — nothing else serves them. Take **Technitium** if you want to serve or forward encrypted DNS without a sidecar; it is the only backend that forwards over DoH and DoQ, not just DoT. Otherwise take **BIND9**, the default — it is the only one with split-horizon views and RPZ blocklists. All three do online DNSSEC, so that no longer picks for you. Catalog zones barely do: BIND9 and PowerDNS both publish one for secondaries outside the group (members of a group never need to consume it, #3764), and Technitium not at all until [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)).
 
    | Backend | Setup | When to choose |
    |---|---|---|
@@ -169,7 +169,7 @@ The BIND9 / PowerDNS / Technitium / Kea containers are [agents](#agent-and-agent
 
 </details>
 
-> **Worked example — Ridgeline College.** Ridgeline creates one server group named `default`, leaves the group defaults as-is, and runs `docker compose --profile dns-bind9 up -d` on the SpatiumDDI host. The BIND9 container auto-registers and appears in the group.
+> **Worked example — Ridgeline College.** Ridgeline keeps the `default` group the agent creates, leaves the group defaults as-is, and runs `docker compose --profile dns-bind9 up -d` on the SpatiumDDI host. The BIND9 container auto-registers and appears in `default`.
 
 > **How you know it worked:** the server appears in the group's server list, enabled, and **Sync with Servers** completes with a healthy per-server status. A group with zero enabled servers can't push anything — that state is the top cause of "my record never appeared" later.
 
@@ -207,8 +207,8 @@ Reverse DNS stores IP-to-name mappings in ordinary zones under the special domai
 
 Same pattern as DNS. Do this before you start pinning subnets to DHCP servers.
 
-1. **DHCP → Server Groups → New Group**.
-2. **Add a server**.
+1. **Use the auto-created group, or make your own.** The Kea agent creates a group named `default` when it registers, so don't create that name by hand (409). For another name, open **DHCP**, click **Create Group** in the groups panel, and move the server into it afterwards from the server's edit form (**Server Group**).
+2. **Start the server** (or add it, for Windows DHCP). Agent-based servers appear in their group by themselves.
 
    **Choosing a backend — two questions.** The matrix follows below unchanged.
 
@@ -224,7 +224,7 @@ Same pattern as DNS. Do this before you start pinning subnets to DHCP servers.
 
 3. Toggle **DHCP Lease Sync** on in Settings once you have at least one agentless server — the Celery beat task pulls leases on a short polling interval (15 s by default, tunable in Settings, 10 s minimum).
 
-> **Worked example — Ridgeline College.** Ridgeline creates a DHCP group named `default` and runs `docker compose --profile dhcp up -d`. The Kea container auto-registers into it. No Windows DHCP exists, so lease sync stays off.
+> **Worked example — Ridgeline College.** Ridgeline keeps the `default` DHCP group and runs `docker compose --profile dhcp up -d`. The Kea container auto-registers into it. No Windows DHCP exists, so lease sync stays off.
 
 > **How you know it worked:** the server appears in the DHCP group's server list, enabled and healthy. For a Windows Path A server, leases start appearing in IPAM (as `dhcp` rows) within a polling interval of enabling **DHCP Lease Sync**.
 
@@ -243,7 +243,7 @@ An **IP Space** is the top-level container — think "address universe". Most or
 - `Lab` — disposable / isolated ranges.
 - `Cloud-AWS` / `Cloud-Azure` — per-cloud RFC1918 ranges.
 
-Create a space with **IPAM → New Space**. You can pin a default DNS group + DHCP group here; anything below will inherit unless overridden.
+Create a space with the **+** button (**New IP Space**) at the top of the IPAM tree. You can pin a default DNS group + DHCP group here; anything below will inherit unless overridden.
 
 > **Worked example — Ridgeline College.** One space: `Campus`. Ridgeline pins nothing here, choosing to pin groups on the block below instead.
 
@@ -272,9 +272,11 @@ On the subnet create form:
 - **DNS inherit settings** / **DHCP inherit settings** — toggle these back on if you pinned something and want to return to inheritance.
 - **Reverse zone** — SpatiumDDI auto-creates the right `in-addr.arpa` (or `ip6.arpa`) zone on the effective DNS group once the subnet has one; opt out with `skip_reverse_zone`.
 
+**How pinning and inheriting interact.** `dns_inherit_settings` decides whether a subnet's own DNS values are read at all. While it is on, anything pinned on the subnet is ignored and the DNS group, primary zone and additional zones come from the nearest block (or the space) that has its own settings. While it is off, the subnet's own group, primary zone and additional zones are used instead of the parent's, as a set, not field by field. Saving a subnet with a primary zone turns `dns_inherit_settings` off for you, so pinning a zone is an override of the whole DNS binding. Leave the zone blank if you want the subnet to keep inheriting.
+
 **Important:** subnets and blocks respect inheritance independently for DNS and DHCP. If you want a subnet to inherit DNS from its parent but use a different DHCP group, that works — toggle `dns_inherit_settings` on, `dhcp_inherit_settings` off, and pin the DHCP group.
 
-> **Worked example — Ridgeline College.** First subnet: `10.20.21.0/24`, VLAN ID 21, primary DNS zone `corp.example.edu`. Both server-group fields stay blank — the subnet inherits the `default` DNS and DHCP groups from the `10.20.0.0/16` block. On save, SpatiumDDI auto-creates the reverse zone `21.20.10.in-addr.arpa` in the `default` group.
+> **Worked example — Ridgeline College.** First subnet: `10.20.21.0/24`, VLAN ID 21, primary DNS zone `corp.example.edu`. The DHCP server group stays blank, so it inherits the `default` DHCP group from the `10.20.0.0/16` block. Because Ridgeline pins a primary zone, the subnet carries its own DNS binding (`dns_inherit_settings` is off) rather than inheriting the block's, and that zone lives in the `default` group. On save, SpatiumDDI auto-creates the reverse zone `21.20.10.in-addr.arpa` in the `default` group.
 
 > **How you know it worked:** the IPAM tree shows `Campus → 10.20.0.0/16 → 10.20.21.0/24`, the subnet detail shows the effective (inherited) DNS and DHCP groups, and the new reverse zone is listed under the DNS group alongside your forward zone.
 
@@ -293,7 +295,7 @@ With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab
 
 For Windows DHCP servers, scopes you create here are written through to the Windows server over WinRM, and scopes that already exist on it are imported on the next lease sync. A group with more than one Windows member asks which server (or failover relationship) a new scope goes to — see [DHCP.md §15](features/DHCP.md#15-windows-dhcp-agentless-winrm).
 
-> **Worked example — Ridgeline College.** On `10.20.21.0/24`, Ridgeline creates one scope and accepts the pre-filled defaults except the suggested initial pool: it replaces `10.20.21.10–10.20.21.254` with `10.20.21.100–10.20.21.199`, a **dynamic** pool for staff laptops. Kept as suggested, the pool would take in `10.20.21.10`, the address step 10 gives `print-01`, and that allocation would stop to ask for confirmation. Then **Add Pool** on the new scope creates an **excluded** pool `10.20.21.1–10.20.21.9` for network infrastructure. Everything else is left for static allocation in step 10.
+> **Worked example — Ridgeline College.** On `10.20.21.0/24`, Ridgeline creates one scope and accepts the pre-filled defaults except the suggested initial pool: it replaces `10.20.21.10–10.20.21.254` with `10.20.21.100–10.20.21.199`, a **dynamic** pool for staff laptops. Kept as suggested, the pool would take in `10.20.21.10`, the address step 10 gives `print-01`, and that allocation would stop to ask for confirmation. Then **Add Pool** on the new scope creates an **excluded** pool `10.20.21.1–10.20.21.9` for network infrastructure. DHCP never offers that excluded range, but IPAM does not know that: step 10 reserves the same addresses in IPAM so **Next available** skips them. Everything else is left for static allocation in step 10.
 
 > **How you know it worked:** the scope and its pools are listed on the subnet's DHCP tab, and the subnet's IP grid marks the pool boundaries — allocating an address inside the dynamic pool by hand asks you to confirm first: a reminder to pin a matching static reservation on the scope, so the DHCP server doesn't lease that address to another client.
 
@@ -305,8 +307,11 @@ For Windows DHCP servers, scopes you create here are written through to the Wind
 
 Now the fun part. In the subnet view:
 
-- Click **Allocate IP** and pick **Next available** to auto-pick the next free address.
+- Click **Allocate IP** and pick **Next available** to auto-pick the next free address. It skips addresses inside a *dynamic* DHCP pool, but **not** a DHCP *excluded* range: IPAM only avoids addresses that already have a row. Reserve infrastructure addresses first, or allocate them by hand.
+- To reserve a block of infrastructure addresses in one go, use **Bulk allocate…** from the subnet's menu: set the range, a hostname template such as `infra-{n}`, **Status** to `reserved`, and turn **Create DNS records** off.
 - Or click any row in the IP grid and fill in hostname, status, tags.
+
+> **Worked example — Ridgeline College.** Before allocating anything else, Ridgeline bulk-allocates `10.20.21.1–10.20.21.9` as `reserved` with the template `infra-{n}` and DNS records off, matching the excluded DHCP pool from step 9. **Next available** then starts at `10.20.21.10`.
 
 When you save an IP with a hostname + DNS zone:
 

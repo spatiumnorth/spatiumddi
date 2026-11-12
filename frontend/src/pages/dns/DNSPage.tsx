@@ -1192,8 +1192,8 @@ function GroupModalForm({
   const isRecursive =
     pickedRecursive ?? dnsDefaults?.dns_recursive_by_default ?? true;
   const setIsRecursive = (v: boolean) => setPickedRecursive(v);
-  // BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
-  // ≥2-server BIND9 groups, and BIND 9.18+ is required.
+  // BIND9 catalog zones (RFC 9432). Off by default. The group primary
+  // publishes the catalog for secondaries outside the group (#3764).
   const [catalogZonesEnabled, setCatalogZonesEnabled] = useState(
     group?.catalog_zones_enabled ?? false,
   );
@@ -1368,12 +1368,10 @@ function GroupModalForm({
           </span>
         </label>
 
-        {/* BIND9 catalog zones (RFC 9432). The producer is the group's
-            is_primary=True bind9 server; every other bind9 member joins
-            as a consumer and pulls members from the catalog instead of
-            getting per-zone config push. Pointless on a single-server
-            group; the toggle is kept available so adding a second server
-            later just works. */}
+        {/* BIND9 catalog zones (RFC 9432). The group's is_primary server
+            publishes the catalog; members of the group never consume it,
+            because each already gets every zone pushed (#3764). It is for
+            BIND secondaries outside the group. */}
         <div className="rounded border bg-muted/20 p-3">
           <label className="flex items-center gap-2 cursor-pointer">
             <input
@@ -1385,8 +1383,9 @@ function GroupModalForm({
             <span className="text-sm font-medium">Use BIND9 catalog zones</span>
           </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Distribute zones via one catalog instead of per-server config push.
-            Requires BIND 9.18+. Skip on single-server groups.
+            The group primary publishes a catalog of this group&apos;s zones for
+            BIND secondaries outside SpatiumDDI (BIND 9.18+). Servers in this
+            group already get every zone and don&apos;t use it.
           </p>
           {group?.catalog_unsupported_warning && (
             <p className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-700 dark:text-amber-400">
@@ -2554,7 +2553,7 @@ function DnssecCard({
   const signingServers = info.data?.signing_servers ?? 0;
   const signingUnmanaged = info.data?.signing_unmanaged ?? false;
   const unmanagedNote =
-    "SpatiumDDI does not sign zones on Technitium: it signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
+    "DNSSEC is not supported on Technitium in 1.0: SpatiumDDI signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 

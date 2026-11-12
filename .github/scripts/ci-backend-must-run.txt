@@ -175,6 +175,8 @@ frontend/default.conf.template
 # templates goes through the trust map rather than overwriting an outer
 # proxy's value with $scheme.
 frontend/16-trusted-proxies.envsh
+# test_frontend_http_port_3852.py (#3852) executes the listen-port renderer the template uses.
+frontend/14-http-port.envsh
 # test_frontend_ipv6_2308.py (#2308) executes the IPv6 renderer the same templates use.
 frontend/17-ipv6.envsh
 charts/spatiumddi/templates/frontend-tls-config.yaml
