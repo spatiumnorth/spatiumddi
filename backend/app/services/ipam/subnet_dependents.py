@@ -38,6 +38,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.address_set import AddressSet
+from app.models.auth import APIToken, Role
 from app.models.bacnet import BACnetDevice
 from app.models.circuit import Circuit
 from app.models.dicom import DICOMApplicationEntity
@@ -45,6 +46,7 @@ from app.models.dns import DNSZone
 from app.models.ipam import NATMapping
 from app.models.ot import OTZone
 from app.models.overlay import OverlaySite
+from app.models.time_bound_grant import TimeBoundGrant
 
 # (label, model, column) for every SET NULL link we re-point.
 LINKS: tuple[tuple[str, Any, str], ...] = (
@@ -63,6 +65,9 @@ class Dependents:
     address_sets: list[AddressSet] = field(default_factory=list)
     ot_zones: list[OTZone] = field(default_factory=list)
     links: dict[str, int] = field(default_factory=dict)
+    # Grants (role permissions, API-token grants, live time-bound grants) that
+    # name the subnet(s) by id, keyed by resource_type.
+    subnet_grants: int = 0
 
 
 async def load_dependents(db: AsyncSession, subnet_ids: list[uuid.UUID]) -> Dependents:
@@ -75,6 +80,7 @@ async def load_dependents(db: AsyncSession, subnet_ids: list[uuid.UUID]) -> Depe
     out.ot_zones = list(
         (await db.execute(select(OTZone).where(OTZone.subnet_id.in_(subnet_ids)))).scalars().all()
     )
+    out.subnet_grants = await count_grants(db, "subnet", [str(i) for i in subnet_ids])
     for label, model, col in LINKS:
         n = (
             await db.scalar(
@@ -84,6 +90,99 @@ async def load_dependents(db: AsyncSession, subnet_ids: list[uuid.UUID]) -> Depe
         if n:
             out.links[label] = out.links.get(label, 0) + int(n)
     return out
+
+
+def _entry_matches(entry: Any, rtype: str, ids: Any) -> bool:
+    return (
+        isinstance(entry, dict)
+        and entry.get("resource_type") == rtype
+        and str(entry.get("resource_id") or "") in ids
+    )
+
+
+async def count_grants(db: AsyncSession, rtype: str, ids: list[str]) -> int:
+    """How many grants name one of ``ids`` as a ``rtype`` resource_id."""
+    n = 0
+    for (perms,) in (await db.execute(select(Role.permissions))).all():
+        n += sum(1 for e in perms or [] if _entry_matches(e, rtype, ids))
+    for (grants,) in (await db.execute(select(APIToken.resource_grants))).all():
+        n += sum(1 for e in grants or [] if _entry_matches(e, rtype, ids))
+    n += (
+        await db.scalar(
+            select(func.count())
+            .select_from(TimeBoundGrant)
+            .where(
+                TimeBoundGrant.resource_type == rtype,
+                TimeBoundGrant.resource_id.in_(ids),
+                TimeBoundGrant.revoked_at.is_(None),
+            )
+        )
+    ) or 0
+    return n
+
+
+def _extend_list(entries: list[Any], rtype: str, mapping: dict[str, list[str]]) -> list[Any]:
+    out = list(entries)
+    have = {
+        (e.get("action"), e.get("resource_type"), str(e.get("resource_id") or ""))
+        for e in entries
+        if isinstance(e, dict)
+    }
+    for e in entries:
+        if not _entry_matches(e, rtype, mapping):
+            continue
+        for new_id in mapping[str(e.get("resource_id"))]:
+            key = (e.get("action"), rtype, new_id)
+            if key not in have:
+                have.add(key)
+                out.append({**e, "resource_id": new_id})
+    return out
+
+
+async def grant_also_to(db: AsyncSession, rtype: str, mapping: dict[str, list[str]]) -> None:
+    """Add a grant on each new id wherever one names the old id.
+
+    Only for new rows whose scope is a SUBSET of the old one (a split's
+    children, a divided set's pieces): the holder keeps exactly what they had.
+    The old entry stays; it matches nothing once the old row is gone.
+    """
+    if not mapping:
+        return
+    for role in (await db.execute(select(Role))).scalars().all():
+        new = _extend_list(role.permissions or [], rtype, mapping)
+        if len(new) != len(role.permissions or []):
+            role.permissions = new
+    for tok in (await db.execute(select(APIToken))).scalars().all():
+        if tok.resource_grants:
+            new = _extend_list(tok.resource_grants, rtype, mapping)
+            if len(new) != len(tok.resource_grants):
+                tok.resource_grants = new
+    rows = (
+        (
+            await db.execute(
+                select(TimeBoundGrant).where(
+                    TimeBoundGrant.resource_type == rtype,
+                    TimeBoundGrant.resource_id.in_(list(mapping)),
+                    TimeBoundGrant.revoked_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for g in rows:
+        for new_id in mapping[str(g.resource_id)]:
+            db.add(
+                TimeBoundGrant(
+                    group_id=g.group_id,
+                    action=g.action,
+                    resource_type=rtype,
+                    resource_id=new_id,
+                    expires_at=g.expires_at,
+                    reason=g.reason,
+                    granted_by_user_id=g.granted_by_user_id,
+                )
+            )
 
 
 def _ip(value: Any) -> Any:
@@ -130,13 +229,19 @@ def split_warnings(dep: Dependents, child_nets: list[Any]) -> list[str]:
         if multi:
             msg += (
                 f" {multi} span more than one child and are divided: the original set "
-                "keeps the first piece and each other child gets a copy of the rest."
+                "keeps the first piece and each other child gets a copy of the rest "
+                "(with the same access grants copied onto it)."
             )
         out.append(msg)
     if dep.ot_zones:
         out.append(
             "The parent's OT zone (Purdue level and cell) is kept on the first child "
             "and copied onto every other child."
+        )
+    if dep.subnet_grants:
+        out.append(
+            f"{dep.subnet_grants} permission grant(s) name the parent subnet; they are "
+            "copied onto every child so the holders keep their access."
         )
     if dep.links:
         what = ", ".join(f"{n} {k}" for k, n in sorted(dep.links.items()))
@@ -151,6 +256,7 @@ async def carry_for_split(
     db: AsyncSession, parent_id: uuid.UUID, child_nets: list[Any], children: list[Any]
 ) -> None:
     dep = await load_dependents(db, [parent_id])
+    set_copies: dict[str, list[str]] = {}
     for aset in dep.address_sets:
         pieces = _set_pieces(aset, child_nets)
         if not pieces:  # nothing of it falls in a child: keep it on the first
@@ -162,8 +268,7 @@ async def carry_for_split(
                 for k, v in fields.items():
                     setattr(aset, k, v)
                 continue
-            db.add(
-                AddressSet(
+            copy = AddressSet(
                     name=aset.name,
                     description=aset.description,
                     subnet_id=children[idx].id,
@@ -175,8 +280,10 @@ async def carry_for_split(
                     explicit_addresses=fields.get("explicit_addresses", []),
                     tags=dict(aset.tags or {}),
                     custom_fields=dict(aset.custom_fields or {}),
-                )
             )
+            db.add(copy)
+            await db.flush()
+            set_copies.setdefault(str(aset.id), []).append(str(copy.id))
     for zone in dep.ot_zones:
         for child in children[1:]:
             db.add(
@@ -192,6 +299,10 @@ async def carry_for_split(
         zone.subnet_id = children[0].id
     await db.flush()
     await _repoint_links(db, [parent_id], children[0].id)
+    # Delegations follow: a copy covers part of the original's range, and each
+    # child part of the parent's, so the holder keeps what they had.
+    await grant_also_to(db, "address_set", set_copies)
+    await grant_also_to(db, "subnet", {str(parent_id): [str(c.id) for c in children]})
 
 
 async def _repoint_links(db: AsyncSession, old_ids: list[uuid.UUID], new_id: uuid.UUID) -> None:
@@ -246,6 +357,13 @@ def merge_warnings(dep: Dependents) -> list[str]:
             f"{len(dep.ot_zones)} OT zones at the same Purdue level are folded into "
             "one on the merged subnet (the target's, else the first); the others' "
             "name and cell are dropped."
+        )
+    if dep.subnet_grants:
+        out.append(
+            f"{dep.subnet_grants} permission grant(s) (role, API token or time-bound) name a "
+            "source subnet by id and are NOT carried: the merged subnet is wider than "
+            "any one source, so copying them would widen access. Those holders lose access "
+            "to it; re-grant on the merged subnet afterwards if intended."
         )
     if dep.links:
         what = ", ".join(f"{n} {k}" for k, n in sorted(dep.links.items()))

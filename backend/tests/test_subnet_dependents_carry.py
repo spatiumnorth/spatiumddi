@@ -112,3 +112,64 @@ async def test_merge_conflicts_on_name_and_level(db_session: AsyncSession) -> No
     preview = await preview_subnet_merge(db_session, a, [b.id])
     types = {c.type for c in preview.conflicts}
     assert {"address_set_name_conflict", "ot_zone_level_conflict"} <= types
+
+
+@pytest.mark.asyncio
+async def test_split_copies_delegations_merge_does_not_widen(db_session: AsyncSession) -> None:
+    from app.models.auth import Role
+    from app.services.ipam.subnet_dependents import count_grants
+
+    (p,) = await _subnets(db_session, "10.0.0.0/24")
+    straddle = _set(p, "wide", "10.0.0.100", "10.0.0.150")
+    db_session.add(straddle)
+    await db_session.flush()
+    role = Role(
+        name=f"r-{uuid.uuid4().hex[:6]}",
+        permissions=[
+            {"action": "write", "resource_type": "address_set", "resource_id": str(straddle.id)},
+            {"action": "write", "resource_type": "subnet", "resource_id": str(p.id)},
+        ],
+    )
+    db_session.add(role)
+    await db_session.flush()
+    role_id = role.id
+    assert "permission grant" in " ".join((await preview_subnet_split(db_session, p, 25)).warnings)
+
+    res = await commit_subnet_split(db_session, p, 25, confirm_cidr="10.0.0.0/24")
+    c0, c1 = (c.id for c in res.children)
+    db_session.expire_all()
+    sets = (await db_session.execute(select(AddressSet))).scalars().all()
+    granted = {
+        str(e["resource_id"])
+        for e in (await db_session.get(Role, role_id)).permissions
+        if e["resource_type"] == "address_set"
+    }
+    assert granted >= {str(s.id) for s in sets}  # the copy is delegated too
+    subnets = {
+        str(e["resource_id"])
+        for e in (await db_session.get(Role, role_id)).permissions
+        if e["resource_type"] == "subnet"
+    }
+    assert {str(c0), str(c1)} <= subnets
+
+    # Merge back: a grant on one source must NOT be copied (it would widen), but is warned.
+    c0o = await db_session.get(Subnet, c0)
+    # the divided set's pieces share a name, which a merge refuses (by design)
+    pv0 = await preview_subnet_merge(db_session, c0o, [c1])
+    assert any(c.type == "address_set_name_conflict" for c in pv0.conflicts)
+    for aset in (await db_session.execute(select(AddressSet))).scalars().all():
+        if aset.subnet_id == c1:
+            aset.name = "wide-b"
+    await db_session.flush()
+    pv = await preview_subnet_merge(db_session, c0o, [c1])
+    assert any("NOT carried" in w for w in pv.warnings)
+    assert await count_grants(db_session, "subnet", [str(c0)]) == 1
+    m = await commit_subnet_merge(db_session, c0o, [c1], confirm_cidr="10.0.0.0/24")
+    merged_id = m.merged_subnet.id
+    db_session.expire_all()
+    subnets = {
+        str(e["resource_id"])
+        for e in (await db_session.get(Role, role_id)).permissions
+        if e["resource_type"] == "subnet"
+    }
+    assert str(merged_id) not in subnets
