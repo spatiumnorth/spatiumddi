@@ -54,6 +54,22 @@ const CRON_PRESETS: { label: string; value: string }[] = [
   { label: "Monthly 1st 03:00 UTC", value: "0 3 1 * *" },
 ];
 
+// Settings the API reads as numbers (#3946). The form holds every value as
+// text; a whole number in one of these goes out as a number, anything else
+// as typed so the API refuses it by name.
+const NUMERIC_CONFIG_FIELDS = new Set(["port", "object_lock_days"]);
+
+function typedConfig(config: Record<string, string>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(config).map(([k, v]) => [
+      k,
+      NUMERIC_CONFIG_FIELDS.has(k) && /^\d+$/.test(v.trim())
+        ? Number(v.trim())
+        : v,
+    ]),
+  );
+}
+
 export function BackupTargetsSection() {
   const qc = useQueryClient();
   const targetsQ = useQuery({
@@ -849,7 +865,7 @@ function TargetFormModal({
         name,
         description,
         enabled,
-        config,
+        config: typedConfig(config),
         passphrase_hint: passphraseHint,
         schedule_cron: trimmedCron === "" ? null : trimmedCron,
         // A write-only target never prunes, and the API refuses the
