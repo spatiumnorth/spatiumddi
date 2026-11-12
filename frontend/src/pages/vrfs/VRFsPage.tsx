@@ -458,7 +458,7 @@ function BulkDeleteModal({
       if (resp.refused.length > 0) {
         setError(
           `Refused ${resp.refused.length} VRF${resp.refused.length === 1 ? "" : "s"} ` +
-            "with linked spaces or blocks. Tick force-detach to proceed.",
+            "with linked spaces or blocks (rows in the Trash count). Tick force-detach to proceed.",
         );
         return;
       }
@@ -497,9 +497,10 @@ function BulkDeleteModal({
             />
             <span>
               <span className="font-medium">Force-detach.</span> Linked IP
-              spaces / IP blocks will have their <code>vrf_id</code> set to NULL
-              via <code>ON DELETE SET NULL</code>. Without this, VRFs with
-              linked rows are skipped.
+              spaces / IP blocks, including ones in the Trash (a restore does
+              not bring the VRF back), will have their <code>vrf_id</code> set
+              to NULL via <code>ON DELETE SET NULL</code>. Without this, VRFs
+              with linked rows are skipped.
             </span>
           </label>
         )}
