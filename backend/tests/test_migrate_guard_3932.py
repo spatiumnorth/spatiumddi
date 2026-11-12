@@ -8,6 +8,9 @@ connection holding a real lock:
 * after a timed-out lock wait, the reaper ends only a stale ``idle in
   transaction`` session of the migrator's own role, and leaves a young one, a
   plain idle one and another role's alone;
+* only a session the migration WAITS ON is ended (``pg_blocking_pids``): an
+  active ``pg_dump``-like holder is waited out, and an unrelated stale
+  idle-in-transaction session (a backup's own) survives;
 * an upgrade that is never blocked ends nothing, however stale;
 * with the reaper off, ``lock_timeout`` turns the silent wait into a logged
   retry that succeeds once the blocker goes, without limit by default (a
@@ -179,6 +182,46 @@ async def test_reaper_ends_only_stale_idle_in_transaction_sessions_of_the_migrat
             await admin.execute("DROP ROLE IF EXISTS mg_other_role")
         finally:
             await admin.close()
+
+
+async def test_an_active_holder_is_waited_out_and_a_non_blocking_stale_session_survives(
+    rig, monkeypatch
+) -> None:
+    """The #3933 regression: a backup's own idle-in-transaction session (a lock
+    the ALTER does not wait on) was ended while the migration waited on
+    pg_dump. Only the sessions the migration waits on may be ended."""
+    cfg, raw_url, _ = rig
+    monkeypatch.setenv(migrate_guard.STALE_IDLE_ENV, "1")
+    monkeypatch.setenv(migrate_guard.LOCK_TIMEOUT_ENV, "1")
+    monkeypatch.setattr(migrate_guard, "backoff_seconds", lambda attempt: 0.1)
+
+    dump = await asyncpg.connect(raw_url)  # pg_dump: active, holds a conflicting lock
+    backup_session = await asyncpg.connect(raw_url)  # idle, holds only unrelated locks
+    watch = await asyncpg.connect(raw_url)
+    try:
+        await backup_session.execute("BEGIN")
+        await backup_session.fetch("SELECT * FROM mg_other")
+        backup_pid = await backup_session.fetchval("SELECT pg_backend_pid()")
+        await dump.execute("BEGIN")
+        await dump.fetch("SELECT * FROM mg_target")
+        dump_pid = await dump.fetchval("SELECT pg_backend_pid()")
+        await asyncio.sleep(1.6)  # backup_session is now past the 1 s threshold
+        sleeping = asyncio.ensure_future(dump.execute("SELECT pg_sleep(6)"))
+
+        t, outcome = _start_upgrade(cfg)
+        await asyncio.sleep(4)  # several timed-out waits, all while the dump is active
+        assert t.is_alive() and "error" not in outcome, repr(outcome.get("error"))
+        assert await _alive(watch, dump_pid), "the active holder was ended"
+        assert await _alive(watch, backup_pid), "a session that blocks nothing was ended"
+        await sleeping
+        await dump.execute("COMMIT")
+        await asyncio.to_thread(t.join, 60)
+        assert not t.is_alive() and "error" not in outcome, repr(outcome.get("error"))
+        assert await watch.fetchval("SELECT version_num FROM alembic_version") == "mg1"
+        assert await _alive(watch, backup_pid), "the bystander did not survive the upgrade"
+    finally:
+        for conn in (dump, backup_session, watch):
+            await conn.close()
 
 
 async def test_lock_timeout_logs_the_holder_retries_and_succeeds_once_it_goes(

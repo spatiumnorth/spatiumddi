@@ -12,10 +12,12 @@ backstops; this module is the migrate command's own half:
 * :func:`apply_lock_timeout` makes every lock wait finish, so a blocked
   revision gives up its place in the lock queue (``55P03``) instead of
   waiting silently with every other query on that table queued behind it;
-* after each timed-out wait, :func:`blocker_report` says who is probably
-  holding the lock and :func:`terminate_stale_idle_sessions` ends the
-  sessions that are provably abandoned (never before a wait has timed out,
-  so a healthy upgrade ends nothing);
+* while a revision waits, :class:`BlockerWatcher` samples
+  ``pg_blocking_pids`` of the migrating backend from a second connection;
+  after each timed-out wait :func:`log_blockers` names those sessions and
+  :func:`terminate_stale_idle_sessions` ends the ones among them that are
+  provably abandoned (never before a wait has timed out, so a healthy
+  upgrade ends nothing, and never a session that does not block it);
 * ``env.py`` then retries the revision after a backoff, by default without
   limit: a migration blocked by a LEGITIMATE long holder (a ``pg_dump``
   backup holds ACCESS SHARE on every table for its whole run) waited and
@@ -24,13 +26,15 @@ backstops; this module is the migrate command's own half:
 
 Every knob is an environment variable so an operator can retune a single
 migrate run without a new image. All of this is a no-op safety net for a
-healthy install: it only acts on a session that is idle in transaction past
-the threshold.
+healthy install: it only acts on a session that blocks the migration and is idle in
+transaction past the threshold.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 from typing import Any
 
 import structlog
@@ -128,33 +132,97 @@ def apply_lock_timeout(connection: Connection, seconds: int | None = None) -> in
     return seconds
 
 
+_BLOCKERS_SQL = """
+    SELECT a.pid, a.state, a.application_name, a.usename,
+           EXTRACT(EPOCH FROM (now() - a.state_change))::int AS state_age_seconds,
+           EXTRACT(EPOCH FROM (now() - a.xact_start))::int AS xact_age_seconds
+      FROM pg_stat_activity a
+     WHERE a.pid = ANY(pg_blocking_pids($1::int))
+"""
+
+
+class BlockerWatcher:
+    """Sample ``pg_blocking_pids`` of the migrating backend while it waits.
+
+    The wait is over by the time ``lock_timeout`` fires, so what blocks the
+    migration can only be read DURING the wait, from a second connection.
+    ``env.py`` runs sync code inside an asyncio ``run_sync``, so the watcher
+    is a daemon thread with its own event loop and its own asyncpg
+    connection. :meth:`take` returns (and clears) every session seen blocking
+    since the last call. Any failure here is swallowed: with no samples the
+    guard ends nothing, which is the safe direction.
+    """
+
+    def __init__(self, dsn: str, migrator_pid: int, interval: float = 2.0) -> None:
+        self._dsn = dsn
+        self._pid = migrator_pid
+        self._interval = interval
+        self._seen: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="migrate-blocker-watch", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def take(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = sorted(self._seen.values(), key=lambda r: -(r["xact_age_seconds"] or 0))
+            self._seen = {}
+        return rows
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._poll())
+        except Exception as exc:  # noqa: BLE001 — the watcher is advisory
+            logger.warning("migrate_blocker_watch_failed", error=str(exc))
+
+    async def _poll(self) -> None:
+        import asyncpg
+
+        conn = await asyncpg.connect(self._dsn)
+        try:
+            while not self._stop.is_set():
+                rows = await conn.fetch(_BLOCKERS_SQL, self._pid)
+                with self._lock:
+                    for r in rows:
+                        self._seen[r["pid"]] = dict(r)
+                await asyncio.sleep(self._interval)
+        finally:
+            await conn.close()
+
+
+def asyncpg_dsn(url: str) -> str:
+    """A SQLAlchemy URL (``postgresql+asyncpg://``) as a plain asyncpg DSN."""
+    return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
 def terminate_stale_idle_sessions(
-    connection: Connection, min_idle_seconds: int | None = None
+    connection: Connection, blocker_pids: list[int], min_idle_seconds: int | None = None
 ) -> list[dict[str, Any]]:
-    """End abandoned ``idle in transaction`` sessions of THIS role (#3932).
+    """End abandoned ``idle in transaction`` sessions the migration WAITS ON.
 
-    Deliberately narrow, because ``pg_terminate_backend`` is not undoable:
+    ``pg_terminate_backend`` is not undoable, so a pid is ended only when ALL
+    hold:
 
-    * ``state = 'idle in transaction'`` exactly: not ``active`` (working),
-      not plain ``idle`` (holds nothing), not ``idle in transaction (aborted)``
-      (already rolled back, holds no lock);
-    * the same database and the SAME role as the migrator, so another
-      application's sessions, a DBA's psql and the replication / CNPG
-      management roles are never touched;
-    * ``state_change`` older than the threshold, so a transaction a live
-      request is between two statements of is left alone;
-    * holding a granted relation lock, since a transaction that holds none
-      cannot be what the migration waits on;
-    * never the migrator's own backend.
+    * it is in ``blocker_pids``, what ``pg_blocking_pids`` of the migrating
+      backend named during the wait. A session that merely holds some lock
+      (a backup's own session holds ACCESS SHARE on a few tables for the whole
+      dump) blocks nothing, and ending it costs that backup its end commit;
+    * ``state = 'idle in transaction'`` exactly: an ``active`` holder (a
+      ``pg_dump``) is waited out, never ended;
+    * ``state_change`` older than the threshold;
+    * the same database and the SAME role as the migrator;
+    * not the migrator's own backend.
 
-    ``env.py`` calls it only after a lock wait has timed out, so an upgrade
-    that is not blocked ends nothing at all.
-
-    Each victim is logged (pid, application, age, last query) before the
-    result is returned.
+    Each victim is logged (pid, application, age, last query).
     """
     threshold = stale_idle_seconds() if min_idle_seconds is None else min_idle_seconds
-    if threshold <= 0:
+    if threshold <= 0 or not blocker_pids:
         return []
     rows = (
         connection.execute(
@@ -164,16 +232,14 @@ def terminate_stale_idle_sessions(
                        left(query, 200) AS last_query,
                        pg_terminate_backend(pid) AS terminated
                   FROM pg_stat_activity
-                 WHERE datname = current_database()
+                 WHERE pid = ANY(CAST(:pids AS int[]))
+                   AND datname = current_database()
                    AND usename = current_user
                    AND pid <> pg_backend_pid()
                    AND state = 'idle in transaction'
                    AND state_change < now() - make_interval(secs => :threshold)
-                   AND EXISTS (SELECT 1 FROM pg_locks l
-                                WHERE l.pid = pg_stat_activity.pid AND l.granted
-                                  AND l.locktype = 'relation')
                 """),
-            {"threshold": threshold},
+            {"pids": [int(p) for p in blocker_pids], "threshold": threshold},
         )
         .mappings()
         .all()
@@ -189,39 +255,15 @@ def terminate_stale_idle_sessions(
             idle_seconds=r["idle_seconds"],
             last_query=r["last_query"],
             terminated=r["terminated"],
-            hint="idle in transaction past the threshold; its lock would block the migration",
+            hint="idle in transaction past the threshold and blocking the migration",
         )
     return out
-
-
-def blocker_report(connection: Connection) -> list[dict[str, Any]]:
-    """Other sessions in this database that hold a lock inside an open
-    transaction, i.e. the likely reason a lock wait just timed out.
-
-    The wait is over by the time this runs, so ``pg_blocking_pids`` has
-    nothing left to say; list the lock holders instead, oldest first.
-    """
-    rows = connection.execute(text("""
-                SELECT a.pid, a.state, a.application_name, a.usename,
-                       EXTRACT(EPOCH FROM (now() - a.state_change))::int AS state_age_seconds,
-                       EXTRACT(EPOCH FROM (now() - a.xact_start))::int AS xact_age_seconds
-                  FROM pg_stat_activity a
-                 WHERE a.datname = current_database()
-                   AND a.pid <> pg_backend_pid()
-                   AND a.xact_start IS NOT NULL
-                   AND EXISTS (SELECT 1 FROM pg_locks l
-                                WHERE l.pid = a.pid AND l.granted
-                                  AND l.locktype IN ('relation', 'transactionid'))
-                 ORDER BY a.xact_start
-                """)).mappings().all()
-    connection.commit()
-    return [dict(r) for r in rows]
 
 
 def log_blockers(blockers: list[dict[str, Any]], *, attempt: int, retries: int | None) -> None:
     if not blockers:
         logger.warning(
-            "migration waiting on a lock; no other open transaction found",
+            "migration waiting on a lock; no blocking session was sampled",
             attempt=attempt,
             retries=retries,
         )

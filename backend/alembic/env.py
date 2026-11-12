@@ -126,6 +126,26 @@ def do_run_migrations(connection: Connection) -> None:
     )
     retries = migrate_guard.lock_retries() if guard else 0
     attempt = 0
+    watcher = None
+    if guard:
+        # Read pg_blocking_pids of this backend while it waits (#3932): the
+        # wait is over when the timeout fires, so it cannot be read then.
+        pid = connection.exec_driver_sql("SELECT pg_backend_pid()").scalar()
+        connection.commit()
+        watcher = migrate_guard.BlockerWatcher(
+            migrate_guard.asyncpg_dsn(config.get_main_option("sqlalchemy.url") or ""),
+            int(pid),
+            interval=max(0.2, min(2.0, migrate_guard.lock_timeout_seconds() / 4)),
+        )
+        watcher.start()
+    try:
+        _retry_loop(connection, guard, retries, attempt, watcher)
+    finally:
+        if watcher is not None:
+            watcher.stop()
+
+
+def _retry_loop(connection: Connection, guard: bool, retries, attempt: int, watcher) -> None:
     while True:
         try:
             with context.begin_transaction():
@@ -141,15 +161,14 @@ def do_run_migrations(connection: Connection) -> None:
             # revision that was waiting (alembic re-reads alembic_version).
             if connection.in_transaction():
                 connection.rollback()
-            migrate_guard.log_blockers(
-                migrate_guard.blocker_report(connection), attempt=attempt, retries=retries
-            )
+            blockers = watcher.take() if watcher is not None else []
+            migrate_guard.log_blockers(blockers, attempt=attempt, retries=retries)
             # Only now, with a wait that has actually timed out, end the
-            # provably abandoned holders; a legitimate long holder (a backup's
-            # pg_dump is active, not idle) is waited out by the retries, which
-            # are unlimited by default so an upgrade that would have succeeded
-            # before #3932 still does.
-            migrate_guard.terminate_stale_idle_sessions(connection)
+            # abandoned sessions the migration was seen waiting on; a
+            # legitimate long holder (a backup's pg_dump is active, not idle)
+            # and any session that blocks nothing are left alone, and the
+            # retries (unlimited by default) wait the holder out.
+            migrate_guard.terminate_stale_idle_sessions(connection, [b["pid"] for b in blockers])
             time.sleep(migrate_guard.backoff_seconds(attempt))
 
 

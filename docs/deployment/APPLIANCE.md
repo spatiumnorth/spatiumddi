@@ -4316,8 +4316,13 @@ TCP keepalives of 60 s / 10 s / 6 and `idle_in_transaction_session_timeout=1h`.
 A session whose pod or node died is dropped within minutes, instead of holding a
 migration's lock for 2 h+ as in the 1.0.0 upgrade drill. These are reloads, not
 restarts. The migrate Job also bounds each lock wait, ends stale idle-in-transaction
-sessions of the app role that block it, and retries until the lock is free; see
-[Kubernetes](KUBERNETES.md). On a seed upgrading from 2026.10.02-1 the old api
-may still hold such a session until the new chart's database settings apply; if
-the API stays "initialising", end it with `pg_terminate_backend(pid)` for the
-`idle in transaction` row in `pg_stat_activity`.
+sessions of the app role that it is actually waiting on, and retries until the
+lock is free; see [Kubernetes](KUBERNETES.md). A session the old api opened
+before this release's database settings applied keeps the old keepalive, about
+2 h 11 min to notice a dead client (a reloaded setting only reaches a session
+when its client next sends a message, which a dead client never does). The
+migration ends it itself: when a lock wait times out (30 s), it ends sessions of
+its own role that block it and have been idle in a transaction for over 5
+minutes, and logs each one as `migration_terminated_stale_session`. A session
+that only holds a lock the migration does not wait on, such as a running
+backup's, is never ended.
