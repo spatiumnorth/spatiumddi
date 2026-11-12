@@ -104,7 +104,7 @@ metadata:
     "why" "DHCP agent (Kea): kea-dhcp4/6 bind :67 and open raw (LPF) sockets through file capabilities, which need NET_BIND_SERVICE and NET_RAW in the bounding set and no_new_privs off. Host networking only when a server sets hostNetwork. Runs as a uid from the namespace range, never root.") }}
 ---
 {{- end }}
-{{- if and .Values.worker.netRawCapability .Values.openshift.workerNetRaw }}
+{{- if .Values.openshift.workerNetRaw }}
 {{- if not .Values.worker.serviceAccount.enabled }}
 {{- fail "openshift.workerNetRaw needs worker.serviceAccount.enabled=true: the SCC is granted to the worker's own ServiceAccount, and binding it to the namespace's default one would hand it to every pod that uses that." }}
 {{- end }}

@@ -102,8 +102,8 @@ openshift:
   # Give the worker NET_RAW + NET_BIND_SERVICE (and its own SCC) so nmap raw
   # scans work. OFF by default: the control plane then runs under plain
   # restricted-v2 with no grant at all, and nmap / tcpdump fall back to what an
-  # unprivileged process can do. Needs ``worker.serviceAccount.enabled`` and
-  # ``worker.netRawCapability`` (the default).
+  # unprivileged process can do. Needs ``worker.serviceAccount.enabled``.
+  # Independent of ``worker.netRawCapability``, which is ignored on OpenShift.
   workerNetRaw: false
 
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
@@ -665,13 +665,16 @@ worker:
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 2000m, memory: 2Gi }
-  # Add CAP_NET_RAW to the worker pod so nmap can do SYN scans + ``-O``
-  # OS detection from the device-profiling auto-nmap path. NET_RAW is
-  # in containerd's default cap set so this is a no-op on permissive
-  # clusters; on restricted PSA / OpenShift-SCC it's required.
-  # Set to false if you've turned off device profiling cluster-wide
-  # and want a tighter security posture.
-  netRawCapability: true
+  # Explicitly ADD CAP_NET_RAW to the worker container (#3952). Off by
+  # default, and leaving it off costs nothing on containerd (k3s, Talos,
+  # EKS, AKS, GKE): containerd's default capability set already carries
+  # NET_RAW, so nmap's SYN scans and ``-O`` OS detection work without it.
+  # Turning it on matters only on a runtime whose default set lacks NET_RAW
+  # (CRI-O outside OpenShift). It also makes the pod fail Pod Security
+  # ``baseline``: PSA refuses the whole pod at admission, it does not drop
+  # the capability. So with ``true`` the namespace must be ``privileged``,
+  # or exempted. OpenShift is handled by ``openshift.workerNetRaw`` instead.
+  netRawCapability: false
   nodeSelector: {}
   # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []

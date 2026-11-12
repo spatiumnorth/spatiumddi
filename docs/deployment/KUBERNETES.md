@@ -499,13 +499,45 @@ workload defines an HPA — `frontend` / `worker` are fixed-replica Deployments
 
 ### Worker `NET_RAW`
 
-The worker pod adds `CAP_NET_RAW` (`worker.netRawCapability: true`, default on)
-so `nmap` can run SYN scans + `-O` OS detection from the device-profiling
-auto-nmap path. `NET_RAW` is in containerd's default cap set, so this is a
-no-op on permissive clusters; on restricted Pod Security Admission, OpenShift
-SCC, or GKE Autopilot it's required to keep the cap in the bounding set. Set
-`worker.netRawCapability: false` if device profiling is off cluster-wide and you
-want a tighter posture.
+`nmap`'s SYN scans and `-O` OS detection (the device-profiling auto-nmap path)
+use a file capability on the image's `nmap` binary, which works only while
+`NET_RAW` is in the container's bounding set. containerd's default capability
+set already includes `NET_RAW`, so on k3s, Talos, EKS, AKS and GKE the worker
+has it with no setting at all.
+
+`worker.netRawCapability` (default `false`, [#3952](https://github.com/spatiumnorth/spatiumddi/issues/3952))
+adds `NET_RAW` explicitly. You need it only on a runtime whose default set lacks
+it, which in practice means CRI-O outside OpenShift. Turning it on makes Pod
+Security `baseline` and `restricted` **refuse the worker pod at admission**.
+They do not drop the capability. A namespace that enforces either level then
+needs `pod-security.kubernetes.io/enforce: privileged`, or an exemption. On
+OpenShift use `openshift.workerNetRaw` instead (see above).
+
+Verified on k3s with the default (`false`): the worker's bounding set carries
+`NET_RAW`, and `nmap -sS` and `-O` both run. Where `NET_RAW` is absent, nmap can
+do only what an unprivileged process can, a TCP connect scan with no OS
+detection.
+
+### Pod Security levels
+
+The [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+level each component needs with the chart's defaults:
+
+| Component | Highest level that admits it |
+|---|---|
+| api, worker, beat, frontend, migrate Job, Postgres, Redis | `baseline` |
+| DNS agents (`dns-bind9-*`), DHCP agents with `hostNetwork: false` | `baseline` |
+| DHCP agents with `hostNetwork: true` (relay-less LAN) | `privileged`: `baseline` forbids host networking |
+| worker with `worker.netRawCapability: true` | `privileged`: `baseline` forbids adding `NET_RAW` |
+
+None of them pass `restricted`: every container fails its
+`allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` and
+`runAsNonRoot` checks. Measured with
+`kubectl label --dry-run=server ns spatiumddi pod-security.kubernetes.io/enforce=<level>`
+on a default single-node install with one BIND9 and one Kea agent (#3952).
+
+So a default install, with DHCP agents off host networking, runs in a namespace
+that enforces `baseline`. Talos enforces `baseline` cluster-wide by default.
 
 ---
 
