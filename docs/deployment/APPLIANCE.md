@@ -2949,13 +2949,18 @@ What to expect:
     ```
 
     The migration is expected to continue within a minute.
-  - 1.0.0 shortens this (#3932): its migration step ends a stale
-    idle-in-transaction session of the app's own role once it has waited
-    on that session's lock (sessions idle more than 5 minutes), and its
-    Postgres settings drop a dead client's session within about 2 minutes.
-    Check the 1.0.0 release notes to confirm #3932 is included. If the
-    console still shows "initialising" more than about 15 minutes after
-    the seed's reboot, use the manual way out above.
+  - 1.0.0 shortens this (#3932): when its migration has waited 30 seconds
+    on a lock, it ends any session of the app's own role that is blocking
+    it and has been idle in a transaction for more than 5 minutes, and logs
+    each one as `migration_terminated_stale_session`. In testing, a
+    three-node upgrade from 2026.10.02-1 had the API back about 10 minutes
+    after the seed's reboot. The new Postgres settings also drop a dead
+    client's session within about 2 minutes, but only for sessions opened
+    after those settings apply. The session the old release left behind
+    still carries the old 2 hour 11 minute keepalive, so it is the
+    migration step that ends it. Check the 1.0.0 release notes to confirm
+    #3932 is included. If the console still shows "initialising" more than
+    about 15 minutes after the seed's reboot, use the manual way out above.
 - **Other things you will see.** The database primary moves four times (the last when the database
   rolls its instances after the migration, with the API not ready for up
   to 30 seconds);
