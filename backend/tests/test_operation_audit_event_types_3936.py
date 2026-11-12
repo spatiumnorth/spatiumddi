@@ -59,3 +59,49 @@ async def test_hostless_address_apply_audits_publishable_type(db_session: AsyncS
     types = await _created_types(db_session)
     assert "ip_address" in types
     assert "ipam.ip_address" not in types
+
+
+async def _events(db: AsyncSession, resource_id_type: str) -> list[str | None]:
+    rows = await db.scalars(select(AuditLog).where(AuditLog.resource_type == resource_id_type))
+    return [event_publisher._audit_to_event_type(r.action, r.resource_type) for r in rows]
+
+
+async def test_hostless_address_apply_fires_ip_created(db_session: AsyncSession) -> None:
+    _scope, subnet, _block = await _estate(db_session)
+    admin, _ = await _user(db_session, name="adm", superadmin=True)
+    op = operations.get_operation("create_ip_address")
+    args = op.args_model(subnet_id=str(subnet.id), address="10.60.0.78")
+    await op.apply(db_session, admin, args)
+    assert "ip.created" in await _events(db_session, "ip_address")
+
+
+async def test_hostless_static_dhcp_address_apply_fires_ip_created(
+    db_session: AsyncSession,
+) -> None:
+    _scope, subnet, _block = await _estate(db_session)
+    admin, _ = await _user(db_session, name="adm", superadmin=True)
+    op = operations.get_operation("create_ip_address")
+    args = op.args_model(
+        subnet_id=str(subnet.id), address="10.60.0.79", status="static_dhcp", mac_address=MAC
+    )
+    await op.apply(db_session, admin, args)
+    assert "ip.created" in await _events(db_session, "ip_address")
+
+
+async def test_hostless_takeover_of_available_row_fires_created_like_rest(
+    db_session: AsyncSession,
+) -> None:
+    """The reclaim audits ``ip.updated`` (as the REST create does) and the
+    create audit now adds the ``ip.created`` that was missing."""
+    from app.models.ipam import IPAddress
+
+    _scope, subnet, _block = await _estate(db_session)
+    admin, _ = await _user(db_session, name="adm", superadmin=True)
+    db_session.add(IPAddress(subnet_id=subnet.id, address="10.60.0.80", status="available"))
+    await db_session.flush()
+    op = operations.get_operation("create_ip_address")
+    args = op.args_model(subnet_id=str(subnet.id), address="10.60.0.80")
+    await op.apply(db_session, admin, args)
+    events = await _events(db_session, "ip_address")
+    assert "ip.created" in events
+    assert "ip.updated" in events
