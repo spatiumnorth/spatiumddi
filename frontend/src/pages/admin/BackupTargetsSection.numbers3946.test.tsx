@@ -51,7 +51,11 @@ const KINDS: BackupTargetKind[] = [
     kind: "ftp",
     label: "FTP",
     inherently_write_only: false,
-    config_fields: [f("host", "Host", true), f("port", "Port")],
+    config_fields: [
+      f("host", "Host", true),
+      f("port", "Port"),
+      f("prefix", "Prefix"),
+    ],
   },
 ];
 
@@ -99,5 +103,52 @@ describe("backup destination Add sends a port as a number (#3946)", () => {
     fireEvent.submit(container.querySelector("form")!);
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     expect(create.mock.calls[0][0].config).toEqual({ host: "h", port: 2121 });
+  });
+});
+
+const STORED: BackupTarget = {
+  id: "t-1",
+  name: "ftp-1",
+  description: "",
+  kind: "ftp",
+  enabled: true,
+  config: { host: "h", port: 21, prefix: null },
+  passphrase_set: true,
+  passphrase_hint: "",
+  schedule_cron: null,
+  retention_keep_last_n: null,
+  retention_keep_days: null,
+  write_only: false,
+  last_run_status: "never",
+  last_run_at: null,
+  last_run_filename: null,
+} as unknown as BackupTarget;
+
+async function openEdit() {
+  list.mockResolvedValue([STORED]);
+  listKinds.mockResolvedValue(KINDS);
+  update.mockResolvedValue({});
+  const view = renderSection();
+  fireEvent.click(await screen.findByTitle(/edit/i));
+  await screen.findByText("Prefix");
+  return view;
+}
+
+describe("backup destination Edit round-trips stored types (#3947)", () => {
+  it("shows a stored null as empty and an untouched Save sends no config", async () => {
+    const { container } = await openEdit();
+    expect(input(container, "Prefix").value).toBe("");
+    expect(input(container, "Port").value).toBe("21");
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update.mock.calls[0][1].config).toBeUndefined();
+  });
+
+  it("sends only the setting that changed, as a number", async () => {
+    const { container } = await openEdit();
+    fireEvent.change(input(container, "Port"), { target: { value: "2121" } });
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update.mock.calls[0][1].config).toEqual({ port: 2121 });
   });
 });

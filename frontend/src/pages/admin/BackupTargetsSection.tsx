@@ -791,7 +791,10 @@ function TargetFormModal({
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [config, setConfig] = useState<Record<string, string>>(() =>
     Object.fromEntries(
-      Object.entries(existing?.config ?? {}).map(([k, v]) => [k, String(v)]),
+      Object.entries(existing?.config ?? {}).map(([k, v]) => [
+        k,
+        v == null ? "" : String(v),
+      ]),
     ),
   );
   // ``existing.config`` redacts secret fields to ``"<set>"`` so
@@ -894,6 +897,24 @@ function TargetFormModal({
         return backupTargetsApi.create(body);
       }
       const body: BackupTargetUpdate = { ...sharedFields };
+      // Send only the settings the operator changed (#3947): the form holds
+      // text, so echoing an untouched one would turn a stored null or number
+      // into text and record a change nobody made. The API merges the rest
+      // from what is stored. A blank secret means "keep".
+      const secretNames = new Set(
+        (kindMeta?.config_fields ?? [])
+          .filter((f) => f.secret)
+          .map((f) => f.name),
+      );
+      const changed: Record<string, string> = {};
+      for (const [k, v] of Object.entries(config)) {
+        const stored = existing!.config?.[k];
+        if (v === (stored == null ? "" : String(stored))) continue;
+        if (secretNames.has(k) && v === "") continue;
+        changed[k] = v;
+      }
+      if (Object.keys(changed).length > 0) body.config = typedConfig(changed);
+      else delete body.config;
       if (passphrase.length > 0) {
         if (passphrase.length < 8) {
           throw new Error("passphrase must be at least 8 characters");
