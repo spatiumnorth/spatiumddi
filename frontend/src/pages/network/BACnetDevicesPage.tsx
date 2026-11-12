@@ -127,6 +127,7 @@ export function BACnetDevicesPage() {
       qc.invalidateQueries({ queryKey: ["bacnet-bbmds"] });
       setDel(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["bacnet-devices"] }),
   });
 
   return (
@@ -485,19 +486,29 @@ export function BACnetDevicesPage() {
         title="Delete BACnet device"
         message={
           <>
-            Delete device instance{" "}
-            <span className="font-mono font-semibold">
-              {del?.device_instance}
-            </span>
-            {del?.device_name ? ` (${del.device_name})` : ""}? The instance
-            number is freed for re-use; the IPAM address itself is untouched.
+            <>
+              Delete device instance{" "}
+              <span className="font-mono font-semibold">
+                {del?.device_instance}
+              </span>
+              {del?.device_name ? ` (${del.device_name})` : ""}? The instance
+              number is freed for re-use; the IPAM address itself is untouched.
+            </>
+            {delMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(delMut.error, "Failed to delete BACnet device")}
+              </p>
+            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
       />
     </div>
   );

@@ -258,3 +258,26 @@ describe("API token whose owner must change password (#3784)", () => {
     expect(screen.getByText(/keep being refused/)).toBeTruthy();
   });
 });
+
+describe("Delete API Token refusal (#3822)", () => {
+  it("says why in the dialog and re-reads the list", async () => {
+    const remove = vi.fn().mockRejectedValue(
+      Object.assign(new Error("404"), {
+        response: { status: 404, data: { detail: "Token not found" } },
+      }),
+    );
+    const { apiTokensApi } = await import("@/lib/api");
+    apiTokensApi.delete = remove;
+    await show(false);
+    fireEvent.click(screen.getAllByTitle("Delete")[0]);
+    const calls = list.mock.calls.length;
+    const btns = await screen.findAllByRole("button", { name: "Delete" });
+    fireEvent.click(btns[btns.length - 1]);
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Token not found",
+      ),
+    );
+    await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(calls));
+  });
+});
