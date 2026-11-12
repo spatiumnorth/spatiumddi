@@ -3092,32 +3092,30 @@ async def update_resolver_settings(
             detail="resolver override mode requires at least one DNS server",
         )
 
+    _resolver_old = _resolver_audit_snapshot(settings)
     for field, value in changes.items():
         setattr(settings, field, value)
 
     # Dedicated audit row (non-negotiable #4) — resolver config steers every
-    # appliance host's DNS lookups. Resolver IPs / domains are not secrets,
-    # so the full shape is recorded.
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="update",
-            resource_type="platform_settings",
-            resource_id="resolver",
-            resource_display="DNS resolver",
-            result="success",
-            new_value={
-                "mode": settings.resolver_mode,
-                "servers": list(settings.resolver_servers or []),
-                "fallback_servers": list(settings.resolver_fallback_servers or []),
-                "search_domains": list(settings.resolver_search_domains or []),
-                "dnssec": settings.resolver_dnssec,
-                "dns_over_tls": settings.resolver_dns_over_tls,
-            },
+    # appliance host's DNS lookups. Resolver IPs / domains are not secrets.
+    # Names only the changed fields (#3995); no row when nothing changed.
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="resolver",
+                resource_display="DNS resolver",
+                result="success",
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
+            )
         )
-    )
 
     await db.commit()
     await db.refresh(settings)
