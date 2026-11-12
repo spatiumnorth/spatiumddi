@@ -16,6 +16,7 @@ from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.models.vlans import VLAN, Router
+from app.services.e911.delete_guard import refuse_if_e911_bound
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(require_resource_permission("vlan"))])
@@ -248,6 +249,11 @@ async def delete_router(router_id: uuid.UUID, current_user: CurrentUser, db: DB)
                 "Reassign or clear the VLAN on those subnets first."
             ),
         )
+    # Its VLANs go with it, and so do the E911 bindings keyed to them (#3891).
+    vlan_ids = (
+        (await db.execute(select(VLAN.id).where(VLAN.router_id == router_id))).scalars().all()
+    )
+    await refuse_if_e911_bound(db, f"router '{r.name}'", vlan_ids=vlan_ids)
     name = r.name
     db.add(
         _audit(
@@ -405,6 +411,7 @@ async def delete_vlan(vlan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
             ),
         )
     display = f"VLAN {v.vlan_id} ({v.name})"
+    await refuse_if_e911_bound(db, display, vlan_ids=[v.id])  # #3891
     db.add(
         _audit(
             current_user,

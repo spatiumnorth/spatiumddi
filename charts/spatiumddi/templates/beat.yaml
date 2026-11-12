@@ -75,6 +75,14 @@ spec:
             - app.celery_app
             - beat
             - --loglevel=info
+            {{- if include "spatiumddi.isOpenShift" . }}
+            # #3852 — beat keeps its schedule db (``celerybeat-schedule``) in the
+            # working directory, /app, which only the image's ``app`` user may
+            # write. OpenShift runs the pod as a random uid, so beat crash-looped
+            # with EACCES. /tmp is sticky world-writable in the image; the file
+            # was never persistent anyway (it lived in the container layer).
+            - --schedule=/tmp/celerybeat-schedule
+            {{- end }}
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
             {{- include "spatiumddi.sharedEnv" . | nindent 12 }}

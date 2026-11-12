@@ -163,3 +163,72 @@ async def test_the_sweep_of_a_older_batch_leaves_the_zone_purgeable(
             .execution_options(include_deleted=True)
         )
     ).first() is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_of_a_live_shared_zone_is_refused_3826(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The zone route's ``?permanent=true`` (and the copilot's delete_dns_zone)
+    on the LIVE zone shared with a trashed subnet is refused, as the Trash row's
+    purge is (#3504): A's trashed PTRs are not ours to cascade away."""
+    headers = await _admin_headers(db_session)
+    a, b, gid, zid = await _setup(client, db_session, headers)
+    r = await client.delete(f"/api/v1/ipam/subnets/{a}", headers=headers)
+    assert r.status_code == 204, r.text
+    zone = await _zone(db_session, zid)
+    assert zone is not None and zone.deleted_at is None  # live, kept by B
+    before = await _ptrs(db_session, zid)
+    assert any(not live for _, live in before)  # A's PTRs sit in the Trash
+
+    r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}?permanent=true", headers=headers)
+    assert r.status_code == 409, r.text
+    assert "10.67.7.0/25" in r.json()["detail"]
+    zone = await _zone(db_session, zid)
+    assert zone is not None and zone.deleted_at is None
+    assert await _ptrs(db_session, zid) == before
+
+    # A's restore still brings its PTRs back into the live zone. (The test client
+    # shares one session across requests; production closes it after the 409.)
+    await db_session.rollback()
+    r = await client.post(f"/api/v1/admin/trash/subnet/{a}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert all(live for _, live in await _ptrs(db_session, zid))
+
+
+@pytest.mark.asyncio
+async def test_copilot_preview_refuses_the_same_delete_3826(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.auth import User
+    from app.services.ai.operations_risky import DeleteZoneArgs, _preview_delete_zone
+
+    headers = await _admin_headers(db_session)
+    a, _b, gid, zid = await _setup(client, db_session, headers)
+    r = await client.delete(f"/api/v1/ipam/subnets/{a}", headers=headers)
+    assert r.status_code == 204, r.text
+    user = (
+        (await db_session.execute(select(User).where(User.is_superadmin.is_(True))))
+        .scalars()
+        .first()
+    )
+    res = await _preview_delete_zone(
+        db_session, user, DeleteZoneArgs(group_id=gid, zone_id=zid, permanent=True)
+    )
+    assert res.ok is False
+    assert "10.67.7.0/25" in res.detail
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_of_a_live_zone_with_no_trashed_sharer_still_works_3826(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    a, b, gid, zid = await _setup(client, db_session, headers)
+    r = await client.delete(f"/api/v1/ipam/subnets/{a}", headers=headers)
+    assert r.status_code == 204, r.text
+    r = await client.delete(f"/api/v1/admin/trash/subnet/{a}", headers=headers)
+    assert r.status_code == 204, r.text
+    r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}?permanent=true", headers=headers)
+    assert r.status_code == 204, r.text
+    assert await _zone(db_session, zid) is None

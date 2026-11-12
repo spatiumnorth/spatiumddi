@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import user_has_permission
 from app.models.address_set import AddressSet
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -41,6 +42,7 @@ logger = structlog.get_logger(__name__)
 # we stop loading and log a structured warning; correctness is unchanged for the
 # normal (tens-of-sets) case. The interval list is additionally sorted + merged
 # so membership is a binary search, not a linear scan over every interval.
+ADDRESS_SETS_MODULE = "ipam.address_sets"
 _MAX_SETS_PER_SUBNET: int = 4096
 _MAX_EXPLICIT_HOSTS: int = 1_000_000
 
@@ -135,7 +137,13 @@ async def load_writable_set_ranges(
     set is sufficient (#9; the old code resolved ``write`` then ``admin``,
     doubling the role-tree walk). Empty when none — the caller still must hold
     subnet write for any IP outside these ranges.
+
+    Always empty while the ``ipam.address_sets`` feature module is off (#3762):
+    the sets are hidden and their API 404s, so a grant on one must not widen
+    allocation write access the operator can no longer see or manage.
     """
+    if not await is_module_enabled(db, ADDRESS_SETS_MODULE):
+        return WritableSetRanges()
     # Bound the rows we pull per subnet (#7) — a pathological subnet with an
     # absurd number of delegated sets must not turn this per-request build into
     # an unbounded scan. ``+1`` so we can detect (and warn on) the overflow.

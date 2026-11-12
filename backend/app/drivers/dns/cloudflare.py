@@ -27,6 +27,7 @@ lifecycle scopes its name lookup to it (#1537); record / read calls do not.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 from typing import Any
 
@@ -192,6 +193,22 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
     """Agentless driver for Cloudflare-hosted authoritative zones."""
 
     name = "cloudflare"
+
+    def _account_identity(self, creds: dict[str, Any]) -> str | None:
+        # An explicit account id names the account whatever token reaches it;
+        # without one, the token is the only identity there is.
+        if creds.get("account_id"):
+            return "account:" + str(creds["account_id"]).strip().lower()
+        token = str(creds.get("api_token") or "")
+        if not token:
+            return None
+        # Only ever compared, never logged or returned; a key-derivation
+        # function rather than a bare hash because the input is a credential.
+        digest = hashlib.scrypt(
+            token.encode(), salt=b"spatiumddi-provider-identity", n=2**14, r=8, p=1, dklen=16
+        )
+        return "token:" + digest.hex()
+
     # The Add-DNS-server modal renders + the probe requires only the token.
     # ``account_id`` is optional (zone create / delete only), so it is not listed here.
     credential_fields: tuple[str, ...] = ("api_token",)

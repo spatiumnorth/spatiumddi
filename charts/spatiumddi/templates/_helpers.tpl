@@ -154,7 +154,9 @@ anti-affinity (#590).
 
   {{- include "spatiumddi.deploymentStrategy" (dict
         "mode" .Values.api.podAntiAffinity
-        "replicas" .Values.api.replicas) | nindent 2 }}
+        "replicas" .Values.api.replicas
+        "root" $ "deployment" (printf "%s-api" (include "spatiumddi.fullname" $))
+        "container" "api") | nindent 2 }}
 
 Required anti-affinity + ``replicas == number of eligible nodes`` makes the
 default surge pod UNSCHEDULABLE, and the default ``maxUnavailable: 0`` then
@@ -191,19 +193,96 @@ cluster has no second node to surge onto in the shape that matters, and the
 frontend's hostNetwork path already accepts the same trade with Recreate.
 The opposite direction (1 → 3) is the ``replicas > 1`` case above and is
 unchanged.
+
+#3780 — except on a ROLLBACK at one replica. Retiring first there deletes
+the newer release's only pod, and when the older release cannot run on the
+schema the newer one migrated (#1227), its pod waits in ``wait-for-migrate``
+forever: no api, no web UI, and so no way to re-apply the newer release from
+the API, which is the documented recovery. Surge-first keeps the newer pod
+serving until the older one is ready, which is never in that case, and only
+a moment in the ordinary one. The release rolled back TO decides this, so it
+has to be in the chart being installed, not the one being left.
+
+So pass ``root`` (the chart root), ``deployment`` (the Deployment's name) and
+``container`` (its main container) as well, and at one replica under ``hard``
+the helper surges first when the live ReplicaSets (``lookup``) say:
+
+  * a pod of this Deployment runs a SemVer release NEWER than this
+    render's image tag: this render is a rollback. Ready or not: after the
+    reboot onto the older slot, firstboot releases the control chart once
+    k3s and the CNPG webhook answer, which is routinely before the newer
+    pod has passed its readiness probe again, and a render that required
+    it ready would retire it first after all. It stays true on every later
+    render of the same release while the newer pod exists (the template
+    already carries the older tag by then), and stops being true once the
+    older pod is ready and the newer ReplicaSet scaled to 0; and
+  * no ReplicaSet of it with pods carries a required anti-affinity term,
+    so the #1541 wedge (a surviving 3-node pod) still retires first.
+
+Anything it cannot read (``helm template``, a tag that is not a 1.x+ SemVer
+release, a CalVer or nightly build, an image pinned by digest, no live
+Deployment) retires first, as
+before. An ordinary upgrade is never a rollback, so it keeps #1659's
+strategy, and ``replicas > 1`` is untouched. ``replicaSets`` replaces the
+lookup with a given list (the chart tests, which have no cluster).
 */}}
 {{- define "spatiumddi.deploymentStrategy" -}}
 {{- $mode := default "soft" .mode -}}
+{{- $keepServing := and (eq $mode "hard") (eq (int .replicas) 1) .root
+      (eq (include "spatiumddi.newerReleaseServing" .) "true") -}}
 strategy:
   type: RollingUpdate
   rollingUpdate:
-  {{- if eq $mode "hard" }}
+  {{- if and (eq $mode "hard") (not $keepServing) }}
     maxSurge: 0
     maxUnavailable: 1
   {{- else }}
     maxSurge: 1
     maxUnavailable: 0
   {{- end }}
+{{- end -}}
+
+{{/*
+"true" when this render rolls ``deployment`` back from a newer release that
+still serves (#3780; see spatiumddi.deploymentStrategy). Only 1.x and later
+SemVer tags count: a CalVer tag (YYYY.MM.DD-N), a nightly (0.0.0-...), "dev"
+or "latest" is an unknown version, never an older one (core/versions.py).
+*/}}
+{{- define "spatiumddi.newerReleaseServing" -}}
+{{- $root := .root -}}
+{{- $release := `^[1-9][0-9]{0,2}\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$` -}}
+{{- $ours := toString ($root.Values.image.tag | default $root.Chart.AppVersion) -}}
+{{- $newer := false -}}
+{{- $blocked := false -}}
+{{- if regexMatch $release $ours -}}
+  {{- $items := .replicaSets -}}
+  {{- if not (hasKey . "replicaSets") -}}
+    {{- $items = get (default (dict) (lookup "apps/v1" "ReplicaSet" $root.Release.Namespace "")) "items" -}}
+  {{- end -}}
+  {{- range $rs := (default (list) $items) -}}
+    {{- $owned := false -}}
+    {{- range $ref := (default (list) (dig "metadata" "ownerReferences" (list) $rs)) -}}
+      {{- if and (eq (toString $ref.kind) "Deployment") (eq (toString $ref.name) (toString $.deployment)) -}}
+        {{- $owned = true -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if and $owned (gt (int (dig "status" "replicas" 0 $rs)) 0) -}}
+      {{- $podSpec := dig "spec" "template" "spec" (dict) $rs -}}
+      {{- if dig "affinity" "podAntiAffinity" "requiredDuringSchedulingIgnoredDuringExecution" (list) $podSpec -}}
+        {{- $blocked = true -}}
+      {{- end -}}
+      {{- range $c := (default (list) $podSpec.containers) -}}
+        {{- if eq (toString $c.name) (toString $.container) -}}
+          {{- $tag := last (splitList ":" (last (splitList "/" (toString $c.image)))) -}}
+          {{- if and (regexMatch $release $tag) (gt ((semver $tag).Compare (semver $ours)) 0) -}}
+            {{- $newer = true -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if and $newer (not $blocked) }}true{{ end -}}
 {{- end -}}
 
 {{- define "spatiumddi.podAntiAffinity" -}}
@@ -1041,4 +1120,147 @@ render that changes nothing.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — are we installing onto OpenShift?
+
+``global.platform`` is ``auto`` (the default), ``kubernetes`` or ``openshift``.
+``auto`` asks the cluster: OpenShift serves ``security.openshift.io/v1``
+(SecurityContextConstraints), which no other distribution does. Without a
+cluster — ``helm template``, Argo CD, a CI render — nothing answers, so those
+pass ``--api-versions security.openshift.io/v1`` or set the value outright.
+
+Renders ``true`` or nothing, so call sites read
+``{{ if include "spatiumddi.isOpenShift" . }}``. Pass the ROOT context (``$``
+inside a ``range``).
+
+Everything OpenShift-specific hangs off this one answer, and every branch it
+opens is additive or removes a pinned uid / gid / fsGroup: with it false the
+render is byte-identical to a chart that never heard of OpenShift.
+*/}}
+{{- define "spatiumddi.isOpenShift" -}}
+{{- $p := default "auto" (.Values.global).platform -}}
+{{- if not (has $p (list "auto" "kubernetes" "openshift")) -}}
+{{- fail (printf "global.platform=%q is not valid: use auto, kubernetes or openshift" $p) -}}
+{{- end -}}
+{{- if or (eq $p "openshift") (and (eq $p "auto") (.Capabilities.APIVersions.Has "security.openshift.io/v1")) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — the port the frontend's nginx listens on. :80 everywhere except
+OpenShift, where the pod runs as a random unprivileged uid and cannot bind it.
+The Service keeps its own port and reaches this one by the container port's
+name (``http``), so nothing else has to know.
+*/}}
+{{- define "spatiumddi.frontendHttpPort" -}}
+{{- if include "spatiumddi.isOpenShift" . -}}8080{{- else -}}80{{- end -}}
+{{- end -}}
+
+{{/*
+#3852 — one SecurityContextConstraints + the Role / RoleBinding that lets a
+fixed set of ServiceAccounts ``use`` it, and nobody else.
+
+Args: ``root``, ``name`` (the SCC's name; also the Role / RoleBinding's),
+``component``, ``serviceAccounts`` (list of names), ``capabilities`` (list),
+``hostNetwork`` (bool), ``why`` (text, rendered as the SCC's description
+annotation).
+
+It is the ``restricted-v2`` SCC with exactly three differences, each of which
+the workload needs and cannot get from any built-in SCC:
+
+  * ``allowedCapabilities`` — the file capabilities on the daemon binaries
+    (``named``, ``kea-dhcp4`` ...) only work when the capability is in the
+    container's bounding set, so the pod has to be allowed to add it.
+  * ``allowPrivilegeEscalation: true`` — the kernel ignores file capabilities
+    for a process with ``no_new_privs`` set, and ``restricted-v2``'s ``false``
+    sets it. The pod does not escalate to root: it stays a non-root uid.
+  * ``allowHostNetwork`` / ``allowHostPorts`` — only when a server asks for
+    ``hostNetwork: true``.
+
+Everything else is kept at ``restricted-v2``'s values: a uid from the
+namespace's range, an SELinux level from the namespace, an fsGroup from its
+range, ``runtime/default`` seccomp, no privileged containers, and the
+volume types the workload uses. ``anyuid`` is NOT a substitute: it has no
+``seccompProfiles``, so it rejects every pod this chart gives a seccomp
+profile.
+*/}}
+{{- define "spatiumddi.openshiftScc" -}}
+{{- $root := .root -}}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+  annotations:
+    kubernetes.io/description: {{ .why | quote }}
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: {{ .hostNetwork | default false }}
+allowHostPID: false
+allowHostPorts: {{ .hostNetwork | default false }}
+allowPrivilegeEscalation: true
+allowPrivilegedContainer: false
+allowedCapabilities:
+  {{- range .capabilities }}
+  - {{ . }}
+  {{- end }}
+defaultAddCapabilities: null
+requiredDropCapabilities:
+  - ALL
+readOnlyRootFilesystem: false
+fsGroup:
+  type: MustRunAs
+runAsUser:
+  type: MustRunAsRange
+seLinuxContext:
+  type: MustRunAs
+supplementalGroups:
+  type: MustRunAs
+seccompProfiles:
+  - runtime/default
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - ephemeral
+  - persistentVolumeClaim
+  - projected
+  - secret
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .name }}-scc
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: [{{ .name | quote }}]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .name }}-scc
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" .component) $root) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .name }}-scc
+subjects:
+  {{- range .serviceAccounts }}
+  - kind: ServiceAccount
+    name: {{ . }}
+    namespace: {{ $root.Release.Namespace }}
+  {{- end }}
 {{- end -}}

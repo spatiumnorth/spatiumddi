@@ -177,6 +177,14 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/Dockerfile",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
+    # #3852 — runs the frontend's listen-port renderer and reads the template +
+    # the image that ships it.
+    "test_frontend_http_port_3852.py": (
+        "frontend/14-http-port.envsh",
+        "frontend/17-ipv6.envsh",
+        "frontend/default.conf.template",
+        "frontend/Dockerfile",
+    ),
     # #1173 — runs the frontend's TLS reload watcher and checks it is copied into
     # the image and that the chart no longer rolls the frontend on a cert change.
     "test_frontend_tls_reload_1173.py": (

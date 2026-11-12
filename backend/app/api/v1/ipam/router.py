@@ -93,6 +93,11 @@ from app.services.dns.sync_check import (
     ipam_authors_zone,
     resolve_reverse_zone,
 )
+from app.services.e911.delete_guard import (
+    e911_bindings_blocking,
+    e911_refusal_detail,
+    refuse_if_e911_bound,
+)
 from app.services.feature_modules import is_module_enabled, require_module
 from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
@@ -103,6 +108,7 @@ from app.services.ipam.address_create_rules import (
     take_address_row,
 )
 from app.services.ipam.address_set_gate import (
+    ADDRESS_SETS_MODULE,
     WritableSetRanges,
     load_writable_set_ranges,
 )
@@ -1785,7 +1791,8 @@ async def _writable_subnet_ids(db: AsyncSession, user: Any) -> set[uuid.UUID] | 
                     set_ids.add(uuid.UUID(str(rid)))
                 except (ValueError, TypeError):
                     continue
-    if any_set or set_ids:
+    # Grants on a disabled address-sets module widen nothing (#3762).
+    if (any_set or set_ids) and await is_module_enabled(db, ADDRESS_SETS_MODULE):
         stmt = select(AddressSet.id, AddressSet.subnet_id)
         if not any_set:
             stmt = stmt.where(AddressSet.id.in_(set_ids))
@@ -2989,6 +2996,7 @@ async def _sync_dns_record(
     skip_create: frozenset[tuple[str, uuid.UUID]] = frozenset(),
     skip_existing: frozenset[uuid.UUID] = frozenset(),
     marking_orphan: bool = False,
+    enforce_ttl: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -3002,7 +3010,11 @@ async def _sync_dns_record(
     ``ttl`` sets the record TTL on **newly created** records (the DDNS path
     passes the subnet's effective ``ddns_ttl`` — #428); None inherits the
     zone default. Updates preserve the existing TTL so a rename doesn't
-    churn it.
+    churn it, unless ``enforce_ttl=True``: the DDNS path passes it, since it
+    owns the TTL of the records it generates, so an existing record takes
+    the current ``ttl`` too, on a rename or as a TTL-only update op (#3776).
+    Only the generated (``auto_generated``) records are touched; an operator
+    record the address adopted (#1867) keeps its own TTL.
 
     ``backfill_reverse_zone=False`` skips the reverse-zone catch-up below. A
     caller that has just made that decision itself passes it — subnet create
@@ -3564,6 +3576,11 @@ async def _sync_dns_record(
                         existing.ttl,
                         record_id=existing.id,
                     )
+                # #3776 — the DDNS path owns the TTL of its records: a
+                # changed effective ddns_ttl reaches an existing record too.
+                ttl_changed = enforce_ttl and existing.ttl != ttl
+                if ttl_changed:
+                    existing.ttl = ttl
                 existing.name = ip.hostname
                 existing.fqdn = target_fqdn
                 existing.value = str(ip.address)
@@ -3582,7 +3599,7 @@ async def _sync_dns_record(
                         ip=ip,
                         stamped_record_id=existing.id,
                     )
-                elif value_changed:
+                elif value_changed or ttl_changed:
                     await _enqueue_dns_op(
                         db,
                         target_zone,
@@ -3803,6 +3820,9 @@ async def _sync_dns_record(
                     )
                     await db.delete(record)
                     continue
+                ttl_changed = enforce_ttl and record.ttl != ttl  # #3776
+                if ttl_changed:
+                    record.ttl = ttl
                 record.name = ptr_name
                 record.fqdn = rev_pointer_full
                 record.value = ptr_value
@@ -3836,7 +3856,7 @@ async def _sync_dns_record(
                         await _enqueue_dns_op(
                             db, rev_zone, "create", ptr_name, "PTR", ptr_value, record.ttl
                         )
-                elif changed:
+                elif changed or ttl_changed:
                     await _enqueue_dns_op(
                         db, rev_zone, "update", ptr_name, "PTR", ptr_value, record.ttl
                     )
@@ -11521,6 +11541,11 @@ async def delete_address(
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
     # Kea / ISC. Typically one row — the batch overhead is negligible.
+    # #3891 — refuse a bound permanent delete BEFORE any DHCP write-through:
+    # the 409 rolls the DB back, but a Windows / FortiGate reservation removal
+    # would already have left the process.
+    if permanent:
+        await refuse_if_e911_bound(db, f"address {ip.address}", ip_ids=[ip.id])
     await _remove_linked_statics(db, current_user, statics_rows)
 
     if permanent:
@@ -11609,6 +11634,7 @@ async def purge_orphans(
         )
     )
     rows = list(res.scalars().all())
+    await refuse_if_e911_bound(db, "these orphan addresses", ip_ids=[ip.id for ip in rows])  # #3891
     # Gather any lingering DHCP reservations across all orphan IPs in one
     # query, then push-delete them in one batched WinRM round trip per
     # server (versus one round trip per IP × one per static). Normally
@@ -13145,6 +13171,14 @@ async def bulk_delete_addresses(
     # half-done.
     to_delete: list[IPAddress] = []
     removed_statics: dict[uuid.UUID, DHCPStaticAssignment] = {}
+    # A permanent delete takes an address's E911 binding with it (#3891): skip
+    # those rows, with the reason, the way the other refusals here do.
+    e911_bound: dict[uuid.UUID, list[str]] = {}
+    if body.permanent:
+        for ip in rows:
+            lines = await e911_bindings_blocking(db, ip_ids=[ip.id])
+            if lines:
+                e911_bound[ip.id] = lines
     for ip in rows:
         if ip.status in ("network", "broadcast"):
             skipped.append(ip.id)
@@ -13183,6 +13217,12 @@ async def bulk_delete_addresses(
             skipped.append(ip.id)
             skipped_reasons[str(ip.id)] = (
                 f"No delete permission on subnet or any address set covering {ip.address}"
+            )
+            continue
+        if body.permanent and ip.id in e911_bound:
+            skipped.append(ip.id)
+            skipped_reasons[str(ip.id)] = e911_refusal_detail(
+                f"address {ip.address}", e911_bound[ip.id]
             )
             continue
         row_statics = statics_by_ip.get(ip.id, [])
