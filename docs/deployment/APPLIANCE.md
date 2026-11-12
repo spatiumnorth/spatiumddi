@@ -1467,9 +1467,9 @@ grandfathered.
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
 LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
 not compliant, but lost contact is never a FAIL), and **not applicable** when no
-appliance reports at all (#2259). Five Operator-Copilot MCP tools
+appliance reports at all (#2259). Six Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
-/ `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
+/ `find_firewall_effective` / `find_web_ui_access` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.
 
 **Web UI source restriction (Phase 6).** A `Web UI access` card on the same tab
@@ -4082,7 +4082,7 @@ Applied to both Alpine and Debian appliance images:
 - ASLR enabled (`/proc/sys/kernel/randomize_va_space = 2`)
 - Core dumps disabled
 - `/tmp` mounted as `tmpfs` (no-exec, no-suid)
-- SSH: `PermitRootLogin no`, `PasswordAuthentication no` (key-only), `Protocol 2`
+- SSH: `PermitRootLogin no`, `Protocol 2`. Password login is on by default, because the installer takes the admin password as the first credential. To go key-only, choose **Key only** when the installer takes your key, or add an authorized key later and turn **Password authentication** off under Appliance, Fleet, SSH
 - All services run as non-root system users (`spatiumddi`, `kea`, `named`)
 - AppArmor profiles (Debian) or seccomp profiles (Docker) for service isolation
 - CIS Benchmark hardening script applied at image build time
@@ -4092,12 +4092,16 @@ Applied to both Alpine and Debian appliance images:
 
 ## 8. Environment Variables for Appliance
 
-```bash
-SPATIUMDDI_FIRSTBOOT=true          # Set to false after first-boot wizard completes
-SPATIUMDDI_APPLIANCE_MODE=true     # Enables appliance-specific UI flows
-SPATIUMDDI_UPDATE_CHANNEL=stable
-SPATIUMDDI_LICENSE_ACCEPTED=false  # Must be true to complete first-boot
-```
+The appliance does not read `SPATIUMDDI_*` environment variables, and there is no first-boot wizard flag or licence-acceptance gate to set. First boot writes the control-plane chart's `sharedEnv` (the Helm values the api, worker and beat pods all receive; see `appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot`), which carries:
+
+| Variable | Meaning |
+|---|---|
+| `APPLIANCE_MODE` | Set to `"true"`. The backend reads it as `appliance_mode` and enables the appliance-specific UI flows and the Kubernetes-Secret certificate path. |
+| `APPLIANCE_VERSION` | The installed appliance version (rendered from the chart's `applianceVersion` value). |
+| `INITIAL_NTP_SERVERS` | The installer's Time source answer; it seeds the initial `ntp_pool_servers` setting and is ignored once that settings row exists. |
+| `APPLIANCE_HOSTNAME` / `APPLIANCE_HOST_IPS` | The host's hostname and global addresses, so every api replica builds the same self-signed Web UI certificate identity. |
+
+Update channels are future work (Phase 8d, pending).
 
 ---
 
