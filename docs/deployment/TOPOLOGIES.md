@@ -271,6 +271,9 @@ The Kubernetes flavour of Topology 4. The umbrella Helm chart
 (`charts/spatiumddi`) ships every component — api / worker / beat /
 frontend / migrate / Postgres + Redis (in-chart StatefulSets, or
 CloudNativePG, or external endpoints) / optional DNS+DHCP agent StatefulSets.
+The same chart installs on Red Hat OpenShift under its default security
+context constraints, with a Route for the UI; see
+[KUBERNETES.md → OpenShift](KUBERNETES.md#openshift).
 
 <p align="center">
   <img src="../assets/topologies/topology-6-kubernetes.svg" alt="Topology 6 — Kubernetes via the umbrella Helm chart" width="900"/>
@@ -383,7 +386,7 @@ SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default),
 
 Wire it up:
 
-1. In `internal-pdns`, create the zones as primaries on the single PowerDNS server. Do not enable catalog zones for the crossover: a catalog is only produced and consumed within one group on one driver, so it cannot carry zones from `internal-pdns` to `edge-bind`.
+1. In `internal-pdns`, create the zones as primaries on the single PowerDNS server. Do not enable catalog zones for the crossover: a group's catalog is published for secondaries SpatiumDDI does not manage, and no agent-managed server consumes one (#3764), so it cannot carry zones from `internal-pdns` to `edge-bind`.
 2. In `edge-bind`, create each fanned-out zone as `zone_type=secondary` (or `stub`) with its per-zone `masters` list pointing at the PowerDNS primary (an `ip` or `ip@port` string, issue #336). BIND loads each as `type slave;` and AXFRs from the master; every BIND member of `edge-bind` is its own secondary and AXFRs each zone independently.
 3. Operator changes land via the SpatiumDDI UI → write-through to the PowerDNS HTTP API → PowerDNS bumps zone serial → BIND notices via NOTIFY-then-IXFR.
 

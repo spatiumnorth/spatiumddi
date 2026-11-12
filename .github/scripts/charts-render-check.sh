@@ -60,7 +60,11 @@
 #                      rollout wedges once replicas == nodes (#590); plus a
 #                      dedicated pass asserting the appliance's api / worker /
 #                      frontend retire first at one replica too, where the
-#                      blocking term rides on the OUTGOING pods (#1541).
+#                      blocking term rides on the OUTGOING pods (#1541),
+#                      and a scratch-chart pass over the helper itself: a
+#                      ROLLBACK at one replica surges first, so the newer
+#                      release keeps serving (#3780; ``lookup`` decides it,
+#                      which ``helm template`` cannot answer).
 #   hpa-replicas     — every render, plus --require passes, a control and
 #                      negative controls: a workload an autoscaler scales
 #                      renders no ``spec.replicas`` (#3111), while the
@@ -168,11 +172,13 @@ render() { # name chart [helm --set args...]
     # CNPG operator's, vendored from upstream via the subchart — not ours to
     # validate, and the upstream schema set carries no strict variant for
     # the kind. Every CR *instance* (the ``Cluster``) is still checked.
+    # Route and SecurityContextConstraints (#3852, OpenShift only) have no schema
+    # in either location above; chart-openshift.py asserts on them instead.
     kubeconform -strict -summary \
         -kubernetes-version "$K8S_VERSION" \
         -schema-location default \
         -schema-location "$CRD_SCHEMAS" \
-        -skip CustomResourceDefinition \
+        -skip CustomResourceDefinition,Route,SecurityContextConstraints \
         -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
@@ -317,6 +323,97 @@ if missing:
     sys.exit(1)
 print("ok #2873: sentinel.conf.tmpl requires the password")
 PYEOF
+# #3852 — OpenShift. ``helm template`` has no cluster to detect the platform
+# from, so the render is told with --api-versions (the same answer a real
+# cluster gives ``.Capabilities.APIVersions.Has``). Everything the restricted
+# SCC refuses — a pinned runAsUser / fsGroup, an added capability, :80 — must be
+# gone from the render, and the Route + the agents' SCCs must be there.
+# chart-openshift.py reads the RENDER; see its docstring.
+UMBRELLA_OPENSHIFT_API=(
+    --api-versions security.openshift.io/v1
+    --api-versions route.openshift.io/v1
+)
+UMBRELLA_OPENSHIFT=(
+    "${UMBRELLA_OPENSHIFT_API[@]}"
+    --set dnsAgents.enabled=true
+    --set dnsAgents.servers[0].name=ns1
+    --set dhcpAgents.enabled=true
+    --set dhcpAgents.servers[0].name=dhcp1
+    --set dhcpAgents.servers[0].hostNetwork=true
+    --set ingress.enabled=true
+    --set worker.serviceAccount.enabled=true
+    --set openshift.workerNetRaw=true
+)
+render umbrella-openshift "$UMBRELLA" "${UMBRELLA_OPENSHIFT[@]}"
+render umbrella-openshift-ha "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" "${UMBRELLA_HA[@]}"
+render umbrella-openshift-defaults "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}"
+render umbrella-openshift-forced "$UMBRELLA" --set global.platform=openshift
+# SCCs managed by the cluster admins: the agents' ServiceAccounts must still be
+# rendered, or the pods that name them are never created.
+render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set openshift.scc.create=false \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+# #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
+# here too (no pinned uid, its ServiceAccount exists).
+render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
+echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
+python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-openshift.py" \
+    "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
+    "$OUT/umbrella-openshift-forced.yaml" "$OUT/umbrella-openshift-upgrade.yaml" \
+    || failures=$((failures + 1))
+if ! grep -q 'component: dhcp-unstick' "$OUT/umbrella-openshift-upgrade.yaml"; then
+    echo "   FAIL #3907: the OpenShift upgrade render has no unstick hook" >&2
+    failures=$((failures + 1))
+fi
+if grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-no-scc.yaml"; then
+    echo "   FAIL #3852: openshift.scc.create=false still renders an SCC" >&2
+    failures=$((failures + 1))
+fi
+for sa in dns-agent dhcp-agent; do
+    if ! grep -qE "^  name: [a-z0-9-]+-spatiumddi-$sa$" "$OUT/umbrella-openshift-no-scc.yaml"; then
+        echo "   FAIL #3852: openshift.scc.create=false drops the $sa ServiceAccount the pods name" >&2
+        failures=$((failures + 1))
+    fi
+done
+# Negative control: the same check on a Kubernetes render, where the pins are
+# deliberately still present, must SEE them — or every pass above could be the
+# check parsing nothing. And the Kubernetes render must carry no OpenShift object.
+python3 "$ROOT/.github/scripts/chart-openshift.py" --expect-pins "$OUT/umbrella-defaults.yaml" \
+    || failures=$((failures + 1))
+if grep -qE '^kind: (Route|SecurityContextConstraints)$' "$OUT/umbrella-defaults.yaml" "$OUT/umbrella-all-on.yaml"; then
+    echo "   FAIL #3852: a Kubernetes render carries an OpenShift object" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: no Route / SCC on a Kubernetes render"
+fi
+# Refusals that exist so a render never produces a pod OpenShift cannot start.
+echo "── OpenShift: refusals (#3852)"
+neg3852() { # label expected-substring [helm --set args...]
+    local label="$1" want="$2"; shift 2
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "$@" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$want"; then
+        echo "   ok: $label refused"
+    else
+        echo "   FAIL: expected $label to be refused with '$want' (rc=$rc)" >&2
+        failures=$((failures + 1))
+    fi
+}
+neg3852 "an unknown platform" "is not valid" --set global.platform=bogus
+neg3852 "the appliance TLS frontend on OpenShift" "frontend.tls.enabled" \
+    --set global.platform=openshift --set frontend.tls.enabled=true
+neg3852 "the appliance hostNetwork frontend on OpenShift" "frontend.hostNetwork" \
+    --set global.platform=openshift --set frontend.hostNetwork=true
+neg3852 "a PowerDNS agent on OpenShift" "does not yet run under OpenShift" \
+    --set global.platform=openshift --set dnsAgents.enabled=true \
+    --set dnsAgents.servers[0].name=p --set dnsAgents.servers[0].flavor=powerdns
+neg3852 "workerNetRaw without the worker ServiceAccount" "worker.serviceAccount.enabled" \
+    --set global.platform=openshift --set openshift.workerNetRaw=true
+neg3852 "an unsupported Route termination" "not supported" \
+    --set global.platform=openshift --set openshift.route.termination=passthrough
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
 # #1174 — the shape the slot-image mirror actually runs in: an appliance
@@ -353,6 +450,234 @@ for n in 1 3; do
         --retire-first api --retire-first worker --retire-first frontend \
         "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
 done
+
+# #3780 — at one replica under ``hard`` a ROLLBACK surges first, so the
+# newer release's only api / worker pod keeps serving while the older
+# release's pod waits on a schema it cannot run. The decision reads the live
+# ReplicaSets through ``lookup``, which ``helm template`` cannot answer (the
+# renders above therefore retire first, and must). So the helper is rendered
+# here in a scratch chart against given ReplicaSets, one Deployment per case,
+# and each case's strategy is checked against the expected one.
+echo "── rollback keeps the newer release serving at one replica (umbrella helpers, #3780)"
+RB_CHART="$OUT/rollback-strategy-chart"
+rm -rf "$RB_CHART"
+mkdir -p "$RB_CHART/templates"
+cp "$UMBRELLA/templates/_helpers.tpl" "$RB_CHART/templates/_helpers.tpl"
+cat > "$RB_CHART/Chart.yaml" <<'EOF'
+apiVersion: v2
+name: spatiumddi
+version: 0.0.0
+appVersion: "0.0.0"
+EOF
+cat > "$RB_CHART/templates/cases.yaml" <<'EOF'
+{{- range $c := .Values.cases }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $c.name }}
+  labels:
+    expect: {{ $c.expect }}
+spec:
+  {{- $root := dict "Values" (dict "image" (dict "tag" $c.ours)) "Chart" $.Chart "Release" $.Release }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" (default "hard" $c.mode) "replicas" (default 1 $c.replicas) "root" $root "deployment" "x-api" "container" "api" "replicaSets" (default (list) $c.rs)) | nindent 2 }}
+{{- end }}
+EOF
+cat > "$RB_CHART/values.yaml" <<'EOF'
+cases:
+  - name: rollback-newer-serving
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "ghcr.io/o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-later-render-older-pod-not-ready
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "ghcr.io/o/spatiumddi-api:1.0.0"}]}}}}
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "reg:5000/o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-to-release-candidate
+    expect: surge
+    ours: 1.0.0-rc.1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.2"}]}}}}
+  - name: rollback-from-release-candidate
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1-rc.1"}]}}}}
+  - name: ordinary-upgrade
+    expect: retire
+    ours: 1.0.1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: rollback-complete-older-serving
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 0},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: demote-old-pod-carries-required-term-1541
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {affinity: {podAntiAffinity: {requiredDuringSchedulingIgnoredDuringExecution: [{topologyKey: kubernetes.io/hostname}]}},
+                                  containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: three-replicas-unchanged
+    expect: retire
+    ours: 1.0.0
+    replicas: 3
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 3, readyReplicas: 3},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: upgrade-from-calver-bridge
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:2026.11.03-1"}]}}}}
+  - name: calver-render-is-unknown
+    expect: retire
+    ours: 2026.11.03-1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: nightly-render-is-unknown
+    expect: retire
+    ours: 0.0.0-nightly-20261108
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: newer-pod-of-another-deployment
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-worker}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-after-reboot-newer-pod-not-ready-yet
+    expect: surge
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1"}]}}}}
+  - name: rollback-rc10-to-rc9-numeric-order
+    expect: surge
+    ours: 1.0.0-rc.9
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.10"}]}}}}
+  - name: upgrade-rc9-to-rc10-numeric-order
+    expect: retire
+    ours: 1.0.0-rc.10
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.9"}]}}}}
+  - name: rollback-rc1-to-beta5
+    expect: surge
+    ours: 1.0.0-beta.5
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.1"}]}}}}
+  - name: upgrade-beta5-to-rc1
+    expect: retire
+    ours: 1.0.0-rc.1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-beta.5"}]}}}}
+  - name: rollback-final-to-rc
+    expect: surge
+    ours: 1.0.0-rc.2
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: upgrade-rc-to-final
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.2"}]}}}}
+  - name: rollback-1.10-to-1.9-numeric-order
+    expect: surge
+    ours: 1.9.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.10.0"}]}}}}
+  - name: same-release-rerender
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0"}]}}}}
+  - name: newer-pod-pinned-by-digest-is-unknown
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.1@sha256:0123456789abcdef"}]}}}}
+  - name: newer-pod-dev-tag-is-unknown
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:dev"}]}}}}
+  - name: newer-pod-nightly-is-unknown
+    expect: retire
+    ours: 1.0.0
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:0.0.0-nightly-20261108"}]}}}}
+  - name: rollback-from-semver-onto-calver-render-is-unknown
+    expect: retire
+    ours: 2026.11.03-1
+    rs:
+      - {metadata: {ownerReferences: [{kind: Deployment, name: x-api}]}, status: {replicas: 1, readyReplicas: 1},
+         spec: {template: {spec: {containers: [{name: api, image: "o/spatiumddi-api:1.0.0-rc.1"}]}}}}
+  - name: empty-lookup-hard-retires
+    expect: retire
+    ours: 1.0.0
+  - name: soft-mode-always-surges
+    expect: surge
+    mode: soft
+    ours: 1.0.0
+EOF
+if helm template rb "$RB_CHART" > "$OUT/rollback-strategy.yaml"; then
+    python3 - "$OUT/rollback-strategy.yaml" <<'EOF' || failures=$((failures + 1))
+import sys
+
+import yaml
+
+bad = 0
+seen = 0
+for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
+    if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+        continue
+    seen += 1
+    name = doc["metadata"]["name"]
+    want = doc["metadata"]["labels"]["expect"]
+    rolling = doc["spec"]["strategy"]["rollingUpdate"]
+    got = "retire" if (rolling["maxSurge"], rolling["maxUnavailable"]) == (0, 1) else "surge"
+    if got != want:
+        print(f"   FAIL: {name}: expected {want}-first, rendered {got}-first ({rolling})", file=sys.stderr)
+        bad += 1
+if seen == 0:
+    print("   FAIL: the #3780 case render produced no Deployment", file=sys.stderr)
+    bad += 1
+print(f"   {seen - bad}/{seen} rollback-strategy cases hold")
+sys.exit(1 if bad else 0)
+EOF
+else
+    echo "   FAIL: the #3780 rollback-strategy case chart did not render" >&2
+    failures=$((failures + 1))
+fi
 
 # #1805 — the api Service's PreferSameNode is the appliance's, not the
 # umbrella default's. The default render (a BYO-Kubernetes install) must omit
@@ -861,6 +1186,51 @@ if not svcs or any(
     print(f"FAIL DHCP nodePort without type is not NodePort: {[d['spec'].get('type') for d in svcs]} (#3229)", file=sys.stderr)
     sys.exit(1)
 print("   DHCP nodePort implies NodePort")
+PYEOF
+# #3907 — the DHCP unstick pre-upgrade hook: a hook-annotated, namespaced Role
+# and Job only when DHCP agents are on and the opt-out is not set.
+# ``helm template`` renders a pre-upgrade hook only with --is-upgrade.
+render umbrella-dhcp-unstick-on "$UMBRELLA" --is-upgrade \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+render umbrella-dhcp-unstick-off "$UMBRELLA" --is-upgrade \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.upgradeUnstickPods=false
+render umbrella-dhcp-unstick-noagents "$UMBRELLA" --is-upgrade
+echo "── DHCP unstick pre-upgrade hook (umbrella, #3907)"
+python3 - "$OUT/umbrella-dhcp-unstick-on.yaml" "$OUT/umbrella-dhcp-unstick-off.yaml" \
+    "$OUT/umbrella-dhcp-unstick-noagents.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+def hook_objs(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    return docs, [d for d in docs if (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick"]
+rc = 0
+docs, objs = hook_objs(sys.argv[1])
+kinds = sorted(d["kind"] for d in objs)
+if kinds != ["Job", "Role", "RoleBinding", "ServiceAccount"]:
+    print(f"FAIL unstick hook objects: {kinds} (#3907)", file=sys.stderr); rc = 1
+for d in objs:
+    a = d["metadata"].get("annotations") or {}
+    if a.get("helm.sh/hook") != "pre-upgrade" or "hook-succeeded" not in a.get("helm.sh/hook-delete-policy", ""):
+        print(f"FAIL {d['kind']} is not a pre-upgrade hook with a delete policy (#3907)", file=sys.stderr); rc = 1
+    if d["kind"] in ("Role", "RoleBinding") and not d["metadata"].get("namespace"):
+        print(f"FAIL {d['kind']} is not namespaced (#3907)", file=sys.stderr); rc = 1
+grants = sorted(
+    (r["resources"][0], tuple(sorted(r["verbs"])))
+    for ro in objs if ro["kind"] == "Role" for r in ro["rules"]
+)
+if grants != [("pods", ("delete", "get", "list")), ("statefulsets", ("delete", "get", "list"))]:
+    print(f"FAIL unstick Role grants {grants} (#3907)", file=sys.stderr); rc = 1
+for d in docs:
+    if d["kind"] in ("ClusterRole", "ClusterRoleBinding") and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick":
+        print("FAIL cluster-scoped unstick object (#3907)", file=sys.stderr); rc = 1
+for p in sys.argv[2:]:
+    if hook_objs(p)[1]:
+        print(f"FAIL unstick hook rendered in {p} (#3907)", file=sys.stderr); rc = 1
+if rc == 0:
+    print("   hook renders with DHCP agents, not with the opt-out or without agents")
+sys.exit(rc)
 PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
