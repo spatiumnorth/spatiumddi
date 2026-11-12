@@ -10,9 +10,10 @@
   throughout the drill; upgrading and rebooting each member in turn
   instead leaves nodes not yet upgraded without DNS and DHCP (#3136). The
   seed's Fleet Reboot does nothing on 2026.10.02-1, so reboot it from its
-  hypervisor, and afterwards the API can show "initialising" for hours
-  while the 1.0.0 migration waits on a stale database session; the notes
-  give a manual way out. A single appliance (under 10 minutes, DNS down
+  hypervisor. Afterwards the API can show "initialising" while the 1.0.0
+  migration waits on a stale database session left by the old release;
+  1.0.0 ends that session itself (#3932), and the notes give a manual way
+  out. A single appliance (under 10 minutes, DNS down
   about 4 minutes), Compose and Helm upgrade as usual (Helm with DHCP
   agents: #3907). The steps are in `docs/deployment/APPLIANCE.md`,
   "Upgrading to 1.0.0".

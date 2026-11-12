@@ -2870,9 +2870,9 @@ fixed in 1.0.0 but not in the release you are running:
 Nothing is harmed by either refusal: no run is created and no node is
 touched. The way off 2026.10.02-1 is **Fleet, node by node**. The order
 below converged a three-node cluster on 1.0.0-rc.2 with DNS and DHCP
-serving on at least two nodes throughout. Whether every reservation,
-record and address came through unchanged was checked in an earlier run
-that used a different order; the check for this order is still owed.
+serving on at least two nodes throughout, and every zone, record,
+subnet, block, pool, reservation, lease and address came through
+unchanged by name.
 
 1. **Stage every node first, with no reboot.** On the node's page in
    **Fleet**, press **Upgrade**, choose **From external URL**, and give
@@ -2933,8 +2933,10 @@ What to expect:
   outlives the pod that opened it, and nothing on the database ends it:
   no idle-in-transaction timeout, no lock timeout, default keepalives. By
   those settings it lasts about 2 hours 11 minutes after the seed went
-  down. In the drill the API still answered 502 43 minutes in. DNS and
-  DHCP keep serving throughout.
+  down. In the drill the API answered 502 for about 2 hours 4 minutes;
+  then the session was dropped, the migration finished, and the cluster
+  converged by itself within 3 minutes. DNS and DHCP kept serving
+  throughout.
   - **A manual way out (not yet drilled).** From the node holding the
     database primary, end the stale sessions. The CNPG cluster in the
     `spatium` namespace is `spatium-control-spatiumddi-postgresql`:
@@ -2947,10 +2949,16 @@ What to expect:
     ```
 
     The migration is expected to continue within a minute.
-  - 1.0.0 itself now ends such sessions (#3932), so upgrades from 1.0.0
-    onwards do not hit this. #3932 may not be merged at the time you read
-    this; check the release notes for the release you install.
-- **Other things you will see.** The database primary moves three times;
+  - 1.0.0 shortens this (#3932): its migration step ends a stale
+    idle-in-transaction session of the app's own role once it has waited
+    on that session's lock (sessions idle more than 5 minutes), and its
+    Postgres settings drop a dead client's session within about 2 minutes.
+    Check the 1.0.0 release notes to confirm #3932 is included. If the
+    console still shows "initialising" more than about 15 minutes after
+    the seed's reboot, use the manual way out above.
+- **Other things you will see.** The database primary moves four times (the last when the database
+  rolls its instances after the migration, with the API not ready for up
+  to 30 seconds);
   every DNS and DHCP agent restarts twice (once when the chart moves,
   once after the seed's boot), each restart a gap of 10 to 40 seconds on
   that node; and a database replica on a member can crash-loop after the
@@ -2960,9 +2968,9 @@ What to expect:
   about two minutes at a member's reboot. A node's k3s can also restart
   while its slot is being written (#1804).
 - **Time.** Staging all three nodes takes about 14 minutes, and each
-  reboot about 3 minutes. The total depends on the migration wait above,
-  so no overall figure is given: the drill had not converged 1 hour 55
-  minutes after the first Upgrade.
+  reboot about 3 minutes. The total depends on the migration wait above:
+  the drill took 3 hours 24 minutes in all, about 2 hours of it that
+  wait.
 - **Kea leases are per node.** Each node's Kea keeps its own leases with
   no HA, so a member asked directly can offer addresses another node has
   leased. A site whose relay points at several nodes needs HA for shared
