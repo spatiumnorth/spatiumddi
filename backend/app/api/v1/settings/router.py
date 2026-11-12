@@ -2565,6 +2565,10 @@ async def update_settings(
         if f in changes and getattr(settings, f) != changes[f]
     }
 
+    # #3847 — branding values before the save, so its audit row records
+    # only what changed (and nothing when the form is echoed back).
+    _branding_old = {f: getattr(settings, f) for f in _branding_fields}
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2844,7 +2848,10 @@ async def update_settings(
 
     # Branding (#885 / #887 / #888) — what an anonymous visitor sees before
     # they authenticate, so every change is on the record.
-    if _branding_fields:
+    _branding_changed = sorted(
+        f for f in _branding_fields if getattr(settings, f) != _branding_old[f]
+    )
+    if _branding_changed:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2855,18 +2862,9 @@ async def update_settings(
                 resource_id="branding",
                 resource_display="Branding",
                 result="success",
-                new_value={
-                    "app_title": str(settings.app_title or ""),
-                    "login_banner_enabled": bool(settings.login_banner_enabled),
-                    "login_banner_title": str(settings.login_banner_title or ""),
-                    "login_banner_text": str(settings.login_banner_text or ""),
-                    "login_banner_require_ack": bool(settings.login_banner_require_ack),
-                    "env_banner_enabled": bool(settings.env_banner_enabled),
-                    "env_banner_text": str(settings.env_banner_text or ""),
-                    "env_banner_bg": str(settings.env_banner_bg or ""),
-                    "env_banner_fg": str(settings.env_banner_fg or ""),
-                    "env_banner_position": str(settings.env_banner_position or "top"),
-                },
+                changed_fields=_branding_changed,
+                old_value={f: _branding_old[f] for f in _branding_changed},
+                new_value={f: getattr(settings, f) for f in _branding_changed},
             )
         )
 

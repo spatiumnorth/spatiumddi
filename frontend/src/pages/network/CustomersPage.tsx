@@ -428,8 +428,10 @@ export function CustomersPage() {
                         setSearch("");
                         setStatusFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New customer" to add one.`}
                     >
-                      No customers yet — click "New customer" to add one.
+                      No customers yet.
                     </ListEmpty>
                   </td>
                 </tr>

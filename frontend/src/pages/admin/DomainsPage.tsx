@@ -580,8 +580,10 @@ export function DomainsPage() {
                         setSearch("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New domain" to add the first one.`}
                     >
-                      No domains yet — click "New domain" to add the first one.
+                      No domains yet.
                     </ListEmpty>
                   </td>
                 </tr>

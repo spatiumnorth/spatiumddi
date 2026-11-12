@@ -250,3 +250,28 @@ async def test_secret_rotation_is_recorded_without_the_value(
     assert rows[-1].old_value == {"snmp_community": "<set>"} or rows[0].old_value == {
         "snmp_community": "<set>"
     }
+
+
+@pytest.mark.asyncio
+async def test_branding_row_names_the_changed_field_and_old_value_3847(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.put("/api/v1/settings", headers=headers, json={"app_title": "Acme DDI"})
+    assert r.status_code == 200, r.text
+    rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
+    assert len(rows) == 1
+    assert rows[0].changed_fields == ["app_title"]
+    assert rows[0].old_value == {"app_title": "SpatiumDDI"}
+    assert rows[0].new_value == {"app_title": "Acme DDI"}
+
+
+@pytest.mark.asyncio
+async def test_branding_save_that_changes_nothing_writes_no_row_3847(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.put("/api/v1/settings", headers=headers, json={"app_title": "SpatiumDDI"})
+    assert r.status_code == 200, r.text
+    rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
+    assert rows == []
