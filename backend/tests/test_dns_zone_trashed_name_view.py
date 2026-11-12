@@ -61,3 +61,32 @@ async def test_trashed_zone_in_view_frees_name_and_restore_refuses(
     restore = await client.post(f"/api/v1/admin/trash/dns_zone/{old_id}/restore", headers=headers)
     assert restore.status_code == 409, restore.text
     assert "already exists" in str(restore.json()["detail"])
+
+
+def test_unique_violation_message_names_the_zone_not_the_columns() -> None:
+    from app.core.integrity_errors import unique_violation_message
+
+    detail = "Key (group_id, view_id, name)=(1, 2, example.test.) already exists."
+    msg = unique_violation_message(detail, "uq_dns_zone_group_view_name")
+    assert "DNS zone" in msg and "group_id" not in msg
+    # Any other key keeps the column-naming sentence.
+    assert "group_id" in unique_violation_message(detail, "uq_something_else")
+
+
+@pytest.mark.asyncio
+async def test_repin_and_rename_onto_trashed_name_in_view(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers, group, view = await _setup(db_session)
+    base = f"/api/v1/dns/groups/{group.id}/zones"
+    trashed = await client.post(base, json={**_BODY, "view_id": str(view.id)}, headers=headers)
+    assert trashed.status_code == 201, trashed.text
+    assert (
+        await client.delete(f"{base}/{trashed.json()['id']}", headers=headers)
+    ).status_code == 204
+    live = await client.post(base, json=_BODY, headers=headers)  # no view
+    assert live.status_code == 201, live.text
+    repin = await client.put(
+        f"{base}/{live.json()['id']}", json={"view_id": str(view.id)}, headers=headers
+    )
+    assert repin.status_code == 200, repin.text

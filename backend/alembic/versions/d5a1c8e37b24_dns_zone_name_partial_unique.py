@@ -45,5 +45,21 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    clash = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                "SELECT count(*) FROM (SELECT 1 FROM dns_zone WHERE view_id IS NOT NULL "
+                "GROUP BY group_id, view_id, name HAVING count(*) > 1) t"
+            )
+        )
+        .scalar()
+    )
+    if clash:
+        raise RuntimeError(
+            f"{clash} DNS zone name(s) exist both live and in the Trash within one view; "
+            "restoring the full unique constraint would fail. Purge or rename the trashed "
+            "zones (Admin -> Trash) and run the downgrade again."
+        )
     op.drop_index(_NAME, table_name="dns_zone")
     op.create_unique_constraint(_NAME, "dns_zone", ["group_id", "view_id", "name"])
