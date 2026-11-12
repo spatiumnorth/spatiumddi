@@ -298,7 +298,7 @@ def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]
 
 #: Text-typed fields whose value may legitimately arrive as a JSON number.
 #: Every other text / password field must be a string.
-NUMERIC_TEXT_FIELDS = frozenset({"port", "object_lock_days"})
+NUMERIC_TEXT_FIELDS = frozenset({"port", "object_lock_days", "version", "uid", "gid", "timeout_s"})
 
 
 def check_config_value_types(driver: BackupDestination, config: dict[str, Any]) -> None:

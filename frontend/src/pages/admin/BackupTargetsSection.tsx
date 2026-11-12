@@ -57,7 +57,14 @@ const CRON_PRESETS: { label: string; value: string }[] = [
 // Settings the API reads as numbers (#3946). The form holds every value as
 // text; a whole number in one of these goes out as a number, anything else
 // as typed so the API refuses it by name.
-const NUMERIC_CONFIG_FIELDS = new Set(["port", "object_lock_days"]);
+const NUMERIC_CONFIG_FIELDS = new Set([
+  "port",
+  "object_lock_days",
+  "version",
+  "uid",
+  "gid",
+  "timeout_s",
+]);
 
 function typedConfig(config: Record<string, string>): Record<string, unknown> {
   return Object.fromEntries(

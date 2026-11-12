@@ -73,3 +73,29 @@ async def test_edit_infinite_port_is_422(client: AsyncClient, db_session: AsyncS
     )
     assert r.status_code == 422, r.text
     assert "'port'" in r.json()["detail"]
+
+
+_NFS = {"server": "h", "export": "/e"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["version", "uid", "gid", "timeout_s", "port"])
+@pytest.mark.parametrize("member", ["1e999", "4.5", '"abc"'])
+async def test_nfs_numeric_fields_bad_value_is_422(
+    field: str, member: str, client: AsyncClient, db_session: AsyncSession
+):
+    headers = {**await _headers(db_session), "Content-Type": "application/json"}
+    r = await client.post(_URL, content=_raw("nfs", _NFS, f'"{field}": {member}'), headers=headers)
+    assert r.status_code == 422, r.text
+    assert repr(field) in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("member", ['"version": 4', '"version": "4"', '"version": 3'])
+async def test_nfs_numbers_and_numeric_text_are_taken(
+    member: str, client: AsyncClient, db_session: AsyncSession
+):
+    headers = {**await _headers(db_session), "Content-Type": "application/json"}
+    config = {**_NFS, "uid": 1000, "gid": 1000, "timeout_s": 30}
+    r = await client.post(_URL, content=_raw("nfs", config, member), headers=headers)
+    assert r.status_code == 201, r.text

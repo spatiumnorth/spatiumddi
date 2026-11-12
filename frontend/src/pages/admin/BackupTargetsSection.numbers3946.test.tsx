@@ -57,6 +57,18 @@ const KINDS: BackupTargetKind[] = [
       f("prefix", "Prefix"),
     ],
   },
+  {
+    kind: "nfs",
+    label: "NFS",
+    inherently_write_only: false,
+    config_fields: [
+      f("server", "Server", true),
+      f("version", "NFS version"),
+      f("uid", "UID"),
+      f("gid", "GID"),
+      f("timeout_s", "Timeout"),
+    ],
+  },
 ];
 
 function renderSection() {
@@ -103,6 +115,41 @@ describe("backup destination Add sends a port as a number (#3946)", () => {
     fireEvent.submit(container.querySelector("form")!);
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     expect(create.mock.calls[0][0].config).toEqual({ host: "h", port: 2121 });
+  });
+
+  it("NFS version, uid, gid and timeout go out as numbers too", async () => {
+    list.mockResolvedValue([]);
+    listKinds.mockResolvedValue(KINDS);
+    create.mockResolvedValue({});
+    const { container } = renderSection();
+    fireEvent.click(await screen.findByText("Add target"));
+    await screen.findByText("FTP (ftp)");
+    const select = container.querySelector("select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "nfs" } });
+    await screen.findByText("Server");
+    fireEvent.change(input(container, "Server"), { target: { value: "s" } });
+    fireEvent.change(input(container, "NFS version"), {
+      target: { value: "4" },
+    });
+    fireEvent.change(input(container, "UID"), { target: { value: "1000" } });
+    fireEvent.change(input(container, "GID"), { target: { value: "1000" } });
+    fireEvent.change(input(container, "Timeout"), { target: { value: "30" } });
+    fireEvent.change(container.querySelector('input[type="text"]')!, {
+      target: { value: "t2" },
+    });
+    const pass = Array.from(
+      container.querySelectorAll('input[type="password"]'),
+    ).at(-1) as HTMLInputElement;
+    fireEvent.change(pass, { target: { value: "passphrase-123" } });
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][0].config).toEqual({
+      server: "s",
+      version: 4,
+      uid: 1000,
+      gid: 1000,
+      timeout_s: 30,
+    });
   });
 });
 
