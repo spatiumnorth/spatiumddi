@@ -420,6 +420,54 @@ header.
 
 Alembic is idempotent, so re-running the migrate Job is always safe.
 
+**A migration never waits silently on a dead client's lock (#3932).** The
+1.0.0 upgrade drill left the API "initialising" for over two hours: the
+migration's `ALTER TABLE` queued behind a session an old api pod had left *idle
+in transaction*. The pod was gone, but PostgreSQL never noticed (the primary had
+moved to another node, and the default TCP keepalive is about 2 h 11 min), and
+nothing ended the session. Three layers now stop that, none needing a restart:
+
+- **Server side.** `postgresql.cnpg.parameters` sets the TCP keepalives
+  (`tcp_keepalives_idle` 60 s, `_interval` 10 s, `_count` 6), so a silent
+  peer's session is dropped in about two minutes: that is what fixes the
+  drill's case. It also sets `idle_in_transaction_session_timeout` to 1 h, a
+  backstop for a client that is alive but stuck in an open transaction. It is
+  an hour rather than minutes on purpose: some work legitimately idles in a
+  transaction for a while (a scheduled backup's session waits through the
+  whole `pg_dump`, up to 30 min, and the upload; a bundle render for a very
+  large DNS group computes between statements; a batched WinRM push waits
+  between chunks), and Postgres ending that session turns slow work into an
+  error. All four are reloads: CNPG applies them to a formed cluster without a
+  rolling restart. The in-chart standalone Postgres takes the same values as
+  `-c` arguments (`postgresql.idleInTransactionSessionTimeout`); that one
+  changes the pod template, so the first upgrade to this chart restarts it
+  once. Set `"0"` to turn the idle timeout off.
+- **The migrate command** (`alembic upgrade`, so the Job and the compose
+  `migrate` service alike) sets `lock_timeout` to
+  `MIGRATION_LOCK_TIMEOUT_SECONDS` (default 30), so a revision waiting on a
+  lock leaves the lock queue instead of stalling every query queued behind it.
+  While a revision waits it samples `pg_blocking_pids` of the migrating backend
+  from a second connection; after each timed-out wait it logs `migration
+  waiting on lock held by pid N (state, age, application name)` for those
+  blockers, and ends the ones that are `idle in transaction`, belong to the
+  app's own database role and have been idle longer than `MIGRATION_STALE_IDLE_TXN_SECONDS` (default 300,
+  `0` disables), logging each pid, and retries after a pause of up to 30 s.
+  It retries **without limit** by default: a migration held up by a
+  legitimate long holder, such as a backup's `pg_dump` (which holds a lock on
+  every table and is active, not idle; a backup's own idle session holds no
+  lock the migration waits on, so it is left alone), waits it out and then succeeds, as it
+  did before. `MIGRATION_LOCK_RETRIES` bounds it (`0` gives up on the first
+  timeout). Nothing is ended unless a lock wait has actually timed out.
+  Revisions commit one by one, so a retry resumes where it stopped. `alembic
+  current`, `stamp` and `downgrade` never end a session.
+- A session the old api opened before this release's settings applied keeps the
+  old keepalive (about 2 h 11 min), since a reloaded setting only reaches a
+  session when its client next sends a message; the migration ends it itself
+  through the rule above.
+- **Still stuck?** Find the holder with `SELECT pid, state, state_change FROM
+  pg_stat_activity WHERE state LIKE 'idle in transaction%'` and end it with
+  `pg_terminate_backend(pid)`.
+
 **Placement (#3207).** The Job's pod follows the api: `migrate.nodeSelector`,
 `migrate.tolerations` and `migrate.affinity` default to unset, meaning
 `api.nodeSelector` / `api.tolerations` / `api.affinity.nodeAffinity` (the
