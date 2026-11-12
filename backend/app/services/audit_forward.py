@@ -565,8 +565,9 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
             # straddling the 200-char cut is no longer an exact match.
             body_preview=redact(resp.text, url, auth_header)[:200],
         )
+        preview = " ".join(redact(resp.text, url, auth_header)[:200].split())
         raise httpx.HTTPStatusError(
-            f"webhook answered HTTP {resp.status_code}",
+            f"webhook answered HTTP {resp.status_code}" + (f": {preview}" if preview else ""),
             request=resp.request,
             response=resp,
         )
@@ -921,10 +922,22 @@ FILTERED = "filtered"
 FAILED = "failed"
 
 
-async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) -> str:
+def _failure_reason(exc: Exception, *secrets: str) -> str:
+    """A failure's own words for the operator (#3931), secrets redacted. An
+    exception with no message (a timeout) is named by its type."""
+    text = redact(str(exc), *secrets).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
+
+
+async def _deliver_to_target(
+    target: dict[str, Any], payload: dict[str, Any], reasons: list[str] | None = None
+) -> str:
     """Deliver ``payload`` to one target; return DELIVERED / FILTERED /
     FAILED. Never raises — a transport failure is a FAILED outcome,
-    logged here exactly as it was when the exception was swallowed.
+    logged here exactly as it was when the exception was swallowed. When
+    ``reasons`` is given, the failure's redacted reason is appended to it
+    (the "Test target" probe shows it, #3931).
 
     This is the ONE function every forwarded event reaches a transport
     through — audit rows, alert events, the AI digest and the "Test
@@ -968,6 +981,8 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                     "audit_forward_smtp_missing_config",
                     target=target.get("name"),
                 )
+                if reasons is not None:
+                    reasons.append("SMTP host, sender address and recipients must all be set")
                 return FAILED
             subject, email_body = _smtp_subject_body(payload)
             await _send_smtp(
@@ -988,8 +1003,19 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                 target=target.get("name"),
                 kind=kind,
             )
+            if reasons is not None:
+                reasons.append(f"unknown target kind {kind!r}")
             return FAILED
     except Exception as exc:  # noqa: BLE001
+        if reasons is not None:
+            reasons.append(
+                _failure_reason(
+                    exc,
+                    target.get("url") or "",
+                    target.get("auth_header") or "",
+                    target.get("smtp_password") or "",
+                )
+            )
         logger.warning(
             "audit_forward_target_failed",
             target=target.get("name"),
