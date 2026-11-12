@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import { Field } from "@/pages/dhcp/_shared";
@@ -3290,7 +3291,7 @@ export function CreateSubnetModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={onClose}
@@ -9131,7 +9132,7 @@ function EditSubnetModalForm({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={() => onClose()}
@@ -13376,7 +13377,7 @@ export function CreateBlockModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={onClose}
@@ -13870,7 +13871,7 @@ function EditBlockModalForm({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={() => onClose()}
