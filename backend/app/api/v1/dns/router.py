@@ -6913,7 +6913,9 @@ async def update_zone(
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
-        await _enforce_no_records_in_other_view(db, zone.id, changes["view_id"])  # #3839
+        await _enforce_no_records_in_other_view(
+            db, zone.id, changes["view_id"], already_pinned=zone.view_id is not None
+        )  # #3839
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -9751,13 +9753,18 @@ async def _enforce_zone_view_in_group(
         )
 
 
-async def _enforce_no_records_in_other_view(db: DB, zone_id: uuid.UUID, pin: uuid.UUID) -> None:
+async def _enforce_no_records_in_other_view(
+    db: DB, zone_id: uuid.UUID, pin: uuid.UUID, *, already_pinned: bool = False
+) -> None:
     """422 pinning a zone while it holds a record scoped to another view (#3839).
 
     A pinned zone renders into its pin alone, so a record scoped to a different
     view is served in no view. The record API refuses writing that state
     (``_enforce_views_in_zone_group``); a change of the zone's pin is held to
-    the same rule, naming the records and their views.
+    the same rule, naming the records and their views. While the zone is still
+    pinned, the record API takes no view but that pin, so moving a record to the
+    new view is refused too (#3943): the remedy then is removing the records'
+    view first, and the words say only that.
     """
     rows = (
         await db.execute(
@@ -9772,12 +9779,18 @@ async def _enforce_no_records_in_other_view(db: DB, zone_id: uuid.UUID, pin: uui
         return
     shown = ", ".join(f"{n} {t} {v} (view '{vn}')" for n, t, v, vn in rows[:5])
     more = ", and more" if len(rows) > 5 else ""
+    remedy = (
+        "Remove their view first (the zone is pinned to its current view, so a "
+        "record cannot be moved to the new one until the zone is), then scope "
+        "them to the new view."
+        if already_pinned
+        else "Move those records to the new view or remove their view first."
+    )
     raise HTTPException(
         status_code=422,
         detail=(
             "Cannot pin this zone to that view: it holds records scoped to another "
-            f"view, which would then be rendered in no view: {shown}{more}. Move "
-            "those records to the new view or remove their view first."
+            f"view, which would then be rendered in no view: {shown}{more}. {remedy}"
         ),
     )
 
