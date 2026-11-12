@@ -1359,6 +1359,8 @@ async def update_assignments(
     # re-renders (drops the blocklist). Read from the eager-loaded relationships
     # before we reassign them.
     old_group_ids = _blocklist_group_ids(bl)
+    old_direct_group_ids = {g.id for g in bl.server_groups}
+    old_view_ids = {v.id for v in bl.views}
 
     changed: list[str] = []
     if body.server_group_ids is not None:
@@ -1382,8 +1384,9 @@ async def update_assignments(
                 raise technitium_api_scope.refusal(
                     f"blocklists are not applied to the Technitium server " f"(group {g.name!r})."
                 )
+        if {g.id for g in groups} != old_direct_group_ids:
+            changed.append("server_group_ids")
         bl.server_groups = groups
-        changed.append("server_group_ids")
 
     if body.add_server_group_ids or body.remove_server_group_ids:
         current = {g.id: g for g in bl.server_groups}
@@ -1413,8 +1416,13 @@ async def update_assignments(
         )
         if len(views) != len(set(body.view_ids)):
             raise HTTPException(status_code=404, detail="One or more views not found")
+        if {v.id for v in views} != old_view_ids:
+            changed.append("view_ids")
         bl.views = views
-        changed.append("view_ids")
+
+    if not changed:
+        # #3738 — nothing stored changed: no audit row, no wake.
+        return await _respond(db, bl)
 
     if body.add_view_ids or body.remove_view_ids:
         vcurrent = {v.id: v for v in bl.views}
