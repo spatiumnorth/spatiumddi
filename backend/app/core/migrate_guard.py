@@ -148,8 +148,9 @@ class BlockerWatcher:
     migration can only be read DURING the wait, from a second connection.
     ``env.py`` runs sync code inside an asyncio ``run_sync``, so the watcher
     is a daemon thread with its own event loop and its own asyncpg
-    connection. :meth:`take` returns (and clears) every session seen blocking
-    since the last call. Any failure here is swallowed: with no samples the
+    connection. :meth:`take` returns (and clears) the sessions in the most
+    recent non-empty sample of blockers, so a session that stopped blocking
+    earlier in the wait is never a target. Any failure here is swallowed: with no samples the
     guard ends nothing, which is the safe direction.
     """
 
@@ -188,9 +189,13 @@ class BlockerWatcher:
         try:
             while not self._stop.is_set():
                 rows = await conn.fetch(_BLOCKERS_SQL, self._pid)
-                with self._lock:
-                    for r in rows:
-                        self._seen[r["pid"]] = dict(r)
+                # Keep only the latest NON-empty sample: a session that blocked
+                # earlier in the wait but no longer does must not be ended at the
+                # next timed-out wait. An empty sample (the wait just ended) keeps
+                # the last real blocker set for take().
+                if rows:
+                    with self._lock:
+                        self._seen = {r["pid"]: dict(r) for r in rows}
                 await asyncio.sleep(self._interval)
         finally:
             await conn.close()
