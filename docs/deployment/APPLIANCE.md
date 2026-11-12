@@ -2848,7 +2848,10 @@ covers how to get off 2026.10.02-1 on each deployment shape (#3915).
 
 The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
 works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
-images (#1181).
+images (#1181). It went through in under 10 minutes, with DNS down for
+about 4 minutes during the reboot. A second, shorter DNS and DHCP
+interruption of a few seconds can follow about 3 minutes after boot
+(#3919).
 
 ### Multi-node cluster, from 2026.10.02-1
 
@@ -2865,56 +2868,105 @@ fixed in 1.0.0 but not in the release you are running:
   instance healthy. It is a false alarm (#1445, item 6).
 
 Nothing is harmed by either refusal: no run is created and no node is
-touched. The way off 2026.10.02-1 is **Fleet, node by node**. The same
-procedure converged a three-node cluster on 1.0.0-rc.2 with every
-reservation, record and address unchanged.
+touched. The way off 2026.10.02-1 is **Fleet, node by node**. The order
+below converged a three-node cluster on 1.0.0-rc.2 with DNS and DHCP
+serving on at least two nodes throughout. Whether every reservation,
+record and address came through unchanged was checked in an earlier run
+that used a different order; the check for this order is still owed.
 
-1. Wait until the cluster is healthy: every node Ready, CNPG healthy with
-   its replicas streaming.
-2. On the node's page in **Fleet**, press **Upgrade**, choose **From
-   external URL**, and give the 1.0.0 slot asset's release URL for your
-   architecture. The node fetches the image itself (about 1.8 GB) and
-   stages it in a few minutes. Its runner ends with `next-boot armed.
-   Operator needs to reboot to switch slots.`
-3. Press **Reboot** once that node has staged. **The reboot is your
-   step.** The Upgrade form in 2026.10.02-1 says the runner "reboots into
-   it", but the runner only writes the inactive slot and arms the next
-   boot. (1.0.0's form says "Reboot to boot the new slot".) The node boots
-   the new slot and commits it.
-4. If a node is still up a few minutes after its **Reboot**, reboot it
-   from its console or its hypervisor (#1445, item 7).
-5. Go to the next node only when the cluster is healthy again. **Members
-   first, the seed last.** The seed's first boot on 1.0.0 moves the
-   control plane to 1.0.0's images; the supervisor and every control-plane
-   Deployment moved within about 2 minutes of it.
+1. **Stage every node first, with no reboot.** On the node's page in
+   **Fleet**, press **Upgrade**, choose **From external URL**, and give
+   the 1.0.0 slot asset's release URL for your architecture. The node
+   fetches the image itself (about 1.9 GB) and writes it to its inactive
+   slot, which takes about 4 to 5 minutes per node. Its runner ends with
+   `next-boot armed. Operator needs to reboot to switch slots.` Do the
+   nodes one at a time, and start the next only once the previous node's
+   Fleet row shows the upgrade done and a reboot pending. Fleet shows the
+   upgrade still in flight, at step `bootloader`, for a while after the
+   runner has armed the next boot, so give it time.
+2. **Wait about 5 minutes after the last stage.** Each node's k3s keeps
+   importing the 1.0.0 images for about 3.5 minutes after its stage ends,
+   and the shared chart moves to 1.0.0's image tag about 80 seconds after
+   the first member boots 1.0.0. A node still importing when the chart
+   moves would meet the DNS and DHCP gap in #3136.
+3. **Reboot the members one at a time, then the seed.** The reboot is
+   your step: the Upgrade form in 2026.10.02-1 says the runner "reboots
+   into it", but the runner only writes the inactive slot and arms the
+   next boot. (1.0.0's form says "Reboot to boot the new slot".) Press
+   **Reboot** on the first member. Before pressing it on the next node,
+   wait until **every node is Ready, DNS and DHCP answer on each of them,
+   and the database has a primary**. Do not wait for all three database
+   replicas: a member that has booted 1.0.0 while the supervisor
+   DaemonSet is still 2026.10.02-1 loses its `spatium.io/role-control-plane`
+   label at every heartbeat, because the old supervisor cannot read the
+   host's cluster-join state through 1.0.0's tighter release-state
+   permissions. A database replica that has to move off that member then
+   cannot be placed again, so the database can sit at 2 of 3 replicas
+   until the seed has rebooted and the supervisors move to 1.0.0.
+4. **The seed's Fleet Reboot does nothing on 2026.10.02-1.** It is
+   accepted and then nothing happens (2 of 2 runs, #1445 item 7). Reboot
+   the seed from its hypervisor, as a guest reboot request rather than a
+   reset; that worked both times. Rebooting from its console was not
+   tested. Then see the API bullet under "What to expect".
+5. After the seed's first boot on 1.0.0 the supervisor and the
+   control-plane Deployments start moving to 1.0.0's images within about
+   3 minutes. How long the API then takes to become Ready depends on the
+   migration; see below.
 
 <!-- #3915-order -->
-The order proven so far is to stage and reboot each node in turn: finish
-one node's Upgrade and Reboot before starting the next, members first and
-the seed last. Staging every node first and rebooting them afterwards may
-shorten the DNS and DHCP gap below, and is being drilled on a fresh
-2026.10.02-1 cluster; this paragraph will be replaced with the result,
-which may recommend that order instead.
+Staging every node before rebooting any is the recommended order. In the
+drill it kept DNS and DHCP on at least two nodes at every 10-second
+sample, and no node was without DNS for more than 30 seconds or without
+DHCP for more than 40 seconds outside its own reboot, which took 2 to
+3.5 minutes. The other order, upgrading and rebooting each member in turn
+before the next, is the one #3136 describes: with it, nodes not yet
+upgraded lose DNS and DHCP.
 <!-- #3915-order -->
 
 What to expect:
 
-- **DNS and DHCP drop on nodes not yet upgraded (#3136).** From the
-  moment the first node reboots into 1.0.0, each node still on
-  2026.10.02-1 stops serving DNS and DHCP until its own Upgrade has
-  staged: the shared appliance chart is moved to 1.0.0's image tag, and
-  the agent pods there cannot start until those images are present. In
-  the three-node run the seed answered no DNS for almost 18 minutes, and
-  the DHCP agents were each down about 5 minutes. **Arrange another
-  resolver and another DHCP path for the whole upgrade**, not only for
-  each reboot. At least one node answered DNS at every sample, and no
-  client lost its lease.
+- **After the seed's reboot, the API and the console can show
+  "initialising" for a long time.** The 1.0.0 migration (`ff32b91acad8`)
+  waits for a lock held by a database session that the seed's old
+  2026.10.02-1 api left idle in a transaction, a parked DNS agent
+  long-poll. If the database primary is not on the seed, that session
+  outlives the pod that opened it, and nothing on the database ends it:
+  no idle-in-transaction timeout, no lock timeout, default keepalives. By
+  those settings it lasts about 2 hours 11 minutes after the seed went
+  down. In the drill the API still answered 502 43 minutes in. DNS and
+  DHCP keep serving throughout.
+  - **A manual way out (not yet drilled).** From the node holding the
+    database primary, end the stale sessions. The CNPG cluster in the
+    `spatium` namespace is `spatium-control-spatiumddi-postgresql`:
+
+    ```bash
+    kubectl -n spatium get pods \
+      -l cnpg.io/cluster=spatium-control-spatiumddi-postgresql,cnpg.io/instanceRole=primary
+    kubectl -n spatium exec -it <primary-pod> -c postgres -- \
+      psql -U postgres -d spatiumddi -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND state_change < now() - interval '5 minutes';"
+    ```
+
+    The migration is expected to continue within a minute.
+  - 1.0.0 itself now ends such sessions (#3932), so upgrades from 1.0.0
+    onwards do not hit this. #3932 may not be merged at the time you read
+    this; check the release notes for the release you install.
+- **Other things you will see.** The database primary moves three times;
+  every DNS and DHCP agent restarts twice (once when the chart moves,
+  once after the seed's boot), each restart a gap of 10 to 40 seconds on
+  that node; and a database replica on a member can crash-loop after the
+  seed's boot until the 1.0.0 API is back.
 - **No drain at each reboot (#1976).** A node goes down with its pods
   still Ready, so API requests through the other nodes can fail for up to
-  about a minute at each reboot. Its k3s can also restart while the new
-  slot is being written (#1804).
-- **Time.** About 47 minutes for three nodes: about 10 minutes for each
-  member and 18 for the seed.
+  about two minutes at a member's reboot. A node's k3s can also restart
+  while its slot is being written (#1804).
+- **Time.** Staging all three nodes takes about 14 minutes, and each
+  reboot about 3 minutes. The total depends on the migration wait above,
+  so no overall figure is given: the drill had not converged 1 hour 55
+  minutes after the first Upgrade.
+- **Kea leases are per node.** Each node's Kea keeps its own leases with
+  no HA, so a member asked directly can offer addresses another node has
+  leased. A site whose relay points at several nodes needs HA for shared
+  scopes.
 
 A cluster already on 1.0.0 or later uses the Rolling Upgrade tab as
 normal.
