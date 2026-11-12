@@ -12076,6 +12076,14 @@ export interface ProvisioningRequestListParams {
   offset?: number;
 }
 
+// What approving a pending request would do now, re-previewed server-side (#3934).
+export interface RequestCurrentPreview {
+  preview_text: string;
+  ok: boolean;
+  detail: string | null;
+  changed: boolean;
+}
+
 export interface SubmitRequestBody {
   kind: RequestKindId;
   args: Record<string, unknown>;
@@ -12118,6 +12126,10 @@ export const requestsApi = {
         total: Number.isFinite(header) ? header : r.data.length,
       };
     }),
+  currentPreview: (id: string) =>
+    api
+      .get<RequestCurrentPreview>(`/requests/${id}/current-preview`)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
   submit: (body: SubmitRequestBody) =>

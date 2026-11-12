@@ -60,6 +60,7 @@ from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
+    _refusal_text,
     approve_change_request,
     count_change_requests,
     get_change_request,
@@ -557,6 +558,75 @@ async def get_request(
 ) -> ProvisioningRequestResponse:
     _require_read(current_user)
     return await _respond(db, await _load_visible(db, req_id, current_user))
+
+
+class CurrentPreviewResponse(BaseModel):
+    """What approving the request would do if pressed now (#3934)."""
+
+    # The preview re-run against the estate as it is now.
+    preview_text: str
+    # False when the operation can no longer be applied as submitted; ``detail``
+    # then says why. Pressing Approve would end the request ``failed``.
+    ok: bool
+    detail: str | None = None
+    # True when ``preview_text`` differs from the one stored at submit.
+    changed: bool
+
+
+@router.get("/{req_id}/current-preview", response_model=CurrentPreviewResponse)
+async def get_current_preview(
+    req_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> CurrentPreviewResponse:
+    """Re-run the operation's preview now, as the caller.
+
+    The stored ``preview_text`` was composed at submit; the approval runs
+    against the estate as it is at the press (a subnet may have been bound to
+    another DNS zone since), so the Approve dialog reads this instead (#3934).
+    Read-only. A request that is no longer pending answers its stored text.
+    """
+    _require_read(current_user)
+    cr = await _load_visible(db, req_id, current_user)
+    stored = CurrentPreviewResponse(preview_text=cr.preview_text, ok=True, changed=False)
+    if cr.state != "pending":
+        return stored
+    from app.services.ai import operations  # noqa: PLC0415
+
+    op = operations.get_operation(cr.operation)
+    if op is None:
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text,
+            ok=False,
+            detail="Operation is not registered.",
+            changed=False,
+        )
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+        preview = await op.preview(db, current_user, args)
+    except HTTPException as exc:
+        await db.rollback()
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text, ok=False, detail=_refusal_text(exc.detail), changed=False
+        )
+    except Exception as exc:  # noqa: BLE001 — a refused preview is data, not a 500
+        await db.rollback()
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text,
+            ok=False,
+            detail=str(exc) or "The operation can no longer be applied.",
+            changed=False,
+        )
+    if not preview.ok:
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text,
+            ok=False,
+            detail=preview.detail or "The operation can no longer be applied.",
+            changed=False,
+        )
+    return CurrentPreviewResponse(
+        preview_text=preview.preview_text,
+        ok=True,
+        changed=preview.preview_text != cr.preview_text,
+    )
 
 
 # ── Decisions (delegated to the shared #62 spine) ──────────────────────────

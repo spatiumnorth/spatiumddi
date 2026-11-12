@@ -607,15 +607,45 @@ function DecisionModal({
     },
   });
 
+  // What approving does NOW (#3934): the stored text was composed at submit,
+  // and the approval runs against the estate as it is at the press.
+  const current = useQuery({
+    queryKey: ["provisioning-requests", "current-preview", request.id],
+    queryFn: () => requestsApi.currentPreview(request.id),
+    enabled: action === "approve",
+    staleTime: 0,
+    gcTime: 0,
+  });
+  const shownText =
+    action === "approve" && current.data?.ok
+      ? current.data.preview_text
+      : request.preview_text;
+
   return (
     <Modal title={title} onClose={onClose} wide>
       <div className="space-y-3">
         <div className="rounded border border-border bg-muted/40 p-2">
           <p className="whitespace-pre-wrap break-words text-xs font-medium">
-            {plainText(request.preview_text)}
+            {plainText(shownText)}
           </p>
           <TemplateLine request={request} />
         </div>
+        {action === "approve" && current.data?.changed ? (
+          <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+            This request changed since it was submitted. Approving does what is
+            shown above, not what the requester first read:{" "}
+            <span className="break-words">
+              {plainText(request.preview_text)}
+            </span>
+          </p>
+        ) : null}
+        {action === "approve" && current.data && !current.data.ok ? (
+          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
+            This can no longer be provisioned as requested:{" "}
+            {plainText(current.data.detail ?? "it was refused")} Approving will
+            mark the request failed.
+          </p>
+        ) : null}
         {request.justification ? (
           <div>
             <p className="text-[11px] font-medium text-muted-foreground">
