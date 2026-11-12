@@ -143,6 +143,9 @@ class ZoneMovePlan:
     # Records in the Trash: they move with the zone, answer nowhere, and are
     # left out of every other figure here (#3921).
     records_trashed: int = 0
+    # Trashed records whose view the move clears: restored later they come back
+    # shared (every view), so the widening acknowledgement covers them too.
+    records_trashed_widened: int = 0
     records_remapped: int = 0
     records_widened: int = 0
     records_cleared_inert: int = 0
@@ -609,9 +612,11 @@ async def assemble_move_plan(
         if deleted_at is None and new_id is not None and import_source != EXTERNAL_IMPORT_SOURCE:
             live_record_view_ids.add(new_id)
         if deleted_at is not None:
-            # In the Trash: the commit still rewrites its view, but it answers
-            # nowhere, so it is neither "remapped" nor "start answering in
-            # EVERY view" and must not ask for the widening acknowledgement.
+            # In the Trash: it answers nowhere now, so it stays out of the
+            # live figures — but the commit rewrites its view, and a cleared
+            # one comes back SHARED on restore. Counted apart; still acked.
+            if action == "cleared_widening":
+                plan.records_trashed_widened += 1
             continue
         if action == "remapped":
             plan.records_remapped += 1
@@ -950,7 +955,16 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             f"have ({detail}). They will become unscoped, which means they start answering in "
             f"EVERY view in the target rather than in one."
         )
-    if plan.zone_view_action == "cleared_widening" or plan.records_widened:
+    if plan.records_trashed_widened:
+        plan.warnings.append(
+            f"{plan.records_trashed_widened} records in the Trash would also lose their view "
+            f"and come back shared (answering in EVERY view) if restored."
+        )
+    if (
+        plan.zone_view_action == "cleared_widening"
+        or plan.records_widened
+        or plan.records_trashed_widened
+    ):
         plan.required_acknowledgements.append(ACK_VIEW_WIDENING)
 
     if plan.zone_view_action == "cleared_inert":

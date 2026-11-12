@@ -42,9 +42,10 @@ async def test_preview_view_figures_count_live_records_only(
 
 
 @pytest.mark.asyncio
-async def test_trash_only_scoped_records_ask_no_widening_acknowledgement(
+async def test_trash_only_widened_records_still_ask_acknowledgement(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    """A trashed record whose view is cleared comes back shared on restore."""
     token = await _superadmin(db_session, "root3921b")
     g1 = await _group(db_session, "g1")
     g3 = await _group(db_session, "g3")
@@ -57,5 +58,6 @@ async def test_trash_only_scoped_records_ask_no_widening_acknowledgement(
 
     body = (await _preview(client, token, zone, g3)).json()
     assert body["records_widened"] == 0
-    assert "view_widening" not in body["required_acknowledgements"]
-    assert body["records_trashed"] == 1
+    assert body["records_trashed_widened"] == 1
+    assert "view_widening" in body["required_acknowledgements"]
+    assert any("in the Trash" in w for w in body["warnings"])
