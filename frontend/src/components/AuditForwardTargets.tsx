@@ -424,6 +424,7 @@ function TargetModal({
   const qc = useQueryClient();
   const [form, setForm] = useState<AuditForwardTargetWrite>(initial);
   const [clearAuthHeader, setClearAuthHeader] = useState(false);
+  const [clearSmtpPassword, setClearSmtpPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const saveMut = useMutation({
@@ -439,10 +440,11 @@ function TargetModal({
       } else if (existingId && !body.auth_header) {
         delete body.auth_header;
       }
-      // Same dance for SMTP password — ``null`` (default on edit) means
-      // "keep". Empty string keeps as is; the operator opens a separate
-      // dialog to clear if they ever need to.
-      if (existingId && smtpPasswordSet && body.smtp_password === null) {
+      // Same for the SMTP password: blank (untouched, or typed then
+      // erased) keeps what is stored; only the explicit checkbox clears.
+      if (clearSmtpPassword) {
+        body.smtp_password = "";
+      } else if (!body.smtp_password) {
         delete body.smtp_password;
       }
       if (body.resource_types && body.resource_types.length === 0) {
@@ -826,6 +828,7 @@ function TargetModal({
                   autoComplete="new-password"
                   className={inputCls}
                   value={form.smtp_password ?? ""}
+                  disabled={clearSmtpPassword}
                   onChange={(e) =>
                     setForm({ ...form, smtp_password: e.target.value })
                   }
@@ -836,6 +839,16 @@ function TargetModal({
                   }
                 />
               </label>
+              {existingId && smtpPasswordSet && (
+                <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={clearSmtpPassword}
+                    onChange={(e) => setClearSmtpPassword(e.target.checked)}
+                  />
+                  Remove the stored password
+                </label>
+              )}
             </div>
             <label className="block">
               <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
