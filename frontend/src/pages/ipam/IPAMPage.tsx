@@ -4672,6 +4672,26 @@ const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 // ``permitsDeleteIp`` where the subnet's sets are known.
 // Clean Orphans is not on that allow-list: it takes ``delete`` on ``subnet``.
 // Pre-parsed address-set bounds (BigInt, IPv4 + IPv6), so a per-row
+/** Gate for a block's / space's selection Delete (n) (#3884): delete on
+ *  subnets when a subnet is ticked, delete on IP blocks when a block is. */
+function selectionDeleteGateFor(
+  perms: { can: (action: string, type: string) => boolean },
+  hasSubnets: boolean,
+  hasBlocks: boolean,
+) {
+  const subnetsOk = !hasSubnets || perms.can("delete", "subnet");
+  const blocksOk = !hasBlocks || perms.can("delete", "ip_block");
+  if (subnetsOk && blocksOk) return {};
+  return permissionGate(
+    false,
+    !subnetsOk && !blocksOk
+      ? `${NEEDS_SUBNET_DELETE}, and delete permission on IP blocks`
+      : !subnetsOk
+        ? NEEDS_SUBNET_DELETE
+        : NEEDS_BLOCK_DELETE,
+  );
+}
+
 // membership test does not re-parse the same strings on every render.
 type SetRanges = {
   contiguous: Array<{ lo: bigint; hi: bigint }>;
@@ -14439,6 +14459,14 @@ export function BlockDetailView({
     { label: spaceName, variant: "space", onClick: onSelectSpace },
     ...ancestors.map(
       (a): BreadcrumbItem => ({
+  // #3884: Delete (n) asks delete on subnets for a ticked subnet and delete
+  // on IP blocks for a ticked block, at the type level, before the approval
+  // gate (the delete handlers' own check).
+  const selectionDeleteGate = selectionDeleteGateFor(
+    perms,
+    selectedSubnetIds.length > 0,
+    hasBlocksSelected,
+  );
         label: a.network + (a.name ? ` (${a.name})` : ""),
         variant: "block",
         onClick: () => onSelectBlock(a),
@@ -14515,6 +14543,7 @@ export function BlockDetailView({
                   >
                     Sync DNS
                   </HeaderButton>
+                  {...selectionDeleteGate}
                 )}
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
                 <ServicesUsingButton
@@ -15927,6 +15956,12 @@ export function SpaceTableView({
         if (item.type === "subnet" && item.subnet) {
           const s = item.subnet;
           if (spaceFilter.network && !s.network.includes(spaceFilter.network))
+  // #3884: Delete (n), as on a block's selection.
+  const selectionDeleteGate = selectionDeleteGateFor(
+    perms,
+    selectedSubnetIds.length > 0,
+    hasBlocksSelected,
+  );
             return false;
           if (
             spaceFilter.name &&
@@ -16043,6 +16078,7 @@ export function SpaceTableView({
             {/* Add block is a primary space-level structural action (blocks are
                 the top-level child of a space), so it sits as a visible button
                 next to Add Subnet rather than hidden in a Tools ▾ dropdown
+                  {...selectionDeleteGate}
                 (#538). Find Free is a low-frequency read; promoted out too so we
                 don't leave a single-item dropdown. Ordering grammar per #465. */}
             <HeaderButton
