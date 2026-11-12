@@ -92,9 +92,15 @@ describe("AI Prompts gates (#3759)", () => {
     state.superadmin = false;
     renderPage();
     await screen.findByText("Other's prompt");
-    const btns = screen.getAllByRole("button", { name: /Only the creator/ });
+    // #3760 — a gated control keeps its action as its accessible name; the
+    // refusal reason is in its title.
+    const btns = screen.getAllByTitle(/Only the creator/);
     expect(btns).toHaveLength(2);
     btns.forEach((b) => expect((b as HTMLButtonElement).disabled).toBe(true));
+    expect(btns.map((b) => b.getAttribute("aria-label")).sort()).toEqual([
+      "Delete",
+      "Edit",
+    ]);
     expect(screen.queryByTitle("Edit")).toBeNull();
   });
 });
