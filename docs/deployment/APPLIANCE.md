@@ -4306,3 +4306,18 @@ success) commits the slot durable. **No reinstall required.**
 If the patch calls `spatium-grub-render`, it inherits all the renderer's
 safety guarantees: `grub-script-check` before swap, `.bak` preservation,
 atomic rename, and the boot-revert on failure.
+
+### Database sessions of a dead client (#3932)
+
+The control-plane CNPG cluster inherits the chart's `postgresql.cnpg.parameters`
+(the supervisor's HelmChartConfig only overrides `shared_buffers` and
+`max_connections`), so every appliance carries
+`idle_in_transaction_session_timeout=15min` and TCP keepalives of 60 s / 10 s / 6.
+A session whose pod or node died is dropped within minutes, instead of holding a
+migration's lock for 2 h+ as in the 1.0.0 upgrade drill. These are reloads, not
+restarts. The migrate Job also ends stale idle-in-transaction sessions of the app
+role and retries on a lock timeout; see
+[Kubernetes](KUBERNETES.md). On a seed upgrading from 2026.10.02-1 the old api
+may still hold such a session until the new chart's database settings apply; if
+the API stays "initialising", end it with `pg_terminate_backend(pid)` for the
+`idle in transaction` row in `pg_stat_activity`.

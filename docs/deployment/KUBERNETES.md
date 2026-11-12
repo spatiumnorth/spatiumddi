@@ -420,6 +420,38 @@ header.
 
 Alembic is idempotent, so re-running the migrate Job is always safe.
 
+**A migration never waits silently on a dead client's lock (#3932).** The
+1.0.0 upgrade drill left the API "initialising" for over two hours: the
+migration's `ALTER TABLE` queued behind a session an old api pod had left *idle
+in transaction*. The pod was gone, but PostgreSQL never noticed (the primary had
+moved to another node, and the default TCP keepalive is about 2 h 11 min), and
+nothing ended the session. Three layers now stop that, none needing a restart:
+
+- **Server side.** `postgresql.cnpg.parameters` sets
+  `idle_in_transaction_session_timeout` (15 min) and the TCP keepalives
+  (`tcp_keepalives_idle` 60 s, `_interval` 10 s, `_count` 6, so a silent peer is
+  dropped in about two minutes). All four are reloads: CNPG applies them to a
+  formed cluster without a rolling restart. The in-chart standalone Postgres
+  takes the same values as `-c` arguments (`postgresql.idleInTransactionSessionTimeout`);
+  that one changes the pod template, so the first upgrade to this chart
+  restarts it once. Set `"0"` to turn the idle timeout off. Nothing in the app
+  idles in a transaction for minutes: requests, agent long-polls (#3479, #3606)
+  and tasks commit or release theirs, and backups and restore drills use
+  connections that are active, not idle.
+- **The migrate command** (`alembic upgrade`, so the Job and the compose
+  `migrate` service alike) first ends sessions that are `idle in transaction`,
+  belong to the app's own database role, and have been idle longer than
+  `MIGRATION_STALE_IDLE_TXN_SECONDS` (default 300, `0` disables), logging each
+  pid. It then sets `lock_timeout` to `MIGRATION_LOCK_TIMEOUT_SECONDS` (default
+  30) and retries a timed-out revision up to `MIGRATION_LOCK_RETRIES` times
+  (default 10) with a growing pause, logging `migration waiting on lock held by
+  pid N (state, age, application name)` each time. Revisions commit one by one,
+  so a retry resumes where it stopped. `alembic current`, `stamp` and
+  `downgrade` never end a session.
+- **Still stuck?** Find the holder with `SELECT pid, state, state_change FROM
+  pg_stat_activity WHERE state LIKE 'idle in transaction%'` and end it with
+  `pg_terminate_backend(pid)`.
+
 **Placement (#3207).** The Job's pod follows the api: `migrate.nodeSelector`,
 `migrate.tolerations` and `migrate.affinity` default to unset, meaning
 `api.nodeSelector` / `api.tolerations` / `api.affinity.nodeAffinity` (the

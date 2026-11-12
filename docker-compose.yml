@@ -6,6 +6,19 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # #3932 — end a session whose client has gone: a dead client's open
+    # transaction must not hold a migration's lock for hours. Reload-only;
+    # see docs/deployment/DOCKER.md.
+    command:
+      - postgres
+      - -c
+      - idle_in_transaction_session_timeout=15min
+      - -c
+      - tcp_keepalives_idle=60
+      - -c
+      - tcp_keepalives_interval=10
+      - -c
+      - tcp_keepalives_count=6
     networks:
       - spatiumddi
     environment:

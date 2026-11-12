@@ -809,6 +809,11 @@ postgresql:
   # limit below to hold it (see ``resources``). Changing it, or the pools /
   # HPA it derives from, restarts the Postgres pod once.
   maxConnections: ""
+  # #3932 — standalone only: ``idle_in_transaction_session_timeout`` ("0"
+  # turns it off). The CNPG kind sets it in ``cnpg.parameters``. The pod's
+  # args also carry the TCP keepalives, so the first upgrade to this chart
+  # restarts a standalone Postgres once.
+  idleInTransactionSessionTimeout: "15min"
   image:
     repository: postgres
     tag: "16-alpine"
@@ -1029,6 +1034,29 @@ postgresql:
       # unbounded pg_wal fills the node's /var and everything else on it.
       # A reload, like ``wal_keep_size``.
       max_slot_wal_keep_size: "3GB"
+      # #3932 — a session whose client has gone must not outlive it. The
+      # 1.0.0 upgrade drill left an api pod's session idle in transaction on
+      # a primary that had since moved; PostgreSQL never noticed the peer
+      # was dead (default keepalive: 2 h + 9 x 75 s) and the migration's
+      # ALTER TABLE queued behind its lock for 2 h+, with the API
+      # "initialising" throughout. Two independent backstops:
+      # * ``idle_in_transaction_session_timeout`` ends a session that has sat
+      #   in an open transaction this long. Nothing in the app idles in a
+      #   transaction for minutes (every request, agent long-poll and task
+      #   commits or releases its transaction; pg_dump-based backups and
+      #   restore drills use their own connections, which are active, not
+      #   idle); 15 min clears the one long path, a backup archive upload
+      #   after its read, which tolerates losing the session (#2353).
+      #   "0" turns it off.
+      # * the TCP keepalives make the server probe a silent peer after 60 s,
+      #   every 10 s, and drop it after 6 misses: a dead client's session is
+      #   gone within ~2 min of the peer dying.
+      # All three are reloads (sighup / user context), not restarts: CNPG
+      # applies them to a formed cluster without a rolling restart.
+      idle_in_transaction_session_timeout: "15min"
+      tcp_keepalives_idle: "60"
+      tcp_keepalives_interval: "10"
+      tcp_keepalives_count: "6"
     # PodMonitor for Prometheus Operator. Default false because most
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:

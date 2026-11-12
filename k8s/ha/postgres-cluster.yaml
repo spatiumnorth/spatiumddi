@@ -75,6 +75,13 @@ spec:
       # as the umbrella chart's postgresql.cnpg.parameters.
       wal_keep_size: "2GB"
       max_slot_wal_keep_size: "3GB"
+      # #3932 — drop a session whose client died (idle in transaction past
+      # 15 min, or a peer silent past ~2 min) so it cannot hold a migration's
+      # lock for hours. Reloads, not restarts. Same values as the umbrella chart.
+      idle_in_transaction_session_timeout: "15min"
+      tcp_keepalives_idle: "60"
+      tcp_keepalives_interval: "10"
+      tcp_keepalives_count: "6"
 
   bootstrap:
     initdb:

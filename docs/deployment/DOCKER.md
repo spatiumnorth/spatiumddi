@@ -232,6 +232,8 @@ The default single Redis container uses `maxmemory-policy allkeys-lru` for Celer
 
 ## 8. Upgrading
 
+> **A dead client cannot block the migration (#3932).** The bundled Postgres starts with `idle_in_transaction_session_timeout=15min` and TCP keepalives of 60 s / 10 s / 6 (a vanished peer's session is dropped in about two minutes), and `migrate` ends stale `idle in transaction` sessions of the app's role (idle over `MIGRATION_STALE_IDLE_TXN_SECONDS`, default 300) before it starts, then sets a `MIGRATION_LOCK_TIMEOUT_SECONDS` (30) `lock_timeout` and retries up to `MIGRATION_LOCK_RETRIES` (10) times, logging `migration waiting on lock held by pid N`. These Postgres settings reload without a restart; an external database needs the same settings applied by its operator.
+
 > **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See §9 below for the full backup / restore surface.
 
 ```bash

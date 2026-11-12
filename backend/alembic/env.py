@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,6 +10,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import all models so Alembic can detect them for autogenerate
+from app.core import migrate_guard
 from app.core.schema_check import explain_unknown_revision
 from app.models import Base  # noqa: F401 — registers all mapped classes
 
@@ -94,15 +96,54 @@ def run_migrations_offline() -> None:
         _run_migrations()
 
 
+def _guard_enabled() -> bool:
+    """The lock guard (#3932) belongs to ``upgrade`` only.
+
+    ``alembic current`` (the ``wait-for-migrate`` init containers) and
+    ``stamp`` / ``downgrade`` must never end another session. A programmatic
+    ``command.upgrade`` has no ``cmd_opts`` and gets the guard.
+    """
+    opts = getattr(config, "cmd_opts", None)
+    cmd = getattr(opts, "cmd", None)
+    if not cmd:
+        return True
+    return getattr(cmd[0], "__name__", "") == "upgrade"
+
+
 def do_run_migrations(connection: Connection) -> None:
+    guard = _guard_enabled()
+    if guard:
+        # #3932 — a session left idle in transaction by a dead client held
+        # this migration's ALTER for 2 h+. End the provably abandoned ones,
+        # then bound every lock wait.
+        migrate_guard.terminate_stale_idle_sessions(connection)
+        migrate_guard.apply_lock_timeout(connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
         transaction_per_migration=TRANSACTION_PER_MIGRATION,
     )
-    with context.begin_transaction():
-        _run_migrations()
+    retries = migrate_guard.lock_retries() if guard else 0
+    attempt = 0
+    while True:
+        try:
+            with context.begin_transaction():
+                _run_migrations()
+            return
+        except Exception as exc:  # noqa: BLE001 — re-raised unless a lock timeout
+            if not (guard and migrate_guard.is_lock_timeout(exc)) or attempt >= retries:
+                raise
+            attempt += 1
+            # Each revision commits on its own, so the retry resumes at the
+            # revision that was waiting (alembic re-reads alembic_version).
+            if connection.in_transaction():
+                connection.rollback()
+            migrate_guard.log_blockers(
+                migrate_guard.blocker_report(connection), attempt=attempt, retries=retries
+            )
+            time.sleep(migrate_guard.backoff_seconds(attempt))
+            migrate_guard.terminate_stale_idle_sessions(connection)
 
 
 async def run_async_migrations() -> None:
