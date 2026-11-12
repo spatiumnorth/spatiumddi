@@ -66,3 +66,26 @@ async def test_unauthenticated_403_is_not_audited(
     assert resp.status_code in (401, 403)
     res = await db_session.execute(select(AuditLog).where(AuditLog.result == "denied"))
     assert res.scalars().all() == []
+
+
+async def test_non_403_http_errors_are_untouched_and_unaudited(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    user, headers = await _plain_user(db_session)
+    user_id = user.id
+    missing = await client.get("/api/v1/no-such-route-3644", headers=headers)
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Not Found"}
+    anon = await client.get("/api/v1/users/me")
+    assert anon.status_code in (401, 403)
+    assert await _denied(db_session, user_id) == []
+
+
+async def test_403_body_and_status_match_the_stock_response(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _plain_user(db_session)
+    resp = await client.post("/api/v1/settings/oui/refresh", headers=headers)
+    assert resp.status_code == 403
+    assert list(resp.json()) == ["detail"]
+    assert resp.headers["content-type"] == "application/json"
