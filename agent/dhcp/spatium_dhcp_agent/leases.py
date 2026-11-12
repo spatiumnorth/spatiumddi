@@ -74,6 +74,14 @@ _BATCH_MAX_BUFFER = 5000
 # the thread goes back to tailing.
 _DRAIN_INTERVAL = 5.0
 _DRAIN_BUDGET = 5.0
+# #3773 — a lease batch the control plane is still committing is not lost:
+# give up on it after 15 s and the resend's batch receipt waits for the
+# original's commit anyway (#1077), holding a server connection while it does,
+# then answers duplicate. Under a busy Kea HA pair a batch can take longer
+# than 15 s, so the read wait matches the frontend proxy's 60 s instead. The
+# connect wait stays short, so an unreachable control plane still spools at
+# once. Snapshot pages share this client.
+_POST_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 
 # "3" is Kea 3.0's "released" (lease-affinity) state. It used to fall through
 # to "active", mirroring a lease the client had released as live.
@@ -228,7 +236,7 @@ class LeaseWatcher:
         return httpx.Client(
             base_url=self.cfg.control_plane_url,
             verify=self.cfg.httpx_verify(),
-            timeout=15.0,
+            timeout=_POST_TIMEOUT,
         )
 
     # ── delivery ─────────────────────────────────────────────────────

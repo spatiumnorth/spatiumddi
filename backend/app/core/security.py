@@ -7,9 +7,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import bcrypt
-from jose import JWTError, jwt
 
 from app.config import settings
+from app.core import jwt_compat as jwt
+from app.core.jwt_compat import JWTError
 
 ALGORITHM = "HS256"
 

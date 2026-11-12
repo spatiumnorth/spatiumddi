@@ -19,7 +19,6 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
@@ -32,6 +31,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.http_etag import etag_matches, format_etag
+from app.core.jwt_compat import JWTError
 from app.models.bgp_looking_glass import BGPLGPeer, LookingGlassCollector
 from app.services.agents.config_apply import apply_reported_status
 from app.services.agents.server_gone import refresh_agent_server

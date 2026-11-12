@@ -64,6 +64,13 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
  && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
+ # #3852 — OpenShift's restricted SCC starts the container as a random uid in
+ # group 0 and no other. Group 0 owning + group-writable is what lets that uid
+ # use every path the agent and named write; named keeps its CAP_NET_BIND_SERVICE
+ # file capability for :53 (see the setcap above). A no-op when the entrypoint
+ # starts as root and drops to ``spatium`` as before.
+ && chgrp -R 0 /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
+ && chmod -R g=u /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
  && { \
       echo "alpine_release=$(cat /etc/alpine-release)"; \
       apk info -v 2>/dev/null \

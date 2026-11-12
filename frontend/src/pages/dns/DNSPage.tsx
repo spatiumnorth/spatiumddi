@@ -1192,8 +1192,8 @@ function GroupModalForm({
   const isRecursive =
     pickedRecursive ?? dnsDefaults?.dns_recursive_by_default ?? true;
   const setIsRecursive = (v: boolean) => setPickedRecursive(v);
-  // BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
-  // ≥2-server BIND9 groups, and BIND 9.18+ is required.
+  // BIND9 catalog zones (RFC 9432). Off by default. The group primary
+  // publishes the catalog for secondaries outside the group (#3764).
   const [catalogZonesEnabled, setCatalogZonesEnabled] = useState(
     group?.catalog_zones_enabled ?? false,
   );
@@ -1368,12 +1368,10 @@ function GroupModalForm({
           </span>
         </label>
 
-        {/* BIND9 catalog zones (RFC 9432). The producer is the group's
-            is_primary=True bind9 server; every other bind9 member joins
-            as a consumer and pulls members from the catalog instead of
-            getting per-zone config push. Pointless on a single-server
-            group; the toggle is kept available so adding a second server
-            later just works. */}
+        {/* BIND9 catalog zones (RFC 9432). The group's is_primary server
+            publishes the catalog; members of the group never consume it,
+            because each already gets every zone pushed (#3764). It is for
+            BIND secondaries outside the group. */}
         <div className="rounded border bg-muted/20 p-3">
           <label className="flex items-center gap-2 cursor-pointer">
             <input
@@ -1385,8 +1383,9 @@ function GroupModalForm({
             <span className="text-sm font-medium">Use BIND9 catalog zones</span>
           </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Distribute zones via one catalog instead of per-server config push.
-            Requires BIND 9.18+. Skip on single-server groups.
+            The group primary publishes a catalog of this group&apos;s zones for
+            BIND secondaries outside SpatiumDDI (BIND 9.18+). Servers in this
+            group already get every zone and don&apos;t use it.
           </p>
           {group?.catalog_unsupported_warning && (
             <p className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-700 dark:text-amber-400">
@@ -2554,7 +2553,7 @@ function DnssecCard({
   const signingServers = info.data?.signing_servers ?? 0;
   const signingUnmanaged = info.data?.signing_unmanaged ?? false;
   const unmanagedNote =
-    "SpatiumDDI does not sign zones on Technitium: it signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
+    "DNSSEC is not supported on Technitium in 1.0: SpatiumDDI signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
@@ -10588,7 +10587,7 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
-function BlocklistScopeModal({
+export function BlocklistScopeModal({
   list,
   group,
   views,
@@ -10600,20 +10599,25 @@ function BlocklistScopeModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const [wholeGroup, setWholeGroup] = useState(
-    list.applied_group_ids.includes(group.id),
-  );
+  // What the dialog opened with: save sends only the DIFFERENCE from this,
+  // as add / remove deltas, so a group or view another client attached since
+  // the tab loaded is never dropped by a replace-the-set write (#3737).
+  const [initialWhole] = useState(list.applied_group_ids.includes(group.id));
+  const [wholeGroup, setWholeGroup] = useState(initialWhole);
   // Only THIS group's views — the checkbox list below renders no others, so
   // seeding from the raw ``applied_view_ids`` would park an un-unpickable
   // id in the state that the footer then counts ("Applies to 1 view" about a
   // view of some other group) and that ships duplicated in the PUT alongside
   // ``otherViews``.
-  const [picked, setPicked] = useState<Set<string>>(() => {
+  const [initialPicked] = useState<Set<string>>(() => {
     const thisGroups = new Set(views.map((v) => v.id));
     return new Set(
       (list.applied_view_ids ?? []).filter((v) => thisGroups.has(v)),
     );
   });
+  const [picked, setPicked] = useState<Set<string>>(
+    () => new Set(initialPicked),
+  );
   const [error, setError] = useState("");
 
   const { data: servers = [] } = useQuery({
@@ -10626,17 +10630,22 @@ function BlocklistScopeModal({
 
   const saveMut = useMutation({
     mutationFn: () => {
-      // Preserve assignments to OTHER groups and to views of other groups —
-      // this modal only speaks for the group it was opened from, and the
-      // endpoint replaces each list wholesale.
-      const otherGroups = list.applied_group_ids.filter((g) => g !== group.id);
-      const thisGroupsViews = new Set(views.map((v) => v.id));
-      const otherViews = (list.applied_view_ids ?? []).filter(
-        (v) => !thisGroupsViews.has(v),
+      // Deltas only: this modal speaks for THIS group and its views, and
+      // the server applies them to the stored sets, so assignments made
+      // elsewhere since the tab loaded survive.
+      const addViews = Array.from(picked).filter((v) => !initialPicked.has(v));
+      const removeViews = Array.from(initialPicked).filter(
+        (v) => !picked.has(v),
       );
       return dnsBlocklistApi.updateAssignments(list.id, {
-        server_group_ids: wholeGroup ? [...otherGroups, group.id] : otherGroups,
-        view_ids: [...otherViews, ...Array.from(picked)],
+        ...(wholeGroup && !initialWhole
+          ? { add_server_group_ids: [group.id] }
+          : {}),
+        ...(!wholeGroup && initialWhole
+          ? { remove_server_group_ids: [group.id] }
+          : {}),
+        ...(addViews.length ? { add_view_ids: addViews } : {}),
+        ...(removeViews.length ? { remove_view_ids: removeViews } : {}),
       });
     },
     onSuccess: () => {
@@ -10768,7 +10777,7 @@ function BlocklistScopeModal({
   );
 }
 
-function BlocklistsTab({ group }: { group: DNSServerGroup }) {
+export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const [selected, setSelected] = useState<DNSBlockList | null>(null);
@@ -10900,12 +10909,12 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       list: DNSBlockList;
       assign: boolean;
     }) => {
-      const ids = new Set(list.applied_group_ids);
-      if (assign) ids.add(group.id);
-      else ids.delete(group.id);
-      return dnsBlocklistApi.updateAssignments(list.id, {
-        server_group_ids: Array.from(ids),
-      });
+      return dnsBlocklistApi.updateAssignments(
+        list.id,
+        assign
+          ? { add_server_group_ids: [group.id] }
+          : { remove_server_group_ids: [group.id] },
+      );
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
   });
@@ -10939,7 +10948,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
-            server_group_ids: [...l.applied_group_ids, group.id],
+            add_server_group_ids: [group.id],
           }),
         ),
       );
@@ -10957,7 +10966,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
-            server_group_ids: l.applied_group_ids.filter((g) => g !== group.id),
+            remove_server_group_ids: [group.id],
           }),
         ),
       );
