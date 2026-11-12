@@ -3863,23 +3863,10 @@ async def _sync_dns_record(
     return True
 
 
-def _compute_free_cidrs(
-    block_network: str,
-    child_networks: list[str],
-    max_results: int = 200,
-) -> list[dict[str, Any]]:
-    """Return a sorted list of free CIDR ranges inside ``block_network``.
-
-    Each entry has ``network`` (CIDR), ``first``, ``last`` (string IPs),
-    and ``size`` (usable address count for the free gap, counted as raw
-    addresses — network/broadcast are not excluded because a free gap
-    is not a routable subnet yet).
-
-    The algorithm subtracts each existing child network from the block
-    using ``ipaddress.Network.address_exclude`` repeatedly. This is
-    correct for arbitrary combinations of child sizes and does not
-    require them to be aligned.
-    """
+def _free_networks(
+    block_network: str, child_networks: list[str]
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Every free CIDR inside ``block_network``, sorted by address, uncapped."""
     block = ipaddress.ip_network(block_network, strict=False)
 
     # Start with a single working set containing the block itself.
@@ -3903,8 +3890,28 @@ def _compute_free_cidrs(
                 next_working.append(net)
         working = next_working
 
-    # Sort by network address and build result
     working.sort(key=lambda n: int(n.network_address))
+    return working
+
+
+def _compute_free_cidrs(
+    block_network: str,
+    child_networks: list[str],
+    max_results: int = 200,
+) -> list[dict[str, Any]]:
+    """Return a sorted list of free CIDR ranges inside ``block_network``.
+
+    Each entry has ``network`` (CIDR), ``first``, ``last`` (string IPs),
+    and ``size`` (usable address count for the free gap, counted as raw
+    addresses — network/broadcast are not excluded because a free gap
+    is not a routable subnet yet).
+
+    The algorithm subtracts each existing child network from the block
+    using ``ipaddress.Network.address_exclude`` repeatedly. This is
+    correct for arbitrary combinations of child sizes and does not
+    require them to be aligned.
+    """
+    working = _free_networks(block_network, child_networks)
     out: list[dict[str, Any]] = []
     for net in working[:max_results]:
         out.append(
@@ -6064,15 +6071,21 @@ async def get_available_subnets(
     )
     existing += [ipaddress.ip_network(str(n), strict=False) for (n,) in child_blocks.all()]
 
+    # Walk the block's FREE ranges (maximal CIDRs, few) rather than every
+    # candidate of this size, which for an IPv6 /48 at /64 is 65,536 and for a
+    # /32 at /64 is 2^32. A candidate is free iff it sits inside one free
+    # range, so each range of prefix <= prefix_len yields its subnets lazily
+    # and the walk ends as soon as ``limit`` are found (#3849).
     available: list[str] = []
-    scanned = 0
-    max_scan = limit * 200  # cap iterations to avoid runaway loops on large sparse blocks
-    for candidate in block_net.subnets(new_prefix=prefix_len):
-        if len(available) >= limit or scanned >= max_scan:
-            break
-        scanned += 1
-        if not any(candidate.overlaps(ex) for ex in existing):
+    for free_net in _free_networks(str(block.network), [str(n) for n in existing]):
+        if free_net.prefixlen > prefix_len:
+            continue
+        for candidate in itertools.islice(
+            free_net.subnets(new_prefix=prefix_len), limit - len(available)
+        ):
             available.append(str(candidate))
+        if len(available) >= limit:
+            break
 
     return available
 
@@ -6084,11 +6097,22 @@ class FreeCidrRange(BaseModel):
     size: int = Field(description=_COUNT_DESC)
     size_exact: str = Field(description=_EXACT_DESC)
     prefix_len: int
+    more_after: int = Field(
+        0,
+        description=(
+            "Only ever non-zero on the LAST range of a capped answer: how many further "
+            "free ranges (higher addresses) were left out. Everything after this range "
+            "up to the end of the block is the omitted part (#3848)."
+        ),
+    )
 
 
 @router.get("/blocks/{block_id}/free-space", response_model=list[FreeCidrRange])
 async def get_block_free_space(
-    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+    block_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    limit: int = Query(200, ge=1, le=10000, description="Most free ranges to return"),
 ) -> list[FreeCidrRange]:
     """Return free CIDR ranges inside this block.
 
@@ -6106,18 +6130,23 @@ async def get_block_free_space(
     )
     child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
-    ranges = _compute_free_cidrs(str(block.network), occupied)
-    return [
+    all_free = _free_networks(str(block.network), occupied)
+    out = [
         FreeCidrRange(
-            network=r["network"],
-            first=r["first"],
-            last=r["last"],
-            size=_int64_count(r["size"]),
-            size_exact=str(r["size"]),
-            prefix_len=r["prefix_len"],
+            network=str(n),
+            first=str(n.network_address),
+            last=str(n.broadcast_address),
+            size=_int64_count(n.num_addresses),
+            size_exact=str(n.num_addresses),
+            prefix_len=n.prefixlen,
         )
-        for r in ranges
+        for n in all_free[:limit]
     ]
+    # A capped answer says so on its last range instead of reading as the
+    # whole block (#3848).
+    if out and len(all_free) > len(out):
+        out[-1].more_after = len(all_free) - len(out)
+    return out
 
 
 class PlanRequestItem(BaseModel):
