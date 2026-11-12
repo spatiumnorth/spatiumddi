@@ -67,6 +67,13 @@ UNMANAGED_SIGNING_DRIVERS: frozenset[str] = frozenset({"technitium"})
 #: zone unsigned under the parent's DS, which is just as bogus.
 PER_SERVER_SIGNING_DRIVERS: frozenset[str] = SIGNING_DRIVERS | UNMANAGED_SIGNING_DRIVERS
 
+#: Every driver on which a new signing request is refused with the Technitium
+#: explanation: the agent-managed ``technitium`` plus the agentless
+#: ``technitium_api`` (#3806). The latter is outside the single-signer count
+#: (it holds no per-server keys SpatiumDDI created) but is the same daemon, and
+#: a sign op against it would be one-shot in exactly the same way.
+SIGN_REFUSED_TECHNITIUM_DRIVERS: frozenset[str] = UNMANAGED_SIGNING_DRIVERS | {"technitium_api"}
+
 WORKAROUND = (
     "Keep a single DNS server in the group (delete it or move the others to "
     "another group; disabling a server does not stop it serving the zone), "
@@ -141,7 +148,7 @@ async def unmanaged_signing_group_ids(
         select(DNSServer.group_id)
         .where(
             DNSServer.group_id.in_(ids),
-            DNSServer.driver.in_(sorted(UNMANAGED_SIGNING_DRIVERS)),
+            DNSServer.driver.in_(sorted(SIGN_REFUSED_TECHNITIUM_DRIVERS)),
         )
         .distinct()
     )

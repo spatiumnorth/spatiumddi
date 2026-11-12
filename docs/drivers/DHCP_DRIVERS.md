@@ -583,3 +583,7 @@ completing the rolling upgrade is what gets both members onto one version.
 Refusing to start would strand the operator in the broken state. DHCP also keeps
 serving throughout (each Kea answers from its own lease store) — only the HA
 replication *between* peers is disrupted.
+
+### Reload scope and HA heartbeat (#3779)
+
+`SyncLoop._apply_bundle` sends the `-t` preflight and `config-reload` only to a daemon whose rendered document, or the HA TLS credential files the dhcp4 document references, differs from what that daemon last confirmed. The baseline also records the daemon's own `config-hash-get`, checked before skipping, so a restarted or unreachable daemon is reloaded. A skipped daemon counts as applied OK, but it is not reloaded when a refused re-render's documents are restored, since it never loaded that render; any non-OK result drops its baseline. The HA `heartbeat-delay` default is 2000 ms (was 10000; migration `ede3bcd2aff4` moves groups still at 10000): the heartbeat paces the hook's WAITING to READY to HOT-STANDBY transitions after every reload. A full incremental `subnet_cmds` apply is deferred.

@@ -34,6 +34,7 @@ from app.core.agent_wake import (
     dns_wake_channels,
     wake_subscription,
 )
+from app.core.dns_names import validate_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.core.jwt_compat import JWTError
 from app.core.redis_client import make_async_redis
@@ -162,6 +163,12 @@ class AgentRegisterRequestV2(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None  # persisted UUID from previous runs
+    # #3757 — a resolvable form of ``hostname`` the control plane reads zones
+    # back from (the chart sends the pod's headless-Service FQDN). Optional:
+    # an older agent sends none and the row keeps its host (new rows use
+    # hostname). Vetted by ``_agent_reported_host``, which ignores rather than
+    # refuses a value it will not store: a refused agent re-bootstraps in a loop.
+    host: str | None = Field(default=None, max_length=255)
 
     @field_validator("driver")
     @classmethod
@@ -171,6 +178,49 @@ class AgentRegisterRequestV2(BaseModel):
                 f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
             )
         return v
+
+
+def _agent_reported_host(body: AgentRegisterRequestV2) -> str | None:
+    """The ``host`` an agent sent, if registration may store it (#3757).
+
+    Only the agent's own name, or a qualified form of it (``<hostname>.<...>``,
+    which is what a StatefulSet pod's DNS name is), and only a legal host name.
+    Anything else is ignored with a warning, never refused: the agent's PSK
+    already lets it pick ``hostname`` freely, so this keeps ``host`` from
+    becoming a second, unrelated address the control plane would dial with the
+    group's TSIG key (an IP literal, another service's name).
+    """
+    raw = (body.host or "").strip()
+    if not raw:
+        return None
+    own = body.hostname.strip().rstrip(".").lower()
+    low = raw.rstrip(".").lower()
+    reason: str | None = None
+    if not own or not (low == own or low.startswith(own + ".")):
+        reason = "not a qualified form of the agent's hostname"
+    else:
+        try:
+            return validate_hostname(raw, field="host")
+        except ValueError as exc:
+            reason = str(exc)
+    logger.warning(
+        "dns_agent_host_ignored",
+        hostname=body.hostname,
+        host=raw,
+        reason=reason,
+        issue="#3757",
+    )
+    return None
+
+
+def _host_is_registration_default(host: str | None, names: set[str]) -> bool:
+    """Whether ``host`` is still what registration itself wrote (#3757): empty,
+    one of the server's names, or a qualified form of one. Anything else is an
+    operator's edit, which a re-registration must not overwrite."""
+    low = (host or "").strip().rstrip(".").lower()
+    if not low:
+        return True
+    return any(n and (low == n or low.startswith(n + ".")) for n in names)
 
 
 # #2078 — every DNS agent released before this fix registered with this
@@ -193,6 +243,11 @@ class AgentRegisterResponseV2(BaseModel):
     token_expires_at: datetime
     config_etag: str | None
     pending_approval: bool
+    # #3757 — the row's stored host after this registration. Its presence tells
+    # the agent this control plane read the ``host`` it sent (a release before
+    # #3757 ignores the field and answers without it); its value may differ from
+    # what was sent when an operator edit or the vetting rule kept the row's own.
+    host: str | None = None
 
 
 class AgentHeartbeatRequest(BaseModel):
@@ -545,13 +600,14 @@ async def agent_register(
     require_approval = os.environ.get("DNS_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
 
     pending_approval = False
+    reported_host = _agent_reported_host(body)
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
         server = DNSServer(
             group_id=group.id,
             name=body.hostname,
             driver=body.driver,
-            host=body.hostname,
+            host=reported_host or body.hostname,
             port=53,
             roles=body.roles,
             status="active",
@@ -584,6 +640,23 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # #3757 — heal rows an older chart registered with a bare pod name.
+        # Only when the agent sent one, never while the row awaits approval
+        # (a fingerprint mismatch must not redirect where its zones are read
+        # from before an operator has looked), and never over an operator's
+        # own edit of the host: only a value registration itself wrote moves.
+        if (
+            reported_host
+            and not server.pending_approval
+            and _host_is_registration_default(
+                server.host,
+                {
+                    server.name.strip().rstrip(".").lower(),
+                    body.hostname.strip().rstrip(".").lower(),
+                },
+            )
+        ):
+            server.host = reported_host
         # Only overwrite when the agent actually reported one: an older agent
         # sends the fixed literal (or nothing) and must not overwrite the real
         # version its own heartbeat already recorded.
@@ -673,6 +746,7 @@ async def agent_register(
         token_expires_at=exp,
         config_etag=server.last_config_etag,
         pending_approval=pending_approval,
+        host=server.host,
     )
     # Before the agent's first poll: an agent of an older release joining a
     # group that serves the zones' own timers switches it to the literal here,

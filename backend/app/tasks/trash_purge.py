@@ -34,6 +34,7 @@ from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
 from app.models.settings import PlatformSettings
 from app.services.dhcp.static_ipam import remove_ipam_for_static
+from app.services.e911.delete_guard import subnet_e911_bound_clause
 from app.services.ipam.orphan_aliases import is_withdrawn_alias, withdrawn_alias_owners
 from app.services.ipam.utilization import recount_subnets_and_blocks
 
@@ -296,7 +297,23 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
                         )
                     )
                     continue
-                await purge_trashed_zone(db, zone)
+                kept = await purge_trashed_zone(db, zone)
+                if kept:
+                    # #3812: the copy another zone of the same name may use stays at
+                    # the provider; say so where an operator will look for it.
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="permanent_delete",
+                            resource_type="dns_zone",
+                            resource_id=str(zone_id),
+                            resource_display=zone_name,
+                            new_value={"provider_copies_kept": kept},
+                            result="success",
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
@@ -357,7 +374,8 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
     first loses data unannounced, the second raised out of the single sweep
     transaction and rolled the whole night back, every night. Such a parent is
     skipped, not deleted, until its child is restored or moved; ``_sweep``
-    reports how many it skipped.
+    reports how many it skipped. A subnet carrying an E911 binding (its own, or
+    on one of its addresses) is held back the same way (#3891).
     """
     where: list[Any] = [model.deleted_at.is_not(None), model.deleted_at < cutoff]  # type: ignore[attr-defined]
     if model is IPBlock:
@@ -373,6 +391,9 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
             ~exists()
             .where(DHCPScope.subnet_id == model.id)  # type: ignore[attr-defined]
             .where(DHCPScope.id.in_(_scopes_with_live_children())),
+            # An E911 binding on the subnet, or on an address in it, goes with
+            # the cascade: held back for the operator to move it (#3891).
+            ~subnet_e911_bound_clause(),
         ]
     elif model is DHCPScope:
         where.append(DHCPScope.id.not_in(_scopes_with_live_children()))
@@ -535,7 +556,11 @@ async def _sweep() -> dict[str, Any]:
             logger.warning(
                 "trash_purge.held_back_live_children",
                 counts=held_back,
-                hint="expired rows with a live row under them are kept; restore or move the live row",
+                hint=(
+                    "expired rows with a live row under them, or a subnet an E911 location "
+                    "binding names (its own or on an address), are kept; restore or move the "
+                    "live row, or remove the binding under Network > E911 > Bindings"
+                ),
             )
 
         refused: dict[str, int] = {}

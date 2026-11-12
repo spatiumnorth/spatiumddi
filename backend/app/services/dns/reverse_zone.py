@@ -687,8 +687,9 @@ async def trashed_sharers(db: AsyncSession, zone: DNSZone) -> list[Subnet]:
     """Every trashed subnet whose trashed records still sit in the trashed auto
     reverse ``zone`` under a batch other than the zone's own (spatiumddi#3504):
     the subnets a purge of the zone's own Trash row would take records from.
-    Empty for a live zone or one the operator made."""
-    if zone.deleted_at is None or not zone.is_auto_generated:
+    A LIVE zone counts too (spatiumddi#3826): a permanent delete of it takes the
+    same records. Empty for a zone the operator made."""
+    if not zone.is_auto_generated:
         return []
     stmt: Any = (
         select(Subnet)
@@ -706,6 +707,28 @@ async def trashed_sharers(db: AsyncSession, zone: DNSZone) -> list[Subnet]:
         .execution_options(include_deleted=True)
     )
     return list((await db.execute(stmt)).scalars().all())
+
+
+async def refuse_delete_with_trashed_sharers(db: AsyncSession, zone: DNSZone) -> None:
+    """409 when deleting the LIVE auto reverse ``zone`` for good would take the
+    trashed records of other subnets' Trash batches with it (spatiumddi#3826):
+    the guard the Trash's own purge of the zone has had since #3504, for the
+    permanent delete through the zone route and the copilot. Nothing is touched."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    sharers = await trashed_sharers(db, zone)
+    if not sharers:
+        return
+    names = [f"subnet {sub.network}" for sub in sharers]
+    shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot permanently delete {zone.name}: it still holds the trashed DNS records "
+            f"of {shown}, in another Trash batch, and that batch's restore needs them. "
+            "Purge those subnets from the Trash first, or restore them; nothing was deleted."
+        ),
+    )
 
 
 async def _hand_over(db: AsyncSession, zone: DNSZone, heir: Subnet) -> None:

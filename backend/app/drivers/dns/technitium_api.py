@@ -162,6 +162,16 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Technitium api_url {url!r} has no host.")
         return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
 
+    def provider_identity(self, server: Any) -> str | None:
+        """Normalised API root: two rows with one URL are one Technitium."""
+        try:
+            creds = self._load_credentials(server)
+            return (
+                "technitium_api:" + self.normalize_api_url(str(creds.get("api_url") or "")).lower()
+            )
+        except Exception:  # noqa: BLE001 — unknown identity, caller fails safe
+            return None
+
     def _creds(self, creds: dict[str, Any]) -> tuple[str, str, bool]:
         """Return ``(api_url_root, token, verify_tls)`` or raise."""
         api_url = self.normalize_api_url(str((creds or {}).get("api_url") or ""))
@@ -521,6 +531,8 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
 
     # ── Zone writes ─────────────────────────────────────────────────────
 
+    honours_adopt_existing = True
+
     async def _apply_zone(
         self,
         server: Any,
@@ -529,6 +541,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
+        adopt_existing: bool = False,
     ) -> bool | None:
         api_url, token, verify = self._creds(creds)
         bare = normalize_fqdn(str(getattr(zone, "name", ""))).rstrip(".")
@@ -569,7 +582,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 # have created itself: an EMPTY Primary. Anything else is the
                 # operator's own data, and a later delete from SpatiumDDI
                 # would remove it (#1775).
-                await self._refuse_unsafe_adoption(client, creds, bare)
+                await self._refuse_unsafe_adoption(client, creds, bare, own_records=adopt_existing)
                 return False
             if op == "delete":
                 try:
@@ -601,9 +614,17 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Technitium: unsupported zone op {op!r}")
 
     async def _refuse_unsafe_adoption(
-        self, client: httpx.AsyncClient, creds: dict[str, Any], bare: str
+        self,
+        client: httpx.AsyncClient,
+        creds: dict[str, Any],
+        bare: str,
+        own_records: bool = False,
     ) -> None:
         """Raise unless the existing zone ``bare`` is an empty Primary zone.
+
+        ``own_records`` (a same-provider zone move, #3805) skips the record
+        count: the zone is the copy SpatiumDDI itself wrote through another
+        server of this Technitium. The visibility and Primary checks stay.
 
         "Empty" means no record besides the apex SOA and NS that Technitium
         puts in every new Primary zone (a sub-apex NS is a delegation).
@@ -628,6 +649,8 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 f"{ztype} zone. Only an empty Primary zone is adopted; delete it "
                 f"in the Technitium console first, or leave it unmanaged."
             )
+        if own_records:
+            return
         body = self._as_dict(
             await self._call(
                 client,
@@ -656,7 +679,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 f"server and holds {len(foreign)} record(s) SpatiumDDI did not "
                 f"create. Only an empty zone is adopted, because deleting the zone "
                 f"from SpatiumDDI later would delete them too. Remove them in the "
-                f"Technitium console first."
+                f"Technitium console first"
             )
 
     # ── Probe ───────────────────────────────────────────────────────────

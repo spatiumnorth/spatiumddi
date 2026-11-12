@@ -16,6 +16,10 @@
 #                             to ``{{ fullname }}-api``.
 #   * API_UPSTREAM_PORT     — TCP port the api listens on. Defaults to
 #                             ``8000`` everywhere.
+#   * FRONTEND_HTTP_PORT    — TCP port nginx listens on (#3852). Defaults to
+#                             ``80``; the Helm chart sets an unprivileged
+#                             port on OpenShift, where the pod cannot bind
+#                             :80. Rendered via 14-http-port.envsh.
 #   * NGINX_LOCAL_RESOLVERS — Space-separated nameserver list for the
 #                             ``resolver`` directive. Auto-populated
 #                             from /etc/resolv.conf by the official
@@ -74,7 +78,7 @@ map "$spatium_proxy_trusted:$http_x_forwarded_proto" $spatium_forwarded_proto {
 }
 
 server {
-    listen 80;
+    listen ${SPATIUM_HTTP_PORT};
     ${SPATIUM_LISTEN6_80}
     server_name _;
     root /usr/share/nginx/html;

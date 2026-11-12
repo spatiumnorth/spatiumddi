@@ -1102,6 +1102,11 @@ async def _dispatch_claimed(
                     )
                 )
         await s.commit()
+    if len(current) < len(ids):
+        kept_ids = {r.id for r in current}
+        await _retract_zone_removed_mid_dispatch(
+            bind, server, [r for r in rows if r.id not in kept_ids]
+        )
     if applied or failures:
         logger.info(
             "record_op_applied_agentless",
@@ -1111,6 +1116,136 @@ async def _dispatch_claimed(
             failed=len(failures),
         )
     return {r.id: r for r in current}
+
+
+async def _retract_zone_removed_mid_dispatch(
+    bind: Any, server: DNSServer, dropped: list[DNSRecordOp]
+) -> None:
+    """Re-send a permanent zone delete's removal to ``server`` when a dispatch
+    that was already in flight outlived it (#3688).
+
+    A record write claims its op row, then calls the provider with no lock. A
+    permanent zone delete that commits in between sweeps the claimed row and
+    pushes the zone's removal; the in-flight call can then reach the provider
+    AFTER it, and its outcome is dropped with the row. So the removal is sent
+    again — but this is a zone DELETE at a customer's provider, and a dropped
+    outcome has several other causes (the retry sweep reclaiming an expired
+    lease, a zone move, a server move, a soft delete), so it fires only when
+    every one of these holds:
+
+    - the op carries the id of the zone it was queued for, and that zone row
+      is gone (a permanent delete; a soft-deleted or moved zone still has its
+      row, and an op queued before ``zone_id`` existed is left alone);
+    - the server is still in the group it was in when the op was claimed, and
+      still enabled with credentials — the permanent delete pushed only to that
+      group's enabled servers, and a server moved away (#934) may serve a live
+      zone of the same name in its new group;
+    - no zone of that name exists in that group now, live or in the Trash (a
+      zone re-created since, or a sibling view's same-named zone, is what the
+      provider's zone of that name is for);
+    - no other group's zone of that name may share the server's provider copy,
+      which the delete kept for that reason (#3812).
+
+    The zone delete is idempotent at the provider (an absent zone reports
+    unchanged), and no database session is open across the calls. Best
+    effort: a failure is logged, never raised.
+    """
+    by_zone: dict[uuid.UUID, list[DNSRecordOp]] = {}
+    for r in dropped:
+        if r.zone_id is not None:
+            by_zone.setdefault(r.zone_id, []).append(r)
+    if not by_zone:
+        return
+    try:
+        claimed_group_id = server.group_id
+        async with AsyncSession(bind) as s:
+            now_server = (
+                await s.execute(
+                    select(
+                        DNSServer.group_id,
+                        DNSServer.is_enabled,
+                        DNSServer.credentials_encrypted.isnot(None),
+                    ).where(DNSServer.id == server.id)
+                )
+            ).one_or_none()
+            if (
+                now_server is None
+                or now_server[0] != claimed_group_id
+                or not now_server[1]
+                or not now_server[2]
+            ):
+                return
+            surviving = set(
+                (
+                    await s.execute(
+                        select(DNSZone.id)
+                        .where(DNSZone.id.in_(list(by_zone)))
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            gone = {zid: rows for zid, rows in by_zone.items() if zid not in surviving}
+            if not gone:
+                return
+            names = sorted({rows[0].zone_name for rows in gone.values()})
+            present = set(
+                (
+                    await s.execute(
+                        select(DNSZone.name)
+                        .where(DNSZone.group_id == claimed_group_id, DNSZone.name.in_(names))
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            # #3812: a provider copy another group's zone of that name may use
+            # was kept by the delete; re-sending the removal would take it.
+            from app.services.dns.zone_move import shared_zone_copy_servers  # noqa: PLC0415
+
+            for name in names:
+                if name in present:
+                    continue
+                probe = DNSZone(id=uuid.uuid4(), group_id=claimed_group_id, name=name)
+                if server.id in (await shared_zone_copy_servers(s, probe)).keep_ids:
+                    present.add(name)
+        from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
+
+        driver = get_driver(server.driver)
+        for name in names:
+            if name in present:
+                continue
+            # The leaked records, for a cloud provider that must empty a zone
+            # before deleting it; it removes only these, never anything else.
+            managed = [
+                c.record
+                for rows in gone.values()
+                for r in rows
+                if r.zone_name == name and (c := _change_from_op_row(r)) is not None
+            ]
+            zone = DNSZone(id=uuid.uuid4(), group_id=claimed_group_id, name=name)
+            if isinstance(driver, CloudDNSDriverBase):
+                changed = await driver.apply_zone_change(
+                    server, zone, "delete", managed_records=managed
+                )
+            else:
+                changed = await driver.apply_zone_change(server, zone, "delete")
+            logger.warning(
+                "agentless_dispatch_after_zone_delete_retracted",
+                server=str(server.id),
+                driver=server.driver,
+                zone=name,
+                changed=changed is not False,
+            )
+    except Exception as exc:  # noqa: BLE001 — the dispatch itself already finished
+        logger.warning(
+            "agentless_dispatch_after_zone_delete_retract_failed",
+            server=str(server.id),
+            driver=server.driver,
+            error=str(exc),
+        )
 
 
 # #1932 — a zone SpatiumDDI auto-creates (a subnet's reverse zone, from IPAM
@@ -2283,6 +2418,23 @@ async def retract_address_records(
     )
     if count:
         logger.info("ipam_address_records_retracted", subnets=len(ids), records=count, zones=zones)
+    return count, wake
+
+
+async def retract_records_of_addresses(
+    db: AsyncSession, *address_where: Any
+) -> tuple[int, set[uuid.UUID]]:
+    """Withdraw the auto-generated DNS records of the addresses ``address_where``
+    selects, the way :func:`retract_address_records` does a subnet's (#3744).
+
+    A subnet / block / space soft delete calls it for the DHCP lease mirrors
+    its scopes' leases leave behind: their teardown runs after the delete's
+    commit, in committed batches, so their records are withdrawn here, set-based,
+    before the stamp, or the stamp would take them into the batch for a restore
+    to bring back. Returns ``(records_retracted, dns_group_ids)``."""
+    count, wake, _zones = await _retract_auto_records(
+        db, [DNSRecord.ip_address_id.in_(select(IPAddress.id).where(*address_where))]
+    )
     return count, wake
 
 

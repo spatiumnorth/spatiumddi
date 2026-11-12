@@ -55,6 +55,7 @@ from app.services.backup.targets import (
     InvalidArchiveNameError,
     SecretFieldError,
     UnsupportedOperationError,
+    check_config_value_types,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
@@ -66,7 +67,7 @@ from app.services.backup.targets import (
     safe_filename,
     secret_field_names,
 )
-from app.services.backup.targets.secrets_config import ENC_PREFIX
+from app.services.backup.targets.secrets_config import ENC_PREFIX, REDACTED_SENTINEL
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
 # so every body here is authorised from its headers before it is read
@@ -395,12 +396,21 @@ async def create_target(
     # treat it as an already-validated stored secret) and be stored unwrapped.
     for name in sorted(secret_field_names(driver)):
         value = body.config.get(name)
+        # ``<set>`` is what a read shows for a stored secret. On Edit it means
+        # "keep the stored one"; on Add nothing is stored, so it would be saved
+        # as the secret itself (#3846).
+        if value == REDACTED_SENTINEL:
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not the '<set>' placeholder",
+            )
         if isinstance(value, str) and value.startswith(ENC_PREFIX):
             raise HTTPException(
                 status_code=422,
                 detail=f"'{name}' must be the secret itself, not a stored '{ENC_PREFIX}' value",
             )
     try:
+        check_config_value_types(driver, body.config)
         # Same auth-mode rules as Edit (#3696): one mode, no unused credential.
         body.config = normalize_config_for_create(driver, body.config)
         driver.validate_config(body.config)
@@ -557,6 +567,7 @@ async def update_target(
         # (#3289). Validation runs on the merged dict so shape checks see
         # all fields.
         try:
+            check_config_value_types(driver, payload["config"])
             merged = merge_config_for_update(
                 driver, incoming=payload["config"], existing=row.config
             )

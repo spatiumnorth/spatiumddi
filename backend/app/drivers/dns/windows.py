@@ -197,6 +197,19 @@ class WindowsDNSDriver(DNSDriver):
 
     name: str = "windows_dns"
 
+    def provider_identity(self, server: Any) -> str | None:
+        """WinRM endpoint: host + port. Two rows for one host share its zones."""
+        host = (getattr(server, "host", "") or "").strip().lower().rstrip(".")
+        if not host:
+            return None
+        try:
+            creds = _load_credentials(server)
+        except Exception:  # noqa: BLE001 — unknown identity, caller fails safe
+            return None
+        use_tls = bool(creds.get("use_tls"))
+        port = int(creds.get("winrm_port") or (5986 if use_tls else 5985))
+        return f"windows_dns:{host}:{port}"
+
     # ── Rendering (all no-ops; Windows manages its own zones) ─────────────
 
     def render_server_config(

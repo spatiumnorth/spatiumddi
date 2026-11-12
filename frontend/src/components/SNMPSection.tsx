@@ -607,8 +607,8 @@ export function SNMPSection({
       )}
 
       <Field
-        label="Allowed source CIDRs (v2c only)"
-        description="Comma- or space-separated list of CIDRs allowed to query SNMP. Empty = nothing allowed (snmpd will run but refuse every query). For v3, USM authenticates by user+pass; use the host firewall (nftables) to restrict by source IP instead."
+        label="Allowed source CIDRs"
+        description="Comma- or space-separated list of CIDRs allowed to query SNMP. The host firewall opens UDP 161 only to these sources, for v2c and v3. Empty = the port is open to any source (v2c still answers nothing until a source is listed; v3 is then protected only by its user credentials)."
       >
         <input
           type="text"

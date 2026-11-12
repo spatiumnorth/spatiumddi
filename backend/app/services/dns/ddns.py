@@ -31,8 +31,10 @@ Design:
   form (``dhcp-20-5``) and low-32-bits IPv6 form (``dhcp-<8 hex>``) gave
   one name. Records already published under those legacy forms are left
   alone and move to the new name when the lease next renews.
-* **Idempotent.** If the IPAM row already has the same hostname and its
-  published record carries that name, no DNS op is queued.
+* **Idempotent.** If the IPAM row already has the same hostname, its
+  published record carries that name, its PTR exists, and both carry the
+  effective ``ddns_ttl``, no DNS op is queued. Otherwise the sync repairs
+  whatever drifted (#3776).
 
 Circular-import note: ``_sync_dns_record`` lives in
 ``app.api.v1.ipam.router`` and is the canonical A/PTR pipeline. The
@@ -278,14 +280,144 @@ async def resolve_ddns_hostname(
     return client_name or _generate_hostname(ip_str)
 
 
-async def _published_name(db: AsyncSession, ipam_row: IPAddress) -> str | None:
-    """Name of the forward record DDNS published for this row, if any."""
-    if ipam_row.dns_record_id is None:
-        return None
-    from app.models.dns import DNSRecord  # noqa: PLC0415 — lazy, avoid cycle
+class DDNSReadCache:
+    """Per-batch memo for :func:`ddns_lease_writes_nothing` (#3776).
 
-    record = await db.get(DNSRecord, ipam_row.dns_record_id)
-    return record.name if record is not None else None
+    A lease-events batch runs the read-only check for every grant before it
+    writes anything, so the reads that depend only on the subnet (its
+    reverse-zone candidates) or that can be made for every row at once (the
+    records DDNS generated for each address) are made once per batch instead
+    of once per lease. Valid only while nothing is written: the batch builds
+    one for each read-only pass (the #3789 pre-lock read, then the check
+    under its row locks) and drops it before the DDNS step runs, which reads
+    fresh state through the same predicate without a cache.
+    """
+
+    __slots__ = ("generated", "reverse")
+
+    def __init__(self) -> None:
+        # Subnet id -> reverse-zone candidates (``load_reverse_candidates``).
+        self.reverse: dict[Any, list[Any]] = {}
+        # IPAM row id -> its DDNS-generated A/AAAA/PTR records, for the rows
+        # ``prefetch_generated`` loaded; a row not in here is read on its own.
+        self.generated: dict[Any, list[Any]] = {}
+
+    async def prefetch_generated(self, db: AsyncSession, row_ids: list[Any]) -> None:
+        """Load the generated records of every row in ``row_ids`` in one query."""
+        from app.models.dns import DNSRecord  # noqa: PLC0415 — lazy, avoid cycle
+
+        ids = [rid for rid in dict.fromkeys(row_ids) if rid is not None]
+        if not ids:
+            return
+        for rid in ids:
+            self.generated.setdefault(rid, [])
+        rows = (await db.execute(_generated_records_query(DNSRecord, ids))).scalars().all()
+        for rec in rows:
+            self.generated[rec.ip_address_id].append(rec)
+
+
+def _generated_records_query(record_cls: Any, row_ids: list[Any]) -> Any:
+    """The records DDNS generated for ``row_ids``: what the TTL and PTR
+    checks of :func:`_ddns_records_current` judge (an alias is not one)."""
+    return select(record_cls).where(
+        record_cls.ip_address_id.in_(row_ids),
+        record_cls.auto_generated.is_(True),
+        record_cls.ip_alias.is_(False),
+        record_cls.record_type.in_(["A", "AAAA", "PTR"]),
+    )
+
+
+async def _ddns_records_current(
+    db: AsyncSession,
+    subnet: Subnet,
+    ipam_row: IPAddress,
+    hostname: str,
+    eff: EffectiveDDNS,
+    cache: DDNSReadCache | None = None,
+) -> bool:
+    """Is everything DDNS publishes for this row already as the sync would
+    write it?
+
+    The one no-write decision behind both :func:`apply_ddns_for_lease` (its
+    idempotency guard) and :func:`ddns_lease_writes_nothing` (the read-only
+    check a lease-events batch skips its zone locks on, #3773), so the two
+    cannot disagree. Read-only. True only when:
+
+    * the forward record the row published still exists and carries
+      ``hostname`` (#1618: the ingest paths stamp the new name onto the row
+      first, so a rename must be judged against the record);
+    * every forward and PTR record DDNS generated for the row carries the
+      effective ``ddns_ttl`` (#3776). An operator record the row adopted
+      (``auto_generated`` false, #1867) keeps its own TTL and is not judged;
+    * the reverse zone covering the address holds its PTR, naming the
+      published name: ours, or an operator's the sync would adopt (#3776).
+      An address no reverse zone covers needs none.
+
+    False means the sync may write, and the full path runs it. ``cache`` (a
+    read-only batch pass only) serves the per-subnet and per-batch reads.
+    """
+    from app.models.dns import DNSRecord, DNSZone  # noqa: PLC0415 — lazy, avoid cycle
+
+    if ipam_row.dns_record_id is None:
+        return False
+    published = await db.get(DNSRecord, ipam_row.dns_record_id)
+    if published is None or published.name != hostname:
+        return False
+    if cache is not None and ipam_row.id in cache.generated:
+        generated = cache.generated[ipam_row.id]
+    else:
+        generated = (
+            (await db.execute(_generated_records_query(DNSRecord, [ipam_row.id]))).scalars().all()
+        )
+    if any(rec.ttl != eff.ttl for rec in generated):
+        return False
+
+    # The PTR, resolved as ``_sync_dns_record`` resolves it: the reverse zone
+    # covering the address, the owner name inside it, and the published
+    # forward FQDN as its value.
+    from app.api.v1.ipam.router import (  # noqa: PLC0415 — lazy, avoid cycle
+        _operator_record_twin,
+        _resolve_effective_dns,
+    )
+    from app.services.dns.sync_check import (  # noqa: PLC0415 — lazy, avoid cycle
+        load_reverse_candidates,
+        pick_reverse_zone,
+    )
+
+    try:
+        ip_obj = ipaddress.ip_address(str(ipam_row.address))
+    except ValueError:
+        return True
+    # ``_resolve_reverse_zone``, with the subnet's candidates memoised per batch.
+    cands = cache.reverse.get(subnet.id) if cache is not None else None
+    if cands is None:
+        group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+        cands = await load_reverse_candidates(db, subnet, group_ids)
+        if cache is not None:
+            cache.reverse[subnet.id] = cands
+    rev_zone = pick_reverse_zone(subnet, ip_obj, cands)
+    if rev_zone is None:
+        return True
+    fwd_zone = await db.get(DNSZone, published.zone_id)
+    if fwd_zone is None:
+        return False
+    rev_pointer_full = ip_obj.reverse_pointer + "."
+    rev_zone_name = rev_zone.name.rstrip(".") + "."
+    if rev_pointer_full == rev_zone_name:
+        ptr_name = "@"
+    else:
+        ptr_name = rev_pointer_full[: -(len(rev_zone_name) + 1)]
+    ptr_value = f"{hostname}.{fwd_zone.name.rstrip('.')}."
+    ptrs = [rec for rec in generated if rec.record_type == "PTR"]
+    if not ptrs:
+        twin = await _operator_record_twin(
+            db, rev_zone.id, name=ptr_name, rtype="PTR", value=ptr_value
+        )
+        return twin is not None
+    return all(
+        rec.zone_id == rev_zone.id and rec.name == ptr_name and rec.value == ptr_value
+        for rec in ptrs
+    )
 
 
 async def _name_holder(
@@ -402,6 +534,36 @@ def _name_conflict_is_loud(subnet: Subnet, ipam_row: IPAddress, hostname: str) -
     return loud
 
 
+async def _name_zone_ids(
+    db: AsyncSession, subnet: Subnet, ipam_row: IPAddress, eff: EffectiveDDNS
+) -> list[Any]:
+    """The zones a lease's name is checked against (:func:`_name_holder`): the
+    ones the sync would write the forward record into — the DDNS override zone
+    or the subnet's, plus the address's extra zones."""
+    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415
+    from app.services.dns.sync_check import forward_zone_ids_in_order  # noqa: PLC0415
+
+    override_zone_id = await _resolve_override_zone_id(db, eff.domain_override)
+    primary = override_zone_id or await _resolve_effective_zone(db, subnet)
+    return forward_zone_ids_in_order(primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids)
+
+
+def _is_reserved_name(ipam_row: IPAddress, hostname: str) -> bool:
+    """Is ``hostname`` another address's generated name (#3362, #3364)?
+
+    An address's own legacy name is not reserved against it, but the legacy
+    IPv4 form is shared by every ``x.y.c.d`` with the same last two octets,
+    so whether it is free is decided by ``_name_holder`` - by whoever holds
+    the record - not here. Compared case-folded: a static assignment's name
+    is the operator's spelling, not sanitised to lower case."""
+    own_names = {
+        _generate_hostname(str(ipam_row.address)),
+        _legacy_generated_hostname(str(ipam_row.address)),
+    }
+    folded = hostname.lower()
+    return folded not in own_names and _GENERATED_NAME_RE.fullmatch(folded) is not None
+
+
 async def _name_or_generated(
     db: AsyncSession,
     subnet: Subnet,
@@ -426,23 +588,9 @@ async def _name_or_generated(
     autoflush would take the audit-chain lock before the sync bumps the
     zone's serial, which deadlocks against a record create on that zone.
     """
-    from app.api.v1.ipam.router import _resolve_effective_zone  # noqa: PLC0415
-    from app.services.dns.sync_check import forward_zone_ids_in_order  # noqa: PLC0415
-
-    override_zone_id = await _resolve_override_zone_id(db, eff.domain_override)
-    primary = override_zone_id or await _resolve_effective_zone(db, subnet)
-    zone_ids = forward_zone_ids_in_order(
-        primary or ipam_row.forward_zone_id, ipam_row.extra_zone_ids
-    )
+    zone_ids = await _name_zone_ids(db, subnet, ipam_row, eff)
     fallback = _generate_hostname(str(ipam_row.address))
-    # An address's own legacy name is not reserved against it, but the legacy
-    # IPv4 form is shared by every ``x.y.c.d`` with the same last two octets,
-    # so whether it is free is decided by ``_name_holder`` - by whoever holds
-    # the record - not here. Compared case-folded: a static assignment's name
-    # is the operator's spelling, not sanitised to lower case.
-    own_names = {fallback, _legacy_generated_hostname(str(ipam_row.address))}
-    folded = hostname.lower()
-    reserved = folded not in own_names and _GENERATED_NAME_RE.fullmatch(folded) is not None
+    reserved = _is_reserved_name(ipam_row, hostname)
     holder = None if reserved else await _name_holder(db, ipam_row, zone_ids, hostname)
     if not reserved and holder is None:
         return hostname
@@ -548,6 +696,48 @@ async def apply_ddns_for_lease(
         db.add_all(audit_rows)
 
 
+async def ddns_lease_writes_nothing(
+    db: AsyncSession,
+    *,
+    subnet: Subnet,
+    ipam_row: IPAddress,
+    client_hostname: str | None,
+    row_hostname: str | None,
+    cache: DDNSReadCache | None = None,
+) -> bool:
+    """Would :func:`apply_ddns_for_lease` write nothing for this lease? (#3773)
+
+    Read-only. ``row_hostname`` is the name ``ipam_row`` will carry when the
+    lease is applied (the ingest path stamps the client's name onto the row
+    before its DDNS runs). True only when the DDNS would end without a write:
+    DDNS off for the subnet, no name to publish beside a row that keeps one,
+    or the name already published for this address, still free, and already
+    on the row. A renewal is the last case: under Kea HA both peers report
+    every one, so a lease-events batch can skip its zone locks for it, which
+    otherwise hold the zone row to the batch's commit and serialise the two
+    peers' batches on it. False whenever a write may follow.
+    ``cache`` is the batch's :class:`DDNSReadCache`, for a pass that writes
+    nothing between its checks.
+    """
+    if not ipam_row.auto_from_lease:
+        return False
+    eff = await resolve_effective_ddns(db, subnet)
+    if not eff.enabled:
+        return True
+    hostname = await resolve_ddns_hostname(db, subnet, str(ipam_row.address), client_hostname)
+    if not hostname:
+        # A blank row retracts what an earlier name published.
+        return bool((row_hostname or "").strip())
+    if row_hostname != hostname:
+        return False
+    if not await _ddns_records_current(db, subnet, ipam_row, hostname, eff, cache):
+        return False
+    if _is_reserved_name(ipam_row, hostname):
+        return False
+    zone_ids = await _name_zone_ids(db, subnet, ipam_row, eff)
+    return await _name_holder(db, ipam_row, zone_ids, hostname) is None
+
+
 async def _publish_ddns_name(
     db: AsyncSession,
     subnet: Subnet,
@@ -570,13 +760,15 @@ async def _publish_ddns_name(
         return False
     hostname = published_name
 
-    # Idempotency: if the hostname is unchanged and the auto-generated
-    # record already published for this IP carries it, skip the sync.
-    # Compare against the record, not just the row: both lease ingest paths
-    # stamp the client's new hostname onto the row before calling us, so a
-    # rename would otherwise look unchanged and the old A/PTR would stay
-    # (#1618).
-    if ipam_row.hostname == hostname and await _published_name(db, ipam_row) == hostname:
+    # Idempotency: if the hostname is unchanged and what DDNS published for
+    # this IP is still as the sync would write it (the forward record at that
+    # name, the PTR, the effective TTL on both — #1618, #3776), skip the sync.
+    # #3773: ``ddns_lease_writes_nothing`` reaches the same no-write outcome
+    # through the same ``_ddns_records_current`` to let a lease-events batch
+    # skip its zone locks.
+    if ipam_row.hostname == hostname and await _ddns_records_current(
+        db, subnet, ipam_row, hostname, eff
+    ):
         return False
 
     ipam_row.hostname = hostname
@@ -591,8 +783,17 @@ async def _publish_ddns_name(
     # cycle. Calling at the bottom of the service call is cycle-free.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
 
+    # ``enforce_ttl``: the DDNS-generated records follow the effective
+    # ddns_ttl on an update too, so a renamed lease or a changed setting does
+    # not keep the TTL the record was first written with (#3776).
     published = await _sync_dns_record(
-        db, ipam_row, subnet, zone_id=override_zone_id, action="create", ttl=eff.ttl
+        db,
+        ipam_row,
+        subnet,
+        zone_id=override_zone_id,
+        action="create",
+        ttl=eff.ttl,
+        enforce_ttl=True,
     )
     if not published and getattr(ipam_row, "_dns_skipped_cname", False):
         # #1493 — the hostname already holds a CNAME, so no A / AAAA (and no
