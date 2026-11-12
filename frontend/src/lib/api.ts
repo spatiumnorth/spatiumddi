@@ -4507,7 +4507,7 @@ export const settingsApi = {
     api
       .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
       .then((r) => r.data),
-  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+  updateAuditTarget: (id: string, body: Partial<AuditForwardTargetWrite>) =>
     api
       .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
       .then((r) => r.data),
@@ -4528,7 +4528,7 @@ export const settingsApi = {
     api
       .post<InfluxDBTarget>("/settings/influxdb-targets", body)
       .then((r) => r.data),
-  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+  updateInfluxTarget: (id: string, body: Partial<InfluxDBTargetWrite>) =>
     api
       .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
       .then((r) => r.data),

@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from ipaddress import ip_network
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import structlog
 from fastapi import (
@@ -3519,8 +3519,11 @@ _VALID_SEVERITIES = {"info", "warn", "error", "denied"}
 
 
 class AuditTargetBody(BaseModel):
-    """Create / update body. kind-specific fields are ignored for
+    """Create body. kind-specific fields are ignored for
     other kinds, so a single shape fits all three (syslog/webhook/smtp)."""
+
+    # True on the update subclass, which is checked on the merged row instead.
+    partial: ClassVar[bool] = False
 
     name: str
     enabled: bool = True
@@ -3607,30 +3610,76 @@ class AuditTargetBody(BaseModel):
         # syslog / URL-less webhook target was saved enabled, then
         # silently skipped by ``audit_forward._load_targets``, and an
         # SMTP target with no recipients warned on every audit row.
-        if self.kind == "syslog":
-            if not self.host.strip():
-                raise ValueError("host is required for a syslog target")
-            if not (1 <= self.port <= 65535):
-                raise ValueError("port must be 1–65535")
-            if not (0 <= self.facility <= 23):
-                raise ValueError("facility must be 0–23 (RFC 5424)")
-        elif self.kind == "webhook":
+        if self.partial:
+            return self
+        _check_kind_config(
+            self.kind,
+            host=self.host,
+            port=self.port,
+            facility=self.facility,
+            smtp_host=self.smtp_host,
+            smtp_port=self.smtp_port,
+            smtp_from_address=self.smtp_from_address,
+            smtp_to_addresses=self.smtp_to_addresses,
+        )
+        if self.kind == "webhook":
             # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
             # so only an explicit blank is refused here. A webhook with no
             # URL at all is caught by ``_require_webhook_url``.
             if self.url is not None and not self.url.strip():
                 raise ValueError("url is required for a webhook target")
-        elif self.kind == "smtp":
-            if not self.smtp_host.strip():
-                raise ValueError("smtp_host is required for an smtp target")
-            if not (1 <= self.smtp_port <= 65535):
-                raise ValueError("smtp_port must be 1–65535")
-            if not self.smtp_from_address.strip():
-                raise ValueError("smtp_from_address is required for an smtp target")
-            recipients = [a for a in (self.smtp_to_addresses or []) if a and a.strip()]
-            if not recipients:
-                raise ValueError("smtp_to_addresses must contain at least one recipient")
         return self
+
+
+def _check_kind_config(
+    kind: str,
+    *,
+    host: str,
+    port: int,
+    facility: int,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_from_address: str,
+    smtp_to_addresses: list[str] | None,
+) -> None:
+    """Per-kind completeness of a target's final field values (#1581).
+
+    Shared by the create body validator and the update handler, which runs
+    it on the merged row (#3926): a PUT carrying one field validates the
+    result, not the partial body.
+    """
+    if kind == "syslog":
+        if not (host or "").strip():
+            raise ValueError("host is required for a syslog target")
+        if not (1 <= port <= 65535):
+            raise ValueError("port must be 1–65535")
+        if not (0 <= facility <= 23):
+            raise ValueError("facility must be 0–23 (RFC 5424)")
+    elif kind == "smtp":
+        if not (smtp_host or "").strip():
+            raise ValueError("smtp_host is required for an smtp target")
+        if not (1 <= smtp_port <= 65535):
+            raise ValueError("smtp_port must be 1–65535")
+        if not (smtp_from_address or "").strip():
+            raise ValueError("smtp_from_address is required for an smtp target")
+        recipients = [a for a in (smtp_to_addresses or []) if a and a.strip()]
+        if not recipients:
+            raise ValueError("smtp_to_addresses must contain at least one recipient")
+
+
+class AuditTargetUpdate(AuditTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    The Edit dialog sends just the fields the operator changed, so a field
+    another client stored since the dialog read the target is not put back.
+    Kind-dependent completeness is checked on the merged result in the
+    handler, not on this partial body.
+    """
+
+    name: str | None = None  # type: ignore[assignment]
+    kind: str | None = None  # type: ignore[assignment]
+
+    partial: ClassVar[bool] = True
 
 
 class AuditTargetResponse(BaseModel):
@@ -3697,35 +3746,91 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
+_AUDIT_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "kind",
+    "format",
+    "host",
+    "port",
+    "protocol",
+    "facility",
+    "ca_cert_pem",
+    "webhook_flavor",
+    "smtp_host",
+    "smtp_port",
+    "smtp_security",
+    "smtp_username",
+    "smtp_from_address",
+    "smtp_to_addresses",
+    "smtp_reply_to",
+    "min_severity",
+    "resource_types",
+)
+# Columns that are NULL-able; an explicit null on an update clears them.
+_AUDIT_NULLABLE_FIELDS = {"ca_cert_pem", "smtp_to_addresses", "min_severity", "resource_types"}
+
+
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
+    """Apply ``body`` to ``t``.
+
+    An :class:`AuditTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
+    """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.kind = body.kind
-    t.format = body.format
-    t.host = body.host
-    t.port = body.port
-    t.protocol = body.protocol
-    t.facility = body.facility
-    t.ca_cert_pem = body.ca_cert_pem
+    sent = body.model_fields_set if isinstance(body, AuditTargetUpdate) else None
+    for field in _AUDIT_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None and field not in _AUDIT_NULLABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
+    # ``url`` / ``auth_header`` / ``smtp_password``: ``None`` or omitted
+    # keeps the stored value, ``""`` clears it, anything else is encrypted.
     t.url_encrypted = apply_write_only(t.url_encrypted, body.url)
     t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
-    t.webhook_flavor = body.webhook_flavor
-    t.smtp_host = body.smtp_host
-    t.smtp_port = body.smtp_port
-    t.smtp_security = body.smtp_security
-    t.smtp_username = body.smtp_username
-    t.smtp_from_address = body.smtp_from_address
-    t.smtp_to_addresses = body.smtp_to_addresses
-    t.smtp_reply_to = body.smtp_reply_to
-    # ``smtp_password`` semantics: ``None`` = leave existing encrypted
-    # value alone (operator editing other fields), ``""`` = clear,
-    # anything else = encrypt + replace.
     if body.smtp_password is not None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
-    t.min_severity = body.min_severity
-    t.resource_types = body.resource_types
+
+
+def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None:
+    """422 when the target as it would be stored is incomplete (#3926).
+
+    Runs BEFORE :func:`_apply_body`, on the row's values overlaid with the
+    keys the body carries, so one field sent for a syslog target is judged
+    against the host it already has, not against the webhook fields it does
+    not carry, and a refusal leaves the row untouched.
+    """
+    sent = body.model_fields_set
+
+    def merged(field: str) -> Any:
+        return getattr(body, field) if field in sent else getattr(t, field)
+
+    for field in _AUDIT_PLAIN_FIELDS:
+        if field in sent and getattr(body, field) is None and field not in _AUDIT_NULLABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+    to_addrs = merged("smtp_to_addresses")
+    kind = merged("kind")
+    try:
+        _check_kind_config(
+            kind,
+            host=merged("host") or "",
+            port=merged("port"),
+            facility=merged("facility"),
+            smtp_host=merged("smtp_host") or "",
+            smtp_port=int(merged("smtp_port") or 0),
+            smtp_from_address=merged("smtp_from_address") or "",
+            smtp_to_addresses=list(to_addrs) if to_addrs else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if kind == "webhook":
+        if body.url is not None and not body.url.strip():
+            raise HTTPException(status_code=422, detail="url is required for a webhook target")
+        if body.url is None and not t.url_encrypted:
+            raise HTTPException(status_code=422, detail="url is required for a webhook target")
 
 
 def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
@@ -3853,7 +3958,7 @@ async def update_audit_target(
     # uuid.UUID, not str: a non-UUID path value used to reach the driver and
     # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
     target_id: uuid.UUID,
-    body: AuditTargetBody,
+    body: AuditTargetUpdate,
     current_user: SuperAdmin,
     db: DB,
 ) -> AuditTargetResponse:
@@ -3861,8 +3966,8 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
-    _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
+    _check_merged_target(row, body)
     _apply_body(row, body)
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
@@ -4041,6 +4146,17 @@ class InfluxDBTargetBody(BaseModel):
         return v
 
 
+class InfluxDBTargetUpdate(InfluxDBTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    A client that sends the whole form back puts the copy it loaded over
+    anything another client stored since; an omitted key is left as stored,
+    so the Edit dialog sends just what the operator changed.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)  # type: ignore[assignment]
+
+
 class InfluxDBTargetResponse(BaseModel):
     id: str
     name: str
@@ -4107,31 +4223,46 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
     )
 
 
+_INFLUX_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "version",
+    "url",
+    "verify_tls",
+    "timeout_seconds",
+    "database",
+    "username",
+    "org",
+    "bucket",
+    "measurement_prefix",
+    "push_interval_seconds",
+    "push_dns_metrics",
+    "push_dhcp_metrics",
+    "push_subnet_utilization",
+    "push_dhcp_scope_leases",
+)
+
+
 def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
     """Apply ``body`` to ``t``; return which secrets were set or cleared.
 
     The return value is for the audit row, which never carries a secret but
     must say that one was replaced or removed (``password_set`` /
     ``token_cleared`` …), or a cleared credential leaves no trace.
+
+    A :class:`InfluxDBTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
     """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.version = body.version
-    t.url = body.url
-    t.verify_tls = body.verify_tls
-    t.timeout_seconds = body.timeout_seconds
-    t.database = body.database
-    t.username = body.username
-    t.org = body.org
-    t.bucket = body.bucket
-    t.measurement_prefix = body.measurement_prefix
-    t.push_interval_seconds = body.push_interval_seconds
-    t.push_dns_metrics = body.push_dns_metrics
-    t.push_dhcp_metrics = body.push_dhcp_metrics
-    t.push_subnet_utilization = body.push_subnet_utilization
-    t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
+    sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
+    for field in _INFLUX_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None:  # an explicit null name on an update
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
     # Blank never clears; only the explicit flag does. A non-blank value
     # sent alongside the flag wins over it: the operator typed a new secret.
     secret_changes: list[str] = []
@@ -4260,7 +4391,7 @@ async def create_influxdb_target(
 @router.put("/influxdb-targets/{target_id}", response_model=InfluxDBTargetResponse)
 async def update_influxdb_target(
     target_id: uuid.UUID,
-    body: InfluxDBTargetBody,
+    body: InfluxDBTargetUpdate,
     current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:
