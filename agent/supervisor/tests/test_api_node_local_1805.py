@@ -102,7 +102,7 @@ def _api_node_local_service(values: dict) -> object:
 @pytest.mark.parametrize("cp_size", [1, 3, 5])
 def test_the_supervisor_turns_on_the_node_local_service(cp_size: int) -> None:
     """#3645: ``api.service.nodeLocal`` (the internalTrafficPolicy: Local api
-    Service the frontend and the supervisors use) is written at every size."""
+    Service the member supervisors use) is written at every size."""
     assert _api_node_local_service(_owned(cp_size)) is True
 
 

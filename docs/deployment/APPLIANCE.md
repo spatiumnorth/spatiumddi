@@ -833,19 +833,23 @@ speaks plain http. So the two callers that carry credentials keep that hop on
 their own node: firstboot and the seed supervisor set `api.service.nodeLocal`,
 which renders a second Service, `spatium-control-spatiumddi-api-local`, with
 `internalTrafficPolicy: Local`. It answers only from an api pod on the caller's
-node. The frontend nginx's `/api` proxy (browsers and remote appliances) and a
-member's supervisor use it; the original `-api` Service is unchanged, for the
-worker, the role agents and the probes, and an older supervisor keeps using it.
+node. A member's supervisor uses it; the original `-api` Service is unchanged,
+for the frontend nginx, the worker, the role agents and the probes, and an
+older supervisor keeps using it.
 
 The requirement is **a ready api pod on every control-plane node** (the
 appliance already runs one per node: `replicas` equals the control-plane size,
-with required anti-affinity). A node whose api pod is down has no local
-endpoint, so its frontend answers 502 for `/api` until the pod is back (the VIP
-health check moves clients to another node), and its supervisor does not wait:
+with required anti-affinity). A node whose api pod is down (crashed, rolling,
+or not yet scheduled after a node join) has no local endpoint, and its
+supervisor does not wait:
 after two refused heartbeats it uses its `CONTROL_PLANE_URL` over https against
 the pinned certificate (`cp_tls`), and retries the local Service every 60 s.
-Plain http is therefore only ever node-local. Not covered yet, and tracked in
-#4019: the role agents, the worker and beat still reach the api over the
+Plain http is therefore only ever node-local. The frontend's `/api` proxy is deliberately not on the
+node-local Service: the node-local path has no fallback there, so it would turn
+an api pod rolling on a node into a UI outage on that node. It keeps the
+cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
+ready). Not covered yet, and tracked in #4019: the frontend's fallback window,
+the role agents, the worker and beat still reach the api over the
 cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
 On a network where the node LAN is not trusted, put a WireGuard-capable CNI
 under the cluster instead of relying on this alone.

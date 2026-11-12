@@ -3,16 +3,15 @@
 
 ``<release>-api-local`` is a second ClusterIP Service over the api pods with
 ``internalTrafficPolicy: Local``: a caller on a node reaches only that node's
-api pod, so the plain-http supervisor and frontend hop never crosses the node
-LAN. It is the appliance's (``api.service.nodeLocal``, set by firstboot and the
-supervisor); the umbrella default, Docker Compose and a BYO-Kubernetes install
-must render exactly the one api Service they always did, and the frontend's
-upstream must follow whichever Service exists.
+api pod, so the plain-http supervisor hop never crosses the node LAN. It is the appliance's
+(``api.service.nodeLocal``, set by firstboot and the supervisor); the umbrella default, Docker Compose and a BYO-Kubernetes install
+must render exactly the one api Service they always did. The frontend keeps the
+cluster-wide ``*-api`` Service in every render: an api pod that is down or
+being rolled on its node must not take that node's UI with it.
 
-Default: every file must have NO ``*-api-local`` Service and a frontend whose
-``API_UPSTREAM_HOST`` is the plain ``*-api`` one. ``--present``: every file must
-have exactly one, with ``internalTrafficPolicy: Local``, the api selector and
-port 8000, and the frontend's ``API_UPSTREAM_HOST`` must name it.
+Default: every file must have NO ``*-api-local`` Service. ``--present``: every
+file must have exactly one, with ``internalTrafficPolicy: Local``, the api selector and
+port 8000. Both: the frontend's ``API_UPSTREAM_HOST`` is the plain ``*-api``.
 
 Usage: chart-api-local-service.py [--present] <manifest.yaml> [...]
 """
@@ -59,9 +58,7 @@ def check(path: Path, present: bool) -> list[str]:
             problems.append(f"{path}: node-local api Service selects different pods")
         if [p.get("port") for p in spec.get("ports", [])] != [8000]:
             problems.append(f"{path}: node-local api Service must expose 8000")
-    want = (local[0]["metadata"]["name"] if present and local else main[0]["metadata"]["name"]) if (
-        local or main
-    ) else ""
+    want = main[0]["metadata"]["name"] if main else ""
     for d in docs:
         if d.get("kind") != "Deployment" or not d["metadata"]["name"].endswith("-frontend"):
             continue
