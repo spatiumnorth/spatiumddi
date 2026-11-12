@@ -38,6 +38,7 @@ from pydantic import (
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -2043,6 +2044,25 @@ class RecordPage(Page[RecordResponse]):
     ``total`` and ``items`` count stored records only."""
 
     served_apex: ServedApex | None = None
+
+
+async def _refresh_record_or_404(db: AsyncSession, record: DNSRecord) -> None:
+    """``db.refresh(record)`` after a commit, a vanished row answered 404 (#3801).
+
+    A permanent delete of the record's zone queued behind the zone-row lock
+    runs the instant the write commits and takes the new record with the zone,
+    so the re-read finds no row and SQLAlchemy raises ``InvalidRequestError``.
+    The zone is gone, which is what ``404 Zone not found`` says to a request
+    that arrives after the delete. Whether the row is gone is decided by
+    looking for it, not by the exception's wording; anything else re-raises.
+    """
+    try:
+        await db.refresh(record)
+    except InvalidRequestError as exc:
+        still_there = await db.scalar(select(DNSRecord.id).where(DNSRecord.id == record.id))
+        if still_there is not None:
+            raise
+        raise HTTPException(status_code=404, detail="Zone not found") from exc
 
 
 def _agentless_op_warning(op: Any) -> str | None:
@@ -9941,7 +9961,7 @@ async def create_record(
         )
     )
     await db.commit()
-    await db.refresh(record)
+    await _refresh_record_or_404(db, record)
     # #1539 — an agentless op is dispatched by the commit above, so its
     # outcome is only known now.
     provider_warning = provider_warning or _agentless_op_warning(op)
@@ -10136,7 +10156,7 @@ async def update_record(
         )
     )
     await db.commit()
-    await db.refresh(record)
+    await _refresh_record_or_404(db, record)
     # #1539 — an agentless op is dispatched by the commit above, so its
     # outcome is only known now (either half of a rename may have failed).
     provider_warning = provider_warning or _agentless_op_warning(
