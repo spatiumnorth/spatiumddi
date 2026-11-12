@@ -132,3 +132,51 @@ async def test_move_allowed_when_subnets_do_not_overlap(client, db_session):
     d, c, bd, bc, sc = await _setup(client, db_session, h, target_subnet="10.71.98.0/24")
     p, r = await _move_preview_commit(client, h, bc, "10.71.96.0/20", d)
     assert p.status_code == 200 and r.status_code == 200, r.text
+
+
+async def test_move_refused_when_child_block_overlaps_reparented_target_block(client, db_session):
+    """The issue's own shape: move a block into a space holding a block it
+    contains. Its child block and that target block would end up as overlapping
+    siblings under the moved block."""
+    h = await _headers(db_session)
+    d = await _space(db_session)
+    c = await _space(db_session)
+    await _block(client, h, d, "10.72.96.0/22")
+    bc = await _block(client, h, c, "10.72.96.0/20")
+    await _block(client, h, c, "10.72.96.0/23", parent_id=bc)
+    p, r = await _move_preview_commit(client, h, bc, "10.72.96.0/20", d)
+    assert p.status_code == 409, p.text
+    assert r.status_code == 409, r.text
+    assert "re-parented" in r.json()["detail"]
+    db_session.expire_all()
+    blk = (
+        await db_session.execute(select(IPBlock).where(IPBlock.id == uuid.UUID(bc)))
+    ).scalar_one()
+    assert str(blk.space_id) == c
+
+
+async def test_move_allowed_when_contained_target_block_has_no_overlapping_child(
+    client, db_session
+):
+    h = await _headers(db_session)
+    d = await _space(db_session)
+    c = await _space(db_session)
+    await _block(client, h, d, "10.73.96.0/22")
+    bc = await _block(client, h, c, "10.73.96.0/20")
+    await _block(client, h, c, "10.73.100.0/22", parent_id=bc)
+    p, r = await _move_preview_commit(client, h, bc, "10.73.96.0/20", d)
+    assert p.status_code == 200 and r.status_code == 200, r.text
+
+
+async def test_trashed_target_subnet_cannot_be_restored_over_a_moved_one(client, db_session):
+    """The move ignores a trashed target subnet, so the Trash restore must
+    still refuse to bring it back beside the overlapping moved one."""
+    h = await _headers(db_session)
+    d, c, bd, bc, sc = await _setup(client, db_session, h)
+    r = await client.get("/api/v1/ipam/subnets", headers=h, params={"space_id": d})
+    sid = r.json()[0]["id"]
+    await _trash(client, h, f"/api/v1/ipam/subnets/{sid}")
+    p, mv = await _move_preview_commit(client, h, bc, "10.71.96.0/20", d)
+    assert mv.status_code == 200, mv.text
+    rr = await client.post(f"/api/v1/admin/trash/subnet/{sid}/restore", headers=h)
+    assert rr.status_code == 409, rr.text
