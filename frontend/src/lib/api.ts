@@ -5232,6 +5232,8 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */

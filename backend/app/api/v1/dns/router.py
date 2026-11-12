@@ -8209,6 +8209,7 @@ class ZoneMovePreviewResponse(BaseModel):
     zone_view_action: str
     zone_view_from: str | None
     records_total: int
+    records_trashed: int = 0
     records_remapped: int
     records_widened: int
     records_cleared_inert: int
@@ -8260,6 +8261,7 @@ class ZoneMovePreviewResponse(BaseModel):
             zone_view_action=plan.zone_view_action,
             zone_view_from=plan.zone_view_from,
             records_total=plan.records_total,
+            records_trashed=plan.records_trashed,
             records_remapped=plan.records_remapped,
             records_widened=plan.records_widened,
             records_cleared_inert=plan.records_cleared_inert,

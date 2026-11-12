@@ -140,6 +140,9 @@ class ZoneMovePlan:
 
     # Per-record view scoping, same three outcomes.
     records_total: int = 0
+    # Records in the Trash: they move with the zone, answer nowhere, and are
+    # left out of every other figure here (#3921).
+    records_trashed: int = 0
     records_remapped: int = 0
     records_widened: int = 0
     records_cleared_inert: int = 0
@@ -573,6 +576,14 @@ async def assemble_move_plan(
             select(func.count()).select_from(DNSRecord).where(DNSRecord.zone_id == zone.id)
         )
     ).scalar_one()
+    plan.records_trashed = (
+        await db.execute(
+            select(func.count())
+            .select_from(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id, DNSRecord.deleted_at.isnot(None))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
 
     # Only view-scoped rows need looking at, and only their ``view_id`` —
     # so this selects two columns rather than hydrating every DNSRecord in
@@ -597,6 +608,11 @@ async def assemble_move_plan(
         action, new_id, old_name = _resolve(view_id)
         if deleted_at is None and new_id is not None and import_source != EXTERNAL_IMPORT_SOURCE:
             live_record_view_ids.add(new_id)
+        if deleted_at is not None:
+            # In the Trash: the commit still rewrites its view, but it answers
+            # nowhere, so it is neither "remapped" nor "start answering in
+            # EVERY view" and must not ask for the widening acknowledgement.
+            continue
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
