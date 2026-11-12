@@ -12,6 +12,8 @@ import {
   X,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { TagFilterChips } from "@/components/TagFilterChips";
@@ -141,7 +143,52 @@ function listToCsv(xs: string[]): string {
 
 // ── Editor modal ──────────────────────────────────────────────────────────────
 
+// Edit reads the VRF when it opens and sends only what changed (#3869); the
+// list's copy may predate another client's edit.
 export function VRFEditorModal({
+  existing,
+  onClose,
+}: {
+  existing: VRF | null;
+  onClose: () => void;
+}) {
+  const fresh = useFreshRow<VRF>(existing ?? undefined, () =>
+    vrfsApi.get(existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit VRF"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <VRFEditorForm existing={fresh.row ?? null} onClose={onClose} />;
+}
+
+function vrfBody(v: {
+  name: string;
+  description: string;
+  route_distinguisher: string | null;
+  import_targets: string[];
+  export_targets: string[];
+  asn_id: string | null;
+  customer_id: string | null;
+}) {
+  return {
+    name: v.name,
+    description: v.description,
+    route_distinguisher: v.route_distinguisher,
+    import_targets: v.import_targets,
+    export_targets: v.export_targets,
+    asn_id: v.asn_id,
+    customer_id: v.customer_id,
+  };
+}
+
+function VRFEditorForm({
   existing,
   onClose,
 }: {
@@ -191,7 +238,17 @@ export function VRFEditorModal({
         customer_id: customerId,
       };
       if (existing) {
-        return vrfsApi.update(existing.id, body);
+        const diff = changedFields(
+          vrfBody({
+            ...existing,
+            route_distinguisher: existing.route_distinguisher ?? null,
+            asn_id: existing.asn_id ?? null,
+            customer_id: existing.customer_id ?? null,
+          }),
+          body as ReturnType<typeof vrfBody>,
+        );
+        if (Object.keys(diff).length === 0) return existing;
+        return vrfsApi.update(existing.id, diff);
       }
       return vrfsApi.create(body as VRFCreate);
     },
@@ -401,7 +458,7 @@ function BulkDeleteModal({
       if (resp.refused.length > 0) {
         setError(
           `Refused ${resp.refused.length} VRF${resp.refused.length === 1 ? "" : "s"} ` +
-            "with linked spaces or blocks. Tick force-detach to proceed.",
+            "with linked spaces or blocks (rows in the Trash count). Tick force-detach to proceed.",
         );
         return;
       }
@@ -440,9 +497,10 @@ function BulkDeleteModal({
             />
             <span>
               <span className="font-medium">Force-detach.</span> Linked IP
-              spaces / IP blocks will have their <code>vrf_id</code> set to NULL
-              via <code>ON DELETE SET NULL</code>. Without this, VRFs with
-              linked rows are skipped.
+              spaces / IP blocks, including ones in the Trash (a restore does
+              not bring the VRF back), will have their <code>vrf_id</code> set
+              to NULL via <code>ON DELETE SET NULL</code>. Without this, VRFs
+              with linked rows are skipped.
             </span>
           </label>
         )}
@@ -638,8 +696,14 @@ export function VRFsPage() {
                     what="VRFs"
                     filtered={tagFilters.length > 0}
                     onClearFilters={() => setTagFilters([])}
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>+ New VRF</strong> to create one.
+                      </>
+                    }
                   >
-                    No VRFs yet. Click <strong>+ New VRF</strong> to create one.
+                    No VRFs yet.
                   </ListEmpty>
                 </td>
               </tr>

@@ -52,6 +52,7 @@ from app.services.dhcp.class_refs import (
     describe_pools,
     pools_restricted_to,
     pxe_pool_refs,
+    trash_hint,
 )
 from app.services.dhcp.option_validation import check_vendor_class_match
 
@@ -333,14 +334,14 @@ async def _refuse_if_pool_bound(
     profile. Same refusal shape as deleting a client class (#2285)."""
     for m in removed:
         name = f"pxe-{str(p.id)[:8]}-{str(m.id)[:8]}"
-        pools = await pools_restricted_to(db, p.group_id, name)
+        pools = await pools_restricted_to(db, p.group_id, name, include_trashed=True)
         if pools:
             detail = (
                 f"Cannot {verb}: boot rule '{m.boot_filename}' generates class "
                 f"'{name}', which is still referenced by {len(pools)} pool(s) "
                 f"({describe_pools(pools)}). Kea accepts a reference to an undefined "
                 "class and the pool would silently match no client. Clear or change "
-                "those references first."
+                "those references first." + trash_hint(pools)
             )
             # Drop the in-session edits so a refused Save leaves nothing staged.
             await db.rollback()

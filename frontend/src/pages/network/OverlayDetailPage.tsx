@@ -975,6 +975,9 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
       qc.invalidateQueries({ queryKey: ["overlay-policies", overlayId] });
       qc.invalidateQueries({ queryKey: ["overlay", overlayId] });
     },
+    // A 404 means the policy is already gone: re-read so it leaves the list.
+    onError: () =>
+      qc.invalidateQueries({ queryKey: ["overlay-policies", overlayId] }),
   });
 
   // Reorder: compute the new priority by averaging neighbours so we
