@@ -76,6 +76,8 @@ async function openEdit(target: InfluxDBTarget) {
   mount(target);
   await screen.findByText("grafana");
   fireEvent.click(screen.getByTitle("Edit"));
+  // The dialog reads the target fresh before it draws (#3926).
+  await screen.findByText("Save");
 }
 
 async function save() {
@@ -97,6 +99,10 @@ describe("stored secrets", () => {
     const pw = screen.getByPlaceholderText("(stored — leave blank to keep)");
     fireEvent.change(pw, { target: { value: "x" } });
     fireEvent.change(pw, { target: { value: "" } });
+    // Something else must change, or Save sends nothing at all (#3926).
+    fireEvent.change(screen.getByDisplayValue("60"), {
+      target: { value: "90" },
+    });
     api.update.mockResolvedValue(BASE);
     await save();
     const body = api.update.mock.calls[0][1] as Record<string, unknown>;
@@ -110,6 +116,9 @@ describe("stored secrets", () => {
     const tok = screen.getByPlaceholderText("(stored — leave blank to keep)");
     fireEvent.change(tok, { target: { value: "x" } });
     fireEvent.change(tok, { target: { value: "" } });
+    fireEvent.change(screen.getByDisplayValue("60"), {
+      target: { value: "90" },
+    });
     api.update.mockResolvedValue(v2);
     await save();
     const body = api.update.mock.calls[0][1] as Record<string, unknown>;
@@ -154,9 +163,44 @@ describe("stored secrets", () => {
   });
 });
 
+describe("Edit saves only what changed (#3926)", () => {
+  it("reads the target fresh and does not put back another client's change", async () => {
+    mount(BASE);
+    await screen.findByText("grafana");
+    // Another client changed the target after the list loaded.
+    const theirs = {
+      ...BASE,
+      url: "http://192.0.2.11:8086",
+      database: "other",
+      measurement_prefix: "xq_",
+      push_dhcp_metrics: false,
+    };
+    api.list.mockResolvedValue([theirs]);
+    fireEvent.click(screen.getByTitle("Edit"));
+    await screen.findByDisplayValue("http://192.0.2.11:8086");
+    fireEvent.change(screen.getByDisplayValue("60"), {
+      target: { value: "120" },
+    });
+    api.update.mockResolvedValue(theirs);
+    await save();
+    expect(api.update).toHaveBeenCalledWith("t1", {
+      push_interval_seconds: 120,
+    });
+  });
+
+  it("sends nothing when nothing changed", async () => {
+    await openEdit(BASE);
+    await save();
+    expect(api.update).not.toHaveBeenCalled();
+  });
+});
+
 describe("a refused save", () => {
   it("shows the server's reason as text and keeps the dialog open", async () => {
     await openEdit(BASE);
+    fireEvent.change(screen.getByDisplayValue("http://192.0.2.10:8086"), {
+      target: { value: "192.0.2.10:8086" },
+    });
     api.update.mockRejectedValue({
       response: {
         data: {

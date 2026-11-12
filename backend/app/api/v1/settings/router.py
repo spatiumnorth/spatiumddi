@@ -3954,6 +3954,17 @@ class InfluxDBTargetBody(BaseModel):
         return v
 
 
+class InfluxDBTargetUpdate(InfluxDBTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    A client that sends the whole form back puts the copy it loaded over
+    anything another client stored since; an omitted key is left as stored,
+    so the Edit dialog sends just what the operator changed.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)  # type: ignore[assignment]
+
+
 class InfluxDBTargetResponse(BaseModel):
     id: str
     name: str
@@ -4020,31 +4031,46 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
     )
 
 
+_INFLUX_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "version",
+    "url",
+    "verify_tls",
+    "timeout_seconds",
+    "database",
+    "username",
+    "org",
+    "bucket",
+    "measurement_prefix",
+    "push_interval_seconds",
+    "push_dns_metrics",
+    "push_dhcp_metrics",
+    "push_subnet_utilization",
+    "push_dhcp_scope_leases",
+)
+
+
 def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
     """Apply ``body`` to ``t``; return which secrets were set or cleared.
 
     The return value is for the audit row, which never carries a secret but
     must say that one was replaced or removed (``password_set`` /
     ``token_cleared`` …), or a cleared credential leaves no trace.
+
+    A :class:`InfluxDBTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
     """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.version = body.version
-    t.url = body.url
-    t.verify_tls = body.verify_tls
-    t.timeout_seconds = body.timeout_seconds
-    t.database = body.database
-    t.username = body.username
-    t.org = body.org
-    t.bucket = body.bucket
-    t.measurement_prefix = body.measurement_prefix
-    t.push_interval_seconds = body.push_interval_seconds
-    t.push_dns_metrics = body.push_dns_metrics
-    t.push_dhcp_metrics = body.push_dhcp_metrics
-    t.push_subnet_utilization = body.push_subnet_utilization
-    t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
+    sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
+    for field in _INFLUX_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None:  # an explicit null name on an update
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
     # Blank never clears; only the explicit flag does. A non-blank value
     # sent alongside the flag wins over it: the operator typed a new secret.
     secret_changes: list[str] = []
@@ -4173,7 +4199,7 @@ async def create_influxdb_target(
 @router.put("/influxdb-targets/{target_id}", response_model=InfluxDBTargetResponse)
 async def update_influxdb_target(
     target_id: uuid.UUID,
-    body: InfluxDBTargetBody,
+    body: InfluxDBTargetUpdate,
     current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:
