@@ -122,6 +122,11 @@ class ListAlertsArgs(BaseModel):
         description="Filter by subject type — 'subnet' or 'server'.",
     )
     limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Rows to skip (newest first) to page past ``limit`` (#3830).",
+    )
 
 
 @register_tool(
@@ -144,7 +149,11 @@ async def list_alerts(db: AsyncSession, user: User, args: ListAlertsArgs) -> lis
         stmt = stmt.where(AlertEvent.severity == args.severity)
     if args.subject_type:
         stmt = stmt.where(AlertEvent.subject_type == args.subject_type)
-    stmt = stmt.order_by(AlertEvent.fired_at.desc()).limit(args.limit)
+    stmt = (
+        stmt.order_by(AlertEvent.fired_at.desc(), AlertEvent.id)
+        .offset(args.offset)
+        .limit(args.limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return [
         {

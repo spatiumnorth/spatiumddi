@@ -120,6 +120,7 @@ const VRF = {
 /** Answers the page's own list, and spies on the two lists it may not ask. */
 function lists(asns: Answer, customers: Answer) {
   answer("vrfsApi", "list", () => Promise.resolve([VRF]));
+  answer("vrfsApi", "get", () => Promise.resolve(VRF));
   const asnList = vi.fn(asns);
   const customerList = vi.fn(customers);
   answer("asnsApi", "list", asnList);
@@ -183,11 +184,8 @@ describe("VRFs page reads for a user who may not read ASNs or customers (#3466)"
     });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    expect(update.mock.calls[0][1]).toMatchObject({
-      description: "new",
-      asn_id: "asn-1",
-      customer_id: "cust-1",
-    });
+    // The links are not in the body, so they are not cleared.
+    expect(update.mock.calls[0][1]).toEqual({ description: "new" });
     expect(asnList).not.toHaveBeenCalled();
     expect(customerList).not.toHaveBeenCalled();
   });
@@ -200,6 +198,9 @@ describe("VRFs page reads for a user who may not read ASNs or customers (#3466)"
     );
     answer("vrfsApi", "list", () =>
       Promise.resolve([{ ...VRF, customer_id: null }]),
+    );
+    answer("vrfsApi", "get", () =>
+      Promise.resolve({ ...VRF, customer_id: null }),
     );
     const row = await showPage();
     fireEvent.click(within(row).getByRole("button", { name: "Edit VRF" }));
