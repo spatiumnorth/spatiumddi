@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
@@ -101,6 +102,9 @@ class ApiTokenCreate(BaseModel):
         return validate_scopes(v)
 
 
+TokenStatus = Literal["active", "revoked", "expired", "owner_disabled", "password_change_required"]
+
+
 class ApiTokenResponse(BaseModel):
     """Safe-to-list representation — no hash, no raw token."""
 
@@ -128,7 +132,7 @@ class ApiTokenResponse(BaseModel):
     # at serialisation (no column). "active" | "revoked" | "expired" |
     # "owner_disabled" | "password_change_required"; ``blocked_reason`` is
     # the operator-readable sentence, None when active.
-    status: str = "active"
+    status: TokenStatus = "active"
     blocked_reason: str | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
@@ -160,6 +164,7 @@ def apply_effective_status(row: ApiTokenResponse) -> ApiTokenResponse:
     exp = row.expires_at
     if exp is not None and exp.tzinfo is None:
         exp = exp.replace(tzinfo=UTC)
+    st: TokenStatus
     if not row.is_active:
         st = "revoked"
     elif exp is not None and exp <= datetime.now(UTC):
@@ -637,9 +642,7 @@ async def _with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
     row = ApiTokenResponse.model_validate(token)
     if token.user_id is not None:
         owner = (
-            await db.execute(
-                select(User).where(User.id == token.user_id)
-            )
+            await db.execute(select(User).where(User.id == token.user_id))
         ).scalar_one_or_none()
         if owner is not None:
             row.owner_username = owner.username
