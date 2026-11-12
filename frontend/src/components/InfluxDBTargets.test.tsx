@@ -15,7 +15,12 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { InfluxDBTarget } from "@/lib/api";
 
-const api = { list: vi.fn(), update: vi.fn(), create: vi.fn() };
+const api = {
+  list: vi.fn(),
+  update: vi.fn(),
+  create: vi.fn(),
+  del: vi.fn(),
+};
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -26,6 +31,7 @@ vi.mock("@/lib/api", async () => {
       listInfluxTargets: () => api.list(),
       updateInfluxTarget: (id: string, body: unknown) => api.update(id, body),
       createInfluxTarget: (body: unknown) => api.create(body),
+      deleteInfluxTarget: (id: string) => api.del(id),
     },
   };
 });
@@ -88,6 +94,7 @@ async function save() {
 
 afterEach(() => {
   cleanup();
+  api.del.mockReset();
   api.list.mockReset();
   api.update.mockReset();
   api.create.mockReset();
@@ -264,5 +271,25 @@ describe("measurement prefix", () => {
   it("shows no empty-prefix note when a prefix is stored", async () => {
     await openEdit(BASE);
     expect(screen.queryByText(/no prefix/i)).toBeNull();
+  });
+});
+
+describe("a refused delete (#3822)", () => {
+  it("says why in an alert and reads the list again", async () => {
+    mount(BASE);
+    await screen.findByText("grafana");
+    api.del.mockRejectedValue({
+      response: { status: 404, data: { detail: "Target not found" } },
+    });
+    fireEvent.click(screen.getByTitle("Delete"));
+    const before = api.list.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Delete" }).slice(-1)[0],
+      );
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Target not found");
+    expect(api.list.mock.calls.length).toBeGreaterThan(before);
   });
 });
