@@ -454,6 +454,45 @@ def test_snapshot_runs_on_start_then_on_recovery_throttled(agent_cfg, cp, clock,
     assert len(snap_posts) == 2
 
 
+def test_one_read_timeout_does_not_request_a_full_snapshot_3811(agent_cfg, cp, clock, tmp_path):
+    """A timed-out post whose batch landed is replayed as the same batch (the
+    server dedupes it); it is not an outage, so no whole-table snapshot."""
+    kea = FakeKea([_kea_lease("10.5.0.1")])
+    w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), kea, clock)
+    w.tick()
+    assert w.snapshot.runs_completed == 1
+
+    cp.lose_next_response = True
+    agent_cfg.kea_lease_file.write_text(_csv_rows(["10.5.0.2"]))
+    clock.advance(6)
+    w.tick()
+    assert len(w._shipper.spool) == 1
+    clock.advance(60)
+    w.tick()
+    assert len(w._shipper.spool) == 0
+    clock.advance(600)
+    w.tick()
+    assert not w._recovered and not w.snapshot.due
+    assert w.snapshot.runs_completed == 1
+    assert sum(1 for c in kea.calls if c["from"] == "start") == 1
+    # The resend reused the batch_id of the first attempt.
+    ids = [
+        b["batch_id"]
+        for b in cp.bodies("/lease-events")
+        if b["leases"][0]["ip_address"] == "10.5.0.2"
+    ]
+    assert len(ids) == 1
+
+
+def test_run_of_timeouts_still_counts_as_an_outage_3811(agent_cfg, cp, clock, tmp_path):
+    kea = FakeKea([_kea_lease("10.6.0.1")])
+    w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), kea, clock)
+    w.tick()
+    for _ in range(5):
+        w._note_slow_failure()
+    assert w._degraded
+
+
 def test_snapshot_waits_for_the_backlog(agent_cfg, cp, clock, tmp_path):
     """A snapshot never overtakes spooled events — replaying those after it
     would roll leases back to an older state."""
