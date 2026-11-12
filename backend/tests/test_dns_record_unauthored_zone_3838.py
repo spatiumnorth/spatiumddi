@@ -107,3 +107,52 @@ async def test_update_refused_delete_allowed_on_legacy_row(
     assert r.status_code == 422, r.text
     r = await client.delete(f"{_url(zone)}/{rec.id}", headers=headers)
     assert r.status_code == 204, r.text
+
+
+@pytest.mark.parametrize("zone_type", ["secondary", "stub"])
+async def test_import_preview_and_commit_agree(
+    client: AsyncClient, db_session: AsyncSession, zone_type: str
+) -> None:
+    """A clean preview must not be followed by a refused commit."""
+    zone, headers = await _setup(db_session, zone_type)
+    base = f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/import"
+    body = {"zone_file": "www IN A 192.0.2.61\n"}
+    for path in ("/preview", "/commit"):
+        r = await client.post(base + path, headers=headers, json=body)
+        assert r.status_code == 422, (path, r.text)
+        assert zone_type in r.json()["detail"]
+    sheet = {"file": ("r.csv", b"name,type,value\nwww,A,192.0.2.61\n", "text/csv")}
+    for path in ("/spreadsheet/preview", "/spreadsheet/commit"):
+        r = await client.post(base + path, headers=headers, files=sheet)
+        assert r.status_code == 422, (path, r.text)
+    assert await _count(db_session, zone) == 0
+
+
+async def test_pool_create_refused_on_secondary(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    zone, headers = await _setup(db_session, "secondary")
+    r = await client.post(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/pools",
+        headers=headers,
+        json={"name": "p", "record_name": "web", "record_type": "A"},
+    )
+    assert r.status_code == 422, r.text
+    assert "secondary" in r.json()["detail"]
+
+
+async def test_legacy_rows_still_listed(client: AsyncClient, db_session: AsyncSession) -> None:
+    zone, headers = await _setup(db_session, "secondary")
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="www",
+            fqdn=f"www.{zone.name}",
+            record_type="A",
+            value="192.0.2.61",
+        )
+    )
+    await db_session.flush()
+    r = await client.get(_url(zone), headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 1

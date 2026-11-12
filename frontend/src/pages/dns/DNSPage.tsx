@@ -4517,6 +4517,14 @@ export function ZoneDetailView({
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
 
+  // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
+  // stub's data is its masters', so the server refuses a record written into
+  // it (422); the record entry points say so instead of failing on submit.
+  const unauthoredReason =
+    !isForward && zone.zone_type !== "primary" && zone.zone_type !== "master"
+      ? `This is a ${zone.zone_type} zone: its records come from its masters, so none can be added here.`
+      : undefined;
+
   // #996 — the Add Record keycap, rendered from lib/shortcuts.ts rather
   // than typed here, so retuning the binding moves the handler below,
   // this tooltip and the ``?`` overlay together.
@@ -4539,7 +4547,13 @@ export function ZoneDetailView({
     // #2529 — the keyboard path must honour the same grant as the button.
     // The ? sheet lists the key under ADD_DNS_RECORD.requires, which must
     // name this same grant (#3167).
-    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
+    if (
+      isForward ||
+      unauthoredReason ||
+      zone.tailscale_tenant_id ||
+      !canWriteRecords
+    )
+      return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4550,7 +4564,13 @@ export function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
+  }, [
+    isForward,
+    unauthoredReason,
+    zone.tailscale_tenant_id,
+    showAddRecord,
+    canWriteRecords,
+  ]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
@@ -4784,6 +4804,9 @@ export function ZoneDetailView({
                       label: "Import zone file",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
                       ...permissionGate(
                         can("write", "dns_record"),
                         NEEDS_RECORD_WRITE,
@@ -4802,6 +4825,9 @@ export function ZoneDetailView({
                       onSelect: () => setShowSheetImport(true),
                       title:
                         "Bulk-edit records from a spreadsheet: preview the adds, changes and deletes, then import",
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
                       ...permissionGate(
                         can("write", "dns_record"),
                         NEEDS_RECORD_WRITE,
@@ -4923,11 +4949,12 @@ export function ZoneDetailView({
               variant="primary"
               icon={Plus}
               onClick={() => setShowAddRecord(true)}
-              disabled={!!zone.tailscale_tenant_id}
+              disabled={!!zone.tailscale_tenant_id || !!unauthoredReason}
               title={
                 zone.tailscale_tenant_id
                   ? "Records are managed by the Tailscale reconciler."
-                  : `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`
+                  : (unauthoredReason ??
+                    `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`)
               }
               {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
             >

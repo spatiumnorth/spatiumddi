@@ -10984,6 +10984,8 @@ async def import_zone_preview(
     Non-mutating: this endpoint never writes to the database.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3838 — preview and commit agree: the commit refuses this zone.
+    _reject_if_unauthored_zone(zone, "import")
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11050,6 +11052,7 @@ async def import_zone_commit(
     # the deleted row (a 500). With a view, its record edits went out before
     # the bump and could deadlock with a delete that took the zone row first.
     zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    _reject_if_unauthored_zone(zone, "import")  # #3838, before any parsing
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11076,7 +11079,6 @@ async def import_zone_commit(
     # record type the group's drivers cannot serve (the provider would reject
     # the op and keep retrying it, rather than the operator getting a 422).
     _reject_if_synthesised_zone(zone, "import")
-    _reject_if_unauthored_zone(zone, "import")
     await _require_superadmin_for_lua(
         db,
         current_user,
@@ -11714,6 +11716,7 @@ async def import_zone_spreadsheet_preview(
     for the columns and the match rule.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    _reject_if_unauthored_zone(zone, "import")  # #3838, as the commit
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     return SheetImportPreviewResponse(
         zone_id=zone.id,
