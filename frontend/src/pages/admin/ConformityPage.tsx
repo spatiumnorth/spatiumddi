@@ -210,8 +210,10 @@ export function ConformityPage() {
                       <ListEmpty
                         error={policiesQ.error}
                         what="conformity policies"
+                        gate={adminGate}
+                        hint={`Click “New policy” to add one.`}
                       >
-                        No policies yet — click “New policy” to add one.
+                        No policies yet.
                       </ListEmpty>
                     </td>
                   </tr>
