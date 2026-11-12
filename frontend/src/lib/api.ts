@@ -13532,7 +13532,7 @@ export interface ApplianceRow {
   host_config_health: Record<
     string,
     {
-      state: "retrying" | "failing";
+      state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
     }
