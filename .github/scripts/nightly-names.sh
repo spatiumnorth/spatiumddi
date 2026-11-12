@@ -7,12 +7,14 @@
 # has always been) or `release/X.Y.Z` (a release branch's own nightly); anything
 # else is refused. A release branch's names carry X.Y.Z so its tags, images and
 # pre-releases form a ring of their own, and neither ring's prune can match the
-# other's:
+# other's. A branch's pre-release tag must NOT start with "nightly": the QA
+# harness (ddi-pg) takes the newest pre-release whose tag starts with
+# "nightly" as main's nightly, so it is "branch-nightly-...":
 #
 #                main                          release/1.0.1
 #   date_tag     nightly-20261112              nightly-1.0.1-20261112
 #   pointer_tag  nightly                       nightly-1.0.1
-#   release_tag  nightly-2026.11.12            nightly-1.0.1-2026.11.12
+#   release_tag  nightly-2026.11.12            branch-nightly-1.0.1-2026.11.12
 #   version      0.0.0-nightly-20261112+abc1234
 #                                              0.0.0-nightly-20261112+release-1.0.1.abc1234
 #
@@ -51,11 +53,11 @@ elif [[ "$REF" =~ ^release/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
   echo "branch_version=${V}"
   echo "date_tag=nightly-${V}-${NIGHT_DATE}"
   echo "pointer_tag=nightly-${V}"
-  echo "release_tag=nightly-${V}-${DOTTED}"
+  echo "release_tag=branch-nightly-${V}-${DOTTED}"
   echo "version=0.0.0-nightly-${NIGHT_DATE}+release-${V}.${SHA::7}"
   echo "cache_scope=nightly-${V}"
   echo "image_ring_re=^nightly-${VRE}-[0-9]{8}\$"
-  echo "release_ring_re=^nightly-${VRE}-[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}\$"
+  echo "release_ring_re=^branch-nightly-${VRE}-[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}\$"
 else
   echo "::error::ref '${REF}' must be 'main' or match ^release/[0-9]+\\.[0-9]+\\.[0-9]+\$" >&2
   exit 1

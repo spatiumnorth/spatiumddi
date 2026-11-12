@@ -730,7 +730,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}  # no checkout in this job
           # THIS ref's pre-releases only (#3950). main's pattern is
-          # ^nightly-YYYY.MM.DD$, so `nightly-1.0.1-…` is not in its ring.
+          # ^nightly-YYYY.MM.DD$; a branch ring is ^branch-nightly-X.Y.Z-YYYY.MM.DD$.
           RING_RE: ${{ needs.gate.outputs.release_ring_re }}
           BUILD_REF: ${{ needs.gate.outputs.ref }}
         run: |
@@ -742,11 +742,11 @@ jobs:
           CUTOFF=$(TZ=America/New_York date -d '7 days ago' +%Y%m%d)
           echo "cutoff: nightly dates < ${CUTOFF} are deleted"
 
-          # startswith("nightly"), no dash — the legacy reused release is
+          # startswith("nightly") (plus branch-nightly-* for #3950), no dash — the legacy reused release is
           # tagged bare `nightly` and must enter the loop to be deleted;
           # anything else oddly-named lands in the fail-safe skip below.
           if ! tags=$(gh release list --limit 200 --json tagName \
-                        --jq '.[].tagName | select(startswith("nightly"))'); then
+                        --jq '.[].tagName | select(startswith("nightly") or startswith("branch-nightly"))'); then
             echo "::error::could not list releases — retention NOT applied"
             exit 1
           fi

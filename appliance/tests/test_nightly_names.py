@@ -44,7 +44,8 @@ def test_release_branch_names_are_suffixed() -> None:
     n = names("release/1.0.1")
     assert n["date_tag"] == "nightly-1.0.1-20261112"
     assert n["pointer_tag"] == "nightly-1.0.1"
-    assert n["release_tag"] == "nightly-1.0.1-2026.11.12"
+    assert n["release_tag"] == "branch-nightly-1.0.1-2026.11.12"
+    assert not n["release_tag"].startswith("nightly")  # QA harness reads nightly* as main's
     assert n["version"] == "0.0.0-nightly-20261112+release-1.0.1.0123456"
     assert n["cache_scope"] == "nightly-1.0.1"
 
