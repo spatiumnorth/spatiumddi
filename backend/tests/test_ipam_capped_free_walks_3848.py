@@ -96,3 +96,53 @@ async def test_available_subnets_is_bounded_on_a_huge_block(
     assert r.status_code == 200, r.text
     assert len(r.json()) == 5
     assert r.json()[0] == "fd00:0:0:1::/128"
+
+
+def _address_exclude_reference(block: str, kids: list[str]) -> list[str]:
+    """The pre-#3848 repeated-address_exclude algorithm, kept as the oracle."""
+    working = [ipaddress.ip_network(block, strict=False)]
+    for raw in kids:
+        child = ipaddress.ip_network(raw, strict=False)
+        nxt: list = []
+        for net in working:
+            if child == net:
+                continue
+            if child.subnet_of(net):
+                nxt.extend(net.address_exclude(child))
+            elif net.subnet_of(child):
+                continue
+            else:
+                nxt.append(net)
+        working = nxt
+    working.sort(key=lambda n: int(n.network_address))
+    return [str(n) for n in working]
+
+
+def test_free_networks_matches_address_exclude_and_is_fast():
+    import random
+    import time
+
+    from app.api.v1.ipam.router import _free_networks
+
+    rng = random.Random(3848)
+    for it in range(400):
+        v6 = it % 2 == 1
+        block = "fd00::/112" if v6 else "10.0.0.0/20"
+        net = ipaddress.ip_network(block)
+        bits = net.max_prefixlen
+        cls = ipaddress.IPv6Network if v6 else ipaddress.IPv4Network
+        kids = []
+        for _ in range(rng.randrange(0, 12)):
+            pl = rng.randrange(net.prefixlen - 2, bits + 1)
+            a = int(net.network_address) + rng.randrange(net.num_addresses)
+            if rng.random() < 0.1:
+                a = rng.randrange(1 << bits)  # outside the block
+            kids.append(str(cls((a >> (bits - pl) << (bits - pl), pl))))
+        got = [str(n) for n in _free_networks(block, kids)]
+        assert got == _address_exclude_reference(block, kids), (block, kids)
+
+    # Thousands of children in a /8 must not be O(children x pieces).
+    kids = [f"10.{rng.randrange(256)}.{rng.randrange(256)}.0/24" for _ in range(5000)]
+    t0 = time.monotonic()
+    _free_networks("10.0.0.0/8", kids)
+    assert time.monotonic() - t0 < 5

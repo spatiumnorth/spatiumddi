@@ -3866,32 +3866,39 @@ async def _sync_dns_record(
 def _free_networks(
     block_network: str, child_networks: list[str]
 ) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-    """Every free CIDR inside ``block_network``, sorted by address, uncapped."""
+    """Every free CIDR inside ``block_network``, sorted by address, uncapped.
+
+    One sweep over the children sorted by address (O(n log n + output)): merge
+    the occupied intervals, then split each gap into its maximal aligned CIDRs.
+    The earlier repeated ``address_exclude`` was O(children x pieces), which
+    for a few thousand children in a /8 or an IPv6 /16 ran for minutes. Same
+    set and order of ranges as that algorithm (pinned by a fuzz test).
+    """
     block = ipaddress.ip_network(block_network, strict=False)
-
-    # Start with a single working set containing the block itself.
-    working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [block]
-
-    # Sort children by prefixlen desc so smaller ones excluded first is fine —
-    # address_exclude handles either ordering. We just iterate.
+    lo = int(block.network_address)
+    hi = int(block.broadcast_address)
+    version = block.version
+    spans: list[tuple[int, int]] = []
     for raw in child_networks:
         child = ipaddress.ip_network(raw, strict=False)
-        next_working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-        for net in working:
-            if child == net:
-                # fully consumed
-                continue
-            if child.subnet_of(net):  # type: ignore[arg-type]
-                next_working.extend(net.address_exclude(child))  # type: ignore[arg-type]
-            elif net.subnet_of(child):  # type: ignore[arg-type]
-                # net is fully covered by child → drop
-                continue
-            else:
-                next_working.append(net)
-        working = next_working
+        if child.version != version:
+            continue
+        c_lo, c_hi = int(child.network_address), int(child.broadcast_address)
+        if c_hi < lo or c_lo > hi:
+            continue
+        spans.append((max(c_lo, lo), min(c_hi, hi)))
+    spans.sort()
 
-    working.sort(key=lambda n: int(n.network_address))
-    return working
+    addr = ipaddress.IPv4Address if version == 4 else ipaddress.IPv6Address
+    out: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    cursor = lo  # first address not yet known to be occupied
+    for s_lo, s_hi in spans:
+        if s_lo > cursor:
+            out.extend(ipaddress.summarize_address_range(addr(cursor), addr(s_lo - 1)))
+        cursor = max(cursor, s_hi + 1)
+    if cursor <= hi:
+        out.extend(ipaddress.summarize_address_range(addr(cursor), addr(hi)))
+    return out
 
 
 def _compute_free_cidrs(
