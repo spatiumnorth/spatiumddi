@@ -61,8 +61,10 @@ logger = structlog.get_logger(__name__)
 SERIAL_GRACE = timedelta(seconds=120)
 
 
-def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
-    """Whether a server's reported serial for ``zone`` reads as in sync.
+def zone_state_in_sync(
+    zone: DNSZone, current: int, target: int, driver: str, *, serials_read_back: bool = True
+) -> bool:
+    """Whether a server's reported serial says it serves the zone's saved state.
 
     A primary zone is in sync when the server serves our serial
     (``last_serial``). A secondary / stub zone's serial is its primary's, not
@@ -72,11 +74,16 @@ def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) ->
     transferred (a transferred zone never serves 0) and not before: at 0 it
     holds no data and answers REFUSED / SERVFAIL (#1967, #3940). A BIND9 agent
     that cannot read the zone back reports nothing, which is not in sync
-    either. Other drivers compare with the target."""
+    either. ``serials_read_back`` is False for a BIND9 agent of a release
+    before #3940: it reports the bundle's serial, 0, for every secondary
+    whatever named holds, so 0 says nothing there and the old comparison with
+    the target stays (a strict rule would flag every secondary of an agent not
+    yet upgraded). Other drivers compare with the target."""
     if (zone.zone_type or "primary") in ("secondary", "stub"):
-        if driver in ("powerdns", "bind9"):
+        if driver == "powerdns" or (driver == "bind9" and serials_read_back):
             return current != 0
         return current == target
+    return current == target
     return current == target
 
 
@@ -197,7 +204,9 @@ def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
 TRANSFERRED = frozenset({"ok", "syncing", "behind", "drift"})
 
 
-def _serial_behind(zone: DNSZone, current: int, target: int, driver: str) -> bool:
+def _serial_behind(
+    zone: DNSZone, current: int, target: int, driver: str, *, serials_read_back: bool = True
+) -> bool:
     """Whether a reported serial says the server has not reached the zone's.
 
     A secondary / stub zone's serial is its primary's, so the in-sync rule
@@ -209,7 +218,9 @@ def _serial_behind(zone: DNSZone, current: int, target: int, driver: str) -> boo
     change; calling them behind would flag every signed zone, permanently.
     """
     if (zone.zone_type or "primary") in ("secondary", "stub"):
-        return not zone_state_in_sync(zone, current, target, driver)
+        return not zone_state_in_sync(
+            zone, current, target, driver, serials_read_back=serials_read_back
+        )
     return current != target and (target - current) % 2**32 < 2**31
 
 
@@ -257,7 +268,11 @@ async def _classify_transferred(
         if st is not None:
             e.current_serial = int(st.current_serial)
         behind_serial = e.current_serial is not None and _serial_behind(
-            zone, e.current_serial, target, by_id[e.server_id].driver
+            zone,
+            e.current_serial,
+            target,
+            by_id[e.server_id].driver,
+            serials_read_back=by_id[e.server_id].agent_reports_served_serials,
         )
         # Under split-horizon a transfer not addressed to the zone's view was
         # answered by some view, maybe another one; an unviewed zone's

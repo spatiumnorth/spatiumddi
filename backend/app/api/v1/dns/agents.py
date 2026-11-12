@@ -115,6 +115,7 @@ from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
     renders_soa_timers,
+    reports_served_serials,
 )
 from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name, zone_holding_views
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
@@ -711,6 +712,7 @@ async def agent_register(
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
     server.agent_renders_soa_timers = renders_soa_timers(agent_features)
+    server.agent_reports_served_serials = reports_served_serials(agent_features)
 
     db.add(
         AuditLog(
@@ -1250,6 +1252,9 @@ async def agent_heartbeat(
         # by an older agent until the upgrade replaces its pod, and by an older one
         # again if a node is rolled back.
         server.agent_renders_soa_timers = renders_soa_timers(
+            request.headers.get(AGENT_FEATURES_HEADER)
+        )
+        server.agent_reports_served_serials = reports_served_serials(
             request.headers.get(AGENT_FEATURES_HEADER)
         )
 

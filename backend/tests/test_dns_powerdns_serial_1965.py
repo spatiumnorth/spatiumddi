@@ -228,6 +228,7 @@ async def test_a_bind9_secondary_reporting_zero_holds_no_copy_3940(
     """BIND9 agents report what named serves (#3940): 0 is no copy held."""
     token = await _token(db_session)
     _, srv, zone = await _setup(db_session, "bind9", zone_type="secondary", serial=0)
+    srv.agent_reports_served_serials = True
     srv_id = srv.id
     await db_session.commit()
     await _report(client, db_session, srv, [("lab.example.test.", 0)])
@@ -236,6 +237,24 @@ async def test_a_bind9_secondary_reporting_zero_holds_no_copy_3940(
     )
     (entry,) = r.json()["zones"]
     assert entry["in_sync"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_older_bind9_agent_reporting_zero_keeps_the_old_verdict_3940(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An agent before #3940 reports the bundle's 0 for every secondary whatever
+    named holds; a strict rule would flag each one as not synced."""
+    token = await _token(db_session)
+    _, srv, zone = await _setup(db_session, "bind9", zone_type="secondary", serial=0)
+    srv_id = srv.id
+    await db_session.commit()
+    await _report(client, db_session, srv, [("lab.example.test.", 0)])
+    r = await client.get(
+        f"/api/v1/dns/servers/{srv_id}/zone-state", headers={"Authorization": f"Bearer {token}"}
+    )
+    (entry,) = r.json()["zones"]
+    assert entry["in_sync"] is True
 
 
 def test_the_control_plane_pdns_conf_mirror_declares_primary_and_secondary() -> None:

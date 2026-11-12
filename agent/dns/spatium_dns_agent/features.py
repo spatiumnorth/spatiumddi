@@ -13,12 +13,19 @@ group's bundles carry the zone's own timers only once every BIND9 agent in it
 says this; until then they carry that literal, and the control plane moves
 the zones' serials when it switches. PowerDNS and Technitium keep their own
 SOA, and the control plane counts only BIND9 servers.
+
+``served-serials`` — the BIND9 driver reports, for a secondary / stub zone, the
+serial named serves (and nothing for a zone it holds no copy of) instead of the
+bundle's serial 0 (#3940). The control plane then counts a BIND9 secondary
+serving 0 as not synced; for an agent that does not say this it keeps comparing
+with the target, since that agent reports 0 for every secondary whatever named
+holds, and a strict rule would read every one of them as not synced.
 """
 
 from __future__ import annotations
 
 FEATURES_HEADER = "X-Spatium-Agent-Features"
-FEATURES: tuple[str, ...] = ("soa-timers",)
+FEATURES: tuple[str, ...] = ("soa-timers", "served-serials")
 
 
 def headers() -> dict[str, str]:
