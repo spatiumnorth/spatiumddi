@@ -110,4 +110,21 @@ describe("refused ASN / VRF / Domain cards (#3796)", () => {
     expect(text).toContain("You don't have permission to see VRFs");
     expect(text).toContain("You don't have permission to see domains");
   });
+
+  it("still show a real (non-403) failure as an error", async () => {
+    const broken = () =>
+      Promise.reject({
+        response: { status: 500, data: { detail: "boom" } },
+      });
+    calls["asnsApi.list"] = broken;
+    calls["vrfsApi.list"] = broken;
+    calls["domainsApi.list"] = broken;
+    const text = await show("overview");
+    expect(text).not.toContain("You don't have permission to see ASNs");
+    expect(text).not.toContain("You don't have permission to see VRFs");
+    expect(text).not.toContain("You don't have permission to see domains");
+    expect(text).toContain("Couldn't load ASNs: boom");
+    expect(text).toContain("Couldn't load VRFs: boom");
+    expect(text).toContain("Couldn't load domains: boom");
+  });
 });
