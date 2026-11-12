@@ -9782,6 +9782,22 @@ async def _enforce_no_records_in_other_view(db: DB, zone_id: uuid.UUID, pin: uui
     )
 
 
+def _zone_pin_view_error(zone: DNSZone, view_ids: Iterable[uuid.UUID | None]) -> str | None:
+    """The refusal for a record view a pinned zone never serves, else None.
+
+    A pinned zone renders into its pin alone, so a record scoped to any other
+    view is served nowhere (#3839). The one rule behind the record API, the
+    zone-file import and the spreadsheet import (#3942).
+    """
+    wanted = {v for v in view_ids if v is not None}
+    if zone.view_id is not None and wanted and wanted != {zone.view_id}:
+        return (
+            "view_id differs from the view this zone is pinned to, so the "
+            "record would never be rendered"
+        )
+    return None
+
+
 async def _enforce_views_in_zone_group(
     db: DB, zone: DNSZone, view_ids: Iterable[uuid.UUID | None]
 ) -> None:
@@ -9810,14 +9826,9 @@ async def _enforce_views_in_zone_group(
             status_code=422,
             detail="view_id does not name a view in this zone's server group",
         )
-    if zone.view_id is not None and wanted != {zone.view_id}:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "view_id differs from the view this zone is pinned to, so the "
-                "record would never be rendered"
-            ),
-        )
+    pin_error = _zone_pin_view_error(zone, wanted)
+    if pin_error is not None:
+        raise HTTPException(status_code=422, detail=pin_error)
 
 
 @router.post(
@@ -11585,6 +11596,12 @@ def _sheet_row_validator(
         if row.value is None:
             return "value is required"
         name = row.name if row.name is not None else target.name  # type: ignore[union-attr]
+        # #3942 — the record API's pin rule; a row that leaves an existing
+        # record's view as it is is not re-judged.
+        if target is None or target.view_id != view_id:
+            pin_error = _zone_pin_view_error(zone, [view_id])
+            if pin_error is not None:
+                return pin_error
         # A trailing dot makes a name absolute, as in a zone file: it must sit
         # in this zone, and is stored relative. Without it the name is relative
         # to the zone, as on the record API. (The record API strips a trailing
