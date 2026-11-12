@@ -796,6 +796,37 @@ async def restore_row(
 
     db.add_all(audit_rows)
     await db.commit()
+    # #3924 — a restored zone's IPAM-generated records are as the Trash held
+    # them; the addresses they belong to went on changing while it sat there.
+    # Reconciled here, after the commit and before the response, not left to a
+    # task: a restore is rare and operator-driven, and the zone must not answer
+    # a name IPAM gave up for even a moment (nor for good if the broker is down
+    # and the opt-in auto-sync is off). The task is the retry if this fails.
+    if restored_zone_ids:
+        from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            reconcile_restored_zone_records,
+            reconcile_restored_zone_records_task,
+        )
+
+        # The restore's UPDATE left the identity map holding the rows as they
+        # were read; the planner must read them as they are now.
+        db.expunge_all()
+        try:
+            _changed, reconcile_wake = await reconcile_restored_zone_records(
+                db, list(restored_zone_ids)
+            )
+            restore_wake_groups |= set(reconcile_wake)
+        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+            await db.rollback()
+            logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
+            from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
+
+            try:
+                await _dispatch(
+                    reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                )
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
     if republish_subnet_ids:
         from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415

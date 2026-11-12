@@ -628,3 +628,142 @@ def republish_restored_lease_ddns_task(  # type: ignore[type-arg]
     except Exception as exc:  # noqa: BLE001
         logger.exception("restore_ddns_republish_failed", error=str(exc))
         raise
+
+
+# ── #3924 — IPAM-generated records a restored zone brings back ─────────────
+
+
+async def restored_zone_candidate_subnets(db: Any, zone_ids: list[Any]) -> list[Any]:
+    """The live subnets whose IPAM-generated records a restore of ``zone_ids``
+    may have left stale: those publishing into one of the zones (forward, or
+    additional), and those owning an address a record of the zones points at
+    (a reverse zone's PTRs). Ascending."""
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+
+    wanted = {str(z) for z in zone_ids}
+    found: set[Any] = set()
+    candidates = list((await db.execute(_CANDIDATE_SUBNET_SQL)).scalars().all())
+    for sid in candidates:
+        subnet = await db.get(Subnet, sid)
+        if subnet is None:
+            continue
+        _groups, zone_id, extra = await _resolve_effective_dns(db, subnet)
+        if ({str(zone_id)} | {str(z) for z in extra}) & wanted:
+            found.add(sid)
+    owned = await db.execute(
+        select(IPAddress.subnet_id)
+        .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+        .where(DNSRecord.zone_id.in_(list(zone_ids)))
+        .distinct()
+    )
+    found.update(owned.scalars().all())
+    live = await db.execute(select(Subnet.id).where(Subnet.id.in_(found)))
+    return sorted(live.scalars().all(), key=str)
+
+
+async def reconcile_restored_zone_records(db: Any, zone_ids: list[Any]) -> tuple[int, set[Any]]:
+    """Make a restored zone answer what IPAM holds now. The zone's records came
+    back as the Trash held them, but its subnets' addresses went on changing
+    meanwhile: renamed (the record keeps the name IPAM gave up), added (no
+    record), or retracted. Runs the IPAM-DNS sync's own plan and apply over the
+    subnets of ``zone_ids``, ``SYNC_BATCH_SIZE`` addresses per transaction, and
+    only for the records IPAM generated, so a hand-made record is untouched.
+    Stale records are left to the sync's own rules (blank names are retracted).
+    Returns ``(records_changed, dns_group_ids_to_wake)``."""
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
+
+    changed = 0
+    wake: set[Any] = set()
+    for subnet_id in await restored_zone_candidate_subnets(db, zone_ids):
+        try:
+            units = await _plan_subnet(db, subnet_id, delete_stale=False)
+            await db.rollback()
+        except Exception as exc:  # noqa: BLE001 — one subnet must not stop the rest
+            await db.rollback()
+            logger.warning(
+                "restore_zone_reconcile_plan_failed", subnet=str(subnet_id), error=_first_line(exc)
+            )
+            continue
+        # A freed address (a reservation deleted while the zone sat in the
+        # Trash keeps its row, status "available", and its old name) is not one
+        # the restore publishes: #3186 took its record out of the zone's batch
+        # on purpose, and this must not put it back.
+        create_ids = [i for u in units for i in u.create_ip_ids]
+        if create_ids:
+            freed = set(
+                (
+                    await db.execute(
+                        select(IPAddress.id).where(
+                            IPAddress.id.in_(create_ids), IPAddress.status == "available"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for u in units:
+                u.create_ip_ids = [i for i in u.create_ip_ids if i not in freed]
+            units = [
+                u
+                for u in units
+                if u.create_ip_ids or u.update_record_ids or u.delete_record_ids or u.mirror_ip_ids
+            ]
+        for i in range(0, len(units), SYNC_BATCH_SIZE):
+            batch = units[i : i + SYNC_BATCH_SIZE]
+            errors: list[str] = []
+            try:
+                created, updated, deleted, _re = await _sync_batch(
+                    db, subnet_id, batch, errors=errors
+                )
+                n = created + updated + deleted
+                if n:
+                    subnet = await db.get(Subnet, subnet_id)
+                    if subnet is not None:
+                        group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+                        wake.update(group_ids)
+                await db.commit()
+                changed += n
+                for err in errors:
+                    logger.warning("restore_zone_reconcile_failed", error=err)
+            except Exception as exc:  # noqa: BLE001 — one batch must not stop the rest
+                await db.rollback()
+                logger.warning(
+                    "restore_zone_reconcile_batch_failed",
+                    subnet=str(subnet_id),
+                    error=_first_line(exc),
+                )
+    return changed, wake
+
+
+async def _run_reconcile_restored_zones(zone_ids: list[str]) -> dict[str, Any]:
+    import uuid  # noqa: PLC0415
+
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            changed, wake = await reconcile_restored_zone_records(
+                db, [uuid.UUID(z) for z in zone_ids]
+            )
+        for gid in wake:
+            await publish_wake(dns_group_channel(gid))
+        return {"status": "ok", "records_changed": changed}
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="app.tasks.ipam_dns_sync.reconcile_restored_zone_records", bind=True)
+@module_gated("core.dns")
+def reconcile_restored_zone_records_task(  # type: ignore[type-arg]
+    self: object, zone_ids: list[str]
+) -> dict[str, Any]:
+    """#3924 — post-commit follow-up of a Trash restore of a DNS zone: bring its
+    IPAM-generated records up to what IPAM holds now."""
+    try:
+        return asyncio.run(_run_reconcile_restored_zones(zone_ids))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("restore_zone_reconcile_failed", error=str(exc))
+        raise
