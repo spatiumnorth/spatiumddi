@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * A refused delete on the Overlays, Customers and PIM domains lists says so
+ * A refused delete on the Overlays, Customers, PIM domains, Circuits, Services and TLS certificate lists says so
  * in the server's words and re-reads the list (#3822).
  */
 
@@ -29,16 +29,43 @@ const ROWS: Record<string, Record<string, unknown>> = {
   },
   customersApi: { id: "c1", name: "cust-one", tags: {}, custom_fields: {} },
   multicastApi: { id: "d1", name: "dom-one", tags: {}, custom_fields: {} },
+  circuitsApi: {
+    id: "ci1",
+    name: "circ-one",
+    tags: {},
+    custom_fields: {},
+  },
+  servicesApi: {
+    id: "s1",
+    name: "svc-one",
+    resources: [],
+    tags: {},
+    custom_fields: {},
+  },
+  tlsCertsApi: {
+    id: "t1",
+    host: "host-one",
+    display_name: "tls-one",
+    port: 443,
+    tags: {},
+    custom_fields: {},
+  },
 };
 const LIST_METHOD: Record<string, string> = {
   overlaysApi: "list",
   customersApi: "list",
   multicastApi: "listDomains",
+  circuitsApi: "list",
+  servicesApi: "list",
+  tlsCertsApi: "list",
 };
 const REMOVE_METHOD: Record<string, string> = {
   overlaysApi: "remove",
   customersApi: "remove",
   multicastApi: "deleteDomain",
+  circuitsApi: "remove",
+  servicesApi: "remove",
+  tlsCertsApi: "remove",
 };
 
 vi.mock("@/lib/api", async () => {
@@ -56,6 +83,18 @@ vi.mock("@/lib/api", async () => {
               if (typeof method === "symbol") return undefined;
               if (name === "authApi" && method === "myPermissions")
                 return async () => ({ is_superadmin: true, grants: [] });
+              if (name === "featureModulesApi" && method === "list")
+                return async () => [
+                  {
+                    id: "security.tls_certs",
+                    label: "x",
+                    group: "x",
+                    description: "",
+                    default_enabled: true,
+                    enabled: true,
+                    requires: [],
+                  },
+                ];
               if (ROWS[name] && method === LIST_METHOD[name])
                 return async () => {
                   listCalls[name] = (listCalls[name] ?? 0) + 1;
@@ -82,6 +121,9 @@ vi.mock("@/lib/api", async () => {
 const { OverlaysPage } = await import("./OverlaysPage");
 const { CustomersPage } = await import("./CustomersPage");
 const { MulticastDomainsTab } = await import("./MulticastDomainsPage");
+const { CircuitsPage } = await import("./CircuitsPage");
+const { ServicesPage } = await import("./ServicesPage");
+const { CertificatesPage } = await import("./CertificatesPage");
 
 afterEach(cleanup);
 
@@ -89,6 +131,9 @@ const CASES = [
   ["Overlays", "overlaysApi", OverlaysPage],
   ["Customers", "customersApi", CustomersPage],
   ["PIM domains", "multicastApi", MulticastDomainsTab],
+  ["Circuits", "circuitsApi", CircuitsPage],
+  ["Services", "servicesApi", ServicesPage],
+  ["TLS certificates", "tlsCertsApi", CertificatesPage],
 ] as const;
 
 describe("a refused list delete (#3822)", () => {
