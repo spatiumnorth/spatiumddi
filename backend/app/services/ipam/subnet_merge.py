@@ -81,6 +81,12 @@ from app.services.ipam.subnet_carry import (
     merge_conflicts_and_warnings,
     merged_carried,
 )
+from app.services.ipam.subnet_dependents import (
+    carry_for_merge,
+    load_dependents,
+    merge_conflicts,
+    merge_warnings,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -522,6 +528,11 @@ async def preview_subnet_merge(
             "deduplicated and re-attached to the merged subnet."
         )
 
+    dep = await load_dependents(db, [s.id for s in sources])
+    for ctype, detail in merge_conflicts(dep):
+        conflicts.append(MergeConflict(type=ctype, detail=detail))
+    warnings.extend(merge_warnings(dep))
+
     return SubnetMergePreview(
         merged_cidr=str(merged) if merged is not None else None,
         source_subnets=[MergeSourceRow(id=s.id, cidr=str(s.network)) for s in sources],
@@ -757,7 +768,12 @@ async def commit_subnet_merge(
             dhcp_servers_notified += 1
     await db.flush()
 
-    # Delete sources last — RESTRICT FKs catch anything we missed.
+    # Address sets, the OT zone and the SET NULL links follow the merged
+    # subnet (#3957): nothing keyed to a source is RESTRICT, so whatever is
+    # not carried here goes with the delete below.
+    await carry_for_merge(db, [s.id for s in sources], target.id, merged_subnet.id)
+
+    # Delete sources last.
     deleted_ids: list[uuid.UUID] = []
     for s in sources:
         deleted_ids.append(s.id)
