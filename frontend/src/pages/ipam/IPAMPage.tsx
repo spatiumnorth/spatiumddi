@@ -296,11 +296,15 @@ export function ImportedChip({
   fields,
   kind,
   id,
+  writable = true,
   onUpdated,
 }: {
   fields: Record<string, unknown>;
   kind: "block" | "subnet";
   id: string;
+  /** False for a caller the write would be refused: the × is disabled with
+   * the reason instead of leading to a confirm the server then refuses (#3883). */
+  writable?: boolean;
   onUpdated: (updated: IPBlock | Subnet) => void;
 }) {
   const qc = useQueryClient();
@@ -359,7 +363,11 @@ export function ImportedChip({
           }}
           aria-label={`Remove import metadata from this ${kind}`}
           title="Remove import metadata"
-          className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
+          {...permissionGate(
+            writable,
+            kind === "block" ? NEEDS_BLOCK_WRITE : NEEDS_SUBNET_WRITE,
+          )}
+          className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 disabled:cursor-not-allowed disabled:opacity-50 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
         >
           ×
         </button>
@@ -6139,6 +6147,7 @@ export function SubnetDetail({
                       fields={prov}
                       kind="subnet"
                       id={subnet.id}
+                      writable={canEditSubnet}
                       onUpdated={(u) => onSubnetEdited(u as Subnet)}
                     />
                   </div>
@@ -6367,7 +6376,8 @@ export function SubnetDetail({
               </p>
               <button
                 onClick={() => setShowAddModal(true)}
-                className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+                {...permissionGate(canAllocate, NEEDS_ADDRESS_WRITE)}
+                className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Plus className="h-3.5 w-3.5" />
                 Allocate first IP
@@ -6780,15 +6790,24 @@ export function SubnetDetail({
                           <tr
                             key={`gap-${row.startIpInt}-${row.endIpInt}`}
                             aria-label={`${count} unallocated IP${count === 1 ? "" : "s"} between rows`}
-                            className="cursor-pointer hover:bg-emerald-500/[0.10]"
+                            className={
+                              canAllocate
+                                ? "cursor-pointer hover:bg-emerald-500/[0.10]"
+                                : undefined
+                            }
                             onClick={() => {
+                              if (!canAllocate) return;
                               setAddModalRange({
                                 startIpInt: row.startIpInt,
                                 endIpInt: row.endIpInt,
                               });
                               setShowAddModal(true);
                             }}
-                            title={`Allocate an IP from this free range (${count} available)`}
+                            title={
+                              canAllocate
+                                ? `Allocate an IP from this free range (${count} available)`
+                                : `${count} free`
+                            }
                           >
                             <td
                               colSpan={12}
@@ -6798,9 +6817,11 @@ export function SubnetDetail({
                               <span className="ml-2 opacity-70">
                                 · {count} free
                               </span>
-                              <span className="ml-2 opacity-60">
-                                · click to allocate
-                              </span>
+                              {canAllocate && (
+                                <span className="ml-2 opacity-60">
+                                  · click to allocate
+                                </span>
+                              )}
                             </td>
                           </tr>
                         );
@@ -14614,6 +14635,7 @@ export function BlockDetailView({
                     fields={prov}
                     kind="block"
                     id={block.id}
+                    writable={canEditBlock}
                     onUpdated={(u) => setBlock(u as IPBlock)}
                   />
                 )}
