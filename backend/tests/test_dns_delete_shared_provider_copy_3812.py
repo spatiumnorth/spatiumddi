@@ -357,3 +357,113 @@ async def test_a_late_dispatch_does_not_resend_the_removal_of_a_kept_copy(
     finally:
         mp.undo()
     assert ("ns-a", "delete") not in provider.calls
+
+
+# ── #3888: cross-group name lock + Windows AD identity ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_provider_zone_name_lock_is_taken_before_the_shared_copy_check(
+    client: AsyncClient, db_session: AsyncSession, provider: _FakeProvider, monkeypatch: Any
+) -> None:
+    """#3888: the name lock comes first, so a concurrent same-name delete or
+    create in another group has committed before the check reads its rows."""
+    import app.api.v1.dns.router as dns_router
+    import app.services.lock_order as lock_order
+
+    events: list[str] = []
+    real_lock = lock_order.lock_provider_zone_name
+    real_check = dns_router.shared_zone_copy_servers
+
+    async def _lock(db: Any, name: str) -> None:
+        events.append(f"lock:{name}")
+        await real_lock(db, name)
+
+    async def _check(*a: Any, **k: Any) -> Any:
+        events.append("check")
+        return await real_check(*a, **k)
+
+    monkeypatch.setattr(lock_order, "lock_provider_zone_name", _lock)
+    monkeypatch.setattr(dns_router, "shared_zone_copy_servers", _check)
+    token = await _token(db_session)
+    za, _zb = await _two_groups(db_session, _A, _A)
+    resp = await client.delete(
+        f"/api/v1/dns/groups/{za.group_id}/zones/{za.id}?permanent=true",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 204, resp.text
+    assert events[:2] == ["lock:example.com.", "check"]
+
+
+@pytest.mark.asyncio
+async def test_trash_purge_takes_the_provider_zone_name_lock(
+    db_session: AsyncSession, provider: _FakeProvider, monkeypatch: Any
+) -> None:
+    import app.services.lock_order as lock_order
+    from app.services.dns.zone_purge import purge_trashed_zone
+
+    names: list[str] = []
+
+    async def _lock(db: Any, name: str) -> None:
+        names.append(name)
+
+    monkeypatch.setattr(lock_order, "lock_provider_zone_name", _lock)
+    za, _zb = await _two_groups(db_session, _A, _A, trashed=True)
+    await purge_trashed_zone(db_session, za)
+    assert names == ["example.com."]
+
+
+@pytest.mark.asyncio
+async def test_provider_zone_name_lock_blocks_a_second_session(db_session: AsyncSession) -> None:
+    from sqlalchemy import text
+
+    from app.services.lock_order import (
+        PROVIDER_ZONE_NAME_NS,
+        _provider_zone_name_key,
+        lock_provider_zone_name,
+    )
+
+    await lock_provider_zone_name(db_session, "Example.COM.")
+    # Same name without case / trailing dot hashes to the same key.
+    assert _provider_zone_name_key("example.com") == _provider_zone_name_key("Example.COM.")
+    # Re-entrant in the holder; a distinct key is still free.
+    held = (
+        await db_session.execute(
+            text("SELECT pg_try_advisory_xact_lock(:ns, :k)"),
+            {"ns": PROVIDER_ZONE_NAME_NS, "k": _provider_zone_name_key("example.com")},
+        )
+    ).scalar_one()
+    assert held is True
+    other = (
+        await db_session.execute(
+            text(
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                "AND classid=:ns AND granted"
+            ),
+            {"ns": PROVIDER_ZONE_NAME_NS},
+        )
+    ).scalar_one()
+    assert other >= 1
+
+
+def _win(host: str, username: str, port: int | None = None) -> Any:
+    from types import SimpleNamespace
+
+    creds: dict[str, Any] = {"username": username, "password": "x"}
+    if port:
+        creds["winrm_port"] = port
+    return SimpleNamespace(host=host, credentials_encrypted=encrypt_dict(creds))
+
+
+def test_windows_identity_is_the_ad_domain_not_the_host() -> None:
+    """#3888: two DCs of one domain share AD-integrated zones."""
+    from app.drivers.dns.windows import WindowsDNSDriver
+
+    d = WindowsDNSDriver()
+    a = d.provider_identity(_win("dc1.corp.example.com", "svc@corp.example.com"))
+    b = d.provider_identity(_win("dc2.corp.example.com", "CORP\\svc", port=5986))
+    c = d.provider_identity(_win("10.0.0.5", "svc@Corp.Example.com"))
+    assert a == b == c == "windows_dns:ad:corp.example.com"
+    assert d.provider_identity(_win("dc1.other.test", "svc")) != a
+    # IP + NetBIOS login: unknown, which callers treat as shared.
+    assert d.provider_identity(_win("10.0.0.5", "CORP\\svc")) is None
