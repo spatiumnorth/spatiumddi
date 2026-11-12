@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
@@ -11799,11 +11800,9 @@ function EditBlockedDomainModal({
           Block subdomains too (
           <code className="font-mono text-xs">*.{domain || "domain"}</code>)
         </label>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11892,11 +11891,9 @@ function EditExceptionModal({
             placeholder="Optional"
           />
         </Field>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
