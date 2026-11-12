@@ -478,8 +478,10 @@ export function ProvidersPage() {
                         setSearch("");
                         setKindFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New provider" to add one.`}
                     >
-                      No providers yet — click "New provider" to add one.
+                      No providers yet.
                     </ListEmpty>
                   </td>
                 </tr>

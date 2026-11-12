@@ -958,8 +958,10 @@ export function CertificatesPage() {
                         setStateFilter("");
                         setSourceFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New target" to add one.`}
                     >
-                      No targets yet — click "New target" to add one.
+                      No targets yet.
                     </ListEmpty>
                   </td>
                 </tr>

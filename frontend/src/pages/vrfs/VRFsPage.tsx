@@ -696,8 +696,14 @@ export function VRFsPage() {
                     what="VRFs"
                     filtered={tagFilters.length > 0}
                     onClearFilters={() => setTagFilters([])}
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>+ New VRF</strong> to create one.
+                      </>
+                    }
                   >
-                    No VRFs yet. Click <strong>+ New VRF</strong> to create one.
+                    No VRFs yet.
                   </ListEmpty>
                 </td>
               </tr>

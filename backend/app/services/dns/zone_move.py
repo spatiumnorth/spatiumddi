@@ -1235,14 +1235,4 @@ async def commit_move(
 
     collect_wake(dns_group_channel(old_group_id), dns_group_channel(target_group.id))
 
-    logger.info(
-        "dns_zone_moved_group",
-        zone_id=str(zone.id),
-        zone_name=zone.name,
-        old_group_id=str(old_group_id),
-        new_group_id=str(target_group.id),
-        records_widened=plan.records_widened,
-        acl_keys_lost=len(plan.acl_keys_lost),
-        dnssec_signed=plan.dnssec_signed,
-    )
     return plan
