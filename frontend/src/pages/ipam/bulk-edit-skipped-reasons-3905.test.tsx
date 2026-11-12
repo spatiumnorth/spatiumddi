@@ -15,7 +15,6 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import type { DNSZone } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 const answers: Record<string, Record<string, Answer>> = {};
