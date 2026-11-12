@@ -499,13 +499,40 @@ workload defines an HPA — `frontend` / `worker` are fixed-replica Deployments
 
 ### Worker `NET_RAW`
 
-The worker pod adds `CAP_NET_RAW` (`worker.netRawCapability: true`, default on)
-so `nmap` can run SYN scans + `-O` OS detection from the device-profiling
-auto-nmap path. `NET_RAW` is in containerd's default cap set, so this is a
-no-op on permissive clusters; on restricted Pod Security Admission, OpenShift
-SCC, or GKE Autopilot it's required to keep the cap in the bounding set. Set
-`worker.netRawCapability: false` if device profiling is off cluster-wide and you
-want a tighter posture.
+`nmap`'s SYN scans and `-O` OS detection (the device-profiling auto-nmap path)
+use a file capability on the image's `nmap` binary, which works only while
+`NET_RAW` is in the container's bounding set. containerd's default capability
+set already includes `NET_RAW`, so on k3s, Talos, EKS, AKS and GKE the worker
+has it with no setting at all.
+
+`worker.netRawCapability` (default `false`, [#3952](https://github.com/spatiumnorth/spatiumddi/issues/3952))
+adds `NET_RAW` explicitly. You need it only on a runtime whose default set lacks
+it, which in practice means CRI-O outside OpenShift. Turning it on makes Pod
+Security `baseline` and `restricted` **refuse the worker pod at admission**.
+They do not drop the capability. A namespace that enforces either level then
+needs `pod-security.kubernetes.io/enforce: privileged`, or an exemption. On
+OpenShift use `openshift.workerNetRaw` instead (see above).
+
+Without `NET_RAW`, nmap falls back to what an unprivileged process can do: a
+TCP connect scan. A profile that asks for `-O` reports nmap's own error in the
+scan result rather than failing the task.
+
+### Pod Security levels
+
+The [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+level each component needs with the chart's defaults:
+
+| Component | Highest level that admits it | Why not higher |
+|---|---|---|
+| api, worker, beat, frontend, migrate Job | `baseline` | they run as a fixed non-root uid without `allowPrivilegeEscalation: false` / `capabilities.drop: ["ALL"]` on every container |
+| DNS agents (`dns-bind9-*`) | `baseline` | `named` binds `:53`, so the container keeps its default capabilities and may escalate |
+| DHCP agents (Kea), `hostNetwork: false` | `baseline` | as the DNS agents, for `:67` |
+| DHCP agents with `hostNetwork: true` (relay-less LAN) | `privileged` | `baseline` forbids host networking |
+| worker with `worker.netRawCapability: true` | `privileged` | `baseline` forbids adding `NET_RAW` |
+| CloudNativePG / Redis | as their own charts state | — |
+
+So a default install, with DHCP agents off host networking, runs in a namespace
+that enforces `baseline`. Talos enforces `baseline` cluster-wide by default.
 
 ---
 
