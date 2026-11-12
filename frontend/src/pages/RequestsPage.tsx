@@ -22,7 +22,12 @@
  * operation surfaces it here with no frontend change, and the two can't drift.
  */
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   authApi,
   requestsApi,
@@ -138,6 +143,10 @@ const STATE_FILTERS: { value: ChangeRequestState; label: string }[] = [
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString();
+}
+
+const REQUESTS_PAGE_SIZE = 100;
+
 }
 
 function errMessage(e: unknown, fallback: string): string {
@@ -681,13 +690,28 @@ export default function RequestsPage() {
     enabled: canSubmit,
   });
 
-  const list = useQuery({
+  // Paged (#3937): the page used to read the newest 100 and say nothing of
+  // the rest, so the oldest pending requests (the first to expire) were
+  // unreachable once the queue passed 100.
+  const list = useInfiniteQuery({
     queryKey: ["provisioning-requests", "list", stateFilter],
-    queryFn: () => requestsApi.list(stateFilter ? { state: stateFilter } : {}),
+    queryFn: ({ pageParam }) =>
+      requestsApi.listPage({
+        ...(stateFilter ? { state: stateFilter } : {}),
+        limit: REQUESTS_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
     refetchInterval: pollUnlessRefused(30000),
   });
 
-  const rows = list.data ?? [];
+  const rows = (list.data?.pages ?? []).flatMap((p) => p.items);
+  const rowsTotal =
+    list.data?.pages[list.data.pages.length - 1]?.total ?? rows.length;
 
   return (
     <div className="space-y-4 p-4">
@@ -862,6 +886,21 @@ export default function RequestsPage() {
           </tbody>
         </table>
       </div>
+
+      {list.hasNextPage ? (
+        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+          <span>
+            Showing the newest {rows.length} of {rowsTotal}.
+          </span>
+          <HeaderButton
+            variant="secondary"
+            disabled={list.isFetchingNextPage}
+            onClick={() => void list.fetchNextPage()}
+          >
+            {list.isFetchingNextPage ? "Loading…" : "Load more"}
+          </HeaderButton>
+        </div>
+      ) : null}
 
       {showNew ? (
         <NewRequestModal

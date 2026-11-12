@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import String, or_, select
 from sqlalchemy import cast as sa_cast
@@ -61,6 +61,7 @@ from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
     approve_change_request,
+    count_change_requests,
     get_change_request,
     list_change_requests,
     mark_cancelled,
@@ -489,6 +490,7 @@ async def get_catalog(current_user: CurrentUser) -> list[RequestKindResponse]:
 async def list_requests(
     current_user: CurrentUser,
     db: DB,
+    response: Response,
     state: str | None = None,
     mine: bool = False,
     limit: int = 100,
@@ -497,13 +499,21 @@ async def list_requests(
     """List self-service requests, newest first.
 
     A caller who cannot approve is ALWAYS scoped to their own rows regardless
-    of ``mine`` — same rule as #62's queue.
+    of ``mine`` — same rule as #62's queue. Still a bare list, but ``offset``
+    pages past ``limit`` and ``X-Total-Count`` carries the number of requests
+    matching the filters *before* the window, so a client can say "100 of 101"
+    instead of presenting a cut list as the whole queue (#3937).
     """
     _require_read(current_user)
     if _can_see_all(current_user):
         scope_user_id = current_user.id if mine else None
     else:
         scope_user_id = current_user.id
+    response.headers["X-Total-Count"] = str(
+        await count_change_requests(
+            db, state=state, requested_by_user_id=scope_user_id, origin=_ORIGIN
+        )
+    )
     rows = await list_change_requests(
         db,
         state=state,

@@ -12108,6 +12108,16 @@ export const requestsApi = {
       .then((r) => r.data),
   list: (params: ProvisioningRequestListParams = {}) =>
     api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // page can say how many it did not draw (#3937).
+  listPage: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
   get: (id: string) =>
     api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
   submit: (body: SubmitRequestBody) =>

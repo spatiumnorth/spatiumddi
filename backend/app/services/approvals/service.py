@@ -218,6 +218,44 @@ async def get_change_request(
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
+def _filtered(
+    stmt: Any,
+    *,
+    state: str | None,
+    resource_type: str | None,
+    requested_by_user_id: UUID | None,
+    origin: str | None,
+) -> Any:
+    if origin is not None:
+        stmt = stmt.where(ChangeRequest.origin == origin)
+    if state is not None:
+        stmt = stmt.where(ChangeRequest.state == state)
+    if resource_type is not None:
+        stmt = stmt.where(ChangeRequest.resource_type == resource_type)
+    if requested_by_user_id is not None:
+        stmt = stmt.where(ChangeRequest.requested_by_user_id == requested_by_user_id)
+    return stmt
+
+
+async def count_change_requests(
+    db: AsyncSession,
+    *,
+    state: str | None = None,
+    resource_type: str | None = None,
+    requested_by_user_id: UUID | None = None,
+    origin: str | None = None,
+) -> int:
+    """How many rows :func:`list_change_requests` would match with no window."""
+    stmt = _filtered(
+        select(func.count()).select_from(ChangeRequest),
+        state=state,
+        resource_type=resource_type,
+        requested_by_user_id=requested_by_user_id,
+        origin=origin,
+    )
+    return int(await db.scalar(stmt) or 0)
+
+
 async def list_change_requests(
     db: AsyncSession,
     *,
@@ -234,16 +272,17 @@ async def list_change_requests(
     live in this table, and each surface passes its own value so neither
     ever renders the other's rows.
     """
-    stmt = select(ChangeRequest)
-    if origin is not None:
-        stmt = stmt.where(ChangeRequest.origin == origin)
-    if state is not None:
-        stmt = stmt.where(ChangeRequest.state == state)
-    if resource_type is not None:
-        stmt = stmt.where(ChangeRequest.resource_type == resource_type)
-    if requested_by_user_id is not None:
-        stmt = stmt.where(ChangeRequest.requested_by_user_id == requested_by_user_id)
-    stmt = stmt.order_by(ChangeRequest.created_at.desc()).limit(limit).offset(offset)
+    stmt = _filtered(
+        select(ChangeRequest),
+        state=state,
+        resource_type=resource_type,
+        requested_by_user_id=requested_by_user_id,
+        origin=origin,
+    )
+    # id tiebreak: paging needs a total order (#3937).
+    stmt = (
+        stmt.order_by(ChangeRequest.created_at.desc(), ChangeRequest.id).limit(limit).offset(offset)
+    )
     return list((await db.execute(stmt)).scalars().all())
 
 
