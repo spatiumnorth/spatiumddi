@@ -40,8 +40,11 @@ spec:
         seccompProfile:
           type: {{ . }}
         {{- end }}
+        {{- if not (include "spatiumddi.isOpenShift" .) }}
         # Redis Alpine image runs as 999:999 by default.
+        {{- /* #3852: omitted on OpenShift — the SCC assigns the fsGroup. */}}
         fsGroup: 999
+        {{- end }}
       containers:
         - name: redis
           image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"

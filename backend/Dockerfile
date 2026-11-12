@@ -181,7 +181,13 @@ RUN useradd --no-create-home --shell /bin/false app \
     && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images /var/lib/spatiumddi/pcaps \
     && chmod 0700 /var/lib/spatiumddi/pcaps \
     && chown app:app /app \
-    && chown -R app:app /var/lib/spatiumddi
+    && chown -R app:app /var/lib/spatiumddi \
+    # #3852 — OpenShift's restricted SCC runs this image as a random uid in
+    # group 0, never as ``app``, and the chart mounts nothing over these paths
+    # there. Group 0 + the owner's bits (pcaps stays closed to others) keeps
+    # them writable to that uid; ``app`` still owns them everywhere else.
+    && chgrp -R 0 /var/lib/spatiumddi \
+    && chmod -R g=u /var/lib/spatiumddi
 
 COPY --from=builder /install /usr/local
 

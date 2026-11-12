@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_str
@@ -684,3 +685,52 @@ async def test_transfer_failure_stays_error_not_behind(
     monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _Boom())
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
     assert report.servers[0].status == "error"
+
+
+@pytest.mark.parametrize("zone_type", ["forward", "stub"])
+async def test_non_authoritative_zone_is_not_applicable_not_a_failed_pull(
+    db_session: AsyncSession, monkeypatch: Any, zone_type: str
+) -> None:
+    """#3758 — a forward / stub zone is not held authoritatively, so drift
+    must not AXFR it and report the NOTAUTH as a pull error."""
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name=f"{zone_type}.example.com."
+    )
+    zone.zone_type = zone_type
+    await db_session.commit()
+
+    class _RefusingDriver:
+        async def pull_zone_records(
+            self, server: Any, zone_name: str, *, tsig: Any = None
+        ) -> list[RecordData]:
+            raise RuntimeError("NOTAUTH")
+
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _RefusingDriver())
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    s = report.servers[0]
+    assert s.status == "unsupported"
+    assert "NOTAUTH" not in (s.error or "")
+    assert s.error
+    assert ("conditional forwarder" if zone_type == "forward" else "stub zone") in s.error
+
+
+async def test_sync_with_server_refuses_a_forward_zone(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    from app.services.dns import pull_from_server as pfs
+    from app.services.dns.pull_from_server import sync_zone_with_server
+
+    async def _no_transfer(*_a: Any, **_k: Any) -> Any:
+        # Stubbed so an unfixed build fails fast instead of attempting a real AXFR.
+        raise RuntimeError("transfer attempted for a forward zone")
+
+    monkeypatch.setattr(pfs, "pull_zone_records_signed", _no_transfer)
+
+    _group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="fwd.example.com."
+    )
+    zone.zone_type = "forward"
+    await db_session.commit()
+    with pytest.raises(ValueError, match="conditional forwarder"):
+        await sync_zone_with_server(db_session, zone, apply=False)

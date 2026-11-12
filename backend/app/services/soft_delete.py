@@ -874,6 +874,23 @@ async def restore_batch(
         zone_ids_for_subnets,
     )
 
+    # #3777: the restored scopes' rows first, ascending id, ``FOR NO KEY
+    # UPDATE`` (the lock their un-stamp takes anyway, which a lease-events
+    # batch's ``FOR KEY SHARE`` does not block). A scope's lease teardown holds
+    # its row ``FOR SHARE`` and then locks the zones of its mirrors, so an
+    # un-stamp flushed after the zones below would wait for a batch that waits
+    # for those zones. The scope sits before the zones in the order
+    # (``app.services.lock_order``).
+    restored_scope_ids = sorted(o.id for o in result.restored if isinstance(o, DHCPScope))
+    if restored_scope_ids:
+        await db.execute(
+            select(DHCPScope.id)
+            .where(DHCPScope.id.in_(restored_scope_ids))
+            .order_by(DHCPScope.id)
+            .with_for_update(key_share=True, of=DHCPScope)
+            .execution_options(include_deleted=True)
+        )
+
     to_lock: set[Any] = set(zone_ids)
     to_lock.update(o.zone_id for o in result.restored if isinstance(o, DNSRecord))
     to_lock.update(
@@ -1081,6 +1098,21 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active zone {obj.name!r} already exists in this group/view"
+        # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
+        # not counted when a second server joins its group, so the restore must
+        # hold it to the same rule the direct sign does, or the group ends up
+        # with two servers each signing it with keys of their own. Locks the
+        # group like the other write paths: this runs on the committing restore.
+        if obj.dnssec_enabled:
+            from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
+
+            refusal = await sign_refusal(db, obj.group_id)
+            if refusal:
+                return (
+                    f"Zone {obj.name!r} is DNSSEC-signed and cannot be restored: "
+                    f"{refusal.removeprefix('Refusing to enable DNSSEC: ')} "
+                    "Remove the extra server first, then restore the zone."
+                )
 
     # DNSRecord is checked set-based for the whole batch by
     # ``_record_conflicts`` (#1389), which ``restore_batch`` runs itself.

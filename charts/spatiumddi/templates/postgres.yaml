@@ -42,9 +42,12 @@ spec:
         seccompProfile:
           type: {{ . }}
         {{- end }}
+        {{- if not (include "spatiumddi.isOpenShift" .) }}
         # Match the postgres image's UID — the Alpine ``postgres`` user
         # runs as 70:70. fsGroup makes the mounted PVC writable.
+        {{- /* #3852: omitted on OpenShift — the SCC assigns an fsGroup from the namespace's range, refuses a pinned one, and that makes the PVC writable. */}}
         fsGroup: 70
+        {{- end }}
       containers:
         - name: postgresql
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"

@@ -31,6 +31,7 @@ from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSServerZoneState, DNSZone
 from app.services.dns.pull_from_server import (
     _key,
+    non_authoritative_reason,
     targets_are_relative,
     without_agent_ns_glue,
     without_server_apex_ns,
@@ -44,7 +45,7 @@ from app.services.dns.tsig import (
     resolve_group_transfer_key,
     resolve_transfer_vip,
     resolve_view_transfer_key,
-    transfer_fallback_hosts,
+    transfer_fallback_kwargs,
     transfer_needs_tsig,
 )
 
@@ -372,6 +373,12 @@ async def compute_zone_drift(
             driver=srv.driver,
             status="ok",
         )
+        # #3758 — a forward / stub zone is not held authoritatively, so the
+        # transfer is refused by design: not applicable, not a failed pull.
+        if (na_reason := non_authoritative_reason(zone)) is not None:
+            entry.status = "unsupported"
+            entry.error = na_reason
+            return entry
         driver = get_driver(srv.driver)
         if not hasattr(driver, "pull_zone_records"):
             entry.status = "unsupported"
@@ -409,8 +416,7 @@ async def compute_zone_drift(
         pull_kwargs: dict[str, Any] = (
             {"include_apex_ns": True} if _renders_apex_ns(srv, driver) else {}
         )
-        if fallback := transfer_fallback_hosts(srv, transfer_vip):
-            pull_kwargs["fallback_hosts"] = fallback
+        pull_kwargs.update(transfer_fallback_kwargs(srv, transfer_vip))
         try:
             on_wire, used = await pull_zone_records_signed(
                 driver, srv, zone.name, keys, view_name=view_name, **pull_kwargs

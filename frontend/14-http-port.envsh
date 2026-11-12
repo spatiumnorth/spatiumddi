@@ -1,0 +1,29 @@
+# Sourced by the nginx image's /docker-entrypoint.sh (name ends in .envsh), so
+# what it exports reaches the envsubst step that renders default.conf.template.
+#
+# The port nginx listens on (#3852). The image has always listened on :80, and
+# that stays the default so Docker Compose and the appliance (hostNetwork
+# :80 / :443) render a byte-identical config. A pod that runs as a random
+# unprivileged uid (OpenShift's restricted SCC) cannot bind a port below 1024,
+# so the Helm chart sets FRONTEND_HTTP_PORT=8080 there.
+#
+# Anything but a plain port number is an error: it is interpolated into the
+# config, and nginx refusing to start on ``listen foo;`` is a worse place to
+# learn about a typo than here.
+
+set -eu
+
+_spatium_port="${FRONTEND_HTTP_PORT:-80}"
+case "$_spatium_port" in
+    ''|*[!0-9]*)
+        echo "14-http-port.envsh: FRONTEND_HTTP_PORT must be a port number, got '$_spatium_port'" >&2
+        exit 1
+        ;;
+esac
+if [ "$_spatium_port" -lt 1 ] || [ "$_spatium_port" -gt 65535 ]; then
+    echo "14-http-port.envsh: FRONTEND_HTTP_PORT out of range: $_spatium_port" >&2
+    exit 1
+fi
+
+SPATIUM_HTTP_PORT="$_spatium_port"
+export SPATIUM_HTTP_PORT

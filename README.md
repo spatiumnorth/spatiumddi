@@ -15,7 +15,7 @@
   <a href="https://github.com/spatiumnorth/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
   <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
-  <img src="https://img.shields.io/badge/status-beta-blue" alt="Status"/>
+  <img src="https://img.shields.io/badge/status-release%20candidate-blue" alt="Status"/>
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@
 
 ---
 
-> ⚠️ **Beta software.** SpatiumDDI is under active development. Core IPAM / DNS / DHCP / appliance surfaces have stabilised since the `2026.04.16-1` alpha cut, but expect occasional schema changes between releases and roadmap features that are still in flight. Ready for evaluation, pilots and staged rollouts today; 1.0.0 is due November 2026. For production use in front of business-critical DNS or DHCP, pin to a tested release, snapshot Postgres before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for the rollout. Early adopter feedback is very welcome — open an issue or start a discussion on GitHub.
+> **1.0.0 release candidate.** `1.0.0-rc.2` is the release candidate for SpatiumDDI 1.0.0: the code is frozen, and only fixes for serious issues land before 1.0.0 ships after a clean soak. Install the [latest release](https://github.com/spatiumnorth/spatiumddi/releases/latest), take a Postgres backup before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for a production rollout. Feedback is very welcome: open an issue or start a discussion on GitHub.
 
 ---
 
@@ -55,7 +55,7 @@
 
 I'm a network engineer, and I spent years running enterprise DDI. The platforms work. What doesn't work is paying for them by the IP, by the appliance and by the feature, then finding that every zone, scope and subnet you own is now locked inside a vendor's data model and a renewal cycle you don't control. Meanwhile the open-source world had every piece — BIND9, PowerDNS, Technitium, Kea — and no single control plane that ran them as one system, with the authentication, delegation and audit trail an organisation actually requires. That gap is why SpatiumDDI exists.
 
-SpatiumDDI is that control plane. It doesn't just render config for DNS and DHCP servers somebody else operates — it deploys and runs BIND9, PowerDNS, Technitium and Kea itself, and it manages Windows DNS and DHCP agentlessly over WinRM, with importers for existing BIND, Windows, PowerDNS, Technitium, Kea, ISC and NetBox estates and a guided Windows cutover rather than a forklift. Group-based RBAC over LDAP, OIDC, SAML, RADIUS or TACACS+; an append-only, tamper-evident audit log; a highly available control plane; an OS appliance with atomic A/B upgrades or a Helm chart; a REST API behind every click; and no telemetry of any kind, so it runs air-gapped. All of it is Apache 2.0 — every feature, on every install, with no licence to count against.
+SpatiumDDI is that control plane. It doesn't just render config for DNS and DHCP servers somebody else operates — it deploys and runs BIND9, PowerDNS, Technitium and Kea itself, and it manages Windows DNS and DHCP agentlessly over WinRM, with importers for existing BIND, Windows, PowerDNS, Technitium, Kea, ISC and NetBox estates and a guided Windows cutover rather than a forklift. Group-based RBAC over LDAP, OIDC, SAML, RADIUS or TACACS+; an append-only, tamper-evident audit log; a highly available control plane; an OS appliance with atomic A/B upgrades, or a Helm chart for Kubernetes and Red Hat OpenShift; a REST API behind every click; and no telemetry of any kind, so it runs air-gapped. All of it is Apache 2.0 — every feature, on every install, with no licence to count against.
 
 Open source is the model, not a concession. SpatiumNorth sells support, deployment and migration from the people who write the code, and MSPs partner to run it for their clients — that is what pays for the platform, not a per-object meter. If your team is evaluating a replacement for commercial DDI, start with the [feature tour](#whats-in-the-box) below and the [documentation](https://www.spatiumddi.com). If you're a homelab or a student learning how DNS, DHCP and IPAM fit together, you're just as welcome: it's the same software.
 
@@ -625,7 +625,7 @@ created during install. `kubectl` is on PATH (with bash completion + a
 diagnostic. `journalctl -u spatiumddi-firstboot` shows the first-boot
 setup log; `kubectl -n spatium logs <pod>` for any pod's stdout/stderr.
 
-> The appliance is beta — see issue
+> See issue
 > [#134](https://github.com/spatiumnorth/spatiumddi/issues/134)
 > + [#183](https://github.com/spatiumnorth/spatiumddi/issues/183)
 > for the roadmap and
@@ -893,8 +893,9 @@ measurements, and its api autoscaler stays at 2 replicas at rest (#3110).
 |---|---|---|
 | **Docker Compose** | Dev, small single-host production — `docker compose up -d` | ✅ Supported |
 | **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumnorth/charts/spatiumddi`). See [`docs/deployment/KUBERNETES.md`](docs/deployment/KUBERNETES.md) |
+| **OpenShift** | Red Hat OpenShift / enterprise Kubernetes | ✅ The same Helm chart, under OpenShift's default security policies (`restricted-v2`); the DNS and DHCP agents get a minimal SCC of their own, and the UI a Route. Tested on OpenShift 5.0. See [`docs/deployment/KUBERNETES.md` → OpenShift](docs/deployment/KUBERNETES.md#openshift) |
 | **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned — no Ansible playbooks yet. For bare-metal today use Docker Compose on a host or the OS appliance: see [`docs/deployment/BAREMETAL.md`](docs/deployment/BAREMETAL.md) |
-| **OS Appliance (ISO / qcow2)** | Easiest deploy, air-gapped, dedicated `/appliance` management hub | 🔄 Beta — Debian 13 + embedded [k3s](https://k3s.io/) + full stack as HelmChart CRs, hybrid USB/CD ISO for amd64 and arm64, installable onto a RAID1 mirror, installer wizard, atomic A/B slot upgrades, in-UI TLS / releases / pods / logs / diagnostics / maintenance. Build with `make appliance-dev-iso`. See [Getting Started](#quick-start-with-the-os-appliance-iso-recommended), [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + issues [#134](https://github.com/spatiumnorth/spatiumddi/issues/134) / [#183](https://github.com/spatiumnorth/spatiumddi/issues/183) |
+| **OS Appliance (ISO / qcow2)** | Easiest deploy, air-gapped, dedicated `/appliance` management hub | ✅ Debian 13 + embedded [k3s](https://k3s.io/) + full stack as HelmChart CRs, hybrid USB/CD ISO for amd64 and arm64, installable onto a RAID1 mirror, installer wizard, atomic A/B slot upgrades, in-UI TLS / releases / pods / logs / diagnostics / maintenance. Build with `make appliance-dev-iso`. See [Getting Started](#quick-start-with-the-os-appliance-iso-recommended), [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + issues [#134](https://github.com/spatiumnorth/spatiumddi/issues/134) / [#183](https://github.com/spatiumnorth/spatiumddi/issues/183) |
 
 ---
 
@@ -963,7 +964,7 @@ SpatiumDDI is built by [SpatiumNorth](https://www.spatiumnorth.com), a Montréal
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | ✅ Done — DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) + DNS Views end-to-end split-horizon + **multi-node control-plane HA** (CloudNativePG + Redis Sentinel + MetalLB VIP, operator promote/demote) all shipped |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance beta (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades, **multi-node rolling cluster upgrade** with CNPG switchover + lease-mutex + preflight + air-gap mirror PVC, consolidated **Cluster tab** (Pods + etcd + live SSE health dashboard), realtime **firewall-log viewer**, Talos-style **console cockpit**) + the **ACME DNS-01 provider** (acme-dns-compatible, for external certbot / lego / acme.sh clients) + the **ACME *embedded client*** (hand-rolled RFC 8555 — auto-issues a CA-trusted Let's Encrypt cert for SpatiumDDI's own Web UI via DNS-01 / HTTP-01, with auto-renewal) all landed. Terraform / Ansible providers still pending |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades, **multi-node rolling cluster upgrade** with CNPG switchover + lease-mutex + preflight + air-gap mirror PVC, consolidated **Cluster tab** (Pods + etcd + live SSE health dashboard), realtime **firewall-log viewer**, Talos-style **console cockpit**) + the **ACME DNS-01 provider** (acme-dns-compatible, for external certbot / lego / acme.sh clients) + the **ACME *embedded client*** (hand-rolled RFC 8555 — auto-issues a CA-trusted Let's Encrypt cert for SpatiumDDI's own Web UI via DNS-01 / HTTP-01, with auto-renewal) all landed. Terraform / Ansible providers still pending |
 | Phase 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | 🔄 In Progress — import/export (DNS + DHCP + NetBox importers, IPAM CSV/JSON/XLSX, the guided Windows cutover), advanced reporting (Top-N, utilization history, compliance PDF) and the self-service request portal landed; multi-tenancy still pending |
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and

@@ -17,6 +17,19 @@ them takes its locks in ONE order:
 4. the audit-chain advisory lock, at commit (#3389, #3503 — see
    ``app.services.audit_chain.LOCKED_BEFORE_AUDIT_TABLES``).
 
+A zone's **sync gate** (#3724, :func:`lock_zone_gate`) comes before all four:
+a transaction-scoped advisory lock per zone, shared by a long writer that
+commits in batches (the IPAM -> DNS auto-sync) and exclusive for a permanent
+zone delete. A taker holds no row lock when it takes the gate, and takes
+several gates in ascending key order, so it can never be waited on by a
+transaction that holds a row and wants a gate. Its purpose is fairness, not
+exclusion: Postgres queues a new shared request behind a waiting exclusive
+one, so a delete waiting for one batch's rows is not overtaken by the next
+batch at the commit boundary (which had it wait a second whole batch).
+Any new taker must take the gate before its first row lock, or it creates a
+cycle; so a writer that deletes several zones one after another in one
+transaction (the trash sweep, a subnet purge's reverse zones) takes none.
+
 Why this order: it is the one the hottest writer already had. A lease-events
 batch upserts its lease rows first (one flush, which writes the rows of one
 mapper in primary-key order), then locks the mirror rows ``FOR UPDATE`` by id
@@ -46,15 +59,58 @@ UPDATE``, the lock the serial-bump UPDATE takes anyway: a concurrent record
 insert's foreign-key check (``FOR KEY SHARE`` on its zone) is not blocked by
 it.
 
+A scope's **gate** (#3748, :func:`lock_scope_gates`) sits beside it at step 0,
+ahead of the zone gate: shared for a lease-events batch, exclusive for every
+delete that takes scope rows ``FOR UPDATE`` or deletes them — the scope delete,
+and the subnet, block and space deletes, for every live scope their cascade
+reaches (soft: before ``_lock_scope_batch_rows``; a permanent subnet delete:
+before its lease rows). It exists because Postgres lets a new ``FOR KEY
+SHARE`` join while another is held even when a ``FOR UPDATE`` is queued, so a
+Kea HA pair's overlapping batches starved the delete past the command timeout;
+a new shared advisory request does queue behind a waiting exclusive one. Taken
+in ascending key order, as each transaction's first lock (the deletes compute
+their scope ids with plain reads), by takers none of which takes a zone gate,
+with no row lock held that the other side waits for (a batch has inserted its
+ingest receipt, which no delete touches). A scope edit needs no gate: its
+UPDATE changes no key column, so it takes the row ``FOR NO KEY UPDATE``, which
+a ``FOR KEY SHARE`` does not block. A DHCP server-group delete needs none
+either: it refuses a group that still has servers, so no agent can post a
+batch for its scopes. Any new delete that takes scope rows ``FOR UPDATE`` must
+take their gates exclusive before its first row lock.
+
 A scope row (``dhcp_scope``) sits between steps 1 and 2 for the lease writers
 that must not write into a scope in the Trash and the delete that puts it there
 (#3733). A lease-events batch holds the scopes its events resolve to ``FOR KEY
 SHARE`` after its lease rows, and reads them again there. A scope soft-delete
-takes its scope row ``FOR UPDATE`` before anything it writes, takes no lease
-row in that transaction, and tears the scope's leases down after its commit,
-one batch per transaction, each batch in the order above. So the stamp waits
-for a batch that already holds the scope, and a later batch waits for the stamp
-and finds the scope in the Trash.
+(and a subnet / block / space soft-delete, for every scope its cascade reaches,
+ascending id, #3744) takes its scope row ``FOR UPDATE`` before anything it
+writes, takes no lease row in that transaction, and tears the scope's leases
+down after its commit, one batch per transaction, each batch in the order
+above. So the stamp waits for a batch that already holds the scope, and a
+later batch waits for the stamp and finds the scope in the Trash.
+Each teardown batch also reads its scope row ``FOR SHARE`` after its lease
+rows and holds it to its commit (#3777), so a Trash restore (an UPDATE of
+``deleted_at``) waits for the batch in flight and the next batch finds the
+scope live. After the lease rows, not before: a Trash purge locks the scope's
+lease rows and then deletes the scope row, which a batch holding the scope
+while it waited for those leases would deadlock with. The restore locks the
+scope rows it un-stamps (``FOR NO KEY UPDATE``, ascending id) before the zones
+it writes (#3627), since the batch goes on from the scope to its mirrors'
+zones. ``FOR SHARE`` and ``FOR NO KEY UPDATE`` both leave a lease-events
+batch's ``FOR KEY SHARE`` alone.
+
+Two things a lease-events batch takes WITHOUT waiting, so neither has a place
+in the order (#3789). Under Kea HA both members report every lease, so the
+two agents' batches carry the same addresses. A renewal whose mirror row
+already says what the event would write, and whose DDNS writes nothing, takes
+its ``ip_address`` row ``FOR NO KEY UPDATE SKIP LOCKED``, after the batch's
+waiting step-2 locks: a row another transaction holds is left to it (the
+other member's batch, writing the same values) and the next report repairs
+anything it did not. And before inserting a new mirror row, a batch takes the row's
+insert claim (:func:`claim_mirror_inserts`) with ``pg_try_advisory_xact_lock``:
+a claim another batch holds means that batch is inserting the same row, and
+this one leaves the address to it rather than wait on its uncommitted insert
+until its commit.
 
 ``tests/_row_lock_order_guard.py`` asserts the order for the whole test suite.
 """
@@ -63,10 +119,11 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+import zlib
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -139,6 +196,99 @@ async def lock_mirror_rows(
             r for r in res.scalars().all() if (r.subnet_id, norm_ip(str(r.address))) in keys
         )
     return rows
+
+
+#: Advisory-lock namespace of the per-zone sync gate (#3724), "ZSYN".
+ZONE_SYNC_GATE_NS = 0x5A53594E
+
+
+def _zone_gate_key(zone_id: Any) -> int:
+    """Signed 32-bit crc32 of the zone id: the second int of the gate's key."""
+    key = zlib.crc32(str(zone_id).encode("utf-8"))
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def lock_zone_gate(db: AsyncSession, zone_ids: Iterable[Any], *, exclusive: bool) -> None:
+    """Step 0 (#3724): take the sync gate of each zone in ``zone_ids``, shared
+    (a batch writer) or ``exclusive`` (a permanent zone delete), in ascending
+    key order, to the end of the transaction. Call it before any row lock.
+    Two zones whose ids collide on the crc32 share a gate, which only costs a
+    wait."""
+    fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+    for key in sorted({_zone_gate_key(z) for z in zone_ids if z is not None}):
+        await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": ZONE_SYNC_GATE_NS, "key": key})
+
+
+#: Advisory-lock namespace of the per-scope gate (#3748), "DSCP".
+SCOPE_GATE_NS = 0x44534350
+
+
+def _scope_gate_key(scope_id: Any) -> int:
+    """Signed 32-bit crc32 of the scope id: the second int of the gate's key."""
+    key = zlib.crc32(str(scope_id).encode("utf-8"))
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def lock_scope_gates(db: AsyncSession, scope_ids: Iterable[Any], *, exclusive: bool) -> None:
+    """Step 0 (#3748): take the gate of each scope in ``scope_ids``, shared
+    (a lease-events batch) or ``exclusive`` (a delete that takes the scope row
+    ``FOR UPDATE``), in ascending key order, to the end of the transaction.
+    Call it before any row lock, and before :func:`lock_zone_gate` when a
+    transaction takes both (none does today).
+
+    A batch holds its scope ``FOR KEY SHARE`` and Postgres lets a new KEY
+    SHARE join while another is held, even with a ``FOR UPDATE`` queued, so
+    two agents (a Kea HA pair) posting overlapping batches kept the delete
+    waiting until the 30 s command timeout. Advisory locks queue a new shared
+    request behind a waiting exclusive one, so the delete waits only for the
+    batches already running. Two scopes whose ids collide on the crc32 share a
+    gate, which only costs a wait."""
+    fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+    for key in sorted({_scope_gate_key(s) for s in scope_ids if s is not None}):
+        await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": SCOPE_GATE_NS, "key": key})
+
+
+#: Advisory-lock namespace of a new lease mirror's insert claim (#3789), "DMIR".
+MIRROR_INSERT_NS = 0x444D4952
+
+
+def _mirror_insert_key(subnet_id: Any, address: str) -> int:
+    """Signed 32-bit crc32 of (subnet id, normalised address)."""
+    key = zlib.crc32(f"{subnet_id}|{address}".encode())
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def claim_mirror_inserts(
+    db: AsyncSession, keys: Iterable[tuple[Any, str]]
+) -> set[tuple[Any, str]]:
+    """Try the insert claim of each new mirror row at ``keys`` ((subnet id,
+    normalised address)) to the end of the transaction, never waiting, and
+    return the keys claimed (#3789).
+
+    Under Kea HA the two members' batches insert the same new mirror rows on
+    a first acquisition. An INSERT that meets another transaction's
+    uncommitted row with the same unique key waits for that transaction to
+    end (``ON CONFLICT DO NOTHING`` waits just the same), and a batch runs
+    for seconds: the second member's batch waited out the first one's and
+    hit the 30 s command timeout. A key another batch has claimed is being
+    inserted by it, with the same values; the caller leaves that address to
+    it. Two keys whose crc32 collide share a claim, which at worst leaves an
+    address's mirror to the next report."""
+    by_key: dict[int, list[tuple[Any, str]]] = {}
+    for subnet_id, address in keys:
+        by_key.setdefault(_mirror_insert_key(subnet_id, address), []).append((subnet_id, address))
+    if not by_key:
+        return set()
+    got = (
+        await db.execute(
+            text(
+                "SELECT k FROM unnest(CAST(:keys AS integer[])) AS k "
+                "WHERE pg_try_advisory_xact_lock(:ns, k)"
+            ),
+            {"ns": MIRROR_INSERT_NS, "keys": sorted(by_key)},
+        )
+    ).scalars()
+    return {key for k in got for key in by_key[k]}
 
 
 async def lock_zone_rows(db: AsyncSession, zone_ids: Iterable[Any]) -> None:
@@ -230,12 +380,30 @@ async def _lock_address_ids(db: AsyncSession, ids: Iterable[Any], *, nowait: boo
         )
 
 
+async def lock_address_rows(db: AsyncSession, ids: Iterable[Any]) -> list[Any]:
+    """Step 2 for a writer that knows its address rows up front (#3724): lock
+    ``ids`` ``FOR NO KEY UPDATE``, ascending id, before it takes any zone.
+
+    A zone delete locks the rows it detaches before the zone (#3691), so a
+    writer that took a zone first and wrote an address later (the IPAM -> DNS
+    auto-sync, one ``_sync_dns_record`` per row) deadlocked with it."""
+    ordered = sorted(set(ids))
+    await _lock_address_ids(db, ordered)
+    return ordered
+
+
 async def lock_addresses_of_zones(db: AsyncSession, zone_ids: Iterable[Any]) -> list[Any]:
     """Step 2 for a zone delete: lock the ``ip_address`` rows a delete of
     ``zone_ids`` would rewrite (:func:`address_ids_of_zones`), ascending id,
     BEFORE the zone rows (#3691). Taken after the zone row, by the foreign
     key, that is step 3 before step 2, and a lease batch holding a mirror and
-    waiting for the zone deadlocks with it."""
+    waiting for the zone deadlocks with it.
+
+    It takes no sync gate (#3724): the trash sweep purges many zones in one
+    transaction, each after the last one's rows, so a gate here would be
+    taken after a row lock, and in the sweep's order rather than by key. A
+    caller that deletes one zone and holds nothing yet takes the gate itself
+    first (the Trash page's permanent delete)."""
     ids = await address_ids_of_zones(db, zone_ids)
     await _lock_address_ids(db, ids)
     return sorted(ids)
@@ -412,6 +580,33 @@ async def lock_zones_for_sync(
         await lock_zones_for_addresses(db, publishing=[(subnet, ip)], zone_id=zone_id)
 
 
+async def zone_ids_for_addresses(
+    db: AsyncSession,
+    *,
+    publishing: Iterable[tuple[Any, Any]] = (),
+    retracting: Iterable[Any] = (),
+    zone_id: Any = None,
+    ddns: bool = False,
+    extra_zone_ids: Iterable[Any] = (),
+) -> set[Any]:
+    """Every zone the DNS syncs of a unit of work may write (read-only): a
+    publish of each ``(subnet, ip_row)`` in ``publishing``, a retraction of
+    each row in ``retracting``, and ``extra_zone_ids`` (the zones of records
+    the work deletes outright, #3724). ``ddns`` adds each subnet's DDNS
+    override zone, which a lease publish writes into instead of the subnet's
+    own (#428)."""
+    pub = [(subnet, ip) for subnet, ip in publishing if ip is not None]
+    rows = [ip for ip in retracting if ip is not None] + [ip for _subnet, ip in pub]
+    zones = {z for z in extra_zone_ids if z is not None}
+    if not rows:
+        return zones
+    zones |= await _published_zone_ids(db, [ip.id for ip in rows])
+    subnet_cache: dict[Any, set[Any] | None] = {}
+    for subnet, ip in pub:
+        zones |= await _publish_zone_ids(db, ip, subnet, zone_id, subnet_cache, ddns)
+    return zones
+
+
 async def lock_zones_for_addresses(
     db: AsyncSession,
     *,
@@ -419,26 +614,26 @@ async def lock_zones_for_addresses(
     retracting: Iterable[Any] = (),
     zone_id: Any = None,
     ddns: bool = False,
+    extra_zone_ids: Iterable[Any] = (),
 ) -> None:
     """Lock, in one id-ordered pass, every zone the DNS syncs of a unit of
-    work may write: a publish of each ``(subnet, ip_row)`` in ``publishing``
-    and a retraction of each row in ``retracting``.
+    work may write (:func:`zone_ids_for_addresses`).
 
     For a transaction that syncs several addresses (a lease batch, the
     sweep): each sync locks its own zones in order, but one address's zones
     after another's are not in id order between them, so a writer taking the
     same zones for its own addresses in another order could still wait in a
-    cycle. ``ddns`` adds each subnet's DDNS override zone, which a lease
-    publish writes into instead of the subnet's own (#428)."""
-    pub = [(subnet, ip) for subnet, ip in publishing if ip is not None]
-    rows = [ip for ip in retracting if ip is not None] + [ip for _subnet, ip in pub]
-    if not rows:
-        return
-    zones = await _published_zone_ids(db, [ip.id for ip in rows])
-    subnet_cache: dict[Any, set[Any] | None] = {}
-    for subnet, ip in pub:
-        zones |= await _publish_zone_ids(db, ip, subnet, zone_id, subnet_cache, ddns)
-    await lock_zone_rows(db, zones)
+    cycle."""
+    zones = await zone_ids_for_addresses(
+        db,
+        publishing=publishing,
+        retracting=retracting,
+        zone_id=zone_id,
+        ddns=ddns,
+        extra_zone_ids=extra_zone_ids,
+    )
+    if zones:
+        await lock_zone_rows(db, zones)
 
 
 async def _mirror_zone_and_address_ids(
