@@ -134,3 +134,55 @@ describe("Teams flavor", () => {
     expect(screen.queryByText(/MessageCard/)).toBeNull();
   });
 });
+
+describe("SMTP password in the target form (#3927)", () => {
+  const SMTP = {
+    ...TARGET,
+    kind: "smtp",
+    url_set: false,
+    auth_header_set: false,
+    smtp_host: "smtp.example.test",
+    smtp_username: "u",
+    smtp_password_set: true,
+    smtp_from_address: "a@example.test",
+    smtp_to_addresses: ["b@example.test"],
+  };
+
+  async function openSmtp() {
+    api.list.mockResolvedValue([SMTP]);
+    api.update.mockResolvedValue(SMTP);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("collector");
+    fireEvent.click(screen.getByTitle("Edit"));
+    await screen.findByPlaceholderText(/stored — leave blank/);
+  }
+
+  it("does not send a blank password, even after typing and erasing", async () => {
+    await openSmtp();
+    const input = screen.getByPlaceholderText(/stored — leave blank/);
+    fireEvent.change(input, { target: { value: "x" } });
+    fireEvent.change(input, { target: { value: "" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Save"));
+    });
+    const body = api.update.mock.calls[0][1] as Record<string, unknown>;
+    expect("smtp_password" in body).toBe(false);
+  });
+
+  it("clears the password only via the explicit checkbox", async () => {
+    await openSmtp();
+    fireEvent.click(screen.getByLabelText("Remove the stored password"));
+    await act(async () => {
+      fireEvent.click(screen.getByText("Save"));
+    });
+    const body = api.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.smtp_password).toBe("");
+  });
+});
