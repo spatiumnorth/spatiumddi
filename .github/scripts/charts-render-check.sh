@@ -354,12 +354,20 @@ render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
     --set openshift.scc.create=false \
     --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
     --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+# #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
+# here too (no pinned uid, its ServiceAccount exists).
+render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
     || failures=$((failures + 1))
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
-    "$OUT/umbrella-openshift-forced.yaml" || failures=$((failures + 1))
+    "$OUT/umbrella-openshift-forced.yaml" "$OUT/umbrella-openshift-upgrade.yaml" \
+    || failures=$((failures + 1))
+if ! grep -q 'component: dhcp-unstick' "$OUT/umbrella-openshift-upgrade.yaml"; then
+    echo "   FAIL #3907: the OpenShift upgrade render has no unstick hook" >&2
+    failures=$((failures + 1))
+fi
 if grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-no-scc.yaml"; then
     echo "   FAIL #3852: openshift.scc.create=false still renders an SCC" >&2
     failures=$((failures + 1))
@@ -1178,6 +1186,51 @@ if not svcs or any(
     print(f"FAIL DHCP nodePort without type is not NodePort: {[d['spec'].get('type') for d in svcs]} (#3229)", file=sys.stderr)
     sys.exit(1)
 print("   DHCP nodePort implies NodePort")
+PYEOF
+# #3907 — the DHCP unstick pre-upgrade hook: a hook-annotated, namespaced Role
+# and Job only when DHCP agents are on and the opt-out is not set.
+# ``helm template`` renders a pre-upgrade hook only with --is-upgrade.
+render umbrella-dhcp-unstick-on "$UMBRELLA" --is-upgrade \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+render umbrella-dhcp-unstick-off "$UMBRELLA" --is-upgrade \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.upgradeUnstickPods=false
+render umbrella-dhcp-unstick-noagents "$UMBRELLA" --is-upgrade
+echo "── DHCP unstick pre-upgrade hook (umbrella, #3907)"
+python3 - "$OUT/umbrella-dhcp-unstick-on.yaml" "$OUT/umbrella-dhcp-unstick-off.yaml" \
+    "$OUT/umbrella-dhcp-unstick-noagents.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+def hook_objs(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    return docs, [d for d in docs if (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick"]
+rc = 0
+docs, objs = hook_objs(sys.argv[1])
+kinds = sorted(d["kind"] for d in objs)
+if kinds != ["Job", "Role", "RoleBinding", "ServiceAccount"]:
+    print(f"FAIL unstick hook objects: {kinds} (#3907)", file=sys.stderr); rc = 1
+for d in objs:
+    a = d["metadata"].get("annotations") or {}
+    if a.get("helm.sh/hook") != "pre-upgrade" or "hook-succeeded" not in a.get("helm.sh/hook-delete-policy", ""):
+        print(f"FAIL {d['kind']} is not a pre-upgrade hook with a delete policy (#3907)", file=sys.stderr); rc = 1
+    if d["kind"] in ("Role", "RoleBinding") and not d["metadata"].get("namespace"):
+        print(f"FAIL {d['kind']} is not namespaced (#3907)", file=sys.stderr); rc = 1
+grants = sorted(
+    (r["resources"][0], tuple(sorted(r["verbs"])))
+    for ro in objs if ro["kind"] == "Role" for r in ro["rules"]
+)
+if grants != [("pods", ("delete", "get", "list")), ("statefulsets", ("delete", "get", "list"))]:
+    print(f"FAIL unstick Role grants {grants} (#3907)", file=sys.stderr); rc = 1
+for d in docs:
+    if d["kind"] in ("ClusterRole", "ClusterRoleBinding") and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-unstick":
+        print("FAIL cluster-scoped unstick object (#3907)", file=sys.stderr); rc = 1
+for p in sys.argv[2:]:
+    if hook_objs(p)[1]:
+        print(f"FAIL unstick hook rendered in {p} (#3907)", file=sys.stderr); rc = 1
+if rc == 0:
+    print("   hook renders with DHCP agents, not with the opt-out or without agents")
+sys.exit(rc)
 PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
