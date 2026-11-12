@@ -69,7 +69,7 @@ async def test_large_zone_is_queued_one_op_per_record(db_session: AsyncSession) 
     srv, zone = await _zone(db_session, n)
     driver = _Driver()
 
-    res = await restore_zone_records_to_server(db_session, srv, driver, zone)
+    res = await restore_zone_records_to_server(db_session, srv, driver, zone, inline_only=False)
 
     assert driver.calls == 0
     assert res.queued_for_agent is True
@@ -96,7 +96,46 @@ async def test_repeat_does_not_queue_duplicates(db_session: AsyncSession) -> Non
     n = INLINE_PUSH_MAX_RECORDS + 1
     srv, zone = await _zone(db_session, n)
     driver = _Driver()
-    await restore_zone_records_to_server(db_session, srv, driver, zone)
-    await restore_zone_records_to_server(db_session, srv, driver, zone)
+    for _ in range(2):
+        await restore_zone_records_to_server(db_session, srv, driver, zone, inline_only=False)
     ops = (await db_session.execute(select(DNSRecordOp))).scalars().all()
     assert len(ops) == n
+
+
+async def test_move_and_rollback_restore_stay_inline_however_large(
+    db_session: AsyncSession,
+) -> None:
+    """A move deletes the zone at the source in the same request, and a
+    rollback restore re-creates a zone that must not sit empty, so neither
+    may leave the target's records merely queued (#3817)."""
+    n = INLINE_PUSH_MAX_RECORDS + 5
+    srv, zone = await _zone(db_session, n)
+    driver = _Driver()
+
+    res = await restore_zone_records_to_server(db_session, srv, driver, zone)
+
+    assert (driver.calls, driver.changes) == (1, n)
+    assert res.queued_for_agent is False
+    assert res.pushed == n
+    assert (await db_session.execute(select(DNSRecordOp))).scalars().all() == []
+
+
+async def test_sync_with_servers_queues_a_large_zone(db_session: AsyncSession) -> None:
+    from unittest.mock import patch
+
+    from app.services.dns import pull_from_server as pfs
+
+    n = INLINE_PUSH_MAX_RECORDS + 5
+    srv, zone = await _zone(db_session, n)
+    driver = _Driver()
+
+    with (
+        patch.object(pfs, "_resolve_primary_and_driver", return_value=(srv, driver, [], None)),
+        patch.object(pfs, "pull_zone_records_signed", return_value=([], None)),
+        patch.object(pfs, "_fallback_kwargs", return_value={}),
+    ):
+        result = await pfs.sync_zone_with_server(db_session, zone, server=srv)
+
+    assert driver.calls == 0
+    assert result.push.queued_for_agent is True
+    assert len((await db_session.execute(select(DNSRecordOp))).scalars().all()) == n

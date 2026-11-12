@@ -5991,7 +5991,7 @@ export function SyncResultModal({
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Stat
-              label={queued_for_agent ? "Queued for agent" : "Pushed"}
+              label={queued_for_agent ? "Queued for delivery" : "Pushed"}
               value={pushed}
               highlight={
                 pushed > 0 && push_errors.length === 0 ? "good" : undefined
@@ -6008,12 +6008,21 @@ export function SyncResultModal({
               hint="DB already matches server"
             />
           </div>
+          {queued_for_agent && pushed > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              These records are queued, not yet on the server. They are applied
+              in the background (an agent applies them on its next poll; for an
+              agentless server the retry sweep does, a batch at a time), so a
+              large zone can take a few minutes to converge. Failed writes are
+              retried; check the server's record-op queue for errors.
+            </p>
+          )}
           {pushed > 0 && (
             <RecordTable
               records={pushed_records}
               heading={
                 queued_for_agent
-                  ? "Records queued for the server's agent"
+                  ? "Records queued — delivered to the server in the background"
                   : "Records applied to the server"
               }
             />
