@@ -22,6 +22,7 @@ import {
   type ApiTokenCreated,
   type ApiTokenResourceGrant,
   type ApiTokenScope,
+  formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -832,6 +833,7 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setConfirmDelete(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
 
   return (
@@ -1046,6 +1048,11 @@ export function ApiTokensPage() {
                 )}
                 ? Any script still using it will start getting 401 responses.
               </p>
+              {deleteMut.isError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {formatApiError(deleteMut.error, "Failed to delete token")}
+                </p>
+              )}
               <div className="flex justify-end gap-2">
                 <button
                   onClick={() => setConfirmDelete(null)}
@@ -1054,7 +1061,10 @@ export function ApiTokensPage() {
                   Cancel
                 </button>
                 <button
-                  onClick={() => deleteMut.mutate(confirmDelete.id)}
+                  onClick={() => {
+                    deleteMut.reset();
+                    deleteMut.mutate(confirmDelete.id);
+                  }}
                   disabled={deleteMut.isPending}
                   className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
                 >
