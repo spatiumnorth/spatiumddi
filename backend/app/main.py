@@ -8,8 +8,10 @@ from typing import Any
 import structlog
 import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
@@ -19,6 +21,7 @@ from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.body_limit import RequestBodyLimitMiddleware
+from app.core.denial_audit import audit_unrecorded_denial
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
@@ -1257,6 +1260,15 @@ def create_app() -> FastAPI:
     from sqlalchemy.exc import (
         OperationalError as SAOperationalError,
     )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_audited(request: Request, exc: StarletteHTTPException) -> Response:
+        """The stock HTTPException response, plus (#3644) a ``denied`` audit row
+        for a 403 decided inside a handler, which writes none of its own. The
+        row is skipped when a gate or ``refuse_and_audit`` already wrote one."""
+        if exc.status_code == 403:
+            await audit_unrecorded_denial(request, exc.detail)
+        return await http_exception_handler(request, exc)
 
     @app.exception_handler(SAInterfaceError)
     @app.exception_handler(SAOperationalError)
