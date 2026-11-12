@@ -3876,7 +3876,9 @@ async def test_audit_target(
             target_dict, payload, reasons
         )
     except Exception as exc:  # noqa: BLE001
-        reason = redact(str(exc), url, auth_header, smtp_password)
+        reason = audit_forward_svc._failure_reason(  # noqa: SLF001
+            exc, url, auth_header, smtp_password
+        )
         raise HTTPException(status_code=502, detail=f"delivery failed: {reason}") from exc
     if outcome != audit_forward_svc.DELIVERED:
         # #1577: a filtered target, a misconfigured one, or a rejected

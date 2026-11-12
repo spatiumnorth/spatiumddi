@@ -74,3 +74,60 @@ async def test_smtp_missing_setting_is_named(client: AsyncClient, db_session: As
     resp = await client.post(f"{_TARGETS}/{created['id']}/test", headers=h)
     assert resp.status_code == 502
     assert "SMTP host" in resp.json()["detail"]
+
+
+_SECRET_URL = (
+    "https://user:pw-s3cret@hooks.example.test/services/T000/B000/SECRETTOKEN?key=qsecret99"
+)
+_SECRETS = ("SECRETTOKEN", "qsecret99", "pw-s3cret", "hdr-fixture-9f8e7d", "T000/B000")
+
+
+def _assert_clean(d: str) -> None:
+    for s in _SECRETS:
+        assert s not in d, f"{s} leaked in {d!r}"
+
+
+async def _probe(client, db, exc=None, *, status=None, echo="") -> str:
+    h = await _admin(db)
+    body = {**_webhook_body(), "url": _SECRET_URL, "auth_header": _AUTH}
+    created = (await client.post(_TARGETS, headers=h, json=body)).json()
+    if status is not None:
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, text=echo)
+
+        real = httpx.AsyncClient
+        with patch.object(
+            svc.httpx,
+            "AsyncClient",
+            lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
+        ):
+            resp = await client.post(f"{_TARGETS}/{created['id']}/test", headers=h)
+    else:
+        with patch.object(svc, "_send_webhook", new=AsyncMock(side_effect=exc)):
+            resp = await client.post(f"{_TARGETS}/{created['id']}/test", headers=h)
+    assert resp.status_code == 502, resp.text
+    return resp.json()["detail"]
+
+
+@pytest.mark.parametrize("status", [404, 500])
+async def test_http_error_echoing_secrets_does_not_leak(
+    client: AsyncClient, db_session: AsyncSession, status: int
+) -> None:
+    echo = (
+        "bad path /services/T000/B000/SECRETTOKEN auth hdr-fixture-9f8e7d key=qsecret99 pw-s3cret"
+    )
+    d = await _probe(client, db_session, status=status, echo=echo)
+    assert str(status) in d
+    _assert_clean(d)
+
+
+async def test_httpx_messages_quoting_the_url_do_not_leak(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    for exc in (
+        httpx.ConnectError(f"cannot connect to {_SECRET_URL.replace('hooks', 'HOOKS')}/x"),
+        httpx.InvalidURL(f"bad {_SECRET_URL}"),
+        httpx.ReadTimeout(f"timed out for url '{_SECRET_URL}'"),
+    ):
+        _assert_clean(await _probe(client, db_session, exc))
