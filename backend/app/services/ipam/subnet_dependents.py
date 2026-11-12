@@ -269,17 +269,17 @@ async def carry_for_split(
                     setattr(aset, k, v)
                 continue
             copy = AddressSet(
-                    name=aset.name,
-                    description=aset.description,
-                    subnet_id=children[idx].id,
-                    customer_id=aset.customer_id,
-                    site_id=aset.site_id,
-                    range_kind=aset.range_kind,
-                    start_address=fields.get("start_address"),
-                    end_address=fields.get("end_address"),
-                    explicit_addresses=fields.get("explicit_addresses", []),
-                    tags=dict(aset.tags or {}),
-                    custom_fields=dict(aset.custom_fields or {}),
+                name=aset.name,
+                description=aset.description,
+                subnet_id=children[idx].id,
+                customer_id=aset.customer_id,
+                site_id=aset.site_id,
+                range_kind=aset.range_kind,
+                start_address=fields.get("start_address"),
+                end_address=fields.get("end_address"),
+                explicit_addresses=fields.get("explicit_addresses", []),
+                tags=dict(aset.tags or {}),
+                custom_fields=dict(aset.custom_fields or {}),
             )
             db.add(copy)
             await db.flush()
