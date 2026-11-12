@@ -974,6 +974,9 @@ times out with `--wait`, or run it without):
 kubectl -n <namespace> delete pod <dhcp-kea-name>-0
 ```
 
+For the version path from 2026.10.02-1 to 1.0.0, and for the appliance and
+Compose shapes, see [Upgrading to 1.0.0](APPLIANCE.md#upgrading-to-100).
+
 ### Manual (manifest) upgrades
 
 If you're running the raw `k8s/base/` manifests instead of the chart, pin the
