@@ -250,6 +250,7 @@ export function DNSBLPage() {
           <input
             className={cn(inputCls, "w-40")}
             placeholder="203.0.113.5"
+            aria-label="Pinned IP address"
             value={newIp}
             onChange={(e) => setNewIp(e.target.value)}
             {...writeGate}
@@ -257,6 +258,7 @@ export function DNSBLPage() {
           <input
             className={cn(inputCls, "flex-1")}
             placeholder="note (optional)"
+            aria-label="Pinned IP note"
             value={newNote}
             onChange={(e) => setNewNote(e.target.value)}
             {...writeGate}

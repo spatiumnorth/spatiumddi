@@ -2656,6 +2656,7 @@ function DnssecCard({
                 value={policyId}
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
+                aria-label="DNSSEC signing policy"
                 title="DNSSEC signing policy (BIND9)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
@@ -7059,10 +7060,20 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
       );
       return;
     }
+    // A cleared Order is refused, never saved as 0 (#3740): 0 sorts the view
+    // ahead of every view ordered 1 and up, and the operator never saw it.
+    const orderText = order.trim();
+    const orderNum = Number(orderText);
+    if (orderText === "" || !Number.isInteger(orderNum) || orderNum < 0) {
+      setError(
+        "Order is required: a whole number, 0 or higher. Views are evaluated lowest first.",
+      );
+      return;
+    }
     const body = {
       name: name.trim(),
       description: description.trim(),
-      order: Number(order) || 0,
+      order: orderNum,
       recursion,
       match_clients: clients,
       match_destinations: lines(matchDestinations),
@@ -7111,8 +7122,11 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
             <input
               className={inputCls}
               type="number"
+              min={0}
+              step={1}
               value={order}
               onChange={(e) => setOrder(e.target.value)}
+              placeholder="0"
             />
           </Field>
           <Field label="Recursion">
@@ -7127,9 +7141,9 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </Field>
         </div>
         <p className="-mt-1 text-[11px] text-muted-foreground">
-          Views are evaluated low order first, and a client is served by the
-          first view it matches — so put the most specific view above the
-          catch-all.
+          Order is a whole number, 0 or higher; lower is evaluated first. Views
+          are evaluated low order first, and a client is served by the first
+          view it matches — so put the most specific view above the catch-all.
         </p>
 
         <Field label="Description">
@@ -12147,6 +12161,7 @@ export function BlocklistDetail({
                           value: ev.target.checked,
                         })
                       }
+                      aria-label={`Also block subdomains of ${e.domain}`}
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."
