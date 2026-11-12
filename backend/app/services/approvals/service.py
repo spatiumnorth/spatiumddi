@@ -573,10 +573,10 @@ _SAFE_WARNING_TEXT = {
 
 # What a non-HTTP failure at apply is stored as. ``str(exc)`` of a database
 # error is raw driver text (SQL, column names, parameter values); the cause is
-# in the server log, not on the request (#3642).
+# in the server log only (not on the request or its audit row; #3642).
 _INTERNAL_FAILURE_TEXT = (
     "The request could not be applied because of an internal error. "
-    "An administrator can find the details in the audit log."
+    "An administrator can find the details in the server log."
 )
 
 
