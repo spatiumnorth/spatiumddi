@@ -47,6 +47,9 @@ export function ListReadError({
  * offers `onClearFilters` when given. The "yet" copy stays for a list that
  * is really empty.
  *
+ * `hint` + `gate` (#3885) keep the "click the button" half of an empty state
+ * from a reader whose button is disabled.
+ *
  * Wrap only the empty branch: the caller has already decided there are no
  * rows to show.
  */
@@ -57,10 +60,20 @@ export function ListEmpty({
   className,
   filtered = false,
   onClearFilters,
+  hint,
+  gate,
 }: {
   error: unknown;
   what: string;
   children: ReactNode;
+  /**
+   * A sentence that tells the reader to use a write button ("Click New X to
+   * add one."), drawn after `children` only when `gate` does not disable that
+   * button (#3885). Keep `children` true for every reader ("No X yet.").
+   */
+  hint?: ReactNode;
+  /** The `permissionGate(...)` the button named in `hint` spreads. */
+  gate?: { disabled?: boolean; title?: string };
   className?: string;
   /** A search, filter, chip or tag is active, so an empty result is not an empty list. */
   filtered?: boolean;
@@ -88,5 +101,10 @@ export function ListEmpty({
       </span>
     );
   }
-  return <>{children}</>;
+  return (
+    <>
+      {children}
+      {hint && !gate?.disabled ? <> {hint}</> : null}
+    </>
+  );
 }

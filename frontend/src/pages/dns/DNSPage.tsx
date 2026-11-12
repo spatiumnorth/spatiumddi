@@ -5264,7 +5264,7 @@ export function ZoneDetailView({
                 ) : hasRecFilter ? (
                   "No records match the current filter."
                 ) : (
-                  'No records yet. Click "Add Record" to create one.'
+                  `No records yet.${canWriteRecords ? ' Click "Add Record" to create one.' : ""}`
                 )}
               </p>
             </div>
@@ -7675,7 +7675,13 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       )}
       {keys.length === 0 && keysData !== undefined && keysError == null && (
         <p className="text-xs italic text-muted-foreground">
-          No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
+          No TSIG keys yet.
+          {isSuperadmin && (
+            <>
+              {" "}
+              Click <em>New TSIG Key</em> to add one.
+            </>
+          )}
         </p>
       )}
 
@@ -10519,7 +10525,7 @@ function ZonesTab({
               </button>
             </>
           ) : (
-            'No zones yet. Click "Add Zone" to create one.'
+            `No zones yet.${can("write", "dns_zone") ? ' Click "Add Zone" to create one.' : ""}`
           )}
         </p>
       )}
