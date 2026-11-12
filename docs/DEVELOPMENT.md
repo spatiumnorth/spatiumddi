@@ -863,9 +863,10 @@ goes on long-lived `release/X.Y.Z` branches (#3948), for example
   it. CI runs the same checks as for `main`, and the PR takes the `X.Y.Z`
   milestone automatically.
 - **Tags stay on `main`.** `release.yml` publishes only a tag on `main`, so a
-  release branch is merged into `main` (a merge commit, not a squash, so its
-  history stays) once the release before it has shipped, and the release is
-  tagged there.
+  release branch is squash-merged into `main` through a PR once the release
+  before it has shipped, and the release is tagged on that commit. Squash,
+  because `protect-main` requires linear history; the branch's own PRs stay
+  linked from the merge PR and from their issues.
 - **Keep the branches current.** Merge `main` into each release branch after
   every release-candidate fix, and `release/1.0.1` into `release/1.1.0`, so
   the final merge into `main` is small and every fix reaches the later
