@@ -55,7 +55,7 @@ const STAMP = "2026-11-05T00:00:00Z";
 const VRF_ROW = {
   id: "vrf1",
   name: "blue",
-  description: "",
+  description: "old",
   route_distinguisher: null,
   import_targets: [],
   export_targets: [],
@@ -67,6 +67,7 @@ const VRF_ROW = {
 } as unknown as VRF;
 
 function openEditor() {
+  answers.vrfsApi = { get: () => Promise.resolve(VRF_ROW) };
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -87,7 +88,10 @@ function asnSelect(): HTMLSelectElement {
 
 async function saveAndReadBody(): Promise<Record<string, unknown>> {
   const update = vi.fn(() => Promise.resolve(VRF_ROW));
-  answers.vrfsApi = { update };
+  answers.vrfsApi = { update, get: () => Promise.resolve(VRF_ROW) };
+  fireEvent.change(screen.getByDisplayValue("old"), {
+    target: { value: "new" },
+  });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(update).toHaveBeenCalled());
   const call = update.mock.calls[0] as unknown as [string, object];
@@ -110,7 +114,7 @@ describe("VRF editor ASN picker with unread permissions (#3546)", () => {
       "Linked (could not be read)",
     );
     const body = await saveAndReadBody();
-    expect(body.asn_id).toBe("asn-linked");
+    expect(body).toEqual({ description: "new" }); // the link is not sent, so not cleared
   });
 
   it("while the read is running it says so, and Save keeps the linked ASN", async () => {
@@ -122,6 +126,6 @@ describe("VRF editor ASN picker with unread permissions (#3546)", () => {
     expect(sel.title).not.toMatch(/role/i);
     expect(sel.selectedOptions[0].textContent).not.toMatch(/role/i);
     const body = await saveAndReadBody();
-    expect(body.asn_id).toBe("asn-linked");
+    expect(body).toEqual({ description: "new" }); // the link is not sent, so not cleared
   });
 });
