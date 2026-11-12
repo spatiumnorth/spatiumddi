@@ -326,7 +326,7 @@ export function ResourcePicker({
           )}
           {options.length > 0 && data?.truncated ? (
             <div className="border-t border-border px-2 py-1 text-[11px] text-muted-foreground">
-              More may exist — keep typing to narrow
+              Showing {options.length} — more match, keep typing to narrow
             </div>
           ) : null}
         </div>

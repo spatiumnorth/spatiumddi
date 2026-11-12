@@ -282,9 +282,9 @@ class ResourceOption(BaseModel):
 
 class ResourceOptionsResponse(BaseModel):
     options: list[ResourceOption]
-    # True when the permission scan hit its cap before filling ``limit`` —
-    # the caller's readable rows may exist beyond the scanned window, so the
-    # UI should say "keep typing to narrow" rather than "no matches".
+    # True when more readable rows match than ``options`` holds (one more was
+    # found past ``limit``) or the permission scan hit its cap before filling
+    # ``limit`` — the UI should say "keep typing to narrow", not "no matches".
     truncated: bool
 
 
@@ -421,7 +421,9 @@ async def resource_options(
     out: list[ResourceOption] = []
     offset = 0
     exhausted = False
-    while len(out) < limit and offset < _PICKER_SCAN_CAP:
+    # Collect ONE past ``limit``: a readable match beyond the page is the only
+    # proof the list is cut (#3938).
+    while len(out) <= limit and offset < _PICKER_SCAN_CAP:
         rows = (await db.execute(query_fn(q).offset(offset).limit(_PICKER_PAGE))).all()
         if not rows:
             exhausted = True
@@ -432,15 +434,20 @@ async def resource_options(
             if not user_has_permission(current_user, "read", rtype, rid):
                 continue
             out.append(to_option(row))
-            if len(out) >= limit:
+            if len(out) > limit:
                 break
         if len(rows) < _PICKER_PAGE:
             exhausted = True
             break
-    # ``truncated`` = the caller's readable rows may exist beyond the scanned
-    # window (cap hit, or limit filled with candidates left) — the UI shows
-    # "keep typing to narrow" instead of a dead-end "no matches".
-    return ResourceOptionsResponse(options=out, truncated=not exhausted and len(out) < limit)
+    # ``truncated`` = the caller's readable rows may exist beyond what is
+    # returned: a further readable match was found past ``limit``, or the scan
+    # cap was hit first. The UI shows "keep typing to narrow" instead of a
+    # dead-end "no matches" or a list that reads as complete.
+    more = len(out) > limit
+    out = out[:limit]
+    return ResourceOptionsResponse(
+        options=out, truncated=more or (not exhausted and len(out) < limit)
+    )
 
 
 # ── Catalog ────────────────────────────────────────────────────────────────
