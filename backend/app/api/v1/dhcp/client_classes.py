@@ -22,6 +22,7 @@ from app.services.dhcp.class_refs import (
     describe_pools,
     pools_restricted_to,
     reserved_name_reason,
+    trash_hint,
 )
 from app.services.dhcp.option_validation import normalize_options, validate_class_test
 
@@ -147,7 +148,7 @@ async def refuse_if_name_referenced(
         detail=(
             f"Cannot {verb} '{name}': it is still referenced by {' and '.join(parts)}. "
             "Kea accepts a reference to an undefined class and the pool would "
-            "silently match no client. Clear or change those references first."
+            "silently match no client. Clear or change those references first." + trash_hint(pools)
         ),
     )
 

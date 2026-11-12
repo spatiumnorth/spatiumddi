@@ -41,6 +41,7 @@ from app.services.dhcp.class_refs import (
     phone_class_name,
     phone_profile_rendered,
     pools_restricted_to,
+    trash_hint,
 )
 from app.services.dhcp.option_validation import (
     check_vendor_class_match,
@@ -246,7 +247,7 @@ async def refuse_if_phone_class_stops_rendering(
                 f"Cannot {verb}: phone profile '{p.name}' generates class '{name}', which is "
                 f"still referenced by {len(pools)} pool(s) ({describe_pools(pools)}). Kea "
                 "accepts a reference to an undefined class and the pool would silently "
-                "match no client. Clear or change those references first."
+                "match no client. Clear or change those references first." + trash_hint(pools)
             ),
         )
 

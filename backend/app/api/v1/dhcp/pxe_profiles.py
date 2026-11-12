@@ -52,6 +52,7 @@ from app.services.dhcp.class_refs import (
     describe_pools,
     pools_restricted_to,
     pxe_pool_refs,
+    trash_hint,
 )
 from app.services.dhcp.option_validation import check_vendor_class_match
 
@@ -340,7 +341,7 @@ async def _refuse_if_pool_bound(
                 f"'{name}', which is still referenced by {len(pools)} pool(s) "
                 f"({describe_pools(pools)}). Kea accepts a reference to an undefined "
                 "class and the pool would silently match no client. Clear or change "
-                "those references first."
+                "those references first." + trash_hint(pools)
             )
             # Drop the in-session edits so a refused Save leaves nothing staged.
             await db.rollback()

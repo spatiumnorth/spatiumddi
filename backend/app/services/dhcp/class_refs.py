@@ -153,6 +153,16 @@ def describe_pools(pools: list[tuple[str, str, str]]) -> str:
     return f"{shown}{more}"
 
 
+def trash_hint(pools: list[tuple[str, str, str]]) -> str:
+    """Way out of a refusal that counted pools in the Trash (#3928)."""
+    if not any(n.endswith(", in Trash") for n, _s, _e in pools):
+        return ""
+    return (
+        " Pools marked 'in Trash' come back with their restriction on restore: purge "
+        "their scope from Administration > Trash, or restore it and clear the pool's class."
+    )
+
+
 async def known_class_names(db: AsyncSession, group_id: uuid.UUID) -> set[str]:
     """Operator class names + device-policy class names in the group."""
     ops = (
