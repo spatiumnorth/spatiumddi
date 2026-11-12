@@ -493,3 +493,27 @@ async def test_a_disabled_address_sets_module_widens_nothing_3762(
         json={"description": "mine"},
     )
     assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_bulk_edit_says_why_a_delegate_row_was_skipped_3905(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    w = await _world(db_session)
+    token = await _delegate(db_session, w)
+    r = await client.post(
+        "/api/v1/ipam/addresses/bulk-edit",
+        headers=_h(token),
+        json={
+            "ip_ids": [str(w["inside"].id), str(w["outside"].id)],
+            "changes": {"description": "bulk"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["updated_count"] == 1
+    assert body["skipped"] == [str(w["outside"].id)]
+    reason = body["skipped_reasons"][str(w["outside"].id)]
+    assert "address set" in reason
+    assert "system" not in reason.lower()
+
