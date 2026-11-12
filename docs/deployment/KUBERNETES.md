@@ -513,23 +513,28 @@ They do not drop the capability. A namespace that enforces either level then
 needs `pod-security.kubernetes.io/enforce: privileged`, or an exemption. On
 OpenShift use `openshift.workerNetRaw` instead (see above).
 
-Without `NET_RAW`, nmap falls back to what an unprivileged process can do: a
-TCP connect scan. A profile that asks for `-O` reports nmap's own error in the
-scan result rather than failing the task.
+Verified on k3s with the default (`false`): the worker's bounding set carries
+`NET_RAW`, and `nmap -sS` and `-O` both run. Where `NET_RAW` is absent, nmap can
+do only what an unprivileged process can, a TCP connect scan with no OS
+detection.
 
 ### Pod Security levels
 
 The [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
 level each component needs with the chart's defaults:
 
-| Component | Highest level that admits it | Why not higher |
-|---|---|---|
-| api, worker, beat, frontend, migrate Job | `baseline` | they run as a fixed non-root uid without `allowPrivilegeEscalation: false` / `capabilities.drop: ["ALL"]` on every container |
-| DNS agents (`dns-bind9-*`) | `baseline` | `named` binds `:53`, so the container keeps its default capabilities and may escalate |
-| DHCP agents (Kea), `hostNetwork: false` | `baseline` | as the DNS agents, for `:67` |
-| DHCP agents with `hostNetwork: true` (relay-less LAN) | `privileged` | `baseline` forbids host networking |
-| worker with `worker.netRawCapability: true` | `privileged` | `baseline` forbids adding `NET_RAW` |
-| CloudNativePG / Redis | as their own charts state | — |
+| Component | Highest level that admits it |
+|---|---|
+| api, worker, beat, frontend, migrate Job, Postgres, Redis | `baseline` |
+| DNS agents (`dns-bind9-*`), DHCP agents with `hostNetwork: false` | `baseline` |
+| DHCP agents with `hostNetwork: true` (relay-less LAN) | `privileged`: `baseline` forbids host networking |
+| worker with `worker.netRawCapability: true` | `privileged`: `baseline` forbids adding `NET_RAW` |
+
+None of them pass `restricted`: every container fails its
+`allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` and
+`runAsNonRoot` checks. Measured with
+`kubectl label --dry-run=server ns spatiumddi pod-security.kubernetes.io/enforce=<level>`
+on a default single-node install with one BIND9 and one Kea agent (#3952).
 
 So a default install, with DHCP agents off host networking, runs in a namespace
 that enforces `baseline`. Talos enforces `baseline` cluster-wide by default.
