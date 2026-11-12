@@ -11203,8 +11203,30 @@ export const alertsApi = {
     api.patch<AlertRule>(`/alerts/rules/${id}`, body).then((r) => r.data),
   deleteRule: (id: string) => api.delete(`/alerts/rules/${id}`),
   listEvents: (
-    params: { open_only?: boolean; rule_id?: string; limit?: number } = {},
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => r.data),
+  // One window of events plus the number matching the filters (the
+  // X-Total-Count header), so a page can say how many it did not draw (#3830).
+  listEventsPage: (
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
   resolveEvent: (id: string) =>
     api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
   evaluateNow: () =>

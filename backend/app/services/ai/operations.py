@@ -53,6 +53,8 @@ from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.sync_check import ipam_authors_zone
+from app.services.dns.zone_synthesis import unauthored_zone_error
 from app.services.ipam.address_create_rules import (
     boundary_address_refusal,
     holds_address,
@@ -484,14 +486,14 @@ async def _hostname_from_fqdn(
     zone_name = zone.name.rstrip(".").lower()
     if not args.fqdn.endswith("." + zone_name):
         return args, (
-            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone this "
-            f"address publishes in. Give a hostname, or an fqdn ending in .{zone_name}."
+            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone bound to "
+            f"this subnet. Give a hostname, or an fqdn ending in .{zone_name}."
         )
     hostname = args.fqdn[: -len(zone_name) - 1]
     if args.hostname and args.hostname != hostname:
         return args, (
             f"hostname {args.hostname} and fqdn {args.fqdn} name different hosts: "
-            f"the address publishes {args.hostname}.{zone_name}. Give one of them."
+            f"the hostname gives {args.hostname}.{zone_name}. Give one of them."
         )
     return args.model_copy(update={"hostname": hostname}), None
 
@@ -589,8 +591,14 @@ async def _preview_create_ip_address(
 
         zone_id = await _resolve_effective_zone(db, subnet)
         zone = await db.get(DNSZone, zone_id) if zone_id else None
-        if zone is not None:
-            rtype = "AAAA" if addr_obj.version == 6 else "A"
+        rtype = "AAAA" if addr_obj.version == 6 else "A"
+        if zone is not None and not ipam_authors_zone(zone):
+            # #3833 — IPAM writes records only into a primary zone it serves
+            # (#1633), so the address is created with its fqdn but no record.
+            # Say so rather than promise one the approval will not write.
+            why = unauthored_zone_error(zone, "creat")
+            parts.append(f"no {rtype} record is published ({why})")
+        elif zone is not None:
             # #3647 — the address sync skips a forward record beside a CNAME
             # (#1441), so promising one would be false. Refuse, as the DNS
             # record kind does; the approve re-preview re-runs this, so a

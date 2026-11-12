@@ -667,17 +667,27 @@ export function CircuitsPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => circuitsApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["circuits"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete circuits")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => circuitsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["circuits"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete circuit"));
+      qc.invalidateQueries({ queryKey: ["circuits"] });
+    },
   });
 
   function toggle(id: string) {
@@ -697,6 +707,11 @@ export function CircuitsPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">WAN circuits</h1>
