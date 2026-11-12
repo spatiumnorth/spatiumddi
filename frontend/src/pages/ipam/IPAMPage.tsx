@@ -3536,9 +3536,14 @@ function CollisionWarningBanner({
 export function AddAddressModal({
   subnetId,
   presetRange,
+  nextAvailable = true,
   onClose,
 }: {
   subnetId: string;
+  /** False for a holder the server refuses ``POST /subnets/{id}/next`` to (a
+   * grant scoped to this one subnet, #3902): the dialog opens in Specific IP
+   * and Next available is disabled with the reason. */
+  nextAvailable?: boolean;
   /** When set (e.g. operator clicked a "free range" gap row), the
    * modal opens locked to manual mode with the address pre-filled to
    * the start of the range and a row of quick-pick buttons for first
@@ -3548,7 +3553,7 @@ export function AddAddressModal({
 }) {
   const qc = useQueryClient();
   const [mode, setMode] = useState<"manual" | "next">(
-    presetRange ? "manual" : "next",
+    presetRange || !nextAvailable ? "manual" : "next",
   );
   const [address, setAddress] = useState(
     presetRange ? intToIpv4(presetRange.startIpInt) : "",
@@ -3866,6 +3871,9 @@ export function AddAddressModal({
           {(["next", "manual"] as const).map((m) => (
             <button
               key={m}
+              {...(m === "next" && !nextAvailable
+                ? { disabled: true, title: NEEDS_NEXT_ADDRESS }
+                : {})}
               onClick={() => {
                 // Carry the "next available" IP into the Specific-IP field so
                 // switching modes doesn't drop the operator on an empty input.
@@ -3886,6 +3894,9 @@ export function AddAddressModal({
                 mode === m
                   ? "bg-primary text-primary-foreground border-primary"
                   : "hover:bg-muted",
+                m === "next" &&
+                  !nextAvailable &&
+                  "cursor-not-allowed opacity-50",
               )}
             >
               {m === "next" ? "Next available" : "Specific IP"}
@@ -4656,22 +4667,13 @@ const NEEDS_BLOCK_DNS_SYNC =
   "Requires read permission on IP blocks and IP addresses, and write permission on IP blocks";
 const NEEDS_SPACE_DNS_SYNC =
   "Requires read permission on IP spaces and IP addresses, and write permission on IP spaces";
+const NEEDS_NEXT_ADDRESS =
+  "Requires write permission on subnets, or on an address set in this subnet (a grant on this one subnet allows a specific IP only)";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
 const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 
-// The IPAM router's gate for an address delete and Bulk delete
-// (``DELETE /addresses/{id}``, ``POST /addresses/bulk-delete``): ``delete`` on
-// ``subnet`` at the type level — the subnet owns its addresses
-// (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or any
-// ``delete`` grant on an address set, scoped or not (the ``_ADDRESS_SET_ROUTES``
-// admit, ``has_any_grant_for``). The handler then wants write on the row AND a
-// delete grant covering it: delete on its subnet, or on an address set that
-// contains it. This is the coarse test; a row's own delete is decided by
-// ``permitsDeleteIp`` where the subnet's sets are known.
-// Clean Orphans is not on that allow-list: it takes ``delete`` on ``subnet``.
-// Pre-parsed address-set bounds (BigInt, IPv4 + IPv6), so a per-row
 /** Gate for a block's / space's selection Delete (n) (#3884): delete on
  *  subnets when a subnet is ticked, delete on IP blocks when a block is. */
 function selectionDeleteGateFor(
@@ -4692,6 +4694,17 @@ function selectionDeleteGateFor(
   );
 }
 
+// The IPAM router's gate for an address delete and Bulk delete
+// (``DELETE /addresses/{id}``, ``POST /addresses/bulk-delete``): ``delete`` on
+// ``subnet`` at the type level — the subnet owns its addresses
+// (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or any
+// ``delete`` grant on an address set, scoped or not (the ``_ADDRESS_SET_ROUTES``
+// admit, ``has_any_grant_for``). The handler then wants write on the row AND a
+// delete grant covering it: delete on its subnet, or on an address set that
+// contains it. This is the coarse test; a row's own delete is decided by
+// ``permitsDeleteIp`` where the subnet's sets are known.
+// Clean Orphans is not on that allow-list: it takes ``delete`` on ``subnet``.
+// Pre-parsed address-set bounds (BigInt, IPv4 + IPv6), so a per-row
 // membership test does not re-parse the same strings on every render.
 type SetRanges = {
   contiguous: Array<{ lo: bigint; hi: bigint }>;
@@ -4798,7 +4811,7 @@ function ToolsMenu({
           label: "Bulk allocate…",
           icon: Layers,
           onSelect: onBulkAllocate,
-          ...permissionGate(can.allocate, NEEDS_ADDRESS_WRITE),
+          ...permissionGate(can.allocate, NEEDS_NEXT_ADDRESS),
         },
         {
           key: "clean-orphans",
@@ -5202,8 +5215,13 @@ export function SubnetDetail({
     addressInSetRanges(writableRanges, address);
 
   // The full per-IP write decision used by gray-out + checkbox + menu.
+  // #3902: editing an existing address, bulk edit and the allocation tools are
+  // routes a grant scoped to this one subnet does not reach (only PUT
+  // /subnets/{id} and POST /subnets/{id}/addresses are on its instance list),
+  // so the subnet half is the type-level write, as the server asks.
+  const subnetTypeWritable = perms.can("write", "subnet");
   const permitsWriteIp = (address: string): boolean =>
-    subnetWritable || ipInWritableSet(address);
+    subnetTypeWritable || ipInWritableSet(address);
 
   // The same for removing the row: delete on subnets, or a delete grant on
   // an address set that contains the address (the server asks the same). The
@@ -5244,6 +5262,8 @@ export function SubnetDetail({
   // the type-level ask: the server still refuses them to a scoped holder.
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
+  // Next available, Bulk allocate and Import: not on a scoped grant's list.
+  const canAllocateBulk = subnetTypeWritable || writableSets.length > 0;
   const canScan =
     perms.can("write", "manage_nmap_scans") &&
     perms.can("read", "manage_nmap_scans");
@@ -5961,7 +5981,7 @@ export function SubnetDetail({
             />
             <SubnetImportExportButton
               subnet={subnet}
-              canImport={canAllocate}
+              canImport={canAllocateBulk}
               onCommitted={() => {
                 qc.invalidateQueries({ queryKey: ["addresses"] });
                 qc.invalidateQueries({ queryKey: ["subnets"] });
@@ -5970,7 +5990,7 @@ export function SubnetDetail({
             />
             <ToolsMenu
               can={{
-                allocate: canAllocate,
+                allocate: canAllocateBulk,
                 reshape: canWriteSubnets,
                 scan: canScan,
                 // Clean Orphans takes ``delete`` on ``subnet``: an
@@ -6317,7 +6337,8 @@ export function SubnetDetail({
                 onClick={() => setShowBulkDelete(true)}
                 className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-2.5 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
                 {...permissionGate(
-                  canAllocate && (subnetDeletable || deletableSets.length > 0),
+                  canAllocateBulk &&
+                    (subnetDeletable || deletableSets.length > 0),
                   NEEDS_ADDRESS_DELETE,
                 )}
               >
@@ -7400,6 +7421,7 @@ export function SubnetDetail({
         <AddAddressModal
           subnetId={subnet.id}
           presetRange={addModalRange}
+          nextAvailable={canAllocateBulk}
           onClose={() => {
             setShowAddModal(false);
             setAddModalRange(null);
@@ -14440,6 +14462,14 @@ export function BlockDetailView({
   // at the type level: the bulk edit and the split and merge commits at the
   // router gate, and every handler, the previews included, itself.
   const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
+  // #3884: Delete (n) asks delete on subnets for a ticked subnet and delete
+  // on IP blocks for a ticked block, at the type level, before the approval
+  // gate (the delete handlers' own check).
+  const selectionDeleteGate = selectionDeleteGateFor(
+    perms,
+    selectedSubnetIds.length > 0,
+    hasBlocksSelected,
+  );
   const toggleOne = (key: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -14459,14 +14489,6 @@ export function BlockDetailView({
     { label: spaceName, variant: "space", onClick: onSelectSpace },
     ...ancestors.map(
       (a): BreadcrumbItem => ({
-  // #3884: Delete (n) asks delete on subnets for a ticked subnet and delete
-  // on IP blocks for a ticked block, at the type level, before the approval
-  // gate (the delete handlers' own check).
-  const selectionDeleteGate = selectionDeleteGateFor(
-    perms,
-    selectedSubnetIds.length > 0,
-    hasBlocksSelected,
-  );
         label: a.network + (a.name ? ` (${a.name})` : ""),
         variant: "block",
         onClick: () => onSelectBlock(a),
@@ -14524,6 +14546,7 @@ export function BlockDetailView({
                     setBulkDeleteKeys([...selected]);
                     setShowBulkDelete(true);
                   }}
+                  {...selectionDeleteGate}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -14543,7 +14566,6 @@ export function BlockDetailView({
                   >
                     Sync DNS
                   </HeaderButton>
-                  {...selectionDeleteGate}
                 )}
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
                 <ServicesUsingButton
@@ -15937,6 +15959,12 @@ export function SpaceTableView({
   // #3384: Bulk Edit, Split… and Merge… ask write on subnets at the type
   // level, as on a block's selection.
   const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
+  // #3884: Delete (n), as on a block's selection.
+  const selectionDeleteGate = selectionDeleteGateFor(
+    perms,
+    selectedSubnetIds.length > 0,
+    hasBlocksSelected,
+  );
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -15956,12 +15984,6 @@ export function SpaceTableView({
         if (item.type === "subnet" && item.subnet) {
           const s = item.subnet;
           if (spaceFilter.network && !s.network.includes(spaceFilter.network))
-  // #3884: Delete (n), as on a block's selection.
-  const selectionDeleteGate = selectionDeleteGateFor(
-    perms,
-    selectedSubnetIds.length > 0,
-    hasBlocksSelected,
-  );
             return false;
           if (
             spaceFilter.name &&
@@ -16059,6 +16081,7 @@ export function SpaceTableView({
                     setBulkDeleteKeys([...selected]);
                     setShowBulkDelete(true);
                   }}
+                  {...selectionDeleteGate}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -16078,7 +16101,6 @@ export function SpaceTableView({
             {/* Add block is a primary space-level structural action (blocks are
                 the top-level child of a space), so it sits as a visible button
                 next to Add Subnet rather than hidden in a Tools ▾ dropdown
-                  {...selectionDeleteGate}
                 (#538). Find Free is a low-frequency read; promoted out too so we
                 don't leave a single-item dropdown. Ordering grammar per #465. */}
             <HeaderButton
