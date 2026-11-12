@@ -3542,6 +3542,17 @@ function RecordModalForm({
     queryKey: ["dns-views", groupId],
     queryFn: () => dnsApi.listViews(groupId),
   });
+  // #3944 — a zone pinned to one view renders into that view alone, and the
+  // record API refuses a record scoped to any other, so the field offers the
+  // pin and the unscoped default only.
+  const { data: groupZones = [] } = useQuery({
+    queryKey: ["dns-zones", groupId],
+    queryFn: () => dnsApi.listZones(groupId),
+  });
+  const pinViewId = groupZones.find((z) => z.id === zoneId)?.view_id ?? null;
+  const viewChoices = pinViewId
+    ? views.filter((v) => v.id === pinViewId || v.id === viewId)
+    : views;
 
   // SRV carries priority + weight + port (RFC 2782); MX carries only a
   // priority (the preference). Everything else carries none. (#424)
@@ -3848,12 +3859,18 @@ function RecordModalForm({
             onChange={(e) => setViewId(e.target.value)}
           >
             <option value="">All views (default)</option>
-            {views.map((v) => (
+            {viewChoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
+          {pinViewId && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              This zone is pinned to one view, so its records can only be in
+              that view.
+            </p>
+          )}
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
