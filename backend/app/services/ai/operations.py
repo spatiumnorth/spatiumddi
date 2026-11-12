@@ -930,7 +930,9 @@ async def _apply_create_ip_address(
         db,
         user=user,
         action="create",
-        resource_type="ipam.ip_address",
+        # Bare RBAC type: event_publisher + the compliance change alert key
+        # on "ip_address"; a namespaced string silences both (#3936).
+        resource_type="ip_address",
         resource_id=str(row.id),
         resource_display=str(args.address),
         new_value={
@@ -3069,7 +3071,8 @@ async def _apply_create_dns_record(
         db,
         user=user,
         action="create",
-        resource_type="dns.record",
+        # Bare type, as the REST create audits — keys ``dns.record.created`` (#3936).
+        resource_type="dns_record",
         resource_id=str(row.id),
         resource_display=f"{name} {rtype} {args.value}",
         new_value={
@@ -3838,7 +3841,8 @@ async def _apply_create_dhcp_static(
         db,
         user=user,
         action="create",
-        resource_type="dhcp.static_assignment",
+        # Bare type, as the REST create audits — keys ``dhcp.static.created`` (#3936).
+        resource_type="dhcp_static_assignment",
         resource_id=str(row.id),
         resource_display=f"{args.ip_address} ({args.mac_address})",
         new_value={
