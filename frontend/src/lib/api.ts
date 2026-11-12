@@ -1277,6 +1277,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
