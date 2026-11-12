@@ -1188,17 +1188,27 @@ export function ServicesPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => servicesApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["services"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete services")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => servicesApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["services"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete service"));
+      qc.invalidateQueries({ queryKey: ["services"] });
+    },
   });
 
   function toggle(id: string) {
@@ -1225,6 +1235,11 @@ export function ServicesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Services</h1>
