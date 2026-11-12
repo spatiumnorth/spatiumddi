@@ -815,9 +815,16 @@ export function CertificatesPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => tlsCertsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete TLS cert target"));
+      qc.invalidateQueries({ queryKey: ["tls-certs"] });
+    },
   });
 
   if (ready && !moduleOn) {
@@ -832,6 +839,11 @@ export function CertificatesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="flex items-center gap-2 text-xl font-semibold">

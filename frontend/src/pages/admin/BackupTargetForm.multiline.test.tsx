@@ -284,9 +284,13 @@ describe("backup target form keeps line breaks (#2199)", () => {
     });
     fireEvent.submit(container.querySelector("form")!);
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    const body = update.mock.calls[0][1] as { config: Record<string, string> };
-    expect(body.config.private_key).toBe("");
-    expect(body.config.known_hosts).toBe(KNOWN_HOSTS);
+    // #3947: an untouched setting is not sent; the API keeps the stored
+    // secret and lines.
+    const body = update.mock.calls[0][1] as {
+      config?: Record<string, string>;
+    };
+    expect(body.config?.private_key).toBeUndefined();
+    expect(body.config?.known_hosts).toBeUndefined();
   });
 
   it("Replace from file sends the new value; Clear goes back to keeping (#3643)", async () => {
@@ -312,7 +316,9 @@ describe("backup target form keeps line breaks (#2199)", () => {
     await screen.findByText(/Set — stored encrypted/);
     fireEvent.submit(container.querySelector("form")!);
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    const body = update.mock.calls[0][1] as { config: Record<string, string> };
-    expect(body.config.private_key).toBe("");
+    const body = update.mock.calls[0][1] as {
+      config?: Record<string, string>;
+    };
+    expect(body.config?.private_key).toBeUndefined();
   });
 });

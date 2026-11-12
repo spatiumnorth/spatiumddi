@@ -662,7 +662,7 @@ async def update_target(
         secret_names = set(secret_field_names(driver))
         for key in sorted(set(before_config) | set(after_config)):
             a, b = before_config.get(key), after_config.get(key)
-            if (a or None) == (b or None):
+            if _reads_as(a) == _reads_as(b):
                 continue
             if key in secret_names and a and b and a != b:
                 # Re-wrapping an unchanged secret yields fresh ciphertext;
@@ -713,6 +713,17 @@ async def update_target(
     await db.commit()
     await db.refresh(row)
     return _to_response(row)
+
+
+def _reads_as(value: Any) -> str | None:
+    """A config value as it reads, for the audit diff (#3947): unset is
+    None, and a number reads as its text, so ``21`` and ``"21"`` are one
+    setting."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
 @router.delete("/{target_id}", status_code=204)
