@@ -819,7 +819,19 @@ async def assemble_move_plan(
             plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
 
     _fill_warnings(plan)
-    plan.warnings.extend((await shared_provider_sources(db, zone.group_id, target_group.id)).notes)
+    shared = await shared_provider_sources(db, zone.group_id, target_group.id)
+    # The commit also keeps the source copy for a third group's (or a sibling
+    # view's) zone of the same name (#3812); say so here instead of promising
+    # a delete (#3896).
+    others = await shared_zone_copy_servers(db, zone, group_id=zone.group_id)
+    notes = list(shared.notes)
+    if others.keep_ids:
+        by_id = {s_.id: s_.name for s_ in await _agentless_servers(db, zone.group_id)}
+        for sid in others.keep_ids:
+            name = by_id.get(sid)
+            notes = [n for n in notes if not n.startswith(f"Source copy on '{name}' is deleted")]
+    plan.warnings.extend(notes)
+    plan.warnings.extend(n for n in others.notes if n not in plan.warnings)
     return plan
 
 
