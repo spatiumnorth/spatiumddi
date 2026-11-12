@@ -3657,6 +3657,9 @@ export function AddAddressModal({
     enabled: mode === "next",
     refetchOnMount: "always",
     staleTime: 0,
+    // The dialog mounts afresh on every open: a kept copy would offer the
+    // address the last open just allocated until the re-read answers (#3866).
+    gcTime: 0,
   });
 
   const { data: cfDefs = [] } = useQuery({
