@@ -8,10 +8,17 @@
       "type": "object",
       "properties": {
         "repository": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "tag": {
-          "type": "string"
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
         }
       }
     },
@@ -22,10 +29,16 @@
       "type": "object"
     },
     "fullnameOverride": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "nameOverride": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "auth": {
       "type": "object"
@@ -34,7 +47,10 @@
       "type": "array"
     },
     "applianceVersion": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "api": {
       "type": "object",
