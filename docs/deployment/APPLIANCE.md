@@ -1463,6 +1463,8 @@ on 22); everything else is advisory (`nft -c -f` on the host is the final
 authority), and the lint runs delta-only so pre-existing values are
 grandfathered.
 
+**SNMP and `firewall_extra` (#3819).** UDP 161 is accepted only from the sources in `snmp_allowed_sources` (Fleet → Services → SNMP). `firewall_extra` lands in the same input chain, whose policy is drop, and the SNMP rule only ever accepts. So a `firewall_extra` rule that accepts UDP 161 **adds** its sources to the allowed list rather than being narrowed by it. If you scope SNMP to a list, remove any older custom accept for port 161. IPv6 sources work: snmpd listens on all IPv6 addresses (`udp6:161`) whenever the list holds an IPv6 prefix or is empty, and stays on `::1` for an IPv4-only list (#3813).
+
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
 LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
