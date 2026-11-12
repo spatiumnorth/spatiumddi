@@ -270,7 +270,7 @@ from app.services.dns.zone_move import (
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
-from app.services.dns.zone_synthesis import synthesised_zone_error
+from app.services.dns.zone_synthesis import synthesised_zone_error, unauthored_zone_error
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -7423,18 +7423,15 @@ async def _push_windows_dynamic_update(
     return warnings
 
 
-async def _replace_update_acl_rows(
+async def _validate_update_acl_body(
     db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
 ) -> tuple[list[str], list[str]]:
-    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+    """Validate a full-replace ACL payload without writing (#3738).
 
-    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
-    apply. Verifies every referenced TSIG key belongs to the group, runs
-    the driver capability gate (raising ``HTTPException(422)`` on a
-    hard-unsupported entry), then drops + re-inserts the ordered set and
-    optionally flips ``dynamic_update_enabled``. Returns
-    ``(driver_names, warnings)``; the caller writes the audit row +
-    commits.
+    Verifies every referenced TSIG key belongs to the group and runs the
+    driver capability gate (422 on a hard-unsupported entry). Returns
+    ``(driver_names, warnings)``. Run before the no-op shortcut so an
+    unchanged save is refused exactly as it was before.
     """
     driver_names = await _group_driver_names(db, group_id)
 
@@ -7481,6 +7478,21 @@ async def _replace_update_acl_rows(
                 status_code=422,
                 detail={"code": "DYNAMIC_UPDATE_UNSUPPORTED", "message": str(exc)},
             ) from exc
+    return driver_names, warnings
+
+
+async def _replace_update_acl_rows(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+) -> tuple[list[str], list[str]]:
+    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+
+    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
+    apply. Validates (see ``_validate_update_acl_body``), then drops +
+    re-inserts the ordered set and optionally flips
+    ``dynamic_update_enabled``. Returns ``(driver_names, warnings)``; the
+    caller writes the audit row + commits.
+    """
+    driver_names, warnings = await _validate_update_acl_body(db, group_id, zone, body)
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
@@ -7538,6 +7550,39 @@ async def replace_zone_update_acl(
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
     await _lock_acl_and_check_version(db, zone, body.expected_version)
+
+    # #3738 — audit only what changed; a save that changes nothing writes no
+    # audit row, no wake and no Windows push, and answers with the stored state.
+    await _validate_update_acl_body(db, group_id, zone, body)
+    old_entries = await _load_acl_out(db, zone.id)
+
+    # Entry order is meaningful (seq = first-match order in update-policy),
+    # so entries compare as an ordered list; only record_types is a set.
+    def _canon(rows: Any) -> list[Any]:
+        return [
+            (
+                r.action,
+                r.match_kind,
+                r.ip_cidr,
+                str(r.tsig_key_id) if r.tsig_key_id else None,
+                r.name_scope,
+                r.name_pattern,
+                sorted(r.record_types) if r.record_types else None,
+            )
+            for r in rows
+        ]
+
+    changed_fields: list[str] = []
+    if _canon(old_entries) != _canon(body.entries):
+        changed_fields.append("update_acl")
+    if (
+        body.dynamic_update_enabled is not None
+        and body.dynamic_update_enabled != zone.dynamic_update_enabled
+    ):
+        changed_fields.append("dynamic_update_enabled")
+    if not changed_fields:
+        return await get_zone_update_acl(group_id, zone_id, db, current_user)
+
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
     db.add(
@@ -7549,7 +7594,7 @@ async def replace_zone_update_acl(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=f"{zone.name} dynamic-update ACL",
-            changed_fields=["update_acl", "dynamic_update_enabled"],
+            changed_fields=changed_fields,
             result="success",
         )
     )
@@ -9737,6 +9782,22 @@ async def _enforce_no_records_in_other_view(db: DB, zone_id: uuid.UUID, pin: uui
     )
 
 
+def _zone_pin_view_error(zone: DNSZone, view_ids: Iterable[uuid.UUID | None]) -> str | None:
+    """The refusal for a record view a pinned zone never serves, else None.
+
+    A pinned zone renders into its pin alone, so a record scoped to any other
+    view is served nowhere (#3839). The one rule behind the record API, the
+    zone-file import and the spreadsheet import (#3942).
+    """
+    wanted = {v for v in view_ids if v is not None}
+    if zone.view_id is not None and wanted and wanted != {zone.view_id}:
+        return (
+            "view_id differs from the view this zone is pinned to, so the "
+            "record would never be rendered"
+        )
+    return None
+
+
 async def _enforce_views_in_zone_group(
     db: DB, zone: DNSZone, view_ids: Iterable[uuid.UUID | None]
 ) -> None:
@@ -9765,14 +9826,9 @@ async def _enforce_views_in_zone_group(
             status_code=422,
             detail="view_id does not name a view in this zone's server group",
         )
-    if zone.view_id is not None and wanted != {zone.view_id}:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "view_id differs from the view this zone is pinned to, so the "
-                "record would never be rendered"
-            ),
-        )
+    pin_error = _zone_pin_view_error(zone, wanted)
+    if pin_error is not None:
+        raise HTTPException(status_code=422, detail=pin_error)
 
 
 @router.post(
@@ -9790,6 +9846,7 @@ async def create_record(
     zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
     await _require_superadmin_for_lua(
         db, current_user, [body.record_type], what="create a LUA record"
     )
@@ -9908,6 +9965,8 @@ async def update_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
+    if zone is not None:
+        _reject_if_unauthored_zone(zone, "edit")
     # #1563 — explicit null clears view_id and ttl (ttl null = inherit
     # the zone TTL; exclude_none dropped both, so the clear never
     # landed); null for a NOT NULL column is a 422.
@@ -10519,6 +10578,7 @@ async def bulk_create_records(
     zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
 
     await _require_superadmin_for_lua(
         db, current_user, [r.record_type for r in body.records], what="create a LUA record"
@@ -10980,6 +11040,8 @@ async def import_zone_preview(
     Non-mutating: this endpoint never writes to the database.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3838 — preview and commit agree: the commit refuses this zone.
+    _reject_if_unauthored_zone(zone, "import")
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11046,6 +11108,7 @@ async def import_zone_commit(
     # the deleted row (a 500). With a view, its record edits went out before
     # the bump and could deadlock with a delete that took the zone row first.
     zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    _reject_if_unauthored_zone(zone, "import")  # #3838, before any parsing
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -11533,6 +11596,12 @@ def _sheet_row_validator(
         if row.value is None:
             return "value is required"
         name = row.name if row.name is not None else target.name  # type: ignore[union-attr]
+        # #3942 — the record API's pin rule; a row that leaves an existing
+        # record's view as it is is not re-judged.
+        if target is None or target.view_id != view_id:
+            pin_error = _zone_pin_view_error(zone, [view_id])
+            if pin_error is not None:
+                return pin_error
         # A trailing dot makes a name absolute, as in a zone file: it must sit
         # in this zone, and is stored relative. Without it the name is relative
         # to the zone, as on the record API. (The record API strips a trailing
@@ -11709,6 +11778,7 @@ async def import_zone_spreadsheet_preview(
     for the columns and the match rule.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    _reject_if_unauthored_zone(zone, "import")  # #3838, as the commit
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     return SheetImportPreviewResponse(
         zone_id=zone.id,
@@ -11786,6 +11856,7 @@ async def import_zone_spreadsheet_commit(
             ),
         )
     _reject_if_synthesised_zone(zone, "import")
+    _reject_if_unauthored_zone(zone, "import")
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     if plan.errors:
         raise HTTPException(
@@ -12344,6 +12415,13 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
     the operator can manage the zone manually.
     """
     msg = synthesised_zone_error(zone, op)
+    if msg is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
+
+
+def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
+    """Refuse a record write into a secondary, stub or forward zone (#3838)."""
+    msg = unauthored_zone_error(zone, op)
     if msg is not None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 

@@ -244,7 +244,10 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     page's permanent delete goes through the same helper and fails the same
     way (#1830).
     """
-    from app.services.dns.reverse_zone import hand_over_zone_to_trashed_sharer  # noqa: PLC0415
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        hand_over_zone_to_trashed_sharer,
+        trashed_sharers,
+    )
     from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
@@ -295,6 +298,19 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
                             },
                             result="success",
                         )
+                    )
+                    continue
+                # #3889 — an expired zone the operator made (not handed over above)
+                # still holding another trashed subnet's records is kept until that
+                # subnet is purged or restored: its FK cascade would take them.
+                held_by = [] if zone.is_auto_generated else await trashed_sharers(db, zone)
+                if held_by:
+                    logger.info(
+                        "trash_purge.zone_held_for_trashed_subnet",
+                        zone=zone_name,
+                        zone_id=str(zone_id),
+                        subnets=[str(s.network) for s in held_by],
+                        hint="kept until those subnets leave the Trash",
                     )
                     continue
                 kept = await purge_trashed_zone(db, zone)

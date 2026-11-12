@@ -179,6 +179,7 @@ function ProviderEditorModal({
             <select
               className={inputCls}
               value={defaultAsnId}
+              aria-label="Default ASN"
               onChange={(e) => setDefaultAsnId(e.target.value)}
               disabled={asnsQuery.isLoading || !canReadAsns}
               title={

@@ -2656,6 +2656,7 @@ function DnssecCard({
                 value={policyId}
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
+                aria-label="DNSSEC signing policy"
                 title="DNSSEC signing policy (BIND9)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
@@ -4517,6 +4518,14 @@ export function ZoneDetailView({
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
 
+  // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
+  // stub's data is its masters', so the server refuses a record written into
+  // it (422); the record entry points say so instead of failing on submit.
+  const unauthoredReason =
+    !isForward && zone.zone_type !== "primary" && zone.zone_type !== "master"
+      ? `This is a ${zone.zone_type} zone: its records come from its masters, so none can be added here.`
+      : undefined;
+
   // #996 — the Add Record keycap, rendered from lib/shortcuts.ts rather
   // than typed here, so retuning the binding moves the handler below,
   // this tooltip and the ``?`` overlay together.
@@ -4539,7 +4548,13 @@ export function ZoneDetailView({
     // #2529 — the keyboard path must honour the same grant as the button.
     // The ? sheet lists the key under ADD_DNS_RECORD.requires, which must
     // name this same grant (#3167).
-    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
+    if (
+      isForward ||
+      unauthoredReason ||
+      zone.tailscale_tenant_id ||
+      !canWriteRecords
+    )
+      return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4550,7 +4565,13 @@ export function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
+  }, [
+    isForward,
+    unauthoredReason,
+    zone.tailscale_tenant_id,
+    showAddRecord,
+    canWriteRecords,
+  ]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
@@ -4784,6 +4805,9 @@ export function ZoneDetailView({
                       label: "Import zone file",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
                       ...permissionGate(
                         can("write", "dns_record"),
                         NEEDS_RECORD_WRITE,
@@ -4802,6 +4826,9 @@ export function ZoneDetailView({
                       onSelect: () => setShowSheetImport(true),
                       title:
                         "Bulk-edit records from a spreadsheet: preview the adds, changes and deletes, then import",
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
                       ...permissionGate(
                         can("write", "dns_record"),
                         NEEDS_RECORD_WRITE,
@@ -4923,11 +4950,12 @@ export function ZoneDetailView({
               variant="primary"
               icon={Plus}
               onClick={() => setShowAddRecord(true)}
-              disabled={!!zone.tailscale_tenant_id}
+              disabled={!!zone.tailscale_tenant_id || !!unauthoredReason}
               title={
                 zone.tailscale_tenant_id
                   ? "Records are managed by the Tailscale reconciler."
-                  : `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`
+                  : (unauthoredReason ??
+                    `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`)
               }
               {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
             >
@@ -7032,10 +7060,20 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
       );
       return;
     }
+    // A cleared Order is refused, never saved as 0 (#3740): 0 sorts the view
+    // ahead of every view ordered 1 and up, and the operator never saw it.
+    const orderText = order.trim();
+    const orderNum = Number(orderText);
+    if (orderText === "" || !Number.isInteger(orderNum) || orderNum < 0) {
+      setError(
+        "Order is required: a whole number, 0 or higher. Views are evaluated lowest first.",
+      );
+      return;
+    }
     const body = {
       name: name.trim(),
       description: description.trim(),
-      order: Number(order) || 0,
+      order: orderNum,
       recursion,
       match_clients: clients,
       match_destinations: lines(matchDestinations),
@@ -7084,8 +7122,11 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
             <input
               className={inputCls}
               type="number"
+              min={0}
+              step={1}
               value={order}
               onChange={(e) => setOrder(e.target.value)}
+              placeholder="0"
             />
           </Field>
           <Field label="Recursion">
@@ -7100,9 +7141,9 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </Field>
         </div>
         <p className="-mt-1 text-[11px] text-muted-foreground">
-          Views are evaluated low order first, and a client is served by the
-          first view it matches — so put the most specific view above the
-          catch-all.
+          Order is a whole number, 0 or higher; lower is evaluated first. Views
+          are evaluated low order first, and a client is served by the first
+          view it matches — so put the most specific view above the catch-all.
         </p>
 
         <Field label="Description">
@@ -12120,6 +12161,7 @@ export function BlocklistDetail({
                           value: ev.target.checked,
                         })
                       }
+                      aria-label={`Also block subdomains of ${e.domain}`}
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."

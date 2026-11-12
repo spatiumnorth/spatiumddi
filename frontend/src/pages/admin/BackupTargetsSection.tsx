@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -998,13 +998,9 @@ function TargetFormModal({
                   <MultilineConfigField
                     name={f.name}
                     masked={f.type === "password" || f.secret}
+                    stored={isSecretStored}
                     value={config[f.name] ?? ""}
                     onChange={(v) => setConfig({ ...config, [f.name]: v })}
-                    placeholder={
-                      isSecretStored
-                        ? "(set — leave empty to keep, type to replace)"
-                        : undefined
-                    }
                   />
                 ) : (
                   <input
@@ -1314,64 +1310,98 @@ function Field({
 }
 
 /**
- * A config value made of lines. A secret one is masked until the operator
- * asks to see it — a textarea has no ``type="password"``, so the mask is
- * ``-webkit-text-security`` (Chromium, Safari, and Firefox since 114).
- * While masked it also behaves like a password input in the ways CSS
- * cannot: copy, cut and drag out are refused, and password managers are
- * told to leave it alone. The value itself is never touched: whatever is
- * typed or pasted, line breaks included, is what the form sends.
+ * A config value made of lines. A secret one (PEM key, service-account JSON)
+ * is never placed in a text control (#3643): a CSS mask leaves the clear text
+ * in the DOM and the accessibility tree, and in form history / spellcheck.
+ * It is taken from a file picker or the clipboard straight into state and the
+ * page shows only a status line (line count) with Replace / Clear actions. A
+ * stored secret is write-only: the API returns a sentinel, shown as "Set".
+ * The value is sent byte for byte, line breaks included. A non-secret
+ * multi-line value (known_hosts, headers) stays an ordinary textarea.
  */
 function MultilineConfigField({
   name,
   masked,
+  stored,
   value,
   onChange,
-  placeholder,
 }: {
   name: string;
   masked: boolean;
+  stored: boolean;
   value: string;
   onChange: (v: string) => void;
-  placeholder?: string;
 }) {
-  const [revealed, setRevealed] = useState(false);
-  const hidden = masked && !revealed;
-  return (
-    <div className="space-y-1">
+  const [err, setErr] = useState<string | null>(null);
+  if (!masked) {
+    return (
       <textarea
         name={name}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        rows={masked ? 6 : 4}
+        rows={4}
         spellCheck={false}
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"
         wrap="off"
-        data-masked={hidden ? "true" : "false"}
-        data-lpignore="true"
-        data-1p-ignore="true"
-        data-bwignore="true"
-        onCopy={hidden ? (e) => e.preventDefault() : undefined}
-        onCut={hidden ? (e) => e.preventDefault() : undefined}
-        onDragStart={hidden ? (e) => e.preventDefault() : undefined}
-        style={
-          hidden ? ({ WebkitTextSecurity: "disc" } as CSSProperties) : undefined
-        }
         className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
       />
-      {masked && (
+    );
+  }
+  const lines = value ? value.split("\n").length : 0;
+  const btn =
+    "rounded-md border px-2 py-1 text-xs hover:bg-muted focus:outline-none focus:ring-2 focus:ring-ring";
+  return (
+    <div className="space-y-1" data-secret-field={name}>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="text-muted-foreground" role="status">
+          {value
+            ? `New value ready (${lines} line${lines === 1 ? "" : "s"}, hidden)`
+            : stored
+              ? "Set — stored encrypted, never shown"
+              : "Not set"}
+        </span>
+        <label className={`${btn} cursor-pointer`}>
+          {value || stored ? "Replace from file…" : "Choose file…"}
+          <input
+            type="file"
+            data-secret-file={name}
+            className="sr-only"
+            onChange={async (e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (!f) return;
+              try {
+                onChange(await f.text());
+                setErr(null);
+              } catch {
+                setErr("Could not read that file.");
+              }
+            }}
+          />
+        </label>
         <button
           type="button"
-          onClick={() => setRevealed((r) => !r)}
-          aria-pressed={revealed}
-          className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+          className={btn}
+          onClick={async () => {
+            try {
+              onChange(await navigator.clipboard.readText());
+              setErr(null);
+            } catch {
+              setErr("Clipboard access was refused; use a file instead.");
+            }
+          }}
         >
-          {revealed ? "Hide" : "Show"}
+          Paste from clipboard
         </button>
-      )}
+        {value && (
+          <button type="button" className={btn} onClick={() => onChange("")}>
+            Clear
+          </button>
+        )}
+      </div>
+      {err && <p className="text-[11px] text-destructive">{err}</p>}
     </div>
   );
 }
