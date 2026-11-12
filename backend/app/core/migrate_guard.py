@@ -9,13 +9,18 @@ nothing in the stack ends such a session: ``lock_timeout`` and
 is ~2 h 11 min. The charts and the compose file now set the server-side
 backstops; this module is the migrate command's own half:
 
-* :func:`terminate_stale_idle_sessions` ends the sessions that are provably
-  abandoned, before the first ``ALTER``;
 * :func:`apply_lock_timeout` makes every lock wait finish, so a blocked
-  migration fails fast (``55P03``) instead of waiting silently;
-* :func:`blocker_report` says who is probably holding the lock, and
-  ``env.py`` retries a bounded number of times, re-running the reaper (a
-  session's idle age only grows) with a backoff.
+  revision gives up its place in the lock queue (``55P03``) instead of
+  waiting silently with every other query on that table queued behind it;
+* after each timed-out wait, :func:`blocker_report` says who is probably
+  holding the lock and :func:`terminate_stale_idle_sessions` ends the
+  sessions that are provably abandoned (never before a wait has timed out,
+  so a healthy upgrade ends nothing);
+* ``env.py`` then retries the revision after a backoff, by default without
+  limit: a migration blocked by a LEGITIMATE long holder (a ``pg_dump``
+  backup holds ACCESS SHARE on every table for its whole run) waited and
+  then succeeded before #3932, and must still do so. A failed migrate Job
+  means an api that never starts, which is worse than a slow one.
 
 Every knob is an environment variable so an operator can retune a single
 migrate run without a new image. All of this is a no-op safety net for a
@@ -39,7 +44,9 @@ LOCK_RETRIES_ENV = "MIGRATION_LOCK_RETRIES"
 STALE_IDLE_ENV = "MIGRATION_STALE_IDLE_TXN_SECONDS"
 
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30
-DEFAULT_LOCK_RETRIES = 10
+# None = retry until the lock is granted (see the module docstring); an
+# operator can bound it with MIGRATION_LOCK_RETRIES.
+DEFAULT_LOCK_RETRIES: int | None = None
 # Longer than any legitimate pause inside one request, shorter than a human
 # notices a stuck upgrade. 0 disables the reaper.
 DEFAULT_STALE_IDLE_SECONDS = 300
@@ -64,8 +71,21 @@ def lock_timeout_seconds() -> int:
     return _int_env(LOCK_TIMEOUT_ENV, DEFAULT_LOCK_TIMEOUT_SECONDS)
 
 
-def lock_retries() -> int:
-    return _int_env(LOCK_RETRIES_ENV, DEFAULT_LOCK_RETRIES)
+def lock_retries() -> int | None:
+    """Retries after a timed-out lock wait; ``None`` means unlimited.
+
+    Unset, empty or negative is unlimited; ``0`` gives up on the first
+    timeout.
+    """
+    raw = os.environ.get(LOCK_RETRIES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_LOCK_RETRIES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("migrate_guard_bad_env", name=LOCK_RETRIES_ENV, value=raw, using="unlimited")
+        return DEFAULT_LOCK_RETRIES
+    return None if value < 0 else value
 
 
 def stale_idle_seconds() -> int:
@@ -123,7 +143,12 @@ def terminate_stale_idle_sessions(
       management roles are never touched;
     * ``state_change`` older than the threshold, so a transaction a live
       request is between two statements of is left alone;
+    * holding a granted relation lock, since a transaction that holds none
+      cannot be what the migration waits on;
     * never the migrator's own backend.
+
+    ``env.py`` calls it only after a lock wait has timed out, so an upgrade
+    that is not blocked ends nothing at all.
 
     Each victim is logged (pid, application, age, last query) before the
     result is returned.
@@ -144,6 +169,9 @@ def terminate_stale_idle_sessions(
                    AND pid <> pg_backend_pid()
                    AND state = 'idle in transaction'
                    AND state_change < now() - make_interval(secs => :threshold)
+                   AND EXISTS (SELECT 1 FROM pg_locks l
+                                WHERE l.pid = pg_stat_activity.pid AND l.granted
+                                  AND l.locktype = 'relation')
                 """),
             {"threshold": threshold},
         )
@@ -190,7 +218,7 @@ def blocker_report(connection: Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def log_blockers(blockers: list[dict[str, Any]], *, attempt: int, retries: int) -> None:
+def log_blockers(blockers: list[dict[str, Any]], *, attempt: int, retries: int | None) -> None:
     if not blockers:
         logger.warning(
             "migration waiting on a lock; no other open transaction found",

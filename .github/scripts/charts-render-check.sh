@@ -981,14 +981,14 @@ python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster \
 # the idle-in-transaction timeout and the TCP keepalives, and a CNPG change of
 # these is a reload (they are not restart-only parameters).
 echo "── Postgres drops dead-client sessions: idle_in_transaction_session_timeout + keepalives (#3932)"
-for want in 'idle_in_transaction_session_timeout: 15min' 'tcp_keepalives_idle: "60"' \
+for want in 'idle_in_transaction_session_timeout: 1h' 'tcp_keepalives_idle: "60"' \
         'tcp_keepalives_interval: "10"' 'tcp_keepalives_count: "6"'; do
     if ! grep -qF "      $want" "$OUT/umbrella-ha.yaml"; then
         echo "   FAIL: the CNPG Cluster render lacks: $want" >&2
         failures=$((failures + 1))
     fi
 done
-for want in 'idle_in_transaction_session_timeout=15min' 'tcp_keepalives_idle=60' \
+for want in 'idle_in_transaction_session_timeout=1h' 'tcp_keepalives_idle=60' \
         'tcp_keepalives_interval=10' 'tcp_keepalives_count=6'; do
     if ! grep -qF -- "- $want" "$OUT/umbrella-defaults.yaml"; then
         echo "   FAIL: the standalone Postgres render lacks: $want" >&2

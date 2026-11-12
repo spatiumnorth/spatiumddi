@@ -5,12 +5,14 @@ migration's ``ALTER TABLE`` for 2 h+, with every pod waiting on it. These run
 the REAL ``alembic/env.py`` against a throwaway database with a real second
 connection holding a real lock:
 
-* the pre-step ends only a stale ``idle in transaction`` session of the
-  migrator's own role, and leaves a young one, a plain idle one and another
-  role's alone;
+* after a timed-out lock wait, the reaper ends only a stale ``idle in
+  transaction`` session of the migrator's own role, and leaves a young one, a
+  plain idle one and another role's alone;
+* an upgrade that is never blocked ends nothing, however stale;
 * with the reaper off, ``lock_timeout`` turns the silent wait into a logged
-  retry that succeeds once the blocker goes, and into an error when it never
-  does.
+  retry that succeeds once the blocker goes, without limit by default (a
+  legitimate long holder, a backup's pg_dump, must be waited out as before),
+  and into an error only when the operator bounded the retries.
 """
 
 from __future__ import annotations
@@ -116,8 +118,11 @@ async def test_reaper_ends_only_stale_idle_in_transaction_sessions_of_the_migrat
     rig, monkeypatch
 ) -> None:
     cfg, raw_url, maintenance_url = rig
-    monkeypatch.setenv(migrate_guard.STALE_IDLE_ENV, "1")
-    monkeypatch.setenv(migrate_guard.LOCK_TIMEOUT_ENV, "60")
+    # The young session must still be under the threshold after the 1 s lock
+    # wait that has to time out before the reaper runs.
+    monkeypatch.setenv(migrate_guard.STALE_IDLE_ENV, "3")
+    monkeypatch.setenv(migrate_guard.LOCK_TIMEOUT_ENV, "1")
+    monkeypatch.setattr(migrate_guard, "backoff_seconds", lambda attempt: 0.1)
 
     stale = await asyncpg.connect(raw_url)  # the dead api pod's session
     young = await asyncpg.connect(raw_url)
@@ -150,7 +155,7 @@ async def test_reaper_ends_only_stale_idle_in_transaction_sessions_of_the_migrat
             other_pid = await other_role.fetchval("SELECT pg_backend_pid()")
             # Backdate nothing: it just has to be as old as the stale one.
         plain_pid = await plain_idle.fetchval("SELECT pg_backend_pid()")
-        await asyncio.sleep(1.6)  # stale + other_role are now older than 1 s
+        await asyncio.sleep(3.6)  # stale + other_role are now older than 3 s
         await young.execute("BEGIN")
         await young.fetch("SELECT * FROM mg_other")
         young_pid = await young.fetchval("SELECT pg_backend_pid()")
@@ -233,6 +238,73 @@ async def test_lock_timeout_gives_up_after_the_bounded_retries(rig, monkeypatch)
         assert migrate_guard.is_lock_timeout(outcome.get("error")), repr(outcome.get("error"))
     finally:
         await holder.close()
+
+
+async def test_an_unblocked_upgrade_ends_no_session_however_stale(rig, monkeypatch) -> None:
+    """The reaper is reactive: nothing is ended unless a lock wait timed out."""
+    cfg, raw_url, _ = rig
+    monkeypatch.setenv(migrate_guard.STALE_IDLE_ENV, "1")
+    monkeypatch.setenv(migrate_guard.LOCK_TIMEOUT_ENV, "1")
+
+    stale = await asyncpg.connect(raw_url)  # e.g. a backup session, not in the way
+    watch = await asyncpg.connect(raw_url)
+    try:
+        await stale.execute("BEGIN")
+        await stale.fetch("SELECT * FROM mg_other")  # a lock the ALTER does not need
+        stale_pid = await stale.fetchval("SELECT pg_backend_pid()")
+        await asyncio.sleep(1.6)
+        t, outcome = _start_upgrade(cfg)
+        await asyncio.to_thread(t.join, 60)
+        assert not t.is_alive() and "error" not in outcome, repr(outcome.get("error"))
+        assert await watch.fetchval("SELECT version_num FROM alembic_version") == "mg1"
+        assert await _alive(watch, stale_pid), "a session that blocked nothing was ended"
+    finally:
+        await stale.close()
+        await watch.close()
+
+
+async def test_retries_are_unlimited_by_default(rig, monkeypatch) -> None:
+    """A legitimate long holder (a backup's pg_dump) is waited out, as it was
+    before #3932, rather than failing the migrate Job and stranding the api."""
+    cfg, raw_url, _ = rig
+    monkeypatch.setenv(migrate_guard.STALE_IDLE_ENV, "0")
+    monkeypatch.setenv(migrate_guard.LOCK_TIMEOUT_ENV, "1")
+    monkeypatch.delenv(migrate_guard.LOCK_RETRIES_ENV, raising=False)
+    monkeypatch.setattr(migrate_guard, "backoff_seconds", lambda attempt: 0.05)
+    attempts: list[int] = []
+    real_log = migrate_guard.log_blockers
+
+    def recording(blockers, **kw):
+        attempts.append(kw["attempt"])
+        real_log(blockers, **kw)
+
+    monkeypatch.setattr(migrate_guard, "log_blockers", recording)
+
+    holder = await asyncpg.connect(raw_url)
+    try:
+        await holder.execute("BEGIN")
+        await holder.fetch("SELECT * FROM mg_target")
+        t, outcome = _start_upgrade(cfg)
+        # Well past the old default budget of 10 retries.
+        deadline = asyncio.get_running_loop().time() + 60
+        while len(attempts) < 12 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.2)
+        assert t.is_alive() and "error" not in outcome, repr(outcome.get("error"))
+        assert len(attempts) >= 12
+        await holder.execute("COMMIT")
+        await asyncio.to_thread(t.join, 60)
+        assert not t.is_alive()
+        assert "error" not in outcome, repr(outcome.get("error"))
+    finally:
+        await holder.close()
+
+
+def test_lock_retries_env_parsing(monkeypatch) -> None:
+    monkeypatch.delenv(migrate_guard.LOCK_RETRIES_ENV, raising=False)
+    assert migrate_guard.lock_retries() is None
+    for raw, want in (("", None), ("-1", None), ("junk", None), ("0", 0), ("7", 7)):
+        monkeypatch.setenv(migrate_guard.LOCK_RETRIES_ENV, raw)
+        assert migrate_guard.lock_retries() == want, raw
 
 
 def test_lock_timeout_is_recognised_through_the_wrapper_chain() -> None:

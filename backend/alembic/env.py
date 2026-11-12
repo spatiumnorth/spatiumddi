@@ -114,9 +114,9 @@ def do_run_migrations(connection: Connection) -> None:
     guard = _guard_enabled()
     if guard:
         # #3932 — a session left idle in transaction by a dead client held
-        # this migration's ALTER for 2 h+. End the provably abandoned ones,
-        # then bound every lock wait.
-        migrate_guard.terminate_stale_idle_sessions(connection)
+        # this migration's ALTER for 2 h+. Bound every lock wait so the
+        # revision leaves the lock queue (and stops stalling every query
+        # queued behind it) instead of waiting silently.
         migrate_guard.apply_lock_timeout(connection)
     context.configure(
         connection=connection,
@@ -132,7 +132,9 @@ def do_run_migrations(connection: Connection) -> None:
                 _run_migrations()
             return
         except Exception as exc:  # noqa: BLE001 — re-raised unless a lock timeout
-            if not (guard and migrate_guard.is_lock_timeout(exc)) or attempt >= retries:
+            if not (guard and migrate_guard.is_lock_timeout(exc)):
+                raise
+            if retries is not None and attempt >= retries:
                 raise
             attempt += 1
             # Each revision commits on its own, so the retry resumes at the
@@ -142,8 +144,13 @@ def do_run_migrations(connection: Connection) -> None:
             migrate_guard.log_blockers(
                 migrate_guard.blocker_report(connection), attempt=attempt, retries=retries
             )
-            time.sleep(migrate_guard.backoff_seconds(attempt))
+            # Only now, with a wait that has actually timed out, end the
+            # provably abandoned holders; a legitimate long holder (a backup's
+            # pg_dump is active, not idle) is waited out by the retries, which
+            # are unlimited by default so an upgrade that would have succeeded
+            # before #3932 still does.
             migrate_guard.terminate_stale_idle_sessions(connection)
+            time.sleep(migrate_guard.backoff_seconds(attempt))
 
 
 async def run_async_migrations() -> None:

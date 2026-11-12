@@ -813,7 +813,7 @@ postgresql:
   # turns it off). The CNPG kind sets it in ``cnpg.parameters``. The pod's
   # args also carry the TCP keepalives, so the first upgrade to this chart
   # restarts a standalone Postgres once.
-  idleInTransactionSessionTimeout: "15min"
+  idleInTransactionSessionTimeout: "1h"
   image:
     repository: postgres
     tag: "16-alpine"
@@ -1040,20 +1040,24 @@ postgresql:
       # was dead (default keepalive: 2 h + 9 x 75 s) and the migration's
       # ALTER TABLE queued behind its lock for 2 h+, with the API
       # "initialising" throughout. Two independent backstops:
-      # * ``idle_in_transaction_session_timeout`` ends a session that has sat
-      #   in an open transaction this long. Nothing in the app idles in a
-      #   transaction for minutes (every request, agent long-poll and task
-      #   commits or releases its transaction; pg_dump-based backups and
-      #   restore drills use their own connections, which are active, not
-      #   idle); 15 min clears the one long path, a backup archive upload
-      #   after its read, which tolerates losing the session (#2353).
-      #   "0" turns it off.
       # * the TCP keepalives make the server probe a silent peer after 60 s,
       #   every 10 s, and drop it after 6 misses: a dead client's session is
-      #   gone within ~2 min of the peer dying.
-      # All three are reloads (sighup / user context), not restarts: CNPG
+      #   gone within ~2 min of the peer dying. This is the half that fixes
+      #   the drill's case.
+      # * ``idle_in_transaction_session_timeout`` is the backstop for a
+      #   client that is alive but stuck in an open transaction. It has to
+      #   sit above the longest LEGITIMATE idle window, because Postgres
+      #   ending such a session turns slow work into an error: a scheduled
+      #   backup holds its session idle in transaction for the whole pg_dump
+      #   (up to 30 min) and upload, an agent bundle render for a very large
+      #   group can compute for many minutes between statements (#2240),
+      #   and a batched WinRM push idles between its chunks. Hence 1 h, not
+      #   minutes. The migrate command ends a stale holder that blocks it
+      #   after 5 min on its own (MIGRATION_STALE_IDLE_TXN_SECONDS).
+      #   "0" turns it off.
+      # All four are reloads (sighup / user context), not restarts: CNPG
       # applies them to a formed cluster without a rolling restart.
-      idle_in_transaction_session_timeout: "15min"
+      idle_in_transaction_session_timeout: "1h"
       tcp_keepalives_idle: "60"
       tcp_keepalives_interval: "10"
       tcp_keepalives_count: "6"
