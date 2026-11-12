@@ -609,8 +609,10 @@ export function OverlaysPage() {
                         setCustomerFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New overlay" to add one.`}
                     >
-                      No overlays yet — click "New overlay" to add one.
+                      No overlays yet.
                     </ListEmpty>
                   </td>
                 </tr>
