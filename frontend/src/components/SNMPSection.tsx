@@ -442,7 +442,7 @@ export function SNMPSection({
 
       <Field
         label="Enable SNMP"
-        description="When on, the rendered snmpd.conf is shipped to every appliance host through the ConfigBundle long-poll, the host runner validates it via ``snmpd -t``, and starts snmpd."
+        description="When on, the rendered snmpd.conf is shipped to every appliance host through the ConfigBundle long-poll, the host runner checks it with a probe run of snmpd, and starts snmpd."
       >
         <Toggle
           checked={enabled}
