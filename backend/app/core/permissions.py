@@ -973,6 +973,7 @@ def require_resource_permission(
 
 def require_any_resource_permission(
     *resource_types: str,
+    admit_scoped: bool = False,
 ) -> Callable[..., Awaitable[User]]:
     """Like :func:`require_resource_permission` but accepts multiple resource types.
 
@@ -980,6 +981,12 @@ def require_any_resource_permission(
     resource types. Used by aggregate routers (e.g. IPAM has ip_space, ip_block,
     subnet, ip_address routes all under a single APIRouter, so we accept any of
     those four).
+
+    ``admit_scoped`` (#4007) additionally admits a caller holding ANY grant
+    (scoped or unscoped, :func:`has_any_grant_for`) for the method's action on
+    a listed type, for a router whose handlers enforce the per-row boundary
+    themselves — a grant scoped to one resource cannot satisfy the unscoped
+    check above, so without it that delegate never reaches its own row.
     """
 
     async def _dep(
@@ -991,6 +998,8 @@ def require_any_resource_permission(
         actions = gate_actions(request)
         for rt in resource_types:
             if any(user_has_permission(current_user, a, rt) for a in actions):
+                return current_user
+            if admit_scoped and any(has_any_grant_for(current_user, a, rt) for a in actions):
                 return current_user
         first = resource_types[0] if resource_types else "*"
         await _record_denial(db, current_user, request, action, first, None)

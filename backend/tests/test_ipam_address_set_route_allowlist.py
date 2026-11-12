@@ -517,3 +517,37 @@ async def test_bulk_edit_says_why_a_delegate_row_was_skipped_3905(
     assert "address set" in reason
     assert "system" not in reason.lower()
 
+
+@pytest.mark.asyncio
+async def test_set_scoped_admin_edits_only_its_own_set_4007(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    w = await _world(db_session)
+    other = AddressSet(
+        name="other",
+        subnet_id=w["subnet"].id,
+        range_kind="contiguous",
+        start_address="10.0.5.100",
+        end_address="10.0.5.120",
+    )
+    db_session.add(other)
+    token = await _delegate(db_session, w)
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/address-sets/{w['set'].id}",
+        headers=_h(token),
+        json={"description": "renamed by delegate"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["description"] == "renamed by delegate"
+
+    # Nothing wider: a set the grant does not name is still refused.
+    r = await client.put(
+        f"/api/v1/address-sets/{other.id}",
+        headers=_h(token),
+        json={"description": "hijack"},
+    )
+    assert r.status_code in (403, 404), r.text
+    r = await client.delete(f"/api/v1/address-sets/{other.id}", headers=_h(token))
+    assert r.status_code in (403, 404), r.text
