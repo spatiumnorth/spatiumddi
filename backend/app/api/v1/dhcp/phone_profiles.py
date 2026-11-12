@@ -236,7 +236,9 @@ async def refuse_if_phone_class_stops_rendering(
         ):
             return
     name = phone_class_name(p.id)
-    pools = await pools_restricted_to(db, p.group_id, name, exclude_scope_id=exclude_scope_id)
+    pools = await pools_restricted_to(
+        db, p.group_id, name, exclude_scope_id=exclude_scope_id, include_trashed=always
+    )
     if pools:
         raise HTTPException(
             status_code=409,

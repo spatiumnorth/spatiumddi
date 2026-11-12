@@ -133,7 +133,7 @@ async def refuse_if_name_referenced(
     rewriting it, or leaving it dangling, changes who a pool serves. Same
     posture as the DNS ACL reference guard and the family-change guard above.
     """
-    pools = await pools_restricted_to(db, group_id, name)
+    pools = await pools_restricted_to(db, group_id, name, include_trashed=True)
     members = await classes_testing_membership(db, group_id, name, exclude_class_id)
     if not pools and not members:
         return

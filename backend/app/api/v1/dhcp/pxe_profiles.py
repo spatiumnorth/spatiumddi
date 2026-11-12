@@ -333,7 +333,7 @@ async def _refuse_if_pool_bound(
     profile. Same refusal shape as deleting a client class (#2285)."""
     for m in removed:
         name = f"pxe-{str(p.id)[:8]}-{str(m.id)[:8]}"
-        pools = await pools_restricted_to(db, p.group_id, name)
+        pools = await pools_restricted_to(db, p.group_id, name, include_trashed=True)
         if pools:
             detail = (
                 f"Cannot {verb}: boot rule '{m.boot_filename}' generates class "
