@@ -465,5 +465,7 @@ def test_windows_identity_is_the_ad_domain_not_the_host() -> None:
     c = d.provider_identity(_win("10.0.0.5", "svc@Corp.Example.com"))
     assert a == b == c == "windows_dns:ad:corp.example.com"
     assert d.provider_identity(_win("dc1.other.test", "svc")) != a
+    # An alternate UPN suffix must not split two DCs of one domain.
+    assert d.provider_identity(_win("dc3.corp.example.com", "svc@contoso.com")) == a
     # IP + NetBIOS login: unknown, which callers treat as shared.
     assert d.provider_identity(_win("10.0.0.5", "CORP\\svc")) is None

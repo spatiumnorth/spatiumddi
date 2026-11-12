@@ -204,8 +204,8 @@ class WindowsDNSDriver(DNSDriver):
         Domain``): replicated to every DC of the domain, so two rows for two
         DCs of one domain share every zone, while host + port told them apart
         and let one group's delete remove the zone for the other. The domain
-        is the UPN realm of the service account (``user@corp.example.com``),
-        else the DNS suffix of the host's FQDN. ``None`` (an IP address with a
+        is the DNS suffix of the host's FQDN, else (an IP or short host name)
+        the UPN realm of the service account. ``None`` (an IP address with a
         NetBIOS-style login, no credentials) means unknown, which callers
         treat as "might be shared".
         """
@@ -216,15 +216,20 @@ class WindowsDNSDriver(DNSDriver):
             creds = _load_credentials(server)
         except Exception:  # noqa: BLE001 — unknown identity, caller fails safe
             return None
-        username = str(creds.get("username") or "")
-        realm = username.rsplit("@", 1)[1].strip().lower().rstrip(".") if "@" in username else ""
+        # The host's own DNS suffix first: a DC's FQDN is its AD DNS domain,
+        # while a UPN suffix can be any alternate (user@contoso.com on a
+        # corp.contoso.com domain) and would split two DCs of one domain.
+        realm = ""
+        try:
+            ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            labels = host.split(".")
+            if len(labels) >= 2 and labels[1]:
+                realm = ".".join(labels[1:])
         if not realm:
-            try:
-                ipaddress.ip_address(host.strip("[]"))
-            except ValueError:
-                labels = host.split(".")
-                if len(labels) >= 2 and labels[1]:
-                    realm = ".".join(labels[1:])
+            username = str(creds.get("username") or "")
+            if "@" in username:
+                realm = username.rsplit("@", 1)[1].strip().lower().rstrip(".")
         return f"windows_dns:ad:{realm}" if realm else None
 
     # ── Rendering (all no-ops; Windows manages its own zones) ─────────────
