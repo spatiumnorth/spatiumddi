@@ -381,3 +381,74 @@ async def test_get_unknown_404(client: AsyncClient, db_session: AsyncSession) ->
         headers={"Authorization": f"Bearer {token}"},
     )
     assert r.status_code == 404
+
+
+# ── RBAC: internal subnet labels (#3641) ─────────────────────────────
+
+
+async def _user_with(db: AsyncSession, perms: list[dict[str, str]]) -> str:
+    from app.models.auth import Group, Role
+
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Test",
+        hashed_password=hash_password("x"),
+        is_superadmin=False,
+    )
+    db.add(u)
+    await db.flush()
+    role = Role(name=f"r-{uuid.uuid4().hex[:6]}", description="", permissions=perms)
+    db.add(role)
+    await db.flush()
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    group.users = [u]
+    db.add(group)
+    await db.flush()
+    return create_access_token(str(u.id))
+
+
+@pytest.mark.asyncio
+async def test_internal_subnet_labels_redacted_without_subnet_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    sub = await _make_subnet(db_session)
+    m = NATMapping(
+        name="hide-1",
+        kind="hide",
+        internal_subnet_id=sub.id,
+        external_ip="203.0.113.5",
+        protocol="any",
+    )
+    db_session.add(m)
+    low = await _user_with(db_session, [{"action": "read", "resource_type": "nat_mapping"}])
+    full = await _user_with(
+        db_session,
+        [
+            {"action": "read", "resource_type": "nat_mapping"},
+            {"action": "read", "resource_type": "subnet"},
+        ],
+    )
+    _, admin = await _make_user(db_session)
+    await db_session.commit()
+
+    for path in (
+        "/api/v1/ipam/nat-mappings",
+        f"/api/v1/ipam/nat-mappings/{m.id}",
+        f"/api/v1/ipam/nat-mappings/by-subnet/{sub.id}",
+    ):
+        for tok, visible in ((low, False), (full, True), (admin, True)):
+            r = await client.get(path, headers={"Authorization": f"Bearer {tok}"})
+            assert r.status_code == 200, (path, r.text)
+            body = r.json()
+            row = body["items"][0] if isinstance(body, dict) and "items" in body else body
+            row = row[0] if isinstance(row, list) else row
+            if visible:
+                assert row["internal_subnet_name"] == "s"
+                assert row["internal_subnet_cidr"] == "10.10.0.0/24"
+                assert row["internal_subnet_redacted"] is False
+            else:
+                assert row["internal_subnet_name"] is None
+                assert row["internal_subnet_cidr"] is None
+                assert row["internal_subnet_redacted"] is True
