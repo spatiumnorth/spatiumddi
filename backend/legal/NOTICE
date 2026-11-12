@@ -1,0 +1,192 @@
+SpatiumDDI
+Copyright 2026 Spatium North Inc.
+
+This product bundles, ships, or integrates with the following open source
+components. Grouped by role; license + project URL for each.
+
+For an operator-facing catalogue of the same ground — which artifact each
+component ships in, the version pinned, and why it is there — see
+docs/THIRD_PARTY.md (published at https://www.spatiumddi.com/THIRD_PARTY.html).
+Where the two disagree about a license, THIS file is authoritative.
+
+── Operating system & boot (OS appliance image) ──────────────────────────
+- Linux Kernel — GPL v2 — https://kernel.org
+- Debian — DFSG (mixed) — https://debian.org
+- Alpine Linux — MIT + GPL v2 (kernel) — https://alpinelinux.org
+- GRUB 2 — GPL v3 — https://www.gnu.org/software/grub
+- systemd (incl. udev, systemd-resolved) — LGPL v2.1 — https://systemd.io
+- NetworkManager — GPL v2+ — https://networkmanager.dev
+- chrony (NTP) — GPL v2 — https://chrony-project.org
+- Net-SNMP (snmpd) — BSD-style (multiple) — https://net-snmp.org
+- lldpd — ISC — https://lldpd.github.io
+- nftables — GPL v2 — https://netfilter.org
+- OpenSSH — BSD-style — https://www.openssh.com
+- rsyslog (+ rsyslog-gnutls) — GPL v3 / LGPL v3 (libs) — https://www.rsyslog.com
+- cloud-init — GPL v3 / Apache 2.0 (dual) — https://cloud-init.io
+- unattended-upgrades — GPL v2 — https://github.com/mvo5/unattended-upgrades
+- newt / whiptail (install wizard dialogs) — LGPL v2 — https://pagure.io/newt
+- gdisk / parted / dosfstools / e2fsprogs — GPL v2 / GPL v3 — (Debian)
+- mdadm / multipath-tools / kpartx / lvm2 — GPL v2 (mdadm, kpartx) / LGPL v2.1 + GPL v2 (multipath-tools, lvm2) — (Debian)
+- exfatprogs — GPL v2 — https://github.com/exfatprogs/exfatprogs
+- rsync — GPL v3 — https://rsync.samba.org
+- qemu-guest-agent — GPL v2 — https://www.qemu.org
+- open-vm-tools — GPL v2 + BSD — https://github.com/vmware/open-vm-tools
+- zstd — BSD 3-Clause / GPL v2 (dual) — https://facebook.github.io/zstd
+- jq — MIT — https://jqlang.github.io/jq
+- curl — curl license (MIT-like) — https://curl.se
+- Rich / psutil (appliance console dashboard) — MIT / BSD 3-Clause —
+  https://github.com/Textualize/rich , https://github.com/giampaolo/psutil
+
+── Kubernetes control plane / orchestration (multi-node HA appliance) ─────
+- k3s — Apache 2.0 — https://k3s.io
+- etcd — Apache 2.0 — https://etcd.io
+- containerd — Apache 2.0 — https://containerd.io
+- runc — Apache 2.0 — https://github.com/opencontainers/runc
+- CoreDNS — Apache 2.0 — https://coredns.io
+- Flannel (CNI) — Apache 2.0 — https://github.com/flannel-io/flannel
+- local-path-provisioner — Apache 2.0 — https://github.com/rancher/local-path-provisioner
+- Traefik (present in the k3s airgap bundle; disabled by config) — MIT —
+  https://traefik.io
+- metrics-server (present in the k3s airgap bundle; disabled by config) —
+  Apache 2.0 — https://github.com/kubernetes-sigs/metrics-server
+- Helm — Apache 2.0 — https://helm.sh
+- MetalLB (L2 load balancer / control-plane VIP) — Apache 2.0 — https://metallb.io
+- FRRouting (BGP daemon, via MetalLB's frr-k8s backend) — GPL v2 — https://frrouting.org
+- frr-k8s (MetalLB's BGP backend; only with BGP mode enabled) — Apache 2.0 —
+  https://github.com/metallb/frr-k8s
+- kube-rbac-proxy (frr-k8s metrics sidecar; only with BGP mode enabled) —
+  Apache 2.0 — https://github.com/brancz/kube-rbac-proxy
+- CloudNativePG (PostgreSQL operator) — Apache 2.0 — https://cloudnative-pg.io
+- Patroni (bare-metal HA Postgres overlay) — MIT — https://github.com/patroni/patroni
+- HAProxy (Patroni HA overlay) — GPL v2 (+ LGPL exception for libs) —
+  https://www.haproxy.org
+
+── Data services ──────────────────────────────────────────────────────────
+- PostgreSQL — PostgreSQL License — https://postgresql.org
+- Redis — BSD 3-Clause (pre-7.4) / RSALv2 + SSPLv1 (7.4+) /
+  RSALv2 + SSPLv1 + AGPLv3 (8.0+; SpatiumDDI ships 8.x) — https://redis.io
+- Prometheus (+ client_python) — Apache 2.0 — https://prometheus.io
+- node-exporter / kube-state-metrics (default-off appliance workloads) —
+  Apache 2.0 — https://prometheus.io
+
+── DNS / DHCP / routing service engines ────────────────────────────────────
+- ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
+- radvd (IPv6 Router Advertisement Daemon) — BSD-style — https://radvd.litech.org
+- ISC BIND 9 (+ bind-tools / dnsutils) — MPL 2.0 — https://isc.org/bind
+- PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
+- PowerDNS dnsdist — GPL v2 — https://dnsdist.org
+- Technitium DNS Server — GPL v3 — https://technitium.com/dns
+- GoBGP (BGP Looking Glass collector, issue #566) — Apache 2.0 — https://github.com/osrg/gobgp
+
+── Container base images & init ────────────────────────────────────────────
+- python:3.12-slim — PSF + Debian — https://python.org
+- node (frontend build stage) — MIT — https://nodejs.org
+- ASP.NET Core runtime (Technitium agent image) — MIT — https://dotnet.microsoft.com
+- tini — MIT — https://github.com/krallin/tini
+- su-exec — MIT — https://github.com/ncopa/su-exec
+- gosu — Apache 2.0 — https://github.com/tianon/gosu
+
+── Operator tooling shipped in the API image ───────────────────────────────
+- nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org
+- tcpdump / libpcap (packet capture) — BSD 3-Clause — https://www.tcpdump.org
+- mtr — GPL v2 — https://www.bitwizard.nl/mtr
+- whois — GPL v2 — https://github.com/rfc1036/whois
+- iputils (ping) / traceroute — BSD / GPL v2 — (Debian)
+- PostgreSQL client tools (pg_dump / pg_restore) — PostgreSQL License —
+  https://postgresql.org
+- xmlsec1 (SAML signature verification) — MIT — https://www.aleksey.com/xmlsec
+- libnfs (NFS backup destination, #971) — LGPL v2.1 — https://github.com/sahlberg/libnfs
+  Dynamically linked at runtime through ctypes; not modified, not statically
+  linked, and not redistributed in source form. The Debian package 'libnfs14'
+  is installed unmodified into the API image.
+
+── Backend (Python) ───────────────────────────────────────────────────────
+- Python — PSF License — https://python.org
+- FastAPI — MIT — https://fastapi.tiangolo.com
+- Swagger UI (swagger-ui-dist, vendored for /api/docs; its LICENSE and NOTICE
+  ship beside it in backend/app/static/api-docs/swagger-ui/) — Apache 2.0 —
+  https://github.com/swagger-api/swagger-ui
+- ReDoc (vendored for /api/redoc; its LICENSE ships beside it in
+  backend/app/static/api-docs/redoc/) — MIT — https://github.com/Redocly/redoc
+- Starlette — BSD 3-Clause — https://www.starlette.io
+- Uvicorn — BSD 3-Clause — https://www.uvicorn.org
+- SQLAlchemy — MIT — https://sqlalchemy.org
+- Alembic — MIT — https://alembic.sqlalchemy.org
+- asyncpg — Apache 2.0 — https://github.com/MagicStack/asyncpg
+- Pydantic (+ pydantic-settings) — MIT — https://pydantic.dev
+- Celery — BSD 3-Clause — https://celeryq.dev
+- redis-py (+ hiredis) — MIT — https://github.com/redis/redis-py
+- structlog — MIT / Apache 2.0 — https://www.structlog.org
+- cryptography — Apache 2.0 / BSD 3-Clause — https://cryptography.io
+- pyOpenSSL (TLS cert chain capture) — Apache 2.0 — https://www.pyopenssl.org
+- joserfc (JWT issue + verify, OIDC ID-token validation, JWKS) — BSD 3-Clause — https://jose.authlib.org
+- bcrypt — Apache 2.0 — https://github.com/pyca/bcrypt
+- pyotp (TOTP) — MIT — https://github.com/pyauth/pyotp
+- python-multipart — Apache 2.0 — https://github.com/Kludex/python-multipart
+- httpx — BSD 3-Clause — https://www.python-httpx.org
+- ldap3 (LDAP) — LGPL v3 — https://github.com/cannatag/ldap3
+- python3-saml (SAML) — MIT — https://github.com/SAML-Toolkits/python3-saml
+- pyrad (RADIUS) — BSD 3-Clause — https://github.com/pyradius/pyrad
+- tacacs_plus (TACACS+) — BSD — https://github.com/ansible/tacacs_plus
+- paramiko (SSH transport) — LGPL v2.1 — https://www.paramiko.org
+- smbprotocol (SMB backup targets) — MIT — https://github.com/jborean93/smbprotocol
+- dnspython — ISC — https://www.dnspython.org
+- Jinja2 — BSD 3-Clause — https://jinja.palletsprojects.com
+- pywinrm (Windows DNS / DHCP over WinRM) — MIT — https://github.com/diyan/pywinrm
+- requests-credssp (CredSSP transport for WinRM) — MIT — https://github.com/jborean93/requests-credssp
+- pysnmp — BSD 2-Clause — https://github.com/lextudio/pysnmp
+- openpyxl (XLSX import/export) — MIT — https://openpyxl.readthedocs.io
+- reportlab (PDF export) — BSD 3-Clause — https://www.reportlab.com
+- croniter (schedule parsing) — MIT — https://github.com/kiorky/croniter
+- icalendar (Wake-on-LAN calendar gate — .ics parsing) — BSD 2-Clause — https://github.com/collective/icalendar
+- caldav (Wake-on-LAN calendar gate — CalDAV client) — Apache 2.0 / GPL v3 (dual) — https://github.com/python-caldav/caldav
+- python-dateutil (recurrence RRULE/RDATE expansion) — Apache 2.0 / BSD 3-Clause — https://github.com/dateutil/dateutil
+- idna (IDNA2008 host/record name normalization — issue #597) — BSD 3-Clause — https://github.com/kjd/idna
+- PyYAML — MIT — https://pyyaml.org
+- docker SDK for Python (appliance cert reload) — Apache 2.0 — https://github.com/docker/docker-py
+- boto3 / botocore (AWS — infra mirror + Route 53 DNS + S3 backups) — Apache 2.0 — https://github.com/boto/boto3
+- azure-identity / azure-mgmt-network / azure-mgmt-compute / azure-mgmt-dns / azure-mgmt-resource / azure-storage-blob (Azure — infra mirror + Azure DNS + Blob backups) — MIT — https://github.com/Azure/azure-sdk-for-python
+- google-cloud-compute / google-cloud-dns / google-cloud-storage / google-auth (GCP — infra mirror + Cloud DNS + GCS backups) — Apache 2.0 — https://github.com/googleapis/google-cloud-python
+- Cloudflare DNS API (Cloud DNS driver) — service API, no SDK (plain REST via httpx) — https://api.cloudflare.com
+- openai (Operator Copilot model client) — Apache 2.0 — https://github.com/openai/openai-python
+- anthropic (Operator Copilot model client) — MIT — https://github.com/anthropics/anthropic-sdk-python
+
+── Agent runtimes (Python, in the service container images) ────────────────
+- Scapy (passive DHCP fingerprinting — DHCP agent image) — GPL v2 — https://scapy.net
+
+── Frontend (TypeScript / React) ──────────────────────────────────────────
+- React — MIT — https://react.dev
+- Vite — MIT — https://vitejs.dev
+- TypeScript — Apache 2.0 — https://www.typescriptlang.org
+- Tailwind CSS (+ tailwindcss-animate) — MIT — https://tailwindcss.com
+- TanStack Query (React Query) — MIT — https://tanstack.com/query
+- React Router — MIT — https://reactrouter.com
+- axios — MIT — https://axios-http.com
+- shadcn/ui (component patterns) — MIT — https://ui.shadcn.com
+- Radix UI primitives — MIT — https://www.radix-ui.com
+- Recharts — MIT — https://recharts.org
+- lucide-react (icons) — ISC — https://lucide.dev
+- react-markdown / remark-gfm — MIT — https://github.com/remarkjs/react-markdown
+- dnd-kit — MIT — https://dndkit.com
+- clsx / tailwind-merge — MIT — https://github.com/lukeed/clsx
+- qrcode-generator (device-enrolment QR codes) — MIT — https://github.com/kazuhikoarase/qrcode-generator
+- nginx (frontend static serving + agent landing) — BSD 2-Clause — https://nginx.org
+
+This list covers the major bundled / shipped components; it is not an
+exhaustive enumeration of every transitive dependency. The complete
+transitive sets are backend/pyproject.toml (with the resolved versions
+listed by `importlib.metadata` inside the API image, which ships no pip —
+see docs/THIRD_PARTY.md) and frontend/package-lock.json.
+
+Full license texts are not vendored into this repository. Each component's
+license ships with the component itself and can be read from a running
+system — for example:
+
+  /usr/share/doc/<package>/copyright        (Debian appliance packages)
+  /usr/share/licenses/<package>/            (Alpine agent images)
+  /usr/share/doc/k3s/LICENSE                (k3s, fetched at image build)
+  /usr/local/lib/python3.12/site-packages/<name>-*.dist-info/
+                                            (Python packages, API image)
+
+docs/THIRD_PARTY.md documents this in more detail, including the copyleft
+components and what their terms mean for redistribution.

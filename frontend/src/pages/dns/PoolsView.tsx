@@ -148,7 +148,13 @@ export function PoolsView({
                 "No pools."
               ) : (
                 <>
-                  No pools yet. Click <em>New Pool</em> to create one.
+                  No pools yet.
+                  {!poolGate.disabled && (
+                    <>
+                      {" "}
+                      Click <em>New Pool</em> to create one.
+                    </>
+                  )}
                 </>
               )}
             </p>
