@@ -440,6 +440,7 @@ APPLIANCE_CP_HARD=(
     --set frontend.podAntiAffinity=hard
     --set frontend.hostNetwork=true
     --set api.service.trafficDistribution=PreferSameNode
+    --set api.service.nodeLocal=true
     --set api.autoscaling.enabled=false
 )
 for n in 1 3; do
@@ -676,6 +677,20 @@ sys.exit(1 if bad else 0)
 EOF
 else
     echo "   FAIL: the #3780 rollback-strategy case chart did not render" >&2
+    failures=$((failures + 1))
+fi
+
+# #3645 — the node-local api Service (internalTrafficPolicy: Local) is the
+# appliance's too: the default render must not carry it, the appliance's must,
+# and the frontend's upstream must name whichever Service exists.
+echo "── node-local api Service: appliance only (umbrella, #3645)"
+python3 "$ROOT/.github/scripts/chart-api-local-service.py" \
+    "$OUT/umbrella-defaults.yaml" || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-api-local-service.py" --present \
+    "$OUT/umbrella-appliance-cp-1.yaml" "$OUT/umbrella-appliance-cp-3.yaml" \
+    || failures=$((failures + 1))
+if grep -l -- "-api-local" "$OUT"/appliance-*.yaml >/dev/null 2>&1; then
+    echo "   FAIL: the role chart must not render the node-local api Service" >&2
     failures=$((failures + 1))
 fi
 

@@ -125,7 +125,7 @@ spec:
             # logs ``Host not found`` on every /api/ request. Use the
             # FQDN so resolution works in both cases.
             - name: API_UPSTREAM_HOST
-              value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api.%s.svc.cluster.local" (include "spatiumddi.fullname" .) .Release.Namespace) | quote }}
+              value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api%s.%s.svc.cluster.local" (include "spatiumddi.fullname" .) (ternary "-local" "" (.Values.api.service.nodeLocal | default false)) .Release.Namespace) | quote }}
             - name: API_UPSTREAM_PORT
               value: {{ .Values.frontend.apiUpstream.port | default .Values.api.service.port | quote }}
             {{- if include "spatiumddi.isOpenShift" . }}

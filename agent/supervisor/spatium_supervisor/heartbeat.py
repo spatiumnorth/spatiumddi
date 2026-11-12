@@ -145,17 +145,71 @@ def _is_control_plane_member() -> bool:
     return appliance_state.is_control_plane_member()
 
 
+# #3645 — the node-local api Service (``internalTrafficPolicy: Local``). Plain
+# http is only ever sent to the api pod on this node, so it never crosses the
+# node LAN (pod traffic between nodes is flannel host-gw: routed, not
+# encrypted). A control plane that predates the Service has no such name; the
+# lookup fails and ``_effective_control_plane_url`` falls back like it does for
+# a node with no ready api pod of its own.
+_IN_CLUSTER_NODE_LOCAL_URL = (
+    "http://spatium-control-spatiumddi-api-local.spatium.svc.cluster.local.:8000"
+)
+
+# Consecutive connection failures to the node-local Service before the
+# supervisor stops using it, and how long it then waits before trying it again.
+_LOCAL_API_FAIL_THRESHOLD = 2
+_LOCAL_API_RETRY_S = 60.0
+
+_local_api: dict[str, Any] = {"failures": 0, "last_failure": 0.0, "fallback_logged": False}
+
+
+def note_local_api_result(url: str, ok: bool) -> None:
+    """Record whether a call to the node-local Service reached an api pod.
+
+    ``ok`` is True for any HTTP answer (even a 5xx: the pod is there) and
+    False for a connection-level failure. Calls to any other URL are ignored.
+    """
+    if not url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+        return
+    if ok:
+        if _local_api["failures"] >= _LOCAL_API_FAIL_THRESHOLD:
+            log.info("supervisor.control_plane.node_local_restored")
+        _local_api["failures"] = 0
+        _local_api["fallback_logged"] = False
+        return
+    _local_api["failures"] += 1
+    _local_api["last_failure"] = time.monotonic()
+
+
+def _local_api_usable() -> bool:
+    if _local_api["failures"] < _LOCAL_API_FAIL_THRESHOLD:
+        return True
+    # Down: use the fallback, but let one call through now and then so a
+    # restarted local api pod is picked up again.
+    return time.monotonic() - _local_api["last_failure"] >= _LOCAL_API_RETRY_S
+
+
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     """Resolve the heartbeat target.
 
-    Cluster members talk to the in-cluster api Service (resilient to
-    any single node loss + load-balanced); everyone else uses the
-    configured ``CONTROL_PLANE_URL``. Returns ``""`` only when a
-    non-member has no configured URL — the caller skips the
-    heartbeat in that case.
+    Cluster members talk to the api pod on their own node through the
+    node-local Service (#3645), so the plain-http hop never leaves the node.
+    While that node has no ready api pod, they use the configured
+    ``CONTROL_PLANE_URL``, which goes over https against the pinned
+    certificate (``cp_tls``), never plain http across the node LAN.
+    Everyone else uses the configured URL. Returns ``""`` only when a
+    non-member has no configured URL — the caller skips the heartbeat.
     """
-    if _is_control_plane_member():
-        return _IN_CLUSTER_CONTROL_PLANE_URL
+    if not _is_control_plane_member():
+        return cfg.control_plane_url
+    if _local_api_usable() or not cfg.control_plane_url:
+        return _IN_CLUSTER_NODE_LOCAL_URL
+    if not _local_api["fallback_logged"]:
+        _local_api["fallback_logged"] = True
+        log.warning(
+            "supervisor.control_plane.node_local_unavailable",
+            fallback=cfg.control_plane_url,
+        )
     return cfg.control_plane_url
 
 
@@ -1475,6 +1529,9 @@ def heartbeat_once(
             url, content=body_bytes, headers=headers, timeout=float(hold_s) + 10.0
         )
     except httpx.HTTPError as exc:
+        # A read timeout means an api pod took the request; anything else
+        # (refused, no endpoint, DNS) means the node-local Service has none.
+        note_local_api_result(url, isinstance(exc, httpx.ReadTimeout))
         # Transient network / DNS / timeout — don't count toward
         # revocation strikes. The control plane is unreachable, not
         # rejecting us; once it comes back the 200 path resumes.
@@ -1485,6 +1542,7 @@ def heartbeat_once(
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
         return None
+    note_local_api_result(url, True)
     revocation = revocation_reason(resp)
     if revocation is None and resp.status_code in (403, 404):
         # #2798 — a refusal that is NOT the control plane's revocation

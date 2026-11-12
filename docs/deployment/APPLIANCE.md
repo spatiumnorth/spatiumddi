@@ -397,7 +397,7 @@ separate profiles that STATE does not model.
 k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
 `*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
 way, the frontend nginx finds the api, and on a multi-node control plane a
-member's supervisor heartbeats the in-cluster api Service name. Nothing on
+member's supervisor heartbeats the node-local api Service name. Nothing on
 the appliance talks to it from the LAN — it is not a DNS server operators put
 zones on, and it is unrelated to the BIND9 / Kea role containers.
 
@@ -696,7 +696,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.service.nodeLocal` (`true` at every size, #3645); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -815,15 +815,40 @@ agent). Dismissal requires a deliberate checkbox and is remembered
 client-side.
 
 **Heartbeat targets.** A supervisor that is itself a control-plane
-cluster member heartbeats the **in-cluster api Service**
-(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
-than the seed node's IP it was installed/promoted against — so losing any
-single node never strands a member's control plane, and kube-proxy
-load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+cluster member heartbeats the **node-local api Service**
+(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local:8000`, #3645:
+only ever the api pod on its own node) rather than the seed node's IP it was
+installed/promoted against. With no ready api pod on its node it falls back to
+its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
+a node's api pod never strands a member's control plane and no plain http
+crosses the node LAN. Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
 `heartbeat.py`).
+
+**Node-local api traffic (#3645).** Pod-to-pod traffic between nodes is flannel
+`host-gw`: routed over the node LAN, not tunnelled or encrypted, and the api
+speaks plain http. So the two callers that carry credentials keep that hop on
+their own node: firstboot and the seed supervisor set `api.service.nodeLocal`,
+which renders a second Service, `spatium-control-spatiumddi-api-local`, with
+`internalTrafficPolicy: Local`. It answers only from an api pod on the caller's
+node. The frontend nginx's `/api` proxy (browsers and remote appliances) and a
+member's supervisor use it; the original `-api` Service is unchanged, for the
+worker, the role agents and the probes, and an older supervisor keeps using it.
+
+The requirement is **a ready api pod on every control-plane node** (the
+appliance already runs one per node: `replicas` equals the control-plane size,
+with required anti-affinity). A node whose api pod is down has no local
+endpoint, so its frontend answers 502 for `/api` until the pod is back (the VIP
+health check moves clients to another node), and its supervisor does not wait:
+after two refused heartbeats it uses its `CONTROL_PLANE_URL` over https against
+the pinned certificate (`cp_tls`), and retries the local Service every 60 s.
+Plain http is therefore only ever node-local. Not covered yet, and tracked in
+#4019: the role agents, the worker and beat still reach the api over the
+cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
+On a network where the node LAN is not trusted, put a WireGuard-capable CNI
+under the cluster instead of relying on this alone.
 
 ### Guided etcd restore (Phase 9b)
 
