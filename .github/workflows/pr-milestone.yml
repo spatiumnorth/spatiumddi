@@ -12,6 +12,9 @@ name: PR — Milestone
 #   takes the next drop's milestone, the lowest-versioned open one, a beta or
 #   RC included (1.0.0-beta.4 < 1.0.0-rc.1 < 1.0.0), so the fallback moves on
 #   by itself when a milestone is closed.
+# - A PR into a ``release/X.Y.Z`` branch (#3948) ships in X.Y.Z whatever its
+#   issues say, so it takes the open milestone titled ``X.Y.Z`` when there is
+#   one, before anything above is consulted.
 # - A milestone already on the PR is never changed.
 #
 # pull_request_target so fork PRs get a token that can write the milestone.
@@ -49,6 +52,24 @@ jobs:
             if (pr.data.milestone) {
               core.info(`#${number} already has milestone ${pr.data.milestone.title}`);
               return;
+            }
+
+            // #3948 — a release branch decides the release, not the issues.
+            const branch = /^release\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(pr.data.base.ref);
+            if (branch) {
+              const open = await github.paginate(github.rest.issues.listMilestones, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
+              const m = open.find((x) => x.title === branch[1]);
+              if (m) {
+                await github.rest.issues.update({ owner, repo, issue_number: number, milestone: m.number });
+                core.info(`#${number} -> ${m.title}: its base branch ${pr.data.base.ref}`);
+                return;
+              }
+              core.info(`#${number}: no open milestone titled ${branch[1]} for ${pr.data.base.ref}; falling back`);
             }
 
             const q = await github.graphql(

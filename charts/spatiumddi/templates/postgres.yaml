@@ -58,6 +58,17 @@ spec:
           args:
             - -c
             - max_connections={{ .Values.postgresql.maxConnections | default (include "spatiumddi.postgresMaxConnections" .) }}
+            {{- /* #3932 — end a session whose client has gone (see
+                   postgresql.cnpg.parameters for the reasoning); the same
+                   values, reload-only, as the CNPG cluster. */}}
+            - -c
+            - idle_in_transaction_session_timeout={{ .Values.postgresql.idleInTransactionSessionTimeout }}
+            - -c
+            - tcp_keepalives_idle=60
+            - -c
+            - tcp_keepalives_interval=10
+            - -c
+            - tcp_keepalives_count=6
           ports:
             - name: postgres
               containerPort: 5432
