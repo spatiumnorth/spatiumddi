@@ -147,6 +147,8 @@ function fmtTime(iso: string | null): string {
 
 const REQUESTS_PAGE_SIZE = 100;
 
+function axiosStatus(e: unknown): number | undefined {
+  return (e as { response?: { status?: number } })?.response?.status;
 }
 
 function errMessage(e: unknown, fallback: string): string {
@@ -594,7 +596,15 @@ function DecisionModal({
       }
       onClose();
     },
-    onError: (e) => setError(errMessage(e, `Could not ${action} the request`)),
+    onError: (e) => {
+      setError(errMessage(e, `Could not ${action} the request`));
+      // A 409 means the request was decided elsewhere since the list loaded
+      // (#3935): refresh so the row stops offering the decision.
+      if (axiosStatus(e) === 409) {
+        setFailed(true);
+        void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
+      }
+    },
   });
 
   return (

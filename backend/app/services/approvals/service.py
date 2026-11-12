@@ -289,8 +289,36 @@ async def list_change_requests(
 # ── State transitions (each guarded + audited) ─────────────────────────────
 
 
+_DECIDED_WORDS = {
+    "approved": "approved",
+    "executed": "approved and provisioned",
+    "failed": "approved, and its provisioning failed",
+    "rejected": "rejected",
+    "cancelled": "cancelled",
+    "expired": "expired",
+}
+
+
+def already_decided_text(cr: ChangeRequest) -> str:
+    """Plain words for a decision refused because the request is not pending
+    (#3935): what happened, who did it and when, with no id or schema state
+    name. The Requests page's own vocabulary (Provisioned, Cancelled, ...)."""
+    what = _DECIDED_WORDS.get(cr.state, cr.state)
+    who = f" by {cr.decided_by_display}" if cr.decided_by_display else ""
+    at = (
+        f" at {cr.decided_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+        if cr.decided_at is not None
+        else ""
+    )
+    if cr.state == "expired":
+        return "This request has already expired and can no longer be decided."
+    return f"This request was already {what}{who}{at}. Refresh to see its current state."
+
+
 def _require_state(cr: ChangeRequest, expected: str) -> None:
     if cr.state != expected:
+        if expected == "pending":
+            raise ChangeRequestStateError(already_decided_text(cr))
         raise ChangeRequestStateError(
             f"change request {cr.id} is {cr.state!r}, expected {expected!r}"
         )
@@ -775,7 +803,7 @@ async def approve_change_request(
     #     Before the expiry branch, which writes (mark_expired + commit).
     _enforce_token_scope(request, cr.operation)
     if cr.state != "pending":
-        raise DecisionConflict(f"Change request is not pending (state={cr.state!r})")
+        raise DecisionConflict(already_decided_text(cr))
     # #10: one expiry convention everywhere — ``expires_at <= now`` means expired
     # (matches the sweep select + recheck), so a request can't be approved in the
     # same instant the sweep would expire it.
