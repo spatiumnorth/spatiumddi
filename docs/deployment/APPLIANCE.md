@@ -3586,7 +3586,11 @@ so a first-time operator never gets stuck looking for the upload.
    gives up (finishing only the node it is on) 8 minutes after its last
    renewal, before the Lease could lapse for anyone else. If a drive
    exits with the run still `running`, a beat sweep re-drives it once
-   the Lease has been free on two sweeps a minute apart (#1713). If the drive itself died, the Lease lapses after its
+   the Lease has been free on two sweeps a minute apart (#1713). After the shared-tag
+   hand-off the hop chain refreshes a 45 s heartbeat; if it stops (the worker holding
+   the hop was killed) the run is re-driven within about two minutes, otherwise
+   (a hand-off from a build without the heartbeat, or Redis unreadable) the sweep
+   waits out the 15-minute grace (#3851). If the drive itself died, the Lease lapses after its
    10-minute duration; a superadmin can free it sooner with
    **Force release** beside the Lease pill (`POST
    /api/v1/upgrades/lease/force-release`). That is refused while the
