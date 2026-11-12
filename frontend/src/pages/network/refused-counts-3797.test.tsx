@@ -80,7 +80,7 @@ describe("refused reads are not drawn as zero or none (#3797)", () => {
     await waitFor(() =>
       expect(text()).toContain("You don't have permission to see network"),
     );
-    expect(text()).not.toMatch(/\b0 devices\b/);
+    expect(text()).not.toMatch(/0 devices/);
   });
 
   it("DICOM does not say no associations are documented", async () => {
