@@ -57,6 +57,14 @@ on:
         required: false
         type: string
         default: amd64
+      ref:
+        description: >-
+          Commit or branch to build. Empty = the caller's own commit (what
+          release.yml and the main nightly want); nightly.yml passes the sha
+          of a release branch here (#3950).
+        required: false
+        type: string
+        default: ""
       artifact_retention_days:
         description: Retention for the appliance-artifacts upload.
         required: false
@@ -99,6 +107,8 @@ jobs:
       slot_name: ${{ steps.slot.outputs.slot_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -125,7 +135,7 @@ jobs:
           {
               echo "APPLIANCE_VERSION=\"${VERSION}\""
               echo "BUILD_TIME=\"$(date -u -Iseconds)\""
-              echo "GIT_SHA=\"${GITHUB_SHA}\""
+              echo "GIT_SHA=\"$(git rev-parse HEAD)\""
               # #1026 — the architecture this rootfs is built FOR, which
               # is what ``spatium-upgrade-slot`` compares against the
               # running node's own ``uname -m`` before it writes a slot.
