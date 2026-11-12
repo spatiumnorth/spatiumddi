@@ -612,12 +612,22 @@ export function BulkAllocateModal({
                   </select>
                 </div>
               )}
-              {createDnsRecords && availableZones.length === 0 && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  No DNS zones are pinned to this subnet — A records will fall
-                  through to the effective default zone if one exists.
-                </p>
-              )}
+              {createDnsRecords &&
+                availableZones.length === 0 &&
+                zonesSettled &&
+                (effectiveDns?.dns_zone_id ? (
+                  // #3903: the zone list wants a read this caller may lack,
+                  // while the subnet's own effective DNS names the zone.
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    A records are published in this subnet&apos;s DNS zone. Your
+                    permissions do not list DNS zones, so its name is not shown.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    No DNS zones are pinned to this subnet — A records will fall
+                    through to the effective default zone if one exists.
+                  </p>
+                ))}
             </div>
           )}
 

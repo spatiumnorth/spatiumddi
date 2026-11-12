@@ -3738,6 +3738,20 @@ export function AddAddressModal({
     if (target && target !== dnsZoneId) setDnsZoneId(target);
   }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // #3903: the zone the address will be published in. The zone list needs a
+  // type-level read on DNS zones, which a grant scoped to the subnet lacks, so
+  // `availableZones` can be empty while the subnet's own effective DNS (which
+  // that grant reads) names the zone. An untouched pick sends no zone, which
+  // the server reads as that zone (#2466).
+  const publishZoneId = dnsZoneTouched
+    ? dnsZoneId
+    : dnsZoneId || effectiveDns?.dns_zone_id || "";
+  const zoneListUnreadable =
+    dnsOn &&
+    zonesSettled &&
+    availableZones.length === 0 &&
+    !!effectiveDns?.dns_zone_id;
+
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
       // "None (no DNS record)" is sent as "" — an absent / null zone means
@@ -4017,6 +4031,15 @@ export function AddAddressModal({
           {isDefaultGatewayHostnameInput(hostname) &&
             availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
+        {zoneListUnreadable && (
+          <Field label="DNS Zone">
+            <p className="py-1 text-xs text-muted-foreground">
+              <Globe2 className="mr-1 inline h-3 w-3" />
+              Published in this subnet&apos;s DNS zone. Your permissions do not
+              list DNS zones, so its name is not shown.
+            </p>
+          </Field>
+        )}
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
           <Field label="DNS Zone">
@@ -4200,7 +4223,7 @@ export function AddAddressModal({
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
                 records point to the IP. Withdrawn while the IP is an orphan and
                 back when it is restored; deleted when the IP is purged.
-                {!dnsZoneId && (
+                {!publishZoneId && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
                   </span>
@@ -4259,7 +4282,7 @@ export function AddAddressModal({
                     { name: "", record_type: "CNAME" },
                   ])
                 }
-                disabled={!hostname || !dnsZoneId}
+                disabled={!hostname || !publishZoneId}
                 className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
               >
                 <Plus className="h-3 w-3" /> Add alias
