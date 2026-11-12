@@ -25,7 +25,7 @@ Two entry points are exported:
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Annotated, NoReturn
 from uuid import UUID
 
@@ -999,7 +999,11 @@ def require_any_resource_permission(
         for rt in resource_types:
             if any(user_has_permission(current_user, a, rt) for a in actions):
                 return current_user
-            if admit_scoped and any(has_any_grant_for(current_user, a, rt) for a in actions):
+            if (
+                admit_scoped
+                and any(has_any_grant_for(current_user, a, rt) for a in actions)
+                and _token_covers_type(current_user, actions, rt)
+            ):
                 return current_user
         first = resource_types[0] if resource_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
@@ -1010,6 +1014,16 @@ def require_any_resource_permission(
 
     _dep.spatium_requires = ("method", list(resource_types))  # type: ignore[attr-defined]
     return _dep
+
+
+def _token_covers_type(user: User, actions: Iterable[str], resource_type: str) -> bool:
+    """A resource-scoped API token (#374) may only narrow its owner, so the
+    coarse ``admit_scoped`` gate must not admit one whose own grants cover none
+    of the actions on the type (``has_any_grant_for`` reads the owner alone)."""
+    grants = _token_grants_for(user)
+    if not grants:
+        return True
+    return any(_token_grants_allow(grants, a, resource_type, None) for a in actions)
 
 
 def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
