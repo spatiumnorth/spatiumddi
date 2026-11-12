@@ -1546,6 +1546,7 @@ export interface TemplateReapplyAllResponse {
   instances_processed: number;
   instances_skipped: number;
   cap_reached: boolean;
+  skipped: { target_id: string; network: string; reason: string }[];
 }
 
 export const ipamApi = {
