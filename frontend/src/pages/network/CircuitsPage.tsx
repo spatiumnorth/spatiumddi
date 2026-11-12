@@ -883,8 +883,10 @@ export function CircuitsPage() {
                         setProviderFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New circuit" to add one.`}
                     >
-                      No circuits yet — click "New circuit" to add one.
+                      No circuits yet.
                     </ListEmpty>
                   </td>
                 </tr>
