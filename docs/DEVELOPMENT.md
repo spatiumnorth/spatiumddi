@@ -852,6 +852,31 @@ multi-arch fan-out happens in CI on a tagged release.
   behavioral change.
 - **Add a changelog fragment; don't edit `CHANGELOG.md`.** See below.
 
+### Release branches
+
+While `main` is frozen for a release candidate, work for the next releases
+goes on long-lived `release/X.Y.Z` branches (#3948), for example
+`release/1.0.1` and `release/1.1.0`:
+
+- **Target the branch of the release the issue is milestoned for.** Branch
+  `issue-NNN` off `release/X.Y.Z` instead of `main`, and open the PR against
+  it. CI runs the same checks as for `main`, and the PR takes the `X.Y.Z`
+  milestone automatically.
+- **Tags stay on `main`.** `release.yml` publishes only a tag on `main`, so a
+  release branch is merged into `main` (a merge commit, not a squash, so its
+  history stays) once the release before it has shipped, and the release is
+  tagged there.
+- **Keep the branches current.** Merge `main` into each release branch after
+  every release-candidate fix, and `release/1.0.1` into `release/1.1.0`, so
+  the final merge into `main` is small and every fix reaches the later
+  release.
+- **Alembic heads.** When a merge brings migrations from both sides, the
+  result has two heads and CI fails. Re-point the `down_revision` of the
+  first migration the incoming side added at the other side's head, in the
+  merge commit.
+- **Changelog fragments** come along with the merge; release prep folds them
+  as usual.
+
 ### Changelog fragments
 
 Every PR used to add its entry at the top of `### Fixed` under
