@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -413,7 +414,7 @@ export function NATPage() {
     [kindFilter, search, page],
   );
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["nat-mappings", params],
     queryFn: () => natApi.list(params),
     placeholderData: (prev) => prev,
@@ -517,7 +518,9 @@ export function NATPage() {
             <p className="px-4 py-6 text-sm text-muted-foreground">Loading…</p>
           ) : items.length === 0 ? (
             <p className="px-4 py-6 text-sm text-muted-foreground">
-              No NAT mappings match the current filters.
+              <ListEmpty error={error} what="NAT mappings">
+                No NAT mappings match the current filters.
+              </ListEmpty>
             </p>
           ) : (
             <table className="w-full text-sm">

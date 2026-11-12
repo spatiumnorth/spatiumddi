@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Router as RouterIcon,
@@ -102,6 +103,7 @@ export function VLANsPage() {
     data: routers = [],
     isLoading,
     isFetching,
+    error: routersError,
   } = useQuery({
     queryKey: ["vlans", "routers"],
     queryFn: vlansApi.listRouters,
@@ -166,7 +168,9 @@ export function VLANsPage() {
           )}
           {!isLoading && routers.length === 0 && (
             <p className="text-xs text-muted-foreground italic px-2 py-4">
-              No routers yet. Click + to add one.
+              <ListEmpty error={routersError} what="routers">
+                No routers yet. Click + to add one.
+              </ListEmpty>
             </p>
           )}
           {routers.map((r) => (

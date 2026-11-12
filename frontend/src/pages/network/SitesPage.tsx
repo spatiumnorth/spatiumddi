@@ -572,11 +572,14 @@ function SiteTreeRow({
 
 function SiteTreeView({
   sites,
+  listError,
   onEdit,
   onMove,
   onDelete,
 }: {
   sites: SiteRead[];
+  /** The list query's error, so a refused read isn't drawn as an empty tree. */
+  listError?: unknown;
   onEdit: (s: SiteRead) => void;
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
@@ -686,7 +689,9 @@ function SiteTreeView({
         <div className="divide-y rounded-lg border text-sm">
           {roots.length === 0 ? (
             <p className="px-3 py-6 text-center text-muted-foreground">
-              No sites yet — click “New site” to add one.
+              <ListEmpty error={listError} what="sites">
+                No sites yet — click “New site” to add one.
+              </ListEmpty>
             </p>
           ) : (
             roots.map((s) => (
@@ -968,6 +973,7 @@ export function SitesPage() {
           ) : (
             <SiteTreeView
               sites={allSites}
+              listError={allSitesQuery.error}
               onEdit={(s) => setEditing(s)}
               onMove={(s) => setMoving(s)}
               onDelete={askDelete}
