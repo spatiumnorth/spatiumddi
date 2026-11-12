@@ -72,3 +72,40 @@ async def test_offset_pages_past_limit_and_total_counts_every_match(
 
     all_states = await client.get("/api/v1/alerts/events?limit=1", headers=h)
     assert all_states.headers["x-total-count"] == "7"
+
+
+async def test_mcp_list_alerts_offset_pages(db_session: AsyncSession) -> None:
+    from app.services.ai.tools.network import ListAlertsArgs, list_alerts
+
+    rule = AlertRule(
+        name="r2",
+        description="",
+        rule_type="subnet_utilization",
+        severity="info",
+        enabled=True,
+        threshold_percent=0,
+    )
+    db_session.add(rule)
+    await db_session.flush()
+    now = datetime.now(UTC)
+    for i in range(4):
+        db_session.add(
+            AlertEvent(
+                rule_id=rule.id,
+                subject_type="subnet",
+                subject_id=str(i),
+                severity="info",
+                message=f"m{i}",
+                fired_at=now - timedelta(minutes=i),
+            )
+        )
+    await db_session.flush()
+    user = User(
+        username="mcp-u",
+        email="mcp@example.test",
+        display_name="M",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    page2 = await list_alerts(db_session, user, ListAlertsArgs(limit=2, offset=2))
+    assert [e["subject_id"] for e in page2] == ["2", "3"]
