@@ -773,3 +773,81 @@ def test_spool_module_byte_identical_to_dns_agent():
     if not dns.exists():
         pytest.skip("DNS agent not present in this checkout")
     assert here.read_bytes() == dns.read_bytes()
+
+
+# ── #3782 — the backlog the spool cannot see ─────────────────────────
+
+
+def test_unread_lease_file_and_inflight_batch_are_reported_as_pending_3782(
+    agent_cfg, cp, clock, tmp_path
+):
+    """While the tailer is blocked in a slow post the on-disk spool is empty;
+    the events in that post, and the ones still unread in Kea's CSV, must show
+    up in the pending report."""
+    ips = [f"10.9.{i // 200}.{i % 200 + 1}" for i in range(600)]
+    w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), FakeKea(), clock)
+    assert w.pending_status() == {
+        "pending_events": 0,
+        "pending_oldest_at": None,
+        "unread_bytes": 0,
+    }
+
+    agent_cfg.kea_lease_file.write_text(_csv_rows(ips))
+    unread = w.pending_status()
+    assert unread["pending_events"] == 0
+    assert unread["unread_bytes"] == agent_cfg.kea_lease_file.stat().st_size
+
+    seen: list[dict] = []
+
+    real_poster = w._poster
+
+    def slow_post(payload):
+        seen.append(w.pending_status())
+        return real_poster(payload)
+
+    slow_post.last_duplicate = False  # type: ignore[attr-defined]
+    w._poster = slow_post  # type: ignore[assignment]
+    w.tick()
+    # A post in flight saw its own batch as pending even though the on-disk
+    # spool was empty, and the whole file had already been read.
+    busiest = max(seen, key=lambda r: r["pending_events"])
+    assert busiest["pending_events"] >= 100
+    assert busiest["pending_oldest_at"] is not None
+    assert busiest["unread_bytes"] == 0
+    assert len(w._shipper.spool) == 0  # the spool really did read empty
+    # Everything delivered: the report drains back to zero.
+    assert w.pending_status()["pending_events"] == 0
+    assert w.pending_status()["pending_oldest_at"] is None
+
+
+def test_heartbeat_folds_pending_into_the_spool_report_3782(agent_cfg, tmp_path, monkeypatch):
+    mgr = SpoolManager(tmp_path, total_bytes=1000)
+    mgr.declare("lease_events", 1.0)
+    mgr.get("lease_events")
+    hb = HeartbeatClient(agent_cfg, ["tok"], spool_manager=mgr)
+    hb.pending_provider = lambda: {
+        "pending_events": 2400,
+        "pending_oldest_at": "2026-11-08T10:00:00+00:00",
+        "unread_bytes": 4096,
+    }
+    monkeypatch.setattr(hb, "_kea_version", lambda: None)
+    sent: list[dict] = []
+
+    class _C:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, path, json, headers):
+            sent.append(dict(json))
+            return _Resp(200, {})
+
+    monkeypatch.setattr(hb, "_client", lambda: _C())
+    hb.send_once()
+    spool = sent[0]["spool"]
+    assert spool["entries"] == 0  # the on-disk spool is genuinely empty
+    assert spool["pending_events"] == 2400
+    assert spool["streams"]["lease_events"]["pending_events"] == 2400
+    assert spool["streams"]["lease_events"]["unread_bytes"] == 4096

@@ -62,6 +62,13 @@ class SpoolStreamStatus(BaseModel):
     expired_entries_total: int = Field(default=0, ge=0)
     rejected_entries_total: int = Field(default=0, ge=0)
     write_failures_total: int = Field(default=0, ge=0)
+    # #3782 — events the agent has read but neither delivered nor spooled, and
+    # lease-file bytes it has not read yet because it is busy posting. None =
+    # the agent does not report them (older agent, or a stream with no such
+    # buffer): unknown, never 0.
+    pending_events: int | None = Field(default=None, ge=0)
+    pending_oldest_at: datetime | None = None
+    unread_bytes: int | None = Field(default=None, ge=0)
 
 
 class SpoolStatus(BaseModel):
@@ -78,6 +85,13 @@ class SpoolStatus(BaseModel):
     trimmed_bytes_total: int = Field(default=0, ge=0)
     last_trim_at: datetime | None = None
     expired_entries_total: int = Field(default=0, ge=0)
+    # #3782 — events the agent has read but neither delivered nor spooled, and
+    # lease-file bytes it has not read yet because it is busy posting. None =
+    # the agent does not report them (older agent, or a stream with no such
+    # buffer): unknown, never 0.
+    pending_events: int | None = Field(default=None, ge=0)
+    pending_oldest_at: datetime | None = None
+    unread_bytes: int | None = Field(default=None, ge=0)
     streams: dict[_StreamName, SpoolStreamStatus] = Field(
         default_factory=dict, max_length=_MAX_STREAMS
     )

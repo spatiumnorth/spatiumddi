@@ -208,6 +208,14 @@ class LeaseWatcher:
         self._pending: list[dict[str, Any]] = []
         # #1141 — v6 events, batched apart from v4 (see the module docstring).
         self._pending_v6: list[dict[str, Any]] = []
+        # #3782 — events already read from Kea's CSV but not yet delivered or
+        # spooled: ``_pending`` plus the slice a flush has taken out of it and
+        # is posting right now. The on-disk spool counts none of them, so a
+        # watcher blocked in a slow POST read as an empty spool while the
+        # lease files grew unread behind it. ``_oldest_pending_at`` is the wall
+        # clock of the oldest such event (None = nothing waiting).
+        self._inflight = 0
+        self._oldest_pending_at: float | None = None
         self._last_flush = time.monotonic()
         self._last_drain = 0.0
         # Read offset per tailed file (v4 and v6 CSVs rotate independently).
@@ -246,6 +254,31 @@ class LeaseWatcher:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def pending_status(self) -> dict[str, Any]:
+        """What the spool cannot see (#3782), for the heartbeat's ``spool``.
+
+        ``pending_events`` are read but undelivered and unspooled;
+        ``unread_bytes`` are still in Kea's lease CSVs because the tailer is
+        busy posting; ``pending_oldest_at`` dates the oldest event in memory.
+        """
+        unread = 0
+        for path in (self.cfg.kea_lease_file, self.cfg.kea_lease_file_v6):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            offset = self._offsets.get(path, 0)
+            unread += size if size < offset else size - offset
+        events = len(self._pending) + len(self._pending_v6) + self._inflight
+        oldest = self._oldest_pending_at if events else None
+        return {
+            "pending_events": events,
+            "pending_oldest_at": (
+                datetime.fromtimestamp(oldest, tz=timezone.utc).isoformat() if oldest else None
+            ),
+            "unread_bytes": unread,
+        }
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -313,7 +346,11 @@ class LeaseWatcher:
                 # Sent, or durably queued behind the backlog — either way no
                 # longer this process's to lose.
                 setattr(self, attr, pending[len(batch) :])
-                outcome = self._shipper.ship({"leases": batch})
+                self._inflight = len(batch)
+                try:
+                    outcome = self._shipper.ship({"leases": batch})
+                finally:
+                    self._inflight = 0
                 if outcome == SENT:
                     log.info("lease_events_flushed", count=len(batch))
             else:
@@ -325,6 +362,8 @@ class LeaseWatcher:
                 if outcome == RETRY:
                     break
                 setattr(self, attr, pending[len(batch) :])
+        if not (self._pending or self._pending_v6):
+            self._oldest_pending_at = None
 
     def _maybe_drain(self) -> None:
         if not len(self._shipper.spool):
@@ -390,6 +429,8 @@ class LeaseWatcher:
                     setattr(self, attr, pending[drop:])
                     log.warning("lease_events_buffer_trimmed", dropped=drop)
                 getattr(self, attr).append(evt)
+                if self._oldest_pending_at is None:
+                    self._oldest_pending_at = time.time()
             if len(getattr(self, attr)) >= _BATCH_MAX_EVENTS and self._shipper.spool.enabled:
                 self._flush()
 

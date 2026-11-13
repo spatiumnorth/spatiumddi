@@ -16,6 +16,17 @@ export type SpoolState =
   | { kind: "none" }
   /** Queued pushes the control plane has not received yet. */
   | { kind: "backlog"; bytes: number; entries: number; oldestAt: string | null }
+  /**
+   * #3782 — the on-disk spool is empty but the agent holds events it has not
+   * delivered (in memory, or still unread in Kea's lease file). The lag an
+   * operator cares about sits here during a busy spell.
+   */
+  | {
+      kind: "pending";
+      events: number;
+      unreadBytes: number;
+      oldestAt: string | null;
+    }
   /** The spool hit its cap and dropped data within the last 24 h. */
   | {
       kind: "trimmed";
@@ -55,6 +66,16 @@ export function spoolState(
       bytes: status.bytes,
       entries: status.entries ?? 0,
       oldestAt: status.oldest_at,
+    };
+  }
+  const events = status.pending_events ?? 0;
+  const unread = status.unread_bytes ?? 0;
+  if (events > 0 || unread > 0) {
+    return {
+      kind: "pending",
+      events,
+      unreadBytes: unread,
+      oldestAt: status.pending_oldest_at ?? null,
     };
   }
   return { kind: "none" };
