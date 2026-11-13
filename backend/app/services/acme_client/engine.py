@@ -53,6 +53,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
+from app.core.safe_fetch import GuardedTransport
+
 logger = structlog.get_logger(__name__)
 
 # CA directory URLs. Staging issues untrusted certs but has far higher
@@ -86,6 +88,28 @@ class ACMEProtocolError(Exception):
 
 
 # ── base64url helpers (no padding, per JOSE) ────────────────────────
+
+
+_NOT_ACME_MESSAGE = "the server did not answer like an ACME CA"
+_ACME_ERROR_URN_PREFIX = "urn:ietf:params:acme:error:"
+
+
+def _require_https_url(value: object, what: str) -> str:
+    """A URL the CA hands back (or the configured directory) must be https."""
+    if not isinstance(value, str) or not value.lower().startswith("https://"):
+        raise ACMEProtocolError(f"ACME {what} URL is missing or is not an https:// URL")
+    return value
+
+
+def _problem_summary(problem: dict[str, Any]) -> str:
+    """Text for an error answer. Only an RFC 8555 problem document (type is an
+    ACME error URN) is quoted; anything else gets a fixed message, so a
+    response body from a non-CA host never lands in a stored error."""
+    ptype = problem.get("type")
+    if not isinstance(ptype, str) or not ptype.startswith(_ACME_ERROR_URN_PREFIX):
+        return _NOT_ACME_MESSAGE
+    detail = problem.get("detail")
+    return str(detail)[:300] if isinstance(detail, str) and detail else ptype
 
 
 def generate_account_key_pem() -> str:
@@ -246,7 +270,12 @@ class ACMEClient:
         self._eab_hmac_b64 = eab_hmac_b64
         self._directory: dict[str, Any] | None = None
         self._nonce: str | None = None
+        # Every connection resolves the host itself, refuses a loopback /
+        # link-local / metadata answer and dials the address it checked.
+        # RFC 1918 stays reachable: a private CA on an internal address is a
+        # normal deployment.
         self._http = httpx.AsyncClient(
+            transport=GuardedTransport(label="acme"),
             timeout=_HTTP_TIMEOUT,
             headers={"User-Agent": "spatiumddi-acme-client/1 (+https://www.spatiumddi.com)"},
         )
@@ -276,18 +305,25 @@ class ACMEClient:
 
     async def _get_directory(self) -> dict[str, Any]:
         if self._directory is None:
+            _require_https_url(self.directory_url, "directory")
             resp = await self._http.get(self.directory_url)
             if resp.status_code != 200:
                 raise ACMEProtocolError(
                     f"directory fetch failed: HTTP {resp.status_code}",
                 )
-            self._directory = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                raise ACMEProtocolError(_NOT_ACME_MESSAGE)
+            self._directory = data
         return self._directory
 
     async def _ensure_nonce(self) -> str:
         if self._nonce is None:
             directory = await self._get_directory()
-            new_nonce_url = directory["newNonce"]
+            new_nonce_url = _require_https_url(directory.get("newNonce"), "newNonce")
             resp = await self._http.head(new_nonce_url)
             nonce = resp.headers.get("Replay-Nonce")
             if not nonce:
@@ -341,6 +377,7 @@ class ACMEClient:
         On ``badNonce`` we refresh the nonce once and retry — the RFC
         explicitly allows this and it's common under concurrency.
         """
+        _require_https_url(url, "request")
         nonce = await self._ensure_nonce()
         body = self._build_jws(url, payload, nonce)
         resp = await self._http.post(
@@ -357,8 +394,7 @@ class ACMEClient:
             ):
                 return await self._post(url, payload, _retried=True)
             raise ACMEProtocolError(
-                f"ACME {url} → HTTP {resp.status_code}: "
-                f"{problem.get('detail') or problem.get('type') or resp.text[:300]}",
+                f"ACME {url} → HTTP {resp.status_code}: {_problem_summary(problem)}",
                 problem=problem,
             )
         return resp

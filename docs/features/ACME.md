@@ -399,6 +399,17 @@ operator-uploaded certs use — with `source="letsencrypt"`. The
 This is a **fleet-level** cert (the control plane's Web UI), not a
 per-appliance cert — see *Phase 6* below.
 
+### Directory URL and CA addresses
+
+The ACME client talks only to `https://` URLs: the configured directory URL
+and every URL the CA's directory lists. Before connecting it resolves the host,
+refuses the request if any answer is a loopback, link-local (including the
+cloud-metadata address) or unspecified address, and dials the address it
+checked. Private ranges (RFC 1918 / unique-local) are allowed, so a private CA
+such as step-ca on an internal address works unchanged. A response from a
+server that does not answer with an ACME problem document is reported with a
+fixed message rather than its body.
+
 ### Feature module
 
 The whole surface lives behind the **`security.certificates`**

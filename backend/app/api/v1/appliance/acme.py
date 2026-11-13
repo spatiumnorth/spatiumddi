@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -49,6 +50,7 @@ from app.core.permissions import (
     require_certificate_store,
     user_has_permission,
 )
+from app.core.ssrf import classify_address
 from app.models.acme_client import (
     ACME_CHALLENGE_DNS01,
     ACME_CHALLENGE_HTTP01,
@@ -198,6 +200,12 @@ def _require_https(directory_url: str) -> str:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "directory_url must be an https:// URL",
+        )
+    host = urlsplit(cleaned).hostname or ""
+    if not host or classify_address(host) is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "directory_url must not point at a loopback, link-local or metadata address",
         )
     return cleaned
 
