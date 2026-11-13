@@ -81,6 +81,7 @@ from app.core.session_rotation import (
     request_session_jti,
     resolve_live_session_id,
     revoke_live_sessions,
+    revoke_session_chain,
     rotation_successor,
 )
 from app.models.audit import AuditLog
@@ -299,6 +300,24 @@ def _clear_refresh_cookie(response: Response) -> None:
     response.delete_cookie(_REFRESH_COOKIE, path=_REFRESH_COOKIE_PATH)
 
 
+def _past_absolute_lifetime(session: UserSession, now: datetime) -> bool:
+    """True once ``settings.session_absolute_max_days`` have passed since the
+    sign-in (#1252). ``created_at`` is the sign-in time, carried across
+    rotations, so refreshing never extends this. ``0`` disables it."""
+    max_days = settings.session_absolute_max_days
+    return max_days > 0 and now >= session.created_at + timedelta(days=max_days)
+
+
+def _next_expiry(created_at: datetime, now: datetime) -> datetime:
+    """``expires_at`` for a session rotated at ``now``: the sliding window,
+    clamped to the absolute lifetime (#1252)."""
+    expires = now + timedelta(days=settings.refresh_token_expire_days)
+    max_days = settings.session_absolute_max_days
+    if max_days > 0:
+        expires = min(expires, created_at + timedelta(days=max_days))
+    return expires
+
+
 async def _refresh_session_is_live(db: AsyncSession, session: UserSession, now: datetime) -> bool:
     """Not revoked, not past ``expires_at``, and not idle past the configured
     Session Timeout. ``session`` is already resolved through the rotation
@@ -307,6 +326,7 @@ async def _refresh_session_is_live(db: AsyncSession, session: UserSession, now: 
     return (
         not session.revoked
         and session.expires_at > now
+        and not _past_absolute_lifetime(session, now)
         and not is_idle_expired(session, await get_session_timeout_minutes(db), now)
     )
 
@@ -357,7 +377,7 @@ async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) 
         auth_source=auth_source,
         created_at=now,
         last_seen_at=now,
-        expires_at=now + timedelta(days=settings.refresh_token_expire_days),
+        expires_at=_next_expiry(now, now),
     )
     db.add(session_row)
     await db.flush()  # populate session_row.id before we sign the JWT
@@ -924,6 +944,38 @@ async def login_mfa(
     )
 
 
+async def _revoke_reused_family(db: AsyncSession, request: Request, presented: UserSession) -> None:
+    """Refresh-token reuse detected (#1252): revoke the live end of the
+    rotation chain ``presented`` belongs to and audit it. Commits, because the
+    caller answers 401 and the revocation must not roll back with it."""
+    revoked = await revoke_session_chain(db, presented.id)
+    user = await db.get(User, presented.user_id)
+    db.add(
+        AuditLog(
+            user_id=presented.user_id,
+            user_display_name=user.display_name if user else "",
+            auth_source=presented.auth_source,
+            source_ip=_client_ip(request),
+            user_agent=clean_user_agent(request.headers.get("user-agent")),
+            action="session.refresh_reuse_detected",
+            resource_type="user_session",
+            resource_id=str(presented.id),
+            resource_display=user.username if user else None,
+            result="denied",
+            new_value={
+                "family_revoked": revoked is not None,
+                "revoked_session_id": str(revoked.id) if revoked is not None else None,
+            },
+        )
+    )
+    await db.commit()
+    logger.warning(
+        "refresh_token_reuse_detected",
+        user_id=str(presented.user_id),
+        family_revoked=revoked is not None,
+    )
+
+
 @router.post("/refresh", response_model=RefreshResponse)
 async def refresh_token_endpoint(request: Request, response: Response, db: DB) -> RefreshResponse:
     """Exchange the HttpOnly refresh cookie for a new access token (with
@@ -950,6 +1002,16 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
     # this refresh renews.
     session = await rotation_successor(db, presented, now) if presented is not None else None
     in_grace = session is not None and session is not presented
+    if session is None and presented is not None and presented.rotated_at is not None:
+        # A cookie that was rotated away, presented again after the grace
+        # window: the client that rotated it holds the successor, so this is
+        # a second holder of the cookie, i.e. a copy (RFC 9700 §4.14). Revoke
+        # the live end of the family so neither holder keeps a session, and
+        # leave an audit row; then refuse.
+        await _revoke_reused_family(db, request, presented)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
+        )
     # Expiry and the idle timeout, by the same rule the docs spec route
     # applies (``live_refresh_session``).
     if session is None or not await _refresh_session_is_live(db, session, now):
@@ -1000,7 +1062,7 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
         # refresh says nothing about whether anyone is at the keyboard.
         # Restamping here would reset the idle timeout every 15 minutes.
         last_seen_at=last_activity(session),
-        expires_at=now + timedelta(days=settings.refresh_token_expire_days),
+        expires_at=_next_expiry(session.created_at, now),
     )
     db.add(new_session)
     await db.flush()

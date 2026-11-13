@@ -52,6 +52,21 @@ group membership.
   else.
 - Access token expires in 15 min. Refresh token expires in 7 days
   (`refresh_token_expire_days` default) and rotates on every use.
+- **Absolute session lifetime (#1252).** Refresh slides a session's expiry,
+  so an active session would never end. `session_absolute_max_days` (env
+  `SESSION_ABSOLUTE_MAX_DAYS`, default 30, `0` = off) caps a session at that
+  many days from sign-in: `created_at` is carried across rotations, so
+  refreshing never extends it, and a refresh past it is a 401. It applies to
+  every sign-in path (local, LDAP, RADIUS, TACACS+, OIDC, SAML), which all
+  mint sessions the same way. API tokens are not sessions and are unaffected.
+- **Refresh-token reuse detection (#1252).** Presenting a rotated-away
+  refresh cookie AFTER the grace window below means a second holder of the
+  cookie (RFC 9700 §4.14). The live end of that rotation chain is revoked, so
+  neither holder keeps a session, a `session.refresh_reuse_detected` audit row
+  is written (result `denied`), and the request gets a 401. Inside the grace
+  window it is treated as two tabs racing, not theft. Trade-off: a client
+  that loses a refresh response and retries after more than 10 seconds is
+  signed out and must sign in again.
 - **Rotation grace window (#2941).** The tabs of one browser share the
   refresh cookie, so two tabs can refresh at the same moment with the same
   cookie. For 10 seconds after a rotation (`ROTATION_GRACE` in
