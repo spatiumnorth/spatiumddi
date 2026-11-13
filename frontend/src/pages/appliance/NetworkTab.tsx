@@ -24,6 +24,7 @@ import { Modal } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { usePermissions } from "@/hooks/usePermissions";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Phase 4f — Network & Host info (read-mostly MVP).
@@ -74,9 +75,9 @@ export function NetworkTab() {
       </div>
 
       {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {formatApiError(error)}
-        </div>
+        </FormError>
       )}
 
       {data?.reboot_pending_from_host && <RebootBanner />}
@@ -214,7 +215,9 @@ function VerboseBootCard() {
         })}
       </div>
       {save.isError && (
-        <p className="text-xs text-destructive">{formatApiError(save.error)}</p>
+        <FormError className="text-xs text-destructive">
+          {formatApiError(save.error)}
+        </FormError>
       )}
       {save.isSuccess && (
         <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
