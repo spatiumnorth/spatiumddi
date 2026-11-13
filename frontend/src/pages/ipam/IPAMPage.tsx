@@ -96,6 +96,17 @@ import {
   formatApiError,
   formatDialogError,
 } from "@/lib/api";
+import {
+  ADDRESS_TABLE_DEFAULT_PAGE_SIZE,
+  ADDRESS_TABLE_PAGE_SIZES,
+  buildAddressTableRows,
+  buildTableParams,
+  fetchAddressTablePage,
+  hasPageOnlyFilter,
+  ipStringToInt,
+  type AddressOrPoolRow,
+  type FilterMode,
+} from "@/lib/address-table";
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
@@ -394,17 +405,10 @@ const COUNTABLE_MAX = Number.MAX_SAFE_INTEGER;
 // the quick-filter is active.
 const TREE_GROUP_CAP = 300;
 
-// Max IP rows painted in the per-subnet address table before a
-// "Show N more…" reveal (issue #517). A busy /16 can carry tens of
-// thousands of rows, each wrapped in a ContextMenu + inline-edit cells;
-// mounting them all locks the tab for seconds. The cap bounds the DOM
-// while every filter / select-all / shift-range op still runs over the
-// FULL filtered set (only the *rendering* is windowed).
-const ADDRESS_ROW_CAP = 500;
-
-// Sortable columns for the per-subnet IP table (issue #519). Client-side
-// sort over the already-loaded page; ``null`` = the API's native inet
-// order (which also keeps the DHCP-pool / gap boundary rows meaningful).
+// Sortable columns for the per-subnet IP table (issue #519). Sorted by the
+// server across all pages (``dns`` is derived in the browser, so it orders the
+// page on screen only); ``null`` = the API's native inet order (which also
+// keeps the DHCP-pool / gap boundary rows meaningful).
 type AddressSortKey =
   | "address"
   | "hostname"
@@ -4898,13 +4902,6 @@ function ActionsMenu({
 // subnet IP list. IPv6 pool markers are out of scope until the IPv6
 // allocation story lands.
 
-function ipStringToInt(ip: string): number {
-  const p = ip.split(".").map(Number);
-  if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255))
-    return NaN;
-  return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
-}
-
 // Parse a dotted IPv4 quad to its 32-bit BigInt value, or null if malformed.
 function ipv4ToBigInt(ip: string): bigint | null {
   const parts = ip.split(".");
@@ -4993,33 +4990,79 @@ function intToIpv4(n: number): string {
   ].join(".");
 }
 
-type PoolMeta = {
-  id: string;
-  name: string;
-  pool_type: string;
-  start_ip: string;
-  end_ip: string;
-  _start: number;
-  _end: number;
-};
-
-type AddressOrPoolRow =
-  | { kind: "ip"; addr: IPAddress }
-  | {
-      kind: "pool-boundary";
-      pool: PoolMeta;
-      boundary: "start" | "end";
-    }
-  // Visual marker between two non-adjacent IPAM rows (eg .10 and .12,
-  // showing .11 is unallocated). Subtle by design — it's a heads-up
-  // for "you deleted something and might have missed the hole", not
-  // a primary navigation aid. Skipped inside dynamic DHCP pools where
-  // gaps are owned by the DHCP server and aren't operator-allocatable.
-  | {
-      kind: "gap";
-      startIpInt: number;
-      endIpInt: number;
-    };
+// Pager for the subnet address table (#1256). Not drawn for a subnet that fits
+// the first page, so a small subnet looks as it always did.
+function AddressPager({
+  total,
+  pageIndex,
+  pageSize,
+  onPage,
+  onPageSize,
+  pageOnlyFilter,
+}: {
+  total: number;
+  pageIndex: number;
+  pageSize: number;
+  onPage: (i: number) => void;
+  onPageSize: (n: number) => void;
+  pageOnlyFilter: boolean;
+}) {
+  if (total <= pageSize && pageIndex === 0) return null;
+  const first = total === 0 ? 0 : pageIndex * pageSize + 1;
+  const last = Math.min(total, (pageIndex + 1) * pageSize);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const btn =
+    "rounded-md border bg-background px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-40";
+  return (
+    <div
+      className="mb-2 flex flex-wrap items-center gap-2 px-1 text-xs text-muted-foreground"
+      data-testid="address-pager"
+    >
+      <span>
+        {first.toLocaleString()}–{last.toLocaleString()} of{" "}
+        {total.toLocaleString()}
+      </span>
+      <button
+        type="button"
+        className={btn}
+        disabled={pageIndex === 0}
+        onClick={() => onPage(pageIndex - 1)}
+      >
+        Previous
+      </button>
+      <span>
+        Page {pageIndex + 1} of {pages.toLocaleString()}
+      </span>
+      <button
+        type="button"
+        className={btn}
+        disabled={pageIndex + 1 >= pages}
+        onClick={() => onPage(pageIndex + 1)}
+      >
+        Next
+      </button>
+      <label className="ml-auto flex items-center gap-1">
+        Rows per page
+        <select
+          value={pageSize}
+          onChange={(e) => onPageSize(Number(e.target.value))}
+          className="rounded border bg-background px-1 py-0.5 text-xs"
+        >
+          {ADDRESS_TABLE_PAGE_SIZES.map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
+      </label>
+      {pageOnlyFilter && (
+        <span className="basis-full">
+          The DNS filter applies to the rows on this page only.
+        </span>
+      )}
+    </div>
+  );
+}
 
 // ─── Subnet Detail Panel (right pane) ────────────────────────────────────────
 
@@ -5306,7 +5349,6 @@ export function SubnetDetail({
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
 
-  type FilterMode = "contains" | "begins" | "ends" | "regex";
   const [colFilters, setColFilters] = useState({
     address: "",
     hostname: "",
@@ -5331,9 +5373,15 @@ export function SubnetDetail({
   const [sortState, setSortState] = useState<AddressSortState | null>(null);
   const onSort = (key: AddressSortKey) =>
     setSortState((prev) => cycleSort(prev, key));
-  // Row-window reveal (issue #517) — the table paints at most
-  // ADDRESS_ROW_CAP rows until the operator opts into the full list.
-  const [showAllAddressRows, setShowAllAddressRows] = useState(false);
+  // Paging (#1256): the server filters, sorts and windows the list; the table
+  // holds one page. The page index is stored with the query it belongs to, so
+  // any change of filter / sort / page size reads as page 0 without an effect.
+  const [pageSize, setPageSize] = useState<number>(
+    ADDRESS_TABLE_DEFAULT_PAGE_SIZE,
+  );
+  const [pageState, setPageState] = useState({ key: "", index: 0 });
+  const [selectingAll, setSelectingAll] = useState(false);
+  const [selectAllError, setSelectAllError] = useState<string | null>(null);
   // #517: render EITHER the mobile card list OR the desktop table — never
   // both. Previously both were always in the DOM (one CSS-hidden), doubling
   // the mounted element count on a busy subnet. Matches the ``sm`` (640px)
@@ -5357,13 +5405,31 @@ export function SubnetDetail({
     setAddressTagFilters([]);
     setSelectedIpIds(new Set());
     setSortState(null);
-    setShowAllAddressRows(false);
+    setPageState({ key: "", index: 0 });
+    setSelectAllError(null);
   }, [subnet.id]);
 
-  const { data: addresses, isLoading } = useQuery({
-    queryKey: ["addresses", subnet.id],
-    queryFn: () => ipamApi.listAddresses(subnet.id),
+  const tableFilterState = {
+    colFilters,
+    filterModes,
+    tagChips: addressTagFilters,
+    sort: sortState,
+  };
+  const serverParams = buildTableParams(tableFilterState);
+  const pageKey = JSON.stringify([serverParams, pageSize]);
+  const pageIndex = pageState.key === pageKey ? pageState.index : 0;
+  const setPageIndex = (i: number) => setPageState({ key: pageKey, index: i });
+  const { data: pageData, isLoading } = useQuery({
+    queryKey: ["addresses", subnet.id, "table", pageKey, pageIndex],
+    queryFn: () =>
+      fetchAddressTablePage(subnet.id, serverParams, pageIndex, pageSize),
+    // Keep the old page on screen while the next one loads, so the filter
+    // inputs (and the focus in them) survive a keystroke.
+    placeholderData: (prev) => prev,
   });
+  const addresses = pageData?.rows;
+  const totalMatching = pageData?.total ?? 0;
+  const isLastPage = (pageIndex + 1) * pageSize >= totalMatching;
 
   // Per-IP DNS sync state derived from the same drift report the sync modal
   // uses. Refreshed alongside addresses; stale-while-revalidate is fine since
@@ -5499,302 +5565,111 @@ export function SubnetDetail({
     });
   }
 
-  function applyFilter(
-    value: string,
-    filter: string,
-    mode: FilterMode = "contains",
-  ): boolean {
-    if (!filter) return true;
-    const v = value.toLowerCase();
-    const f = filter.toLowerCase();
-    if (mode === "begins") return v.startsWith(f);
-    if (mode === "ends") return v.endsWith(f);
-    if (mode === "regex") {
-      try {
-        return new RegExp(filter, "i").test(value);
-      } catch {
-        return true;
-      }
-    }
-    return v.includes(f);
-  }
-
-  // #517: memoize the filtered list so a keystroke in an unrelated field
-  // (or any parent re-render) doesn't re-scan every address. Keyed on the
-  // raw list + the filter inputs + the DNS drift report (which drives the
-  // ``dns`` column filter via ``ipDnsState``).
+  // The column filters other than ``dns`` are applied by the server (#1256),
+  // so ``addresses`` is already the matching page. The DNS-state filter is
+  // derived from the drift report, which only the browser has: it narrows the
+  // rows of the page on screen.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const filteredAddresses = useMemo(
     () =>
-      addresses?.filter((a) => {
-        const cf = colFilters;
-        const fm = filterModes;
-        if (!applyFilter(a.address, cf.address, fm.address)) return false;
-        if (!applyFilter(a.hostname ?? "", cf.hostname, fm.hostname))
-          return false;
-        // MAC column filters either the MAC itself (with punctuation stripped
-        // so ``00:11`` and ``0011`` both match) or the OUI vendor name, so
-        // "apple" / "cisco" work when the operator knows the maker but not
-        // the prefix. Vendor only matches when OUI lookup is enabled and the
-        // row carries a vendor value.
-        const macNorm = (a.mac_address ?? "").replace(/[:\-.]/g, "");
-        const macFilter = cf.mac.replace(/[:\-.]/g, "");
-        const macHit = applyFilter(macNorm, macFilter, fm.mac);
-        const vendorHit = applyFilter(a.vendor ?? "", cf.mac, fm.mac);
-        if (cf.mac && !macHit && !vendorHit) return false;
-        if (!applyFilter(a.description ?? "", cf.description, fm.description))
-          return false;
-        if (cf.tags) {
-          // Tag filter matches either `key`, `value`, or `key=value`. Clicking a
-          // chip in the row fills in the exact `key=value` form for an exact hit.
-          const t = (a.tags as Record<string, unknown> | null) ?? {};
-          const entries = Object.entries(t).map(
-            ([k, v]) => `${k}=${v == null ? "" : String(v)}`,
-          );
-          const hay = [
-            ...Object.keys(t),
-            ...Object.values(t).map((v) => (v == null ? "" : String(v))),
-            ...entries,
-          ].join("\n");
-          if (!applyFilter(hay, cf.tags, fm.tags)) return false;
-        }
-        if (
-          addressTagFilters.length > 0 &&
-          !matchesAllTagChips(
-            (a.tags as Record<string, unknown> | null) ?? {},
-            addressTagFilters,
-          )
-        )
-          return false;
-        if (cf.status && a.status !== cf.status) return false;
-        if (cf.dns && ipDnsState(a) !== cf.dns) return false;
-        return true;
-      }),
-    [
-      addresses,
-      colFilters,
-      filterModes,
-      addressTagFilters,
-      dnsDrift,
-      subnetHasDnsZone,
-    ],
+      colFilters.dns
+        ? addresses?.filter((a) => ipDnsState(a) === colFilters.dns)
+        : addresses,
+    [addresses, colFilters.dns, dnsDrift, subnetHasDnsZone],
   );
   const hasActiveFilter =
     Object.values(colFilters).some(Boolean) || addressTagFilters.length > 0;
 
-  // #519: apply the client-side column sort. ``null`` keeps the API's
-  // native inet order (the default, and the only order in which the
-  // pool-boundary + gap marker rows below make sense).
+  // The DNS column's state is browser-derived too, so sorting on it orders the
+  // page on screen; every other column is sorted by the server.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sortedAddresses = useMemo(() => {
-    if (!filteredAddresses || !sortState) return filteredAddresses;
-    const { key, dir } = sortState;
-    const mul = dir === "asc" ? 1 : -1;
-    const strOf = (a: IPAddress): string => {
-      switch (key) {
-        case "hostname":
-          return (a.fqdn || a.hostname || "").toLowerCase();
-        case "mac":
-          return (a.mac_address || a.vendor || "").toLowerCase();
-        case "description":
-          return (a.description || "").toLowerCase();
-        case "status":
-          return a.status || "";
-        case "dns":
-          return ipDnsState(a);
-        default:
-          return "";
-      }
-    };
-    // Precompute one sort key per row so the comparator does no parsing
-    // (``Date.parse`` / ``ipStringToInt``) — O(n) key extraction instead of
-    // the O(n log n) parsing a comparator-side parse would cost on a large
-    // subnet. ``num`` carries the numeric key (last_seen epoch / address int,
-    // NaN for a non-v4 address), ``str`` the string key.
-    const decorated = filteredAddresses.map((addr) => {
-      let num: number | null = null;
-      let str = "";
-      if (key === "last_seen") {
-        num = addr.last_seen_at ? Date.parse(addr.last_seen_at) : null;
-      } else if (key === "address") {
-        const ai = ipStringToInt(String(addr.address));
-        num = Number.isFinite(ai) ? ai : NaN;
-        str = String(addr.address);
-      } else {
-        str = strOf(addr);
-      }
-      return { addr, num, str };
-    });
-    // Directional compare (a<b ⇒ negative). ``last_seen`` nulls always
-    // sort last irrespective of direction (handled before the mul).
-    decorated.sort((a, b) => {
-      if (key === "last_seen") {
-        if (a.num === null && b.num === null) return 0;
-        if (a.num === null) return 1;
-        if (b.num === null) return -1;
-        return mul * (a.num - b.num);
-      }
-      if (key === "address") {
-        if (Number.isFinite(a.num) && Number.isFinite(b.num))
-          return mul * ((a.num as number) - (b.num as number));
-        return mul * a.str.localeCompare(b.str);
-      }
-      return mul * a.str.localeCompare(b.str);
-    });
-    return decorated.map((d) => d.addr);
+    if (!filteredAddresses || sortState?.key !== "dns")
+      return filteredAddresses;
+    const mul = sortState.dir === "asc" ? 1 : -1;
+    return [...filteredAddresses].sort(
+      (a, b) => mul * ipDnsState(a).localeCompare(ipDnsState(b)),
+    );
   }, [filteredAddresses, sortState, dnsDrift, subnetHasDnsZone]);
 
-  // Interleave DHCP pool boundary markers with the IP rows so the user
-  // can see where a pool begins / ends, even when no IPs are assigned
-  // inside it yet. Dynamic pools are the important case (they can't be
-  // manually allocated); static / excluded pools are shown for parity.
-  // IPv4-only — matches the existing ``ipPoolInfo`` helper.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const tableRows = useMemo<AddressOrPoolRow[]>(() => {
-    if (!sortedAddresses) return [] as AddressOrPoolRow[];
-    // Under a custom column sort the inet-order-dependent pool-boundary
-    // and gap marker rows no longer make sense, so render a plain list of
-    // IP rows (pool membership still shows per-row via ``ipPoolInfo``).
-    if (sortState) {
-      const flat = sortedAddresses.map(
-        (addr) => ({ kind: "ip", addr }) as AddressOrPoolRow,
-      );
-      return hideReserved
-        ? flat.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr))
-        : flat;
-    }
-    const rows: AddressOrPoolRow[] = [];
-    const sortedPools = [...allPools]
-      .map((p) => ({
-        ...p,
-        _start: ipStringToInt(p.start_ip),
-        _end: ipStringToInt(p.end_ip),
-      }))
-      .filter((p) => Number.isFinite(p._start) && Number.isFinite(p._end))
-      .sort((a, b) => a._start - b._start);
-
-    const started = new Set<string>();
-    const ended = new Set<string>();
-
-    // Emit every pool-boundary marker that resolves at or before ``ipInt``,
-    // interleaved by the marker's own IP position. When several pools resolve
-    // at the same address crossing (e.g. two dynamic pools with no allocated
-    // IP between them), emitting all starts then all ends would render
-    // ``START a, START b, END a, END b``; sorting the events by position keeps
-    // it ``START a, END a, START b, END b`` — each pool's END precedes the next
-    // pool's START. (Since ``_start <= _end`` for a pool, its start always
-    // sorts before its end, so a pool opened in this same batch is closed in
-    // order too.)
-    const emitBoundariesUpTo = (ipInt: number) => {
-      type BoundaryEvent = {
-        pos: number;
-        pool: (typeof sortedPools)[number];
-        boundary: "start" | "end";
-      };
-      const events: BoundaryEvent[] = [];
-      for (const p of sortedPools) {
-        if (!started.has(p.id) && p._start <= ipInt) {
-          events.push({ pos: p._start, pool: p, boundary: "start" });
-        }
-        if (!ended.has(p.id) && p._end < ipInt) {
-          events.push({ pos: p._end, pool: p, boundary: "end" });
-        }
-      }
-      events.sort((a, b) =>
-        a.pos !== b.pos ? a.pos - b.pos : a.boundary === "end" ? -1 : 1,
-      );
-      for (const e of events) {
-        rows.push({
-          kind: "pool-boundary",
-          pool: e.pool,
-          boundary: e.boundary,
-        });
-        if (e.boundary === "start") started.add(e.pool.id);
-        else ended.add(e.pool.id);
-      }
-    };
-
-    // Helper for the gap detector: a gap fully inside a dynamic pool
-    // is suppressed because those slots belong to the DHCP server, not
-    // to IPAM allocation. Reserved/excluded pools still surface gaps
-    // since the operator can manually allocate inside them.
-    const gapInsideDynamicPool = (s: number, e: number) =>
-      sortedPools.some(
-        (p) => p.pool_type === "dynamic" && p._start <= s && e <= p._end,
-      );
-
-    let prevIpInt: number | null = null;
-    for (const addr of sortedAddresses) {
-      const ipInt = ipStringToInt(String(addr.address));
-      if (!Number.isFinite(ipInt)) {
-        rows.push({ kind: "ip", addr });
-        prevIpInt = null;
-        continue;
-      }
-      emitBoundariesUpTo(ipInt);
-
-      // Gap detection between the previous IP and this one. Skipped
-      // when a pool boundary just got emitted (the boundary already
-      // signals the discontinuity) or when the gap falls inside a
-      // dynamic pool (DHCP-owned, not operator-allocatable).
-      //
-      // Also skipped whenever a filter is active: gaps are computed from the
-      // *filtered* list, so a filter that hides allocated rows would fabricate
-      // a clickable "N free" range over addresses that are actually in use —
-      // and the allocate modal it opens would then collide (#501).
-      if (
-        !hasActiveFilter &&
-        !hideFreeRanges &&
-        prevIpInt !== null &&
-        ipInt - prevIpInt > 1
-      ) {
-        const lastWasPool = rows[rows.length - 1]?.kind === "pool-boundary";
-        const gapStart = prevIpInt + 1;
-        const gapEnd = ipInt - 1;
-        if (!lastWasPool && !gapInsideDynamicPool(gapStart, gapEnd)) {
-          rows.push({ kind: "gap", startIpInt: gapStart, endIpInt: gapEnd });
-        }
-      }
-
-      rows.push({ kind: "ip", addr });
-      prevIpInt = ipInt;
-    }
-    // Close out any pools still open, then emit markers for pools that
-    // sit entirely past the last assigned IP so the range is still
-    // visible.
-    for (const p of sortedPools) {
-      if (started.has(p.id) && !ended.has(p.id)) {
-        rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
-        ended.add(p.id);
-      }
-    }
-    for (const p of sortedPools) {
-      if (!started.has(p.id)) {
-        rows.push({ kind: "pool-boundary", pool: p, boundary: "start" });
-        rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
-      }
-    }
-    if (hideReserved)
-      return rows.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr));
-    return rows;
-  }, [
-    sortedAddresses,
-    sortState,
-    allPools,
-    hasActiveFilter,
-    hideReserved,
-    hideFreeRanges,
-  ]);
-
-  // #517: window the painted rows. Every op that walks the data
-  // (select-all, shift-range, filtering) still uses the full ``tableRows``
-  // / ``filteredAddresses`` — only the DOM output is capped.
-  const visibleRows = useMemo(
+  // Interleave DHCP pool boundary markers and free-range gaps with the IP
+  // rows of the page (``buildAddressTableRows``). IPv4-only, as before.
+  const tableRows = useMemo<AddressOrPoolRow[]>(
     () =>
-      showAllAddressRows ? tableRows : tableRows.slice(0, ADDRESS_ROW_CAP),
-    [tableRows, showAllAddressRows],
+      buildAddressTableRows({
+        addresses: sortedAddresses ?? [],
+        prev: pageData?.prev ?? null,
+        isLastPage,
+        sorted: !!sortState,
+        pools: allPools,
+        hasActiveFilter,
+        hideReserved,
+        hideFreeRanges,
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      sortedAddresses,
+      pageData?.prev,
+      isLastPage,
+      sortState,
+      allPools,
+      hasActiveFilter,
+      hideReserved,
+      hideFreeRanges,
+    ],
   );
-  const hiddenRowCount = tableRows.length - visibleRows.length;
+  const visibleRows = tableRows;
+
+  // The checkbox rows of this page: what "select all" ticks. Skips the rows
+  // the table never offers a checkbox for, and the ones the caller cannot
+  // write (matches the per-row gate, #514).
+  const selectableRows = (filteredAddresses ?? []).filter(
+    (a: IPAddress) =>
+      a.status !== "network" &&
+      a.status !== "broadcast" &&
+      !a.auto_from_lease &&
+      // Never select a row the table is currently hiding.
+      !(hideReserved && isPaddingRow(a)) &&
+      permitsWriteIp(a.address),
+  );
+  const pageAllSelected =
+    selectableRows.length > 0 &&
+    selectableRows.every((a: IPAddress) => selectedIpIds.has(a.id));
+  // "Select all N matching" asks the server for the ids behind the filters, so
+  // it is only honest when the server applies every filter and the caller may
+  // write the whole subnet (not just an address-set slice of it).
+  const canSelectAllMatching =
+    pageAllSelected &&
+    totalMatching > (addresses?.length ?? 0) &&
+    subnetWritable &&
+    !hasPageOnlyFilter(tableFilterState);
+  const selectAllMatching = async () => {
+    setSelectAllError(null);
+    setSelectingAll(true);
+    try {
+      const {
+        sort: _s,
+        order: _o,
+        limit: _l,
+        offset: _f,
+        ...filters
+      } = serverParams;
+      const res = await ipamApi.searchAddressIds({
+        ...filters,
+        subnet_id: subnet.id,
+        selectable: true,
+      });
+      setSelectedIpIds(new Set(res.ids));
+      if (res.capped)
+        setSelectAllError(
+          `Selection capped at ${res.ids.length.toLocaleString()} of ${res.total.toLocaleString()} matches (server limit). Narrow the filters to act on the rest.`,
+        );
+    } catch (e) {
+      setSelectAllError(formatApiError(e, "Failed to gather matching IPs."));
+    } finally {
+      setSelectingAll(false);
+    }
+  };
 
   const [confirmDeleteAddr, setConfirmDeleteAddr] = useState<IPAddress | null>(
     null,
@@ -6286,6 +6161,17 @@ export function SubnetDetail({
                 {selectedIpIds.size} {selectedIpIds.size === 1 ? "IP" : "IPs"}{" "}
                 selected
               </span>
+              {canSelectAllMatching && (
+                <button
+                  onClick={selectAllMatching}
+                  disabled={selectingAll}
+                  className="rounded-md border bg-background px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                >
+                  {selectingAll
+                    ? "Selecting…"
+                    : `Select all ${totalMatching.toLocaleString()} matching`}
+                </button>
+              )}
               <button
                 onClick={() => setShowBulkEdit(true)}
                 className="flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs hover:bg-accent"
@@ -6305,7 +6191,10 @@ export function SubnetDetail({
                 Bulk delete
               </button>
               <button
-                onClick={() => setSelectedIpIds(new Set())}
+                onClick={() => {
+                  setSelectedIpIds(new Set());
+                  setSelectAllError(null);
+                }}
                 className="rounded-md p-1 text-muted-foreground hover:text-foreground"
                 title="Clear selection"
               >
@@ -6359,7 +6248,7 @@ export function SubnetDetail({
             <p className="p-6 text-sm text-muted-foreground">
               Loading addresses…
             </p>
-          ) : !addresses?.length ? (
+          ) : totalMatching === 0 && !hasActiveFilter ? (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <Network className="mb-3 h-10 w-10 text-muted-foreground/30" />
               <p className="text-sm text-muted-foreground">
@@ -6408,6 +6297,19 @@ export function SubnetDetail({
                   Hide free ranges
                 </label>
               </div>
+              {selectAllError && (
+                <div className="mb-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs">
+                  {selectAllError}
+                </div>
+              )}
+              <AddressPager
+                total={totalMatching}
+                pageIndex={pageIndex}
+                pageSize={pageSize}
+                onPage={setPageIndex}
+                onPageSize={setPageSize}
+                pageOnlyFilter={hasPageOnlyFilter(tableFilterState)}
+              />
               {inlineEditError && (
                 <div className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
                   <span className="flex-1">{inlineEditError}</span>
@@ -6475,15 +6377,6 @@ export function SubnetDetail({
                       </button>
                     );
                   })}
-                  {hiddenRowCount > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setShowAllAddressRows(true)}
-                      className="w-full rounded-md border border-dashed py-2 text-xs text-muted-foreground hover:bg-muted/40"
-                    >
-                      Show {hiddenRowCount.toLocaleString()} more…
-                    </button>
-                  )}
                 </div>
               )}
 
@@ -6498,44 +6391,24 @@ export function SubnetDetail({
                   <thead className="sticky top-0 z-10 bg-card">
                     <tr className="border-b bg-muted/40 text-xs">
                       <th className="w-8 px-2 py-2">
-                        {(() => {
-                          const selectable = (filteredAddresses ?? []).filter(
-                            (a: IPAddress) =>
-                              a.status !== "network" &&
-                              a.status !== "broadcast" &&
-                              !a.auto_from_lease &&
-                              // Never select a row the table is currently hiding.
-                              !(hideReserved && isPaddingRow(a)) &&
-                              // Only rows the caller can actually write — matches
-                              // the per-row checkbox gate so a delegated operator
-                              // (address sets, #103) can't select rows a bulk op
-                              // would then partially 403 (#514).
-                              permitsWriteIp(a.address),
-                          );
-                          const allSelected =
-                            selectable.length > 0 &&
-                            selectable.every((a: IPAddress) =>
-                              selectedIpIds.has(a.id),
-                            );
-                          return (
-                            <input
-                              type="checkbox"
-                              checked={allSelected}
-                              aria-label="Select all"
-                              onChange={(e) => {
-                                if (e.target.checked) {
-                                  setSelectedIpIds(
-                                    new Set(
-                                      selectable.map((a: IPAddress) => a.id),
-                                    ),
-                                  );
-                                } else {
-                                  setSelectedIpIds(new Set());
-                                }
-                              }}
-                            />
-                          );
-                        })()}
+                        <input
+                          type="checkbox"
+                          checked={pageAllSelected}
+                          aria-label="Select all"
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setSelectedIpIds(
+                                (prev) =>
+                                  new Set([
+                                    ...prev,
+                                    ...selectableRows.map((a) => a.id),
+                                  ]),
+                              );
+                            } else {
+                              setSelectedIpIds(new Set());
+                            }
+                          }}
+                        />
                       </th>
                       {addressColumns(dhcpOn, dnsOn).map((col) => {
                         const label =
@@ -7353,21 +7226,6 @@ export function SubnetDetail({
                         </ContextMenu>
                       );
                     })}
-                    {hiddenRowCount > 0 && (
-                      <tr>
-                        <td colSpan={12} className="px-4 py-2 text-center">
-                          <button
-                            type="button"
-                            onClick={() => setShowAllAddressRows(true)}
-                            className="rounded-md border border-dashed px-3 py-1 text-xs text-muted-foreground hover:bg-muted/40"
-                            title="Rendering is capped for performance on large subnets"
-                          >
-                            Show {hiddenRowCount.toLocaleString()} more row
-                            {hiddenRowCount === 1 ? "" : "s"}…
-                          </button>
-                        </td>
-                      </tr>
-                    )}
                   </tbody>
                 </table>
               )}

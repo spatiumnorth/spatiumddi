@@ -1029,6 +1029,14 @@ export interface AddressQueryParams {
   q?: string;
   hostname?: string;
   mac?: string;
+  /** Column filters of the subnet table (#1256): substring of the address,
+   *  of the description, and of any tag key / value / ``key=value``. */
+  address?: string;
+  description?: string;
+  tag_text?: string;
+  /** ``<field>:<mode>`` per text filter, mode ``begins`` | ``ends`` |
+   *  ``regex`` (default ``contains``). */
+  match?: string[];
   status_filter?: string;
   /** Repeatable ``k:v`` tag filters. */
   tag?: string[];
@@ -1988,7 +1996,10 @@ export const ipamApi = {
   /** Gather the ids of every match (capped at 5000) for the "select all
    *  N matches → bulk edit/delete" flow. */
   searchAddressIds: (
-    params: Omit<AddressSearchParams, "sort" | "order" | "limit" | "offset">,
+    params: Omit<AddressSearchParams, "sort" | "order" | "limit" | "offset"> & {
+      /** Leave out the rows the subnet table has no checkbox for. */
+      selectable?: boolean;
+    },
   ) =>
     api
       .get<AddressSearchIdsResponse>(`/ipam/addresses/search/ids`, { params })

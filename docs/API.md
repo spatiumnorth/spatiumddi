@@ -607,7 +607,15 @@ with no `limit` returns at most 10,000 rows, and `limit` itself may not
 exceed 10,000 (422). When the cap cuts a list short the response carries
 `X-Result-Truncated: true` and a `Warning: 299` header; page with
 `limit` / `offset` until `offset + len(rows) >= X-Total-Count`. Clients
-that read the whole list with no parameters must page. For **cross-subnet** address queries use the envelope
+that read the whole list with no parameters must page. The same endpoint
+(#1256 part 2) takes the IPAM table's column filters: `address`,
+`description`, `tag_text` (a tag key, value or `key=value`) beside `hostname`
+/ `mac` / `status_filter` / `tag`, and repeatable `match=<field>:<mode>` with
+mode `begins`, `ends` or `regex` (default `contains`; a regex that does not
+compile matches everything). `sort=hostname|mac|description|status|last_seen`
+puts NULLs last in both directions. `GET /addresses/search/ids` accepts the
+same filters plus `selectable=true`, which leaves out network / broadcast
+rows and rows mirrored from a DHCP lease. For **cross-subnet** address queries use the envelope
 endpoints `GET /api/v1/ipam/addresses/search` (paginated, joined
 subnet/space context) and `GET /api/v1/ipam/addresses/search/ids`
 (a capped id list for select-all-matches). Both are permission-scoped
