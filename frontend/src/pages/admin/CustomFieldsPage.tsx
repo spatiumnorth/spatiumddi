@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { customFieldsApi, formatApiError, type CustomField } from "@/lib/api";
 import {
@@ -385,7 +386,11 @@ export function CustomFieldsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState<CustomField | null>(null);
   const [modalError, setModalError] = useState<string>("");
 
-  const { data: fields = [], isLoading } = useQuery({
+  const {
+    data: fields = [],
+    isLoading,
+    error: fieldsError,
+  } = useQuery({
     queryKey: ["custom-fields"],
     queryFn: () => customFieldsApi.list(),
   });
@@ -508,8 +513,10 @@ export function CustomFieldsPage() {
 
       {fields.length === 0 && (
         <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
-          No custom fields defined yet.
-          {canWrite && ' Click "New Field" to add one.'}
+          <ListEmpty error={fieldsError} what="custom fields">
+            No custom fields defined yet.
+            {canWrite && ' Click "New Field" to add one.'}
+          </ListEmpty>
         </div>
       )}
 

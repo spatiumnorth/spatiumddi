@@ -147,7 +147,7 @@ for line in "${RELEASES[@]}"; do
     # would silently shrink the real releases' asset window from
     # KEEP_VERSIONED to KEEP_VERSIONED-7.
     case "$tag" in
-        nightly | nightly-*)
+        nightly | nightly-* | branch-nightly-*)
             echo "  [--] ${tag} — nightly pre-release: skipped (nightly.yml owns its retention)"
             continue
             ;;

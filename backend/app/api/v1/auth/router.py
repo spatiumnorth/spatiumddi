@@ -57,6 +57,7 @@ from app.core.auth_throttle import (
     refund_stepup_attempt,
 )
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.denial_audit import note_denial_audited
 from app.core.jwt_compat import JWTError
 from app.core.mfa_enrol_proof import (
     ProofUnavailable,
@@ -1383,6 +1384,7 @@ async def mfa_enroll_begin(
     if outcome is ReauthOutcome.BAD_CREDENTIAL:
         await record_stepup_password_failure(current_user.id)
     if outcome is not ReauthOutcome.OK:
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,

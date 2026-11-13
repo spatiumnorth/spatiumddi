@@ -410,3 +410,39 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()
+
+
+# A full or selective restore replays the whole schema in ONE transaction, which
+# takes a lock on every relation it creates (about a thousand). The lock table
+# is shared by the whole Postgres server, and under ``-n auto`` every xdist
+# worker's test database lives on that one server, so two replays running at
+# the same time on two workers can exhaust it ("out of shared memory", HINT:
+# max_locks_per_transaction). Which tests land on which worker at the same
+# moment depends on the shard's file list, so it surfaced only once a new test
+# file reshuffled shard 9 (#3945). Serialise replays across workers with a file
+# lock on the runner; a single replay is far under the limit.
+_RESTORE_LOCK_PATH = os.path.join(
+    os.environ.get("TMPDIR", "/tmp"), "spatiumddi-test-restore-replay.lock"
+)
+
+
+@pytest.fixture(autouse=True)
+def _serialise_restore_replays(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    import asyncio
+    import fcntl
+
+    from app.services.backup import restore as _restore
+
+    original = _restore._replay_clean
+
+    async def _locked_replay(*args, **kwargs):
+        fd = os.open(_RESTORE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            return await original(*args, **kwargs)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    monkeypatch.setattr(_restore, "_replay_clean", _locked_replay)
+    yield

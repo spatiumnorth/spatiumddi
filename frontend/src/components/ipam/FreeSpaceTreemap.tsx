@@ -108,8 +108,33 @@ export function FreeSpaceTreemap({
         network: f.network,
       });
     }
+    // A capped answer names the rest on its last range (#3848): one cell for
+    // the block's remainder, less what the children already draw inside it.
+    const last = freeRanges[freeRanges.length - 1];
+    const lastSpan = last ? cidrSpan(last.network) : null;
+    if (last?.more_after && lastSpan && parent) {
+      const tailStart = lastSpan.base + lastSpan.size;
+      let size = parent.base + parent.size - tailStart;
+      for (const n of [
+        ...childBlocks.map((b) => b.network),
+        ...directSubnets.map((x) => x.network),
+      ]) {
+        const sp = cidrSpan(n);
+        if (sp && sp.base >= tailStart) size -= sp.size;
+      }
+      if (size > 0n) {
+        out.push({
+          name: `Rest of block (${last.more_after.toLocaleString()} more free ranges)`,
+          size: Math.max(1, bigFraction(size, parent.size) * 2 ** 48),
+          addrs: size,
+          kind: "free",
+          network: `rest of block after ${last.network}`,
+        });
+      }
+    }
     return out.filter((c) => c.size > 0);
   }, [block.network, childBlocks, directSubnets, freeRanges]);
+  const omitted = freeRanges[freeRanges.length - 1]?.more_after ?? 0;
 
   if (error != null) {
     return (
@@ -140,6 +165,13 @@ export function FreeSpaceTreemap({
           <Tooltip content={<TreemapTooltip />} />
         </Treemap>
       </ResponsiveContainer>
+      {omitted > 0 && (
+        <p className="mt-1 text-[10px] text-amber-600 dark:text-amber-400">
+          Showing {freeRanges.length.toLocaleString()} of{" "}
+          {(freeRanges.length + omitted).toLocaleString()} free ranges; the rest
+          of the block is drawn as one free cell.
+        </p>
+      )}
     </div>
   );
 }

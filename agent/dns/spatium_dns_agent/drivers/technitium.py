@@ -75,6 +75,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 import structlog
 
+from ..blocklist_entries import iter_entries
 from ..secure_io import write_private
 from ._caa import parse_caa
 from ._forwarders import zone_forward_transport as _zone_forward_transport
@@ -1976,7 +1977,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
         for exc in bl.get("exceptions") or []:
             if exc:
                 allowed.add(str(exc).rstrip(".").lower())
-        for entry in bl.get("entries") or []:
+        for entry in iter_entries(bl):
             domain = str(entry.get("domain") or "").rstrip(".").lower()
             if not domain:
                 continue

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -145,11 +146,7 @@ function ClientClassModalForm({
           <h3 className="text-sm font-semibold mb-2">Options</h3>
           <DHCPOptionsEditor value={options} onChange={setOptions} />
         </div>
-        {error && (
-          <p role="alert" className="text-xs text-destructive">
-            {error}
-          </p>
-        )}
+        <FormError>{error}</FormError>
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>

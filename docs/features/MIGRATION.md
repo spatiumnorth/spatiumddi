@@ -780,8 +780,8 @@ _Moved here from the README feature tour (#3410), so the detail stays in the doc
 
 one-shot migration tool that turns existing zone data into native SpatiumDDI zones + records.
 
-- Four sources, one canonical IR + commit pipeline:
-  - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser walks `include` directives, resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, and feeds the same canonical-zone shape the other sources do
+- Five sources, one canonical IR + commit pipeline:
+  - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser reads `named.conf` itself (an `include`d file is not read, and the preview names each include so you can paste its zone declarations into `named.conf`), resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, and feeds the same canonical-zone shape the other sources do
   - **Windows DNS** — live pull over WinRM via the existing `WindowsDNSDriver`; honours system zones (TrustAnchors / `_msdcs.*`) by routing them through a dedicated branch instead of trying to migrate them
   - **PowerDNS** — live pull over the authoritative REST API (`X-API-Key` auth, hard cap of 5000 zones / 60 s socket timeout); hoists SOA from rrset content, splits MX / SRV priority into the dedicated columns, drops disabled records + DNSSEC + LUA / ALIAS with distinct warnings
   - **Technitium** — live pull over the console REST API (token auth); only `Primary` zones import, with secondary / stub / forwarder / catalog reported as warnings rather than minted as rows SpatiumDDI would then serve authoritatively. Technitium returns structured `rData` whose field names differ from its own *write* API and which renders numeric rdata as enum names, so the importer inverts that back to wire values (`DANE-EE` / `SPKI` / `SHA2-256` → `3 1 1 <hex>`), passing unknown enum members through unchanged
