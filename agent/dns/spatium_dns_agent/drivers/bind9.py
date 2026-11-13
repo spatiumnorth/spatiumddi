@@ -146,6 +146,15 @@ logging {{
 """
 
 
+#: ``response-policy`` options, shared by the global and per-view forms.
+#: ``servfail-until-ready yes`` (#4064): a policy zone of hundreds of
+#: thousands of names loads in the background while named is already
+#: answering, so a blocked name resolved for the first 5-11 s after every
+#: start. Until the zones have loaded named SERVFAILs instead of leaking.
+_RPZ_POLICY_OPTIONS = (
+    "break-dnssec yes qname-wait-recurse no servfail-until-ready yes"
+)
+
 # RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
 # category, never to ``queries`` — so without these two lines a blocked
 # lookup is invisible to the control plane and every per-client
@@ -3199,9 +3208,15 @@ class Bind9Driver(DriverBase):
             # qname first and does not rewrite a failed lookup, so a blocked
             # name whose upstream is dead answered SERVFAIL after ~10 s instead
             # of the policy answer. A blocklist wants the opposite.
+            # servfail-until-ready (#4064): named answers while a large policy
+            # zone is still loading in the background, so for the first
+            # seconds after every start a blocked name resolved normally.
+            # With it, named SERVFAILs until the zones have loaded; a zone
+            # that fails to load counts as settled, so a broken one cannot
+            # keep named from serving.
             response_policy_block = (
                 f"    response-policy {{ {zones_list}; }} "
-                "break-dnssec yes qname-wait-recurse no;\n"
+                f"{_RPZ_POLICY_OPTIONS};\n"
             )
 
         logging_block = _render_logging_block(opts)
@@ -3453,7 +3468,7 @@ class Bind9Driver(DriverBase):
                     )
                     body += (
                         f"response-policy {{ {zlist}; }} "
-                        "break-dnssec yes qname-wait-recurse no;\n"
+                        f"{_RPZ_POLICY_OPTIONS};\n"
                     )
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
