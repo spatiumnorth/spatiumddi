@@ -394,6 +394,9 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /import/commit": _BLOCK_OCCUPANCY,
     "POST /import/addresses/preview": _SUBNET,
     "POST /import/addresses/commit": _SUBNET,
+    # #2251 — Populate from DNS: IPAM rows only, so the subnet owns the write.
+    "POST /import/dns/preview": _SUBNET,
+    "POST /import/dns/commit": _SUBNET,
     # An export or report carries the space, its blocks, subnets and addresses.
     "GET /export": ("ip_space", "ip_block", "subnet", "ip_address"),
     "GET /export.pdf": ("ip_space", "ip_block", "subnet", "ip_address"),

@@ -177,6 +177,7 @@ import {
   ExportButton,
   SubnetImportExportButton,
 } from "./ImportExportModals";
+import { PopulateFromDnsButton } from "./PopulateFromDnsModal";
 import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
 import { MoveBlockModal } from "./MoveBlockModal";
 import {
@@ -5942,6 +5943,16 @@ export function SubnetDetail({
             <SubnetImportExportButton
               subnet={subnet}
               canImport={canAllocate}
+              onCommitted={() => {
+                qc.invalidateQueries({ queryKey: ["addresses"] });
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
+              }}
+            />
+            <PopulateFromDnsButton
+              scope={{ subnet_id: subnet.id }}
+              label={subnet.network}
+              canWrite={canAllocate}
               onCommitted={() => {
                 qc.invalidateQueries({ queryKey: ["addresses"] });
                 qc.invalidateQueries({ queryKey: ["subnets"] });
@@ -14517,6 +14528,16 @@ export function BlockDetailView({
                   </HeaderButton>
                 )}
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
+                <PopulateFromDnsButton
+                  scope={{ block_id: block.id }}
+                  label={block.network}
+                  canWrite={perms.can("write", "subnet")}
+                  onCommitted={() => {
+                    qc.invalidateQueries({ queryKey: ["addresses"] });
+                    qc.invalidateQueries({ queryKey: ["subnets"] });
+                    qc.invalidateQueries({ queryKey: ["blocks"] });
+                  }}
+                />
                 <ServicesUsingButton
                   kind="ip_block"
                   resourceId={block.id}
@@ -16040,6 +16061,16 @@ export function SpaceTableView({
               </HeaderButton>
             )}
             <ExportButton scope={{ space_id: space.id }} label="Export" />
+            <PopulateFromDnsButton
+              scope={{ space_id: space.id }}
+              label={space.name}
+              canWrite={perms.can("write", "subnet")}
+              onCommitted={() => {
+                qc.invalidateQueries({ queryKey: ["addresses"] });
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["blocks"] });
+              }}
+            />
             {/* Add block is a primary space-level structural action (blocks are
                 the top-level child of a space), so it sits as a visible button
                 next to Add Subnet rather than hidden in a Tools ▾ dropdown

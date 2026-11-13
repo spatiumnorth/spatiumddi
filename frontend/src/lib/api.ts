@@ -2376,7 +2376,72 @@ function _buildImportForm(
   return form;
 }
 
+// #2251 — Populate IPAM from existing DNS records.
+export interface PopulateFromDnsBody {
+  space_id?: string;
+  block_id?: string;
+  subnet_id?: string;
+  zone_ids?: string[];
+  status?: "allocated" | "reserved" | "deprecated";
+  dynamic_action?: "skip" | "dhcp" | "static";
+  link_ptr?: boolean;
+  resolutions?: Record<string, string>;
+  exclude?: string[];
+  category?: string;
+  offset?: number;
+  limit?: number;
+}
+export interface PopulateRecord {
+  id: string;
+  zone_id: string;
+  zone_name: string;
+  name: string;
+  fqdn: string;
+  record_type: string;
+  dynamic: boolean | null;
+}
+export interface PopulateItem {
+  address: string;
+  subnet_id: string;
+  subnet: string;
+  category: "new" | "link" | "linked" | "conflict" | "dynamic" | "skipped";
+  reason: string;
+  hostname: string;
+  existing_ip_id: string | null;
+  existing_hostname: string | null;
+  ptr: "none" | "match" | "mismatch";
+  records: PopulateRecord[];
+}
+export interface PopulateFromDnsPreview {
+  records_scanned: number;
+  subnets_in_scope: number;
+  zones: { id: string; name: string }[];
+  counts: Record<string, number>;
+  reasons: Record<string, number>;
+  dynamic_unknown: number;
+  outside: { network: string; records: number; sample: string[] }[];
+  outside_total: number;
+  total_items: number;
+  items: PopulateItem[];
+}
+export interface PopulateFromDnsCommit {
+  created: number;
+  linked: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+}
+
 export const ipamIoApi = {
+  previewPopulateFromDns: (body: PopulateFromDnsBody) =>
+    api
+      .post<PopulateFromDnsPreview>("/ipam/import/dns/preview", body)
+      .then((r) => r.data),
+  commitPopulateFromDns: (body: PopulateFromDnsBody) =>
+    api
+      .post<PopulateFromDnsCommit>("/ipam/import/dns/commit", body)
+      .then((r) => r.data),
+
   preview: (
     file: File,
     opts: { space_id?: string; space_name?: string; strategy: ImportStrategy },
