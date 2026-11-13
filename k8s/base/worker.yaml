@@ -103,6 +103,15 @@ spec:
                   name: spatiumddi-secrets
                   key: credential-key
                   optional: true
+            # #1358 — the release whose rollout added credential-key to a running
+            # install: that release reads the key but keeps writing under the
+            # SECRET_KEY-derived one. Optional; see secrets.yaml.example.
+            - name: CREDENTIAL_KEY_SINCE
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key-since
+                  optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
             # #1547 — Redis password from the Secret, interpolated
@@ -230,6 +239,15 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: credential-key
+                  optional: true
+            # #1358 — the release whose rollout added credential-key to a running
+            # install: that release reads the key but keeps writing under the
+            # SECRET_KEY-derived one. Optional; see secrets.yaml.example.
+            - name: CREDENTIAL_KEY_SINCE
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key-since
                   optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"

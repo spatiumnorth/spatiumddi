@@ -230,20 +230,27 @@ class _KeyRing:
         raise InvalidToken
 
 
-def _fernet_from_keys(secret_key: str, credential_encryption_key: str) -> _KeyRing:
+def _fernet_from_keys(
+    secret_key: str, credential_encryption_key: str, *, defer_dedicated_writes: bool = False
+) -> _KeyRing:
     """Build a key ring using the same precedence rules as
     :func:`app.core.crypto._fernet`: a dedicated ``credential_encryption_key``
     encrypts and is tried first, and the key derived from ``secret_key``
     (SHA-256) is always a read fallback (#1358: values written before the
     dedicated key was configured are still under it). With no usable
-    dedicated key the derived one does both.
+    dedicated key the derived one does both. ``defer_dedicated_writes``
+    mirrors crypto.py during the rollout that introduced the dedicated key:
+    the derived key encrypts and the dedicated one is only read.
     """
     digest = hashlib.sha256((secret_key or "").encode()).digest()
     derived = Fernet(base64.urlsafe_b64encode(digest))
     raw = (credential_encryption_key or "").strip()
     if raw:
         try:
-            return _KeyRing(Fernet(raw.encode()), derived)
+            dedicated = Fernet(raw.encode())
+            if defer_dedicated_writes:
+                return _KeyRing(derived, dedicated)
+            return _KeyRing(dedicated, derived)
         except (ValueError, Exception):  # noqa: BLE001
             # Mirrors crypto.py: malformed explicit key → fall back
             # to the derived key so the install still functions.
@@ -395,6 +402,7 @@ async def rewrap_secrets(
     source_credential_key: str,
     dest_secret_key: str,
     dest_credential_key: str,
+    dest_defer_dedicated_writes: bool = False,
 ) -> RewrapOutcome:
     """Walk every Fernet-encrypted column + every JSONB-embedded Fernet
     string, rewrapping each value from ``source`` to ``dest``.
@@ -414,7 +422,11 @@ async def rewrap_secrets(
         return outcome
 
     source_fernet = _fernet_from_keys(source_secret_key, source_credential_key)
-    dest_fernet = _fernet_from_keys(dest_secret_key, dest_credential_key)
+    dest_fernet = _fernet_from_keys(
+        dest_secret_key,
+        dest_credential_key,
+        defer_dedicated_writes=dest_defer_dedicated_writes,
+    )
 
     # asyncpg uses ``postgresql://`` (or ``postgres://``) URLs —
     # SQLAlchemy's ``postgresql+asyncpg://`` is unparseable. Strip
@@ -528,11 +540,20 @@ async def _rewrap_column(
             ciphertext = bytes(row[enc_col])
             new_value, status = _rewrap_value(source, dest, ciphertext)
             if status == "rewrapped":
-                await conn.execute(
-                    f"UPDATE {table} SET {enc_col} = $1 WHERE {pk_col} = $2",
+                # Compare-and-swap on the value read (#1358): the rotation
+                # runs with the stack up, so the app may have written a new
+                # credential since the SELECT. Overwriting it would silently
+                # put the OLD secret back; a value the app wrote is already
+                # under a key every reader has, so leaving it is correct.
+                updated = await conn.execute(
+                    f"UPDATE {table} SET {enc_col} = $1 WHERE {pk_col} = $2 AND {enc_col} = $3",
                     new_value,
                     pk,
+                    ciphertext,
                 )
+                if updated.endswith(" 0"):
+                    outcome.skipped_idempotent_rows += 1
+                    continue
                 outcome.rewrapped_rows += 1
             elif status == "idempotent":
                 outcome.skipped_idempotent_rows += 1
@@ -591,7 +612,7 @@ async def _rewrap_jsonb_field(
             doc = _decode_jsonb(row["doc"])
             if doc is None:
                 continue
-            mutated = False
+            mutated = 0
             for holder, key, ciphertext in _jsonb_secret_sites(spec, doc):
                 new_value, status = _rewrap_value(source, dest, ciphertext)
                 if status == "rewrapped":
@@ -600,8 +621,7 @@ async def _rewrap_jsonb_field(
                     # string literal.
                     assert new_value is not None
                     holder[key] = spec.prefix + new_value.decode("utf-8")
-                    mutated = True
-                    outcome.rewrapped_jsonb_fields += 1
+                    mutated += 1
                 elif status == "idempotent":
                     outcome.skipped_idempotent_rows += 1
                 else:
@@ -624,12 +644,21 @@ async def _rewrap_jsonb_field(
                         reason=status,
                     )
             if mutated:
-                await conn.execute(
+                # Compare-and-swap on the document read (#1358): the whole
+                # document is rewritten, so a concurrent edit to ANY field of
+                # it (not just the secret) would otherwise be reverted.
+                original = row["doc"]
+                updated = await conn.execute(
                     f"UPDATE {spec.table} SET {spec.column} = $1::jsonb "  # noqa: S608
-                    f"WHERE {spec.pk_col} = $2",
+                    f"WHERE {spec.pk_col} = $2 AND {spec.column}::jsonb = $3::jsonb",
                     json.dumps(doc),
                     row["pk"],
+                    original if isinstance(original, str) else json.dumps(original),
                 )
+                if updated.endswith(" 0"):
+                    outcome.skipped_idempotent_rows += mutated
+                else:
+                    outcome.rewrapped_jsonb_fields += mutated
 
 
 def _decode_jsonb(raw: Any) -> Any:

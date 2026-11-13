@@ -16,7 +16,13 @@ restore uses (:func:`app.services.backup.rewrap.rewrap_secrets`). It is
 idempotent and resumable: a value already under the dedicated key is counted
 and left alone, so a re-run after an interruption (or after a new credential
 was written under the legacy key by an older pod) is safe, and it can be run
-while the stack is up. The fallback stays in place afterwards.
+while the stack is up: each value is swapped only if it is still the one
+read, so a credential the app changes meanwhile is never put back. The
+fallback stays in place afterwards.
+
+During the rollout that ADDED the key to a running install (the chart or the
+appliance stamps ``CREDENTIAL_KEY_SINCE`` with that release) this refuses,
+because a pod that has not restarted since could not read what it moves.
 
 To replace a dedicated key that is already in use, set the new one as
 CREDENTIAL_ENCRYPTION_KEY and pass the old one as
@@ -34,7 +40,7 @@ import asyncio
 import os
 import sys
 
-from app.config import credential_key_problem, settings
+from app.config import credential_key_problem, credential_key_writes_deferred, settings
 from app.core.rotate_secret_key import record_rotation_audit
 from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
@@ -58,6 +64,18 @@ async def rotate(old_credential_key: str = "") -> int:
             "CREDENTIAL_ENCRYPTION_KEY is not set to a valid Fernet key. Generate one "
             'with `python3 -c "from cryptography.fernet import Fernet; '
             'print(Fernet.generate_key().decode())"`, set it, and run this again.',
+            file=sys.stderr,
+        )
+        return 2
+    if credential_key_writes_deferred(settings.credential_key_since, settings.version):
+        # The rollout that added the key may still have pods that cannot read
+        # it; moving values onto it now would make them unreadable there.
+        print(
+            f"CREDENTIAL_KEY_SINCE is {settings.credential_key_since!r}, the version this "
+            "process runs: the key was added during this release's rollout, so values stay "
+            "under the SECRET_KEY-derived key until the next upgrade. Once every api, worker "
+            "and beat pod has restarted since the key was added, you may run this with "
+            "CREDENTIAL_KEY_SINCE= (empty) in this command's environment.",
             file=sys.stderr,
         )
         return 2

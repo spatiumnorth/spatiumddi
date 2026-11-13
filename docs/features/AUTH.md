@@ -336,6 +336,14 @@ logs a `credential_encryption_key_not_set` warning, since anyone who can recover
 `SECRET_KEY` can then open every stored secret). To move existing values onto
 the dedicated key run `python -m app.core.rotate_credential_key` (see
 [Moving stored credentials onto a dedicated key](../deployment/DOCKER.md#moving-stored-credentials-onto-a-dedicated-key)).
+When the Helm chart or the appliance adds the key to an install that is
+already running, it also stamps `CREDENTIAL_KEY_SINCE` with that release: while
+the api runs that release it reads the key but keeps writing under the derived
+one, because the rollout can still have pods (the previous image, or ones
+started before the Secret had the key) that cannot read it. Writes move onto
+the key from the next release, and the rotation command refuses until then
+(override with `CREDENTIAL_KEY_SINCE=` in its environment once every api,
+worker and beat pod has restarted).
 See `backend/app/core/crypto.py`.
 
 **Group mappings.** Each provider owns a list of `AuthGroupMapping` rows

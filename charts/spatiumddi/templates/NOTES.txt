@@ -39,8 +39,10 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 
    Stored credentials are encrypted under a separate generated key
    (credential-key in the same Secret). On an install upgraded from a
-   release that had none, existing values are still readable; move them onto
-   it with:
+   release that had none, existing values are still readable, and this
+   release keeps writing under the old key so no pod from before the upgrade
+   meets a value it cannot read (credential-key-since). After the NEXT
+   upgrade, move them onto it with:
 
      kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "spatiumddi.fullname" . }}-api -- python -m app.core.rotate_credential_key
 {{- end }}

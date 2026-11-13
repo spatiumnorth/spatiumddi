@@ -39,7 +39,7 @@ import asyncio
 import os
 import sys
 
-from app.config import settings, signing_key_weakness
+from app.config import credential_key_writes_deferred, settings, signing_key_weakness
 from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
 
@@ -111,6 +111,9 @@ async def rotate(old_secret_key: str, old_credential_key: str) -> int:
         source_credential_key=old_credential_key,
         dest_secret_key=settings.secret_key,
         dest_credential_key=settings.credential_encryption_key,
+        dest_defer_dedicated_writes=credential_key_writes_deferred(
+            settings.credential_key_since, settings.version
+        ),
     )
     if outcome.same_install:
         print(

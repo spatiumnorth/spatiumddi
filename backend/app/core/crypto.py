@@ -13,6 +13,11 @@ Uses Fernet (AES-128-CBC + HMAC-SHA256). Two keys can be in play (#1358):
   key. With no dedicated key configured the derived key is used for both
   reading and writing, as before (and a warning is logged once).
 
+While ``settings.credential_key_since`` equals the running version (the
+rollout that added the key to a running install), the order is swapped: the
+derived key writes and the dedicated one is only read, so a pod that does not
+have the dedicated key yet can still read everything written meanwhile.
+
 Replacing either key without first re-encrypting existing rows makes the
 values written under it unreadable.
 """
@@ -29,7 +34,7 @@ from functools import lru_cache
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
 
-from app.config import settings
+from app.config import credential_key_writes_deferred, settings
 
 logger = structlog.get_logger(__name__)
 
@@ -61,6 +66,12 @@ def _fernet() -> tuple[Fernet, ...]:
             logger.error("credential_encryption_key_invalid", error=str(exc))
             print(f"WARNING: {msg} Falling back to a SECRET_KEY-derived key.", file=sys.stderr)
             return (_derived_fernet(),)
+        if credential_key_writes_deferred(settings.credential_key_since, settings.version):
+            # The rollout that introduced the key: some reader may not have
+            # it yet, so keep WRITING under the derived key and only read the
+            # dedicated one. Writes move across on the next release.
+            logger.info("credential_encryption_key_writes_deferred")
+            return (_derived_fernet(), dedicated)
         # Writes use the dedicated key; the SECRET_KEY-derived one stays a
         # read fallback so values written before it was configured still open.
         return (dedicated, _derived_fernet())

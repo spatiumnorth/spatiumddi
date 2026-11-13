@@ -121,6 +121,14 @@ auth:
   # encrypted under. Empty = generated and kept across upgrades, like secretKey.
   # Set it explicitly when rendering without a cluster (helm template, GitOps).
   credentialEncryptionKey: ""
+  # #1358 — CREDENTIAL_KEY_SINCE. Empty = the chart decides: it stamps the
+  # release that adds a key to an already-running install, and the api of
+  # that release keeps writing under the old key until the next upgrade (so a
+  # pod from before the key can still read everything). A render without
+  # cluster access (helm template, GitOps) cannot see the stored value, so it
+  # stamps the version being rendered every time and writes never move onto
+  # the key: there, set this to the version that first carried the key.
+  credentialKeySince: ""
   # #1159 — bearer token /metrics accepts (any API token works too). Empty =
   # generated on first install and kept across upgrades, like secretKey.
   metricsToken: ""

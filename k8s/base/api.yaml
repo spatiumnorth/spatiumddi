@@ -72,6 +72,15 @@ spec:
                   name: spatiumddi-secrets
                   key: credential-key
                   optional: true
+            # #1358 — the release whose rollout added credential-key to a running
+            # install: that release reads the key but keeps writing under the
+            # SECRET_KEY-derived one. Optional; see secrets.yaml.example.
+            - name: CREDENTIAL_KEY_SINCE
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key-since
+                  optional: true
             # #1159 — /metrics scrape token. Optional: without it only API
             # tokens can scrape.
             - name: PROMETHEUS_METRICS_TOKEN

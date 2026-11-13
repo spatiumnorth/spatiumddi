@@ -75,6 +75,13 @@ case "$*" in
     name=$5
     [ -d "$S/secrets/$name" ] && echo "secret/$name"
     exit 0 ;;
+  "-n spatium get secret "*" -o jsonpath={.metadata.resourceVersion} {.data.credential-key}")
+    name=$5
+    [ -d "$S/secrets/$name" ] || exit 1
+    rv=1; [ -f "$S/secrets/$name/.rv" ] && rv=$(cat "$S/secrets/$name/.rv")
+    ck=""; [ -f "$S/secrets/$name/credential-key" ] && ck=$(cat "$S/secrets/$name/credential-key")
+    printf '%s %s' "$rv" "$ck"
+    exit 0 ;;
   "-n spatium get secret "*" -o jsonpath="*)
     name=$5
     [ -d "$S/secrets/$name" ] || { echo "Error from server (NotFound): secrets \"$name\" not found" >&2; exit 1; }
@@ -82,6 +89,7 @@ case "$*" in
       *"{.data.secret-key}"*) f=secret-key ;;
       *"{.data.metrics-token}"*) f=metrics-token ;;
       *"{.data.credential-key}"*) f=credential-key ;;
+      *"{.data.credential-key-since}"*) f=credential-key-since ;;
       *) echo "stub: unexpected jsonpath: $*" >&2; exit 3 ;;
     esac
     [ -f "$S/secrets/$name/$f" ] && printf '%s' "$(cat "$S/secrets/$name/$f")"
@@ -92,8 +100,9 @@ case "$*" in
     name=$(sed -n 's/^  name: //p' "$S/created.yaml")
     [ -d "$S/secrets/$name" ] && { echo "AlreadyExists" >&2; exit 1; }
     mkdir -p "$S/secrets/$name"
-    for f in secret-key metrics-token credential-key; do
-      sed -n "s/^  $f: //p" "$S/created.yaml" | tr -d '\n' > "$S/secrets/$name/$f"
+    for f in secret-key metrics-token credential-key credential-key-since; do
+      v=$(sed -n "s/^  $f: //p" "$S/created.yaml" | tr -d '\n')
+      [ -n "$v" ] && printf '%s' "$v" > "$S/secrets/$name/$f"
     done
     [ -f "$S/tamper" ] && printf 'dGFtcGVyZWQ=' > "$S/secrets/$name/secret-key"
     exit 0 ;;
@@ -101,7 +110,13 @@ case "$*" in
     name=$5
     [ -d "$S/secrets/$name" ] || exit 1
     [ -f "$S/patchfail" ] && { echo "stub: patch refused" >&2; exit 1; }
-    sed -n 's/.*"credential-key":"\([^"]*\)".*/\1/p' | tr -d '\n' > "$S/secrets/$name/credential-key"
+    cat > "$S/patch.json"
+    # The apiserver's optimistic lock: a stale resourceVersion is a 409.
+    rv=1; [ -f "$S/secrets/$name/.rv" ] && rv=$(cat "$S/secrets/$name/.rv")
+    [ -f "$S/bumprv" ] && rv=$((rv + 1))
+    grep -q "\"resourceVersion\":\"$rv\"" "$S/patch.json" || { echo "Conflict (409)" >&2; exit 1; }
+    sed -n 's/.*"credential-key":"\([^"]*\)".*/\1/p' "$S/patch.json" | tr -d '\n' > "$S/secrets/$name/credential-key"
+    sed -n 's/.*"credential-key-since":"\([^"]*\)".*/\1/p' "$S/patch.json" | tr -d '\n' > "$S/secrets/$name/credential-key-since"
     exit 0 ;;
 esac
 echo "stub k3s: unexpected: $*" >&2
@@ -138,7 +153,7 @@ class Run:
         d = self.stub / "secrets" / name
         if not d.is_dir():
             return None
-        return {f.name: f.read_text() for f in d.iterdir()}
+        return {f.name: f.read_text() for f in d.iterdir() if not f.name.startswith(".")}
 
     @property
     def created(self) -> str | None:
@@ -148,7 +163,8 @@ class Run:
 
 def _run(tmp_path: Path, *, secrets: dict[str, dict[str, str]] | None = None,
          apierr: bool = False, createfail: bool = False, tamper: bool = False,
-         patchfail: bool = False) -> Run:
+         patchfail: bool = False, bumprv: bool = False,
+         version: str | None = "2026.11.13-1") -> Run:
     stub = tmp_path / "stub"
     stub.mkdir()
     (stub / "secrets").mkdir()
@@ -158,7 +174,7 @@ def _run(tmp_path: Path, *, secrets: dict[str, dict[str, str]] | None = None,
         for k, v in data.items():
             (d / k).write_text(v)
     for flag, on in (("apierr", apierr), ("createfail", createfail), ("tamper", tamper),
-                     ("patchfail", patchfail)):
+                     ("patchfail", patchfail), ("bumprv", bumprv)):
         if on:
             (stub / flag).touch()
     k3s = tmp_path / "k3s"
@@ -177,7 +193,12 @@ def _run(tmp_path: Path, *, secrets: dict[str, dict[str, str]] | None = None,
     )
     proc = subprocess.run(
         [SHELL, "-c", script],
-        env={**os.environ, "SPATIUM_FIRSTBOOT_LIB": "1", "STUB": str(stub)},
+        env={
+            **{k: v for k, v in os.environ.items() if k != "SPATIUMDDI_VERSION"},
+            "SPATIUM_FIRSTBOOT_LIB": "1",
+            "STUB": str(stub),
+            **({"SPATIUMDDI_VERSION": version} if version is not None else {}),
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -215,6 +236,7 @@ def test_upgrade_keeps_an_existing_metrics_token(tmp_path):
     got = r.secret(APP_KEYS)
     assert got is not None
     got.pop("credential-key")  # #1358: generated alongside; asserted below
+    got.pop("credential-key-since")
     assert got == {"secret-key": key, "metrics-token": token}
 
 
@@ -249,6 +271,7 @@ def test_an_existing_app_keys_secret_is_never_overwritten(tmp_path):
     got = r.secret(APP_KEYS)
     assert got is not None
     got.pop("credential-key")  # #1358: added when missing; the keys above are untouched
+    got.pop("credential-key-since")
     assert got == mine
     assert r.created is None
     assert r.stamp.exists()
@@ -419,3 +442,63 @@ def test_a_failed_credential_key_patch_does_not_fail_the_secret(tmp_path):
     assert r.stamp.exists()
     got = r.secret(APP_KEYS)
     assert got is not None and "credential-key" not in got
+
+
+# ── #1358: no reader without the key ever sees a value written under it ──────
+
+
+def test_a_key_added_to_a_running_install_is_stamped_with_this_version(tmp_path):
+    r = _run(tmp_path, secrets={APP_KEYS: {"secret-key": _b64("a" * 64)}})
+    assert r.proc.returncode == 0, r.proc.stderr
+    got = r.secret(APP_KEYS)
+    assert got is not None and _is_fernet_key_b64(got["credential-key"])
+    # The api of this version reads it but keeps writing under the old key.
+    assert base64.b64decode(got["credential-key-since"]).decode() == "2026.11.13-1"
+    patch = (r.stub / "patch.json").read_text()
+    assert '"resourceVersion":"1"' in patch
+
+
+def test_no_key_is_added_when_the_version_is_unknown(tmp_path):
+    r = _run(tmp_path, secrets={APP_KEYS: {"secret-key": _b64("a" * 64)}}, version=None)
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert "credential-key" not in (r.secret(APP_KEYS) or {})
+
+
+def test_a_second_node_racing_to_add_a_key_does_not_replace_the_first(tmp_path):
+    # The Secret changed between our read and our patch (another node added
+    # its key): the stale resourceVersion is refused and nothing is replaced.
+    r = _run(tmp_path, secrets={APP_KEYS: {"secret-key": _b64("a" * 64)}}, bumprv=True)
+    assert r.proc.returncode == 0, r.proc.stderr
+    got = r.secret(APP_KEYS)
+    assert got is not None and "credential-key" not in got
+    assert "another node" in r.proc.stderr
+
+
+def test_a_fresh_install_key_carries_no_stamp(tmp_path):
+    r = _run(tmp_path)
+    got = r.secret(APP_KEYS)
+    assert got is not None and "credential-key-since" not in got
+
+
+def test_a_key_generated_for_a_chart_owned_install_is_stamped(tmp_path):
+    r = _run(tmp_path, secrets={CHART_APP: {"secret-key": _b64("a" * 64)}})
+    got = r.secret(APP_KEYS)
+    assert got is not None
+    assert base64.b64decode(got["credential-key-since"]).decode() == "2026.11.13-1"
+
+
+def test_the_chart_minted_stamp_is_carried_over(tmp_path):
+    ckey = _b64("Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm8=")
+    r = _run(
+        tmp_path,
+        secrets={
+            CHART_APP: {
+                "secret-key": _b64("a" * 64),
+                "credential-key": ckey,
+                "credential-key-since": _b64("2026.11.01-1"),
+            }
+        },
+    )
+    got = r.secret(APP_KEYS)
+    assert got is not None and got["credential-key"] == ckey
+    assert base64.b64decode(got["credential-key-since"]).decode() == "2026.11.01-1"

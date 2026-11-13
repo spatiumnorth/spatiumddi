@@ -2565,6 +2565,17 @@ reassert_control_plane_class() {
 # it are unreadable without it. Best effort by design: ``auth.existingSecret``
 # stays on the strength of ``secret-key`` alone, so a failure here must not
 # make the caller strip it (that would swap in a chart-owned SECRET_KEY).
+#
+# Two guards, both about a reader that does not have the key:
+#  * ``credential-key-since`` is stamped with the version this slot runs. The
+#    api of that version reads the key but keeps WRITING under the
+#    SECRET_KEY-derived one (CREDENTIAL_KEY_SINCE, app/config.py), because
+#    its rollout can still have pods of the previous image, which cannot read
+#    it. The next release writes with it. Without a known version there is no
+#    safe stamp, so no key is added.
+#  * the patch carries the resourceVersion it read, so two nodes adding a key
+#    at once cannot both win: the loser's patch is refused (409) instead of
+#    replacing a key pods may already have started with.
 _new_credential_key_b64() {
     # A Fernet key is url-safe base64 of 32 random bytes; the Secret's data
     # field is that string base64'd again.
@@ -2573,16 +2584,23 @@ _new_credential_key_b64() {
 
 ensure_credential_key() {
     local kc="/usr/local/bin/k3s kubectl -n spatium"
-    local have="" ckey=""
-    have=$($kc get secret "$APP_KEY_SECRET" -o jsonpath='{.data.credential-key}' 2>/dev/null) || return 0
+    local got="" rv="" have="" ckey="" since=""
+    # One read for both, so the resourceVersion is the one the key was read at.
+    got=$($kc get secret "$APP_KEY_SECRET" -o jsonpath='{.metadata.resourceVersion} {.data.credential-key}' 2>/dev/null) || return 0
+    rv=${got%% *}
+    have=${got#* }
+    [ "$have" = "$got" ] && have=""
     [ -z "$have" ] || return 0
+    [ -n "$rv" ] || return 0
+    [ -n "${SPATIUMDDI_VERSION:-}" ] || return 0
+    since=$(printf '%s' "$SPATIUMDDI_VERSION" | base64 | tr -d '\n')
     ckey=$(_new_credential_key_b64) || return 0
     [ -n "$ckey" ] || return 0
     echo "Adding credential-key to ${APP_KEY_SECRET} (#1358)"
     # Value via stdin (merge patch), never argv.
-    printf '%s' "{\"data\":{\"credential-key\":\"${ckey}\"}}" \
+    printf '%s' "{\"metadata\":{\"resourceVersion\":\"${rv}\"},\"data\":{\"credential-key\":\"${ckey}\",\"credential-key-since\":\"${since}\"}}" \
         | $kc patch secret "$APP_KEY_SECRET" --type merge --patch-file /dev/stdin >/dev/null 2>&1 \
-        || echo "WARN: could not add credential-key to ${APP_KEY_SECRET}; stored credentials stay under the SECRET_KEY-derived key (#1358)." >&2
+        || echo "WARN: could not add credential-key to ${APP_KEY_SECRET} (or another node added one first); stored credentials stay under the key already in use (#1358)." >&2
     return 0
 }
 
@@ -2590,7 +2608,7 @@ ensure_app_key_secret() {
     local kc="/usr/local/bin/k3s kubectl -n spatium"
     # Initialised: this script runs under ``set -u``, where a bare ``local
     # token`` is unset and the metrics-token check below would abort it.
-    local found="" key="" token="" ckey=""
+    local found="" key="" token="" ckey="" since=""
     found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
     if [ -n "$found" ]; then
         ensure_credential_key
@@ -2604,6 +2622,17 @@ ensure_app_key_secret() {
         # A credential-key the chart already minted (#1358) is carried over:
         # values may have been written under it.
         ckey=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.credential-key}' 2>/dev/null) || ckey=""
+        since=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.credential-key-since}' 2>/dev/null) || since=""
+        # No key there: the api running off that Secret has none either, so a
+        # key generated now is new to a RUNNING install. Stamp it (see
+        # ensure_credential_key), or add none when the version is unknown.
+        if [ -z "$ckey" ]; then
+            since=""
+            if [ -n "${SPATIUMDDI_VERSION:-}" ]; then
+                ckey=$(_new_credential_key_b64) || return 1
+                since=$(printf '%s' "$SPATIUMDDI_VERSION" | base64 | tr -d '\n')
+            fi
+        fi
         if [ -z "$key" ]; then
             echo "WARN: ${CHART_APP_SECRET} exists but carries no secret-key; not generating one (#1448)." >&2
             return 1
@@ -2612,8 +2641,10 @@ ensure_app_key_secret() {
     else
         echo "Generating SECRET_KEY into ${APP_KEY_SECRET} (fresh install, #1448)"
         key=$(openssl rand -hex 32 | tr -d '\n' | base64 | tr -d '\n')
+        # Fresh install: no pod has run yet, so no stamp — the key is written
+        # with from the start.
+        ckey=$(_new_credential_key_b64) || return 1
     fi
-    [ -n "$ckey" ] || ckey=$(_new_credential_key_b64) || return 1
     [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
     # Values go through stdin as base64, never argv, so they never show in a
     # process listing. ``create`` (not ``apply``) fails if the Secret appeared
@@ -2631,7 +2662,8 @@ ensure_app_key_secret() {
         "data:" \
         "  secret-key: ${key}" \
         "  metrics-token: ${token}" \
-        "  credential-key: ${ckey}" \
+        "${ckey:+  credential-key: ${ckey}}" \
+        "${since:+  credential-key-since: ${since}}" \
         | $kc create -f - >/dev/null 2>&1; then
         found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
         [ -n "$found" ] || return 1

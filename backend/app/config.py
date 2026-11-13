@@ -62,6 +62,19 @@ def signing_key_weakness(key: str) -> str | None:
     return None
 
 
+def credential_key_writes_deferred(since: str, version: str) -> bool:
+    """True while a dedicated credential key must be read but not written (#1358).
+
+    ``since`` is the version stamped when the key was added to a running
+    install; ``version`` is this process's own. Equal means this process is
+    part of the rollout that introduced the key, where a reader without it may
+    still be running. Any other version comes later (every reader since has
+    the key), so writes move onto it.
+    """
+    since = (since or "").strip()
+    return bool(since) and since == (version or "").strip()
+
+
 def credential_key_problem(key: str) -> str | None:
     """Why ``key`` cannot be the CREDENTIAL_ENCRYPTION_KEY, or None if it can.
 
@@ -118,6 +131,16 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
     credential_encryption_key: str = ""
+    # #1358 — the release that FIRST carried ``credential_encryption_key`` on
+    # this install, stamped by the Helm chart / appliance firstboot when they
+    # add a key to an install that was already running. While the running
+    # version equals it, the dedicated key is read but never written: the
+    # rollout that introduced it may still have pods (older image, or started
+    # before the Secret had the key) that can only read the SECRET_KEY-derived
+    # key, and a value written under the dedicated key would be unreadable to
+    # them. Empty (fresh install, compose, an operator-set key) = write with
+    # it straight away. See :func:`credential_key_writes_deferred`.
+    credential_key_since: str = ""
 
     # CORS — comma-separated allowed origins (e.g.
     # "https://ddi.example.com,https://ipam.example.com"). Default "*"
