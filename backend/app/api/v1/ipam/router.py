@@ -13415,6 +13415,10 @@ class IPAddressBulkEditResponse(BaseModel):
     # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
     # removed. An updated address absent from it had none to remove (#2172).
     dns_cleared: list[uuid.UUID] = []
+    # Why a row in ``skipped`` was skipped, keyed by id (#3905), as the bulk
+    # delete does (#1714): a delegate must not be told its grant's gap is a
+    # "system row".
+    skipped_reasons: dict[str, str] = {}
 
 
 @router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
@@ -13459,6 +13463,7 @@ async def bulk_edit_addresses(
     found_ids = {ip.id for ip in rows}
     not_found = [i for i in body.ip_ids if i not in found_ids]
     updated = 0
+    skipped_reasons: dict[str, str] = {}
     skipped: list[uuid.UUID] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
@@ -13515,17 +13520,22 @@ async def bulk_edit_addresses(
         for ip in rows:
             if ip.status in ("network", "broadcast", "orphan"):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = (
+                    "System row (network, broadcast or orphan); not editable."
+                )
                 continue
             # Skip dynamic-lease mirrors — DHCP server owns their state and any
             # edit here would be overwritten on the next pull. The UI already
             # blocks these from being selected; this is defence-in-depth.
             if ip.auto_from_lease:
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = "DHCP lease mirror; the DHCP server owns it."
                 continue
             # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
             # IPs outside its bound subnet.
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = "Outside the subnet this API token is scoped to."
                 continue
             # GHSA-875w — nor move an IP into a zone the token holds no grant
             # on (the IP's own subnet zones and its current zone pass).
@@ -13553,6 +13563,7 @@ async def bulk_edit_addresses(
                     )
                 except HTTPException:
                     skipped.append(ip.id)
+                    skipped_reasons[str(ip.id)] = "Names a DNS zone this token or user may not use."
                     continue
             # Address-set write delegation (#103): skip IPs the caller has no
             # write permission on (subnet-wide nor any covering address set).
@@ -13564,6 +13575,9 @@ async def bulk_edit_addresses(
                 set_ranges,
             ):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = (
+                    "Not in an address set you can edit, and no write permission on its subnet."
+                )
                 continue
 
             old: dict[str, Any] = {}
@@ -13678,6 +13692,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        skipped_reasons=skipped_reasons,
         dns_cleared=dns_cleared,
     )
 

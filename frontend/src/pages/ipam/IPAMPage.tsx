@@ -11431,8 +11431,12 @@ export function BulkEditAddressesModal({
       if (subnetId)
         qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       if (res.skipped.length > 0) {
+        // Say why (#3905): a delegate's rows outside its address set are not
+        // "system/orphan rows". Older servers send no reasons.
+        const reasons = [...new Set(Object.values(res.skipped_reasons ?? {}))];
         setError(
-          `${res.updated_count} updated; ${res.skipped.length} skipped (system/orphan rows).`,
+          `${res.updated_count} updated; ${res.skipped.length} skipped` +
+            (reasons.length > 0 ? `. ${reasons.join(" ")}` : "."),
         );
         // #516 — 1.2 s was too short to read the skipped-rows report (the
         // only place it surfaces). Give the operator time to see it.

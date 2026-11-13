@@ -23,8 +23,9 @@ const PAGE_SIZE = 200;
 // operator knows to run it again for the remainder.
 const BULK_CAP = 5000;
 
-// The route's gate (#2521, #3058): write on subnets, which own the address
-// rows a hand-picked or all-matching deprecate rewrites.
+// The route's gate (#2521, #3058, #3906): write on subnets, or a write grant
+// on an address set (#103), whose delegate the route admits and holds to each
+// row its set covers (the rest come back in ``skipped``).
 const DEPRECATE_DENIED = "Requires write permission on subnets";
 
 const inputCls =
@@ -41,7 +42,8 @@ export function StaleIPReportPage() {
   const qc = useQueryClient();
   const perms = usePermissions();
   const deprecateGate = permissionGate(
-    perms.can("write", "subnet"),
+    perms.can("write", "subnet") ||
+      perms.hasAnyGrantFor("write", "address_set"),
     DEPRECATE_DENIED,
   );
   const [staleDays, setStaleDays] = useState(90);
