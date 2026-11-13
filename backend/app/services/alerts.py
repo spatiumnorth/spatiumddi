@@ -4139,7 +4139,7 @@ async def _matching_agent_config_rejected_subjects(
                 refused = detail[len(PARTIAL_APPLY_PREFIX) :]
                 message = (
                     f"{kind} server '{row.name}' applied the configuration, but {refused}. "
-                    "Nothing was rolled back; fix the refused zones' data."
+                    "Nothing was rolled back; each reason says what to change."
                 )
             else:
                 message = (
