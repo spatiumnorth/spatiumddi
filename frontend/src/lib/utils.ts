@@ -80,3 +80,16 @@ export function swatchTintCls(key: string | null | undefined): string | null {
   if (!key) return null;
   return SWATCH_COLORS.find((c) => c.key === key)?.tint ?? null;
 }
+
+/** Selected (checkbox-ticked) table row (#4075). The tint sits on the `tr`
+ *  itself with `!` so it beats the tbody-level zebra rule
+ *  (`[&>tr:nth-child(even)]`, higher specificity than a plain `bg-*`) and
+ *  the row's own hover. Even and odd rows take different tokens so the
+ *  stripes still read across adjacent selected rows; hover is a third,
+ *  stronger shade; the accent bar is an inset shadow on the first cell, so
+ *  it never shifts layout. Colours live in `index.css`. */
+export function selectedRowClass(selected: boolean): string {
+  return selected
+    ? "even:!bg-[hsl(var(--row-selected-even))] odd:!bg-[hsl(var(--row-selected-odd))] hover:!bg-[hsl(var(--row-selected-hover))] [&>td:first-child]:shadow-[inset_3px_0_0_hsl(var(--primary))]"
+    : "";
+}

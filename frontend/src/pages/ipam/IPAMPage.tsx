@@ -133,7 +133,7 @@ import {
   type IpDnsState,
 } from "@/lib/gatewayDns";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
-import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -6963,7 +6963,7 @@ export function SubnetDetail({
                                   addr.status !== "orphan" &&
                                   !permitsWrite &&
                                   "opacity-50",
-                                rowSelected && "bg-primary/5",
+                                selectedRowClass(rowSelected),
                                 isHighlightedRow(addr.id) &&
                                   "spatium-row-highlight",
                               )}
@@ -15408,7 +15408,10 @@ export function BlockDetailView({
                         <tr
                           key={item.key}
                           onClick={() => onSelectBlock(b)}
-                          className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                          className={cn(
+                            "border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10",
+                            selectedRowClass(selected.has(blockKey)),
+                          )}
                         >
                           <td
                             className="w-8 px-2 py-2"
@@ -15494,7 +15497,7 @@ export function BlockDetailView({
                           onClick={() => onSelectSubnet(s)}
                           className={cn(
                             "border-b last:border-0 cursor-pointer hover:bg-muted/30",
-                            selected.has(`subnet:${s.id}`) && "bg-primary/5",
+                            selectedRowClass(selected.has(`subnet:${s.id}`)),
                           )}
                         >
                           <td
@@ -16463,7 +16466,10 @@ export function SpaceTableView({
                       <tr
                         key={item.key}
                         onClick={() => onSelectBlock(b)}
-                        className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                        className={cn(
+                          "border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10",
+                          selectedRowClass(selected.has(key)),
+                        )}
                       >
                         <td
                           className="w-8 px-2 py-2"
