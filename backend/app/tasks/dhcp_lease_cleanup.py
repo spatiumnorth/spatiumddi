@@ -47,6 +47,7 @@ from app.services.lock_order import (
     lock_mirror_rows,
     lock_zones_for_addresses,
 )
+from app.tasks._system_audit import add_system_audit
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -82,13 +83,13 @@ def _write_order(subnet_id: Any, address: Any) -> tuple[str, int, int, str]:
 _MIRROR_LOOKUP_CHUNK = 1000
 
 
-async def _sweep() -> tuple[int, int]:
+async def _expire_leases() -> tuple[int, int, list[str]]:
     cutoff = datetime.now(UTC) - EXPIRY_GRACE
     async with task_session() as db:
         # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
         # do no work (and open no driver connections) when it is.
         if not await is_module_enabled(db, "core.dhcp"):
-            return (0, 0)
+            return (0, 0, [])
         # Find any active-marked lease whose actual expiry passed the grace.
         # #3605: row-locked, in id order, before anything else is written. A
         # lease-events batch updates its lease rows first (one flush, which
@@ -125,6 +126,7 @@ async def _sweep() -> tuple[int, int]:
         )
         locked = list(res.scalars().all())
         cleaned = 0
+        freed_addresses: list[str] = []
         touched_subnets: set[Any] = set()  # recounted once below (#3345)
         # Lazy-import the DDNS revoke to keep this task light when
         # DDNS is off. The helper itself no-ops when the subnet is not
@@ -214,6 +216,7 @@ async def _sweep() -> tuple[int, int]:
             await purge_trashed_address_records(db, [row.id])  # #3186
             await db.delete(row)
             touched_subnets.add(row.subnet_id)
+            freed_addresses.append(str(row.address))
             cleaned += 1
 
         # Second pass — hard-delete leases that have sat in ``expired`` past the
@@ -228,11 +231,47 @@ async def _sweep() -> tuple[int, int]:
                 await db.delete(lease)
                 deleted += 1
 
-        # The sweep writes no audit row, so it never waits for the audit-chain
-        # lock and need not take it before the row locks (#3345).
+        # This transaction writes no audit row, so it never waits for the
+        # audit-chain lock and need not take it before the row locks (#3345).
+        # The audit row for what it did (#1257) goes in its own transaction
+        # after this commit (``_audit_sweep``), for the same reason.
         await recount_subnets_and_blocks(db, touched_subnets, audit_lock=False)
         await db.commit()
-        return cleaned, deleted
+        return cleaned, deleted, freed_addresses
+
+
+async def _sweep() -> tuple[int, int]:
+    """The expiry pass, then its audit row (#1257). Returns (mirrors, leases)."""
+    cleaned, deleted, freed = await _expire_leases()
+    await _audit_sweep(cleaned, deleted, freed)
+    return cleaned, deleted
+
+
+async def _audit_sweep(cleaned: int, deleted: int, freed_addresses: list[str]) -> None:
+    """One summary audit row for an expiry sweep that changed something (#1257).
+
+    Removing mirrored IPAM rows and revoking their DDNS records is a mutation
+    (non-negotiable #4). Written after the pass's own commit, in a separate
+    transaction, so the audit-chain lock is never taken while the sweep holds
+    lease, mirror and zone row locks.
+    """
+    if not (cleaned or deleted):
+        return
+    async with task_session() as db:
+        add_system_audit(
+            db,
+            action="dhcp-lease-expiry-sweep",
+            resource_type="platform",
+            resource_id="dhcp-lease-expiry-sweep",
+            resource_display="expired DHCP leases",
+            new_value={
+                "ipam_rows_removed": cleaned,
+                "expired_leases_deleted": deleted,
+                "addresses": freed_addresses[:50],
+                "capped": len(freed_addresses) > 50,
+            },
+        )
+        await db.commit()
 
 
 # Cap on rows the re-mirror pass hands over per run, so a backlog (a long run

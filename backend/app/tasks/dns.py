@@ -25,6 +25,7 @@ from app.services.agents.daemon_state import forget_stale_ok
 from app.services.dns_blocklist import looks_like_html, parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
 from app.services.forward_secrets import redact, secret_url_in_flight, url_display
+from app.tasks._system_audit import add_system_audit
 from app.tasks.module_gate import module_gated
 
 # If an agent hasn't heartbeat'd in this long, the server is unreachable.
@@ -387,6 +388,23 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 from app.services.dns.bundle_dirty import mark_bundles_dirty
 
                 await mark_bundles_dirty(db, everyone=True)
+                # A feed refresh that changed the entry set is a mutation of
+                # the effective blocklist (non-negotiable #4, #1257): one
+                # summary row per list per refresh, counts only.
+                add_system_audit(
+                    db,
+                    action="dns-blocklist-feed-refresh",
+                    resource_type="dns_blocklist",
+                    resource_id=str(bl.id),
+                    resource_display=bl.name,
+                    new_value={
+                        "added": len(to_add),
+                        "removed": len(to_remove),
+                        "exceptions_added": len(exc_to_add),
+                        "exceptions_removed": len(exc_to_remove),
+                        "entry_count": bl.entry_count,
+                    },
+                )
 
             await db.commit()
 
