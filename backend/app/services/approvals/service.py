@@ -28,13 +28,13 @@ import structlog
 from fastapi import HTTPException, Request, status
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.agent_wake import collecting_wakes
 from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import Group, User
 from app.models.change_request import CHANGE_REQUEST_ORIGINS, ChangeRequest
 from app.services.api_token_scopes import enforce_operation_token_scope
 
@@ -519,6 +519,7 @@ async def mark_failed(
     requester_id: UUID | None,
     request: Request | None,
     error: str,
+    audit_error: str | None = None,
 ) -> ChangeRequest:
     """``approved`` → ``failed`` (terminal). ``apply()`` (or its
     re-preview stale-state guard) failed at execution time. Like
@@ -538,7 +539,7 @@ async def mark_failed(
             "state": "approved",
             "requested_by": str(requester_id) if requester_id is not None else None,
         },
-        new_value={"state": "failed", "error": error},
+        new_value={"state": "failed", "error": audit_error or error},
     )
     logger.warning(
         "change_request.failed",
@@ -623,7 +624,39 @@ class DecisionUnprocessable(DecisionError):
     status_code = 422
 
 
-def _refusal_text(detail: Any) -> str:
+_SAFE_KEYS = ("fqdn", "mac_address", "ptr_name", "address")
+_SAFE_FALLBACK = "The request conflicts with something that already exists."
+# What a requester is told for each collision warning: the name, MAC or
+# address they asked for is theirs to read, what it collides with is not.
+_SAFE_WARNING_TEXT = {
+    "fqdn_collision": "The name {fqdn} is already in use.",
+    "mac_collision": "MAC {mac_address} is already assigned to another address.",
+    "ptr_collision": "The reverse name {ptr_name} already points to another address.",
+    "dynamic_pool": (
+        "The address {address} now falls inside a DHCP dynamic pool, so the DHCP"
+        " server may hand it to another device."
+    ),
+}
+
+# What a non-HTTP failure at apply is stored as. ``str(exc)`` of a database
+# error is raw driver text (SQL, column names, parameter values); the cause is
+# in the server log only (not on the request or its audit row; #3642).
+_INTERNAL_FAILURE_TEXT = (
+    "The request could not be applied because of an internal error. "
+    "An administrator can find the details in the server log."
+)
+
+
+def _exception_text(exc: Exception) -> str:
+    """Worded text for an exception that is not an HTTP refusal. A ValueError
+    is an operation's own sentence; anything else (a database error above all)
+    is not fit to show."""
+    if type(exc) is ValueError:
+        return str(exc)
+    return _INTERNAL_FAILURE_TEXT
+
+
+def _refusal_text(detail: Any, *, requester_safe: bool = False) -> str:
     """The text an HTTPException's ``detail`` puts on a failed request.
 
     The requester reads ``error`` on the portal (#2911), so it must be a
@@ -632,7 +665,11 @@ def _refusal_text(detail: Any) -> str:
     True}`` — the REST UI's "save anyway" prompt — which has no confirm step
     at approve time, so each warning is spelled out instead (collisions, a
     dynamic DHCP pool, a public-facing zone). Anything else falls back to
-    JSON."""
+    JSON.
+
+    ``requester_safe`` words the same warnings without naming the address,
+    subnet or pool bounds they found: the approver may read those, the
+    requester who gets the text may not (#3642)."""
     if isinstance(detail, str):
         return detail
     if isinstance(detail, dict) and isinstance(detail.get("warnings"), list):
@@ -642,7 +679,11 @@ def _refusal_text(detail: Any) -> str:
                 parts.append(str(w))
                 continue
             kind = w.get("kind")
-            if kind == "fqdn_collision":
+            if requester_safe and kind in _SAFE_WARNING_TEXT:
+                parts.append(_SAFE_WARNING_TEXT[kind].format(**{k: w.get(k) for k in _SAFE_KEYS}))
+            elif requester_safe and not (isinstance(w.get("message"), str) and w["message"]):
+                parts.append(_SAFE_FALLBACK)
+            elif kind == "fqdn_collision":
                 parts.append(
                     f"The name {w.get('fqdn')} is already used by {w.get('existing_ip')}"
                     f" in {w.get('existing_subnet')}."
@@ -675,6 +716,8 @@ def _refusal_text(detail: Any) -> str:
                 parts.append(json.dumps(w, sort_keys=True, default=str))
         if parts:
             return " ".join(parts)
+    if requester_safe:
+        return _SAFE_FALLBACK
     return json.dumps(detail, sort_keys=True, default=str)
 
 
@@ -731,6 +774,59 @@ async def _relock_after_failed_apply(
     )
 
 
+async def _requester_error(
+    db: AsyncSession,
+    cr: ChangeRequest,
+    *,
+    error: str,
+    detail: Any,
+    rerun_preview: bool,
+) -> str:
+    """The failure text a portal requester may read (#3642).
+
+    ``error`` names whatever the APPROVER could read. Here: a target the
+    requester cannot read is answered as an unknown id, as at submit; a
+    refused re-preview is re-run under the requester so it words itself from
+    their reads; collision warnings drop what they collided with. A text that
+    is a plain sentence about the request itself passes through."""
+    from app.services.ai.operations import (  # noqa: PLC0415 — avoid cycle
+        get_operation,
+        previewing_for_requester,
+        unreadable_target_detail,
+    )
+
+    requester = None
+    if cr.requested_by_user_id is not None:
+        requester = (
+            await db.execute(
+                select(User)
+                .where(User.id == cr.requested_by_user_id)
+                .options(selectinload(User.groups).selectinload(Group.roles))
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    op = get_operation(cr.operation)
+    if requester is None or op is None:
+        return _SAFE_FALLBACK
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+        hidden = unreadable_target_detail(requester, op, args)
+        if hidden is not None:
+            return hidden
+        if rerun_preview:
+            with previewing_for_requester():
+                again = await op.preview(db, requester, args)
+            if not again.ok:
+                return again.detail or _SAFE_FALLBACK
+            return _SAFE_FALLBACK
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("change_request.requester_error_failed", error=str(exc))
+        return _SAFE_FALLBACK
+    if detail is not None:
+        return _refusal_text(detail, requester_safe=True)
+    return error
+
+
 async def _stamp_apply_failed(
     db: AsyncSession,
     cr_id: UUID,
@@ -739,6 +835,8 @@ async def _stamp_apply_failed(
     request: Request | None,
     note: str | None,
     error: str,
+    detail: Any = None,
+    rerun_preview: bool = False,
 ) -> ChangeRequest:
     """Re-lock the (rolled-back) row and stamp ``pending → approved → failed``.
 
@@ -748,15 +846,31 @@ async def _stamp_apply_failed(
     before ``mark_failed`` — unless ``apply()`` had already committed it, in
     which case only the failure is stamped (one ``approved`` audit row, not
     two). Raises :class:`DecisionConflict` if the row vanished or another
-    actor decided it mid-apply."""
+    actor decided it mid-apply.
+
+    ``error`` was composed under the approver's reads, so on a portal request
+    the requester-facing ``cr.error`` is re-composed under the requester's own
+    (:func:`_requester_error`); the audit row keeps the approver's text
+    (#3642)."""
     cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
     requester_id = cr.requested_by_user_id
     if not approval_committed:
         # apply()'s commit carries the stamp and its audit row together
         # (#3549), so a committed approval is already audited.
         await mark_approved(db, cr, approver=approver, request=request, note=note)
+    shown = error
+    if cr.origin == "portal":
+        shown = await _requester_error(
+            db, cr, error=error, detail=detail, rerun_preview=rerun_preview
+        )
     await mark_failed(
-        db, cr, approver=approver, requester_id=requester_id, request=request, error=error
+        db,
+        cr,
+        approver=approver,
+        requester_id=requester_id,
+        request=request,
+        error=shown,
+        audit_error=error,
     )
     await db.commit()
     # ``modified_at`` is a server-side onupdate, so the flush expired it; the
@@ -935,11 +1049,21 @@ async def approve_change_request(
             request=request,
             note=note,
             error=_refusal_text(exc.detail),
+            detail=exc.detail,
+            rerun_preview=True,
         )
     except Exception as exc:  # noqa: BLE001
         await _safe_rollback(db)
+        logger.warning(
+            "change_request.preview_failed", change_request_id=str(cr_id), error=str(exc)
+        )
         return await _stamp_apply_failed(
-            db, cr_id, approver=approver, request=request, note=note, error=str(exc)
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=_exception_text(exc),
         )
     if not preview.ok and preview.forbidden_detail is not None:
         # The target exists, but THIS approver can neither read nor act on
@@ -967,6 +1091,7 @@ async def approve_change_request(
             request=request,
             note=note,
             error=preview.detail or "The operation can no longer be applied.",
+            rerun_preview=True,
         )
 
     # 5a. Idempotent resolution (#62 concurrent break-glass). When the op's
@@ -1101,13 +1226,20 @@ async def approve_change_request(
             request=request,
             note=note,
             error=_refusal_text(exc.detail),
+            detail=exc.detail,
         )
     except Exception as exc:  # noqa: BLE001
         # apply() rolled back its own transaction; reload + lock to stamp the
         # failure (the approval transition was rolled back too).
         await _safe_rollback(db)
+        logger.warning("change_request.apply_raised", change_request_id=str(cr_id), error=str(exc))
         return await _stamp_apply_failed(
-            db, cr_id, approver=approver, request=request, note=note, error=str(exc)
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=_exception_text(exc),
         )
 
     if not approval_audit["written"]:
