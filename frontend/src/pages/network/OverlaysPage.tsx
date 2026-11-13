@@ -24,6 +24,7 @@ import {
   MissingCustomerOption,
 } from "@/components/ownership/pickers";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -316,7 +317,9 @@ export function OverlayEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -402,17 +405,27 @@ export function OverlaysPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => overlaysApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["overlays"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete overlays")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => overlaysApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["overlays"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete overlay"));
+      qc.invalidateQueries({ queryKey: ["overlays"] });
+    },
   });
 
   function toggle(id: string) {
@@ -431,6 +444,11 @@ export function OverlaysPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">SD-WAN overlays</h1>
@@ -594,8 +612,10 @@ export function OverlaysPage() {
                         setCustomerFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New overlay" to add one.`}
                     >
-                      No overlays yet — click "New overlay" to add one.
+                      No overlays yet.
                     </ListEmpty>
                   </td>
                 </tr>

@@ -53,6 +53,8 @@ from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.sync_check import ipam_authors_zone
+from app.services.dns.zone_synthesis import unauthored_zone_error
 from app.services.ipam.address_create_rules import (
     boundary_address_refusal,
     holds_address,
@@ -483,14 +485,14 @@ async def _hostname_from_fqdn(
     zone_name = zone.name.rstrip(".").lower()
     if not args.fqdn.endswith("." + zone_name):
         return args, (
-            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone this "
-            f"address publishes in. Give a hostname, or an fqdn ending in .{zone_name}."
+            f"fqdn {args.fqdn} is not a name in {zone_name}, the DNS zone bound to "
+            f"this subnet. Give a hostname, or an fqdn ending in .{zone_name}."
         )
     hostname = args.fqdn[: -len(zone_name) - 1]
     if args.hostname and args.hostname != hostname:
         return args, (
             f"hostname {args.hostname} and fqdn {args.fqdn} name different hosts: "
-            f"the address publishes {args.hostname}.{zone_name}. Give one of them."
+            f"the hostname gives {args.hostname}.{zone_name}. Give one of them."
         )
     return args.model_copy(update={"hostname": hostname}), None
 
@@ -588,8 +590,14 @@ async def _preview_create_ip_address(
 
         zone_id = await _resolve_effective_zone(db, subnet)
         zone = await db.get(DNSZone, zone_id) if zone_id else None
-        if zone is not None:
-            rtype = "AAAA" if addr_obj.version == 6 else "A"
+        rtype = "AAAA" if addr_obj.version == 6 else "A"
+        if zone is not None and not ipam_authors_zone(zone):
+            # #3833 — IPAM writes records only into a primary zone it serves
+            # (#1633), so the address is created with its fqdn but no record.
+            # Say so rather than promise one the approval will not write.
+            why = unauthored_zone_error(zone, "creat")
+            parts.append(f"no {rtype} record is published ({why})")
+        elif zone is not None:
             # #3647 — the address sync skips a forward record beside a CNAME
             # (#1441), so promising one would be false. Refuse, as the DNS
             # record kind does; the approve re-preview re-runs this, so a
@@ -930,7 +938,9 @@ async def _apply_create_ip_address(
         db,
         user=user,
         action="create",
-        resource_type="ipam.ip_address",
+        # Bare RBAC type: event_publisher + the compliance change alert key
+        # on "ip_address"; a namespaced string silences both (#3936).
+        resource_type="ip_address",
         resource_id=str(row.id),
         resource_display=str(args.address),
         new_value={
@@ -2771,7 +2781,10 @@ async def _preview_create_dns_record(
         find_cname_conflict,
         is_apex,
     )
-    from app.services.dns.zone_synthesis import synthesised_zone_error
+    from app.services.dns.zone_synthesis import (
+        synthesised_zone_error,
+        unauthored_zone_error,
+    )
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2811,7 +2824,7 @@ async def _preview_create_dns_record(
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
     # #2653 — the REST create's refusal; the reconciler would revert the row.
-    synth_err = synthesised_zone_error(zone, "edit")
+    synth_err = synthesised_zone_error(zone, "edit") or unauthored_zone_error(zone, "add")
     if synth_err is not None:
         return PreviewResult(ok=False, detail=synth_err)
 
@@ -2886,8 +2899,16 @@ async def _validate_submit_create_dns_record(
     is still present rather than at approve (#2903)."""
     from fastapi import HTTPException  # noqa: PLC0415
 
+    from app.models.dns import DNSZone  # noqa: PLC0415
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
+    from app.services.dns.zone_synthesis import unauthored_zone_error  # noqa: PLC0415
 
+    zone = await db.get(DNSZone, UUID(args.zone_id))
+    if zone is not None:
+        # #3838 — a secondary / stub / forward zone serves none of our records.
+        err = unauthored_zone_error(zone, "add")
+        if err is not None:
+            raise HTTPException(status_code=422, detail=err)
     rtype = args.record_type.strip().upper()
     # The create's per-type priority / weight / port rules (#3245): 422 in its
     # words for a field the type does not take.
@@ -2932,7 +2953,10 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
-    from app.services.dns.zone_synthesis import synthesised_zone_error
+    from app.services.dns.zone_synthesis import (
+        synthesised_zone_error,
+        unauthored_zone_error,
+    )
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2962,7 +2986,7 @@ async def _apply_create_dns_record(
     # propose and apply must not receive records.
     if getattr(zone, "deleted_at", None) is not None:
         raise ValueError(f"Zone {args.zone_id} is deleted.")
-    synth_err = synthesised_zone_error(zone, "edit")
+    synth_err = synthesised_zone_error(zone, "edit") or unauthored_zone_error(zone, "add")
     if synth_err is not None:
         raise ValueError(synth_err)
 
@@ -3055,7 +3079,8 @@ async def _apply_create_dns_record(
         db,
         user=user,
         action="create",
-        resource_type="dns.record",
+        # Bare type, as the REST create audits — keys ``dns.record.created`` (#3936).
+        resource_type="dns_record",
         resource_id=str(row.id),
         resource_display=f"{name} {rtype} {args.value}",
         new_value={
@@ -3824,7 +3849,8 @@ async def _apply_create_dhcp_static(
         db,
         user=user,
         action="create",
-        resource_type="dhcp.static_assignment",
+        # Bare type, as the REST create audits — keys ``dhcp.static.created`` (#3936).
+        resource_type="dhcp_static_assignment",
         resource_id=str(row.id),
         resource_display=f"{args.ip_address} ({args.mac_address})",
         new_value={

@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
@@ -2656,6 +2657,7 @@ function DnssecCard({
                 value={policyId}
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
+                aria-label="DNSSEC signing policy"
                 title="DNSSEC signing policy (BIND9)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
@@ -3540,6 +3542,17 @@ function RecordModalForm({
     queryKey: ["dns-views", groupId],
     queryFn: () => dnsApi.listViews(groupId),
   });
+  // #3944 — a zone pinned to one view renders into that view alone, and the
+  // record API refuses a record scoped to any other, so the field offers the
+  // pin and the unscoped default only.
+  const { data: groupZones = [] } = useQuery({
+    queryKey: ["dns-zones", groupId],
+    queryFn: () => dnsApi.listZones(groupId),
+  });
+  const pinViewId = groupZones.find((z) => z.id === zoneId)?.view_id ?? null;
+  const viewChoices = pinViewId
+    ? views.filter((v) => v.id === pinViewId || v.id === viewId)
+    : views;
 
   // SRV carries priority + weight + port (RFC 2782); MX carries only a
   // priority (the preference). Everything else carries none. (#424)
@@ -3846,12 +3859,18 @@ function RecordModalForm({
             onChange={(e) => setViewId(e.target.value)}
           >
             <option value="">All views (default)</option>
-            {views.map((v) => (
+            {viewChoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
+          {pinViewId && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              This zone is pinned to one view, so its records can only be in
+              that view.
+            </p>
+          )}
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
@@ -4517,6 +4536,14 @@ export function ZoneDetailView({
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
 
+  // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
+  // stub's data is its masters', so the server refuses a record written into
+  // it (422); the record entry points say so instead of failing on submit.
+  const unauthoredReason =
+    !isForward && zone.zone_type !== "primary" && zone.zone_type !== "master"
+      ? `This is a ${zone.zone_type} zone: its records come from its masters, so none can be added here.`
+      : undefined;
+
   // #996 — the Add Record keycap, rendered from lib/shortcuts.ts rather
   // than typed here, so retuning the binding moves the handler below,
   // this tooltip and the ``?`` overlay together.
@@ -4539,7 +4566,13 @@ export function ZoneDetailView({
     // #2529 — the keyboard path must honour the same grant as the button.
     // The ? sheet lists the key under ADD_DNS_RECORD.requires, which must
     // name this same grant (#3167).
-    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
+    if (
+      isForward ||
+      unauthoredReason ||
+      zone.tailscale_tenant_id ||
+      !canWriteRecords
+    )
+      return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4550,7 +4583,13 @@ export function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
+  }, [
+    isForward,
+    unauthoredReason,
+    zone.tailscale_tenant_id,
+    showAddRecord,
+    canWriteRecords,
+  ]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
@@ -4784,6 +4823,9 @@ export function ZoneDetailView({
                       label: "Import zone file",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
                       ...permissionGate(
                         can("write", "dns_record"),
                         NEEDS_RECORD_WRITE,
@@ -4802,6 +4844,9 @@ export function ZoneDetailView({
                       onSelect: () => setShowSheetImport(true),
                       title:
                         "Bulk-edit records from a spreadsheet: preview the adds, changes and deletes, then import",
+                      ...(unauthoredReason
+                        ? { disabled: true, title: unauthoredReason }
+                        : {}),
                       ...permissionGate(
                         can("write", "dns_record"),
                         NEEDS_RECORD_WRITE,
@@ -4923,11 +4968,12 @@ export function ZoneDetailView({
               variant="primary"
               icon={Plus}
               onClick={() => setShowAddRecord(true)}
-              disabled={!!zone.tailscale_tenant_id}
+              disabled={!!zone.tailscale_tenant_id || !!unauthoredReason}
               title={
                 zone.tailscale_tenant_id
                   ? "Records are managed by the Tailscale reconciler."
-                  : `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`
+                  : (unauthoredReason ??
+                    `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`)
               }
               {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
             >
@@ -5236,7 +5282,7 @@ export function ZoneDetailView({
                 ) : hasRecFilter ? (
                   "No records match the current filter."
                 ) : (
-                  'No records yet. Click "Add Record" to create one.'
+                  `No records yet.${canWriteRecords ? ' Click "Add Record" to create one.' : ""}`
                 )}
               </p>
             </div>
@@ -7032,10 +7078,20 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
       );
       return;
     }
+    // A cleared Order is refused, never saved as 0 (#3740): 0 sorts the view
+    // ahead of every view ordered 1 and up, and the operator never saw it.
+    const orderText = order.trim();
+    const orderNum = Number(orderText);
+    if (orderText === "" || !Number.isInteger(orderNum) || orderNum < 0) {
+      setError(
+        "Order is required: a whole number, 0 or higher. Views are evaluated lowest first.",
+      );
+      return;
+    }
     const body = {
       name: name.trim(),
       description: description.trim(),
-      order: Number(order) || 0,
+      order: orderNum,
       recursion,
       match_clients: clients,
       match_destinations: lines(matchDestinations),
@@ -7084,8 +7140,11 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
             <input
               className={inputCls}
               type="number"
+              min={0}
+              step={1}
               value={order}
               onChange={(e) => setOrder(e.target.value)}
+              placeholder="0"
             />
           </Field>
           <Field label="Recursion">
@@ -7100,9 +7159,9 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </Field>
         </div>
         <p className="-mt-1 text-[11px] text-muted-foreground">
-          Views are evaluated low order first, and a client is served by the
-          first view it matches — so put the most specific view above the
-          catch-all.
+          Order is a whole number, 0 or higher; lower is evaluated first. Views
+          are evaluated low order first, and a client is served by the first
+          view it matches — so put the most specific view above the catch-all.
         </p>
 
         <Field label="Description">
@@ -7634,7 +7693,13 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       )}
       {keys.length === 0 && keysData !== undefined && keysError == null && (
         <p className="text-xs italic text-muted-foreground">
-          No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
+          No TSIG keys yet.
+          {isSuperadmin && (
+            <>
+              {" "}
+              Click <em>New TSIG Key</em> to add one.
+            </>
+          )}
         </p>
       )}
 
@@ -10478,7 +10543,7 @@ function ZonesTab({
               </button>
             </>
           ) : (
-            'No zones yet. Click "Add Zone" to create one.'
+            `No zones yet.${can("write", "dns_zone") ? ' Click "Add Zone" to create one.' : ""}`
           )}
         </p>
       )}
@@ -11000,14 +11065,35 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       setSelectedIds(new Set());
     },
   });
+  // Every list is its own DELETE, so every result is read (#3822): a refused
+  // delete leaves its list in place, the dialog stays open and says why, and
+  // only the lists that were not deleted stay selected.
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null);
   const bulkDelete = useMutation({
-    mutationFn: async (ids: string[]) => {
-      await Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id)));
-    },
-    onSuccess: () => {
+    mutationFn: (ids: string[]) =>
+      Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id))),
+    onSuccess: (results, ids) => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      setSelectedIds(new Set());
-      setConfirmBulkDelete(false);
+      const failed = ids.filter((_, i) => results[i].status === "rejected");
+      setSelectedIds(new Set(failed));
+      if (failed.length === 0) {
+        setConfirmBulkDelete(false);
+        return;
+      }
+      const reasons = [
+        ...new Set(
+          results.flatMap((r) =>
+            r.status === "rejected" ? [formatApiError(r.reason)] : [],
+          ),
+        ),
+      ];
+      const what =
+        failed.length < ids.length
+          ? `${failed.length} of ${ids.length} blocking lists were not deleted`
+          : ids.length === 1
+            ? "The blocking list was not deleted"
+            : `None of the ${ids.length} blocking lists were deleted`;
+      setBulkDeleteError(`${what}: ${reasons.join("; ")}`);
     },
   });
 
@@ -11367,8 +11453,19 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           description={`Permanently delete "${confirmDelete.name}" and all its entries/exceptions?`}
           checkLabel={`I understand all entries in "${confirmDelete.name}" will be permanently deleted.`}
           onConfirm={() => deleteMut.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            deleteMut.reset();
+          }}
           isPending={deleteMut.isPending}
+          error={
+            deleteMut.isError
+              ? formatApiError(
+                  deleteMut.error,
+                  "Failed to delete blocking list",
+                )
+              : null
+          }
         />
       )}
       {confirmBulkDelete && (
@@ -11376,9 +11473,16 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           title={`Delete ${selCount} blocklist${selCount === 1 ? "" : "s"}`}
           description={`Permanently delete the ${selCount} selected blocking list${selCount === 1 ? "" : "s"} and all their entries / exceptions? This cannot be undone.`}
           checkLabel={`I understand the ${selCount} selected blocking list${selCount === 1 ? " will be" : "s will be"} permanently deleted.`}
-          onConfirm={() => bulkDelete.mutate(Array.from(selectedIds))}
-          onClose={() => setConfirmBulkDelete(false)}
+          onConfirm={() => {
+            setBulkDeleteError(null);
+            bulkDelete.mutate(Array.from(selectedIds));
+          }}
+          onClose={() => {
+            setConfirmBulkDelete(false);
+            setBulkDeleteError(null);
+          }}
           isPending={bulkDelete.isPending}
+          error={bulkDeleteError}
         />
       )}
     </div>
@@ -11713,11 +11817,9 @@ function EditBlockedDomainModal({
           Block subdomains too (
           <code className="font-mono text-xs">*.{domain || "domain"}</code>)
         </label>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11806,11 +11908,9 @@ function EditExceptionModal({
             placeholder="Optional"
           />
         </Field>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -12120,6 +12220,7 @@ export function BlocklistDetail({
                           value: ev.target.checked,
                         })
                       }
+                      aria-label={`Also block subdomains of ${e.domain}`}
                       title={
                         e.source !== "manual"
                           ? "Feed-sourced entries can't be toggled."

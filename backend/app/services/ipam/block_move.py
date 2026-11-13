@@ -333,6 +333,65 @@ async def _check_overlap_in_target(
     return reparent
 
 
+async def _check_subnet_overlap_in_target(
+    db: AsyncSession,
+    moved_block: IPBlock,
+    target_space_id: uuid.UUID,
+    descendant_subnet_ids: list[str],
+    descendant_block_ids: list[str],
+    reparent_chain: list[str],
+) -> None:
+    """Refuse a move that would leave two overlapping live subnets in the target
+    space, the rule ``create_subnet`` and the Trash restore enforce (#3923).
+
+    Subnets carry their own ``space_id``, so the block-level check above never
+    sees them. Only a cross-space move can introduce an overlap. Also refuses a
+    moved child block that would sit at the same level as, and overlap, a
+    target block being re-parented under the moved block.
+    """
+    if descendant_subnet_ids and moved_block.space_id != target_space_id:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT m.network::text, t.network::text FROM subnet m "
+                    "JOIN subnet t ON t.space_id = CAST(:space AS uuid) "
+                    "AND t.network && m.network "
+                    "WHERE m.id = ANY(CAST(:ids AS uuid[])) "
+                    "AND t.id != m.id AND t.deleted_at IS NULL "
+                    "AND NOT (t.id = ANY(CAST(:ids AS uuid[]))) "
+                    "ORDER BY m.network LIMIT 1"
+                ),
+                {"space": str(target_space_id), "ids": descendant_subnet_ids},
+            )
+        ).first()
+        if row:
+            raise BlockMoveError(
+                f"Subnet {row[0]} in the moved block overlaps with existing subnet "
+                f"{row[1]} in the target space.",
+                status_code=409,
+            )
+    if reparent_chain:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT c.network::text, r.network::text FROM ip_block c "
+                    "JOIN ip_block r ON r.network && c.network "
+                    "WHERE c.parent_block_id = CAST(:moved AS uuid) "
+                    "AND c.deleted_at IS NULL "
+                    "AND r.id = ANY(CAST(:reparent AS uuid[])) AND r.deleted_at IS NULL "
+                    "LIMIT 1"
+                ),
+                {"moved": str(moved_block.id), "reparent": reparent_chain},
+            )
+        ).first()
+        if row:
+            raise BlockMoveError(
+                f"Child block {row[0]} of the moved block overlaps with block {row[1]} "
+                f"in the target space that would be re-parented under it.",
+                status_code=409,
+            )
+
+
 async def _validate_target_parent(
     db: AsyncSession,
     moved_block: IPBlock,
@@ -403,6 +462,14 @@ async def assemble_move_plan(
 
     reparent_chain = await _check_overlap_in_target(
         db, moved_block, target_space_id, target_parent_id
+    )
+    await _check_subnet_overlap_in_target(
+        db,
+        moved_block,
+        target_space_id,
+        descendant_subnet_ids,
+        descendant_block_ids,
+        reparent_chain,
     )
 
     # Soft warnings — non-blocking, surfaced in preview.

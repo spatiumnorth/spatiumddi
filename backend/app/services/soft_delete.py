@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
@@ -558,6 +558,45 @@ async def _record_cname_conflicts(
     return found
 
 
+async def _record_view_conflicts(
+    db: AsyncSession, batch_id: uuid.UUID
+) -> dict[uuid.UUID, tuple[str, str]]:
+    """The batch's records scoped to a view their live zone is no longer pinned to (#3920).
+
+    A pinned zone renders into its pin alone, so a record scoped to another
+    view is served in no view. The record API refuses writing that state and
+    Edit Zone refuses re-pinning into it (#3839), but a record waiting in the
+    Trash is counted by neither, so Restore was a door to it. Returns
+    ``{record id: (label, reason)}``. A zone in the Trash is
+    ``_record_parent_conflicts``'s case, and a record in a restored zone's own
+    batch keeps the pin it was deleted under.
+    """
+    zone = aliased(DNSZone)
+    pin = aliased(DNSView)
+    own = aliased(DNSView)
+    stmt: Any = (
+        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type, own.name, pin.name)
+        .join(zone, zone.id == DNSRecord.zone_id)
+        .join(own, own.id == DNSRecord.view_id)
+        .join(pin, pin.id == zone.view_id)
+        .where(
+            DNSRecord.deletion_batch_id == batch_id,
+            zone.deleted_at.is_(None),
+            DNSRecord.view_id != zone.view_id,
+        )
+        .execution_options(include_deleted=True)
+    )
+    return {
+        row_id: (
+            _record_label(fqdn, rtype),
+            f"it is scoped to view '{own_name}' but its zone is now pinned to view "
+            f"'{pin_name}', so it would be served in no view — move the zone's pin "
+            "back, or restore it after changing the zone's view",
+        )
+        for row_id, fqdn, rtype, own_name, pin_name in (await db.execute(stmt)).tuples()
+    }
+
+
 async def _record_parent_conflicts(
     db: AsyncSession, batch_id: uuid.UUID
 ) -> dict[uuid.UUID, tuple[str, str, DNSZone]]:
@@ -765,7 +804,13 @@ async def restore_batch(
     record_conflicts: dict[uuid.UUID, str] = {}
     record_parent_conflicts: dict[uuid.UUID, str] = {}
     record_cname_conflicts: dict[uuid.UUID, str] = {}
+    record_view_conflicts: dict[uuid.UUID, str] = {}
     if conflict_check is not None:
+        for rid, (label, reason) in (await _record_view_conflicts(db, batch_id)).items():
+            record_view_conflicts[rid] = reason
+            result.conflicts.append(
+                {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
+            )
         record_conflicts = await _record_conflicts(db, batch_id)
         for rid, (label, reason) in (await _record_cname_conflicts(db, batch_id)).items():
             if rid in record_conflicts:
@@ -856,6 +901,7 @@ async def restore_batch(
         if r.id not in record_conflicts
         and r.id not in record_parent_conflicts
         and r.id not in record_cname_conflicts
+        and r.id not in record_view_conflicts
     )
 
     if result.conflicts and not skip_conflicts:
