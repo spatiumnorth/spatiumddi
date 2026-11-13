@@ -758,11 +758,12 @@ def _run_pcap_runner(tmp_path: Path, bpf: str, tcpdump_body: str):
     return pcap
 
 
-def test_pcap_runner_refuses_a_filter_starting_with_a_dash(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "bpf", ["-V/etc/hostname", "  -w/tmp/x", "\t-V/etc/hostname"], ids=["bare", "spaces", "tab"]
+)
+def test_pcap_runner_refuses_a_filter_starting_with_a_dash(tmp_path: Path, bpf: str) -> None:
     called = tmp_path / "called"
-    pcap = _run_pcap_runner(
-        tmp_path, "-V/etc/hostname", f'#!/bin/bash\ntouch "{called}"\nexit 0\n'
-    )
+    pcap = _run_pcap_runner(tmp_path, bpf, f'#!/bin/bash\ntouch "{called}"\nexit 0\n')
     assert not called.exists()
     assert "invalid capture filter" in (pcap / "c1.state").read_text()
 
