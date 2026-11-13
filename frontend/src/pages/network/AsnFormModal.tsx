@@ -8,10 +8,13 @@ import {
   type ASNUpdate,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { cn } from "@/lib/utils";
 
 import { Field, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -25,6 +28,30 @@ export function AsnFormModal({
   onClose,
 }: {
   asn?: ASNRead | null;
+  onClose: () => void;
+}) {
+  // Edit reads the ASN when it opens and sends only what changed (#3869).
+  const fresh = useFreshRow<ASNRead>(asn ?? undefined, () =>
+    asnsApi.get(asn!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit ASN"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <AsnForm asn={fresh.row ?? null} onClose={onClose} />;
+}
+
+function AsnForm({
+  asn,
+  onClose,
+}: {
+  asn: ASNRead | null;
   onClose: () => void;
 }) {
   const isEdit = Boolean(asn);
@@ -81,7 +108,19 @@ export function AsnFormModal({
           provider_id: providerId,
           tags,
         };
-        return asnsApi.update(asn.id, body);
+        const diff = changedFields(
+          {
+            name: asn.name,
+            description: asn.description,
+            holder_org: asn.holder_org,
+            customer_id: asn.customer_id,
+            provider_id: asn.provider_id,
+            tags: asn.tags ?? {},
+          },
+          body as Record<string, unknown>,
+        ) as ASNUpdate;
+        if (Object.keys(diff).length === 0) return asn;
+        return asnsApi.update(asn.id, diff);
       }
       const n = Number(number);
       if (!Number.isInteger(n) || n < 1 || n > 4_294_967_295) {
@@ -192,7 +231,9 @@ export function AsnFormModal({
             onChange={(e) => setTagsRaw(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"

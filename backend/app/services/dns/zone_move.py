@@ -140,6 +140,12 @@ class ZoneMovePlan:
 
     # Per-record view scoping, same three outcomes.
     records_total: int = 0
+    # Records in the Trash: they move with the zone, answer nowhere, and are
+    # left out of every other figure here (#3921).
+    records_trashed: int = 0
+    # Trashed records whose view the move clears: restored later they come back
+    # shared (every view), so the widening acknowledgement covers them too.
+    records_trashed_widened: int = 0
     records_remapped: int = 0
     records_widened: int = 0
     records_cleared_inert: int = 0
@@ -573,6 +579,14 @@ async def assemble_move_plan(
             select(func.count()).select_from(DNSRecord).where(DNSRecord.zone_id == zone.id)
         )
     ).scalar_one()
+    plan.records_trashed = (
+        await db.execute(
+            select(func.count())
+            .select_from(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id, DNSRecord.deleted_at.isnot(None))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
 
     # Only view-scoped rows need looking at, and only their ``view_id`` —
     # so this selects two columns rather than hydrating every DNSRecord in
@@ -597,6 +611,13 @@ async def assemble_move_plan(
         action, new_id, old_name = _resolve(view_id)
         if deleted_at is None and new_id is not None and import_source != EXTERNAL_IMPORT_SOURCE:
             live_record_view_ids.add(new_id)
+        if deleted_at is not None:
+            # In the Trash: it answers nowhere now, so it stays out of the
+            # live figures — but the commit rewrites its view, and a cleared
+            # one comes back SHARED on restore. Counted apart; still acked.
+            if action == "cleared_widening":
+                plan.records_trashed_widened += 1
+            continue
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
@@ -803,7 +824,19 @@ async def assemble_move_plan(
             plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
 
     _fill_warnings(plan)
-    plan.warnings.extend((await shared_provider_sources(db, zone.group_id, target_group.id)).notes)
+    shared = await shared_provider_sources(db, zone.group_id, target_group.id)
+    # The commit also keeps the source copy for a third group's (or a sibling
+    # view's) zone of the same name (#3812); say so here instead of promising
+    # a delete (#3896).
+    others = await shared_zone_copy_servers(db, zone, group_id=zone.group_id)
+    notes = list(shared.notes)
+    if others.keep_ids:
+        by_id = {s_.id: s_.name for s_ in await _agentless_servers(db, zone.group_id)}
+        for sid in others.keep_ids:
+            name = by_id.get(sid)
+            notes = [n for n in notes if not n.startswith(f"Source copy on '{name}' is deleted")]
+    plan.warnings.extend(notes)
+    plan.warnings.extend(n for n in others.notes if n not in plan.warnings)
     return plan
 
 
@@ -922,7 +955,16 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             f"have ({detail}). They will become unscoped, which means they start answering in "
             f"EVERY view in the target rather than in one."
         )
-    if plan.zone_view_action == "cleared_widening" or plan.records_widened:
+    if plan.records_trashed_widened:
+        plan.warnings.append(
+            f"{plan.records_trashed_widened} records in the Trash would also lose their view "
+            f"and come back shared (answering in EVERY view) if restored."
+        )
+    if (
+        plan.zone_view_action == "cleared_widening"
+        or plan.records_widened
+        or plan.records_trashed_widened
+    ):
         plan.required_acknowledgements.append(ACK_VIEW_WIDENING)
 
     if plan.zone_view_action == "cleared_inert":
@@ -1235,14 +1277,4 @@ async def commit_move(
 
     collect_wake(dns_group_channel(old_group_id), dns_group_channel(target_group.id))
 
-    logger.info(
-        "dns_zone_moved_group",
-        zone_id=str(zone.id),
-        zone_name=zone.name,
-        old_group_id=str(old_group_id),
-        new_group_id=str(target_group.id),
-        records_widened=plan.records_widened,
-        acl_keys_lost=len(plan.acl_keys_lost),
-        dnssec_signed=plan.dnssec_signed,
-    )
     return plan

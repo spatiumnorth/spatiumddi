@@ -87,6 +87,7 @@ const VRF = {
 
 async function showPage() {
   answer("vrfsApi", "list", () => Promise.resolve([VRF]));
+  answer("vrfsApi", "get", () => Promise.resolve(VRF));
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -121,6 +122,7 @@ describe("VRFs page with unread permissions (#3546)", () => {
     );
     const update = vi.fn((..._a: unknown[]) => Promise.resolve(VRF));
     answer("vrfsApi", "update", update);
+    answer("vrfsApi", "get", () => Promise.resolve(VRF));
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -141,14 +143,15 @@ describe("VRFs page with unread permissions (#3546)", () => {
     expect(sel.disabled).toBe(true);
     expect(sel.title).not.toMatch(/role/i);
     expect(sel.selectedOptions[0].textContent).not.toMatch(/role/i);
+    fireEvent.change(screen.getByDisplayValue("old"), {
+      target: { value: "new" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(update).toHaveBeenCalled());
-    const body = (update.mock.calls[0] as unknown as [string, object])[1] as {
-      customer_id: string;
-      asn_id: string;
-    };
-    expect(body.customer_id).toBe("cust-1");
-    expect(body.asn_id).toBe("asn-1");
+    // The links are not in the body, so they are not cleared.
+    expect((update.mock.calls[0] as unknown as [string, object])[1]).toEqual({
+      description: "new",
+    });
   });
 
   it("with permissions read and no grant, the role wording stays", async () => {

@@ -68,6 +68,7 @@ from app.models.e911 import (
 )
 from app.models.network import NetworkDevice, NetworkInterface
 from app.services.dhcp.agent_wake_targets import dhcp_group_channels_with_scopes
+from app.services.e911.binding_labels import resolve_binding_labels
 from app.services.e911.exports import render_csv, render_ios_snippets
 from app.services.e911.resolver import Resolution, resolve_location
 from app.services.search.ranking import escape_like
@@ -340,6 +341,12 @@ class BindingRead(BaseModel):
     mac_address: str | None
     ip_address_id: uuid.UUID | None
     site_id: uuid.UUID | None
+    #: The target spelled the way an operator knows it — ``192.0.2.50
+    #: (subnet 192.0.2.0/24)`` rather than the address row's id (#4060).
+    #: Null for a MAC / BSSID (the raw value already reads well) and when
+    #: the referenced row is gone; ``target_missing`` says which.
+    target_label: str | None = None
+    target_missing: bool = False
     is_active: bool
     notes: str
     created_at: datetime
@@ -418,7 +425,9 @@ def _erl_read(row: EmergencyResponseLocation, binding_count: int = 0) -> ERLRead
     )
 
 
-def _binding_read(row: ERLBinding, erl_name: str) -> BindingRead:
+def _binding_read(
+    row: ERLBinding, erl_name: str, target: tuple[str | None, bool] = (None, False)
+) -> BindingRead:
     return BindingRead(
         id=row.id,
         erl_id=row.erl_id,
@@ -432,6 +441,8 @@ def _binding_read(row: ERLBinding, erl_name: str) -> BindingRead:
         mac_address=str(row.mac_address) if row.mac_address else None,
         ip_address_id=row.ip_address_id,
         site_id=row.site_id,
+        target_label=target[0],
+        target_missing=target[1],
         is_active=row.is_active,
         notes=row.notes,
         created_at=row.created_at,
@@ -687,7 +698,8 @@ async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUs
     collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _erl_read(row)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
 
 
 @router.post("/erls/{erl_id}/validation", response_model=ERLRead)
@@ -715,7 +727,8 @@ async def record_validation(
     )
     await db.commit()
     await db.refresh(row)
-    return _erl_read(row)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
 
 
 @router.delete("/erls/{erl_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -791,8 +804,9 @@ async def list_bindings(
             .offset(offset)
         )
     ).all()
+    labels = await resolve_binding_labels(db, [b for b, _ in rows])
     return BindingListResponse(
-        items=[_binding_read(b, name) for b, name in rows],
+        items=[_binding_read(b, name, labels[b.id]) for b, name in rows],
         total=int(total),
         limit=limit,
         offset=offset,
@@ -834,7 +848,7 @@ async def create_binding(body: BindingCreate, db: DB, user: CurrentUser) -> Bind
     collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _binding_read(row, erl.name)
+    return _binding_read(row, erl.name, (await resolve_binding_labels(db, [row]))[row.id])
 
 
 @router.patch("/bindings/{binding_id}", response_model=BindingRead)
@@ -869,7 +883,7 @@ async def update_binding(
     collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _binding_read(row, erl.name)
+    return _binding_read(row, erl.name, (await resolve_binding_labels(db, [row]))[row.id])
 
 
 @router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -984,6 +998,7 @@ async def get_location(
         source_ip=request.client.host if request.client else None,
     )
     await db.commit()
+    erl_counts = await _binding_counts(db, [resolution.erl.id]) if resolution.erl else {}
 
     return LocationResponse(
         identity_kind=resolution.identity_kind,
@@ -994,7 +1009,11 @@ async def get_location(
         degraded_reason=resolution.degraded_reason,
         observed_at=resolution.observed_at,
         evidence_age_seconds=resolution.evidence_age_seconds,
-        erl=_erl_read(resolution.erl) if resolution.erl else None,
+        erl=(
+            _erl_read(resolution.erl, erl_counts.get(resolution.erl.id, 0))
+            if resolution.erl
+            else None
+        ),
         evidence=[
             EvidenceRead(
                 kind=e.kind,

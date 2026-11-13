@@ -25,6 +25,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { Field, errMsg, humanDuration, humanTime, inputCls } from "../_shared";
 import { PeerDetailModal } from "./PeerDetailModal";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Established = green, the transitional FSM states = amber, Idle = rose.
 // Exported so PeerDetailModal's header chip reuses the exact same
@@ -509,9 +510,9 @@ export function PeerFormModal({
         </div>
 
         {err && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {err}
-          </div>
+          </FormError>
         )}
 
         {!isEdit && metallbBgpPeers.length > 0 && (
