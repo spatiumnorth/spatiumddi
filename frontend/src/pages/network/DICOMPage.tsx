@@ -472,9 +472,14 @@ export function DICOMPage() {
           <div className="rounded-lg border">
             {peers.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {peersQ.isLoading
-                  ? "Loading associations…"
-                  : "No associations documented. Without them, the blast radius of renumbering a host cannot be reported."}
+                {peersQ.isLoading ? (
+                  "Loading associations…"
+                ) : (
+                  <ListEmpty error={peersQ.error} what="associations">
+                    No associations documented. Without them, the blast radius
+                    of renumbering a host cannot be reported.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">

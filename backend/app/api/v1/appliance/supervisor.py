@@ -96,6 +96,7 @@ from app.core.auth_throttle import (
     refund_pairing_attempt,
 )
 from app.core.db_transient import is_transient_db_error
+from app.core.denial_audit import note_denial_audited
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import is_installed_target, upgrade_direction
@@ -4532,6 +4533,7 @@ async def delete_appliance(
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -4768,6 +4770,7 @@ async def permanent_delete_appliance(
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,

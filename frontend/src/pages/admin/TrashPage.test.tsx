@@ -605,14 +605,18 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
   it("names a subnet's scopes, addresses and records, and does not count the batch", async () => {
     const t = await openDelete("subnet", 4);
     expect(t).toMatch(/DHCP scopes \(with their pools and static/);
-    expect(t).toMatch(/addresses and the DNS records published for them/);
+    expect(t).toMatch(/addresses, the DNS records published for them/);
     expect(t).toMatch(/E911 location binding names it/);
+    // #3894 — the purge also cascades the subnet's address sets and OT zones.
+    expect(t).toMatch(/its address sets and its OT zones/);
     expect(t).not.toMatch(/other row/);
   });
 
   it("names a zone's records and pools", async () => {
     const t = await openDelete("dns_zone", 3);
-    expect(t).toMatch(/All of its DNS records and its DNS pools/);
+    expect(t).toMatch(/All of its DNS records, its DNS pools/);
+    // #3894 — and the zone's update ACLs, DNSSEC keys and ACME accounts.
+    expect(t).toMatch(/dynamic update ACLs, its DNSSEC keys and its ACME/);
     // #3504 — a shared reverse zone's purge would take another batch's PTRs.
     expect(t).toMatch(/another trashed subnet's records cannot be purged/);
     // Restoring those subnets is refused while the zone is trashed (#1957), so
@@ -620,6 +624,14 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
     expect(t).not.toMatch(/restore those subnets/);
     expect(t).toMatch(/purge or restore the subnet the zone was deleted with/);
     expect(t).not.toMatch(/other row/);
+  });
+
+  it("names a space's plans, VLAN mappings and AV ranges, a block's not (#3894)", async () => {
+    const space = await openDelete("ip_space", 1);
+    expect(space).toMatch(/subnet plans, VLAN mappings and AV reserved ranges/);
+    cleanup();
+    const block = await openDelete("ip_block", 1);
+    expect(block).not.toMatch(/subnet plans/);
   });
 
   it("adds no count for a row deleted alone", async () => {

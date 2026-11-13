@@ -1039,8 +1039,14 @@ _PCT_RESOLVE_MARGIN = 5.0
 
 
 def _pct_resolve_floor(threshold: float) -> float:
-    """The value an open event must fall below to resolve."""
-    return threshold - _PCT_RESOLVE_MARGIN
+    """The value an open event must fall below to resolve.
+
+    ``threshold - margin``, except that a threshold within one margin of
+    zero would give a floor of 0% or below, which no reading is ever under
+    (#3831): the alert would stay open on an empty subnet for ever. There
+    the margin shrinks to half the threshold, so 0% always clears it."""
+    floor = threshold - _PCT_RESOLVE_MARGIN
+    return floor if floor > 0 else threshold / 2
 
 
 # #3542 — a matcher that keeps an open subject only because of the margin

@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
@@ -3541,6 +3542,17 @@ function RecordModalForm({
     queryKey: ["dns-views", groupId],
     queryFn: () => dnsApi.listViews(groupId),
   });
+  // #3944 — a zone pinned to one view renders into that view alone, and the
+  // record API refuses a record scoped to any other, so the field offers the
+  // pin and the unscoped default only.
+  const { data: groupZones = [] } = useQuery({
+    queryKey: ["dns-zones", groupId],
+    queryFn: () => dnsApi.listZones(groupId),
+  });
+  const pinViewId = groupZones.find((z) => z.id === zoneId)?.view_id ?? null;
+  const viewChoices = pinViewId
+    ? views.filter((v) => v.id === pinViewId || v.id === viewId)
+    : views;
 
   // SRV carries priority + weight + port (RFC 2782); MX carries only a
   // priority (the preference). Everything else carries none. (#424)
@@ -3847,12 +3859,18 @@ function RecordModalForm({
             onChange={(e) => setViewId(e.target.value)}
           >
             <option value="">All views (default)</option>
-            {views.map((v) => (
+            {viewChoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
+          {pinViewId && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              This zone is pinned to one view, so its records can only be in
+              that view.
+            </p>
+          )}
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
@@ -4131,6 +4149,15 @@ function MoveZoneModal({
               <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                 <span className="text-muted-foreground">Records moving</span>
                 <span>{preview.records_total}</span>
+                {preview.records_trashed > 0 && (
+                  <>
+                    <span className="text-muted-foreground">In the Trash</span>
+                    <span>
+                      {preview.records_trashed} more move with the zone (not
+                      counted above or in the view figures)
+                    </span>
+                  </>
+                )}
                 {preview.records_remapped > 0 && (
                   <>
                     <span className="text-muted-foreground">
@@ -5264,7 +5291,7 @@ export function ZoneDetailView({
                 ) : hasRecFilter ? (
                   "No records match the current filter."
                 ) : (
-                  'No records yet. Click "Add Record" to create one.'
+                  `No records yet.${canWriteRecords ? ' Click "Add Record" to create one.' : ""}`
                 )}
               </p>
             </div>
@@ -7675,7 +7702,13 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       )}
       {keys.length === 0 && keysData !== undefined && keysError == null && (
         <p className="text-xs italic text-muted-foreground">
-          No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
+          No TSIG keys yet.
+          {isSuperadmin && (
+            <>
+              {" "}
+              Click <em>New TSIG Key</em> to add one.
+            </>
+          )}
         </p>
       )}
 
@@ -8096,8 +8129,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   // client's change, and the form is filled from this read, not the cache.
   const {
     data: opts,
-    isLoading,
     isFetching,
+    isError: optsError,
   } = useQuery({
     queryKey: ["dns-options", groupId],
     queryFn: () => dnsApi.getOptions(groupId),
@@ -8445,7 +8478,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     };
     // Send only what changed (#3739). The baseline is the fill-time read run
     // through the same shaping, so a field left alone compares equal.
-    const o = filledFrom!;
+    if (!filledFrom) return;
+    const o = filledFrom;
     const diff = changedFields(
       {
         forwarders: o.forwarders,
@@ -8501,8 +8535,19 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     saveMut.mutate(diff);
   }
 
-  if (isLoading)
+  // No editable form until the form has been filled from a settled read
+  // (#3864): with a cached copy the query is not "loading" while the re-read
+  // is pending, and the form would show its built-in defaults, take edits the
+  // fill then overwrites, and Save would have no baseline.
+  if (!filledFrom) {
+    if (optsError && !isFetching)
+      return (
+        <p className="text-sm text-destructive">
+          Could not load the group's options.
+        </p>
+      );
     return <p className="text-sm text-muted-foreground">Loading…</p>;
+  }
 
   // Full-width select to prevent text/arrow overlap
   const selCls =
@@ -10519,7 +10564,7 @@ function ZonesTab({
               </button>
             </>
           ) : (
-            'No zones yet. Click "Add Zone" to create one.'
+            `No zones yet.${can("write", "dns_zone") ? ' Click "Add Zone" to create one.' : ""}`
           )}
         </p>
       )}
@@ -11041,14 +11086,35 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       setSelectedIds(new Set());
     },
   });
+  // Every list is its own DELETE, so every result is read (#3822): a refused
+  // delete leaves its list in place, the dialog stays open and says why, and
+  // only the lists that were not deleted stay selected.
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null);
   const bulkDelete = useMutation({
-    mutationFn: async (ids: string[]) => {
-      await Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id)));
-    },
-    onSuccess: () => {
+    mutationFn: (ids: string[]) =>
+      Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id))),
+    onSuccess: (results, ids) => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      setSelectedIds(new Set());
-      setConfirmBulkDelete(false);
+      const failed = ids.filter((_, i) => results[i].status === "rejected");
+      setSelectedIds(new Set(failed));
+      if (failed.length === 0) {
+        setConfirmBulkDelete(false);
+        return;
+      }
+      const reasons = [
+        ...new Set(
+          results.flatMap((r) =>
+            r.status === "rejected" ? [formatApiError(r.reason)] : [],
+          ),
+        ),
+      ];
+      const what =
+        failed.length < ids.length
+          ? `${failed.length} of ${ids.length} blocking lists were not deleted`
+          : ids.length === 1
+            ? "The blocking list was not deleted"
+            : `None of the ${ids.length} blocking lists were deleted`;
+      setBulkDeleteError(`${what}: ${reasons.join("; ")}`);
     },
   });
 
@@ -11408,8 +11474,19 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           description={`Permanently delete "${confirmDelete.name}" and all its entries/exceptions?`}
           checkLabel={`I understand all entries in "${confirmDelete.name}" will be permanently deleted.`}
           onConfirm={() => deleteMut.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            deleteMut.reset();
+          }}
           isPending={deleteMut.isPending}
+          error={
+            deleteMut.isError
+              ? formatApiError(
+                  deleteMut.error,
+                  "Failed to delete blocking list",
+                )
+              : null
+          }
         />
       )}
       {confirmBulkDelete && (
@@ -11417,9 +11494,16 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           title={`Delete ${selCount} blocklist${selCount === 1 ? "" : "s"}`}
           description={`Permanently delete the ${selCount} selected blocking list${selCount === 1 ? "" : "s"} and all their entries / exceptions? This cannot be undone.`}
           checkLabel={`I understand the ${selCount} selected blocking list${selCount === 1 ? " will be" : "s will be"} permanently deleted.`}
-          onConfirm={() => bulkDelete.mutate(Array.from(selectedIds))}
-          onClose={() => setConfirmBulkDelete(false)}
+          onConfirm={() => {
+            setBulkDeleteError(null);
+            bulkDelete.mutate(Array.from(selectedIds));
+          }}
+          onClose={() => {
+            setConfirmBulkDelete(false);
+            setBulkDeleteError(null);
+          }}
           isPending={bulkDelete.isPending}
+          error={bulkDeleteError}
         />
       )}
     </div>
@@ -11754,11 +11838,9 @@ function EditBlockedDomainModal({
           Block subdomains too (
           <code className="font-mono text-xs">*.{domain || "domain"}</code>)
         </label>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11847,11 +11929,9 @@ function EditExceptionModal({
             placeholder="Optional"
           />
         </Field>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

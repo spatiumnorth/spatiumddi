@@ -22,6 +22,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // AV over IP (issue #540, part of #543). Two operator surfaces on one
 // page because they only make sense together: the flows are the AV
@@ -107,6 +108,8 @@ export function AVFlowsPage() {
       qc.invalidateQueries({ queryKey: ["av-flows"] });
       setDeleteFlow(null);
     },
+    // A 404 means the row is already gone: re-read so it leaves the list.
+    onError: () => qc.invalidateQueries({ queryKey: ["av-flows"] }),
   });
 
   const deleteRangeMut = useMutation({
@@ -115,6 +118,7 @@ export function AVFlowsPage() {
       qc.invalidateQueries({ queryKey: ["av-reserved-ranges"] });
       setDeleteRange(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["av-reserved-ranges"] }),
   });
 
   function protocolLabel(id: string): string {
@@ -499,9 +503,20 @@ export function AVFlowsPage() {
         title="Remove AV flow"
         message={
           <>
-            Remove the AV identity from{" "}
-            <span className="font-mono">{deleteFlow?.group_address}</span>? The
-            multicast group itself is kept — it simply stops being an AV flow.
+            <>
+              Remove the AV identity from{" "}
+              <span className="font-mono">{deleteFlow?.group_address}</span>?
+              The multicast group itself is kept — it simply stops being an AV
+              flow.
+            </>
+            {deleteFlowMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(
+                  deleteFlowMut.error,
+                  "Failed to delete AV flow",
+                )}
+              </p>
+            )}
           </>
         }
         tone="destructive"
@@ -510,23 +525,39 @@ export function AVFlowsPage() {
         onConfirm={() =>
           deleteFlow && deleteFlowMut.mutate(deleteFlow.group_id)
         }
-        onClose={() => setDeleteFlow(null)}
+        onClose={() => {
+          setDeleteFlow(null);
+          deleteFlowMut.reset();
+        }}
       />
       <ConfirmModal
         open={deleteRange !== null}
         title="Delete reserved range"
         message={
           <>
-            Undeclare <span className="font-mono">{deleteRange?.cidr}</span>?
-            Nothing cascades — groups and flows inside the range are untouched,
-            they just stop being checkable against it.
+            <>
+              Undeclare <span className="font-mono">{deleteRange?.cidr}</span>?
+              Nothing cascades — groups and flows inside the range are
+              untouched, they just stop being checkable against it.
+            </>
+            {deleteRangeMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(
+                  deleteRangeMut.error,
+                  "Failed to delete reserved range",
+                )}
+              </p>
+            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteRangeMut.isPending}
         onConfirm={() => deleteRange && deleteRangeMut.mutate(deleteRange.id)}
-        onClose={() => setDeleteRange(null)}
+        onClose={() => {
+          setDeleteRange(null);
+          deleteRangeMut.reset();
+        }}
       />
     </div>
   );
@@ -733,7 +764,9 @@ function FlowModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -935,7 +968,9 @@ function RangeModal({
           </span>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

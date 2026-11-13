@@ -105,7 +105,8 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     # Kea HA hook tuning — rendered into libdhcp_ha.so config when the
-    # group is an HA pair. Defaults mirror Kea's documented recommendations.
+    # group is an HA pair. Defaults mirror Kea's documented ones except the
+    # heartbeat, which is 2000 ms rather than Kea's 10000 (#3779, #3854).
     heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     max_response_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=60000)
     max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
