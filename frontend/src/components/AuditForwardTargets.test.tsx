@@ -24,6 +24,7 @@ import type { AuditForwardTarget } from "@/lib/api";
 const api = {
   list: vi.fn(),
   update: vi.fn(),
+  del: vi.fn(),
 };
 
 vi.mock("@/lib/api", async () => {
@@ -34,6 +35,7 @@ vi.mock("@/lib/api", async () => {
       ...actual.settingsApi,
       listAuditTargets: () => api.list(),
       updateAuditTarget: (id: string, body: unknown) => api.update(id, body),
+      deleteAuditTarget: (id: string) => api.del(id),
     },
   };
 });
@@ -89,11 +91,16 @@ afterEach(() => {
   cleanup();
   api.list.mockReset();
   api.update.mockReset();
+  api.del.mockReset();
 });
 
 describe("webhook secrets in the target form", () => {
   it("keeps the stored URL and header when both are left blank", async () => {
     await openEdit();
+    // Something else must change, or Save sends nothing at all (#3926).
+    fireEvent.change(screen.getByDisplayValue("collector"), {
+      target: { value: "collector2" },
+    });
     await act(async () => {
       fireEvent.click(screen.getByText("Save"));
     });
@@ -169,6 +176,9 @@ describe("SMTP password in the target form (#3927)", () => {
     const input = screen.getByPlaceholderText(/stored — leave blank/);
     fireEvent.change(input, { target: { value: "x" } });
     fireEvent.change(input, { target: { value: "" } });
+    fireEvent.change(screen.getByDisplayValue("collector"), {
+      target: { value: "collector2" },
+    });
     await act(async () => {
       fireEvent.click(screen.getByText("Save"));
     });
@@ -184,5 +194,69 @@ describe("SMTP password in the target form (#3927)", () => {
     });
     const body = api.update.mock.calls[0][1] as Record<string, unknown>;
     expect(body.smtp_password).toBe("");
+  });
+});
+
+describe("Edit saves only what changed (#3926)", () => {
+  it("reads the target fresh and does not put back another client's change", async () => {
+    api.list.mockResolvedValue([TARGET]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("collector");
+    // Another client renamed it and switched the flavor after the list loaded.
+    const theirs = { ...TARGET, name: "renamed", webhook_flavor: "slack" };
+    api.list.mockResolvedValue([theirs]);
+    api.update.mockResolvedValue(theirs);
+    fireEvent.click(screen.getByTitle("Edit"));
+    await screen.findByDisplayValue("renamed");
+    fireEvent.change(screen.getByDisplayValue("Enabled"), {
+      target: { value: "0" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Save"));
+    });
+    expect(api.update).toHaveBeenCalledWith("t1", { enabled: false });
+  });
+
+  it("sends nothing when nothing changed", async () => {
+    await openEdit();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Save"));
+    });
+    expect(api.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("a refused delete (#3822)", () => {
+  it("says why in an alert and reads the list again", async () => {
+    api.list.mockResolvedValue([TARGET]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("collector");
+    api.del.mockRejectedValue({
+      response: { status: 404, data: { detail: "Target not found" } },
+    });
+    fireEvent.click(screen.getByTitle("Delete"));
+    const before = api.list.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Delete" }).slice(-1)[0],
+      );
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Target not found");
+    expect(api.list.mock.calls.length).toBeGreaterThan(before);
   });
 });

@@ -19,6 +19,8 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { deletePolicyDescription } from "./devicePolicyCopy";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { FormError } from "@/components/ui/form-error";
 
 const KEY_BASE = "dhcp-device-policies";
 const OBS_KEY = "dhcp-device-observations";
@@ -54,7 +56,11 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
   const [del, setDel] = useState<DHCPDevicePolicy | null>(null);
   const [preview, setPreview] = useState<DHCPDevicePolicy | null>(null);
 
-  const { data: policies = [], isFetching } = useQuery({
+  const {
+    data: policies = [],
+    isFetching,
+    error: policiesError,
+  } = useQuery({
     queryKey: [KEY_BASE, groupId],
     queryFn: () => dhcpApi.listDevicePolicies(groupId),
     enabled: !!groupId,
@@ -95,6 +101,10 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
 
       {isFetching && policies.length === 0 ? (
         <div className="text-sm text-muted-foreground">Loading&hellip;</div>
+      ) : policiesError && policies.length === 0 ? (
+        <div className="rounded-md border border-dashed p-6 text-center text-sm">
+          <ListReadError error={policiesError} what="device policies" />
+        </div>
       ) : policies.length === 0 ? (
         <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
           No device policies yet. A policy turns &ldquo;printers get a short
@@ -300,7 +310,7 @@ function DevicePolicyForm({
   const [optionsError, setOptionsError] = useState<string | null>(null);
   const [leaseError, setLeaseError] = useState<string | null>(null);
 
-  const { data: obs } = useQuery({
+  const { data: obs, error: obsError } = useQuery({
     queryKey: [OBS_KEY, groupId],
     queryFn: () => dhcpApi.listDeviceObservations(groupId),
     enabled: !!groupId,
@@ -425,15 +435,23 @@ function DevicePolicyForm({
         <Field
           label="Device classes"
           hint={
-            obs && obs.total_devices === 0
-              ? override.trim()
-                ? "No fingerprints collected yet — device classes have nothing to match until passive fingerprinting is enabled. The manual match expression below applies regardless."
-                : "No fingerprints collected yet — enable passive fingerprinting first, or this policy will match nothing."
-              : "Classes fingerbank has returned on this network, with device counts."
+            obsError
+              ? "Couldn't read the observed device classes, so the list below is not the network's."
+              : obs && obs.total_devices === 0
+                ? override.trim()
+                  ? "No fingerprints collected yet — device classes have nothing to match until passive fingerprinting is enabled. The manual match expression below applies regardless."
+                  : "No fingerprints collected yet — enable passive fingerprinting first, or this policy will match nothing."
+                : "Classes fingerbank has returned on this network, with device counts."
           }
         >
           <div className="max-h-44 space-y-1 overflow-y-auto rounded-md border p-2">
-            {options.length === 0 ? (
+            {obsError && options.length === 0 ? (
+              <ListReadError
+                error={obsError}
+                what="observed device classes"
+                className="text-xs"
+              />
+            ) : options.length === 0 ? (
               <div className="text-xs text-muted-foreground">
                 Nothing observed yet.
               </div>
@@ -554,7 +572,9 @@ function DevicePolicyForm({
         </label>
 
         {mut.isError && (
-          <div className="text-xs text-destructive">{errMsg(mut.error)}</div>
+          <FormError className="text-xs text-destructive">
+            {errMsg(mut.error)}
+          </FormError>
         )}
         <Btns
           onClose={onClose}
