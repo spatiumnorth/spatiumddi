@@ -5650,6 +5650,8 @@ export interface AgentSpoolStreamStatus {
   pending_oldest_at?: string | null;
   /** Lease-file bytes the agent has not read yet (busy posting). */
   unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
 }
 
 /**
@@ -5676,6 +5678,8 @@ export interface AgentSpoolStatus {
   pending_oldest_at?: string | null;
   /** Lease-file bytes the agent has not read yet (busy posting). */
   unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
   streams: Record<string, AgentSpoolStreamStatus>;
 }
 

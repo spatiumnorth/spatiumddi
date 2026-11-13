@@ -46,18 +46,20 @@ describe("spoolState", () => {
     expect(spoolState(undefined, NOW)).toEqual({ kind: "none" });
   });
 
-  it("shows the in-memory lease backlog of an agent with an empty spool (#3782)", () => {
+  it("shows the lease backlog of an agent with an empty spool once lag is past the flush interval (#3782)", () => {
     const st = spoolState(
       status({
         pending_events: 2400,
         pending_oldest_at: "2026-09-22T11:55:00Z",
         unread_bytes: 4096,
+        unread_events_estimated: 2000,
       }),
       NOW,
     );
     expect(st).toEqual({
       kind: "pending",
       events: 2400,
+      estimated: 2000,
       unreadBytes: 4096,
       oldestAt: "2026-09-22T11:55:00Z",
     });
@@ -68,6 +70,26 @@ describe("spoolState", () => {
       spoolState(status({ bytes: 10, entries: 1, pending_events: 5 }), NOW)
         .kind,
     ).toBe("backlog");
+  });
+
+  it("shows nothing for normal flush buffering (#3782)", () => {
+    const recent = new Date(NOW - 5_000).toISOString();
+    expect(
+      spoolState(
+        status({
+          pending_events: 76,
+          pending_oldest_at: recent,
+          unread_bytes: 553,
+        }),
+        NOW,
+      ).kind,
+    ).toBe("none");
+    // Old but tiny: not a backlog either.
+    const old = new Date(NOW - 60_000).toISOString();
+    expect(
+      spoolState(status({ pending_events: 3, pending_oldest_at: old }), NOW)
+        .kind,
+    ).toBe("none");
   });
 
   it("shows nothing for an empty spool with no recent trim", () => {

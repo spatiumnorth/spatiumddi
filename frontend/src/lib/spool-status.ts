@@ -24,6 +24,7 @@ export type SpoolState =
   | {
       kind: "pending";
       events: number;
+      estimated: number;
       unreadBytes: number;
       oldestAt: string | null;
     }
@@ -40,6 +41,10 @@ function isRecent(ts: string | null | undefined, now: number): boolean {
   const t = Date.parse(ts);
   return Number.isFinite(t) && now - t <= TRIM_RECENT_MS;
 }
+
+/** Lag above 2x the agent's 5 s flush interval, and at least this many events. */
+const PENDING_MIN_LAG_MS = 10_000;
+const PENDING_MIN_EVENTS = 20;
 
 export function spoolState(
   status: AgentSpoolStatus | null | undefined,
@@ -68,14 +73,18 @@ export function spoolState(
       oldestAt: status.oldest_at,
     };
   }
+  // Steady traffic always holds a few events until the next flush; only a lag
+  // well past the flush interval (5 s) with a real backlog is "behind".
   const events = status.pending_events ?? 0;
-  const unread = status.unread_bytes ?? 0;
-  if (events > 0 || unread > 0) {
+  const oldestAt = status.pending_oldest_at ?? null;
+  const lagMs = oldestAt ? now - new Date(oldestAt).getTime() : 0;
+  if (events >= PENDING_MIN_EVENTS && lagMs > PENDING_MIN_LAG_MS) {
     return {
       kind: "pending",
       events,
-      unreadBytes: unread,
-      oldestAt: status.pending_oldest_at ?? null,
+      estimated: status.unread_events_estimated ?? 0,
+      unreadBytes: status.unread_bytes ?? 0,
+      oldestAt,
     };
   }
   return { kind: "none" };

@@ -634,6 +634,7 @@ async def test_dhcp_heartbeat_persists_in_memory_lease_backlog_3782(
     spool["pending_events"] = 2400
     spool["pending_oldest_at"] = oldest
     spool["unread_bytes"] = 4096
+    spool["unread_events_estimated"] = 2000
     spool["streams"]["lease_events"].update(
         pending_events=2400, pending_oldest_at=oldest, unread_bytes=4096
     )
@@ -645,6 +646,7 @@ async def test_dhcp_heartbeat_persists_in_memory_lease_backlog_3782(
     assert row is not None and row["entries"] == 0
     assert row["pending_events"] == 2400
     assert row["unread_bytes"] == 4096
+    assert row["unread_events_estimated"] == 2000
     assert row["streams"]["lease_events"]["pending_events"] == 2400
     assert row["streams"]["lease_events"]["pending_oldest_at"].startswith("2026-11-08T10:00:00")
 

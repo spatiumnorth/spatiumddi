@@ -69,6 +69,8 @@ class SpoolStreamStatus(BaseModel):
     pending_events: int | None = Field(default=None, ge=0)
     pending_oldest_at: datetime | None = None
     unread_bytes: int | None = Field(default=None, ge=0)
+    # Of pending_events, how many are an ESTIMATE from unread_bytes.
+    unread_events_estimated: int | None = Field(default=None, ge=0)
 
 
 class SpoolStatus(BaseModel):
@@ -92,6 +94,8 @@ class SpoolStatus(BaseModel):
     pending_events: int | None = Field(default=None, ge=0)
     pending_oldest_at: datetime | None = None
     unread_bytes: int | None = Field(default=None, ge=0)
+    # Of pending_events, how many are an ESTIMATE from unread_bytes.
+    unread_events_estimated: int | None = Field(default=None, ge=0)
     streams: dict[_StreamName, SpoolStreamStatus] = Field(
         default_factory=dict, max_length=_MAX_STREAMS
     )

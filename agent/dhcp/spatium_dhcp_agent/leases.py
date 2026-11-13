@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -70,6 +71,7 @@ _BATCH_MAX_SECONDS = 5.0
 # spool-disabled fallback, where a persistent failure leaves _pending
 # unflushed while run() keeps appending new lease rows. Trim-half on overflow.
 _BATCH_MAX_BUFFER = 5000
+_DEFAULT_ROW_BYTES = 160  # typical Kea CSV lease row, until some are parsed
 # #1077 — idle backlog replay cadence, and how long one replay may run before
 # the thread goes back to tailing.
 _DRAIN_INTERVAL = 5.0
@@ -216,6 +218,12 @@ class LeaseWatcher:
         # clock of the oldest such event (None = nothing waiting).
         self._inflight = 0
         self._oldest_pending_at: float | None = None
+        # Row-size observations (bytes / rows actually parsed) turn the unread
+        # byte count into an event estimate; ``_read_at`` is when each file
+        # was last read to its end, so rows still unread are at most that old.
+        self._row_bytes = 0
+        self._rows_read = 0
+        self._read_at: dict[Path, float] = {}
         self._last_flush = time.monotonic()
         self._last_drain = 0.0
         # Read offset per tailed file (v4 and v6 CSVs rotate independently).
@@ -258,22 +266,37 @@ class LeaseWatcher:
     def pending_status(self) -> dict[str, Any]:
         """What the spool cannot see (#3782), for the heartbeat's ``spool``.
 
-        ``pending_events`` are read but undelivered and unspooled;
-        ``unread_bytes`` are still in Kea's lease CSVs because the tailer is
-        busy posting; ``pending_oldest_at`` dates the oldest event in memory.
+        ``pending_events`` is the whole backlog: events read but undelivered
+        and unspooled, plus an estimate (``unread_events_estimated``) of the
+        rows still unread in Kea's lease CSVs because the tailer is busy
+        posting (``unread_bytes``). ``pending_oldest_at`` dates the oldest of
+        them (an unread row is at most as old as the file's last full read),
+        so the lag falls as the agent catches up.
         """
         unread = 0
+        unread_since: list[float] = []
         for path in (self.cfg.kea_lease_file, self.cfg.kea_lease_file_v6):
             try:
                 size = path.stat().st_size
             except OSError:
                 continue
             offset = self._offsets.get(path, 0)
-            unread += size if size < offset else size - offset
-        events = len(self._pending) + len(self._pending_v6) + self._inflight
-        oldest = self._oldest_pending_at if events else None
+            left = size if size < offset else size - offset
+            unread += left
+            if left > 0 and path in self._read_at:
+                unread_since.append(self._read_at[path])
+        # An ESTIMATE: unread bytes / the mean row size this agent has parsed
+        # (a typical Kea CSV row when it has parsed none yet).
+        avg = self._row_bytes / self._rows_read if self._rows_read else _DEFAULT_ROW_BYTES
+        est_unread = math.ceil(unread / avg) if unread else 0
+        in_memory = len(self._pending) + len(self._pending_v6) + self._inflight
+        oldest_candidates = list(unread_since)
+        if in_memory and self._oldest_pending_at:
+            oldest_candidates.append(self._oldest_pending_at)
+        oldest = min(oldest_candidates) if oldest_candidates else None
         return {
-            "pending_events": events,
+            "pending_events": in_memory + est_unread,
+            "unread_events_estimated": est_unread,
             "pending_oldest_at": (
                 datetime.fromtimestamp(oldest, tz=timezone.utc).isoformat() if oldest else None
             ),
@@ -409,15 +432,19 @@ class LeaseWatcher:
             offset = 0
         if size == offset:
             self._offsets[path] = offset
+            self._read_at[path] = time.time()
             return []
         with path.open("r", encoding="utf-8", errors="replace") as f:
             f.seek(offset)
             data = f.read()
             self._offsets[path] = f.tell()
+        self._read_at[path] = time.time()
         if not data:
             return []
-        reader = csv.reader(io.StringIO(data))
-        return list(reader)
+        rows = list(csv.reader(io.StringIO(data)))
+        self._row_bytes += len(data.encode("utf-8", errors="replace"))
+        self._rows_read += len(rows)
+        return rows
 
     def _tail(self, path: Path, parse: Any, attr: str) -> None:
         for row in self._read_new_rows(path):

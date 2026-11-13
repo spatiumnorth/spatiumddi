@@ -786,16 +786,18 @@ def test_unread_lease_file_and_inflight_batch_are_reported_as_pending_3782(
     up in the pending report."""
     ips = [f"10.9.{i // 200}.{i % 200 + 1}" for i in range(600)]
     w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), FakeKea(), clock)
-    assert w.pending_status() == {
-        "pending_events": 0,
-        "pending_oldest_at": None,
-        "unread_bytes": 0,
-    }
+    idle = w.pending_status()
+    assert idle["pending_events"] == 0
+    assert idle["pending_oldest_at"] is None
+    assert idle["unread_bytes"] == 0
 
     agent_cfg.kea_lease_file.write_text(_csv_rows(ips))
     unread = w.pending_status()
-    assert unread["pending_events"] == 0
+    # Unread rows count, as an estimate, so the figure is the backlog and not
+    # just the batch in hand.
     assert unread["unread_bytes"] == agent_cfg.kea_lease_file.stat().st_size
+    assert unread["unread_events_estimated"] > 150
+    assert unread["pending_events"] == unread["unread_events_estimated"]
 
     seen: list[dict] = []
 
@@ -814,10 +816,33 @@ def test_unread_lease_file_and_inflight_batch_are_reported_as_pending_3782(
     assert busiest["pending_events"] >= 100
     assert busiest["pending_oldest_at"] is not None
     assert busiest["unread_bytes"] == 0
+    assert busiest["unread_events_estimated"] == 0
     assert len(w._shipper.spool) == 0  # the spool really did read empty
     # Everything delivered: the report drains back to zero.
     assert w.pending_status()["pending_events"] == 0
     assert w.pending_status()["pending_oldest_at"] is None
+
+
+def test_backlog_and_lag_fall_as_the_agent_catches_up_3782(agent_cfg, cp, clock, tmp_path):
+    """Unread file rows count towards the backlog, and its age is measured from
+    the last full read, so both shrink as the tailer drains the file."""
+    ips = [f"10.8.{i // 200}.{i % 200 + 1}" for i in range(400)]
+    w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), FakeKea(), clock)
+    w.tick()  # reads the (empty) file: caught up now
+    agent_cfg.kea_lease_file.write_text(_csv_rows(ips))
+    w._read_at[agent_cfg.kea_lease_file] = time.time() - 60  # blocked for a minute
+    behind = w.pending_status()
+    # Row size comes from the file itself once any rows were parsed; before
+    # that a default is used, so allow slack either side of the true 400.
+    assert 100 <= behind["pending_events"] <= 800
+    lag = time.time() - datetime.fromisoformat(behind["pending_oldest_at"]).timestamp()
+    assert 55 <= lag <= 70
+
+    w.tick()  # drains the file and delivers it
+    after = w.pending_status()
+    assert after["pending_events"] == 0
+    assert after["unread_bytes"] == 0
+    assert after["pending_oldest_at"] is None
 
 
 def test_heartbeat_folds_pending_into_the_spool_report_3782(agent_cfg, tmp_path, monkeypatch):

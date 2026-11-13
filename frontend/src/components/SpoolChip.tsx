@@ -67,7 +67,10 @@ export function SpoolChip({
     const age = formatAge(state.oldestAt);
     const title = [
       "This agent is behind on delivering events to the control plane. They are held in the agent's memory or still unread in Kea's lease file, so nothing is queued on disk yet. Nothing is lost; the agent catches up once the control plane keeps pace.",
-      `\n\n${state.events} events waiting`,
+      `\n\n${state.estimated > 0 ? "about " : ""}${state.events} events waiting`,
+      state.estimated > 0
+        ? ` (${state.estimated} estimated from the unread lease file)`
+        : "",
       age ? `, oldest ${age} ago` : "",
       state.unreadBytes > 0
         ? `\n${formatBytes(state.unreadBytes)} of lease file not read yet`
@@ -78,7 +81,8 @@ export function SpoolChip({
         className={`inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400 ${className}`}
         title={title}
       >
-        Behind: {state.events} events{age ? `, ${age}` : ""}
+        Behind{age ? ` ${age}` : ""}: {state.estimated > 0 ? "~" : ""}
+        {state.events} events
       </span>
     );
   }
