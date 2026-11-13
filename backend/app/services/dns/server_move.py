@@ -120,20 +120,19 @@ class ServerMoveResult:
         }
 
 
-# #1782 — Technitium catalog zones are broken in both roles (the producer's
-# member zones inherit the catalog's transfer Deny / notify None, undoing the
-# #734 grant; the consumer's SecondaryCatalog has no TSIG and stays empty).
-# The real fix is #1766 (1.1.0); until then SpatiumDDI stops claiming it.
-CATALOG_UNSUPPORTED_DRIVERS = frozenset({"technitium", "technitium_api"})
+# #1782 / #1766 — the agent-managed Technitium driver now does catalog zones
+# as a producer (member zones override the catalog's transfer / notify, and
+# the catalog zone itself is transferable). The agentless ``technitium_api``
+# driver still writes no catalog state to the daemon, so it stays refused.
+CATALOG_UNSUPPORTED_DRIVERS = frozenset({"technitium_api"})
 
 
 def catalog_unsupported_message(drivers: list[str] | set[str]) -> str:
     bad = ", ".join(sorted(set(drivers) & CATALOG_UNSUPPORTED_DRIVERS))
     return (
-        f"Catalog zones are not supported on Technitium (driver {bad}): its member "
-        "zones inherit the catalog zone's zone-transfer Deny and notify None, which "
-        "stops zone transfers, drift checks and NOTIFY, and its consumer catalog is "
-        "created without TSIG, so it stays empty. Support is tracked in #1766 (1.1.0)."
+        f"Catalog zones are not supported on the agentless Technitium driver ({bad}): "
+        "SpatiumDDI does not write catalog zones or membership to that server. Use "
+        "the agent-managed technitium driver for catalog zones."
     )
 
 
