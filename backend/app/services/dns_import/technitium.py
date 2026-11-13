@@ -292,7 +292,9 @@ async def parse_technitium_server(
     zones: list[ImportedZone] = []
     warnings: list[str] = []
 
-    async with httpx.AsyncClient(timeout=timeout, verify=verify_tls, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, verify=verify_tls, follow_redirects=False
+    ) as client:
         summaries = await _list_zone_summaries(client, api_url, api_token)
         if len(summaries) > _MAX_ZONES_PER_PULL:
             raise TechnitiumImportError(
@@ -377,7 +379,9 @@ async def test_technitium_connection(
     timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Cheap reachability + auth probe for the import form."""
-    async with httpx.AsyncClient(timeout=timeout, verify=verify_tls, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, verify=verify_tls, follow_redirects=False
+    ) as client:
         summaries = await _list_zone_summaries(client, api_url, api_token)
     summaries = [z for z in summaries if not z.get("internal")]
     importable = [z for z in summaries if str(z.get("type")) in _IMPORTABLE_ZONE_TYPES]
