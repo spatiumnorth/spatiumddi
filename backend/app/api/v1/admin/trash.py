@@ -898,9 +898,10 @@ async def _tear_down_scope_leases_before_purge(
     if done:
         return
     try:
+        from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.dhcp_lease_cleanup import tear_down_trashed_scope_leases  # noqa: PLC0415
 
-        tear_down_trashed_scope_leases.delay(str(scope_id))
+        await dispatch(tear_down_trashed_scope_leases, str(scope_id))
     except Exception as exc:  # noqa: BLE001 — a lost enqueue is safe: the lease sweep
         # tears down the leases of any scope in the Trash every 300 s.
         logger.warning("trash.purge_lease_teardown_enqueue_failed", error=str(exc))

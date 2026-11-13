@@ -34,6 +34,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // One-shot snippet operators can paste into Settings → Control
 // Plane → Integrations on UniFi OS to mint an API key with the
@@ -879,7 +880,9 @@ export function ControllerModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -939,9 +942,9 @@ function DeleteControllerModal({
           <span>I understand.</span>
         </label>
         {error && (
-          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button
