@@ -161,6 +161,24 @@ async def test_create_rejects_bad_bpf(client: AsyncClient, db_session: AsyncSess
     assert r.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "bpf",
+    ["-V/etc/hostname", " \t-w/tmp/x", "\u2010V/etc/hostname"],
+    ids=["dash", "whitespace-dash", "unicode-hyphen"],
+)
+async def test_create_rejects_filter_read_as_an_option(
+    client: AsyncClient, db_session: AsyncSession, bpf: str
+) -> None:
+    _, token = await _superadmin(db_session)
+    r = await client.post(
+        "/api/v1/pcap/captures",
+        json={"interface": "any", "bpf_filter": bpf, "max_duration_s": 10},
+        headers=_hdr(token),
+    )
+    assert r.status_code == 422
+    assert (await db_session.execute(select(PacketCapture))).scalars().first() is None
+
+
 # ── list / get / cancel / bulk-delete ────────────────────────────────
 
 

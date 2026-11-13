@@ -13,6 +13,7 @@ command-line cap and hard-failing an entire chunk (#426).
 from __future__ import annotations
 
 import base64
+import unicodedata
 from typing import Any
 
 import structlog
@@ -41,6 +42,41 @@ class WinRMCommandTooLong(RuntimeError):
     Raised before dispatch so the caller can split the batch rather than
     let CMD.EXE truncate it into a cryptic parser error.
     """
+
+
+# Every character PowerShell's tokenizer treats as a single quote. A
+# single-quoted literal ends at any of them, and a quote is written inside
+# the literal by doubling the same character, so each must be doubled.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+_PS_SINGLE_QUOTE_TABLE = {ord(c): c * 2 for c in _PS_SINGLE_QUOTES}
+
+
+def ps_single_quote_escape(value: str | None) -> str:
+    """Escape ``value`` for the inside of a PowerShell single-quoted literal.
+
+    The one definition of this rule: every driver, and the runbook text,
+    goes through it (a sweep test fails on a private copy).
+    """
+    return (value or "").translate(_PS_SINGLE_QUOTE_TABLE)
+
+
+def ps_single_quote(value: str | None) -> str:
+    """Return ``value`` as a complete PowerShell single-quoted literal."""
+    return "'" + ps_single_quote_escape(value) + "'"
+
+
+def ps_one_line(value: str | None) -> str:
+    """``value`` with every control or line-separator character replaced by a space.
+
+    For a value written OUTSIDE a literal, such as in a ``#`` comment, where a
+    line break would end the comment and start a statement, and for script text
+    an operator copies out of a Markdown code fence, where a line break could
+    close the fence. No host or zone name legitimately contains one of these
+    characters, so nothing correct is lost.
+    """
+    return "".join(
+        " " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in (value or "")
+    )
 
 
 def encoded_command_len(script: str) -> int:
