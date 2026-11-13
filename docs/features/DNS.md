@@ -1183,7 +1183,7 @@ lists to `nxdomain`, which changes nothing they answer.
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
 - Block list entries are written as RPZ zone records
-- Updating the RPZ zone uses `rndc reload <rpz-zone>` (no full restart)
+- Updating the RPZ zone is incremental (#4041): the agent diffs the new render against what named last loaded and sends only the adds and deletes as RFC 2136 updates signed with the group's own key, so a one-domain edit to a million-entry list is one small message and named never holds the old and the new zone together. The full `rndc reload <rpz-zone>` is the fallback: the first apply after an upgrade, a revert, a view-scoped zone (an update over loopback cannot name a view), a group with no TSIG key, a refused or failed update, a change of more than 50,000 lines, or named serving a serial other than the one the agent recorded. The new zone file is still written in every case, so a restart loads it. The bundle still ships the whole list; moving blocklist content into its own versioned stream is not done yet
 - Every list a scope draws on is folded into ONE RPZ zone per view (plus one group zone), so BIND's limit of 64 zones per `response-policy` statement can never be reached by assigning lists; there is deliberately no assignment-time cap (#3564)
 
 ### UI Features
