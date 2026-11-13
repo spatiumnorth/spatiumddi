@@ -11381,10 +11381,10 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                     ))}
                     {feedSkippedTotal(l) > 0 && (
                       <span
-                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground"
                         title={feedSkippedTitle(l)}
                       >
-                        {feedSkippedTotal(l)} rules not enforced
+                        {feedSkippedTotal(l)} rules skipped
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
@@ -12137,7 +12137,9 @@ export function BlocklistDetail({
         </p>
       )}
       {feedSkippedTotal(list) > 0 && (
-        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
+        <p className="text-xs text-muted-foreground">
+          {feedSkippedTitle(list)}
+        </p>
       )}
 
       {/* Blocked domains (the list itself) */}
