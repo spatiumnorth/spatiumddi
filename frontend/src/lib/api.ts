@@ -2169,6 +2169,7 @@ export const ipamApi = {
       mac_address?: string;
       description?: string;
       custom_fields?: Record<string, unknown>;
+      tags?: Record<string, unknown>;
       dns_zone_id?: string | null;
       /** Issue #25 — additional zones to publish A/AAAA records into. */
       extra_zone_ids?: string[];
