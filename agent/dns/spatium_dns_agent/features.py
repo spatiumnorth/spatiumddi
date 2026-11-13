@@ -13,12 +13,23 @@ group's bundles carry the zone's own timers only once every BIND9 agent in it
 says this; until then they carry that literal, and the control plane moves
 the zones' serials when it switches. PowerDNS and Technitium keep their own
 SOA, and the control plane counts only BIND9 servers.
+
+``served-serials`` — the BIND9 driver reports, for a secondary / stub zone, the
+serial named serves (and nothing for a zone it holds no copy of) instead of the
+bundle's serial 0 (#3940). The control plane then counts a BIND9 secondary
+serving 0 as not synced, whatever the agent's release (an older agent's start-up
+report already carries real served serials, and its 0 means "not reported").
+
+``packed-blocklists`` (#4040) — the agent reads a blocklist's ``entries`` as
+packed runs (``blocklist_entries``) as well as one object per entry. The
+control plane sends the packed shape only to a server whose agent said so, and
+the per-entry shape to every other.
 """
 
 from __future__ import annotations
 
 FEATURES_HEADER = "X-Spatium-Agent-Features"
-FEATURES: tuple[str, ...] = ("soa-timers",)
+FEATURES: tuple[str, ...] = ("soa-timers", "served-serials", "packed-blocklists")
 
 
 def headers() -> dict[str, str]:
