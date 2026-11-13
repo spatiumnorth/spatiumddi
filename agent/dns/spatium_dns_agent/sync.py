@@ -185,17 +185,26 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
     No driver produces both today; if one ever did, both are named here.
     """
     parts: list[str] = []
-    if held:
+    # A zone held for its name (#3843) was never checked or refused by anything:
+    # no change to its data will load it, so it is worded apart from the zones
+    # named-checkzone refused (#1403).
+    for group, lead in (
+        ([h for h in held if not h.name_hold], "named-checkzone refused {count}, held back until the data loads"),
+        ([h for h in held if h.name_hold], "the agent holds back {count} whose name is too long for its files"),
+    ):
+        if not group:
+            continue
         zones = "; ".join(
             f"{h.zone}{f' (view {h.view})' if h.view else ''}: {h.reason} ("
             + ("still served from its last good copy" if h.served else "not served")
             + ")"
-            for h in held
+            for h in group
         )
-        count = "a zone file" if len(held) == 1 else f"{len(held)} zone files"
+        noun = "zone file" if lead.startswith("named") else "zone"
+        count = f"a {noun}" if len(group) == 1 else f"{len(group)} {noun}s"
         parts.append(
-            f"named-checkzone refused {count}, held back until the data loads; "
-            f"every other change in this config is live: {zones}"
+            lead.format(count=count)
+            + f"; every other change in this config is live: {zones}"
         )
     if refused:
         parts.append(
