@@ -53,6 +53,13 @@ permissions:
   actions: write
   contents: read
 
+env:
+  # THE LIST OF REFS GIVEN A NIGHTLY (#3950): space-separated, `main` plus
+  # any release/X.Y.Z branches under stabilisation. Add a branch when it is
+  # cut and drop it when it ships; one that does not exist on origin is
+  # skipped with a notice, not a failure.
+  NIGHTLY_REFS: "main release/1.0.1"
+
 jobs:
   wait-then-dispatch:
     name: Wait for the Eastern target, then start the nightly
@@ -110,19 +117,41 @@ jobs:
             fi
           fi
 
-          # ── Has tonight's nightly already been dispatched? ───────────
-          # By this workflow or by hand — anything created in the hour
-          # before the target or later counts. (An afternoon dispatch by
-          # a human belongs to the previous evening; nightly.yml treats
-          # it that way too.)
+          # ── Which refs still need tonight's nightly dispatched? ──────
+          # Per ref (#3950): main having its nightly says nothing about a
+          # release branch. By this workflow or by hand — anything created
+          # in the hour before the target or later counts. (An afternoon
+          # dispatch by a human belongs to the previous evening; nightly.yml
+          # treats it that way too.) nightly.yml names its runs
+          # "Nightly (<ref>)", which is what tells the refs apart; a run
+          # from before that rename is titled plain "Nightly" and was main's.
           since=$(date -u -d "@$((target - 3600))" +%FT%TZ)
-          already=$(gh run list --workflow nightly.yml --event workflow_dispatch --limit 20 \
-                      --json databaseId,createdAt \
-                      --jq "[.[] | select(.createdAt >= \"${since}\") | \"\\(.databaseId) (\\(.createdAt))\"] | join(\", \")")
-          if [ -n "$already" ]; then
-            echo "→ tonight's nightly was already dispatched: ${already}; nothing to do"
+          runs=$(gh run list --workflow nightly.yml --event workflow_dispatch --limit 40 \
+                   --json databaseId,createdAt,displayTitle)
+          pending=()
+          for ref in $NIGHTLY_REFS; do
+            if [ "$ref" != "main" ] && [[ ! "$ref" =~ ^release/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::NIGHTLY_REFS entry '${ref}' is neither main nor release/X.Y.Z"
+              exit 1
+            fi
+            already=$(printf '%s' "$runs" | jq -r --arg since "$since" --arg ref "$ref" \
+                        '[.[] | select(.createdAt >= $since)
+                              | select(.displayTitle == "Nightly (" + $ref + ")"
+                                       or ($ref == "main" and .displayTitle == "Nightly"))
+                              | "\(.databaseId) (\(.createdAt))"] | join(", ")')
+            if [ -n "$already" ]; then
+              echo "→ ${ref}: tonight's nightly was already dispatched: ${already}"
+            elif [ "$ref" != "main" ] && ! gh api "repos/${GH_REPO}/git/ref/heads/${ref}" >/dev/null 2>&1; then
+              echo "::notice::${ref} does not exist on origin; no nightly for it"
+            else
+              pending+=("$ref")
+            fi
+          done
+          if [ "${#pending[@]}" -eq 0 ]; then
+            echo "→ nothing to dispatch; nothing to do"
             exit 0
           fi
+          echo "→ to dispatch: ${pending[*]}"
 
           # ── Wait ─────────────────────────────────────────────────────
           wait=$((target - now))
@@ -141,5 +170,15 @@ jobs:
           fi
 
           # ── Dispatch ─────────────────────────────────────────────────
-          gh workflow run nightly.yml
-          echo "→ nightly.yml dispatched at $(TZ=America/New_York date '+%F %H:%M:%S %Z')"
+          # main first: a failure on one ref must not starve the others, so
+          # a failed dispatch is counted and reported at the end.
+          failed=0
+          for ref in "${pending[@]}"; do
+            if gh workflow run nightly.yml -f "ref=${ref}"; then
+              echo "→ nightly.yml (${ref}) dispatched at $(TZ=America/New_York date '+%F %H:%M:%S %Z')"
+            else
+              echo "::error::dispatching nightly.yml for ${ref} failed"
+              failed=$((failed + 1))
+            fi
+          done
+          [ "$failed" -eq 0 ]
