@@ -687,7 +687,8 @@ async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUs
     collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
-    return _erl_read(row)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
 
 
 @router.post("/erls/{erl_id}/validation", response_model=ERLRead)
@@ -715,7 +716,8 @@ async def record_validation(
     )
     await db.commit()
     await db.refresh(row)
-    return _erl_read(row)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
 
 
 @router.delete("/erls/{erl_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -984,6 +986,7 @@ async def get_location(
         source_ip=request.client.host if request.client else None,
     )
     await db.commit()
+    erl_counts = await _binding_counts(db, [resolution.erl.id]) if resolution.erl else {}
 
     return LocationResponse(
         identity_kind=resolution.identity_kind,
@@ -994,7 +997,11 @@ async def get_location(
         degraded_reason=resolution.degraded_reason,
         observed_at=resolution.observed_at,
         evidence_age_seconds=resolution.evidence_age_seconds,
-        erl=_erl_read(resolution.erl) if resolution.erl else None,
+        erl=(
+            _erl_read(resolution.erl, erl_counts.get(resolution.erl.id, 0))
+            if resolution.erl
+            else None
+        ),
         evidence=[
             EvidenceRead(
                 kind=e.kind,

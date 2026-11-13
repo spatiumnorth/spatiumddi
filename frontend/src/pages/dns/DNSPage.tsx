@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
@@ -4148,6 +4149,15 @@ function MoveZoneModal({
               <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                 <span className="text-muted-foreground">Records moving</span>
                 <span>{preview.records_total}</span>
+                {preview.records_trashed > 0 && (
+                  <>
+                    <span className="text-muted-foreground">In the Trash</span>
+                    <span>
+                      {preview.records_trashed} more move with the zone (not
+                      counted above or in the view figures)
+                    </span>
+                  </>
+                )}
                 {preview.records_remapped > 0 && (
                   <>
                     <span className="text-muted-foreground">
@@ -5281,7 +5291,7 @@ export function ZoneDetailView({
                 ) : hasRecFilter ? (
                   "No records match the current filter."
                 ) : (
-                  'No records yet. Click "Add Record" to create one.'
+                  `No records yet.${canWriteRecords ? ' Click "Add Record" to create one.' : ""}`
                 )}
               </p>
             </div>
@@ -7692,7 +7702,13 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       )}
       {keys.length === 0 && keysData !== undefined && keysError == null && (
         <p className="text-xs italic text-muted-foreground">
-          No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
+          No TSIG keys yet.
+          {isSuperadmin && (
+            <>
+              {" "}
+              Click <em>New TSIG Key</em> to add one.
+            </>
+          )}
         </p>
       )}
 
@@ -8113,8 +8129,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   // client's change, and the form is filled from this read, not the cache.
   const {
     data: opts,
-    isLoading,
     isFetching,
+    isError: optsError,
   } = useQuery({
     queryKey: ["dns-options", groupId],
     queryFn: () => dnsApi.getOptions(groupId),
@@ -8462,7 +8478,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     };
     // Send only what changed (#3739). The baseline is the fill-time read run
     // through the same shaping, so a field left alone compares equal.
-    const o = filledFrom!;
+    if (!filledFrom) return;
+    const o = filledFrom;
     const diff = changedFields(
       {
         forwarders: o.forwarders,
@@ -8518,8 +8535,19 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     saveMut.mutate(diff);
   }
 
-  if (isLoading)
+  // No editable form until the form has been filled from a settled read
+  // (#3864): with a cached copy the query is not "loading" while the re-read
+  // is pending, and the form would show its built-in defaults, take edits the
+  // fill then overwrites, and Save would have no baseline.
+  if (!filledFrom) {
+    if (optsError && !isFetching)
+      return (
+        <p className="text-sm text-destructive">
+          Could not load the group's options.
+        </p>
+      );
     return <p className="text-sm text-muted-foreground">Loading…</p>;
+  }
 
   // Full-width select to prevent text/arrow overlap
   const selCls =
@@ -10536,7 +10564,7 @@ function ZonesTab({
               </button>
             </>
           ) : (
-            'No zones yet. Click "Add Zone" to create one.'
+            `No zones yet.${can("write", "dns_zone") ? ' Click "Add Zone" to create one.' : ""}`
           )}
         </p>
       )}
@@ -11810,11 +11838,9 @@ function EditBlockedDomainModal({
           Block subdomains too (
           <code className="font-mono text-xs">*.{domain || "domain"}</code>)
         </label>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11903,11 +11929,9 @@ function EditExceptionModal({
             placeholder="Optional"
           />
         </Field>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
