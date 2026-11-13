@@ -55,6 +55,7 @@ import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -1413,9 +1414,9 @@ function DeviceProfileSection({
       </div>
 
       {error && (
-        <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
+        <FormError className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
           {error}
-        </div>
+        </FormError>
       )}
 
       {/* Passive layer — DHCP fingerprint via fingerbank. */}
