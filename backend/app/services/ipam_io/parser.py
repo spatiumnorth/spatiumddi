@@ -59,6 +59,7 @@ _KNOWN_ADDRESS_COLUMNS = {
     "fqdn",
     "mac",
     "mac_address",
+    "duid",
     "description",
     "status",
     "tags",

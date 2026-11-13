@@ -465,7 +465,7 @@ async def list_dhcp_statics(
             "id": str(s.id),
             "scope_id": str(s.scope_id),
             "ip_address": str(s.ip_address),
-            "mac_address": str(s.mac_address),
+            "mac_address": str(s.mac_address) if s.mac_address else None,
             "client_id": s.client_id,
             "duid": getattr(s, "duid", None),
             "hostname": s.hostname,

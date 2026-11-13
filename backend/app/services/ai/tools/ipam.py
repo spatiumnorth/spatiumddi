@@ -719,6 +719,7 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
                 "hostname": ip.hostname,
                 "fqdn": current_fqdn(ip.hostname, ip.fqdn),
                 "mac_address": str(ip.mac_address) if ip.mac_address else None,
+                "duid": ip.duid,
                 "mac_vendor": vendor,
                 "is_voip_phone": is_voip_phone_vendor(vendor),
                 "description": ip.description,
@@ -1005,7 +1006,8 @@ _TAG_KIND_TABLE: dict[str, tuple[type, bool, Any]] = {
         lambda r: {
             "id": str(r.id),
             "ip_address": str(r.ip_address),
-            "mac_address": str(r.mac_address),
+            "mac_address": str(r.mac_address) if r.mac_address else None,
+            "duid": r.duid,
             "hostname": r.hostname,
             "tags": r.tags or {},
         },

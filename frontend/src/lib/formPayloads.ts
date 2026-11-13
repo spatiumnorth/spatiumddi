@@ -60,6 +60,28 @@ export function poolHealthCheckFields(
   return out;
 }
 
+/** DHCP static assignment: the MAC is required on a v4 scope, optional on a v6
+ *  one that carries a DUID (#3900). A blank v6 MAC goes out as null, which an
+ *  edit reads as "clear it". */
+export function staticMacField(f: { isV6: boolean; mac: string }): {
+  mac_address?: string | null;
+} {
+  const mac = f.mac.trim();
+  if (f.isV6) return { mac_address: mac || null };
+  return { mac_address: mac };
+}
+
+/** Whether a static-assignment form still lacks an identifier its scope
+ *  accepts: a MAC on v4, a MAC or a DUID on v6 (#3900). */
+export function staticIdentityMissing(f: {
+  isV6: boolean;
+  mac: string;
+  duid: string;
+}): boolean {
+  if (f.isV6) return !f.mac.trim() && !f.duid.trim();
+  return !f.mac.trim();
+}
+
 /** DHCP static assignment: the DUID field exists only on a v6 scope. */
 export function staticDuidField(
   f: { isV6: boolean; duid: string },

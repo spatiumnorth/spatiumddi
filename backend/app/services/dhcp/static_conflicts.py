@@ -19,16 +19,53 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
+from app.services.dhcp.normalize import canonical_duid, canonicalize_mac
+
+
+def resolve_static_identity(
+    scope: DHCPScope, mac: str | None, duid: str | None
+) -> tuple[str | None, str | None]:
+    """The canonical ``(mac, duid)`` a reservation on ``scope`` is keyed on (#3900).
+
+    A DHCPv6 reservation is identified by a DUID, or by a MAC (Kea matches it
+    through ``hw-address``); it needs one of the two. A DHCPv4 reservation is
+    keyed on the MAC and needs one: a DUID is meaningless there, and Kea would
+    ignore it, leaving a reservation that matches nothing. Raises 422.
+    """
+    try:
+        mac_c = canonicalize_mac(mac) if mac else None
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    try:
+        duid_c = canonical_duid(duid) if duid else None
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid DUID: {e}") from e
+    if (scope.address_family or "ipv4") == "ipv6":
+        if mac_c is None and duid_c is None:
+            raise HTTPException(
+                status_code=422,
+                detail="A DHCPv6 reservation needs a DUID or a MAC address",
+            )
+    else:
+        if duid_c is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="A DUID only identifies a DHCPv6 client; use a MAC address on an IPv4 scope",
+            )
+        if mac_c is None:
+            raise HTTPException(status_code=422, detail="A DHCPv4 reservation needs a MAC address")
+    return mac_c, duid_c
 
 
 async def check_static_conflicts(
     db: AsyncSession,
     scope: DHCPScope,
     ip: str,
-    mac: str,
+    mac: str | None,
     exclude_id: uuid.UUID | None = None,
     *,
     name_other_scope: bool = True,
+    duid: str | None = None,
 ) -> None:
     """Conflict: same MAC in the group (across scopes), same IP in the scope,
     a malformed IP, or an IP outside the scope's subnet.
@@ -37,23 +74,41 @@ async def check_static_conflicts(
     MAC out of the 409: the request portal's submitter holds read on THIS
     scope only, and the holding scope may be one they cannot see (#2903).
     """
-    # MAC dup across every scope served by the same group
-    same_mac = await db.execute(
-        select(DHCPStaticAssignment)
-        .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
-        .where(
-            DHCPScope.group_id == scope.group_id,
-            DHCPStaticAssignment.mac_address == mac,
+    # MAC dup across every scope of the same ADDRESS FAMILY served by the
+    # group. The family matters (#3900): a dual-stack host legitimately holds
+    # a v4 reservation and a v6 one under the same MAC, in different scopes.
+    if mac is not None:
+        same_mac = await db.execute(
+            select(DHCPStaticAssignment)
+            .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
+            .where(
+                DHCPScope.group_id == scope.group_id,
+                DHCPScope.address_family == scope.address_family,
+                DHCPStaticAssignment.mac_address == mac,
+            )
         )
-    )
-    for row in same_mac.scalars().all():
-        if exclude_id is not None and row.id == exclude_id:
-            continue
-        where = f" in scope {row.scope_id}" if name_other_scope else ""
-        raise HTTPException(
-            status_code=409,
-            detail=f"MAC {mac} already reserved in this group{where}",
+        for row in same_mac.scalars().all():
+            if exclude_id is not None and row.id == exclude_id:
+                continue
+            where = f" in scope {row.scope_id}" if name_other_scope else ""
+            raise HTTPException(
+                status_code=409,
+                detail=f"MAC {mac} already reserved in this group{where}",
+            )
+
+    if duid is not None:
+        same_duid = await db.execute(
+            select(DHCPStaticAssignment).where(
+                DHCPStaticAssignment.scope_id == scope.id,
+                DHCPStaticAssignment.duid == duid,
+            )
         )
+        for row in same_duid.scalars().all():
+            if exclude_id is not None and row.id == exclude_id:
+                continue
+            raise HTTPException(
+                status_code=409, detail=f"DUID {duid} is already reserved in this scope"
+            )
 
     try:
         ip_addr = ipaddress.ip_address(ip)

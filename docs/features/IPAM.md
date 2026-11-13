@@ -131,7 +131,7 @@ IPAddress
     allocated,      -- manually assigned in IPAM
     reserved,       -- held but not assigned (e.g., future use, gateway placeholder)
     dhcp,           -- currently active DHCP lease
-    static_dhcp,    -- has a static DHCP assignment (requires mac_address)
+    static_dhcp,    -- has a static DHCP assignment (requires mac_address, or duid on IPv6)
     discovered,     -- seen on network but not in IPAM
     orphan,         -- was assigned, device no longer seen
     deprecated      -- was assigned, now decommissioned
@@ -139,7 +139,8 @@ IPAddress
   hostname: str (nullable)
   fqdn: str (nullable, computed from hostname + domain)
   domain_id (FK → DNSZone, nullable)   -- which domain this hostname belongs to
-  mac_address: macaddr (nullable)      -- required when status = static_dhcp
+  mac_address: macaddr (nullable)      -- required when status = static_dhcp (IPv4)
+  duid: str (nullable)                 -- DHCPv6 DUID; IPv6 rows only. Identifies a static_dhcp v6 address with no MAC (#3900)
   description: str
   
   -- Ownership
@@ -832,7 +833,7 @@ Import behavior:
 - Export a block, subnet, or entire space
 - Formats: CSV, JSON, Excel (`.xlsx`)
 - Includes: all subnet metadata + utilization + custom fields + IP address list (optional)
-- **What each format holds with "Include IP addresses" ticked (#2420):** JSON and XLSX carry the subnet metadata *and* the address list (XLSX as separate sheets); PDF keeps its subnet table and appends the addresses. **CSV is the address list only** (`subnet,address,status,hostname,fqdn,mac_address,description,last_seen_at` + custom fields), the shape the address importer reads, so it round-trips. For subnet metadata in CSV, download it with the box unticked. The CSV follows the box, not whether the scope happens to hold addresses
+- **What each format holds with "Include IP addresses" ticked (#2420):** JSON and XLSX carry the subnet metadata *and* the address list (XLSX as separate sheets); PDF keeps its subnet table and appends the addresses. **CSV is the address list only** (`subnet,address,status,hostname,fqdn,mac_address,duid,description,last_seen_at` + custom fields), the shape the address importer reads, so it round-trips. For subnet metadata in CSV, download it with the box unticked. The CSV follows the box, not whether the scope happens to hold addresses
 
 ### DNS Zone Import / Export
 
@@ -2199,9 +2200,17 @@ already wires this up for every delete / allocate / create flow.
   same subnet returns `409`.
 - **Malformed IP.** Non-parseable address in create / import paths
   returns `422`.
-- **`static_dhcp` status requires a MAC.** Creating an IP with
+- **`static_dhcp` status requires an identifier.** Creating an IP with
   `status="static_dhcp"` without a `mac_address` is rejected — a
-  static reservation needs something to match on. `422`.
+  static reservation needs something to match on. `422`. On an
+  **IPv6** address a `duid` serves instead (#3900): a DHCPv6 client is
+  identified by its DUID, so the reservation mirrored onto the v6 scope
+  is keyed on it and needs no MAC. A `duid` on an IPv4 address is a
+  `422`. A dual-stack host is two rows, one per family, each mirrored
+  to the reservation in its own scope; give both the same hostname so
+  DNS publishes an A and an AAAA under one FQDN. The Add / Edit address
+  dialogs show a DUID field on an IPv6 address, and the CSV importer
+  reads a `duid` column.
 - **Collision warnings are soft, not hard.** Duplicate hostname +
   forward zone, or duplicate MAC across subnets, returns `409` with
   `{"warnings": [...], "requires_confirmation": True}`; the client

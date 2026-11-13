@@ -482,13 +482,14 @@ errors.
 
 ## 3. Static DHCP Assignments
 
-Static assignments bind a MAC address (or client identifier) to a specific IP, hostname, and optional per-host options.
+Static assignments bind a MAC address (or client identifier) to a specific IP, hostname, and optional per-host options. On a DHCPv6 scope the reservation can be keyed on the client's **DUID** instead, with no MAC at all (#3900).
 
 ```
 DHCPStaticAssignment
   id, scope_id                  -- NOT NULL / ON DELETE CASCADE; part of the reservation's identity
   ip_address: inet              -- must fall inside the scope's subnet (422 if not — issue #619)
-  mac_address: macaddr          -- primary identifier
+  mac_address: macaddr (nullable) -- primary identifier; required on a v4 scope, optional on a v6 one that has a duid (#3900)
+  duid: str (nullable)          -- DHCPv6 DUID, canonical colon-hex; v6 scopes only (#368, #3900)
   client_id: str (nullable)     -- DHCP client identifier (alternative to MAC)
   hostname: str
   description: str
@@ -503,6 +504,15 @@ scope's `subnet4` stanza and Windows binds it to the scope's network address, so
 there is no renderable form of a relocated reservation — a body `scope_id` on
 create/update is rejected with a `422` (issue #619). To move one, delete it and
 re-create it under the target scope.
+
+**Identifier rules (#3900).** A CHECK requires a MAC or a DUID, and the API refines that per address family:
+
+| Scope | Accepted identifiers | Kea renders |
+|---|---|---|
+| IPv4 | MAC (required). A `duid` is a 422: nothing would ever match it | `hw-address` (+ `client-id` when set) |
+| IPv6 | a `duid`, a MAC, or both | `duid` when set, otherwise `hw-address` (Kea matches it via `host-reservation-identifiers`) |
+
+A DUID is hex octets (`:`, `-` or `.` separators allowed), 3 to 130 octets per RFC 8415 §11.1 (DUID-LLT, -EN, -LL and -UUID all fit), and is stored lowercase with colons, the form Kea reports on a lease. It must be unique within a scope (409). A MAC must be unique within the group **per address family**, so one dual-stack host can hold a v4 reservation and a v6 one under the same MAC; they are two reservations in two scopes, linked by the shared hostname (so the A and AAAA records share one FQDN). Windows DHCP and FortiGate render MAC-keyed reservations only, so a DUID-only reservation is skipped there.
 
 ### Static Assignment UI Workflow
 

@@ -43,6 +43,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +56,8 @@ from app.services.dhcp.ipam_mirror import (
     lease_hostname_suppressed_subnets,
 )
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
+from app.services.dhcp.normalize import canonical_duid
+from app.services.dhcp.static_conflicts import resolve_static_identity
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.ipam.utilization import recount_subnets_and_blocks
 
@@ -199,7 +202,11 @@ async def upsert_ipam_for_static(
     # validator folded it to "", or one written by an importer) is no name,
     # and the DNS sync below retracts what an earlier name published.
     row.hostname = (st.hostname or "").strip()
-    row.mac_address = str(st.mac_address)
+    row.mac_address = str(st.mac_address) if st.mac_address else None
+    # A DUID-keyed DHCPv6 reservation (#3900) mirrors its DUID, so the IPAM
+    # row stays a complete description of the reservation (and a later IPAM
+    # save re-syncs the same identifier instead of clearing it).
+    row.duid = st.duid
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
     # A row taken over here may be a lease's mirror: the address a client
@@ -910,6 +917,39 @@ async def _linked_static_for_row(db: AsyncSession, row: IPAddress) -> DHCPStatic
     return res.scalars().first()
 
 
+def _identity_label(st: DHCPStaticAssignment) -> str:
+    """The identifier an audit row / message names a reservation by: its MAC,
+    or the DUID of a DUID-only DHCPv6 reservation (#3900)."""
+    return str(st.mac_address) if st.mac_address else (st.duid or "")
+
+
+def _row_identity(row: IPAddress) -> tuple[str | None, str | None]:
+    """A ``static_dhcp`` row's canonical ``(mac, duid)``. Raises ``ValueError``
+    naming the malformed one (a stored value that predates validation)."""
+    mac = canonicalize_mac(str(row.mac_address)) if row.mac_address else None
+    duid = canonical_duid(row.duid) if row.duid else None
+    return mac, duid
+
+
+def _identity_match(mac: str | None, duid: str | None) -> list[Any]:
+    """Conditions matching a reservation by the same MAC or the same DUID."""
+    conds: list[Any] = []
+    if mac:
+        conds.append(DHCPStaticAssignment.mac_address == mac)
+    if duid:
+        conds.append(DHCPStaticAssignment.duid == duid)
+    return conds
+
+
+def _same_identity(st: DHCPStaticAssignment, mac: str | None, duid: str | None) -> bool:
+    """True when ``st`` carries exactly this MAC and DUID."""
+    return (str(st.mac_address) if st.mac_address else None) == mac and (st.duid or None) == duid
+
+
+def _identity_name(mac: str | None, duid: str | None) -> str:
+    return f"MAC {mac}" if mac else f"DUID {duid}"
+
+
 def _audit_static_change(
     db: AsyncSession,
     user: User | None,
@@ -953,7 +993,8 @@ def _static_audit_value(
     return {
         "scope_id": str(scope_id),
         "ip_address": str(st.ip_address),
-        "mac_address": str(st.mac_address),
+        "mac_address": str(st.mac_address) if st.mac_address else None,
+        "duid": st.duid,
         "hostname": st.hostname or "",
         "description": st.description or "",
         "ip_address_id": str(row.id),
@@ -969,12 +1010,13 @@ def audit_static_removed(db: AsyncSession, user: User | None, st: DHCPStaticAssi
         user,
         "delete",
         static_id=st.id,
-        mac=str(st.mac_address),
+        mac=_identity_label(st),
         ip=str(st.ip_address),
         old_value={
             "scope_id": str(st.scope_id),
             "ip_address": str(st.ip_address),
-            "mac_address": str(st.mac_address),
+            "mac_address": str(st.mac_address) if st.mac_address else None,
+            "duid": st.duid,
             "hostname": st.hostname or "",
         },
     )
@@ -1024,12 +1066,12 @@ async def new_reservation_refusal(
     not the one who provisions). The words name no other address or scope:
     the requester may not be able to read them.
     """
-    if row.status != "static_dhcp" or not row.mac_address:
+    if row.status != "static_dhcp" or not (row.mac_address or row.duid):
         return None
     try:
-        mac = canonicalize_mac(str(row.mac_address))
+        mac, duid = _row_identity(row)
     except ValueError:
-        return f"Invalid MAC address {row.mac_address!r}"
+        return f"Invalid MAC address {row.mac_address!r} or DUID {row.duid!r}"
     if _dhcp_permission_warning(user, "write", row, verb="created") is not None:
         return (
             "The approver has no 'write' permission on DHCP reservations (dhcp_static), "
@@ -1049,6 +1091,10 @@ async def new_reservation_refusal(
             "make this allocation by hand."
         )
     scope = scopes[0]
+    try:
+        mac, duid = resolve_static_identity(scope, mac, duid)
+    except HTTPException as exc:
+        return str(exc.detail)
     existing = (
         (
             await db.execute(
@@ -1056,7 +1102,7 @@ async def new_reservation_refusal(
                     DHCPStaticAssignment.scope_id == scope.id,
                     or_(
                         DHCPStaticAssignment.ip_address == str(row.address),
-                        DHCPStaticAssignment.mac_address == mac,
+                        *_identity_match(mac, duid),
                     ),
                 )
             )
@@ -1065,13 +1111,13 @@ async def new_reservation_refusal(
         .first()
     )
     if existing is not None:
-        if str(existing.ip_address) == str(row.address) and str(existing.mac_address) == mac:
+        if str(existing.ip_address) == str(row.address) and _same_identity(existing, mac, duid):
             return None  # adopted by the sync, not a conflict
         return (
-            f"A DHCP reservation for {row.address} or MAC {mac} already exists on the "
-            "scope that serves this subnet, so no reservation can be made."
+            f"A DHCP reservation for {row.address} or {_identity_name(mac, duid)} already "
+            "exists on the scope that serves this subnet, so no reservation can be made."
         )
-    if await _static_mac_clash(db, scope, mac, exclude_id=None) is not None:
+    if mac and await _static_mac_clash(db, scope, mac, exclude_id=None) is not None:
         return (
             f"MAC {mac} is already reserved in the DHCP server group that serves this "
             "subnet, so no reservation can be made."
@@ -1123,7 +1169,7 @@ async def sync_static_for_ipam_row(
         created_by_user_id = acting_user.id
 
     linked = await _linked_static_for_row(db, row)
-    is_reservation = row.status == "static_dhcp" and bool(row.mac_address)
+    is_reservation = row.status == "static_dhcp" and bool(row.mac_address or row.duid)
 
     if not is_reservation:
         if linked is None:
@@ -1140,7 +1186,7 @@ async def sync_static_for_ipam_row(
         row.static_assignment_id = None
         deleted_id, deleted_mac, deleted_ip = (
             linked.id,
-            str(linked.mac_address),
+            _identity_label(linked),
             str(linked.ip_address),
         )
         await db.delete(linked)
@@ -1156,24 +1202,31 @@ async def sync_static_for_ipam_row(
         return IPAMStaticSync(static=None, scope=scope, action="delete")
 
     try:
-        mac = canonicalize_mac(str(row.mac_address))
+        mac, duid = _row_identity(row)
     except ValueError:
-        return IPAMStaticSync(warning=f"Invalid MAC address {row.mac_address!r}")
+        return IPAMStaticSync(
+            warning=f"Invalid MAC address {row.mac_address!r} or DUID {row.duid!r}"
+        )
 
     if linked is not None:
         scope = await db.get(DHCPScope, linked.scope_id)
         if scope is None:
             return IPAMStaticSync(warning="Linked DHCP reservation's scope no longer exists")
+        try:
+            mac, duid = resolve_static_identity(scope, mac, duid)
+        except HTTPException as exc:
+            return IPAMStaticSync(static=linked, scope=scope, warning=str(exc.detail))
         # A MAC the group already reserves under another row would collide
         # in the rendered bundle; leave the reservation untouched and warn.
-        clash = await _static_mac_clash(db, scope, mac, exclude_id=linked.id)
+        clash = await _static_mac_clash(db, scope, mac, exclude_id=linked.id) if mac else None
         if clash is not None:
             return IPAMStaticSync(
                 static=linked,
                 scope=scope,
                 warning=f"MAC {mac} is already reserved in this DHCP group (scope {clash.scope_id})",
             )
-        prev_mac, prev_ip = str(linked.mac_address), str(linked.ip_address)
+        prev_mac = str(linked.mac_address) if linked.mac_address else None
+        prev_duid, prev_ip = linked.duid, str(linked.ip_address)
         prev_hostname, prev_description = linked.hostname or "", linked.description or ""
         # #1629 walk — copy only a description the row actually carries.
         # A reservation made on the DHCP side carries a description its
@@ -1182,6 +1235,7 @@ async def sync_static_for_ipam_row(
         effective_description = row.description or prev_description
         changed = (
             prev_mac != mac
+            or prev_duid != duid
             or prev_ip != str(row.address)
             or prev_hostname != (row.hostname or "").strip()
             or prev_description != effective_description
@@ -1196,6 +1250,8 @@ async def sync_static_for_ipam_row(
             changed_fields.append("ip_address")
         if prev_mac != mac:
             changed_fields.append("mac_address")
+        if prev_duid != duid:
+            changed_fields.append("duid")
         if prev_hostname != (row.hostname or "").strip():
             changed_fields.append("hostname")
         if prev_description != effective_description:
@@ -1207,12 +1263,14 @@ async def sync_static_for_ipam_row(
             "scope_id": str(scope.id),
             "ip_address": prev_ip,
             "mac_address": prev_mac,
+            "duid": prev_duid,
             "hostname": prev_hostname,
             "description": prev_description,
             "ip_address_id": str(row.id),
         }
         linked.ip_address = str(row.address)
         linked.mac_address = mac
+        linked.duid = duid
         linked.hostname = (row.hostname or "").strip()
         linked.description = effective_description
         await db.flush()
@@ -1227,7 +1285,7 @@ async def sync_static_for_ipam_row(
             acting_user,
             "update",
             static_id=linked.id,
-            mac=str(linked.mac_address),
+            mac=_identity_label(linked),
             ip=str(linked.ip_address),
             changed_fields=changed_fields,
             old_value=old_value,
@@ -1257,6 +1315,10 @@ async def sync_static_for_ipam_row(
             )
         )
     scope = scopes[0]
+    try:
+        mac, duid = resolve_static_identity(scope, mac, duid)
+    except HTTPException as exc:
+        return IPAMStaticSync(scope=scope, warning=str(exc.detail))
 
     # An identical reservation already on the scope (created from the DHCP
     # side but never back-linked, e.g. a pre-#1628 row) is adopted, not
@@ -1269,7 +1331,7 @@ async def sync_static_for_ipam_row(
                     DHCPStaticAssignment.scope_id == scope.id,
                     or_(
                         DHCPStaticAssignment.ip_address == str(row.address),
-                        DHCPStaticAssignment.mac_address == mac,
+                        *_identity_match(mac, duid),
                     ),
                 )
             )
@@ -1278,14 +1340,14 @@ async def sync_static_for_ipam_row(
         .first()
     )
     if existing is not None:
-        if str(existing.ip_address) == str(row.address) and str(existing.mac_address) == mac:
+        if str(existing.ip_address) == str(row.address) and _same_identity(existing, mac, duid):
             await upsert_ipam_for_static(db, scope, existing, action="update")
             _audit_static_change(
                 db,
                 acting_user,
                 "update",
                 static_id=existing.id,
-                mac=str(existing.mac_address),
+                mac=_identity_label(existing),
                 ip=str(existing.ip_address),
                 changed_fields=["ip_address_id"],
                 new_value=_static_audit_value(existing, scope.id, row),
@@ -1295,10 +1357,10 @@ async def sync_static_for_ipam_row(
             scope=scope,
             warning=(
                 f"A conflicting DHCP reservation already exists on this scope for "
-                f"{row.address} / {mac}; no reservation was created."
+                f"{row.address} / {mac or duid}; no reservation was created."
             ),
         )
-    clash = await _static_mac_clash(db, scope, mac, exclude_id=None)
+    clash = await _static_mac_clash(db, scope, mac, exclude_id=None) if mac else None
     if clash is not None:
         return IPAMStaticSync(
             scope=scope,
@@ -1309,6 +1371,7 @@ async def sync_static_for_ipam_row(
         scope_id=scope.id,
         ip_address=str(row.address),
         mac_address=mac,
+        duid=duid,
         hostname=(row.hostname or "").strip(),
         description=row.description or "",
         ip_address_id=row.id,
@@ -1324,7 +1387,7 @@ async def sync_static_for_ipam_row(
         acting_user,
         "create",
         static_id=st.id,
-        mac=str(st.mac_address),
+        mac=_identity_label(st),
         ip=str(st.ip_address),
         new_value=_static_audit_value(st, scope.id, row),
     )
@@ -1342,7 +1405,13 @@ async def _static_mac_clash(
     res = await db.execute(
         select(DHCPStaticAssignment)
         .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
-        .where(DHCPScope.group_id == scope.group_id, DHCPStaticAssignment.mac_address == mac)
+        .where(
+            DHCPScope.group_id == scope.group_id,
+            # Same address family only: a dual-stack host keeps one MAC on its
+            # v4 and its v6 reservation (#3900).
+            DHCPScope.address_family == scope.address_family,
+            DHCPStaticAssignment.mac_address == mac,
+        )
     )
     for other in res.scalars().all():
         if exclude_id is not None and other.id == exclude_id:

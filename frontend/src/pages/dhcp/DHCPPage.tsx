@@ -1904,7 +1904,7 @@ export function ServerPoolsOrStaticsTab({
     { key: "ip", dir: "asc" },
     (row, key) => {
       if (key === "scope") return row.scope?.name ?? "";
-      if (key === "mac") return row.item?.mac_address ?? "";
+      if (key === "mac") return row.item?.mac_address ?? row.item?.duid ?? "";
       if (key === "ip") return ipToInt(row.item?.ip_address);
       if (key === "hostname") return row.item?.hostname ?? "";
       return "";
@@ -2115,7 +2115,15 @@ export function ServerPoolsOrStaticsTab({
                         <tr className="border-b last:border-0">
                           <td className="px-3 py-2 text-xs">{scope.name}</td>
                           <td className="px-3 py-2 font-mono text-xs">
-                            {s.mac_address}
+                            {s.mac_address ?? (s.duid ? "" : "—")}
+                            {s.duid && (
+                              <div
+                                className="text-[11px] text-muted-foreground"
+                                title={`DHCPv6 DUID ${s.duid}`}
+                              >
+                                DUID {s.duid}
+                              </div>
+                            )}
                           </td>
                           <td className="px-3 py-2 font-mono text-xs">
                             {s.ip_address}
@@ -2152,9 +2160,11 @@ export function ServerPoolsOrStaticsTab({
                           Copy IP
                         </ContextMenuItem>
                         <ContextMenuItem
-                          onSelect={() => copyToClipboard(s.mac_address)}
+                          onSelect={() =>
+                            copyToClipboard(s.mac_address ?? s.duid ?? "")
+                          }
                         >
-                          Copy MAC
+                          {s.mac_address ? "Copy MAC" : "Copy DUID"}
                         </ContextMenuItem>
                         {s.hostname && (
                           <ContextMenuItem
@@ -2205,7 +2215,7 @@ export function ServerPoolsOrStaticsTab({
       {delStatic && (
         <DeleteConfirmModal
           title="Delete Static Assignment"
-          description={`Delete reservation ${delStatic.item.ip_address} (${delStatic.item.mac_address})?`}
+          description={`Delete reservation ${delStatic.item.ip_address} (${delStatic.item.mac_address ?? delStatic.item.duid})?`}
           onConfirm={() => delMut.mutate(delStatic)}
           onClose={() => {
             setDelStatic(null);
