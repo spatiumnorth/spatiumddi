@@ -232,3 +232,108 @@ async def test_permanent_delete_of_a_live_zone_with_no_trashed_sharer_still_work
     r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}?permanent=true", headers=headers)
     assert r.status_code == 204, r.text
     assert await _zone(db_session, zid) is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_of_an_operator_made_zone_is_refused_3889(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An operator-made forward zone holding a trashed subnet's A record: the
+    permanent delete is refused too (#3889), and that subnet's restore keeps it."""
+    from app.models.dns import DNSRecord
+    from tests.test_subnet_delete_reverse_zone_1066 import _bound_subnet, _fixture
+    from tests.test_subnet_trash_retracts_dns_1906 import _address
+
+    headers = await _admin_headers(db_session)
+    ids = await _fixture(db_session)
+    _space, _block, gid, zid = ids
+    sid = await _bound_subnet(client, headers, ids, "10.67.9.0/25")
+    await _address(client, headers, sid, "10.67.9.10", "hz")
+    r = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert r.status_code == 204, r.text
+    zone_id = uuid.UUID(zid)
+
+    async def _fwd() -> list[tuple[str, bool]]:
+        rows = (
+            await db_session.execute(
+                select(DNSRecord.name, DNSRecord.deleted_at)
+                .where(DNSRecord.zone_id == zone_id, DNSRecord.record_type == "A")
+                .execution_options(include_deleted=True, populate_existing=True)
+            )
+        ).all()
+        return sorted((n, d is None) for n, d in rows)
+
+    before = await _fwd()
+    assert before == [("hz", False)]
+
+    r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}?permanent=true", headers=headers)
+    assert r.status_code == 409, r.text
+    assert "10.67.9.0/25" in r.json()["detail"]
+    zone = await _zone(db_session, zone_id)
+    assert zone is not None and zone.deleted_at is None
+    assert await _fwd() == before
+
+    await db_session.rollback()
+    r = await client.post(f"/api/v1/admin/trash/subnet/{sid}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert await _fwd() == [("hz", True)]
+
+
+async def _trashed_subnet_in_trashed_operator_zone(client, db_session, headers):  # type: ignore[no-untyped-def]
+    from tests.test_subnet_delete_reverse_zone_1066 import _bound_subnet, _fixture
+    from tests.test_subnet_trash_retracts_dns_1906 import _address
+
+    ids = await _fixture(db_session)
+    _space, _block, gid, zid = ids
+    sid = await _bound_subnet(client, headers, ids, "10.67.9.0/25")
+    await _address(client, headers, sid, "10.67.9.10", "hz")
+    r = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert r.status_code == 204, r.text
+    r = await client.delete(f"/api/v1/dns/groups/{gid}/zones/{zid}", headers=headers)
+    assert r.status_code == 204, r.text
+    zone = await _zone(db_session, uuid.UUID(zid))
+    assert zone is not None and zone.deleted_at is not None and not zone.is_auto_generated
+    return sid, uuid.UUID(zid)
+
+
+@pytest.mark.asyncio
+async def test_trash_purge_of_a_trashed_operator_zone_is_refused_3889(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    sid, zid = await _trashed_subnet_in_trashed_operator_zone(client, db_session, headers)
+    r = await client.delete(f"/api/v1/admin/trash/dns_zone/{zid}", headers=headers)
+    assert r.status_code == 409, r.text
+    assert "10.67.9.0/25" in r.json()["detail"]
+    assert await _zone(db_session, zid) is not None
+
+
+@pytest.mark.asyncio
+async def test_expiry_sweep_keeps_an_operator_zone_a_trashed_subnet_needs_3889(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.tasks.trash_purge import _purge_dns_zones
+
+    headers = await _admin_headers(db_session)
+    sid, zid = await _trashed_subnet_in_trashed_operator_zone(client, db_session, headers)
+    old = datetime.now(UTC) - timedelta(days=60)
+    await db_session.execute(
+        update(DNSZone)
+        .where(DNSZone.id == zid)
+        .values(deleted_at=old)
+        .execution_options(include_deleted=True)
+    )
+    await db_session.commit()
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    purged, skipped = await _purge_dns_zones(db_session, cutoff)
+    await db_session.commit()
+    assert (purged, skipped) == (0, 0)
+    assert await _zone(db_session, zid) is not None
+
+    # Once the subnet leaves the Trash, the next sweep takes the zone.
+    r = await client.delete(f"/api/v1/admin/trash/subnet/{sid}", headers=headers)
+    assert r.status_code == 204, r.text
+    purged, _ = await _purge_dns_zones(db_session, cutoff)
+    await db_session.commit()
+    assert purged == 1
+    assert await _zone(db_session, zid) is None

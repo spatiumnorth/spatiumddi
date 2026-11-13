@@ -17,6 +17,7 @@ import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -272,7 +273,9 @@ function DomainEditorModal({
             onChange={(e) => setCfRaw(e.target.value)}
           />
         </div>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -580,8 +583,10 @@ export function DomainsPage() {
                         setSearch("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New domain" to add the first one.`}
                     >
-                      No domains yet — click "New domain" to add the first one.
+                      No domains yet.
                     </ListEmpty>
                   </td>
                 </tr>

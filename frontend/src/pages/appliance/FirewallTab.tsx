@@ -54,6 +54,7 @@ import { cn } from "@/lib/utils";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { FormError } from "@/components/ui/form-error";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -417,9 +418,9 @@ export function FirewallLogsSection() {
       </div>
 
       {err && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
           {err}
-        </div>
+        </FormError>
       )}
 
       <div
@@ -551,9 +552,9 @@ function EnforcementCard() {
       )}
 
       {set.isError && (
-        <p className="mt-2 text-xs text-destructive">
+        <FormError className="mt-2 text-xs text-destructive">
           {formatApiError(set.error)}
-        </p>
+        </FormError>
       )}
 
       <ConfirmModal
@@ -682,9 +683,9 @@ function PoliciesSection() {
       </div>
 
       {posture.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(posture.error)}
-        </p>
+        </FormError>
       )}
 
       <div className="flex items-center justify-between">
@@ -808,9 +809,9 @@ function PoliciesSection() {
       )}
 
       {toggle.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(toggle.error)}
-        </p>
+        </FormError>
       )}
 
       {showNew && (
@@ -956,9 +957,9 @@ function NewPolicyModal({
           </label>
         )}
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1237,9 +1238,9 @@ function RuleEditorModal({
         </p>
         <RuleRowsEditor rows={rows} setRows={setRows} />
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1434,9 +1435,9 @@ function NewAliasModal({
           />
         </label>
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1532,7 +1533,9 @@ function EffectiveSection() {
       </div>
 
       {error && (
-        <p className="text-xs text-destructive">{formatApiError(error)}</p>
+        <FormError className="text-xs text-destructive">
+          {formatApiError(error)}
+        </FormError>
       )}
 
       {eff && (
@@ -1665,9 +1668,9 @@ function PreviewSection() {
       <RuleRowsEditor rows={rows} setRows={setRows} />
 
       {preview.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(preview.error)}
-        </p>
+        </FormError>
       )}
 
       {preview.data && (
