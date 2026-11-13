@@ -10073,9 +10073,9 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
-    if "value" in changes:
+    if set(changes) - {"ttl"}:
         await _require_superadmin_for_lua(
-            db, current_user, [record.record_type], what="change a LUA record's value"
+            db, current_user, [record.record_type], what="change a LUA record other than its TTL"
         )
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
@@ -11969,7 +11969,12 @@ async def import_zone_spreadsheet_commit(
         db,
         current_user,
         [c.record_type for c in plan.creates]
-        + [u.candidate.record_type for u in plan.updates if "value" in u.changed],
+        + [
+            rt
+            for u in plan.updates
+            if set(u.changed) - {"ttl", "comment"}
+            for rt in (u.candidate.record_type, u.record.record_type)
+        ],
         what="import a LUA record",
     )
 

@@ -3591,6 +3591,9 @@ function RecordModalForm({
               placeholder='@ for apex, "www", "mail"'
               required
               autoFocus
+              // A LUA record's name and view place a snippet this user may
+              // not write, so they stay as stored (as the snippet does).
+              readOnly={!!record && type === "LUA" && !canWriteLua}
             />
             {nameErr && <p className="text-xs text-destructive">{nameErr}</p>}
           </Field>
@@ -3813,6 +3816,7 @@ function RecordModalForm({
             className={inputCls}
             value={viewId}
             onChange={(e) => setViewId(e.target.value)}
+            disabled={!!record && type === "LUA" && !canWriteLua}
           >
             <option value="">No view (unscoped, default)</option>
             {viewChoices.map((v) => (
