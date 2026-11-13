@@ -8644,6 +8644,8 @@ class BlockMovePreviewResponse(BaseModel):
     target_space_id: str
     target_parent_id: str | None
     descendant_blocks_count: int
+    # Child blocks in the Trash: they move too, but are not in the count above.
+    descendant_blocks_trashed: int = 0
     descendant_subnets_count: int
     descendant_ip_addresses_total: int
     reparent_chain_block_ids: list[str]
@@ -8703,13 +8705,25 @@ async def move_block_preview(
         plan = await preview_move(db, block, body.target_space_id, body.target_parent_id)
     except BlockMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    # The Trash is left out of the count (#3922), as Resize's preview does
+    # (#3710); the commit still moves those blocks, so they are reported apart.
+    live_descendants = 0
+    if plan.descendant_block_ids:
+        live_descendants = (
+            await db.execute(
+                select(func.count())
+                .select_from(IPBlock)
+                .where(IPBlock.id.in_([uuid.UUID(b) for b in plan.descendant_block_ids]))
+            )
+        ).scalar_one()
     return BlockMovePreviewResponse(
         block_id=plan.block_id,
         block_network=plan.block_network,
         source_space_id=plan.source_space_id,
         target_space_id=plan.target_space_id,
         target_parent_id=plan.target_parent_id,
-        descendant_blocks_count=len(plan.descendant_block_ids),
+        descendant_blocks_count=live_descendants,
+        descendant_blocks_trashed=len(plan.descendant_block_ids) - live_descendants,
         descendant_subnets_count=len(plan.descendant_subnet_ids),
         descendant_ip_addresses_total=plan.descendant_ip_count,
         reparent_chain_block_ids=plan.reparent_chain_block_ids,

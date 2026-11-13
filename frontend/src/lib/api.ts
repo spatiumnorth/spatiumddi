@@ -1280,6 +1280,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
@@ -5236,6 +5238,9 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
+  records_trashed_widened: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */

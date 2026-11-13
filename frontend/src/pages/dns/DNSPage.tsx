@@ -4149,6 +4149,15 @@ function MoveZoneModal({
               <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                 <span className="text-muted-foreground">Records moving</span>
                 <span>{preview.records_total}</span>
+                {preview.records_trashed > 0 && (
+                  <>
+                    <span className="text-muted-foreground">In the Trash</span>
+                    <span>
+                      {preview.records_trashed} more move with the zone (not
+                      counted above or in the view figures)
+                    </span>
+                  </>
+                )}
                 {preview.records_remapped > 0 && (
                   <>
                     <span className="text-muted-foreground">
