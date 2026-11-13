@@ -82,7 +82,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
-from app.core.update_nulls import changed_keys, resolve_update_changes
+from app.core.update_nulls import apply_clear_list, changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
@@ -1939,6 +1939,16 @@ class RecordUpdate(BaseModel):
     port: int | None = None
     view_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
+    # #1211 — a generated client cannot send an explicit null, so a nullable
+    # field is cleared by naming it here. ``ttl`` goes back to the zone default.
+    clear: list[Literal["ttl", "priority", "weight", "port"]] = Field(
+        default_factory=list, exclude=True
+    )
+
+    @model_validator(mode="after")
+    def _apply_clear(self) -> RecordUpdate:
+        apply_clear_list(self, self.clear)
+        return self
 
     @field_validator("name")
     @classmethod
@@ -9913,7 +9923,10 @@ async def update_record(
     # landed); null for a NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
-        clearable={"view_id", "ttl"},
+        # priority / weight / port clear only through ``clear`` (#1211): a bare
+        # null for them stays dropped, so a client that serialises unmanaged
+        # optionals as null cannot wipe an MX / SRV row's fields.
+        clearable={"view_id", "ttl", *body.clear},
         non_nullable={"name", "value", "tags"},
     )
     # An untouched Save sends every field the dialog shows; only a field whose

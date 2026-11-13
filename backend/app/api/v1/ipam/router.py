@@ -46,6 +46,7 @@ from app.core.permissions import (
     type_level_allows,
     user_has_permission,
 )
+from app.core.update_nulls import apply_clear_list
 from app.models.address_set import AddressSet
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -4527,6 +4528,14 @@ class SubnetUpdate(BaseModel):
     subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
+    # #1211 — a generated client cannot send an explicit null, so a nullable
+    # field is cleared by naming it here (same effect as ``"gateway": null``).
+    clear: list[Literal["gateway"]] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="after")
+    def _apply_clear(self) -> "SubnetUpdate":
+        apply_clear_list(self, self.clear)
+        return self
 
     @field_validator("discovery_interval_minutes")
     @classmethod
@@ -4990,6 +4999,14 @@ class IPAddressUpdate(BaseModel):
     decom_date: date | None = None
     # See IPAddressCreate.force.
     force: bool = False
+    # #1211 — a generated client cannot send an explicit null, so a nullable
+    # field is cleared by naming it here (same effect as ``"mac_address": null``).
+    clear: list[Literal["mac_address"]] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="after")
+    def _apply_clear(self) -> "IPAddressUpdate":
+        apply_clear_list(self, self.clear)
+        return self
 
     @field_validator("hostname")
     @classmethod
