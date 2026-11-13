@@ -101,6 +101,26 @@ class _HasConfigApplyColumns(Protocol):
     config_apply_at: datetime | None
 
 
+def forget_stale_ok(server: _HasConfigApplyColumns) -> bool:
+    """A new agent process no longer inherits its predecessor's ``ok`` (#4139).
+
+    ``ok`` is the previous process's word about the config IT applied. A
+    restarted agent has applied nothing yet, and the control plane only hears
+    its verdict on a heartbeat up to a heartbeat interval later; until then
+    the row would read converged even when the restart then fails to apply.
+    NULL is the convention for "nothing current to say" (UNKNOWN, #882): no
+    chip, no alert. Only ``ok`` is retired; a failure verdict stays until the
+    new process replaces it with its own. Returns whether it wrote.
+    """
+    if server.config_apply_status != STATUS_OK:
+        return False
+    server.config_apply_status = None
+    server.config_apply_error = None
+    server.config_failed_etag = None
+    server.config_apply_at = None
+    return True
+
+
 def _clip(value: Any, limit: int) -> str | None:
     if value is None:
         return None

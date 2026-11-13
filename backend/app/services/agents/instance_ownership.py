@@ -47,6 +47,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
+from app.services.agents.config_apply import forget_stale_ok as config_forget_stale_ok
+from app.services.agents.daemon_state import forget_stale_ok as daemon_forget_stale_ok
 
 logger = structlog.get_logger(__name__)
 
@@ -282,6 +284,10 @@ async def claim_poll[ServerT: (
     locked.agent_instances_displaced = displaced[-DISPLACED_KEEP:]
     locked.agent_instance = instance
     locked.agent_instance_seen_at = now
+    # #4139 — a new process has applied nothing yet: the previous one's ``ok``
+    # (config and daemon) is not its word. Its own heartbeat restores them.
+    config_forget_stale_ok(locked)
+    daemon_forget_stale_ok(locked)
     await db.commit()
     logger.info(
         f"{kind}_agent_instance_took_over",
