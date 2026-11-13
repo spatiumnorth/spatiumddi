@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
@@ -4312,6 +4313,8 @@ export function ZoneDetailView({
   // name / fqdn / value / type on the server; the per-column recFilter below
   // stays a client-side refinement over the current page.
   const [recordSearch, setRecordSearch] = useState("");
+  // The box edits `recordSearch` at once; the query follows 300 ms later (#4077).
+  const debouncedRecordSearch = useDebouncedValue(recordSearch);
   const [recordPage, setRecordPage] = useState(1);
   const recordPageSize = 100;
   // Search-landing highlight — ``highlightRecordId`` is passed down
@@ -4406,9 +4409,9 @@ export function ZoneDetailView({
       page: recordPage,
       page_size: recordPageSize,
     };
-    if (recordSearch.trim()) p.search = recordSearch.trim();
+    if (debouncedRecordSearch.trim()) p.search = debouncedRecordSearch.trim();
     return p;
-  }, [recordPage, recordSearch]);
+  }, [recordPage, debouncedRecordSearch]);
   const {
     data: recordsPage,
     isFetching,
@@ -4416,6 +4419,9 @@ export function ZoneDetailView({
   } = useQuery({
     queryKey: ["dns-records", zone.id, recordParams],
     queryFn: () => dnsApi.listRecords(group.id, zone.id, recordParams),
+    // Keep this zone's previous page on screen while the next search loads.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === zone.id ? prev : undefined,
   });
   const records = recordsPage?.items ?? [];
   const recordsTotal = recordsPage?.total ?? 0;
@@ -5280,7 +5286,8 @@ export function ZoneDetailView({
                 {recordsTotal.toLocaleString()}{" "}
                 {recordsTotal === 1 ? "record" : "records"}
                 {hasRecFilter && " · page filtered"}
-                {isFetching && " · loading…"}
+                {(isFetching || recordSearch !== debouncedRecordSearch) &&
+                  " · searching…"}
               </span>
             )}
             <div className="ml-auto">
@@ -9598,7 +9605,7 @@ function applyTextFilter(
   return v.includes(f);
 }
 
-function RecordsTab({
+export function RecordsTab({
   group,
   onSelectZone,
 }: {
@@ -9611,6 +9618,9 @@ function RecordsTab({
   // name / fqdn / value / type / zone on the server; the per-column filters
   // below stay client-side refinements over the current page.
   const [groupRecordSearch, setGroupRecordSearch] = useState("");
+  // The box edits `groupRecordSearch` at once; the query follows 300 ms later
+  // (#4077).
+  const debouncedGroupRecordSearch = useDebouncedValue(groupRecordSearch);
   const [groupRecordPage, setGroupRecordPage] = useState(1);
   const groupRecordPageSize = 100;
   const groupRecordParams = useMemo(() => {
@@ -9618,16 +9628,22 @@ function RecordsTab({
       page: groupRecordPage,
       page_size: groupRecordPageSize,
     };
-    if (groupRecordSearch.trim()) p.search = groupRecordSearch.trim();
+    if (debouncedGroupRecordSearch.trim())
+      p.search = debouncedGroupRecordSearch.trim();
     return p;
-  }, [groupRecordPage, groupRecordSearch]);
+  }, [groupRecordPage, debouncedGroupRecordSearch]);
   const {
     data: groupRecordsPage,
     isLoading,
+    isFetching: groupRecordsFetching,
     error: groupRecordsError,
   } = useQuery({
     queryKey: ["dns-group-records", group.id, groupRecordParams],
     queryFn: () => dnsApi.listGroupRecords(group.id, groupRecordParams),
+    // A new search keeps the previous rows (of this group) until it answers,
+    // so the page below — and the search box in it — is never unmounted (#4077).
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === group.id ? prev : undefined,
   });
   const records = groupRecordsPage?.items ?? [];
   const recordsTotal = groupRecordsPage?.total ?? 0;
@@ -9845,6 +9861,9 @@ function RecordsTab({
               {filtered.length.toLocaleString()} of{" "}
               {recordsTotal.toLocaleString()}{" "}
               {recordsTotal === 1 ? "record" : "records"}
+              {(groupRecordsFetching ||
+                groupRecordSearch !== debouncedGroupRecordSearch) &&
+                " · searching…"}
             </p>
           )}
         </div>
