@@ -770,6 +770,19 @@ def _render_rate_limit_block(opts: dict[str, Any]) -> str:
         ]
         if exempt:
             rrl.append("        exempt-clients { " + "; ".join(exempt) + "; };")
+        # #3577 — optional knobs; null/absent = BIND's own default.
+        for key, directive in (
+            ("rrl_nxdomains_per_second", "nxdomains-per-second"),
+            ("rrl_errors_per_second", "errors-per-second"),
+            ("rrl_referrals_per_second", "referrals-per-second"),
+            ("rrl_nodata_per_second", "nodata-per-second"),
+            ("rrl_all_per_second", "all-per-second"),
+            ("rrl_ipv4_prefix_length", "ipv4-prefix-length"),
+            ("rrl_ipv6_prefix_length", "ipv6-prefix-length"),
+            ("rrl_max_table_size", "max-table-size"),
+        ):
+            if opts.get(key) is not None:
+                rrl.append(f"        {directive} {int(opts[key])};")
         if opts.get("rrl_log_only"):
             rrl.append("        log-only yes;")
         rrl.append("    };")

@@ -345,6 +345,9 @@ the control-plane preview template `named.conf.j2`.
 - `rrl_enabled` gates a `rate-limit { responses-per-second; window; slip;
   [qps-scale]; [exempt-clients]; [log-only]; }` stanza. `log-only` is BIND's
   dry-run (count + log drops, drop nothing) for sizing the limit safely.
+  The optional `rrl_{nxdomains,errors,referrals,nodata,all}_per_second`,
+  `rrl_ipv{4,6}_prefix_length` and `rrl_max_table_size` (#3577) render inside
+  the same stanza, each only when non-null.
 - `minimal_responses`, `tcp_clients`, `clients_per_query`,
   `max_clients_per_query` each render only when set.
 - **Every field defaults to a no-op**, so adding the feature renders

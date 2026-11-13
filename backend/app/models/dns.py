@@ -853,7 +853,9 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # ── Response Rate Limiting (RRL) + amplification defenses (issue #146) ──
     # All default to a no-op so an existing install renders byte-identical
-    # named.conf until an operator opts in. The rate-limit{} block is emitted
+    # named.conf until an operator opts in. The one exception is a NEW group
+    # created as ``is_public_facing`` (#3577), which is seeded with
+    # ``rrl_enabled=True`` by the API; the column default stays False. The rate-limit{} block is emitted
     # only when rrl_enabled; the amplification knobs render only when set.
     rrl_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     rrl_responses_per_second: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
@@ -863,6 +865,16 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     rrl_exempt_clients: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     # log-only: count + log would-be drops without actually dropping (dry run).
     rrl_log_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Extra rate-limit knobs (#3577). All nullable: null = BIND's own default
+    # (nothing is rendered), so setting them is opt-in per knob.
+    rrl_nxdomains_per_second: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_errors_per_second: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_referrals_per_second: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_nodata_per_second: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_all_per_second: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_ipv4_prefix_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_ipv6_prefix_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_max_table_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Amplification reduction (each renders only when set; null = BIND default).
     minimal_responses: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

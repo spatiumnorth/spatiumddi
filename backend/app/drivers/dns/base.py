@@ -228,6 +228,14 @@ class ServerOptions:
     rrl_qps_scale: int | None = None
     rrl_exempt_clients: tuple[str, ...] = ()
     rrl_log_only: bool = False
+    rrl_nxdomains_per_second: int | None = None
+    rrl_errors_per_second: int | None = None
+    rrl_referrals_per_second: int | None = None
+    rrl_nodata_per_second: int | None = None
+    rrl_all_per_second: int | None = None
+    rrl_ipv4_prefix_length: int | None = None
+    rrl_ipv6_prefix_length: int | None = None
+    rrl_max_table_size: int | None = None
     minimal_responses: bool = False
     tcp_clients: int | None = None
     clients_per_query: int | None = None

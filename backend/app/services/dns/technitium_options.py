@@ -28,6 +28,38 @@ from typing import Any
 UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
     "minimal_responses": (False, "Technitium has no minimal-responses setting"),
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
+    "rrl_nxdomains_per_second": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_errors_per_second": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_referrals_per_second": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_nodata_per_second": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_all_per_second": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_ipv4_prefix_length": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_ipv6_prefix_length": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
+    "rrl_max_table_size": (
+        None,
+        "Technitium rate-limits by queries per minute, not BIND rate-limit knobs",
+    ),
     "clients_per_query": (None, "Technitium has no clients-per-query setting"),
     "max_clients_per_query": (None, "Technitium has no clients-per-query setting"),
     "allow_query_cache": (

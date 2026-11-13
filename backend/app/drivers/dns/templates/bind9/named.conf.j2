@@ -128,6 +128,30 @@ options {
         {%- if _exempt %}
         exempt-clients { {% for c in _exempt %}{{ c }}; {% endfor %}};
         {%- endif %}
+        {%- if options.rrl_nxdomains_per_second is not none %}
+        nxdomains-per-second {{ options.rrl_nxdomains_per_second }};
+        {%- endif %}
+        {%- if options.rrl_errors_per_second is not none %}
+        errors-per-second {{ options.rrl_errors_per_second }};
+        {%- endif %}
+        {%- if options.rrl_referrals_per_second is not none %}
+        referrals-per-second {{ options.rrl_referrals_per_second }};
+        {%- endif %}
+        {%- if options.rrl_nodata_per_second is not none %}
+        nodata-per-second {{ options.rrl_nodata_per_second }};
+        {%- endif %}
+        {%- if options.rrl_all_per_second is not none %}
+        all-per-second {{ options.rrl_all_per_second }};
+        {%- endif %}
+        {%- if options.rrl_ipv4_prefix_length is not none %}
+        ipv4-prefix-length {{ options.rrl_ipv4_prefix_length }};
+        {%- endif %}
+        {%- if options.rrl_ipv6_prefix_length is not none %}
+        ipv6-prefix-length {{ options.rrl_ipv6_prefix_length }};
+        {%- endif %}
+        {%- if options.rrl_max_table_size is not none %}
+        max-table-size {{ options.rrl_max_table_size }};
+        {%- endif %}
         {%- if options.rrl_log_only %}
         log-only yes;
         {%- endif %}

@@ -1144,6 +1144,19 @@ class TrustAnchorResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+#: #3577 — the BIND9-only rate-limit knobs beyond the original six.
+RRL_EXTRA_FIELDS = (
+    "rrl_nxdomains_per_second",
+    "rrl_errors_per_second",
+    "rrl_referrals_per_second",
+    "rrl_nodata_per_second",
+    "rrl_all_per_second",
+    "rrl_ipv4_prefix_length",
+    "rrl_ipv6_prefix_length",
+    "rrl_max_table_size",
+)
+
+
 class ServerOptionsUpdate(BaseModel):
     forwarders: list[str] | None = None
     forward_policy: str | None = None
@@ -1175,6 +1188,15 @@ class ServerOptionsUpdate(BaseModel):
     rrl_qps_scale: int | None = Field(default=None, ge=1, le=1000)
     rrl_exempt_clients: list[str] | None = None
     rrl_log_only: bool | None = None
+    # #3577 — extra rate-limit knobs; null = BIND default (BIND9 only).
+    rrl_nxdomains_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_errors_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_referrals_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_nodata_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_all_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_ipv4_prefix_length: int | None = Field(default=None, ge=0, le=32)
+    rrl_ipv6_prefix_length: int | None = Field(default=None, ge=1, le=128)
+    rrl_max_table_size: int | None = Field(default=None, ge=1, le=100000000)
     minimal_responses: bool | None = None
     tcp_clients: int | None = Field(default=None, ge=1, le=10000)
     clients_per_query: int | None = Field(default=None, ge=1, le=1000)
@@ -1317,6 +1339,14 @@ class ServerOptionsResponse(BaseModel):
     rrl_qps_scale: int | None
     rrl_exempt_clients: list[str]
     rrl_log_only: bool
+    rrl_nxdomains_per_second: int | None
+    rrl_errors_per_second: int | None
+    rrl_referrals_per_second: int | None
+    rrl_nodata_per_second: int | None
+    rrl_all_per_second: int | None
+    rrl_ipv4_prefix_length: int | None
+    rrl_ipv6_prefix_length: int | None
+    rrl_max_table_size: int | None
     minimal_responses: bool
     tcp_clients: int | None
     clients_per_query: int | None
@@ -2277,7 +2307,12 @@ async def create_group(
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
     # Auto-create default options (#3087: DNSSEC validation from Settings)
-    options = DNSServerOptions(group=group, dnssec_validation=defaults.dnssec_validation)
+    options = DNSServerOptions(
+        group=group,
+        dnssec_validation=defaults.dnssec_validation,
+        # #3577: a group created as public-facing starts with RRL on.
+        rrl_enabled=bool(group.is_public_facing),
+    )
     db.add(options)
 
     db.add(
@@ -2383,8 +2418,23 @@ async def update_group(
         if set(group_drivers) & CATALOG_UNSUPPORTED_DRIVERS:
             raise HTTPException(status_code=422, detail=catalog_unsupported_message(group_drivers))
     before = {k: getattr(group, k, None) for k in changes}
+    flipped_public = changes.get("is_public_facing") is True and not group.is_public_facing
     for k, v in changes.items():
         setattr(group, k, v)
+    # #3577: marking an existing group public-facing turns RRL on for it (an
+    # explicit operator act, never a migration). Only on the False -> True
+    # flip, and not for a group Technitium-API-managed (RRL is never applied
+    # there, so the option row would claim a defence that is not running).
+    # The operator can switch it off again under Options.
+    if flipped_public and not await technitium_api_scope.group_is_technitium_api(db, group.id):
+        group_opts = await _load_options(group.id, db)
+        if group_opts is None:
+            group_opts = DNSServerOptions(group_id=group.id)
+            db.add(group_opts)
+        if not group_opts.rrl_enabled:
+            group_opts.rrl_enabled = True
+            before["rrl_enabled"] = False
+            changes = {**changes, "rrl_enabled": True}
 
     db.add(
         AuditLog(
@@ -4596,6 +4646,14 @@ async def update_options(
     # be removed via the UI/API once set (issue #146 review finding).
     for field in (
         "rrl_qps_scale",
+        "rrl_nxdomains_per_second",
+        "rrl_errors_per_second",
+        "rrl_referrals_per_second",
+        "rrl_nodata_per_second",
+        "rrl_all_per_second",
+        "rrl_ipv4_prefix_length",
+        "rrl_ipv6_prefix_length",
+        "rrl_max_table_size",
         "tcp_clients",
         "clients_per_query",
         "max_clients_per_query",
@@ -4657,6 +4715,22 @@ async def update_options(
             "cache-access ACL, so the value would be ignored. Move the PowerDNS "
             "server to its own group, or leave it at its default.",
         )
+    # #3577: the extra rate-limit knobs are rendered by BIND9 only. Refuse a
+    # changed non-null value on a group with a PowerDNS server (it would be
+    # stored and ignored); Technitium refuses them via UNSUPPORTED_OPTIONS.
+    if "powerdns" in await _group_driver_names(db, group_id):
+        ignored = [
+            f
+            for f in RRL_EXTRA_FIELDS
+            if changes.get(f) is not None and changes[f] != getattr(opts, f, None)
+        ]
+        if ignored:
+            raise HTTPException(
+                422,
+                f"{', '.join(ignored)}: this group has a PowerDNS server, which has no "
+                "BIND-style rate-limit knobs (front it with dnsdist instead). Move the "
+                "PowerDNS server to its own group, or leave them unset.",
+            )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport

@@ -264,6 +264,33 @@ def test_render_server_config_rrl_enabled(zone: ZoneData) -> None:
     assert "max-clients-per-query 120;" in out
 
 
+def test_render_server_config_rrl_extra_knobs(zone: ZoneData) -> None:
+    """#3577 — the extra rate-limit knobs render in the Jinja preview too, and
+    only when set."""
+    opts = ServerOptions(
+        rrl_enabled=True,
+        rrl_nxdomains_per_second=5,
+        rrl_errors_per_second=6,
+        rrl_ipv4_prefix_length=24,
+        rrl_ipv6_prefix_length=56,
+        rrl_max_table_size=20000,
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), opts, bundle=_bundle_with_opts(zone, opts)
+    )
+    assert "nxdomains-per-second 5;" in out
+    assert "errors-per-second 6;" in out
+    assert "ipv4-prefix-length 24;" in out
+    assert "ipv6-prefix-length 56;" in out
+    assert "max-table-size 20000;" in out
+    assert "referrals-per-second" not in out
+    plain = ServerOptions(rrl_enabled=True)
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), plain, bundle=_bundle_with_opts(zone, plain)
+    )
+    assert "prefix-length" not in out and "nxdomains" not in out
+
+
 def test_rrl_exempt_clients_normalized() -> None:
     """#146 review — the schema strips + drops blanks + dedups so neither
     renderer emits an invalid ``exempt-clients { ; };`` stanza."""

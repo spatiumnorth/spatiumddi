@@ -8047,6 +8047,27 @@ export function RevealedSecretModal({
 
 // ── Options Tab ───────────────────────────────────────────────────────────────
 
+// #3577 — optional BIND rate-limit knobs beyond rps / window / slip.
+type RrlExtraKey =
+  | "rrl_nxdomains_per_second"
+  | "rrl_errors_per_second"
+  | "rrl_referrals_per_second"
+  | "rrl_nodata_per_second"
+  | "rrl_all_per_second"
+  | "rrl_ipv4_prefix_length"
+  | "rrl_ipv6_prefix_length"
+  | "rrl_max_table_size";
+const RRL_EXTRA_KNOBS: [RrlExtraKey, string][] = [
+  ["rrl_nxdomains_per_second", "nxdomains-per-second"],
+  ["rrl_errors_per_second", "errors-per-second (random-subdomain attacks)"],
+  ["rrl_referrals_per_second", "referrals-per-second"],
+  ["rrl_nodata_per_second", "nodata-per-second"],
+  ["rrl_all_per_second", "all-per-second"],
+  ["rrl_ipv4_prefix_length", "ipv4-prefix-length (BIND default 24)"],
+  ["rrl_ipv6_prefix_length", "ipv6-prefix-length (BIND default 56)"],
+  ["rrl_max_table_size", "max-table-size"],
+];
+
 export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
@@ -8139,6 +8160,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const [rrlWindow, setRrlWindow] = useState(15);
   const [rrlSlip, setRrlSlip] = useState(2);
   const [rrlQpsScale, setRrlQpsScale] = useState("");
+  // #3577 — extra rate-limit knobs, kept as strings ("" = unset).
+  const [rrlExtra, setRrlExtra] = useState<Record<string, string>>({});
   const [rrlExempt, setRrlExempt] = useState("");
   const [rrlLogOnly, setRrlLogOnly] = useState(false);
   const [minimalResponses, setMinimalResponses] = useState(false);
@@ -8195,6 +8218,11 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     setRrlQpsScale(opts.rrl_qps_scale?.toString() ?? "");
     setRrlExempt(opts.rrl_exempt_clients.join(", "));
     setRrlLogOnly(opts.rrl_log_only);
+    setRrlExtra(
+      Object.fromEntries(
+        RRL_EXTRA_KNOBS.map(([k]) => [k, opts[k]?.toString() ?? ""]),
+      ),
+    );
     setMinimalResponses(opts.minimal_responses);
     setTcpClients(opts.tcp_clients?.toString() ?? "");
     setClientsPerQuery(opts.clients_per_query?.toString() ?? "");
@@ -8379,6 +8407,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
       rrl_qps_scale: numOrNull(rrlQpsScale),
       rrl_exempt_clients: list(rrlExempt),
       rrl_log_only: rrlLogOnly,
+      ...Object.fromEntries(
+        RRL_EXTRA_KNOBS.map(([k]) => [k, numOrNull(rrlExtra[k] ?? "")]),
+      ),
       minimal_responses: minimalResponses,
       tcp_clients: numOrNull(tcpClients),
       clients_per_query: numOrNull(clientsPerQuery),
@@ -8427,6 +8458,14 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         rrl_qps_scale: o.rrl_qps_scale ?? null,
         rrl_exempt_clients: o.rrl_exempt_clients,
         rrl_log_only: o.rrl_log_only,
+        rrl_nxdomains_per_second: o.rrl_nxdomains_per_second ?? null,
+        rrl_errors_per_second: o.rrl_errors_per_second ?? null,
+        rrl_referrals_per_second: o.rrl_referrals_per_second ?? null,
+        rrl_nodata_per_second: o.rrl_nodata_per_second ?? null,
+        rrl_all_per_second: o.rrl_all_per_second ?? null,
+        rrl_ipv4_prefix_length: o.rrl_ipv4_prefix_length ?? null,
+        rrl_ipv6_prefix_length: o.rrl_ipv6_prefix_length ?? null,
+        rrl_max_table_size: o.rrl_max_table_size ?? null,
         minimal_responses: o.minimal_responses,
         tcp_clients: o.tcp_clients ?? null,
         clients_per_query: o.clients_per_query ?? null,
@@ -8855,6 +8894,23 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 placeholder="unset"
               />
             </Field>
+            <div className="grid grid-cols-2 gap-3">
+              {RRL_EXTRA_KNOBS.map(([k, label]) => (
+                <Field key={k} label={label}>
+                  <input
+                    type="number"
+                    min={0}
+                    className={inputCls}
+                    value={rrlExtra[k] ?? ""}
+                    onChange={(e) => {
+                      setRrlExtra({ ...rrlExtra, [k]: e.target.value });
+                      setDirty(true);
+                    }}
+                    placeholder="unset"
+                  />
+                </Field>
+              ))}
+            </div>
             <Field label="exempt-clients (comma/newline CIDRs or ACL names)">
               <input
                 className={inputCls}
