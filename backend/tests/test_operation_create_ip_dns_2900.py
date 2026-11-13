@@ -238,9 +238,10 @@ async def test_approved_portal_request_creates_a_record(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "failed"
-    assert resp.json()["error"] == (
-        f"The name app01.{zone_name} is already used by 10.98.5.20 in 10.98.5.0/24."
-    )
+    # #3642 — the requester is told the name is taken, but not which address
+    # holds it or in which subnet: they may not be able to read either.
+    assert resp.json()["error"] == f"The name app01.{zone_name} is already in use."
+    assert "10.98.5" not in resp.json()["error"]
     cr = await db_session.get(ChangeRequest, uuid.UUID(rid2))
     assert cr is not None
     await db_session.refresh(cr)

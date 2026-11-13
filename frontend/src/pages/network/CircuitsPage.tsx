@@ -29,6 +29,7 @@ import {
   SiteChip,
 } from "@/components/ownership/pickers";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -554,7 +555,9 @@ export function CircuitEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -667,17 +670,27 @@ export function CircuitsPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => circuitsApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["circuits"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete circuits")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => circuitsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["circuits"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete circuit"));
+      qc.invalidateQueries({ queryKey: ["circuits"] });
+    },
   });
 
   function toggle(id: string) {
@@ -697,6 +710,11 @@ export function CircuitsPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">WAN circuits</h1>
@@ -868,8 +886,10 @@ export function CircuitsPage() {
                         setProviderFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New circuit" to add one.`}
                     >
-                      No circuits yet — click "New circuit" to add one.
+                      No circuits yet.
                     </ListEmpty>
                   </td>
                 </tr>
