@@ -16399,6 +16399,8 @@ export interface NATMapping {
   // hide-NAT path); without these the UI can only show the bare UUID.
   internal_subnet_cidr: string | null;
   internal_subnet_name: string | null;
+  /** True when the caller cannot read the subnet, so the labels above are withheld (#3641). */
+  internal_subnet_redacted?: boolean;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;

@@ -10478,9 +10478,11 @@ function _formatNatLine(m: NATMapping): {
   const subnetLabel =
     m.internal_subnet_cidr ??
     m.internal_subnet_name ??
-    (m.internal_subnet_id
-      ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
-      : "—");
+    (m.internal_subnet_redacted
+      ? "restricted subnet"
+      : m.internal_subnet_id
+        ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+        : "—");
   const internal =
     (m.internal_ip ?? (m.internal_subnet_id ? subnetLabel : "—")) +
     _formatNatPorts(m.internal_port_start, m.internal_port_end);
