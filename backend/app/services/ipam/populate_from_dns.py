@@ -46,6 +46,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dns.sync_check import ptr_address
+from app.services.integration_ownership import dns_record_owned_elsewhere
 from app.services.ipam.address_create_rules import boundary_address_refusal
 
 logger = structlog.get_logger(__name__)
@@ -58,15 +59,6 @@ DynamicAction = Literal["skip", "dhcp", "static"]
 POPULATE_STATUSES: frozenset[str] = frozenset({"allocated", "reserved", "deprecated"})
 _COMMIT_CHUNK = 500
 MAX_OUTSIDE_GROUPS = 500
-
-# A record owned by something other than a person: the row it has is that
-# owner's, and linking IPAM to it would let IPAM's deletes reach it.
-_OWNER_COLUMNS = (
-    "kubernetes_cluster_id",
-    "tailscale_tenant_id",
-    "netbird_instance_id",
-    "pool_member_id",
-)
 
 
 class PopulateError(ValueError):
@@ -251,7 +243,7 @@ def _label_of(rec: DNSRecord) -> str | None:
 
 
 def _is_managed(rec: DNSRecord) -> bool:
-    return any(getattr(rec, c, None) is not None for c in _OWNER_COLUMNS)
+    return dns_record_owned_elsewhere(rec)
 
 
 # ── plan ──────────────────────────────────────────────────────────────
