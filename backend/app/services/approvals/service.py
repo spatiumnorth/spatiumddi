@@ -218,6 +218,44 @@ async def get_change_request(
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
+def _filtered(
+    stmt: Any,
+    *,
+    state: str | None,
+    resource_type: str | None,
+    requested_by_user_id: UUID | None,
+    origin: str | None,
+) -> Any:
+    if origin is not None:
+        stmt = stmt.where(ChangeRequest.origin == origin)
+    if state is not None:
+        stmt = stmt.where(ChangeRequest.state == state)
+    if resource_type is not None:
+        stmt = stmt.where(ChangeRequest.resource_type == resource_type)
+    if requested_by_user_id is not None:
+        stmt = stmt.where(ChangeRequest.requested_by_user_id == requested_by_user_id)
+    return stmt
+
+
+async def count_change_requests(
+    db: AsyncSession,
+    *,
+    state: str | None = None,
+    resource_type: str | None = None,
+    requested_by_user_id: UUID | None = None,
+    origin: str | None = None,
+) -> int:
+    """How many rows :func:`list_change_requests` would match with no window."""
+    stmt = _filtered(
+        select(func.count()).select_from(ChangeRequest),
+        state=state,
+        resource_type=resource_type,
+        requested_by_user_id=requested_by_user_id,
+        origin=origin,
+    )
+    return int(await db.scalar(stmt) or 0)
+
+
 async def list_change_requests(
     db: AsyncSession,
     *,
@@ -234,24 +272,53 @@ async def list_change_requests(
     live in this table, and each surface passes its own value so neither
     ever renders the other's rows.
     """
-    stmt = select(ChangeRequest)
-    if origin is not None:
-        stmt = stmt.where(ChangeRequest.origin == origin)
-    if state is not None:
-        stmt = stmt.where(ChangeRequest.state == state)
-    if resource_type is not None:
-        stmt = stmt.where(ChangeRequest.resource_type == resource_type)
-    if requested_by_user_id is not None:
-        stmt = stmt.where(ChangeRequest.requested_by_user_id == requested_by_user_id)
-    stmt = stmt.order_by(ChangeRequest.created_at.desc()).limit(limit).offset(offset)
+    stmt = _filtered(
+        select(ChangeRequest),
+        state=state,
+        resource_type=resource_type,
+        requested_by_user_id=requested_by_user_id,
+        origin=origin,
+    )
+    # id tiebreak: paging needs a total order (#3937).
+    stmt = (
+        stmt.order_by(ChangeRequest.created_at.desc(), ChangeRequest.id).limit(limit).offset(offset)
+    )
     return list((await db.execute(stmt)).scalars().all())
 
 
 # ── State transitions (each guarded + audited) ─────────────────────────────
 
 
+_DECIDED_WORDS = {
+    "approved": "approved",
+    "executed": "approved and provisioned",
+    "failed": "approved, and its provisioning failed",
+    "rejected": "rejected",
+    "cancelled": "cancelled",
+    "expired": "expired",
+}
+
+
+def already_decided_text(cr: ChangeRequest) -> str:
+    """Plain words for a decision refused because the request is not pending
+    (#3935): what happened, who did it and when, with no id or schema state
+    name. The Requests page's own vocabulary (Provisioned, Cancelled, ...)."""
+    what = _DECIDED_WORDS.get(cr.state, cr.state)
+    who = f" by {cr.decided_by_display}" if cr.decided_by_display else ""
+    at = (
+        f" at {cr.decided_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+        if cr.decided_at is not None
+        else ""
+    )
+    if cr.state == "expired":
+        return "This request has already expired and can no longer be decided."
+    return f"This request was already {what}{who}{at}. Refresh to see its current state."
+
+
 def _require_state(cr: ChangeRequest, expected: str) -> None:
     if cr.state != expected:
+        if expected == "pending":
+            raise ChangeRequestStateError(already_decided_text(cr))
         raise ChangeRequestStateError(
             f"change request {cr.id} is {cr.state!r}, expected {expected!r}"
         )
@@ -736,7 +803,7 @@ async def approve_change_request(
     #     Before the expiry branch, which writes (mark_expired + commit).
     _enforce_token_scope(request, cr.operation)
     if cr.state != "pending":
-        raise DecisionConflict(f"Change request is not pending (state={cr.state!r})")
+        raise DecisionConflict(already_decided_text(cr))
     # #10: one expiry convention everywhere — ``expires_at <= now`` means expired
     # (matches the sweep select + recheck), so a request can't be approved in the
     # same instant the sweep would expire it.
