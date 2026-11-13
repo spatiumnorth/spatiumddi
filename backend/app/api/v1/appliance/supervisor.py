@@ -5137,27 +5137,19 @@ async def update_appliance_roles(
             retired_servers = dns_move.retired
             moved_servers.extend(dns_move.moved)
             row.assigned_dns_group_id = dns_group.id
-    # #1782 — Technitium cannot do catalog zones (#1766). The own-server move
-    # above refuses it for a server that already exists, but an appliance
-    # whose agent has not registered yet has none: the pointer alone would
-    # send a fresh Technitium agent into a catalog group, and registration
-    # cannot refuse it (a refused agent loops). So refuse it here, on change.
+    # #1858 — a Technitium appliance must not be pointed at a group holding a
+    # key Technitium cannot use. (Catalog zones are no longer refused here:
+    # the agent-managed driver supports them, #1766.) The own-server move
+    # above covers a server that exists; an appliance whose agent has not
+    # registered yet has none, so the pointer is checked here, on change.
     if row.assigned_dns_group_id is not None and "dns-technitium" in (row.assigned_roles or []):
         changed = (
             "dns-technitium" not in prev_dns_roles or row.assigned_dns_group_id != prev_dns_group_id
         )
         if changed:
             from app.models.dns import DNSServerGroup
-            from app.services.dns.server_move import catalog_unsupported_message
 
             target = await db.get(DNSServerGroup, row.assigned_dns_group_id)
-            if target is not None and target.catalog_zones_enabled:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    f"DNS server group {target.name!r} has catalog zones enabled. "
-                    + catalog_unsupported_message({"technitium"}),
-                )
-            # #1858 — and not into a group holding a key Technitium cannot use.
             if target is not None:
                 from app.services.dns.tsig_algorithms import group_key_refusal
 

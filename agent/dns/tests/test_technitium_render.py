@@ -1847,6 +1847,83 @@ def test_catalog_rename_deletes_old_zone(tmp_path: Path) -> None:
     assert next(c for c in calls if c[2] == "zones/create")[3]["zone"] == "new.test"
 
 
+# ── Catalog producer keeps transfer / notify (issue #1766) ─────────────
+
+
+def test_catalog_members_override_the_catalog_zones_transfer_and_notify(
+    tmp_path: Path,
+) -> None:
+    """A catalog member otherwise takes transfer / notify / query access from
+    the catalog zone (Deny / None), undoing the #734 grant on every zone."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "producer", "zone_name": "cat.test"},
+        [{"zone": "p.test", "type": "Primary"}, {"zone": "s.test", "type": "Secondary"}],
+    )
+    member = [c[3] for c in calls if c[2] == "zones/options/set" and c[3]["zone"] == "p.test"]
+    assert member == [
+        {
+            "zone": "p.test",
+            "catalog": "cat.test",
+            "overrideCatalogZoneTransfer": "true",
+            "overrideCatalogNotify": "true",
+            "overrideCatalogQueryAccess": "true",
+        }
+    ]
+    # Un-enrolling sends no override flags.
+    calls.clear()
+    d._apply_catalog("t", None, [{"zone": "p.test", "type": "Primary"}])
+    assert [c[3] for c in calls if c[2] == "zones/options/set"] == [
+        {"zone": "p.test", "catalog": ""}
+    ]
+
+
+def test_catalog_zone_gets_its_own_transfer_and_notify_options(tmp_path: Path) -> None:
+    """The Catalog zone is created Deny / None; a consumer cannot read it
+    unless the producer configures it."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle = _zone_bundle(
+        zones=[{"name": "p.test.", "type": "primary", "records": []}],
+        options={"also_notify": ["192.0.2.50"], "allow_transfer": ["key ddns-key"]},
+        tsig_keys=[{"name": "ddns-key", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}],
+        catalog={"mode": "producer", "zone_name": "cat.test."},
+    )
+    d.render(bundle)
+    server = _json.loads((tmp_path / "rendered.new" / "server.json").read_text())
+    opts = server["catalog"]["options"]
+    assert opts["zoneTransfer"] == "Allow"
+    assert opts["zoneTransferTsigKeyNames"] == ["ddns-key"]
+    assert opts["notify"] == "SpecifiedNameServers"
+    assert opts["notifyNameServers"] == ["192.0.2.50"]
+
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", server["catalog"], [])
+    sent = [c[3] for c in calls if c[2] == "zones/options/set" and c[3]["zone"] == "cat.test"]
+    assert len(sent) == 1
+    assert sent[0]["zoneTransfer"] == "Allow"
+    assert sent[0]["zoneTransferTsigKeyNames"] == "ddns-key"
+    assert sent[0]["notify"] == "SpecifiedNameServers"
+    assert sent[0]["notifyNameServers"] == "192.0.2.50"
+
+
+def test_catalog_zone_notifies_nobody_without_also_notify_targets(tmp_path: Path) -> None:
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        _zone_bundle(
+            zones=[{"name": "p.test.", "type": "primary", "records": []}],
+            catalog={"mode": "producer", "zone_name": "cat.test."},
+        )
+    )
+    server = _json.loads((tmp_path / "rendered.new" / "server.json").read_text())
+    assert server["catalog"]["options"]["notify"] == "None"
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 
 

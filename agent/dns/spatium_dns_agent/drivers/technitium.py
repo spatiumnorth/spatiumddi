@@ -1705,7 +1705,7 @@ def _transfer_access(
 #: Zone types whose NOTIFY the group / zone settings govern (#2267). Technitium
 #: accepts ``notify`` on Primary and Secondary zones; a Stub or Forwarder zone
 #: has nothing to notify (BIND renders no notify for them either).
-_NOTIFY_ZONE_TYPES = frozenset({"Primary", "Secondary"})
+_NOTIFY_ZONE_TYPES = frozenset({"Primary", "Secondary", "Catalog"})
 
 #: BIND's ``notify`` choices that notify from Primary zones only.
 _NOTIFY_PRIMARY_ONLY = frozenset({"master-only", "primary-only"})
@@ -1764,6 +1764,12 @@ def _notify_options(
         notify = "SpecifiedNameServers" if targets else "None"
     else:
         notify = "BothZoneAndSpecifiedNameServers" if targets else "ZoneNameServers"
+    if ztype == "Catalog":
+        # A catalog zone's own NS set is not a real server (RFC 9432 §4.2
+        # says to use ``invalid.``), so notifying "the zone's name servers"
+        # only wastes lookups. Only the operator's also-notify addresses —
+        # the consumers — are ever notified (#1766).
+        notify = "None" if mode == "no" or not targets else "SpecifiedNameServers"
     if notify in ("None", "ZoneNameServers"):
         targets = []
     return {"notify": notify, "notifyNameServers": targets}, unapplied
@@ -1869,7 +1875,7 @@ def _zone_options_payload(
         notify, notify_unapplied = _notify_options(ztype, bundle, zone)
         payload.update(notify)
         unapplied.extend(notify_unapplied)
-    if ztype != "Primary":
+    if ztype not in ("Primary", "Catalog"):
         if unapplied:
             payload["_unapplied"] = unapplied
         return payload
@@ -2544,6 +2550,12 @@ class TechnitiumDriver(DriverBase):
         # Written to its own file, and 0600: unlike zones.json this one
         # carries TSIG shared secrets.
         catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
+        if catalog and catalog.get("mode") == "producer":
+            # The Catalog zone is created with transfer Deny / notify None
+            # and is not in the bundle's zone list, so its own options are
+            # resolved here the way a member's are: an external secondary
+            # has to be able to AXFR the catalog itself (#1766).
+            catalog = {**catalog, "options": _zone_options_payload("Catalog", bundle)}
         server_payload = {
             # Encrypted transports + forwarders (#741). Carried verbatim so
             # swap_and_reload can apply them without re-reading the bundle.
@@ -2867,8 +2879,12 @@ class TechnitiumDriver(DriverBase):
     ) -> None:
         """Apply the group's catalog-zone role.
 
-        **Producer** creates the ``Catalog`` zone and stamps
-        ``catalog=<name>`` onto each primary this server owns.
+        **Producer** creates the ``Catalog`` zone, applies its transfer /
+        notify options (``catalog["options"]``, from ``render``), and stamps
+        ``catalog=<name>`` onto each primary this server owns together with
+        the ``overrideCatalog*`` flags, so a member keeps its own transfer,
+        notify and query-access settings instead of the catalog zone's
+        (#1766).
 
         **Consumer** is not a role (#3764). Every agent in a group already
         gets every zone in its bundle, so a ``SecondaryCatalog`` would only
@@ -2903,6 +2919,12 @@ class TechnitiumDriver(DriverBase):
 
         if mode == "producer" and cat_name:
             self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
+            # A new Catalog zone is created with zoneTransfer=Deny and
+            # notify=None, so without its own options no consumer can read
+            # the catalog (#1766).
+            catalog_options = (catalog or {}).get("options")
+            if catalog_options:
+                self._apply_zone_options(token, cat_name, catalog_options)
 
         # Producer stamps the name on; disabled clears it. Empty string is
         # how Technitium clears the field (verified — it reads back null).
@@ -2911,9 +2933,20 @@ class TechnitiumDriver(DriverBase):
             if entry.get("type") != "Primary":
                 continue
             zone = entry["zone"]
-            resp = self._call(
-                token, "POST", "zones/options/set", {"zone": zone, "catalog": desired}
-            )
+            params: dict[str, Any] = {"zone": zone, "catalog": desired}
+            if desired:
+                # A member otherwise takes its transfer, notify and query
+                # access from the catalog zone (``DnsServer`` /
+                # ``AuthZoneInfo``), whose own are Deny / None: that undid
+                # the #734 transfer grant on every zone of the producer.
+                # The zone's own options, already applied by the reconcile
+                # above, stay in force (#1766).
+                params.update(
+                    overrideCatalogZoneTransfer="true",
+                    overrideCatalogNotify="true",
+                    overrideCatalogQueryAccess="true",
+                )
+            resp = self._call(token, "POST", "zones/options/set", params)
             body = resp.json()
             if body.get("status") != "ok":
                 log.warning(
