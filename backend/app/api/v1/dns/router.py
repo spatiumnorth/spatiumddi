@@ -1409,6 +1409,22 @@ class ViewCreate(BaseModel):
     # View-level query control overrides (fall back to server-group options if null)
     allow_query: list[str] | None = None
     allow_query_cache: list[str] | None = None
+    # The view's own default forwarders (#3523), BIND9 only. Unset inherits the
+    # group's ``forwarders`` / ``forward_policy``; the transport is the view's own.
+    forwarders: list[str] | None = None
+    forward_policy: str | None = None
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
+
+    @field_validator("forward_policy")
+    @classmethod
+    def validate_forward_policy(cls, v: str | None) -> str | None:
+        return _validate_view_forward_policy(v)
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_tls_hostname(v)
 
 
 class ViewUpdate(BaseModel):
@@ -1420,6 +1436,20 @@ class ViewUpdate(BaseModel):
     order: int | None = None
     allow_query: list[str] | None = None
     allow_query_cache: list[str] | None = None
+    forwarders: list[str] | None = None
+    forward_policy: str | None = None
+    forward_transport: str | None = None
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
+
+    @field_validator("forward_policy")
+    @classmethod
+    def validate_forward_policy(cls, v: str | None) -> str | None:
+        return _validate_view_forward_policy(v)
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_tls_hostname(v)
 
 
 class ViewResponse(BaseModel):
@@ -1433,6 +1463,10 @@ class ViewResponse(BaseModel):
     order: int
     allow_query: list[str] | None = None
     allow_query_cache: list[str] | None = None
+    forwarders: list[str] | None = None
+    forward_policy: str | None = None
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = None
     # #3551 — set on ``GET /groups/{id}/views`` when the group's estimated
     # named memory is at 80 % or more of its agents' limit: each view that
     # applies a blocklist loads its own copy of it.
@@ -1532,6 +1566,13 @@ _SOA_TIMER_MAX = DNS_TTL_MAX
 def _validate_zone_forward_transport(v: str | None) -> str | None:
     if v is not None and v not in VALID_FORWARD_TRANSPORTS:
         raise ValueError(f"forward_transport must be one of {sorted(VALID_FORWARD_TRANSPORTS)}")
+    return v
+
+
+def _validate_view_forward_policy(v: str | None) -> str | None:
+    """A view's ``forward`` policy (#3523): first | only, or None to inherit the group's."""
+    if v is not None and v not in VALID_FORWARD_POLICIES:
+        raise ValueError(f"forward_policy must be one of {sorted(VALID_FORWARD_POLICIES)}")
     return v
 
 
@@ -5664,7 +5705,10 @@ async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ViewRe
 
 
 async def _validated_view_fields(
-    group_id: uuid.UUID, body: ViewCreate | ViewUpdate, db: DB
+    group_id: uuid.UUID,
+    body: ViewCreate | ViewUpdate,
+    db: DB,
+    view: DNSView | None = None,
 ) -> dict[str, Any]:
     """Validate the free-text halves of a view before they reach named.conf.
 
@@ -5705,12 +5749,82 @@ async def _validated_view_fields(
                 changes[attr] = validate_address_match_list(
                     value, field=attr, known_acls=acl_names, known_keys=known_keys
                 )
+        if getattr(body, "forwarders", None):
+            # Same grammar as the group's forwarders (#1244), in the canonical
+            # ``ip[@port]`` spelling the agent splits on.
+            changes["forwarders"] = validate_zone_forwarders(body.forwarders)
     except ViewValidationError as exc:
         raise HTTPException(
             status_code=422,
             detail={"field": exc.field, "value": exc.value, "message": str(exc)},
         ) from exc
+    await _check_view_forwarders(group_id, body, changes, view, db)
     return changes
+
+
+async def _check_view_forwarders(
+    group_id: uuid.UUID,
+    body: ViewCreate | ViewUpdate,
+    changes: dict[str, Any],
+    view: DNSView | None,
+    db: DB,
+) -> None:
+    """422 a view's default forwarders the group cannot render faithfully (#3523).
+
+    Per-view forwarders are a BIND9 feature: PowerDNS, Technitium and the
+    Windows / cloud drivers have no per-view forwarding, so a group holding any
+    of them refuses rather than quietly serving every view the group's.
+    An empty list is stored as NULL: both mean "inherit the group's".
+    The transport is the view's own (do53 | tls, as BIND can speak), checked with
+    the forward-zone rules: a certificate name for TLS, one name per forwarder
+    set (#877), no encrypted-only upstream over do53.
+
+    Only a change to one of the four fields is held to it, so a view stored
+    before this gate stays editable.
+    """
+    fields = ("forwarders", "forward_policy", "forward_transport", "forward_tls_hostname")
+    touched = {f for f in fields if f in body.model_fields_set}
+    if "forwarders" in touched and not changes.get("forwarders"):
+        changes["forwarders"] = None
+    transport = getattr(body, "forward_transport", None)
+    if transport is not None and transport not in ("do53", "tls"):
+        raise HTTPException(
+            422,
+            f"A view's forward_transport must be do53 or tls, not {transport!r}: BIND9 "
+            "has no client-side HTTP or QUIC transport.",
+        )
+    if not touched:
+        return
+
+    def effective(field: str, default: Any = None) -> Any:
+        if field in changes:
+            return changes[field]
+        if field in body.model_fields_set:
+            return getattr(body, field)
+        return getattr(view, field, default) if view is not None else default
+
+    forwarders = list(effective("forwarders") or [])
+    if not forwarders:
+        return
+    drivers = await _group_driver_names(db, group_id)
+    others = sorted(set(drivers) - {"bind9"})
+    if others:
+        raise HTTPException(
+            422,
+            f"Per-view forwarders are only supported by BIND9, but this group also runs "
+            f"{', '.join(others)}, which cannot forward per view. Leave the view's "
+            "forwarders empty to inherit the group's, or move those servers to their own group.",
+        )
+    name = effective("name") or ""
+    refusal = zone_forward_transport_refusal(
+        zone_name=name,
+        transport=effective("forward_transport") or "do53",
+        hostname=effective("forward_tls_hostname"),
+        forwarders=forwarders,
+        drivers=drivers,
+    )
+    if refusal:
+        raise HTTPException(422, f"View {name!r}: {refusal}")
 
 
 @router.post(
@@ -5775,7 +5889,13 @@ async def update_view(
     # = inherit server options, #430); null for a NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
-        clearable={"allow_query", "allow_query_cache"},
+        clearable={
+            "allow_query",
+            "allow_query_cache",
+            "forwarders",
+            "forward_policy",
+            "forward_tls_hostname",
+        },
         non_nullable={
             "name",
             "description",
@@ -5783,9 +5903,10 @@ async def update_view(
             "match_destinations",
             "recursion",
             "order",
+            "forward_transport",
         },
     )
-    changes.update(await _validated_view_fields(group_id, body, db))
+    changes.update(await _validated_view_fields(group_id, body, db, view))
     before = {k: getattr(view, k, None) for k in changes}
     for k, v in changes.items():
         setattr(view, k, v)

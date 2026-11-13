@@ -1078,6 +1078,18 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     allow_query: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     allow_query_cache: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
+    # View-level default forwarders (#3523): rendered as ``forwarders`` /
+    # ``forward`` inside the view block. NULL or empty inherits the group's
+    # (``DNSServerOptions.forwarders``). Like a forward zone's (#2121), the view's
+    # transport is its OWN setting (do53 | tls) and does not inherit the
+    # group's; ``forward_policy`` NULL inherits the group's. BIND9 only.
+    forwarders: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    forward_policy: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    forward_transport: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="do53", server_default="do53"
+    )
+    forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="views")
     zones: Mapped[list["DNSZone"]] = relationship("DNSZone", back_populates="view")
     blocklists: Mapped[list["DNSBlockList"]] = relationship(

@@ -458,6 +458,10 @@ DNSView
   match_clients: [CIDR list]     -- source IPs that see this view
   match_destinations: [CIDR list]
   recursion: bool
+  forwarders: [ip[@port]] | null -- the view's own default forwarders; null = the group's (#3523)
+  forward_policy: first | only | null   -- null = the group's
+  forward_transport: do53 | tls  -- the view's OWN transport (not the group's)
+  forward_tls_hostname: str | null      -- DoT certificate name, when forward_transport = tls
   zones: [DNSZone]               -- zones present in this view (may differ per view)
   order: int                     -- views are evaluated in order (first match wins)
 ```
@@ -1283,6 +1287,22 @@ view "guest" {
   A view name is capped at **45 characters**, not 63: the per-view RPZ zone
   is named `spatium-blocklist-<view>.rpz.`, and that 18-character prefix
   has to fit inside the 63-octet DNS label limit with it.
+- **A view can have its own default forwarders**
+  ([#3523](https://github.com/spatiumnorth/spatiumddi/issues/3523)): BIND9 takes
+  `forwarders { … }; forward first|only;` inside a `view {}` block, overriding
+  the group's `options {}` for the clients the view matches (a guest VLAN to a
+  filtering resolver, staff to the internal resolver). Empty inherits the
+  group's, so a group that sets none renders byte-identically to before. The
+  transport is the view's own, like a forward zone's (#2121): it does not
+  inherit the group's `forward_transport`, and DoT needs `forward_tls_hostname`.
+  The policy falls back to the group's and is written out explicitly in the
+  block, so a group at `forward only` cannot leave a `first` view `only`.
+  Validation is the group's: `ip[@port]` entries, one certificate name per
+  forwarder set (#877), no encrypted-only upstream (Mullvad) over plain DNS.
+  **BIND9 only**: a group that also holds a PowerDNS, Technitium or Windows
+  server refuses (422) a view with forwarders, since those drivers have no
+  per-view forwarding. This is per-view *default* forwarding; per-domain
+  forwarding per view is a `forward` zone pinned to the view.
 - **Deleting a view** leaves its zones in place (they fall back to being
   served from the remaining views) but any list scoped *only* to it stops
   applying anywhere.

@@ -6998,6 +6998,34 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
   );
   const [showSubnets, setShowSubnets] = useState(false);
   const [error, setError] = useState("");
+  // Default forwarders for this view (#3523); empty inherits the group's.
+  const [forwarders, setForwarders] = useState(
+    (view?.forwarders ?? []).join("\n"),
+  );
+  const [forwardPolicy, setForwardPolicy] = useState<"" | "first" | "only">(
+    view?.forward_policy ?? "",
+  );
+  const [forwardTransport, setForwardTransport] = useState<"do53" | "tls">(
+    view?.forward_transport ?? "do53",
+  );
+  const [forwardTlsHostname, setForwardTlsHostname] = useState(
+    view?.forward_tls_hostname ?? "",
+  );
+  const { data: presetCatalog } = useQuery({
+    queryKey: ["dns", "forwarder-presets"],
+    queryFn: () => dnsApi.forwarderPresets(),
+    staleTime: Infinity,
+  });
+
+  function applyPreset(id: string) {
+    const preset = (presetCatalog?.presets ?? []).find((p) => p.id === id);
+    if (!preset) return;
+    setForwarders(preset.ipv4.join("\n"));
+    setForwardTlsHostname(preset.tls_hostname);
+    // An upstream that refuses plain port 53 is switched to DoT rather than
+    // left in a state the API refuses.
+    if (preset.requires_encrypted) setForwardTransport("tls");
+  }
 
   const lines = (s: string) =>
     s
@@ -7039,6 +7067,16 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
       recursion,
       match_clients: clients,
       match_destinations: lines(matchDestinations),
+      forwarders: lines(forwarders).length ? lines(forwarders) : null,
+      forward_policy:
+        lines(forwarders).length && forwardPolicy ? forwardPolicy : null,
+      forward_transport: lines(forwarders).length ? forwardTransport : "do53",
+      forward_tls_hostname:
+        lines(forwarders).length &&
+        forwardTransport === "tls" &&
+        forwardTlsHostname.trim()
+          ? forwardTlsHostname.trim()
+          : null,
     };
     if (!view) {
       saveMut.mutate(body);
@@ -7053,6 +7091,12 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
         recursion: view.recursion ?? true,
         match_clients: view.match_clients ?? ["any"],
         match_destinations: view.match_destinations ?? [],
+        forwarders: view.forwarders?.length ? view.forwarders : null,
+        forward_policy: view.forwarders?.length ? view.forward_policy : null,
+        forward_transport: view.forward_transport ?? "do53",
+        forward_tls_hostname: view.forwarders?.length
+          ? view.forward_tls_hostname
+          : null,
       },
       body,
     );
@@ -7157,6 +7201,96 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
               Matches the address the query arrived <em>on</em>, not the client
               it came from. Only useful on a multi-homed server.
             </p>
+          </div>
+        </details>
+
+        <details
+          className="rounded border bg-muted/20 px-2 py-1.5"
+          open={lines(forwarders).length > 0}
+        >
+          <summary className="cursor-pointer text-xs text-muted-foreground">
+            Forwarders (BIND9 only)
+          </summary>
+          <div className="mt-2 space-y-2">
+            <p className="text-[11px] text-muted-foreground">
+              Default upstream resolvers for clients this view matches, e.g. a
+              filtering resolver for a guest VLAN. Leave empty to inherit the
+              group&apos;s forwarders.
+            </p>
+            <Field label="Preset">
+              <select
+                className={inputCls}
+                value=""
+                onChange={(e) => applyPreset(e.target.value)}
+              >
+                <option value="">Fill from a public resolver…</option>
+                {[
+                  ...new Set(
+                    (presetCatalog?.presets ?? []).map((p) => p.provider),
+                  ),
+                ].map((provider) => (
+                  <optgroup key={provider} label={provider}>
+                    {(presetCatalog?.presets ?? [])
+                      .filter((p) => p.provider === provider)
+                      .map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                  </optgroup>
+                ))}
+              </select>
+            </Field>
+            <textarea
+              aria-label="View forwarders"
+              value={forwarders}
+              onChange={(e) => setForwarders(e.target.value)}
+              className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
+              placeholder={
+                "Inherits the group's forwarders\n10.0.0.5\n10.0.0.6@5353"
+              }
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Fallback policy">
+                <select
+                  className={inputCls}
+                  value={forwardPolicy}
+                  onChange={(e) =>
+                    setForwardPolicy(e.target.value as "" | "first" | "only")
+                  }
+                >
+                  <option value="">Inherit the group&apos;s</option>
+                  <option value="first">
+                    forward first — fall back to recursion
+                  </option>
+                  <option value="only">
+                    forward only — never fall back to recursion
+                  </option>
+                </select>
+              </Field>
+              <Field label="Upstream transport">
+                <select
+                  className={inputCls}
+                  value={forwardTransport}
+                  onChange={(e) =>
+                    setForwardTransport(e.target.value as "do53" | "tls")
+                  }
+                >
+                  <option value="do53">Plain DNS (port 53)</option>
+                  <option value="tls">DNS over TLS (DoT)</option>
+                </select>
+              </Field>
+            </div>
+            {forwardTransport === "tls" && (
+              <Field label="Certificate name (DoT)">
+                <input
+                  className={inputCls}
+                  value={forwardTlsHostname}
+                  onChange={(e) => setForwardTlsHostname(e.target.value)}
+                  placeholder="family.cloudflare-dns.com"
+                />
+              </Field>
+            )}
           </div>
         </details>
 
