@@ -25,6 +25,7 @@ import {
   useApplianceAdminGate,
   useCanReadApplianceLogs,
 } from "@/hooks/useApplianceAdmin";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Phase 4d (rewritten as Phase 11 wave 4) — Pod management tab.
@@ -89,15 +90,15 @@ export function ContainersTab() {
       </div>
 
       {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {listReadErrorMessage(error, "the pods")}
-        </div>
+        </FormError>
       )}
       {/* A refused Restart / Stop / Start used to say nothing (#1342). */}
       {action.isError && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {formatApiError(action.error, "Pod action failed")}
-        </div>
+        </FormError>
       )}
 
       {isLoading ? (
@@ -368,10 +369,10 @@ function LogsStreamModal({
           )}
         </div>
         {error && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+          <FormError className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>{error}</span>
-          </div>
+          </FormError>
         )}
         <div
           ref={containerRef}

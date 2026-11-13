@@ -13,6 +13,7 @@ import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import { automaticSpaceLabel, pinnedScanSpaceName } from "./scanSpace";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Parsed-summary panel for a finished nmap scan.
@@ -221,9 +222,9 @@ function StampDiscoveredModal({
           </p>
         )}
         {errMsg && (
-          <p className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+          <FormError className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
             {String(errMsg)}
-          </p>
+          </FormError>
         )}
         {result && (
           <div className="mt-2 space-y-1 rounded-md border bg-muted/30 p-3 text-sm">
