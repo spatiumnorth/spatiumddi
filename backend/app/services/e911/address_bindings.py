@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Collection
 
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.e911 import ERLBinding
@@ -50,6 +50,24 @@ async def keep_row_if_bound(db: AsyncSession, row: IPAddress) -> bool:
     row.auto_from_lease = False
     row.dhcp_lease_id = None
     row.static_assignment_id = None
+    # The binding says "the device on THIS address is in that room"; with the
+    # device gone, the next one to be given the address would be handed the old
+    # room - a precise answer about the wrong phone, which is worse than the
+    # coarser live one (E911.md). Kept for the operator, but inactive until they
+    # re-activate it (the resolver only walks active bindings).
+    await db.execute(
+        update(ERLBinding)
+        .where(ERLBinding.ip_address_id == row.id, ERLBinding.is_active.is_(True))
+        .values(
+            is_active=False,
+            notes=func.concat(
+                ERLBinding.notes,
+                case((ERLBinding.notes == "", ""), else_=" "),
+                "[Deactivated: its address was released; re-activate when the new device is known.]",
+            ),
+        )
+        .execution_options(synchronize_session=False)
+    )
     return True
 
 

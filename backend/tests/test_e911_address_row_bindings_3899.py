@@ -23,6 +23,7 @@ from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dhcp.lease_cleanup import purge_lease
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics, upsert_ipam_for_static
+from app.services.e911.resolver import resolve_location
 from app.services.ipam.subnet_merge import commit_subnet_merge, preview_subnet_merge
 from app.services.ipam.subnet_split import commit_subnet_split
 from tests.test_dhcp_static_readdress_live_lease import (
@@ -175,6 +176,47 @@ async def test_resize_move_gateway_keeps_a_bound_old_gateway_row(
 
 
 @pytest.mark.asyncio
+async def test_resize_preview_lists_a_bound_boundary_row_as_kept(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin_token(db_session)}"}
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.198.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    await db_session.commit()
+    r = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=h,
+        json={
+            "space_id": str(space.id),
+            "block_id": str(block.id),
+            "network": "10.198.1.128/25",
+            "skip_reverse_zone": True,
+        },
+    )
+    assert r.status_code == 201, r.text
+    sid = uuid.UUID(r.json()["id"])
+    net_row = (
+        await db_session.execute(
+            select(IPAddress).where(IPAddress.subnet_id == sid, IPAddress.address == "10.198.1.128")
+        )
+    ).scalar_one()
+    erl = await _erl(db_session)
+    await _bind_ip(db_session, erl, net_row)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/resize/preview", headers=h, json={"new_cidr": "10.198.1.0/24"}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "10.198.1.128" not in [p["ip"] for p in body["placeholders_default_named"]]
+    assert "10.198.1.128" in [p["ip"] for p in body["placeholders_renamed"]]
+
+
+@pytest.mark.asyncio
 async def test_merge_keeps_a_bound_retired_gateway_row(db_session: AsyncSession) -> None:
     a, b = await _subnets(db_session, "10.0.0.0/25", "10.0.0.128/25")
     a.gateway, b.gateway = "10.0.0.1", "10.0.0.129"
@@ -292,6 +334,15 @@ async def test_a_purged_lease_keeps_a_bound_mirror_row(db_session: AsyncSession)
     await db_session.flush()
     (bound,) = await _ip_binding_rows(db_session, erl)
     assert bound.status == "available" and not bound.auto_from_lease and not bound.hostname
+    # The old device is gone: the next one handed this address must NOT be told
+    # it is in the old device's room. Kept, listed, but inactive.
+    b = (
+        await db_session.execute(select(ERLBinding).where(ERLBinding.ip_address_id == bound.id))
+    ).scalar_one()
+    await db_session.refresh(b)
+    assert b.is_active is False and "re-activate" in b.notes
+    res = await resolve_location(db_session, ip="10.0.0.99")
+    assert res.erl is None or res.erl.id != erl.id
 
 
 @pytest.mark.asyncio

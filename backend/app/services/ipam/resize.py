@@ -773,6 +773,11 @@ async def preview_subnet_resize(
     # Placeholder classification — independent of conflicts so the UI can
     # show the distribution even when the preview is otherwise blocked.
     default_named, renamed = await _load_boundary_placeholders(db, subnet.id, old_net)
+    # A row a registry record names is kept by the commit (#3958), so the
+    # preview lists it as kept, not as "will be replaced".
+    _kept = await registry_referenced_ip_ids(db, [r.id for r in default_named])
+    renamed = renamed + [r for r in default_named if r.id in _kept]
+    default_named = [r for r in default_named if r.id not in _kept]
     placeholders_default_named = [
         {
             "ip": str(row.address),
