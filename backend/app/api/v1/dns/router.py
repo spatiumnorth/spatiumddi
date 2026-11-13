@@ -3525,6 +3525,9 @@ async def _sync_single_server(
     # 1. Topology discovery (Path B for Windows / REST API for the rest).
     zones_on_server: list[str] = []
     zone_meta_by_name: dict[str, dict[str, Any]] = {}
+    # #1771 — a failed zone listing is not an empty server: step 3 must not
+    # read "nothing on the server" and create every zone in the group.
+    zone_pull_failed = False
     if topology_capable:
         try:
             discovered = await get_driver(server.driver).pull_zones_from_server(server)  # type: ignore[attr-defined]
@@ -3535,6 +3538,7 @@ async def _sync_single_server(
                 zones_on_server.append(name)
                 zone_meta_by_name[name] = z
         except Exception as exc:  # noqa: BLE001 — informational, keep going
+            zone_pull_failed = True
             logger.warning(
                 "dns.sync_from_server.pull_zones_failed",
                 server=str(server.id),
@@ -3609,7 +3613,11 @@ async def _sync_single_server(
     #    Windows DNS over WinRM + cloud DNS via provider API).
     zones_pushed_to_server: list[str] = []
     zones_push_to_server_errors: list[str] = []
-    if topology_capable:
+    if topology_capable and zone_pull_failed:
+        zones_push_to_server_errors.append(
+            "zone listing from the server failed, so no missing zone was pushed"
+        )
+    elif topology_capable:
         server_zone_set = {n for n in zones_on_server}
         driver = get_driver(server.driver)
         # Re-query zones after the import step so newly-imported rows
@@ -3620,7 +3628,11 @@ async def _sync_single_server(
             if bare in server_zone_set:
                 continue
             try:
-                await driver.apply_zone_change(server, zone, "create")
+                changed = await driver.apply_zone_change(server, zone, "create")
+                if changed is False:
+                    # Already on the server (a zone the listing hid from this
+                    # token): adopted, not pushed (#1771).
+                    continue
                 zones_pushed_to_server.append(bare)
                 db.add(
                     AuditLog(

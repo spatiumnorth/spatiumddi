@@ -34,6 +34,7 @@ from app.services.dns.named_conf_validation import split_zone_forwarders
 from app.services.dns.new_object_defaults import load_dns_defaults
 from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
+    provision_zone_at_agentless_servers,
     record_op_payload,
     resolve_primary_server,
 )
@@ -357,6 +358,11 @@ async def _create_zone_at(
     db.add(zone)
     await db.flush()  # populate zone.id for the FK
     await render_guard.check(db, f"import zone {target_name!r}", error=ValueError)
+    # #1771 — an agentless group (technitium_api / Windows Path B / cloud) only
+    # gets the zone when it is created there; a row alone leaves the record
+    # ops below failing "no such zone" or landing in an enclosing zone. Queued
+    # for after the commit, ahead of those ops. No-op for agent-managed groups.
+    await provision_zone_at_agentless_servers(db, zone)
 
     record_rows, skipped_records = await _build_records_for_zone(
         db,
