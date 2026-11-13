@@ -244,7 +244,10 @@ export function BulkAllocateModal({
     queries: zoneGroupIds.map((gId) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
-      staleTime: 60_000,
+      // Re-read on open too: the primary may be a zone created since the
+      // cached list was taken (#4028, as #3078).
+      staleTime: 0,
+      refetchOnMount: "always" as const,
       enabled: dnsOn,
     })),
   });
@@ -266,7 +269,7 @@ export function BulkAllocateModal({
   // back to the first zone once every group has answered) and re-pick when it
   // lands, until the operator has chosen.
   const primaryZoneId = effectiveDns?.dns_zone_id;
-  const zonesSettled = zoneQueries.every((q) => !q.isLoading);
+  const zonesSettled = zoneQueries.every((q) => !q.isLoading && !q.isFetching);
   // Zones still on their way, or the subnet's DNS being re-read over a cached
   // copy: the pick is not final yet, so Preview waits (#3080).
   const zonesPending =
@@ -612,12 +615,22 @@ export function BulkAllocateModal({
                   </select>
                 </div>
               )}
-              {createDnsRecords && availableZones.length === 0 && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  No DNS zones are pinned to this subnet — A records will fall
-                  through to the effective default zone if one exists.
-                </p>
-              )}
+              {createDnsRecords &&
+                availableZones.length === 0 &&
+                zonesSettled &&
+                (effectiveDns?.dns_zone_id ? (
+                  // #3903: the zone list wants a read this caller may lack,
+                  // while the subnet's own effective DNS names the zone.
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    A records are published in this subnet&apos;s DNS zone. Your
+                    permissions do not list DNS zones, so its name is not shown.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    No DNS zones are pinned to this subnet — A records will fall
+                    through to the effective default zone if one exists.
+                  </p>
+                ))}
             </div>
           )}
 
