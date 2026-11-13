@@ -5665,6 +5665,8 @@ export interface AgentSpoolStreamStatus {
   unread_bytes?: number | null;
   /** How many of `pending_events` are estimated from `unread_bytes`. */
   unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
 }
 
 /**
@@ -5693,6 +5695,8 @@ export interface AgentSpoolStatus {
   unread_bytes?: number | null;
   /** How many of `pending_events` are estimated from `unread_bytes`. */
   unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
   streams: Record<string, AgentSpoolStreamStatus>;
 }
 

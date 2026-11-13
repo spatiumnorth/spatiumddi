@@ -71,6 +71,9 @@ class SpoolStreamStatus(BaseModel):
     unread_bytes: int | None = Field(default=None, ge=0)
     # Of pending_events, how many are an ESTIMATE from unread_bytes.
     unread_events_estimated: int | None = Field(default=None, ge=0)
+    # Age of the oldest undelivered row AT THE AGENT'S REPORT, so the page never
+    # measures it against its own clock from a heartbeat up to a minute old.
+    pending_lag_seconds: float | None = Field(default=None, ge=0)
 
 
 class SpoolStatus(BaseModel):
@@ -96,6 +99,9 @@ class SpoolStatus(BaseModel):
     unread_bytes: int | None = Field(default=None, ge=0)
     # Of pending_events, how many are an ESTIMATE from unread_bytes.
     unread_events_estimated: int | None = Field(default=None, ge=0)
+    # Age of the oldest undelivered row AT THE AGENT'S REPORT, so the page never
+    # measures it against its own clock from a heartbeat up to a minute old.
+    pending_lag_seconds: float | None = Field(default=None, ge=0)
     streams: dict[_StreamName, SpoolStreamStatus] = Field(
         default_factory=dict, max_length=_MAX_STREAMS
     )

@@ -1,3 +1,3 @@
 ### Fixed
 
-- The servers page now shows how far behind a DHCP agent is on lease events: the count includes an estimate of rows still unread in Kea's lease file, the chip leads with the lag (which falls as the agent catches up), and it only appears once the lag is well past the normal flush interval, so steady traffic shows nothing (#3782).
+- The servers page now shows how far behind a DHCP agent is on lease events: the count includes rows the agent has read but not yet delivered and an estimate of rows still unread in Kea's lease file, and both the count and the age fall as the agent catches up. The age is the agent's own at its heartbeat, and the chip appears only once the lag passes two heartbeat intervals (60 s), so a healthy agent under steady renewal traffic shows nothing; counts print with a thousands separator (#3782).

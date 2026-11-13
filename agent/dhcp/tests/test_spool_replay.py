@@ -845,6 +845,45 @@ def test_backlog_and_lag_fall_as_the_agent_catches_up_3782(agent_cfg, cp, clock,
     assert after["pending_oldest_at"] is None
 
 
+def test_rows_read_but_not_yet_posted_are_counted_and_fall_with_each_batch_3782(
+    agent_cfg, cp, clock, tmp_path
+):
+    """One read takes the whole file; the posts go out 100 at a time. The rows
+    in hand between those are counted nowhere but ``_tail``'s loop, so the
+    report must count them, and count (and age) less after every batch."""
+    ips = [f"10.7.{i // 200}.{i % 200 + 1}" for i in range(450)]
+    w, _ = _watcher(agent_cfg, cp, _spool(tmp_path, "lease_events"), FakeKea(), clock)
+    w.tick()  # caught up on the empty file
+    agent_cfg.kea_lease_file.write_text(_csv_rows(ips))
+    w._read_at[agent_cfg.kea_lease_file] = time.time() - 120  # blocked two minutes
+
+    seen: list[dict] = []
+    real_poster = w._poster
+
+    def slow_post(payload):
+        seen.append(w.pending_status())
+        return real_poster(payload)
+
+    slow_post.last_duplicate = False  # type: ignore[attr-defined]
+    w._poster = slow_post  # type: ignore[assignment]
+    w.tick()
+
+    # Exactly what is still owed at each post, the batch in flight included.
+    assert [r["pending_events"] for r in seen] == [450, 350, 250, 150]
+    # The last 50 wait in the buffer for the next flush, still counted.
+    assert w.pending_status()["pending_events"] == 50
+    w._flush()
+    assert seen[-1]["pending_events"] == 50
+    assert all(r["unread_bytes"] == 0 for r in seen)
+    lags = [r["pending_lag_seconds"] for r in seen]
+    assert lags[0] >= 119
+    assert all(a > b for a, b in zip(lags, lags[1:]))
+    assert lags[-1] < lags[0] / 2
+    done = w.pending_status()
+    assert done["pending_events"] == 0
+    assert done["pending_lag_seconds"] is None
+
+
 def test_heartbeat_folds_pending_into_the_spool_report_3782(agent_cfg, tmp_path, monkeypatch):
     mgr = SpoolManager(tmp_path, total_bytes=1000)
     mgr.declare("lease_events", 1.0)
@@ -853,6 +892,7 @@ def test_heartbeat_folds_pending_into_the_spool_report_3782(agent_cfg, tmp_path,
     hb.pending_provider = lambda: {
         "pending_events": 2400,
         "pending_oldest_at": "2026-11-08T10:00:00+00:00",
+        "pending_lag_seconds": 75.5,
         "unread_bytes": 4096,
     }
     monkeypatch.setattr(hb, "_kea_version", lambda: None)
@@ -876,3 +916,4 @@ def test_heartbeat_folds_pending_into_the_spool_report_3782(agent_cfg, tmp_path,
     assert spool["pending_events"] == 2400
     assert spool["streams"]["lease_events"]["pending_events"] == 2400
     assert spool["streams"]["lease_events"]["unread_bytes"] == 4096
+    assert spool["pending_lag_seconds"] == 75.5

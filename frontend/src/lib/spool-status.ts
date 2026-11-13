@@ -26,7 +26,7 @@ export type SpoolState =
       events: number;
       estimated: number;
       unreadBytes: number;
-      oldestAt: string | null;
+      lagSeconds: number;
     }
   /** The spool hit its cap and dropped data within the last 24 h. */
   | {
@@ -42,9 +42,21 @@ function isRecent(ts: string | null | undefined, now: number): boolean {
   return Number.isFinite(t) && now - t <= TRIM_RECENT_MS;
 }
 
-/** Lag above 2x the agent's 5 s flush interval, and at least this many events. */
-const PENDING_MIN_LAG_MS = 10_000;
+/**
+ * "Behind" means the agent is falling behind, not that it holds events: a
+ * healthy agent always holds a flush interval's worth (20 to 90 events at 10
+ * renewals/s), and a row lock on a scope can hold it for ~20 s. Lag is read as
+ * of the heartbeat (the agent's own `pending_lag_seconds`), never against the
+ * page's clock, and has to exceed two heartbeat intervals (2 x 30 s): the
+ * agent has then failed to deliver for two whole reports running.
+ */
+const PENDING_MIN_LAG_S = 60;
 const PENDING_MIN_EVENTS = 20;
+
+/** Thousands separator for counts shown to the operator. */
+export function formatCount(n: number): string {
+  return n.toLocaleString();
+}
 
 export function spoolState(
   status: AgentSpoolStatus | null | undefined,
@@ -73,18 +85,20 @@ export function spoolState(
       oldestAt: status.oldest_at,
     };
   }
-  // Steady traffic always holds a few events until the next flush; only a lag
-  // well past the flush interval (5 s) with a real backlog is "behind".
+  // rc.2 agents report no lag (null/absent): unknown, so no chip.
   const events = status.pending_events ?? 0;
-  const oldestAt = status.pending_oldest_at ?? null;
-  const lagMs = oldestAt ? now - new Date(oldestAt).getTime() : 0;
-  if (events >= PENDING_MIN_EVENTS && lagMs > PENDING_MIN_LAG_MS) {
+  const lagS = status.pending_lag_seconds;
+  if (
+    events >= PENDING_MIN_EVENTS &&
+    lagS != null &&
+    lagS > PENDING_MIN_LAG_S
+  ) {
     return {
       kind: "pending",
       events,
       estimated: status.unread_events_estimated ?? 0,
       unreadBytes: status.unread_bytes ?? 0,
-      oldestAt,
+      lagSeconds: lagS,
     };
   }
   return { kind: "none" };
@@ -100,6 +114,11 @@ export function formatBytes(n: number): string {
     i += 1;
   }
   return `${v.toFixed(1)} ${units[i]}`;
+}
+
+/** An age given in seconds, in the same units as {@link formatAge}. */
+export function formatLag(seconds: number): string {
+  return formatAge(new Date(0).toISOString(), seconds * 1000) as string;
 }
 
 export function formatAge(fromIso: string | null, now: number = Date.now()) {

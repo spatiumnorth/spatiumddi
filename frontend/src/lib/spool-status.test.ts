@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentSpoolStatus, AgentSpoolStreamStatus } from "@/lib/api";
-import { formatBytes, spoolState, TRIM_RECENT_MS } from "@/lib/spool-status";
+import {
+  formatBytes,
+  formatCount,
+  spoolState,
+  TRIM_RECENT_MS,
+} from "@/lib/spool-status";
 
 const NOW = Date.parse("2026-09-22T12:00:00Z");
 
@@ -46,11 +51,11 @@ describe("spoolState", () => {
     expect(spoolState(undefined, NOW)).toEqual({ kind: "none" });
   });
 
-  it("shows the lease backlog of an agent with an empty spool once lag is past the flush interval (#3782)", () => {
+  it("shows the lease backlog of an agent that is falling behind (#3782)", () => {
     const st = spoolState(
       status({
         pending_events: 2400,
-        pending_oldest_at: "2026-09-22T11:55:00Z",
+        pending_lag_seconds: 300,
         unread_bytes: 4096,
         unread_events_estimated: 2000,
       }),
@@ -61,7 +66,7 @@ describe("spoolState", () => {
       events: 2400,
       estimated: 2000,
       unreadBytes: 4096,
-      oldestAt: "2026-09-22T11:55:00Z",
+      lagSeconds: 300,
     });
     // Absent / null counts are unknown, not a backlog.
     expect(spoolState(status({ pending_events: null }), NOW).kind).toBe("none");
@@ -72,24 +77,58 @@ describe("spoolState", () => {
     ).toBe("backlog");
   });
 
-  it("shows nothing for normal flush buffering (#3782)", () => {
-    const recent = new Date(NOW - 5_000).toISOString();
+  it("a steady, healthy agent shows no chip however stale its heartbeat is (#3782)", () => {
+    // 20-89 events held at every heartbeat, lag a few seconds as of the report.
+    // The heartbeat being 30 s old on the page's clock must not matter.
+    const stale = new Date(NOW - 30_000).toISOString();
+    for (const [events, lag] of [
+      [20, 2],
+      [66, 9.6],
+      [89, 25],
+      [500, 59],
+    ]) {
+      expect(
+        spoolState(
+          status({
+            pending_events: events,
+            pending_lag_seconds: lag,
+            pending_oldest_at: stale,
+            last_trim_at: null,
+          }),
+          NOW + 120_000,
+        ).kind,
+      ).toBe("none");
+    }
+  });
+
+  it("a growing backlog shows, and tiny ones do not (#3782)", () => {
+    const at = (events: number, lag: number) =>
+      spoolState(
+        status({ pending_events: events, pending_lag_seconds: lag }),
+        NOW,
+      ).kind;
+    expect(at(1257, 79)).toBe("pending");
+    expect(at(1648, 220)).toBe("pending");
+    expect(at(3, 600)).toBe("none");
+  });
+
+  it("an agent that reports no pending fields (1.0.0-rc.2) shows no chip (#3782)", () => {
     expect(
       spoolState(
         status({
-          pending_events: 76,
-          pending_oldest_at: recent,
-          unread_bytes: 553,
+          pending_events: null,
+          pending_lag_seconds: null,
+          pending_oldest_at: null,
         }),
         NOW,
       ).kind,
     ).toBe("none");
-    // Old but tiny: not a backlog either.
-    const old = new Date(NOW - 60_000).toISOString();
-    expect(
-      spoolState(status({ pending_events: 3, pending_oldest_at: old }), NOW)
-        .kind,
-    ).toBe("none");
+    expect(spoolState(status(), NOW).kind).toBe("none");
+  });
+
+  it("prints counts with a thousands separator (#3782)", () => {
+    expect(formatCount(1928)).toBe("1,928");
+    expect(formatCount(20)).toBe("20");
   });
 
   it("shows nothing for an empty spool with no recent trim", () => {
