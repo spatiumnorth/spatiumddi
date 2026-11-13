@@ -172,6 +172,61 @@ _DNSSEC_RECORD_TYPES = frozenset(
 # Verified live: ECDSA/P256/RSA/EDDSA and NSEC/NSEC3 all sign successfully.
 _DNSSEC_SIGN_DEFAULTS = {"algorithm": "ECDSA", "curve": "P256", "nxProof": "NSEC"}
 
+# DNSSECPolicy ``algorithm`` token → ``zones/dnssec/sign`` parameters and the
+# IANA algorithm number the resulting keys carry (used to tell a signed zone
+# whose policy has since changed). RSA key sizes are not on the policy, so 2048
+# bits (what BIND's rsasha256/512 policies use).
+_DNSSEC_POLICY_ALGORITHMS: dict[str, tuple[dict[str, str], int]] = {
+    "ecdsap256sha256": ({"algorithm": "ECDSA", "curve": "P256"}, 13),
+    "ecdsap384sha384": ({"algorithm": "ECDSA", "curve": "P384"}, 14),
+    "ed25519": ({"algorithm": "EDDSA", "curve": "ED25519"}, 15),
+    "ed448": ({"algorithm": "EDDSA", "curve": "ED448"}, 16),
+    "rsasha256": (
+        {"algorithm": "RSA", "hashAlgorithm": "SHA256", "kskKeySize": "2048", "zskKeySize": "2048"},
+        8,
+    ),
+    "rsasha512": (
+        {"algorithm": "RSA", "hashAlgorithm": "SHA512", "kskKeySize": "2048", "zskKeySize": "2048"},
+        10,
+    ),
+}
+
+
+def _dnssec_sign_spec(policy: dict[str, Any] | None) -> dict[str, Any]:
+    """Map a bundle ``dnssec_policies`` entry onto Technitium's sign call.
+
+    ``policy`` None is the built-in ``default`` (ECDSA P256, NSEC, Technitium's
+    own 30-day ZSK roll). Returns ``{"params", "algorithm_number", "nsec3",
+    "ignored"}``: ``params`` goes to ``zones/dnssec/sign`` as is,
+    ``algorithm_number`` / ``nsec3`` describe what a zone signed from it looks
+    like, and ``ignored`` lists the policy settings Technitium cannot express
+    (reported, never silently dropped): a KSK lifetime (its ``rolloverDays`` is
+    set per key at creation, so a KSK never rolls on its own here) and NSEC3
+    opt-out.
+    """
+    algo = str((policy or {}).get("algorithm") or "ecdsap256sha256").lower()
+    base, number = _DNSSEC_POLICY_ALGORITHMS.get(
+        algo, _DNSSEC_POLICY_ALGORITHMS["ecdsap256sha256"]
+    )
+    params: dict[str, str] = dict(base)
+    ignored: list[str] = []
+    if algo not in _DNSSEC_POLICY_ALGORITHMS:
+        ignored.append(f"algorithm {algo!r} (signed ecdsap256sha256 instead)")
+    nsec3 = bool((policy or {}).get("nsec3"))
+    params["nxProof"] = "NSEC3" if nsec3 else "NSEC"
+    if nsec3:
+        params["iterations"] = str(int((policy or {}).get("nsec3_iterations") or 0))
+        params["saltLength"] = str(int((policy or {}).get("nsec3_salt_length") or 0))
+        if (policy or {}).get("nsec3_optout"):
+            ignored.append("NSEC3 opt-out")
+    if policy is not None and policy.get("zsk_lifetime_days") is not None:
+        # Technitium: 0 disables the automatic ZSK roll, 1-365 is the period.
+        params["zskRolloverDays"] = str(min(max(int(policy["zsk_lifetime_days"]), 0), 365))
+    if (policy or {}).get("ksk_lifetime_days"):
+        ignored.append("KSK lifetime")
+    return {"params": params, "algorithm_number": number, "nsec3": nsec3, "ignored": ignored}
+
+
 # DS digest-type name → the number that goes in a DS record's presentation
 # form (RFC 4034 §5.1.3 / RFC 8624).
 _DS_DIGEST_TYPES = {"SHA1": 1, "SHA256": 2, "GOST": 3, "SHA384": 4}
@@ -2406,6 +2461,9 @@ class TechnitiumDriver(DriverBase):
             log.warning("technitium_transfer_key_not_installed", where=where, key=wanted)
             return None
 
+        policies_by_name = {
+            p.get("name"): p for p in (bundle.get("dnssec_policies") or []) if p.get("name")
+        }
         zones_payload = []
         for zone in raw_zones or []:
             zname = (zone.get("name") or "").rstrip(".")
@@ -2535,6 +2593,11 @@ class TechnitiumDriver(DriverBase):
                 apex = _zone_apex(zname, zone)
                 if apex is not None:
                     entry["apex"] = apex
+            if ztype == "Primary" and zone.get("dnssec_enabled"):
+                # #1767 — signing state is structural: the zone is signed (with
+                # the policy's parameters) on every apply that finds it unsigned.
+                pname = zone.get("dnssec_policy_name")
+                entry["dnssec"] = _dnssec_sign_spec(policies_by_name.get(pname) if pname else None)
             zones_payload.append(entry)
 
 
@@ -3058,6 +3121,8 @@ class TechnitiumDriver(DriverBase):
             return {"dnssec_state": self._dnssec_sign(token, zone)}
         if op_kind == "dnssec_unsign":
             return {"dnssec_state": self._dnssec_unsign(token, zone)}
+        if op_kind == "dnssec_rollover":
+            return self._dnssec_rollover(token, op)
 
         rec = op["record"]
         rtype = (rec.get("type") or "").upper()
@@ -3785,6 +3850,88 @@ class TechnitiumDriver(DriverBase):
 
     # ── DNSSEC (issue #740) ─────────────────────────────────────────────
 
+    # Signing parameters of each zone, from the applied bundle (#1767). The
+    # ``dnssec_sign`` op carries no policy, so it signs with what the last
+    # reconcile derived from the bundle (defaults for a zone not seen yet).
+    _dnssec_specs: dict[str, dict[str, Any]] | None = None
+
+    def _reconcile_dnssec(self, token: str, zone_payload: dict[str, Any]) -> None:
+        """Make a zone flagged signed in the bundle signed on this daemon (#1767).
+
+        The one-shot ``dnssec_sign`` op is never re-sent, so a zone created
+        fresh on a new server, re-created after a retire, or restored on an
+        empty data volume came back unsigned under a DS the control plane
+        still showed. Every apply now compares the daemon with the bundle.
+
+        Deliberately one-directional: a zone the bundle does not flag is left
+        as it is (the ``dnssec_unsign`` op is the operator's explicit action;
+        unsigning on a missing flag would destroy keys on a guess). A zone
+        already signed with a different algorithm / NSEC mode than its policy
+        now says is reported, not re-signed: that needs unsign + sign, which
+        changes the keys and so the DS the operator published.
+        """
+        spec = zone_payload.get("dnssec")
+        if not spec:
+            return
+        zone = zone_payload["zone"]
+        if self._dnssec_specs is None:
+            self._dnssec_specs = {}
+        self._dnssec_specs[zone] = spec
+        if spec.get("ignored"):
+            log.warning(
+                "technitium_dnssec_policy_not_expressible", zone=zone, ignored=spec["ignored"]
+            )
+        try:
+            props = self._call(
+                token, "GET", "zones/dnssec/properties/get", {"zone": zone}
+            ).json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("technitium_dnssec_status_unreadable", zone=zone, error=str(exc))
+            self._note_apply_failure(f"{zone}: DNSSEC status unreadable: {exc}")
+            return
+        if props.get("status") != "ok":
+            log.warning(
+                "technitium_dnssec_status_unreadable", zone=zone, error=props.get("errorMessage")
+            )
+            self._note_apply_failure(f"{zone}: DNSSEC status: {props.get('errorMessage')}")
+            return
+        info = props.get("response") or {}
+        status = str(info.get("dnssecStatus") or "")
+        if status == "Unsigned":
+            try:
+                self._sign_zone(token, zone, spec["params"])
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                log.error("technitium_dnssec_sign_failed", zone=zone, error=str(exc))
+                self._note_apply_failure(f"{zone}: DNSSEC sign: {exc}")
+            return
+        mismatches: list[str] = []
+        keys = info.get("dnssecPrivateKeys") or []
+        live_algos = {int(k.get("algorithmNumber") or 0) for k in keys}
+        if live_algos and live_algos != {spec["algorithm_number"]}:
+            mismatches.append("algorithm")
+        if (status == "SignedWithNSEC3") != bool(spec["nsec3"]):
+            mismatches.append("NSEC/NSEC3")
+        if mismatches:
+            log.warning("technitium_dnssec_policy_mismatch", zone=zone, differs=mismatches)
+            self._note_apply_failure(
+                f"{zone}: signed with a different {' and '.join(mismatches)} than its DNSSEC "
+                "policy; unsign and re-sign the zone to apply it (this changes the keys, so "
+                "re-publish the DS)"
+            )
+
+    def _sign_zone(self, token: str, zone: str, params: dict[str, str]) -> bool:
+        """``zones/dnssec/sign``; True when it signed, False when already signed."""
+        resp = self._call(token, "POST", "zones/dnssec/sign", {"zone": zone, **params})
+        body = resp.json()
+        if body.get("status") != "ok":
+            msg = (body.get("errorMessage") or "").lower()
+            if "already signed" not in msg:
+                raise RuntimeError(f"Technitium sign {zone} failed: {body.get('errorMessage')}")
+            log.info("technitium_dnssec_already_signed", zone=zone)
+            return False
+        log.info("technitium_dnssec_signed", zone=zone)
+        return True
+
     def _dnssec_sign(self, token: str, zone: str) -> dict[str, Any]:
         """Sign the zone, then report its DS rrset + per-key state.
 
@@ -3792,22 +3939,77 @@ class TechnitiumDriver(DriverBase):
         zone" clicks should converge on "signed", not error. Technitium
         answers an already-signed zone with ``Cannot sign zone: the zone
         is already signed.`` (verified live), which is treated as success
-        so the collect below still reports current state.
+        so the collect below still reports current state. Signs with the
+        zone's policy as last read from the bundle (#1767).
         """
+        spec = (self._dnssec_specs or {}).get(zone)
+        params = spec["params"] if spec else _DNSSEC_SIGN_DEFAULTS
+        self._sign_zone(token, zone, params)
+        return self._collect_dnssec_state(token, zone)
+
+    def _dnssec_rollover(self, token: str, op: dict[str, Any]) -> dict[str, Any] | None:
+        """Roll one key now (``zones/dnssec/properties/rolloverDnsKey``, #1767).
+
+        Technitium generates and publishes the replacement and retires the old
+        key once it is active. A KSK's ``rolloverDays`` defaults to 0 (never),
+        so this is the only way a KSK rolls. The new key set is read back so
+        the control plane (and the DS to publish) follow.
+        """
+        zone = op["zone_name"].rstrip(".")
+        key_tag = (op.get("record") or {}).get("key_tag")
         resp = self._call(
-            token, "POST", "zones/dnssec/sign", {"zone": zone, **_DNSSEC_SIGN_DEFAULTS}
+            token,
+            "POST",
+            "zones/dnssec/properties/rolloverDnsKey",
+            {"zone": zone, "keyTag": key_tag},
         )
         body = resp.json()
         if body.get("status") != "ok":
-            msg = (body.get("errorMessage") or "").lower()
-            if "already signed" not in msg:
-                raise RuntimeError(
-                    f"Technitium sign {zone} failed: {body.get('errorMessage')}"
-                )
-            log.info("technitium_dnssec_already_signed", zone=zone)
-        else:
-            log.info("technitium_dnssec_signed", zone=zone)
-        return self._collect_dnssec_state(token, zone)
+            raise RuntimeError(
+                f"Technitium rollover {zone} key {key_tag} failed: {body.get('errorMessage')}"
+            )
+        log.info("technitium_dnssec_rollover_triggered", zone=zone, key_tag=key_tag)
+        return {"dnssec_state": self._collect_dnssec_state(token, zone)}
+
+    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        """Report entries for every signed primary zone in ``bundle`` (#1767).
+
+        The sync loop calls this after each structural apply and on its
+        periodic refresh, which is what carries a ZSK auto-rollover, or a KSK
+        moving from Ready to Active once the DS lands, back to the control
+        plane. (It used to exist only as the private per-zone helper below,
+        reached from the sign op, so state was reported once and never again.)
+        A zone whose keys cannot be read is left out and ``dnssec_incomplete``
+        set, so the sync loop retries soon instead of reporting an empty key
+        set that would wipe the control plane's rows.
+        """
+        self.dnssec_incomplete = False
+        out: list[dict[str, Any]] = []
+        zones = [
+            (z.get("name") or "").rstrip(".")
+            for z in bundle.get("zones") or []
+            if z.get("dnssec_enabled") and (z.get("type") or "primary").lower() in {"primary", "master"}
+        ]
+        if not zones:
+            return out
+        token = self._get_api_token()
+        if token is None:
+            self.dnssec_incomplete = True
+            return out
+        for zname in dict.fromkeys(zones):
+            if not zname:
+                continue
+            try:
+                state = self._collect_dnssec_state(token, zname)
+            except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                log.warning("dnssec_state_collect_failed", zone=zname, error=str(exc))
+                self.dnssec_incomplete = True
+                continue
+            if not state["keys"]:
+                self.dnssec_incomplete = True
+                continue
+            out.append(state)
+        return out
 
     def _dnssec_unsign(self, token: str, zone: str) -> dict[str, Any]:
         """Unsign, and report empty DS + no keys so the control plane
@@ -3962,11 +4164,13 @@ class TechnitiumDriver(DriverBase):
             self._save_held_zone_now(zone)
         if not held:
             self._reconcile_zone_body(token, zone, zone_payload, options)
+            self._reconcile_dnssec(token, zone_payload)
             return False
         try:
             # The zone's options, query access among them, are what release
             # the hold, so they are applied last rather than first.
             self._reconcile_zone_body(token, zone, zone_payload, None)
+            self._reconcile_dnssec(token, zone_payload)
         finally:
             released = self._release_zone(token, zone, options)
         return not released

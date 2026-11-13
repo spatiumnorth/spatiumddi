@@ -1189,8 +1189,8 @@ async def find_zone_dnssec_info(
         # keys: the DS shown is one server's, and the others' do not match it.
         "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
         "signing_servers": signers,
-        # #1783 — the group runs Technitium: SpatiumDDI will not sign or
-        # re-sign here (#1767), so do not propose it. With dnssec_enabled,
+        # The group runs the agentless Technitium API driver: SpatiumDDI will
+        # not sign or re-sign here, so do not propose it. With dnssec_enabled,
         # the zone was signed before that and is not kept signed.
         "signing_unmanaged": unmanaged,
         "dnssec_unmanaged_warning": bool(zone.dnssec_enabled) and unmanaged,

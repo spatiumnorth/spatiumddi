@@ -1,7 +1,7 @@
 """Single-signer rule for DNSSEC on a multi-server group (#1762).
 
-Every agent engine (BIND9 inline-signing, PowerDNS, and Technitium for zones
-signed before #1783 withdrew it) signs a zone *independently on each server*
+Every agent engine (BIND9 inline-signing, PowerDNS and Technitium) signs a zone
+*independently on each server*
 with keys that server generated and holds.
 SpatiumDDI has no shared key custody, so a signed zone on a group with two
 agent servers is served with two different DNSKEY sets: a validating
@@ -51,28 +51,26 @@ from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
 #: Agent drivers SpatiumDDI signs on: the single source for the router's
 #: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` and ``zone_move``'s
-#: ``DNSSEC_SIGN_DRIVERS``, which both read it from here.
-SIGNING_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns"})
+#: ``DNSSEC_SIGN_DRIVERS``, which both read it from here. Technitium is in it
+#: since #1767: the agent reconciles a zone's signing state from every bundle
+#: (a new server, a re-created zone or a lost volume is signed again), maps the
+#: zone's ``DNSSECPolicy`` onto the sign parameters and reports key state back.
+SIGNING_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns", "technitium"})
 
-#: Agent drivers that may still serve a zone signed before SpatiumDDI stopped
-#: offering signing there (#1783). Technitium signs once and never re-signs
-#: on a new server, a re-created zone or a lost volume, so new signing is
-#: refused; full support is #1767. A zone already signed keeps serving and
-#: can be unsigned, and the zone response flags it ``dnssec_unmanaged_warning``.
-UNMANAGED_SIGNING_DRIVERS: frozenset[str] = frozenset({"technitium"})
+#: Agent drivers that SpatiumDDI no longer signs on but may still serve a
+#: zone signed earlier. Empty since #1767 re-enabled Technitium; kept as the
+#: seam a future withdrawal would use.
+UNMANAGED_SIGNING_DRIVERS: frozenset[str] = frozenset()
 
 #: Agent drivers whose servers hold their own per-server keys for a signed
-#: zone: everything the single-signer rule counts. Technitium stays in it for
-#: zones signed before #1783: a second Technitium server would serve such a
-#: zone unsigned under the parent's DS, which is just as bogus.
+#: zone: everything the single-signer rule counts.
 PER_SERVER_SIGNING_DRIVERS: frozenset[str] = SIGNING_DRIVERS | UNMANAGED_SIGNING_DRIVERS
 
-#: Every driver on which a new signing request is refused with the Technitium
-#: explanation: the agent-managed ``technitium`` plus the agentless
-#: ``technitium_api`` (#3806). The latter is outside the single-signer count
-#: (it holds no per-server keys SpatiumDDI created) but is the same daemon, and
-#: a sign op against it would be one-shot in exactly the same way.
-SIGN_REFUSED_TECHNITIUM_DRIVERS: frozenset[str] = UNMANAGED_SIGNING_DRIVERS | {"technitium_api"}
+#: Drivers on which a new signing request is refused with the Technitium
+#: explanation: the agentless ``technitium_api`` (#3806). It holds no
+#: per-server keys SpatiumDDI created and has no agent to reconcile signing
+#: state from the bundle, so a sign op against it would be one-shot.
+SIGN_REFUSED_TECHNITIUM_DRIVERS: frozenset[str] = frozenset({"technitium_api"})
 
 WORKAROUND = (
     "Keep a single DNS server in the group (delete it or move the others to "
