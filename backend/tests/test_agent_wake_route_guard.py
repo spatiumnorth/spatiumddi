@@ -44,6 +44,9 @@ DELEGATES: dict[tuple[str, str], str] = {
     ("DELETE", "/api/v1/dhcp/scopes/{scope_id}"): (
         "app.services.ai.operations_risky._apply_delete_scope"
     ),
+    ("POST", "/api/v1/dhcp/leases/{lease_id}/reprovision"): (
+        "app.services.dhcp.reprovision.commit_reprovision"
+    ),
     **{
         ("POST", f"/api/v1/dhcp/import/{src}/commit"): "app.api.v1.dhcp_import.router._run_commit"
         for src in ("kea", "isc", "windows")

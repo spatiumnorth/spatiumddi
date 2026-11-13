@@ -2143,6 +2143,11 @@ already wires this up for every delete / allocate / create flow.
   *or* subnets returns `409` with a breakdown (*"Block 10.0.0.0/8
   still contains 3 child block(s) and 5 subnet(s)"*).
   `backend/app/api/v1/ipam/router.py`.
+- **Re-provision a lease-mirror row to static (#1287).** A
+  `auto_from_lease` row's context menu offers **Re-provision to static…**
+  (superadmin): the same preview-then-commit move to a reserved-range
+  address that the DHCP lease list offers; see
+  [DHCP.md](DHCP.md#re-provision-a-lease-to-a-static-address-issue-1287).
 - **Subnet delete refused when non-empty.** A subnet with user-owned
   IPs (anything other than `network`, `broadcast`, `orphan`, or
   DHCP-lease-mirrored `auto_from_lease` rows) or any DHCP scope

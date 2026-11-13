@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import { Field } from "@/pages/dhcp/_shared";
+import { ReprovisionAddressModal } from "@/pages/dhcp/ReprovisionLeaseModal";
 import {
   useQuery,
   useQueries,
@@ -5244,6 +5245,8 @@ export function SubnetDetail({
 
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
+  // #1287 — re-provision a lease-mirror row onto a static address.
+  const [reprovisionIp, setReprovisionIp] = useState<string | null>(null);
   const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   // Per-user sticky toggle to hide the protocol-padding rows (network /
@@ -7347,6 +7350,15 @@ export function SubnetDetail({
                                 <ContextMenuItem disabled>
                                   Managed by DHCP — read-only
                                 </ContextMenuItem>
+                                {perms.isSuperadmin && (
+                                  <ContextMenuItem
+                                    onSelect={() =>
+                                      setReprovisionIp(addr.address)
+                                    }
+                                  >
+                                    Re-provision to static…
+                                  </ContextMenuItem>
+                                )}
                               </>
                             )}
                           </ContextMenuContent>
@@ -7491,6 +7503,12 @@ export function SubnetDetail({
         <EditAddressModal
           address={editingAddress}
           onClose={() => setEditingAddress(null)}
+        />
+      )}
+      {reprovisionIp && (
+        <ReprovisionAddressModal
+          ip={reprovisionIp}
+          onClose={() => setReprovisionIp(null)}
         />
       )}
       {viewingAddress && (
