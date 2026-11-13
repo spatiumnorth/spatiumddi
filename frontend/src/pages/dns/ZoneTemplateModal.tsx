@@ -8,6 +8,7 @@ import {
   type DNSZone,
   type ZoneTemplate,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Zone-template starter wizard.
@@ -181,9 +182,9 @@ export function ZoneTemplateModal({
               ))}
 
               {createMut.isError && (
-                <p className="text-xs text-destructive">
+                <FormError className="text-xs text-destructive">
                   {formatApiError(createMut.error, "Could not create zone")}
-                </p>
+                </FormError>
               )}
 
               <div className="flex items-center justify-end gap-2 pt-1">

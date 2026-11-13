@@ -222,3 +222,62 @@ describe("New token dialog focus (#3483)", () => {
     expect(document.activeElement).toBe(opener);
   });
 });
+
+describe("API token whose owner must change password (#3784)", () => {
+  async function showBlocked(isActive: boolean) {
+    myPermissions.mockResolvedValue({ is_superadmin: true, grants: [] });
+    list.mockResolvedValue([
+      {
+        ...token("t-pw", "pw-token", isActive),
+        owner_password_change_required: true,
+        blocked_reason: "The owner must change their password",
+      },
+    ]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("pw-token");
+    await act(async () => {});
+  }
+
+  it("is not labelled Active", async () => {
+    await showBlocked(true);
+    expect(screen.getByText(/password change required/)).toBeTruthy();
+    expect(screen.queryByText("Active")).toBeNull();
+  });
+
+  it("Re-enable does not promise immediate authentication", async () => {
+    await showBlocked(false);
+    fireEvent.click(screen.getByTitle("Re-enable"));
+    expect(screen.queryByText(/starts authenticating again/)).toBeNull();
+    expect(screen.getByText(/keep being refused/)).toBeTruthy();
+  });
+});
+
+describe("Delete API Token refusal (#3822)", () => {
+  it("says why in the dialog and re-reads the list", async () => {
+    const remove = vi.fn().mockRejectedValue(
+      Object.assign(new Error("404"), {
+        response: { status: 404, data: { detail: "Token not found" } },
+      }),
+    );
+    const { apiTokensApi } = await import("@/lib/api");
+    apiTokensApi.delete = remove;
+    await show(false);
+    fireEvent.click(screen.getAllByTitle("Delete")[0]);
+    const calls = list.mock.calls.length;
+    const btns = await screen.findAllByRole("button", { name: "Delete" });
+    fireEvent.click(btns[btns.length - 1]);
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Token not found",
+      ),
+    );
+    await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(calls));
+  });
+});

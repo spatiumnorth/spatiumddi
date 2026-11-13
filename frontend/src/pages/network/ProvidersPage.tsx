@@ -16,6 +16,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -179,6 +180,7 @@ function ProviderEditorModal({
             <select
               className={inputCls}
               value={defaultAsnId}
+              aria-label="Default ASN"
               onChange={(e) => setDefaultAsnId(e.target.value)}
               disabled={asnsQuery.isLoading || !canReadAsns}
               title={
@@ -221,7 +223,9 @@ function ProviderEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -477,8 +481,10 @@ export function ProvidersPage() {
                         setSearch("");
                         setKindFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New provider" to add one.`}
                     >
-                      No providers yet — click "New provider" to add one.
+                      No providers yet.
                     </ListEmpty>
                   </td>
                 </tr>

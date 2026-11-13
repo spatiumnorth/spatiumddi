@@ -1,0 +1,2 @@
+### Fixed
+- An E911 location binding is no longer silently dropped by automatic deletes: Split puts a subnet's binding on every child and Merge keeps one (or refuses when the sources are bound to different locations); Resize and Merge keep a Gateway or boundary row a binding names; a lease's or reservation's address row that carries a binding is kept as a free address when the lease ends or the reservation's scope or subnet is deleted, and a reservation that moves takes its binding along (#3899, #3958, #3964).

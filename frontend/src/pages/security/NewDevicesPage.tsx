@@ -23,6 +23,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Pager } from "@/components/ui/pager";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -223,6 +224,9 @@ export function NewDevicesPage() {
   });
 
   const moduleSummary = summaryQ.data;
+  // A refused summary read leaves each counter a dash, which reads as "not
+  // loaded yet" rather than "not permitted" — say so once, above them (#3836).
+  const summaryRefused = summaryQ.isError;
 
   return (
     <div className="space-y-4 p-4 md:p-6">
@@ -259,6 +263,11 @@ export function NewDevicesPage() {
       </div>
 
       {/* Summary counts */}
+      {summaryRefused && (
+        <p className="text-xs">
+          <ListReadError error={summaryQ.error} what="new-device counts" />
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <SummaryCard
           label="New"
@@ -350,7 +359,9 @@ export function NewDevicesPage() {
         />
 
         <span className="ml-auto text-xs text-muted-foreground">
-          {total} sighting{total === 1 ? "" : "s"}
+          {sightingsQ.isError
+            ? "Sightings unavailable"
+            : `${total} sighting${total === 1 ? "" : "s"}`}
         </span>
       </div>
 
@@ -416,9 +427,13 @@ export function NewDevicesPage() {
       <div className="rounded-lg border">
         {rows.length === 0 ? (
           <p className="p-8 text-center text-sm text-muted-foreground">
-            {sightingsQ.isLoading
-              ? "Loading…"
-              : "No sightings match these filters."}
+            {sightingsQ.isLoading ? (
+              "Loading…"
+            ) : (
+              <ListEmpty error={sightingsQ.error} what="sightings">
+                No sightings match these filters.
+              </ListEmpty>
+            )}
           </p>
         ) : (
           <div className="overflow-x-auto">

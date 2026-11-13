@@ -622,3 +622,34 @@ async def test_the_migration_encrypts_existing_plaintext(db_session: AsyncSessio
         )
     ).scalar_one()
     assert back == _TEAMS
+
+
+async def test_an_smtp_update_keeps_the_password_unless_told_to_clear(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3927: omitted / null keeps the SMTP password; only ``""`` clears it."""
+    headers = await _admin(db_session)
+    body = {
+        "name": "mail",
+        "kind": "smtp",
+        "smtp_host": "smtp.example.test",
+        "smtp_username": "u",
+        "smtp_password": "s3cret-pw",
+        "smtp_from_address": "a@example.test",
+        "smtp_to_addresses": ["b@example.test"],
+    }
+    created = await client.post(_TARGETS, headers=headers, json=body)
+    assert created.status_code == 201, created.text
+    tid = created.json()["id"]
+    assert created.json()["smtp_password_set"] is True
+    edit = {k: v for k, v in body.items() if k != "smtp_password"}
+
+    for extra in ({}, {"smtp_password": None}):
+        resp = await client.put(f"{_TARGETS}/{tid}", headers=headers, json={**edit, **extra})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["smtp_password_set"] is True
+
+    resp = await client.put(
+        f"{_TARGETS}/{tid}", headers=headers, json={**edit, "smtp_password": ""}
+    )
+    assert resp.json()["smtp_password_set"] is False

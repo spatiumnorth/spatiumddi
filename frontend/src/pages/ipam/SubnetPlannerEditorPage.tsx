@@ -519,7 +519,7 @@ function TreeNodeRow({
           ...node.children,
           {
             id: newNodeId(),
-            network: suggestChildCidr(node, node.children),
+            network: suggestChildCidr(node, node.children, kind),
             name: "",
             description: "",
             kind,

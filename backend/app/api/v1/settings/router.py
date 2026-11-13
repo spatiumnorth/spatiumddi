@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 import uuid
 from datetime import UTC, datetime
 from ipaddress import ip_network
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import structlog
 from fastapi import (
@@ -444,6 +445,127 @@ def _redact_syslog_target(t: Any) -> dict[str, Any]:
         "protocol": t.get("protocol") or "udp",
         "format": t.get("format") or "rfc5424",
         "ca_cert_set": bool(t.get("ca_cert_pem")),
+    }
+
+
+# ── Section audit rows: changed fields only (#3995, follow-up to #3847) ───────
+#
+# SSH / resolver / syslog / APT write a row naming only the fields that
+# changed, with old and new values, and no row when nothing changed. The
+# snapshots below carry NO secret: SSH keys and APT GPG keys / mirror auth
+# appear as digests of the stored value, a syslog CA as a digest, never the
+# material. Reusable for any section: snapshot before, snapshot after, then
+# ``_section_audit_diff``.
+
+
+def _digest(value: Any) -> str:
+    """Short, non-reversible digest of a stored secret-bearing value."""
+    if not value:
+        return ""
+    raw = value if isinstance(value, bytes) else str(value).encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _ssh_key_fingerprint(public_key: str) -> str:
+    """OpenSSH-style ``SHA256:`` fingerprint of a public key line."""
+    import base64
+
+    parts = (public_key or "").split()
+    if len(parts) < 2:
+        return _digest(public_key)
+    try:
+        blob = base64.b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+    except ValueError:
+        return _digest(public_key)
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def _section_audit_diff(
+    old: dict[str, Any], new: dict[str, Any]
+) -> tuple[list[str], dict[str, Any], dict[str, Any]] | None:
+    """``(changed_fields, old_value, new_value)`` for the keys that differ,
+    or None when nothing changed (so the caller writes no row)."""
+    changed = sorted(k for k in new if old.get(k) != new[k])
+    if not changed:
+        return None
+    return changed, {k: old.get(k) for k in changed}, {k: new[k] for k in changed}
+
+
+def _ssh_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "password_auth_enabled": bool(st.ssh_password_auth_enabled),
+        "allow_root_login": bool(st.ssh_allow_root_login),
+        "port": int(st.ssh_port or 22),
+        "allowed_source_networks": list(st.ssh_allowed_source_networks or []),
+        "lockdown": bool(st.ssh_lockdown),
+        "authorized_keys": [
+            {
+                "name": (k.get("name") or "") if isinstance(k, dict) else "",
+                "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
+                "fingerprint": (
+                    _ssh_key_fingerprint(k.get("public_key") or "") if isinstance(k, dict) else ""
+                ),
+            }
+            for k in (st.ssh_authorized_keys or [])
+        ],
+    }
+
+
+def _resolver_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "mode": st.resolver_mode,
+        "servers": list(st.resolver_servers or []),
+        "fallback_servers": list(st.resolver_fallback_servers or []),
+        "search_domains": list(st.resolver_search_domains or []),
+        "dnssec": st.resolver_dnssec,
+        "dns_over_tls": st.resolver_dns_over_tls,
+    }
+
+
+def _syslog_audit_snapshot(st: Any) -> dict[str, Any]:
+    targets = []
+    for t in st.syslog_targets or []:
+        red = _redact_syslog_target(t)
+        red["ca_fingerprint"] = _digest(t.get("ca_cert_pem")) if isinstance(t, dict) else ""
+        targets.append(red)
+    return {
+        "enabled": bool(st.syslog_enabled),
+        "targets": targets,
+        "filter": st.syslog_filter or "",
+        "buffer_disk": bool(st.syslog_buffer_disk),
+    }
+
+
+def _apt_audit_snapshot(st: Any) -> dict[str, Any]:
+    return {
+        "managed": bool(st.apt_managed),
+        "source_count": len(st.apt_sources or []),
+        # Source URIs can embed credentials: digest only.
+        "sources_digest": _digest(json.dumps(st.apt_sources or [], sort_keys=True, default=str)),
+        "gpg_keys": [
+            (
+                {**_redact_apt_gpg_key(k), "digest": _digest(k.get("armoured_text_enc"))}
+                if isinstance(k, dict)
+                else _redact_apt_gpg_key(k)
+            )
+            for k in (st.apt_gpg_keys or [])
+        ],
+        "auth_entries": [
+            (
+                {**_redact_apt_auth(a), "digest": _digest(a.get("password_enc"))}
+                if isinstance(a, dict)
+                else _redact_apt_auth(a)
+            )
+            for a in (st.apt_auth or [])
+        ],
+        "proxy_http_set": bool(st.apt_proxy_http),
+        "proxy_https_set": bool(st.apt_proxy_https),
+        "unattended_upgrades_enabled": bool(st.apt_unattended_upgrades_enabled),
+        "no_proxy": st.apt_proxy_no_proxy or "",
+        "unattended_origins": list(st.apt_unattended_origins or []),
+        "unattended_blocklist": list(st.apt_unattended_blocklist or []),
+        "unattended_automatic_reboot": bool(st.apt_unattended_automatic_reboot),
+        "unattended_reboot_time": st.apt_unattended_reboot_time or "",
     }
 
 
@@ -2198,6 +2320,13 @@ async def update_settings(
                 detail="resolver override mode requires at least one DNS server",
             )
 
+    # #3995 — section snapshots, taken before ANY write (the SSH key list is
+    # assigned directly further down, ahead of the generic setattr loop).
+    _ssh_old = _ssh_audit_snapshot(settings)
+    _resolver_old = _resolver_audit_snapshot(settings)
+    _syslog_old = _syslog_audit_snapshot(settings)
+    _apt_old = _apt_audit_snapshot(settings)
+
     # Old values of the fields the generic audit row below covers, taken before
     # anything is popped or written. Secrets are reduced to set / unset and
     # ``snmp_v3_users`` to its redacted shape.
@@ -2227,12 +2356,6 @@ async def update_settings(
     # loop so we can detect an actual flip and write a dedicated audit row.
     _supervisor_reg_prev = bool(settings.supervisor_registration_enabled)
     _supervisor_reg_requested = changes.get("supervisor_registration_enabled")
-
-    # Issue #155 — whether this request touched any APT field. Computed here
-    # (before the secret-bearing apt_sources / apt_gpg_keys / apt_auth get
-    # popped out of ``changes`` during processing) so an apt_sources-only
-    # change still triggers the dedicated audit row below (NN #4).
-    _apt_touched = any(f.startswith("apt_") for f in changes)
 
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
@@ -2565,6 +2688,10 @@ async def update_settings(
         if f in changes and getattr(settings, f) != changes[f]
     }
 
+    # #3847 — branding values before the save, so its audit row records
+    # only what changed (and nothing when the form is echoed back).
+    _branding_old = {f: getattr(settings, f) for f in _branding_fields}
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2618,10 +2745,10 @@ async def update_settings(
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who
     # can log into every appliance host), so a durable audit entry is
-    # required. Public keys are NOT secrets, so the full key list is
-    # recorded (no redaction). Fires whenever this request touched any
+    # required. Keys are recorded by fingerprint only (#3995). Fires whenever this request touched any
     # ``ssh_*`` field.
-    if _ssh_field_in_request:
+    _diff = _section_audit_diff(_ssh_old, _ssh_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2632,23 +2759,9 @@ async def update_settings(
                 resource_id="ssh",
                 resource_display="SSH access",
                 result="success",
-                new_value={
-                    "password_auth_enabled": bool(settings.ssh_password_auth_enabled),
-                    "allow_root_login": bool(settings.ssh_allow_root_login),
-                    "port": int(settings.ssh_port or 22),
-                    "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
-                    "lockdown": bool(settings.ssh_lockdown),
-                    "authorized_keys": [
-                        {
-                            "name": (k.get("name") or "") if isinstance(k, dict) else "",
-                            "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
-                            "public_key": (
-                                (k.get("public_key") or "") if isinstance(k, dict) else ""
-                            ),
-                        }
-                        for k in (settings.ssh_authorized_keys or [])
-                    ],
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2660,8 +2773,8 @@ async def update_settings(
     # whenever this request touched any ``resolver_*`` field. Computed off
     # ``changes`` which still carries the resolver keys (they go through
     # the generic setattr loop, no special pop like ssh/syslog).
-    _resolver_touched = any(f.startswith("resolver_") for f in changes)
-    if _resolver_touched:
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2672,14 +2785,9 @@ async def update_settings(
                 resource_id="resolver",
                 resource_display="DNS resolver",
                 result="success",
-                new_value={
-                    "mode": settings.resolver_mode,
-                    "servers": list(settings.resolver_servers or []),
-                    "fallback_servers": list(settings.resolver_fallback_servers or []),
-                    "search_domains": list(settings.resolver_search_domains or []),
-                    "dnssec": settings.resolver_dnssec,
-                    "dns_over_tls": settings.resolver_dns_over_tls,
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2709,8 +2817,8 @@ async def update_settings(
     # secret CA PEM, so a durable, redacted audit entry is required. Fires
     # whenever this request touched any ``syslog_*`` field (the targets
     # list shows only the redacted shape — no CA PEM bytes).
-    _syslog_touched = any(f.startswith("syslog_") for f in changes)
-    if _syslog_touched:
+    _diff = _section_audit_diff(_syslog_old, _syslog_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2721,12 +2829,9 @@ async def update_settings(
                 resource_id="syslog",
                 resource_display="Syslog forwarding",
                 result="success",
-                new_value={
-                    "enabled": bool(settings.syslog_enabled),
-                    "targets": [_redact_syslog_target(t) for t in (settings.syslog_targets or [])],
-                    "filter": settings.syslog_filter or "",
-                    "buffer_disk": bool(settings.syslog_buffer_disk),
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2737,7 +2842,8 @@ async def update_settings(
     # generic ``logger.info`` below is not an ``audit_log`` row. The shape
     # records counts + presence only (never the armoured key / password,
     # and not the raw proxy URL which may embed credentials).
-    if _apt_touched:
+    _diff = _section_audit_diff(_apt_old, _apt_audit_snapshot(settings))
+    if _diff:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2748,20 +2854,9 @@ async def update_settings(
                 resource_id="apt",
                 resource_display="APT sources",
                 result="success",
-                new_value={
-                    "managed": bool(settings.apt_managed),
-                    "source_count": len(settings.apt_sources or []),
-                    "gpg_key_count": len(settings.apt_gpg_keys or []),
-                    "auth_entry_count": len(settings.apt_auth or []),
-                    "proxy_http_set": bool(settings.apt_proxy_http),
-                    "proxy_https_set": bool(settings.apt_proxy_https),
-                    "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
-                    # Issue #164 — unattended-upgrades policy summary.
-                    "unattended_origin_count": len(settings.apt_unattended_origins or []),
-                    "unattended_blocklist_count": len(settings.apt_unattended_blocklist or []),
-                    "unattended_automatic_reboot": bool(settings.apt_unattended_automatic_reboot),
-                    "unattended_reboot_time": settings.apt_unattended_reboot_time or "",
-                },
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
             )
         )
 
@@ -2844,7 +2939,10 @@ async def update_settings(
 
     # Branding (#885 / #887 / #888) — what an anonymous visitor sees before
     # they authenticate, so every change is on the record.
-    if _branding_fields:
+    _branding_changed = sorted(
+        f for f in _branding_fields if getattr(settings, f) != _branding_old[f]
+    )
+    if _branding_changed:
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2855,18 +2953,9 @@ async def update_settings(
                 resource_id="branding",
                 resource_display="Branding",
                 result="success",
-                new_value={
-                    "app_title": str(settings.app_title or ""),
-                    "login_banner_enabled": bool(settings.login_banner_enabled),
-                    "login_banner_title": str(settings.login_banner_title or ""),
-                    "login_banner_text": str(settings.login_banner_text or ""),
-                    "login_banner_require_ack": bool(settings.login_banner_require_ack),
-                    "env_banner_enabled": bool(settings.env_banner_enabled),
-                    "env_banner_text": str(settings.env_banner_text or ""),
-                    "env_banner_bg": str(settings.env_banner_bg or ""),
-                    "env_banner_fg": str(settings.env_banner_fg or ""),
-                    "env_banner_position": str(settings.env_banner_position or "top"),
-                },
+                changed_fields=_branding_changed,
+                old_value={f: _branding_old[f] for f in _branding_changed},
+                new_value={f: getattr(settings, f) for f in _branding_changed},
             )
         )
 
@@ -3001,32 +3090,30 @@ async def update_resolver_settings(
             detail="resolver override mode requires at least one DNS server",
         )
 
+    _resolver_old = _resolver_audit_snapshot(settings)
     for field, value in changes.items():
         setattr(settings, field, value)
 
     # Dedicated audit row (non-negotiable #4) — resolver config steers every
-    # appliance host's DNS lookups. Resolver IPs / domains are not secrets,
-    # so the full shape is recorded.
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="update",
-            resource_type="platform_settings",
-            resource_id="resolver",
-            resource_display="DNS resolver",
-            result="success",
-            new_value={
-                "mode": settings.resolver_mode,
-                "servers": list(settings.resolver_servers or []),
-                "fallback_servers": list(settings.resolver_fallback_servers or []),
-                "search_domains": list(settings.resolver_search_domains or []),
-                "dnssec": settings.resolver_dnssec,
-                "dns_over_tls": settings.resolver_dns_over_tls,
-            },
+    # appliance host's DNS lookups. Resolver IPs / domains are not secrets.
+    # Names only the changed fields (#3995); no row when nothing changed.
+    _diff = _section_audit_diff(_resolver_old, _resolver_audit_snapshot(settings))
+    if _diff:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="resolver",
+                resource_display="DNS resolver",
+                result="success",
+                changed_fields=_diff[0],
+                old_value=_diff[1],
+                new_value=_diff[2],
+            )
         )
-    )
 
     await db.commit()
     await db.refresh(settings)
@@ -3432,8 +3519,11 @@ _VALID_SEVERITIES = {"info", "warn", "error", "denied"}
 
 
 class AuditTargetBody(BaseModel):
-    """Create / update body. kind-specific fields are ignored for
+    """Create body. kind-specific fields are ignored for
     other kinds, so a single shape fits all three (syslog/webhook/smtp)."""
+
+    # True on the update subclass, which is checked on the merged row instead.
+    partial: ClassVar[bool] = False
 
     name: str
     enabled: bool = True
@@ -3520,30 +3610,76 @@ class AuditTargetBody(BaseModel):
         # syslog / URL-less webhook target was saved enabled, then
         # silently skipped by ``audit_forward._load_targets``, and an
         # SMTP target with no recipients warned on every audit row.
-        if self.kind == "syslog":
-            if not self.host.strip():
-                raise ValueError("host is required for a syslog target")
-            if not (1 <= self.port <= 65535):
-                raise ValueError("port must be 1–65535")
-            if not (0 <= self.facility <= 23):
-                raise ValueError("facility must be 0–23 (RFC 5424)")
-        elif self.kind == "webhook":
+        if self.partial:
+            return self
+        _check_kind_config(
+            self.kind,
+            host=self.host,
+            port=self.port,
+            facility=self.facility,
+            smtp_host=self.smtp_host,
+            smtp_port=self.smtp_port,
+            smtp_from_address=self.smtp_from_address,
+            smtp_to_addresses=self.smtp_to_addresses,
+        )
+        if self.kind == "webhook":
             # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
             # so only an explicit blank is refused here. A webhook with no
             # URL at all is caught by ``_require_webhook_url``.
             if self.url is not None and not self.url.strip():
                 raise ValueError("url is required for a webhook target")
-        elif self.kind == "smtp":
-            if not self.smtp_host.strip():
-                raise ValueError("smtp_host is required for an smtp target")
-            if not (1 <= self.smtp_port <= 65535):
-                raise ValueError("smtp_port must be 1–65535")
-            if not self.smtp_from_address.strip():
-                raise ValueError("smtp_from_address is required for an smtp target")
-            recipients = [a for a in (self.smtp_to_addresses or []) if a and a.strip()]
-            if not recipients:
-                raise ValueError("smtp_to_addresses must contain at least one recipient")
         return self
+
+
+def _check_kind_config(
+    kind: str,
+    *,
+    host: str,
+    port: int,
+    facility: int,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_from_address: str,
+    smtp_to_addresses: list[str] | None,
+) -> None:
+    """Per-kind completeness of a target's final field values (#1581).
+
+    Shared by the create body validator and the update handler, which runs
+    it on the merged row (#3926): a PUT carrying one field validates the
+    result, not the partial body.
+    """
+    if kind == "syslog":
+        if not (host or "").strip():
+            raise ValueError("host is required for a syslog target")
+        if not (1 <= port <= 65535):
+            raise ValueError("port must be 1–65535")
+        if not (0 <= facility <= 23):
+            raise ValueError("facility must be 0–23 (RFC 5424)")
+    elif kind == "smtp":
+        if not (smtp_host or "").strip():
+            raise ValueError("smtp_host is required for an smtp target")
+        if not (1 <= smtp_port <= 65535):
+            raise ValueError("smtp_port must be 1–65535")
+        if not (smtp_from_address or "").strip():
+            raise ValueError("smtp_from_address is required for an smtp target")
+        recipients = [a for a in (smtp_to_addresses or []) if a and a.strip()]
+        if not recipients:
+            raise ValueError("smtp_to_addresses must contain at least one recipient")
+
+
+class AuditTargetUpdate(AuditTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    The Edit dialog sends just the fields the operator changed, so a field
+    another client stored since the dialog read the target is not put back.
+    Kind-dependent completeness is checked on the merged result in the
+    handler, not on this partial body.
+    """
+
+    name: str | None = None  # type: ignore[assignment]
+    kind: str | None = None  # type: ignore[assignment]
+
+    partial: ClassVar[bool] = True
 
 
 class AuditTargetResponse(BaseModel):
@@ -3610,35 +3746,91 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
+_AUDIT_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "kind",
+    "format",
+    "host",
+    "port",
+    "protocol",
+    "facility",
+    "ca_cert_pem",
+    "webhook_flavor",
+    "smtp_host",
+    "smtp_port",
+    "smtp_security",
+    "smtp_username",
+    "smtp_from_address",
+    "smtp_to_addresses",
+    "smtp_reply_to",
+    "min_severity",
+    "resource_types",
+)
+# Columns that are NULL-able; an explicit null on an update clears them.
+_AUDIT_NULLABLE_FIELDS = {"ca_cert_pem", "smtp_to_addresses", "min_severity", "resource_types"}
+
+
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
+    """Apply ``body`` to ``t``.
+
+    An :class:`AuditTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
+    """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.kind = body.kind
-    t.format = body.format
-    t.host = body.host
-    t.port = body.port
-    t.protocol = body.protocol
-    t.facility = body.facility
-    t.ca_cert_pem = body.ca_cert_pem
+    sent = body.model_fields_set if isinstance(body, AuditTargetUpdate) else None
+    for field in _AUDIT_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None and field not in _AUDIT_NULLABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
+    # ``url`` / ``auth_header`` / ``smtp_password``: ``None`` or omitted
+    # keeps the stored value, ``""`` clears it, anything else is encrypted.
     t.url_encrypted = apply_write_only(t.url_encrypted, body.url)
     t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
-    t.webhook_flavor = body.webhook_flavor
-    t.smtp_host = body.smtp_host
-    t.smtp_port = body.smtp_port
-    t.smtp_security = body.smtp_security
-    t.smtp_username = body.smtp_username
-    t.smtp_from_address = body.smtp_from_address
-    t.smtp_to_addresses = body.smtp_to_addresses
-    t.smtp_reply_to = body.smtp_reply_to
-    # ``smtp_password`` semantics: ``None`` = leave existing encrypted
-    # value alone (operator editing other fields), ``""`` = clear,
-    # anything else = encrypt + replace.
     if body.smtp_password is not None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
-    t.min_severity = body.min_severity
-    t.resource_types = body.resource_types
+
+
+def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None:
+    """422 when the target as it would be stored is incomplete (#3926).
+
+    Runs BEFORE :func:`_apply_body`, on the row's values overlaid with the
+    keys the body carries, so one field sent for a syslog target is judged
+    against the host it already has, not against the webhook fields it does
+    not carry, and a refusal leaves the row untouched.
+    """
+    sent = body.model_fields_set
+
+    def merged(field: str) -> Any:
+        return getattr(body, field) if field in sent else getattr(t, field)
+
+    for field in _AUDIT_PLAIN_FIELDS:
+        if field in sent and getattr(body, field) is None and field not in _AUDIT_NULLABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+    to_addrs = merged("smtp_to_addresses")
+    kind = merged("kind")
+    try:
+        _check_kind_config(
+            kind,
+            host=merged("host") or "",
+            port=merged("port"),
+            facility=merged("facility"),
+            smtp_host=merged("smtp_host") or "",
+            smtp_port=int(merged("smtp_port") or 0),
+            smtp_from_address=merged("smtp_from_address") or "",
+            smtp_to_addresses=list(to_addrs) if to_addrs else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if kind == "webhook":
+        if body.url is not None and not body.url.strip():
+            raise HTTPException(status_code=422, detail="url is required for a webhook target")
+        if body.url is None and not t.url_encrypted:
+            raise HTTPException(status_code=422, detail="url is required for a webhook target")
 
 
 def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
@@ -3766,7 +3958,7 @@ async def update_audit_target(
     # uuid.UUID, not str: a non-UUID path value used to reach the driver and
     # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
     target_id: uuid.UUID,
-    body: AuditTargetBody,
+    body: AuditTargetUpdate,
     current_user: SuperAdmin,
     db: DB,
 ) -> AuditTargetResponse:
@@ -3774,8 +3966,8 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
-    _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
+    _check_merged_target(row, body)
     _apply_body(row, body)
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
@@ -3954,6 +4146,17 @@ class InfluxDBTargetBody(BaseModel):
         return v
 
 
+class InfluxDBTargetUpdate(InfluxDBTargetBody):
+    """PUT body: only the keys the caller sent are applied (#3926).
+
+    A client that sends the whole form back puts the copy it loaded over
+    anything another client stored since; an omitted key is left as stored,
+    so the Edit dialog sends just what the operator changed.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)  # type: ignore[assignment]
+
+
 class InfluxDBTargetResponse(BaseModel):
     id: str
     name: str
@@ -4020,31 +4223,46 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
     )
 
 
+_INFLUX_PLAIN_FIELDS = (
+    "name",
+    "enabled",
+    "version",
+    "url",
+    "verify_tls",
+    "timeout_seconds",
+    "database",
+    "username",
+    "org",
+    "bucket",
+    "measurement_prefix",
+    "push_interval_seconds",
+    "push_dns_metrics",
+    "push_dhcp_metrics",
+    "push_subnet_utilization",
+    "push_dhcp_scope_leases",
+)
+
+
 def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
     """Apply ``body`` to ``t``; return which secrets were set or cleared.
 
     The return value is for the audit row, which never carries a secret but
     must say that one was replaced or removed (``password_set`` /
     ``token_cleared`` …), or a cleared credential leaves no trace.
+
+    A :class:`InfluxDBTargetUpdate` applies only the keys it carries (#3926);
+    a create body applies every field.
     """
     from app.core.crypto import encrypt_str
 
-    t.name = body.name
-    t.enabled = body.enabled
-    t.version = body.version
-    t.url = body.url
-    t.verify_tls = body.verify_tls
-    t.timeout_seconds = body.timeout_seconds
-    t.database = body.database
-    t.username = body.username
-    t.org = body.org
-    t.bucket = body.bucket
-    t.measurement_prefix = body.measurement_prefix
-    t.push_interval_seconds = body.push_interval_seconds
-    t.push_dns_metrics = body.push_dns_metrics
-    t.push_dhcp_metrics = body.push_dhcp_metrics
-    t.push_subnet_utilization = body.push_subnet_utilization
-    t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
+    sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
+    for field in _INFLUX_PLAIN_FIELDS:
+        if sent is not None and field not in sent:
+            continue
+        value = getattr(body, field)
+        if value is None:  # an explicit null name on an update
+            raise HTTPException(status_code=422, detail=f"{field} may not be null")
+        setattr(t, field, value)
     # Blank never clears; only the explicit flag does. A non-blank value
     # sent alongside the flag wins over it: the operator typed a new secret.
     secret_changes: list[str] = []
@@ -4173,7 +4391,7 @@ async def create_influxdb_target(
 @router.put("/influxdb-targets/{target_id}", response_model=InfluxDBTargetResponse)
 async def update_influxdb_target(
     target_id: uuid.UUID,
-    body: InfluxDBTargetBody,
+    body: InfluxDBTargetUpdate,
     current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:

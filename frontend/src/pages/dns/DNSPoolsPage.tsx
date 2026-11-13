@@ -127,8 +127,13 @@ export function DNSPoolsPage() {
             <p className="mt-1 max-w-md text-xs text-muted-foreground">
               A pool maps one DNS name (e.g.{" "}
               <code className="font-mono">www.example.com</code>) to a set of
-              target IPs with health checks. Click <em>New Pool</em> to create
-              one.
+              target IPs with health checks.
+              {!poolGate.disabled && (
+                <>
+                  {" "}
+                  Click <em>New Pool</em> to create one.
+                </>
+              )}
             </p>
           </div>
         )}
