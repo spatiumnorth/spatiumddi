@@ -545,13 +545,16 @@ celery_app.conf.update(
             "task": "app.tasks.subnet_utilization_snapshot.snapshot_subnet_utilization",
             "schedule": schedule(run_every=24 * 3600.0),
         },
-        # Nightly prune of agent-shipped query / activity log entries
-        # older than the retention window (default 24 h). Query logs
+        # Hourly prune of agent-shipped query / activity log entries
+        # older than the retention window (default 24 h), plus terminal
+        # outbox / record-op / config-op rows (#1254). Query logs
         # are a firehose; the short window keeps the tables manageable
-        # without operator tuning.
+        # without operator tuning. Hourly + chunked deletes keep each
+        # transaction small and the effective retention at window + 1 h
+        # rather than up to window + 24 h.
         "log-entries-prune": {
             "task": "app.tasks.prune_logs.prune_log_entries",
-            "schedule": schedule(run_every=24 * 3600.0),
+            "schedule": schedule(run_every=3600.0),
         },
         # Daily at 03:45 UTC (offset from the other prunes), delete
         # terminal packet-capture rows past the retention window

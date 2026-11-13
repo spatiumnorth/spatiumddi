@@ -1232,7 +1232,15 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
     """Queued op for the agent to apply (config push, restart, reload)."""
 
     __tablename__ = "dhcp_config_op"
-    __table_args__ = (Index("ix_dhcp_config_op_server_status", "server_id", "status"),)
+    __table_args__ = (
+        Index("ix_dhcp_config_op_server_status", "server_id", "status"),
+        # #1254 — terminal-row age prune.
+        Index(
+            "ix_dhcp_config_op_terminal_created",
+            "created_at",
+            postgresql_where=sa_text("status IN ('acked', 'failed')"),
+        ),
+    )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
