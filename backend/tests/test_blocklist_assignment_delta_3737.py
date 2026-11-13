@@ -183,3 +183,32 @@ async def _assignment_audits(db: AsyncSession, lid: str) -> int:
             )
         )
     ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_add_only_delta_on_empty_list_persists_4042(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, a, b, url, lid = await _setup(client, db_session, "4042a")
+    r = await client.put(url, json={"add_server_group_ids": [str(a.id)]}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["applied_group_ids"] == [str(a.id)]
+    got = await client.get(f"/api/v1/dns/blocklists/{lid}", headers=h)
+    assert got.json()["applied_group_ids"] == [str(a.id)]
+
+
+@pytest.mark.asyncio
+async def test_view_delta_alone_persists_4042(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.dns import DNSView
+
+    h, a, _b, url, lid = await _setup(client, db_session, "4042v")
+    v = DNSView(name="v4042", group_id=a.id)
+    db_session.add(v)
+    await db_session.flush()
+    r = await client.put(url, json={"add_view_ids": [str(v.id)]}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["applied_view_ids"] == [str(v.id)], r.json()
+    r = await client.put(url, json={"remove_view_ids": [str(v.id)]}, headers=h)
+    assert r.json()["applied_view_ids"] == []

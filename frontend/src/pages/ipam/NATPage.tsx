@@ -568,9 +568,11 @@ export function NATPage() {
                         <span className="text-muted-foreground">
                           {m.internal_subnet_cidr ??
                             m.internal_subnet_name ??
-                            (m.internal_subnet_id
-                              ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
-                              : "—")}
+                            (m.internal_subnet_redacted
+                              ? "restricted subnet"
+                              : m.internal_subnet_id
+                                ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+                                : "—")}
                         </span>
                       ) : (
                         (m.internal_ip ?? "—")

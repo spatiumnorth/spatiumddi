@@ -177,6 +177,20 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
         return None
 
 
+# #3811 — consecutive timed-out / 5xx posts before the control plane counts as
+# down (and a snapshot is owed once it answers again). Fewer than this are a
+# slow API, retried from the spool as the same batch.
+_SLOW_FAILURES_FOR_OUTAGE = 5
+
+
+def _is_unreachable(exc: httpx.HTTPError) -> bool:
+    """True for failures that mean no connection was made (a real outage)."""
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError)) or (
+        isinstance(exc, httpx.TransportError)
+        and not isinstance(exc, (httpx.TimeoutException, httpx.ProtocolError))
+    )
+
+
 class LeaseWatcher:
     def __init__(
         self,
@@ -211,6 +225,7 @@ class LeaseWatcher:
         # the backlog has fully drained (see ``_maybe_snapshot``).
         self._degraded = False
         self._recovered = False
+        self._slow_failures = 0
         if snapshot is None:
             snapshot = LeaseSnapshot(cfg.kea_control_socket, self._post_snapshot)
         self.snapshot = snapshot
@@ -245,19 +260,35 @@ class LeaseWatcher:
         """POST one event batch (live or replayed). Counts what landed."""
         try:
             status = self._poster(payload)
-        except httpx.HTTPError:
-            self._degraded = True
+        except httpx.HTTPError as exc:
+            # #3811 — only a transport failure that says the control plane was
+            # unreachable is an outage. A read timeout (or a 5xx below) means
+            # the API was reached and merely slow: the batch may have landed,
+            # and the spool re-posts it under the SAME batch_id, which the
+            # server dedupes. Escalating that to a full-table snapshot adds
+            # load exactly when the API is behind.
+            if _is_unreachable(exc):
+                self._degraded = True
+            else:
+                self._note_slow_failure()
             raise
         outcome = classify_status(status)
         if outcome == SENT:
+            self._slow_failures = 0
             if not self._poster.last_duplicate:
                 self.heartbeat.lease_count_since_start += len(payload.get("leases") or [])
             if self._degraded:
                 self._degraded = False
                 self._recovered = True
         elif outcome == RETRY:
-            self._degraded = True
+            self._note_slow_failure()
         return status
+
+    def _note_slow_failure(self) -> None:
+        """Count a timed-out / 5xx post; a long unbroken run is an outage."""
+        self._slow_failures += 1
+        if self._slow_failures >= _SLOW_FAILURES_FOR_OUTAGE:
+            self._degraded = True
 
     def _post_snapshot(self, payload: dict[str, Any]) -> int:
         # Snapshot rows are the current lease table, not lease events, so

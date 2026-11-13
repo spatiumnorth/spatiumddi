@@ -1280,6 +1280,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
@@ -2128,6 +2130,8 @@ export const ipamApi = {
         skipped: string[];
         /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
         dns_cleared: string[];
+        /** Why each skipped row was skipped, keyed by id (#3905). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -5236,6 +5240,9 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
+  records_trashed_widened: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */
@@ -5386,6 +5393,8 @@ export interface DNSZoneSyncItem {
   pushed: number;
   server_records: number;
   push_errors: string[];
+  /** The pushed records are queued for background delivery (#3817). */
+  queued_for_agent?: boolean;
   error: string | null;
 }
 
@@ -5395,6 +5404,8 @@ export interface DNSServerSyncResult {
   zones_failed: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   /** Zones listed on the server via WinRM — windows_dns Path B only.
    * Empty for BIND9 and windows_dns without credentials. */
@@ -5428,6 +5439,8 @@ export interface DNSGroupSyncResult {
   servers_succeeded: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   total_zones_imported: number;
   total_zones_pushed_to_server: number;
@@ -13560,7 +13573,7 @@ export interface ApplianceRow {
   host_config_health: Record<
     string,
     {
-      state: "retrying" | "failing";
+      state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
     }
@@ -16394,6 +16407,8 @@ export interface NATMapping {
   // hide-NAT path); without these the UI can only show the bare UUID.
   internal_subnet_cidr: string | null;
   internal_subnet_name: string | null;
+  /** True when the caller cannot read the subnet, so the labels above are withheld (#3641). */
+  internal_subnet_redacted?: boolean;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;
@@ -21539,6 +21554,8 @@ export interface ERLBinding {
   mac_address: string | null;
   ip_address_id: string | null;
   site_id: string | null;
+  target_label?: string | null;
+  target_missing?: boolean;
   is_active: boolean;
   notes: string;
   created_at: string;

@@ -19,6 +19,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { ZoneSerialsLine } from "./ZoneSerialsLine";
+import { servedApexWords } from "./servedApexWords";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -3858,17 +3859,27 @@ function RecordModalForm({
             value={viewId}
             onChange={(e) => setViewId(e.target.value)}
           >
-            <option value="">All views (default)</option>
+            <option value="">No view (unscoped, default)</option>
             {viewChoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
-          {pinViewId && (
+          {pinViewId ? (
             <p className="mt-1 text-xs text-muted-foreground">
               This zone is pinned to one view, so its records can only be in
               that view.
+            </p>
+          ) : (
+            <p
+              className="mt-1 text-xs text-muted-foreground"
+              data-testid="record-view-rule"
+            >
+              A zone with no view of its own is served in the views its records
+              are scoped to. Scoping any record to a view limits the zone, with
+              every unscoped record in it, to the views its records name; only
+              while no record is scoped does the zone serve in every view.
             </p>
           )}
         </Field>
@@ -4149,6 +4160,15 @@ function MoveZoneModal({
               <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                 <span className="text-muted-foreground">Records moving</span>
                 <span>{preview.records_total}</span>
+                {preview.records_trashed > 0 && (
+                  <>
+                    <span className="text-muted-foreground">In the Trash</span>
+                    <span>
+                      {preview.records_trashed} more move with the zone (not
+                      counted above or in the view figures)
+                    </span>
+                  </>
+                )}
                 {preview.records_remapped > 0 && (
                   <>
                     <span className="text-muted-foreground">
@@ -4535,6 +4555,9 @@ export function ZoneDetailView({
   // listed forwarders. The detail surface below swaps the records table
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
+  // #3841 — a stub zone holds no zone data, so Sync with server does not apply
+  // (the API answers 400); it is not offered rather than shown as a failure.
+  const isStub = zone.zone_type === "stub";
 
   // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
   // stub's data is its masters', so the server refuses a record written into
@@ -4812,10 +4835,11 @@ export function ZoneDetailView({
                         : "Sync with server",
                       icon: RefreshCw,
                       iconClassName: syncMut.isPending ? "animate-spin" : "",
-                      disabled: syncMut.isPending,
+                      disabled: syncMut.isPending || isStub,
                       onSelect: () => syncMut.mutate(),
-                      title:
-                        "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
+                      title: isStub
+                        ? "This is a stub zone: the server does not hold it authoritatively, so there is no zone data to transfer and nothing to compare. Sync with server does not apply."
+                        : "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
                       ...permissionGate(canWriteRecords, NEEDS_DNS_WRITE),
                     },
                     {
@@ -6009,7 +6033,7 @@ export function SyncResultModal({
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Stat
-              label={queued_for_agent ? "Queued for agent" : "Pushed"}
+              label={queued_for_agent ? "Queued for delivery" : "Pushed"}
               value={pushed}
               highlight={
                 pushed > 0 && push_errors.length === 0 ? "good" : undefined
@@ -6026,12 +6050,21 @@ export function SyncResultModal({
               hint="DB already matches server"
             />
           </div>
+          {queued_for_agent && pushed > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              These records are queued, not yet on the server. They are applied
+              in the background (an agent applies them on its next poll; for an
+              agentless server the retry sweep does, a batch at a time), so a
+              large zone can take a few minutes to converge. Failed writes are
+              retried; check the server's record-op queue for errors.
+            </p>
+          )}
           {pushed > 0 && (
             <RecordTable
               records={pushed_records}
               heading={
                 queued_for_agent
-                  ? "Records queued for the server's agent"
+                  ? "Records queued — delivered to the server in the background"
                   : "Records applied to the server"
               }
             />
@@ -6207,29 +6240,11 @@ function ServedApexRows({
   // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
   // holds its own address for ns1), or ``invalid.`` for a zone whose name is
   // not a host name, which never resolves.
-  const unaddressedPrimary = apex.unaddressed_primary_ns;
-  const warning =
-    apex.placeholder_glue_loopback && unaddressedPrimary
-      ? `The Primary NS ${unaddressedPrimary} is inside the zone, but the zone holds no A or AAAA record for it, and BIND will not load a zone whose NS has no address. This placeholder name server, glued to 127.0.0.1, is served instead, so resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for ${unaddressedPrimary}.`
-      : apex.placeholder_glue_loopback && apex.source === "declared"
-        ? `The apex NS record ${apex.ns.join(", ")} has no A or AAAA record in the zone, so it is served glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for it.`
-        : apex.placeholder_glue_loopback
-          ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-          : apex.source === "placeholder" && apex.ns.includes("invalid.")
-            ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-            : apex.source === "placeholder"
-              ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
-              : null;
+  const { warning, unaddressed } = servedApexWords(apex, zoneName);
   // A declared apex draws no NS rows of ours, so its warning gets its own row.
-  const unaddressedNs = apex.unaddressed_ns ?? [];
   const declaredWarning =
     apex.source === "declared"
-      ? [
-          warning,
-          unaddressedNs.length > 0
-            ? `The apex NS ${unaddressedNs.join(", ")} lies inside the zone with no A or AAAA record, and BIND will not load a zone whose NS has no address. Add the address record.`
-            : null,
-        ].filter((w): w is string => !!w)
+      ? [warning, unaddressed].filter((w): w is string => !!w)
       : [];
   const nameCell = (
     <td className="py-1.5 pl-5 font-mono text-xs font-medium">
@@ -6833,7 +6848,9 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           <p className="mt-1">
             Note that once any view exists, <em>every</em> zone in this group is
             served from inside a view — zones with no view of their own are
-            rendered into all of them.
+            rendered into all of them, until a record of the zone is scoped to a
+            view: the zone, with its unscoped records, is then limited to the
+            views its records name.
           </p>
         </div>
       ) : views.length === 0 ? null : (
@@ -12778,15 +12795,34 @@ export function SyncWithServersResultModal({
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 text-xs">
               <SyncStat
                 label="Records pushed"
-                value={result.total_pushed}
-                accent={result.total_pushed ? "good" : undefined}
+                value={result.total_pushed - (result.total_queued ?? 0)}
+                accent={
+                  result.total_pushed - (result.total_queued ?? 0)
+                    ? "good"
+                    : undefined
+                }
               />
+              {(result.total_queued ?? 0) > 0 && (
+                <SyncStat
+                  label="Queued for delivery"
+                  value={result.total_queued ?? 0}
+                />
+              )}
               <SyncStat
                 label="Push errors"
                 value={result.total_push_errors}
                 accent={result.total_push_errors ? "bad" : undefined}
               />
             </div>
+            {(result.total_queued ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Queued records are not yet on the server. They are applied in
+                the background (an agent applies them on its next poll; for an
+                agentless server the retry sweep does, a batch at a time), so a
+                large zone can take a few minutes to converge. Failed writes are
+                retried; check the server's record-op queue for errors.
+              </p>
+            )}
 
             {result.items.length === 0 && (
               <p className="text-sm text-muted-foreground italic">
@@ -12926,8 +12962,14 @@ export function SyncWithServersResultModal({
                                   <td className="px-3 py-1 tabular-nums text-emerald-600">
                                     {item.imported || "—"}
                                   </td>
-                                  <td className="px-3 py-1 tabular-nums text-emerald-600">
-                                    {item.pushed || "—"}
+                                  <td
+                                    className={`px-3 py-1 tabular-nums ${item.queued_for_agent ? "text-amber-600" : "text-emerald-600"}`}
+                                  >
+                                    {item.pushed
+                                      ? item.queued_for_agent
+                                        ? `${item.pushed} queued`
+                                        : item.pushed
+                                      : "—"}
                                   </td>
                                   <td className="px-3 py-1">
                                     {item.error ? (
@@ -12937,6 +12979,11 @@ export function SyncWithServersResultModal({
                                     ) : item.push_errors.length > 0 ? (
                                       <span className="text-amber-600">
                                         {item.push_errors.length} push err
+                                      </span>
+                                    ) : item.queued_for_agent &&
+                                      item.pushed > 0 ? (
+                                      <span className="text-amber-600">
+                                        queued, not yet on the server
                                       </span>
                                     ) : (
                                       <span className="text-muted-foreground">
