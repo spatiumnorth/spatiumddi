@@ -459,6 +459,33 @@ def test_a_truncated_file_is_rendered_again(tmp_path: Path, monkeypatch) -> None
     assert _two_renders(tmp_path, truncate, monkeypatch) == [RPZ]
 
 
+def test_a_same_size_corrupted_file_is_rendered_again_4080(tmp_path: Path, monkeypatch) -> None:
+    """A flipped byte keeps the size; only the content hash can tell (#4080)."""
+
+    def flip(p: Path) -> None:
+        data = bytearray(p.read_bytes())
+        i = data.index(b"CNAME")
+        data[i + 4] = ord("X")
+        with open(p, "r+b") as fh:  # in place: same inode, same size
+            fh.write(bytes(data))
+
+    assert _two_renders(tmp_path, flip, monkeypatch) == [RPZ]
+
+
+def test_an_intact_file_is_reused_4080(tmp_path: Path, monkeypatch) -> None:
+    assert _two_renders(tmp_path, lambda p: None, monkeypatch) == []
+
+
+def test_a_sidecar_without_a_content_hash_is_rendered_again_4080(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def old_format(p: Path) -> None:
+        side = bind9._rpz_sidecar(p)
+        side.write_text(" ".join(side.read_text().split()[:2]) + "\n")
+
+    assert _two_renders(tmp_path, old_format, monkeypatch) == [RPZ]
+
+
 def test_another_renderer_revisions_file_is_rendered_again(tmp_path: Path, monkeypatch) -> None:
     def older(p: Path) -> None:
         side = bind9._rpz_sidecar(p)

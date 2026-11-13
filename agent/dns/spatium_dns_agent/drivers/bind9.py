@@ -2098,8 +2098,21 @@ def _rpz_sidecar(path: Path) -> Path:
     return path.with_name(path.name + _RPZ_HASH_SUFFIX)
 
 
-def _write_rpz_sidecar(path: Path, key: str) -> None:
+def _hash_file(path: Path) -> str:
+    """sha256 of ``path``'s bytes, streamed so a 20 MB zone costs 1 MiB."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_rpz_sidecar(path: Path, key: str, digest: str | None = None) -> None:
     """Record ``key`` beside the RPZ file at ``path``, if the name can exist.
+
+    The sidecar holds ``<key> <size> <sha256 of the file>`` (#4080). ``digest``
+    is passed by a caller that has just hashed the file; otherwise it is hashed
+    here.
 
     The sidecar is an optimisation: a zone without one is rendered every
     time, as for a bundle with no hash. A zone name within ~14 bytes of the
@@ -2107,8 +2120,10 @@ def _write_rpz_sidecar(path: Path, key: str) -> None:
     served, just never reused.
     """
     try:
+        if digest is None:
+            digest = _hash_file(path)
         _write_new_inode(
-            _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
+            _rpz_sidecar(path), f"{key} {path.stat().st_size} {digest}\n".encode()
         )
     except OSError as exc:
         if not _name_too_long(exc):
@@ -2146,26 +2161,27 @@ def _rpz_serial(bl: dict[str, Any]) -> int:
     )
 
 
-def _rpz_reusable(src: Path, key: str) -> bool:
-    """``src`` is a regular file whose sidecar records ``key`` and whose size
-    is the size it had when it was written.
+def _rpz_reusable(src: Path, key: str) -> str | None:
+    """The file's sha256 when ``src`` is a regular file whose sidecar records
+    ``key`` and whose bytes still hash to what the sidecar recorded, else None.
 
-    The size is the cheap half of the check: these files are never rewritten
-    once they are reused, so a file truncated by a crash (written, renamed,
-    not yet flushed) would otherwise be linked forward from tree to tree
-    rather than replaced by the next render.
+    The content is the check, not the size (#4080): damage that keeps the size
+    (a flipped byte, a partial restore) used to be linked forward, and named
+    then failed to load the zone while the server reported ok. A file truncated
+    by a crash fails it too. The stream-hash costs far less than a render.
     """
     try:
         recorded = _rpz_sidecar(src).read_text(encoding="utf-8").split()
-        size = src.stat().st_size if src.is_file() and not src.is_symlink() else None
+        if not src.is_file() or src.is_symlink():
+            return None
+        if len(recorded) != 3 or recorded[0] != key:
+            return None
+        if recorded[1] != str(src.stat().st_size):
+            return None
+        digest = _hash_file(src)
     except (OSError, UnicodeDecodeError):
-        return False
-    return (
-        size is not None
-        and len(recorded) == 2
-        and recorded[0] == key
-        and recorded[1] == str(size)
-    )
+        return None
+    return digest if digest == recorded[2] else None
 
 
 def _fsync_path(path: Path) -> None:
@@ -3893,7 +3909,8 @@ class Bind9Driver(DriverBase):
         if key is not None:
             for tree in (self.rendered_dir_name, "rendered.prev"):
                 src = self.state_dir / tree / rel
-                if not _rpz_reusable(src, key):
+                digest = _rpz_reusable(src, key)
+                if digest is None:
                     continue
                 path.parent.mkdir(parents=True, exist_ok=True)
                 how = _link_or_copy(src, path)
@@ -3907,7 +3924,7 @@ class Bind9Driver(DriverBase):
                     # that; it changes no byte, and the backup sharing the
                     # inode loses nothing.
                     os.utime(path)
-                _write_rpz_sidecar(path, key)
+                _write_rpz_sidecar(path, key, digest)
                 log.info(
                     "bind9_rpz_reused",
                     zone=bl["rpz_zone_name"],
