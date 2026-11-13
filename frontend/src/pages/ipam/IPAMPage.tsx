@@ -4562,9 +4562,13 @@ function SyncMenu({
 // in a moment rather than blocking on it.
 function ReconciliationModal({
   subnet,
+  canDiscover,
   onClose,
 }: {
   subnet: Subnet;
+  /** #4117 — the sweep route takes write on subnets (type level); the
+   *  report itself is a read. */
+  canDiscover: boolean;
   onClose: () => void;
 }) {
   const {
@@ -4585,7 +4589,7 @@ function ReconciliationModal({
           ? "Sweep queued — it runs in the background. Refresh in a few seconds to see results."
           : "Couldn't queue the sweep (task broker unreachable).",
       ),
-    onError: () => setNote("Failed to queue the sweep."),
+    onError: (e) => setNote(formatApiError(e, "Failed to queue the sweep")),
   });
 
   const buckets: {
@@ -4642,6 +4646,7 @@ function ReconciliationModal({
               variant="primary"
               onClick={() => discover.mutate()}
               disabled={discover.isPending}
+              {...permissionGate(canDiscover, NEEDS_SUBNET_WRITE)}
             >
               {discover.isPending ? "Queuing…" : "Discover now"}
             </HeaderButton>
@@ -4851,7 +4856,8 @@ function ToolsMenu({
 }: {
   /** #1155 — which of the writing tools the caller's grants will pass;
    *  the rest stay listed, disabled, with the reason as their tooltip.
-   *  Reconcile opens a review and Ask AI reads, so neither is gated. */
+   *  Reconcile opens a review and Ask AI reads, so neither is gated (the
+   *  review gates its own "Discover now", #4117). */
   can: { allocate: boolean; reshape: boolean; scan: boolean; purge: boolean };
   onBulkAllocate: () => void;
   onCleanOrphans: () => void;
@@ -7538,6 +7544,7 @@ export function SubnetDetail({
       {showReconcile && (
         <ReconciliationModal
           subnet={subnet}
+          canDiscover={canWriteSubnets}
           onClose={() => setShowReconcile(false)}
         />
       )}
