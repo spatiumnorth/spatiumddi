@@ -10661,6 +10661,12 @@ export interface DNSQueryAnalyticsRow {
 export interface DNSQueryAnalyticsRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
+  /** Optional narrowing, same meaning as on the grid request (#4072). */
+  q?: string | null;
+  qtype?: string | null;
+  client_ip?: string | null;
+  view?: string | null;
+  rcode?: string | null;
   limit?: number;
 }
 
