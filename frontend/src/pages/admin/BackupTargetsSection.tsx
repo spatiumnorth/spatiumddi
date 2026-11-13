@@ -28,6 +28,7 @@ import {
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Backup Targets section on the Backup admin page (issue #117
@@ -542,14 +543,14 @@ function ArchiveList({
         </>
       )}
       {downloadMut.isError && (
-        <div className="mt-1 break-words text-destructive">
+        <FormError className="mt-1 break-words text-destructive">
           {formatApiError(downloadMut.error, "download failed")}
-        </div>
+        </FormError>
       )}
       {deleteMut.isError && (
-        <div className="mt-1 break-words text-destructive">
+        <FormError className="mt-1 break-words text-destructive">
           {formatApiError(deleteMut.error, "delete failed")}
-        </div>
+        </FormError>
       )}
       {restoring && (
         <RestoreFromArchiveModal
@@ -734,9 +735,9 @@ function RestoreFromArchiveModal({
             />
           </Field>
           {restoreMut.isError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {formatApiError(restoreMut.error, "restore failed")}
-            </div>
+            </FormError>
           )}
           {restoreMut.data && (
             <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
@@ -1242,9 +1243,9 @@ function TargetFormModal({
           </label>
 
           {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {error}
-            </div>
+            </FormError>
           )}
 
           <div className="flex items-center justify-end gap-2 pt-1">
@@ -1445,7 +1446,9 @@ function MultilineConfigField({
           </button>
         )}
       </div>
-      {err && <p className="text-[11px] text-destructive">{err}</p>}
+      {err && (
+        <FormError className="text-[11px] text-destructive">{err}</FormError>
+      )}
     </div>
   );
 }

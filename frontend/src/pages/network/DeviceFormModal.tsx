@@ -26,6 +26,7 @@ import { IPSpacePicker } from "@/components/ipam/space-picker";
 
 import { DEVICE_SECONDS_BOUNDS, secondsFieldError } from "@/lib/seconds";
 import { DEVICE_TYPE_OPTIONS, Field, errMsg, inputCls } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Static option lists ──────────────────────────────────────────────
 
@@ -668,10 +669,10 @@ export function DeviceFormModal({
         {testResult && <TestResultBanner result={testResult} />}
 
         {error && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
             <span>{error}</span>
-          </div>
+          </FormError>
         )}
 
         {/* Footer buttons */}
