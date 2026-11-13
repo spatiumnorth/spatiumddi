@@ -95,7 +95,8 @@ from app.services.dns.agent_token import (
     needs_rotation,
     verify_agent_token,
 )
-from app.services.dns.bundle_dirty import enqueue_renders
+from app.services.dns.blocklist_pack import renders_packed_blocklists
+from app.services.dns.bundle_dirty import enqueue_renders, mark_bundles_dirty
 from app.services.dns.new_object_defaults import add_group_with_defaults
 from app.services.dns.record_ops import (
     ack_op,
@@ -389,6 +390,18 @@ async def _agent_from_authorization(
         # Token rotated out — reject stale one
         raise HTTPException(status_code=401, detail="Stale token")
     return server, payload
+
+
+async def _set_packed_blocklists(db: AsyncSession, server: DNSServer, features: str | None) -> None:
+    """Record whether the agent reads packed blocklist entries (#4040), and
+    re-render the server's stored bundle when that changes: the shape is part
+    of the body, and an agent rolled back to a release that cannot read it
+    must not be served the packed one."""
+    packed = renders_packed_blocklists(features)
+    if server.agent_renders_packed_blocklists == packed:
+        return
+    server.agent_renders_packed_blocklists = packed
+    await mark_bundles_dirty(db, server_ids=[server.id])
 
 
 async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
@@ -711,6 +724,7 @@ async def agent_register(
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
     server.agent_renders_soa_timers = renders_soa_timers(agent_features)
+    await _set_packed_blocklists(db, server, agent_features)
 
     db.add(
         AuditLog(
@@ -1252,6 +1266,7 @@ async def agent_heartbeat(
         server.agent_renders_soa_timers = renders_soa_timers(
             request.headers.get(AGENT_FEATURES_HEADER)
         )
+        await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
 
         # Phase 8f-2 — persist whatever slot state the agent reported. Only
         # overwrite when the agent actually sent a value (older agents
