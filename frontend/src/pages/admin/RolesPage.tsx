@@ -20,6 +20,7 @@ import {
   GRANT_ACTIONS,
   GRANT_RESOURCE_TYPES,
 } from "@/lib/permissionVocabulary";
+import { FormError } from "@/components/ui/form-error";
 
 // What a new grant row offers: the shared vocabulary (lib/permissionVocabulary).
 // A role can hold more than these lists name — the built-in roles do
@@ -234,7 +235,9 @@ function RoleModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -290,7 +293,9 @@ function CloneModal({ role, onClose }: { role: AppRole; onClose: () => void }) {
             autoFocus
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -339,9 +344,9 @@ function DeleteModal({
         </p>
         {/* A refused or failed delete says so; the dialog stays (#1344). */}
         {mutation.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(mutation.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button
