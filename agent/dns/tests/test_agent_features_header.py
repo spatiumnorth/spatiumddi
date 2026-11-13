@@ -23,7 +23,7 @@ from spatium_dns_agent.sync import SyncLoop
 
 
 def test_the_header_names_soa_timers() -> None:
-    assert features.headers() == {"X-Spatium-Agent-Features": "soa-timers,served-serials"}
+    assert features.headers() == {"X-Spatium-Agent-Features": "soa-timers,served-serials,packed-blocklists"}
 
 
 def test_register_sends_it_on_the_wire(
@@ -48,7 +48,7 @@ def test_register_sends_it_on_the_wire(
 
     bootstrap.register(agent_cfg)
 
-    assert seen["x-spatium-agent-features"] == "soa-timers,served-serials"
+    assert seen["x-spatium-agent-features"] == "soa-timers,served-serials,packed-blocklists"
     assert seen["x-dns-agent-key"] == "test-key"
     # #2078 — the build's stamp, not a literal that nothing rewrote.
     assert bodies[0]["version"] == __version__
@@ -61,4 +61,4 @@ def test_the_heartbeat_and_the_config_poll_send_it(agent_cfg: AgentConfig, cls: 
     holder.cfg = agent_cfg
 
     with holder._client() as c:
-        assert c.headers["X-Spatium-Agent-Features"] == "soa-timers,served-serials"
+        assert c.headers["X-Spatium-Agent-Features"] == "soa-timers,served-serials,packed-blocklists"
