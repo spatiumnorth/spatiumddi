@@ -36,6 +36,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the PAN-OS / Panorama web UI to mint a
@@ -1084,7 +1085,9 @@ export function FirewallModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1149,9 +1152,9 @@ function DeleteFirewallModal({
           <span>I understand.</span>
         </label>
         {error && (
-          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

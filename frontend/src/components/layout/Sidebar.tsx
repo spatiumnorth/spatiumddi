@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -23,6 +23,8 @@ import { pollUnlessRefused } from "@/lib/refusal";
 import { useSessionState } from "@/lib/useSessionState";
 import { safeLocalStorage } from "@/lib/safeStorage";
 import { BrandLogo } from "@/components/BrandLogo";
+import { captureSuccessors, returnFocus } from "@/components/ui/focus-return";
+import { hasOpenModal } from "@/components/ui/use-draggable-modal";
 import { UpdateCheckError } from "@/components/UpdateCheckError";
 import {
   usePublicSettings,
@@ -243,6 +245,58 @@ export function Sidebar({
     });
   }
 
+  // Below md the open sidebar is a drawer over a backdrop, so it behaves as
+  // a modal dialog (#3911): focus moves in and stays in, Esc closes it, and
+  // closing gives focus back to what opened it (Open navigation). From md up
+  // `mobileOpen` has no visual effect and none of this applies.
+  const asideRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const drawerOpen =
+    mobileOpen &&
+    (typeof window.matchMedia !== "function" ||
+      !window.matchMedia("(min-width: 768px)").matches);
+  useEffect(() => {
+    const node = asideRef.current;
+    if (!drawerOpen || !node) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (!node.contains(active)) openerRef.current = active;
+    node
+      .querySelector<HTMLElement>('button[aria-label="Close navigation"]')
+      ?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      if (e.key === "Escape") {
+        // A dialog over the drawer owns this Esc.
+        if (hasOpenModal()) return;
+        e.preventDefault();
+        onMobileClose?.();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const cur = document.activeElement;
+      const outside = !cur || !node.contains(cur);
+      if (e.shiftKey ? cur === first || outside : cur === last || outside) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      const opener = openerRef.current;
+      returnFocus([opener], captureSuccessors(opener));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawerOpen]);
+
   // In the mobile drawer, ignore the "collapsed" state — always show labels.
   const effectiveCollapsed = mobileOpen ? false : collapsed;
 
@@ -318,6 +372,11 @@ export function Sidebar({
         />
       )}
       <aside
+        ref={asideRef}
+        id="app-sidebar"
+        {...(drawerOpen
+          ? { role: "dialog", "aria-modal": true, "aria-label": "Navigation" }
+          : {})}
         className={cn(
           "flex flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-all duration-200",
           // Desktop: inline, fixed width, always visible (md+).

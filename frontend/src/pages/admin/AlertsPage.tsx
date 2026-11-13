@@ -1,5 +1,10 @@
 import { cloneElement, isValidElement, useId, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   AlertTriangle,
   Check,
@@ -20,6 +25,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { errMsg } from "@/pages/dhcp/_shared";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import {
@@ -127,6 +133,10 @@ export function RuleEditorModal({
   );
   const [notifySmtp, setNotifySmtp] = useState(existing?.notify_smtp ?? false);
   const [error, setError] = useState<string | null>(null);
+  // #3929 — a number input holding text the browser cannot read as a number
+  // (`85-`) reports value "", which would save as "use the default". Track
+  // those fields (from the input's validity) so Save refuses them in words.
+  const [unreadable, setUnreadable] = useState<Record<string, boolean>>({});
 
   const stored = existing as unknown as Record<string, unknown> | null;
   const current = (p: AlertParamSpec): number | string | null => {
@@ -300,7 +310,13 @@ export function RuleEditorModal({
                 max={p.max ?? undefined}
                 className={inputCls}
                 value={numVal(current(p) as number | null)}
-                onChange={(e) => setParam(p.name, parseNum(e.target.value))}
+                onChange={(e) => {
+                  setUnreadable((u) => ({
+                    ...u,
+                    [p.name]: e.target.validity.badInput,
+                  }));
+                  setParam(p.name, parseNum(e.target.value));
+                }}
               />
             )}
           </Field>
@@ -392,7 +408,19 @@ export function RuleEditorModal({
               catalogueBlocks ||
               (!!existing && catalogue.isLoading)
             }
-            onClick={() => mut.mutate()}
+            onClick={() => {
+              const bad = (spec?.params ?? []).filter(
+                (p) => p.kind !== "select" && unreadable[p.name],
+              );
+              if (bad.length > 0) {
+                setError(
+                  `${bad.map((p) => p.label).join(", ")}: not a number. Enter digits only, or clear the field to use the default.`,
+                );
+                return;
+              }
+              setError(null);
+              mut.mutate();
+            }}
             className={cn(
               "rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
               "hover:bg-primary/90 disabled:opacity-50",
@@ -428,6 +456,8 @@ function paramSummary(r: AlertRule, spec?: AlertRuleTypeSpec): string {
 
 // ── Page ───────────────────────────────────────────────────────────────────
 
+const EVENTS_PAGE_SIZE = 100;
+
 export function AlertsPage() {
   // #1341 — every write on this page takes a superadmin (its handlers
   // take SuperAdmin), so a read-only user is offered none of them.
@@ -440,7 +470,11 @@ export function AlertsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [openOnly, setOpenOnly] = useState(true);
 
-  const { data: rules = [], isLoading: rulesLoading } = useQuery({
+  const {
+    data: rules = [],
+    isLoading: rulesLoading,
+    error: rulesError,
+  } = useQuery({
     queryKey: ["alert-rules"],
     queryFn: alertsApi.listRules,
   });
@@ -452,11 +486,28 @@ export function AlertsPage() {
   });
   const specByType = new Map((ruleTypes ?? []).map((t) => [t.rule_type, t]));
 
-  const { data: events = [] } = useQuery({
+  // Paged (#3830): the page used to read the newest 100 and say "100 shown"
+  // over an estate holding more, while the Dashboard counted every one.
+  const eventsQuery = useInfiniteQuery({
     queryKey: ["alert-events", { openOnly }],
-    queryFn: () => alertsApi.listEvents({ open_only: openOnly, limit: 100 }),
+    queryFn: ({ pageParam }) =>
+      alertsApi.listEventsPage({
+        open_only: openOnly,
+        limit: EVENTS_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
     refetchInterval: 15_000,
   });
+  const events = (eventsQuery.data?.pages ?? []).flatMap((p) => p.items);
+  const eventsTotal =
+    eventsQuery.data?.pages[eventsQuery.data.pages.length - 1]?.total ??
+    events.length;
+  const eventsError = eventsQuery.error;
 
   const toggle = useMutation({
     mutationFn: (r: AlertRule) =>
@@ -533,7 +584,11 @@ export function AlertsPage() {
               <AlertTriangle className="h-4 w-4 text-amber-500" />
               <h2 className="text-sm font-semibold">Events</h2>
               <span className="text-xs text-muted-foreground">
-                {events.length} shown
+                {eventsError && events.length === 0
+                  ? "not loaded"
+                  : eventsTotal > events.length
+                    ? `${events.length} of ${eventsTotal} shown`
+                    : `${events.length} shown`}
               </span>
             </div>
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -558,15 +613,27 @@ export function AlertsPage() {
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
-                {events.length === 0 && (
+                {events.length === 0 && eventsQuery.isLoading && (
                   <tr>
                     <td
                       colSpan={6}
                       className="px-4 py-8 text-center text-xs text-muted-foreground"
                     >
-                      {openOnly
-                        ? "No open events — all clear."
-                        : "No events yet."}
+                      Loading…
+                    </td>
+                  </tr>
+                )}
+                {events.length === 0 && !eventsQuery.isLoading && (
+                  <tr>
+                    <td
+                      colSpan={6}
+                      className="px-4 py-8 text-center text-xs text-muted-foreground"
+                    >
+                      <ListEmpty error={eventsError} what="alert events">
+                        {openOnly
+                          ? "No open events — all clear."
+                          : "No events yet."}
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
@@ -632,6 +699,21 @@ export function AlertsPage() {
               </tbody>
             </table>
           </div>
+          {eventsQuery.hasNextPage && (
+            <div className="flex items-center justify-between gap-3 border-t px-4 py-2.5 text-xs text-muted-foreground">
+              <span>
+                Showing the newest {events.length} of {eventsTotal}.
+              </span>
+              <button
+                type="button"
+                onClick={() => eventsQuery.fetchNextPage()}
+                disabled={eventsQuery.isFetchingNextPage}
+                className="rounded-md border px-3 py-1 text-xs hover:bg-muted disabled:opacity-50"
+              >
+                {eventsQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+              </button>
+            </div>
+          )}
         </div>
 
         {/* ── Rules ───────────────────────────────────────────────────── */}
@@ -639,7 +721,7 @@ export function AlertsPage() {
           <div className="flex items-center justify-between border-b px-4 py-2.5">
             <h2 className="text-sm font-semibold">Rules</h2>
             <span className="text-xs text-muted-foreground">
-              {rules.length} total
+              {rulesError ? "not loaded" : `${rules.length} total`}
             </span>
           </div>
           <div className="overflow-x-auto">
@@ -672,7 +754,14 @@ export function AlertsPage() {
                       colSpan={7}
                       className="px-4 py-8 text-center text-xs text-muted-foreground"
                     >
-                      No rules yet — click “New rule” to create one.
+                      <ListEmpty
+                        error={rulesError}
+                        what="alert rules"
+                        gate={superadminGate}
+                        hint={`Click “New rule” to create one.`}
+                      >
+                        No rules yet.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}

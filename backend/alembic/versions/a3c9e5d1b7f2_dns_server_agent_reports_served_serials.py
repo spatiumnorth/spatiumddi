@@ -7,7 +7,7 @@ control plane keeps comparing an older agent's report with the target until
 that agent says otherwise.
 
 Revision ID: a3c9e5d1b7f2
-Revises: ede3bcd2aff4
+Revises: f3a8d2c61b94
 Create Date: 2026-11-12 15:00:00.000000
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "a3c9e5d1b7f2"
-down_revision = "ede3bcd2aff4"
+down_revision = "f3a8d2c61b94"
 branch_labels = None
 depends_on = None
 

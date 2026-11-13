@@ -550,7 +550,7 @@ const RETENTION_ROWS: {
     key: "soft_delete_purge_days",
     label: "Trash",
     description:
-      "Deleted IPAM / DNS / DHCP items stay restorable this long, then are purged for good. 0–365 days; 0 turns the purge off.",
+      "Deleted items (IPAM, DNS, DHCP, customers, overlay networks and services) stay restorable this long, then are purged for good. 0–365 days; 0 turns the purge off.",
     unit: "days",
     min: 0,
     max: 365,
@@ -890,7 +890,7 @@ const SECTIONS: SectionDef[] = [
     title: "Data Retention",
     group: "Application",
     description:
-      "How long SpatiumDDI keeps what it collects: query and activity logs, metrics, lease history, trash, packet captures, and deleted appliances. A nightly sweep deletes anything older. Audit log entries are never pruned.",
+      "How long SpatiumDDI keeps what it collects: query and activity logs, metrics, lease history, trash, packet captures, deleted appliances, and the E911 location-lookup trail. A nightly sweep deletes anything older. Audit log entries are never pruned.",
     keywords: [
       "retention",
       "retain",
@@ -2871,7 +2871,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="IPv4 Max Prefix for Reporting"
-                  description="Exclude subnets smaller than this from dashboard heatmap + alerts. Default 29 excludes /30, /31, /32 (PTP links, single-host). Set to 32 to disable."
+                  description="Exclude subnets smaller than this from the dashboard heatmap, Top Subnets and alerts (the Dashboard's address totals still count every subnet). Default 29 excludes /30, /31, /32 (PTP links, single-host). Set to 32 to disable."
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">/</span>
@@ -2893,7 +2893,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="IPv6 Max Prefix for Reporting"
-                  description="Exclude subnets smaller than this from dashboard heatmap + alerts. Default 126 excludes /127 (RFC 6164 PTP) and /128. Set to 128 to disable."
+                  description="Exclude subnets smaller than this from the dashboard heatmap, Top Subnets and alerts (the Dashboard's address totals still count every subnet). Default 126 excludes /127 (RFC 6164 PTP) and /128. Set to 128 to disable."
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">/</span>

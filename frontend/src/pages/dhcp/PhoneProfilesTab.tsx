@@ -22,6 +22,7 @@ import {
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { FormError } from "@/components/ui/form-error";
 
 const PROFILE_KEY_BASE = "dhcp-phone-profiles";
 
@@ -615,9 +616,9 @@ function PhoneProfileEditorForm({
         </Field>
 
         {error && (
-          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
 
         <Btns onClose={onClose} pending={saveMut.isPending} />

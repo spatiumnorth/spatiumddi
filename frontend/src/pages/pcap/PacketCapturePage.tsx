@@ -16,6 +16,7 @@ import { pollUnlessRefused } from "@/lib/refusal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { humanTime } from "@/pages/network/_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 type RightTab = "live" | "history" | "result";
 
@@ -473,9 +474,9 @@ function CaptureForm({
         </p>
       )}
       {start.isError && (
-        <p className="text-[11px] text-destructive">
+        <FormError className="text-[11px] text-destructive">
           {formatApiError(start.error, "Failed to start capture.")}
-        </p>
+        </FormError>
       )}
 
       <button

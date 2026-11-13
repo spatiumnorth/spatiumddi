@@ -219,6 +219,41 @@ async def lock_zone_gate(db: AsyncSession, zone_ids: Iterable[Any], *, exclusive
         await db.execute(text(f"SELECT {fn}(:ns, :key)"), {"ns": ZONE_SYNC_GATE_NS, "key": key})
 
 
+#: Advisory-lock namespace of the provider zone-name gate (#3888), "DPZN".
+PROVIDER_ZONE_NAME_NS = 0x44505A4E
+
+
+def _provider_zone_name_key(name: str) -> int:
+    """Signed 32-bit crc32 of the zone name without case or trailing dot."""
+    key = zlib.crc32(name.rstrip(".").lower().encode("utf-8"))
+    return key - 2**32 if key >= 2**31 else key
+
+
+async def lock_provider_zone_name(db: AsyncSession, name: str) -> None:
+    """Serialise create / delete pushes of one zone NAME to agentless providers (#3888).
+
+    Two groups can reach one provider copy of a name (#3812), and "another zone
+    still uses this copy" is read from rows the other group's transaction may
+    not have committed yet: two deletes each see the other's zone as live and
+    both keep the copy, and a create landing between a delete's check and its
+    push loses the copy it just adopted. An exclusive transaction-scoped
+    advisory lock per name, taken before the check and held to commit, makes
+    the second transaction read the first's committed rows.
+
+    Placement: after the zone row lock and the zone gate, since every taker
+    holds those already. It is the only lock a taker waits for while holding
+    them, one name at a time, and its holder waits for nothing but the audit
+    chain lock at commit, which no holder of a name lock is waiting to get
+    ahead of, so it closes no cycle. The Trash sweep takes several, one per
+    purged zone, in the order it purges them; a single-name taker never holds
+    another name, so the sweep waits on it and not the reverse. Two names whose
+    crc32 collide share a lock, which only costs a wait."""
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, :key)"),
+        {"ns": PROVIDER_ZONE_NAME_NS, "key": _provider_zone_name_key(name)},
+    )
+
+
 #: Advisory-lock namespace of the per-scope gate (#3748), "DSCP".
 SCOPE_GATE_NS = 0x44534350
 

@@ -1,0 +1,3 @@
+### Fixed
+- A delete the server refuses (404, 409, 403) now says why, in the server's words, and re-reads the list instead of closing silently: Delete API Token keeps its dialog open with the reason, and the Overlays, Customers, PIM domains, Circuits, Services and TLS certificate lists show an alert line like Providers does (#3822).
+- The same for BACnet devices, AV flows and reserved ranges, OT descriptors and Purdue zones (the confirm stays open with the reason), an overlay's policy list (re-read after a refusal) and the DNS blocking lists' single and bulk delete, whose bulk path swallowed every refusal and now names the lists that were not deleted and why (#3822).
