@@ -1938,6 +1938,10 @@ except Exception:
 reconcile_role_chart_tag() {
     local k3s=/usr/local/bin/k3s nodes cur patch rc
     [ -f "$CHART_TGZ" ] || return 0
+    # The supervisor's rolling-upgrade hold file (#1710/#3136): while one is
+    # recorded, the supervisor itself refuses to write this chart from a node
+    # already on the target, so firstboot must not either.
+    [ -e "${SUPERVISOR_STATE_DIR:-/var/persist/spatium-supervisor}/shared-chart-hold" ] && return 0
     if ! nodes=$($k3s kubectl --request-timeout=10s get nodes -o name 2>/dev/null); then
         echo "WARN: could not list nodes; role chart tag not reconciled this boot (#3919)." >&2
         return 0

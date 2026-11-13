@@ -68,7 +68,7 @@ def _extract_function(name: str) -> str:
     raise AssertionError("no closing brace")
 
 
-def _run(tmp_path, *, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag="NEW"):
+def _run(tmp_path, *, hold=False, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag="NEW"):
     stub = tmp_path / "stub"
     stub.mkdir()
     k3s = tmp_path / "k3s"
@@ -82,6 +82,10 @@ def _run(tmp_path, *, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag
             (stub / flag).touch()
     chart = tmp_path / "chart.tgz"
     chart.write_bytes(b"\x1f\x8bchart-bytes")
+    state = tmp_path / "state"
+    state.mkdir()
+    if hold:
+        (state / "shared-chart-hold").write_text("{}")
     body = _extract_function(FUNC).replace("/usr/local/bin/k3s", str(k3s))
     script = (
         f'. "{SCRIPT}"\nset -eu\n'
@@ -90,7 +94,12 @@ def _run(tmp_path, *, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag
     )
     proc = subprocess.run(
         [SHELL, "-c", script],
-        env={**os.environ, "SPATIUM_FIRSTBOOT_LIB": "1", "STUB": str(stub)},
+        env={
+            **os.environ,
+            "SPATIUM_FIRSTBOOT_LIB": "1",
+            "STUB": str(stub),
+            "SUPERVISOR_STATE_DIR": str(state),
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -127,6 +136,11 @@ def test_already_on_tag_writes_nothing(tmp_path):
 
 def test_cluster_is_left_to_the_supervisor(tmp_path):
     proc, patched, _ = _run(tmp_path, nodes=3)
+    assert "rc=0" in proc.stdout and patched is None
+
+
+def test_recorded_rolling_upgrade_hold_is_respected(tmp_path):
+    proc, patched, _ = _run(tmp_path, hold=True)
     assert "rc=0" in proc.stdout and patched is None
 
 
