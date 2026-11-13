@@ -451,7 +451,11 @@ async def commit_reprovision(
     the lease is no longer live (see the module docstring).
     """
     from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
-    from app.core.agent_wake import collect_wake, dhcp_server_channel  # noqa: PLC0415
+    from app.core.agent_wake import (  # noqa: PLC0415
+        collect_wake,
+        dhcp_group_channel,
+        dhcp_server_channel,
+    )
     from app.services.dhcp.lease_cleanup import purge_lease  # noqa: PLC0415
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row  # noqa: PLC0415
     from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
@@ -555,6 +559,8 @@ async def commit_reprovision(
             "lease_copies_removed": copies_removed,
         },
     )
+    # The new static changes the group's rendered bundle (HA partners share it).
+    collect_wake(dhcp_group_channel(scope.group_id))
     await db.commit()
     logger.info(
         "dhcp_lease_reprovisioned",

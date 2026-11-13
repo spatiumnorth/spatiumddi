@@ -37,6 +37,7 @@ from app.api.v1.dhcp.lease_history import (
 )
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPLease, DHCPLeaseHistory, DHCPServer, DHCPServerGroup
+from app.services.api_token_scopes import token_write
 from app.services.dhcp.reprovision import (
     ReprovisionError,
     commit_reprovision,
@@ -270,6 +271,7 @@ async def preview_lease_reprovision(
 
 
 @router.post("/leases/{lease_id}/reprovision", response_model=ReprovisionPlanOut)
+@token_write("Creates a static reservation and IPAM row, purges the lease, queues lease4-del ops")
 async def commit_lease_reprovision(
     lease_id: uuid.UUID, body: ReprovisionCommit, db: DB, user: SuperAdmin
 ) -> dict[str, Any]:
