@@ -129,6 +129,9 @@ describe("AppliancePage for a certificate-store-only caller (#3067)", () => {
     expect(mocks.getInfo).not.toHaveBeenCalled();
     expect(await screen.findByText("Web UI Certificate")).toBeTruthy();
     expect(screen.queryByText("TLS certificates")).toBeNull();
+    // #3798: no Fleet sidebar for a non-superadmin, so the header must not
+    // point at one.
+    expect(document.body.textContent).not.toContain("Fleet sidebar");
     expect(screen.queryByText("docker/k8s")).toBeNull();
     expect(screen.getByText("Active")).toBeTruthy();
     const [servedDelete, dotDelete] = screen

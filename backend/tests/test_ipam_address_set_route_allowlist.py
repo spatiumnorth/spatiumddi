@@ -493,3 +493,150 @@ async def test_a_disabled_address_sets_module_widens_nothing_3762(
         json={"description": "mine"},
     )
     assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_bulk_edit_says_why_a_delegate_row_was_skipped_3905(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    w = await _world(db_session)
+    token = await _delegate(db_session, w)
+    r = await client.post(
+        "/api/v1/ipam/addresses/bulk-edit",
+        headers=_h(token),
+        json={
+            "ip_ids": [str(w["inside"].id), str(w["outside"].id)],
+            "changes": {"description": "bulk"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["updated_count"] == 1
+    assert body["skipped"] == [str(w["outside"].id)]
+    reason = body["skipped_reasons"][str(w["outside"].id)]
+    assert "address set" in reason
+    assert "system" not in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_set_scoped_admin_edits_only_its_own_set_4007(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    w = await _world(db_session)
+    other = AddressSet(
+        name="other",
+        subnet_id=w["subnet"].id,
+        range_kind="contiguous",
+        start_address="10.0.5.100",
+        end_address="10.0.5.120",
+    )
+    db_session.add(other)
+    token = await _delegate(db_session, w)
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/address-sets/{w['set'].id}",
+        headers=_h(token),
+        json={"description": "renamed by delegate"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["description"] == "renamed by delegate"
+
+    # Nothing wider: a set the grant does not name is still refused.
+    r = await client.put(
+        f"/api/v1/address-sets/{other.id}",
+        headers=_h(token),
+        json={"description": "hijack"},
+    )
+    assert r.status_code in (403, 404), r.text
+    r = await client.delete(f"/api/v1/address-sets/{other.id}", headers=_h(token))
+    assert r.status_code in (403, 404), r.text
+
+
+@pytest.mark.asyncio
+async def test_set_scoped_admin_cannot_read_list_or_create_widely_4007(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The coarse gate admits a set-scoped grant, so every handler must hold
+    its own boundary: no create, no list/get of sets the caller cannot read."""
+    w = await _world(db_session)
+    other = AddressSet(
+        name="other",
+        subnet_id=w["subnet"].id,
+        range_kind="contiguous",
+        start_address="10.0.5.100",
+        end_address="10.0.5.120",
+    )
+    db_session.add(other)
+    token = await _delegate(db_session, w)
+    await db_session.commit()
+
+    r = await client.get("/api/v1/address-sets", headers=_h(token))
+    assert r.status_code == 200, r.text
+    assert r.json() == []  # no subnet read -> no set is readable, not even its own
+    r = await client.get(f"/api/v1/address-sets/{other.id}", headers=_h(token))
+    assert r.status_code == 404
+    r = await client.post(
+        "/api/v1/address-sets",
+        headers=_h(token),
+        json={
+            "name": "new",
+            "subnet_id": str(w["subnet"].id),
+            "range_kind": "contiguous",
+            "start_address": "10.0.5.200",
+            "end_address": "10.0.5.210",
+        },
+    )
+    assert r.status_code == 403, r.text
+    # Range edits to its own set still need write on the parent subnet.
+    r = await client.put(
+        f"/api/v1/address-sets/{w['set'].id}",
+        headers=_h(token),
+        json={"start_address": "10.0.5.1", "end_address": "10.0.5.250"},
+    )
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_admit_scoped_ignores_other_actions_and_types_4007(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    w = await _world(db_session)
+    # A scoped READ grant must not admit a write; a grant on another type
+    # must not admit at all.
+    ro = await _user(
+        db_session,
+        [{"action": "read", "resource_type": "address_set", "resource_id": str(w["set"].id)}],
+    )
+    other_type = await _user(
+        db_session,
+        [{"action": "admin", "resource_type": "dns_zone", "resource_id": str(w["zone"].id)}],
+    )
+    await db_session.commit()
+    body = {"description": "x"}
+    r = await client.put(f"/api/v1/address-sets/{w['set'].id}", headers=_h(ro), json=body)
+    assert r.status_code == 403
+    r = await client.put(f"/api/v1/address-sets/{w['set'].id}", headers=_h(other_type), json=body)
+    assert r.status_code == 403
+    r = await client.get("/api/v1/address-sets", headers=_h(other_type))
+    assert r.status_code == 403
+
+
+def test_admit_scoped_is_opt_in_and_token_narrowing_applies_4007() -> None:
+    import inspect
+
+    from app.core import permissions as perms
+
+    assert (
+        inspect.signature(perms.require_any_resource_permission).parameters["admit_scoped"].default
+        is False
+    )
+    user = User(username="t", email="t@t.io", display_name="t", hashed_password="x")
+    user._api_token_resource_grants = [  # type: ignore[attr-defined]
+        {"action": "write", "resource_type": "dns_zone", "resource_id": str(uuid.uuid4())}
+    ]
+    assert not perms._token_covers_type(user, ["write"], "address_set")
+    user._api_token_resource_grants = [  # type: ignore[attr-defined]
+        {"action": "admin", "resource_type": "address_set", "resource_id": str(uuid.uuid4())}
+    ]
+    assert perms._token_covers_type(user, ["write"], "address_set")

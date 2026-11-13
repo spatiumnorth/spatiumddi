@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
@@ -19,6 +20,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { ZoneSerialsLine } from "./ZoneSerialsLine";
+import { servedApexWords } from "./servedApexWords";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -90,6 +92,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
+import { DeleteChoiceModal } from "@/components/ui/delete-choice-modal";
 import { Field } from "@/pages/dhcp/_shared";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -758,53 +761,6 @@ export function DeleteDNSGroupModal({
       error={error}
       notice={notice}
     />
-  );
-}
-
-/** Single-step destructive confirm (no checkbox). Used for low-stakes deletes
- * like individual DNS records — the two-step modal above stays for group /
- * blocklist deletes where the blast radius is much larger. */
-function ConfirmSingleModal({
-  title,
-  description,
-  onConfirm,
-  onClose,
-  isPending,
-  confirmLabel = "Delete",
-  error,
-}: {
-  title: string;
-  description: React.ReactNode;
-  onConfirm: () => void;
-  onClose: () => void;
-  isPending?: boolean;
-  confirmLabel?: string;
-  /** The server's reason when the action was refused, so a refused
-   *  delete says why instead of leaving the dialog as it was. */
-  error?: string | null;
-}) {
-  return (
-    <Modal title={title} onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">{description}</p>
-        {error && <p className="text-sm text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={isPending}
-            className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-          >
-            {isPending ? "Deleting…" : confirmLabel}
-          </button>
-        </div>
-      </div>
-    </Modal>
   );
 }
 
@@ -3858,17 +3814,27 @@ function RecordModalForm({
             value={viewId}
             onChange={(e) => setViewId(e.target.value)}
           >
-            <option value="">All views (default)</option>
+            <option value="">No view (unscoped, default)</option>
             {viewChoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
-          {pinViewId && (
+          {pinViewId ? (
             <p className="mt-1 text-xs text-muted-foreground">
               This zone is pinned to one view, so its records can only be in
               that view.
+            </p>
+          ) : (
+            <p
+              className="mt-1 text-xs text-muted-foreground"
+              data-testid="record-view-rule"
+            >
+              A zone with no view of its own is served in the views its records
+              are scoped to. Scoping any record to a view limits the zone, with
+              every unscoped record in it, to the views its records name; only
+              while no record is scoped does the zone serve in every view.
             </p>
           )}
         </Field>
@@ -4301,6 +4267,8 @@ export function ZoneDetailView({
   // name / fqdn / value / type on the server; the per-column recFilter below
   // stays a client-side refinement over the current page.
   const [recordSearch, setRecordSearch] = useState("");
+  // The box edits `recordSearch` at once; the query follows 300 ms later (#4077).
+  const debouncedRecordSearch = useDebouncedValue(recordSearch);
   const [recordPage, setRecordPage] = useState(1);
   const recordPageSize = 100;
   // Search-landing highlight — ``highlightRecordId`` is passed down
@@ -4395,9 +4363,9 @@ export function ZoneDetailView({
       page: recordPage,
       page_size: recordPageSize,
     };
-    if (recordSearch.trim()) p.search = recordSearch.trim();
+    if (debouncedRecordSearch.trim()) p.search = debouncedRecordSearch.trim();
     return p;
-  }, [recordPage, recordSearch]);
+  }, [recordPage, debouncedRecordSearch]);
   const {
     data: recordsPage,
     isFetching,
@@ -4405,6 +4373,9 @@ export function ZoneDetailView({
   } = useQuery({
     queryKey: ["dns-records", zone.id, recordParams],
     queryFn: () => dnsApi.listRecords(group.id, zone.id, recordParams),
+    // Keep this zone's previous page on screen while the next search loads.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === zone.id ? prev : undefined,
   });
   const records = recordsPage?.items ?? [];
   const recordsTotal = recordsPage?.total ?? 0;
@@ -4461,7 +4432,8 @@ export function ZoneDetailView({
   });
 
   const deleteRecord = useMutation({
-    mutationFn: (r: DNSRecord) => dnsApi.deleteRecord(group.id, zone.id, r.id),
+    mutationFn: ({ rec, permanent }: { rec: DNSRecord; permanent: boolean }) =>
+      dnsApi.deleteRecord(group.id, zone.id, rec.id, { permanent }),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] }),
   });
@@ -4477,7 +4449,6 @@ export function ZoneDetailView({
   // may use it.
   const { isSuperadmin, can, canWriteRecords, canDeleteRecords } =
     useDnsGrants();
-  const [bulkPermanent, setBulkPermanent] = useState(false);
   // Outcome of the last bulk delete when some rows were skipped — the
   // selection persists across pages, so the count in the modal can differ
   // from what the server did (pool-managed or synthesised rows, wire
@@ -4490,7 +4461,13 @@ export function ZoneDetailView({
     // BULK_DELETE_CHUNK ids and the selection can exceed that across
     // pages, so chunk — and each chunk is its own trash batch, which the
     // confirm copy says rather than promising one restore.
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      permanent,
+    }: {
+      ids: string[];
+      permanent: boolean;
+    }) => {
       let deleted = 0;
       const skipped: { record_id: string; reason: string }[] = [];
       const batches: string[] = [];
@@ -4500,7 +4477,7 @@ export function ZoneDetailView({
           group.id,
           zone.id,
           ids.slice(i, i + BULK_DELETE_CHUNK),
-          { permanent: bulkPermanent },
+          { permanent },
         );
         deleted += res.deleted;
         skipped.push(...res.skipped);
@@ -4509,7 +4486,10 @@ export function ZoneDetailView({
       }
       return { deleted, skipped, batches, providerWarnings };
     },
-    onSuccess: ({ deleted, skipped, batches, providerWarnings }) => {
+    onSuccess: (
+      { deleted, skipped, batches, providerWarnings },
+      { permanent: bulkPermanent },
+    ) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
@@ -4536,7 +4516,6 @@ export function ZoneDetailView({
       } else {
         setBulkDeleteNotice(null);
       }
-      setBulkPermanent(false);
     },
   });
 
@@ -4544,6 +4523,9 @@ export function ZoneDetailView({
   // listed forwarders. The detail surface below swaps the records table
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
+  // #3841 — a stub zone holds no zone data, so Sync with server does not apply
+  // (the API answers 400); it is not offered rather than shown as a failure.
+  const isStub = zone.zone_type === "stub";
 
   // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
   // stub's data is its masters', so the server refuses a record written into
@@ -4821,10 +4803,11 @@ export function ZoneDetailView({
                         : "Sync with server",
                       icon: RefreshCw,
                       iconClassName: syncMut.isPending ? "animate-spin" : "",
-                      disabled: syncMut.isPending,
+                      disabled: syncMut.isPending || isStub,
                       onSelect: () => syncMut.mutate(),
-                      title:
-                        "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
+                      title: isStub
+                        ? "This is a stub zone: the server does not hold it authoritatively, so there is no zone data to transfer and nothing to compare. Sync with server does not apply."
+                        : "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
                       ...permissionGate(canWriteRecords, NEEDS_DNS_WRITE),
                     },
                     {
@@ -5265,7 +5248,8 @@ export function ZoneDetailView({
                 {recordsTotal.toLocaleString()}{" "}
                 {recordsTotal === 1 ? "record" : "records"}
                 {hasRecFilter && " · page filtered"}
-                {isFetching && " · loading…"}
+                {(isFetching || recordSearch !== debouncedRecordSearch) &&
+                  " · searching…"}
               </span>
             )}
             <div className="ml-auto">
@@ -5728,28 +5712,44 @@ export function ZoneDetailView({
         />
       )}
       {confirmDeleteRecord && (
-        <ConfirmSingleModal
+        <DeleteChoiceModal
           title="Delete Record"
-          description={
+          intro={
             <>
               Delete{" "}
               <span className="font-mono">
                 {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
               </span>
-              ? This will remove the record from the zone and fire an RFC 2136
-              update.
+              ?
             </>
           }
-          isPending={deleteRecord.isPending}
+          softHeading="Move to Trash (reversible)"
+          softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
+          softButtonLabel="Move to Trash"
+          permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
+          allowPermanent={isSuperadmin}
+          isSoftPending={
+            deleteRecord.isPending && !deleteRecord.variables?.permanent
+          }
+          isPermanentPending={
+            deleteRecord.isPending && !!deleteRecord.variables?.permanent
+          }
           error={
             deleteRecord.isError
               ? formatApiError(deleteRecord.error, "Delete failed")
               : null
           }
-          onConfirm={() =>
-            deleteRecord.mutate(confirmDeleteRecord, {
-              onSuccess: () => setConfirmDeleteRecord(null),
-            })
+          onSoft={() =>
+            deleteRecord.mutate(
+              { rec: confirmDeleteRecord, permanent: false },
+              { onSuccess: () => setConfirmDeleteRecord(null) },
+            )
+          }
+          onPermanent={() =>
+            deleteRecord.mutate(
+              { rec: confirmDeleteRecord, permanent: true },
+              { onSuccess: () => setConfirmDeleteRecord(null) },
+            )
           }
           onClose={() => {
             deleteRecord.reset();
@@ -5758,46 +5758,47 @@ export function ZoneDetailView({
         />
       )}
       {confirmBulkDelete && (
-        <ConfirmSingleModal
-          title={
-            bulkPermanent
-              ? `Permanently delete ${selectedRecords.size} records`
-              : `Move ${selectedRecords.size} records to the trash`
+        <DeleteChoiceModal
+          title={`Delete ${selectedRecords.size} records`}
+          intro={
+            <>
+              Delete the{" "}
+              <span className="font-medium">{selectedRecords.size}</span>{" "}
+              selected records? Moved to Trash, a superadmin can restore them
+              from Administration → Trash. IPAM-managed records are excluded
+              automatically.
+            </>
           }
-          description={
-            <div className="space-y-2">
-              <p>
-                {bulkPermanent ? "Permanently delete the " : "Move the "}
-                <span className="font-medium">{selectedRecords.size}</span>{" "}
-                selected records
-                {bulkPermanent
-                  ? "? This cannot be undone."
-                  : selectedRecords.size > BULK_DELETE_CHUNK
-                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
-                    : " to the trash? A superadmin can restore them together from Administration → Trash."}{" "}
-                IPAM-managed records are excluded automatically.
-              </p>
-              {isSuperadmin && (
-                <label className="flex items-center gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={bulkPermanent}
-                    onChange={(e) => setBulkPermanent(e.target.checked)}
-                  />
-                  Delete permanently (skip the trash)
-                </label>
-              )}
-            </div>
+          softHeading="Move to Trash (reversible)"
+          softBody={
+            selectedRecords.size > BULK_DELETE_CHUNK
+              ? `The records are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
+              : "A superadmin can restore them together from Administration → Trash."
           }
-          confirmLabel={bulkPermanent ? "Delete permanently" : "Move to trash"}
-          isPending={bulkDeleteRecords.isPending}
-          onConfirm={() =>
-            bulkDeleteRecords.mutate(Array.from(selectedRecords))
+          softButtonLabel="Move to Trash"
+          permanentBody="The records are removed immediately and retracted from the DNS server. There's no undo."
+          allowPermanent={isSuperadmin}
+          isSoftPending={
+            bulkDeleteRecords.isPending &&
+            !bulkDeleteRecords.variables?.permanent
           }
-          onClose={() => {
-            setConfirmBulkDelete(false);
-            setBulkPermanent(false);
-          }}
+          isPermanentPending={
+            bulkDeleteRecords.isPending &&
+            !!bulkDeleteRecords.variables?.permanent
+          }
+          onSoft={() =>
+            bulkDeleteRecords.mutate({
+              ids: Array.from(selectedRecords),
+              permanent: false,
+            })
+          }
+          onPermanent={() =>
+            bulkDeleteRecords.mutate({
+              ids: Array.from(selectedRecords),
+              permanent: true,
+            })
+          }
+          onClose={() => setConfirmBulkDelete(false)}
         />
       )}
       {showMoveZone && (
@@ -6018,7 +6019,7 @@ export function SyncResultModal({
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Stat
-              label={queued_for_agent ? "Queued for agent" : "Pushed"}
+              label={queued_for_agent ? "Queued for delivery" : "Pushed"}
               value={pushed}
               highlight={
                 pushed > 0 && push_errors.length === 0 ? "good" : undefined
@@ -6035,12 +6036,21 @@ export function SyncResultModal({
               hint="DB already matches server"
             />
           </div>
+          {queued_for_agent && pushed > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              These records are queued, not yet on the server. They are applied
+              in the background (an agent applies them on its next poll; for an
+              agentless server the retry sweep does, a batch at a time), so a
+              large zone can take a few minutes to converge. Failed writes are
+              retried; check the server's record-op queue for errors.
+            </p>
+          )}
           {pushed > 0 && (
             <RecordTable
               records={pushed_records}
               heading={
                 queued_for_agent
-                  ? "Records queued for the server's agent"
+                  ? "Records queued — delivered to the server in the background"
                   : "Records applied to the server"
               }
             />
@@ -6216,29 +6226,11 @@ function ServedApexRows({
   // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
   // holds its own address for ns1), or ``invalid.`` for a zone whose name is
   // not a host name, which never resolves.
-  const unaddressedPrimary = apex.unaddressed_primary_ns;
-  const warning =
-    apex.placeholder_glue_loopback && unaddressedPrimary
-      ? `The Primary NS ${unaddressedPrimary} is inside the zone, but the zone holds no A or AAAA record for it, and BIND will not load a zone whose NS has no address. This placeholder name server, glued to 127.0.0.1, is served instead, so resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for ${unaddressedPrimary}.`
-      : apex.placeholder_glue_loopback && apex.source === "declared"
-        ? `The apex NS record ${apex.ns.join(", ")} has no A or AAAA record in the zone, so it is served glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for it.`
-        : apex.placeholder_glue_loopback
-          ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-          : apex.source === "placeholder" && apex.ns.includes("invalid.")
-            ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-            : apex.source === "placeholder"
-              ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
-              : null;
+  const { warning, unaddressed } = servedApexWords(apex, zoneName);
   // A declared apex draws no NS rows of ours, so its warning gets its own row.
-  const unaddressedNs = apex.unaddressed_ns ?? [];
   const declaredWarning =
     apex.source === "declared"
-      ? [
-          warning,
-          unaddressedNs.length > 0
-            ? `The apex NS ${unaddressedNs.join(", ")} lies inside the zone with no A or AAAA record, and BIND will not load a zone whose NS has no address. Add the address record.`
-            : null,
-        ].filter((w): w is string => !!w)
+      ? [warning, unaddressed].filter((w): w is string => !!w)
       : [];
   const nameCell = (
     <td className="py-1.5 pl-5 font-mono text-xs font-medium">
@@ -6842,7 +6834,9 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           <p className="mt-1">
             Note that once any view exists, <em>every</em> zone in this group is
             served from inside a view — zones with no view of their own are
-            rendered into all of them.
+            rendered into all of them, until a record of the zone is scoped to a
+            view: the zone, with its unscoped records, is then limited to the
+            views its records name.
           </p>
         </div>
       ) : views.length === 0 ? null : (
@@ -9590,7 +9584,7 @@ function applyTextFilter(
   return v.includes(f);
 }
 
-function RecordsTab({
+export function RecordsTab({
   group,
   onSelectZone,
 }: {
@@ -9603,6 +9597,9 @@ function RecordsTab({
   // name / fqdn / value / type / zone on the server; the per-column filters
   // below stay client-side refinements over the current page.
   const [groupRecordSearch, setGroupRecordSearch] = useState("");
+  // The box edits `groupRecordSearch` at once; the query follows 300 ms later
+  // (#4077).
+  const debouncedGroupRecordSearch = useDebouncedValue(groupRecordSearch);
   const [groupRecordPage, setGroupRecordPage] = useState(1);
   const groupRecordPageSize = 100;
   const groupRecordParams = useMemo(() => {
@@ -9610,16 +9607,22 @@ function RecordsTab({
       page: groupRecordPage,
       page_size: groupRecordPageSize,
     };
-    if (groupRecordSearch.trim()) p.search = groupRecordSearch.trim();
+    if (debouncedGroupRecordSearch.trim())
+      p.search = debouncedGroupRecordSearch.trim();
     return p;
-  }, [groupRecordPage, groupRecordSearch]);
+  }, [groupRecordPage, debouncedGroupRecordSearch]);
   const {
     data: groupRecordsPage,
     isLoading,
+    isFetching: groupRecordsFetching,
     error: groupRecordsError,
   } = useQuery({
     queryKey: ["dns-group-records", group.id, groupRecordParams],
     queryFn: () => dnsApi.listGroupRecords(group.id, groupRecordParams),
+    // A new search keeps the previous rows (of this group) until it answers,
+    // so the page below — and the search box in it — is never unmounted (#4077).
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === group.id ? prev : undefined,
   });
   const records = groupRecordsPage?.items ?? [];
   const recordsTotal = groupRecordsPage?.total ?? 0;
@@ -9837,6 +9840,9 @@ function RecordsTab({
               {filtered.length.toLocaleString()} of{" "}
               {recordsTotal.toLocaleString()}{" "}
               {recordsTotal === 1 ? "record" : "records"}
+              {(groupRecordsFetching ||
+                groupRecordSearch !== debouncedGroupRecordSearch) &&
+                " · searching…"}
             </p>
           )}
         </div>
@@ -11354,10 +11360,10 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                     ))}
                     {feedSkippedTotal(l) > 0 && (
                       <span
-                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground"
                         title={feedSkippedTitle(l)}
                       >
-                        {feedSkippedTotal(l)} rules not enforced
+                        {feedSkippedTotal(l)} rules skipped
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
@@ -12110,7 +12116,9 @@ export function BlocklistDetail({
         </p>
       )}
       {feedSkippedTotal(list) > 0 && (
-        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
+        <p className="text-xs text-muted-foreground">
+          {feedSkippedTitle(list)}
+        </p>
       )}
 
       {/* Blocked domains (the list itself) */}
@@ -12787,15 +12795,34 @@ export function SyncWithServersResultModal({
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 text-xs">
               <SyncStat
                 label="Records pushed"
-                value={result.total_pushed}
-                accent={result.total_pushed ? "good" : undefined}
+                value={result.total_pushed - (result.total_queued ?? 0)}
+                accent={
+                  result.total_pushed - (result.total_queued ?? 0)
+                    ? "good"
+                    : undefined
+                }
               />
+              {(result.total_queued ?? 0) > 0 && (
+                <SyncStat
+                  label="Queued for delivery"
+                  value={result.total_queued ?? 0}
+                />
+              )}
               <SyncStat
                 label="Push errors"
                 value={result.total_push_errors}
                 accent={result.total_push_errors ? "bad" : undefined}
               />
             </div>
+            {(result.total_queued ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Queued records are not yet on the server. They are applied in
+                the background (an agent applies them on its next poll; for an
+                agentless server the retry sweep does, a batch at a time), so a
+                large zone can take a few minutes to converge. Failed writes are
+                retried; check the server's record-op queue for errors.
+              </p>
+            )}
 
             {result.items.length === 0 && (
               <p className="text-sm text-muted-foreground italic">
@@ -12935,8 +12962,14 @@ export function SyncWithServersResultModal({
                                   <td className="px-3 py-1 tabular-nums text-emerald-600">
                                     {item.imported || "—"}
                                   </td>
-                                  <td className="px-3 py-1 tabular-nums text-emerald-600">
-                                    {item.pushed || "—"}
+                                  <td
+                                    className={`px-3 py-1 tabular-nums ${item.queued_for_agent ? "text-amber-600" : "text-emerald-600"}`}
+                                  >
+                                    {item.pushed
+                                      ? item.queued_for_agent
+                                        ? `${item.pushed} queued`
+                                        : item.pushed
+                                      : "—"}
                                   </td>
                                   <td className="px-3 py-1">
                                     {item.error ? (
@@ -12946,6 +12979,11 @@ export function SyncWithServersResultModal({
                                     ) : item.push_errors.length > 0 ? (
                                       <span className="text-amber-600">
                                         {item.push_errors.length} push err
+                                      </span>
+                                    ) : item.queued_for_agent &&
+                                      item.pushed > 0 ? (
+                                      <span className="text-amber-600">
+                                        queued, not yet on the server
                                       </span>
                                     ) : (
                                       <span className="text-muted-foreground">

@@ -76,6 +76,7 @@ from app.drivers._winrm import (
     MAX_ENCODED_COMMAND,
     WinRMCommandTooLong,
     encoded_command_len,
+    ps_single_quote,
 )
 from app.drivers._winrm import (
     run_ps as _winrm_run_ps,
@@ -1669,12 +1670,12 @@ def _parse_iso(value: Any) -> datetime | None:
 def _ps_literal(value: str) -> str:
     """Return ``value`` quoted as a PowerShell single-quoted literal.
 
-    Single quotes inside the string are doubled — PS's own escape rule
-    for single-quoted literals. No backtick-based escaping, no variable
-    expansion, no injection surface: whatever we pass survives intact.
+    Every quote character PowerShell recognises is doubled (see
+    :func:`app.drivers._winrm.ps_single_quote_escape`). No backtick-based
+    escaping, no variable expansion: whatever we pass survives intact.
     Use this for every user-controlled string that goes into a script.
     """
-    return "'" + (value or "").replace("'", "''") + "'"
+    return ps_single_quote(value)
 
 
 # Option-name → Windows option ID. Inverse of _OPTION_ID_TO_NAME above.

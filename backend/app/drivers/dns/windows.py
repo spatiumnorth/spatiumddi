@@ -43,6 +43,8 @@ from app.drivers._winrm import (
     MAX_ENCODED_COMMAND,
     WinRMCommandTooLong,
     encoded_command_len,
+    ps_single_quote,
+    ps_single_quote_escape,
 )
 from app.drivers._winrm import (
     run_ps as _winrm_run_ps,
@@ -663,7 +665,7 @@ class WindowsDNSDriver(DNSDriver):
         name = _ps_escape_single_quoted((zone_name or "").rstrip("."))
         script = (
             f"Set-DnsServerPrimaryZone -Name '{name}' -DynamicUpdate {mode} -ErrorAction Stop; "
-            f"Write-Output \"zone '{name}' DynamicUpdate set to {mode}\""
+            f"Write-Output 'zone ''{name}'' DynamicUpdate set to {mode}'"
         )
         await asyncio.to_thread(_run_ps, server, creds, script)
         logger.info(
@@ -757,12 +759,13 @@ _PS_LIST_ZONES = (
 def _ps_escape_single_quoted(value: str) -> str:
     """Escape ``value`` for use inside a PowerShell single-quoted literal.
 
-    PS single-quoted strings have exactly one escape rule — double the
-    inner single quote. No backticks, no variable expansion, nothing to
-    worry about. Keeps zone names with apostrophes (unlikely but legal)
-    from breaking the script.
+    Single-quoted strings have one escape rule — double the quote — but
+    PowerShell recognises several quote characters; see
+    :func:`app.drivers._winrm.ps_single_quote_escape`. Operator values are
+    only ever placed in single-quoted literals, never in double-quoted
+    (expandable) strings.
     """
-    return (value or "").replace("'", "''")
+    return ps_single_quote_escape(value)
 
 
 def _ps_list_records(zone_name: str) -> str:
@@ -981,14 +984,14 @@ try {{
         return f"""
 {probe}
 if ($zone) {{
-    Write-Output "zone '{name}' already exists on server"
+    Write-Output 'zone ''{name}'' already exists on server'
 }} else {{
     try {{
         Add-DnsServerPrimaryZone -Name '{name}' -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
-        Write-Output "zone '{name}' created"
+        Write-Output 'zone ''{name}'' created'
     }} catch {{
         if ($_.FullyQualifiedErrorId -match 'WIN32 9609') {{
-            Write-Output "zone '{name}' already exists on server"
+            Write-Output 'zone ''{name}'' already exists on server'
         }} else {{
             throw
         }}
@@ -1005,16 +1008,16 @@ if ($zone) {{
 if ($zone) {{
     try {{
         Remove-DnsServerZone -Name '{name}' -Force -ErrorAction Stop
-        Write-Output "zone '{name}' deleted"
+        Write-Output 'zone ''{name}'' deleted'
     }} catch {{
         if ($_.FullyQualifiedErrorId -match 'WIN32 9601') {{
-            Write-Output "zone '{name}' was not present on server"
+            Write-Output 'zone ''{name}'' was not present on server'
         }} else {{
             throw
         }}
     }}
 }} else {{
-    Write-Output "zone '{name}' was not present on server"
+    Write-Output 'zone ''{name}'' was not present on server'
 }}
 """.strip()
 
@@ -1216,19 +1219,19 @@ def _ps_apply_record(change: RecordChange) -> str:
     value_filter = ""
     match_value = _delete_match_value(change, rtype)
     if match_value is not None:
-        mv = "'" + _ps_escape_single_quoted(match_value) + "'"
+        mv = ps_single_quote(match_value)
         pred = _ps_value_predicate(rtype, "$_.RecordData", mv)
         value_filter = f" | Where-Object {{ {pred} }}"
     delete = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
-    Write-Output "zone '{zone}' not present on server; delete is a no-op"
+    Write-Output 'zone ''{zone}'' not present on server; delete is a no-op'
 }} else {{
     $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue{value_filter}
     if ($rrs) {{
         $rrs | Remove-DnsServerResourceRecord -ZoneName '{zone}' -Force -ErrorAction Stop
-        Write-Output "record '{name}' {rtype} deleted from '{zone}'"
+        Write-Output 'record ''{name}'' {rtype} deleted from ''{zone}'''
     }} else {{
-        Write-Output "record '{name}' {rtype} not present in '{zone}'; delete is a no-op"
+        Write-Output 'record ''{name}'' {rtype} not present in ''{zone}''; delete is a no-op'
     }}
 }}
 """.strip()
@@ -1239,7 +1242,7 @@ if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
     # fix is one click on Sync with Servers.
     create_with_zone_guard = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
-    throw "Zone '{zone}' not found on Windows server. Click 'Sync with Servers' on the server group to push SpatiumDDI zones first."
+    throw 'Zone ''{zone}'' not found on Windows server. Click ''Sync with Servers'' on the server group to push SpatiumDDI zones first.'
 }}
 {create}
 """.strip()
