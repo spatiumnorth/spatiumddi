@@ -124,3 +124,38 @@ describe("Add Pool offers device-policy classes (#2752)", () => {
     expect(sel.value).toBe("spatium-device-iot");
   });
 });
+
+describe("Edit Pool shows the existing-IPs notice (#4027)", () => {
+  it("names the addresses the update reports and says the pool was saved", async () => {
+    updatePool.mockResolvedValue({
+      existing_ips_in_range: [
+        { address: "10.0.0.60", status: "reserved", hostname: "printer" },
+      ],
+    });
+    const pool = {
+      id: "p1",
+      name: "p",
+      start_ip: "10.0.0.10",
+      end_ip: "10.0.0.50",
+      pool_type: "dynamic",
+    } as unknown as DHCPPool;
+    listPools.mockResolvedValue([pool]);
+    const scope = {
+      id: "s1",
+      group_id: "g1",
+      address_family: "ipv4",
+    } as DHCPScope;
+    const onClose = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CreatePoolModal pool={pool} scope={scope} onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    const end = await screen.findByDisplayValue("10.0.0.50");
+    fireEvent.change(end, { target: { value: "10.0.0.70" } });
+    fireEvent.submit(end.closest("form")!);
+    await screen.findByText(/Pool saved — 1 existing IP in this range/);
+    expect(screen.getByText(/10\.0\.0\.60/)).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});
