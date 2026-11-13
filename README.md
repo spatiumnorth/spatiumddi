@@ -42,7 +42,7 @@
 
 ---
 
-> **1.0.0 release candidate.** `1.0.0-rc.2` is the release candidate for SpatiumDDI 1.0.0: the code is frozen, and only fixes for serious issues land before 1.0.0 ships after a clean soak. Upgrading from CalVer? Read [Upgrading to 1.0.0](docs/deployment/APPLIANCE.md#upgrading-to-100) first. Install the [latest release](https://github.com/spatiumnorth/spatiumddi/releases/latest), take a Postgres backup before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for a production rollout. Feedback is very welcome: open an issue or start a discussion on GitHub.
+> **1.0.0 release candidate.** `1.0.0-rc.3` is the release candidate for SpatiumDDI 1.0.0: the code is frozen, and only fixes for serious issues land before 1.0.0 ships after a clean soak. Upgrading from CalVer? Read [Upgrading to 1.0.0](docs/deployment/APPLIANCE.md#upgrading-to-100) first. Install the [latest release](https://github.com/spatiumnorth/spatiumddi/releases/latest), take a Postgres backup before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for a production rollout. Feedback is very welcome: open an issue or start a discussion on GitHub.
 
 ---
 

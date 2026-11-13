@@ -95,7 +95,7 @@ def _validate(cmd: dict[str, Any]) -> dict[str, Any]:
     bpf = cmd.get("bpf_filter")
     if bpf is not None:
         bpf = str(bpf).strip()
-        if bpf and not _BPF_RE.match(bpf):
+        if bpf and (bpf.startswith("-") or not _BPF_RE.match(bpf)):
             raise PcapValidationError("invalid BPF filter")
         bpf = bpf or None
     return {
