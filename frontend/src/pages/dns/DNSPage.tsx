@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
@@ -18,6 +19,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { ZoneSerialsLine } from "./ZoneSerialsLine";
+import { servedApexWords } from "./servedApexWords";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -3541,6 +3543,17 @@ function RecordModalForm({
     queryKey: ["dns-views", groupId],
     queryFn: () => dnsApi.listViews(groupId),
   });
+  // #3944 — a zone pinned to one view renders into that view alone, and the
+  // record API refuses a record scoped to any other, so the field offers the
+  // pin and the unscoped default only.
+  const { data: groupZones = [] } = useQuery({
+    queryKey: ["dns-zones", groupId],
+    queryFn: () => dnsApi.listZones(groupId),
+  });
+  const pinViewId = groupZones.find((z) => z.id === zoneId)?.view_id ?? null;
+  const viewChoices = pinViewId
+    ? views.filter((v) => v.id === pinViewId || v.id === viewId)
+    : views;
 
   // SRV carries priority + weight + port (RFC 2782); MX carries only a
   // priority (the preference). Everything else carries none. (#424)
@@ -3846,13 +3859,29 @@ function RecordModalForm({
             value={viewId}
             onChange={(e) => setViewId(e.target.value)}
           >
-            <option value="">All views (default)</option>
-            {views.map((v) => (
+            <option value="">No view (unscoped, default)</option>
+            {viewChoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name}
               </option>
             ))}
           </select>
+          {pinViewId ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              This zone is pinned to one view, so its records can only be in
+              that view.
+            </p>
+          ) : (
+            <p
+              className="mt-1 text-xs text-muted-foreground"
+              data-testid="record-view-rule"
+            >
+              A zone with no view of its own is served in the views its records
+              are scoped to. Scoping any record to a view limits the zone, with
+              every unscoped record in it, to the views its records name; only
+              while no record is scoped does the zone serve in every view.
+            </p>
+          )}
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
@@ -4155,6 +4184,15 @@ function MoveZoneModal({
               <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                 <span className="text-muted-foreground">Records moving</span>
                 <span>{preview.records_total}</span>
+                {preview.records_trashed > 0 && (
+                  <>
+                    <span className="text-muted-foreground">In the Trash</span>
+                    <span>
+                      {preview.records_trashed} more move with the zone (not
+                      counted above or in the view figures)
+                    </span>
+                  </>
+                )}
                 {preview.records_remapped > 0 && (
                   <>
                     <span className="text-muted-foreground">
@@ -4541,6 +4579,9 @@ export function ZoneDetailView({
   // listed forwarders. The detail surface below swaps the records table
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
+  // #3841 — a stub zone holds no zone data, so Sync with server does not apply
+  // (the API answers 400); it is not offered rather than shown as a failure.
+  const isStub = zone.zone_type === "stub";
 
   // #3838 — only a primary zone is one SpatiumDDI authors. A secondary's or
   // stub's data is its masters', so the server refuses a record written into
@@ -4821,10 +4862,11 @@ export function ZoneDetailView({
                         : "Sync with server",
                       icon: RefreshCw,
                       iconClassName: syncMut.isPending ? "animate-spin" : "",
-                      disabled: syncMut.isPending,
+                      disabled: syncMut.isPending || isStub,
                       onSelect: () => syncMut.mutate(),
-                      title:
-                        "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
+                      title: isStub
+                        ? "This is a stub zone: the server does not hold it authoritatively, so there is no zone data to transfer and nothing to compare. Sync with server does not apply."
+                        : "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
                       ...permissionGate(canWriteRecords, NEEDS_DNS_WRITE),
                     },
                     {
@@ -5291,7 +5333,7 @@ export function ZoneDetailView({
                 ) : hasRecFilter ? (
                   "No records match the current filter."
                 ) : (
-                  'No records yet. Click "Add Record" to create one.'
+                  `No records yet.${canWriteRecords ? ' Click "Add Record" to create one.' : ""}`
                 )}
               </p>
             </div>
@@ -6018,7 +6060,7 @@ export function SyncResultModal({
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Stat
-              label={queued_for_agent ? "Queued for agent" : "Pushed"}
+              label={queued_for_agent ? "Queued for delivery" : "Pushed"}
               value={pushed}
               highlight={
                 pushed > 0 && push_errors.length === 0 ? "good" : undefined
@@ -6035,12 +6077,21 @@ export function SyncResultModal({
               hint="DB already matches server"
             />
           </div>
+          {queued_for_agent && pushed > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              These records are queued, not yet on the server. They are applied
+              in the background (an agent applies them on its next poll; for an
+              agentless server the retry sweep does, a batch at a time), so a
+              large zone can take a few minutes to converge. Failed writes are
+              retried; check the server's record-op queue for errors.
+            </p>
+          )}
           {pushed > 0 && (
             <RecordTable
               records={pushed_records}
               heading={
                 queued_for_agent
-                  ? "Records queued for the server's agent"
+                  ? "Records queued — delivered to the server in the background"
                   : "Records applied to the server"
               }
             />
@@ -6216,29 +6267,11 @@ function ServedApexRows({
   // The placeholder is ``ns1.<zone>`` (glued to loopback unless the zone
   // holds its own address for ns1), or ``invalid.`` for a zone whose name is
   // not a host name, which never resolves.
-  const unaddressedPrimary = apex.unaddressed_primary_ns;
-  const warning =
-    apex.placeholder_glue_loopback && unaddressedPrimary
-      ? `The Primary NS ${unaddressedPrimary} is inside the zone, but the zone holds no A or AAAA record for it, and BIND will not load a zone whose NS has no address. This placeholder name server, glued to 127.0.0.1, is served instead, so resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for ${unaddressedPrimary}.`
-      : apex.placeholder_glue_loopback && apex.source === "declared"
-        ? `The apex NS record ${apex.ns.join(", ")} has no A or AAAA record in the zone, so it is served glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Add an A or AAAA record for it.`
-        : apex.placeholder_glue_loopback
-          ? "This is a placeholder name server glued to 127.0.0.1: resolvers that follow the zone's NS set are sent to their own loopback. Set a Primary NS in Edit Zone, or add NS records."
-          : apex.source === "placeholder" && apex.ns.includes("invalid.")
-            ? "This is a placeholder name server that never resolves. Set a Primary NS in Edit Zone, or add NS records."
-            : apex.source === "placeholder"
-              ? "This is a placeholder name server, used because the zone names none of its own (no Primary NS that resolves, no NS records). Set a Primary NS in Edit Zone, or add NS records."
-              : null;
+  const { warning, unaddressed } = servedApexWords(apex, zoneName);
   // A declared apex draws no NS rows of ours, so its warning gets its own row.
-  const unaddressedNs = apex.unaddressed_ns ?? [];
   const declaredWarning =
     apex.source === "declared"
-      ? [
-          warning,
-          unaddressedNs.length > 0
-            ? `The apex NS ${unaddressedNs.join(", ")} lies inside the zone with no A or AAAA record, and BIND will not load a zone whose NS has no address. Add the address record.`
-            : null,
-        ].filter((w): w is string => !!w)
+      ? [warning, unaddressed].filter((w): w is string => !!w)
       : [];
   const nameCell = (
     <td className="py-1.5 pl-5 font-mono text-xs font-medium">
@@ -6842,7 +6875,9 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           <p className="mt-1">
             Note that once any view exists, <em>every</em> zone in this group is
             served from inside a view — zones with no view of their own are
-            rendered into all of them.
+            rendered into all of them, until a record of the zone is scoped to a
+            view: the zone, with its unscoped records, is then limited to the
+            views its records name.
           </p>
         </div>
       ) : views.length === 0 ? null : (
@@ -7702,7 +7737,13 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       )}
       {keys.length === 0 && keysData !== undefined && keysError == null && (
         <p className="text-xs italic text-muted-foreground">
-          No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
+          No TSIG keys yet.
+          {isSuperadmin && (
+            <>
+              {" "}
+              Click <em>New TSIG Key</em> to add one.
+            </>
+          )}
         </p>
       )}
 
@@ -8123,8 +8164,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   // client's change, and the form is filled from this read, not the cache.
   const {
     data: opts,
-    isLoading,
     isFetching,
+    isError: optsError,
   } = useQuery({
     queryKey: ["dns-options", groupId],
     queryFn: () => dnsApi.getOptions(groupId),
@@ -8472,7 +8513,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     };
     // Send only what changed (#3739). The baseline is the fill-time read run
     // through the same shaping, so a field left alone compares equal.
-    const o = filledFrom!;
+    if (!filledFrom) return;
+    const o = filledFrom;
     const diff = changedFields(
       {
         forwarders: o.forwarders,
@@ -8528,8 +8570,19 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     saveMut.mutate(diff);
   }
 
-  if (isLoading)
+  // No editable form until the form has been filled from a settled read
+  // (#3864): with a cached copy the query is not "loading" while the re-read
+  // is pending, and the form would show its built-in defaults, take edits the
+  // fill then overwrites, and Save would have no baseline.
+  if (!filledFrom) {
+    if (optsError && !isFetching)
+      return (
+        <p className="text-sm text-destructive">
+          Could not load the group's options.
+        </p>
+      );
     return <p className="text-sm text-muted-foreground">Loading…</p>;
+  }
 
   // Full-width select to prevent text/arrow overlap
   const selCls =
@@ -10546,7 +10599,7 @@ function ZonesTab({
               </button>
             </>
           ) : (
-            'No zones yet. Click "Add Zone" to create one.'
+            `No zones yet.${can("write", "dns_zone") ? ' Click "Add Zone" to create one.' : ""}`
           )}
         </p>
       )}
@@ -11068,14 +11121,35 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       setSelectedIds(new Set());
     },
   });
+  // Every list is its own DELETE, so every result is read (#3822): a refused
+  // delete leaves its list in place, the dialog stays open and says why, and
+  // only the lists that were not deleted stay selected.
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null);
   const bulkDelete = useMutation({
-    mutationFn: async (ids: string[]) => {
-      await Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id)));
-    },
-    onSuccess: () => {
+    mutationFn: (ids: string[]) =>
+      Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id))),
+    onSuccess: (results, ids) => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      setSelectedIds(new Set());
-      setConfirmBulkDelete(false);
+      const failed = ids.filter((_, i) => results[i].status === "rejected");
+      setSelectedIds(new Set(failed));
+      if (failed.length === 0) {
+        setConfirmBulkDelete(false);
+        return;
+      }
+      const reasons = [
+        ...new Set(
+          results.flatMap((r) =>
+            r.status === "rejected" ? [formatApiError(r.reason)] : [],
+          ),
+        ),
+      ];
+      const what =
+        failed.length < ids.length
+          ? `${failed.length} of ${ids.length} blocking lists were not deleted`
+          : ids.length === 1
+            ? "The blocking list was not deleted"
+            : `None of the ${ids.length} blocking lists were deleted`;
+      setBulkDeleteError(`${what}: ${reasons.join("; ")}`);
     },
   });
 
@@ -11315,10 +11389,10 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                     ))}
                     {feedSkippedTotal(l) > 0 && (
                       <span
-                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground"
                         title={feedSkippedTitle(l)}
                       >
-                        {feedSkippedTotal(l)} rules not enforced
+                        {feedSkippedTotal(l)} rules skipped
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
@@ -11435,8 +11509,19 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           description={`Permanently delete "${confirmDelete.name}" and all its entries/exceptions?`}
           checkLabel={`I understand all entries in "${confirmDelete.name}" will be permanently deleted.`}
           onConfirm={() => deleteMut.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            deleteMut.reset();
+          }}
           isPending={deleteMut.isPending}
+          error={
+            deleteMut.isError
+              ? formatApiError(
+                  deleteMut.error,
+                  "Failed to delete blocking list",
+                )
+              : null
+          }
         />
       )}
       {confirmBulkDelete && (
@@ -11444,9 +11529,16 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           title={`Delete ${selCount} blocklist${selCount === 1 ? "" : "s"}`}
           description={`Permanently delete the ${selCount} selected blocking list${selCount === 1 ? "" : "s"} and all their entries / exceptions? This cannot be undone.`}
           checkLabel={`I understand the ${selCount} selected blocking list${selCount === 1 ? " will be" : "s will be"} permanently deleted.`}
-          onConfirm={() => bulkDelete.mutate(Array.from(selectedIds))}
-          onClose={() => setConfirmBulkDelete(false)}
+          onConfirm={() => {
+            setBulkDeleteError(null);
+            bulkDelete.mutate(Array.from(selectedIds));
+          }}
+          onClose={() => {
+            setConfirmBulkDelete(false);
+            setBulkDeleteError(null);
+          }}
           isPending={bulkDelete.isPending}
+          error={bulkDeleteError}
         />
       )}
     </div>
@@ -11781,11 +11873,9 @@ function EditBlockedDomainModal({
           Block subdomains too (
           <code className="font-mono text-xs">*.{domain || "domain"}</code>)
         </label>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11874,11 +11964,9 @@ function EditExceptionModal({
             placeholder="Optional"
           />
         </Field>
-        {save.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(save.error, "Save failed")}
-          </p>
-        )}
+        <FormError>
+          {save.isError ? formatApiError(save.error, "Save failed") : null}
+        </FormError>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -12057,7 +12145,9 @@ export function BlocklistDetail({
         </p>
       )}
       {feedSkippedTotal(list) > 0 && (
-        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
+        <p className="text-xs text-muted-foreground">
+          {feedSkippedTitle(list)}
+        </p>
       )}
 
       {/* Blocked domains (the list itself) */}
@@ -12734,15 +12824,34 @@ export function SyncWithServersResultModal({
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 text-xs">
               <SyncStat
                 label="Records pushed"
-                value={result.total_pushed}
-                accent={result.total_pushed ? "good" : undefined}
+                value={result.total_pushed - (result.total_queued ?? 0)}
+                accent={
+                  result.total_pushed - (result.total_queued ?? 0)
+                    ? "good"
+                    : undefined
+                }
               />
+              {(result.total_queued ?? 0) > 0 && (
+                <SyncStat
+                  label="Queued for delivery"
+                  value={result.total_queued ?? 0}
+                />
+              )}
               <SyncStat
                 label="Push errors"
                 value={result.total_push_errors}
                 accent={result.total_push_errors ? "bad" : undefined}
               />
             </div>
+            {(result.total_queued ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Queued records are not yet on the server. They are applied in
+                the background (an agent applies them on its next poll; for an
+                agentless server the retry sweep does, a batch at a time), so a
+                large zone can take a few minutes to converge. Failed writes are
+                retried; check the server's record-op queue for errors.
+              </p>
+            )}
 
             {result.items.length === 0 && (
               <p className="text-sm text-muted-foreground italic">
@@ -12882,8 +12991,14 @@ export function SyncWithServersResultModal({
                                   <td className="px-3 py-1 tabular-nums text-emerald-600">
                                     {item.imported || "—"}
                                   </td>
-                                  <td className="px-3 py-1 tabular-nums text-emerald-600">
-                                    {item.pushed || "—"}
+                                  <td
+                                    className={`px-3 py-1 tabular-nums ${item.queued_for_agent ? "text-amber-600" : "text-emerald-600"}`}
+                                  >
+                                    {item.pushed
+                                      ? item.queued_for_agent
+                                        ? `${item.pushed} queued`
+                                        : item.pushed
+                                      : "—"}
                                   </td>
                                   <td className="px-3 py-1">
                                     {item.error ? (
@@ -12893,6 +13008,11 @@ export function SyncWithServersResultModal({
                                     ) : item.push_errors.length > 0 ? (
                                       <span className="text-amber-600">
                                         {item.push_errors.length} push err
+                                      </span>
+                                    ) : item.queued_for_agent &&
+                                      item.pushed > 0 ? (
+                                      <span className="text-amber-600">
+                                        queued, not yet on the server
                                       </span>
                                     ) : (
                                       <span className="text-muted-foreground">

@@ -372,6 +372,8 @@ async def compute_zone_drift(
     # server_id -> the transfer was addressed to the zone's own view.
     view_addressed: dict[str, bool] = {}
 
+    is_secondary = (zone.zone_type or "primary") == "secondary"
+
     async def _drift_for_server(srv: DNSServer) -> ServerDrift:
         entry = ServerDrift(
             server_id=str(srv.id),
@@ -440,6 +442,14 @@ async def compute_zone_drift(
             return entry
 
         view_addressed[entry.server_id] = is_view_transfer_key(used)
+        # #4057 — a secondary's records come from its primary by transfer;
+        # SpatiumDDI holds none of them, so a diff against the zone's own rows
+        # would list every transferred record as "extra on the server". The
+        # transfer proves the zone is served; the serial check in
+        # ``_classify_transferred`` speaks for convergence.
+        if is_secondary:
+            entry.in_sync = len(on_wire)
+            return entry
         # #1794 — a dot-less name target is relative on a zone-file driver and
         # absolute on a cloud one, so the DB side is keyed per server.
         rel = targets_are_relative(srv)
@@ -469,6 +479,13 @@ async def compute_zone_drift(
     # isolates its own failures, so gather() is safe. Order is preserved.
     report.servers = list(await asyncio.gather(*(_drift_for_server(s) for s in servers)))
     await _classify_transferred(db, zone, servers, report.servers, view_addressed)
+    if is_secondary:
+        report.warnings.append(
+            "This is a secondary zone: its records come from the primary by zone "
+            "transfer and SpatiumDDI does not hold them, so they are not compared "
+            "record by record. Only whether each server is serving the zone, and "
+            "at which serial, is checked."
+        )
 
     # Split-horizon caveats. A zone that belongs to a view has one copy per
     # view it lives in, and an AXFR names only the zone. A transfer addressed
