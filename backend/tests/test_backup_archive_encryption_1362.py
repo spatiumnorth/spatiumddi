@@ -201,7 +201,7 @@ async def test_restore_replays_the_decrypted_dump(
 
 
 @pytest.mark.asyncio
-async def test_new_target_defaults_to_encrypted_and_changes_are_audited(
+async def test_new_target_defaults_to_unencrypted_and_changes_are_audited(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     headers = await _headers(db_session)
@@ -217,13 +217,27 @@ async def test_new_target_defaults_to_encrypted_and_changes_are_audited(
     )
     assert res.status_code in (200, 201), res.text
     body = res.json()
-    assert body["encrypt_archive"] is True
+    assert body["encrypt_archive"] is False
+
+    res = await client.post(
+        "/api/v1/backup/targets",
+        json={
+            "name": "enc-explicit",
+            "kind": "local_volume",
+            "config": {"path": "/var/lib/spatiumddi/backups"},
+            "passphrase": PASSPHRASE,
+            "encrypt_archive": True,
+        },
+        headers=headers,
+    )
+    assert res.status_code in (200, 201), res.text
+    assert res.json()["encrypt_archive"] is True
 
     res = await client.patch(
-        f"/api/v1/backup/targets/{body['id']}", json={"encrypt_archive": False}, headers=headers
+        f"/api/v1/backup/targets/{body['id']}", json={"encrypt_archive": True}, headers=headers
     )
     assert res.status_code == 200, res.text
-    assert res.json()["encrypt_archive"] is False
+    assert res.json()["encrypt_archive"] is True
     rows = (
         await db_session.execute(
             select(AuditLog).where(
@@ -233,7 +247,7 @@ async def test_new_target_defaults_to_encrypted_and_changes_are_audited(
     ).scalars()
     (row,) = list(rows)
     assert row.changed_fields == ["encrypt_archive"]
-    assert row.old_value == {"encrypt_archive": True}
+    assert row.old_value == {"encrypt_archive": False}
     assert PASSPHRASE not in json.dumps(row.new_value)
 
 

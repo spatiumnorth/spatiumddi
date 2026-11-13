@@ -830,9 +830,9 @@ function TargetFormModal({
     existing?.retention_keep_days?.toString() ?? "30",
   );
   const [writeOnly, setWriteOnly] = useState(existing?.write_only ?? false);
-  // On for a new target; an existing one shows what it has stored (#1362).
+  // Off for a new target (opt-in); an existing one shows what it has stored (#1362).
   const [encryptArchive, setEncryptArchive] = useState(
-    existing ? (existing.encrypt_archive ?? false) : true,
+    existing?.encrypt_archive ?? false,
   );
   const [error, setError] = useState<string | null>(null);
 

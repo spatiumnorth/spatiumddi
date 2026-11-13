@@ -224,9 +224,9 @@ class BackupTargetCreate(BaseModel):
     retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool = False
-    # Encrypt the database dump as well as secrets.enc (#1362). On for a
-    # new target; rows that pre-date the option keep it off.
-    encrypt_archive: bool = True
+    # Encrypt the database dump as well as secrets.enc (#1362). Opt-in: off
+    # for a new target, like the rows that pre-date the option.
+    encrypt_archive: bool = False
 
     @field_validator("kind")
     @classmethod
