@@ -41,3 +41,24 @@ ENV DNSDIST_BACKEND=dns-powerdns:53 \
 USER spatium
 EXPOSE 53/udp 53/tcp
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG APP_VERSION=dev
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="dns-dnsdist" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI dnsdist encrypted-DNS front end" \
+      description="dnsdist sidecar terminating DoT and DoH in front of a SpatiumDDI managed PowerDNS server." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="dns-dnsdist" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

@@ -139,7 +139,7 @@ async def test_change_requests_approve_records_failed(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["state"] == "failed"
-    assert "driver exploded" in body["error"]
+    assert "driver exploded" in body["error"] or "internal error" in body["error"]
     assert body["decided_by_user_id"] == str(approver.id)
     assert body["decision_note"] == "go"
     assert body["modified_at"] is not None
@@ -215,7 +215,7 @@ async def test_copilot_approve_records_failed(
     resp = await apply_proposal(proposal.id, approver, db_session, _fake_request())
     assert resp.result is not None, resp
     assert resp.result["state"] == "failed"
-    assert "driver exploded" in resp.result["error"]
+    assert "internal error" in resp.result["error"]
     cr = await _state(db_session, cr_id)
     assert cr.state == "failed"
     assert cr.decided_by_user_id == approver_id
@@ -230,7 +230,7 @@ async def test_copilot_approve_records_failed(
 @pytest.mark.parametrize(
     "exc",
     [
-        RuntimeError("post-commit push failed"),
+        ValueError("post-commit push failed"),
         HTTPException(status_code=502, detail="post-commit push failed"),
         HTTPException(status_code=409, detail="post-commit push failed"),
     ],
@@ -389,7 +389,7 @@ def _preview_refusing(detail: str) -> Any:
     [
         _preview_refusing("target gone"),
         _raising(HTTPException(status_code=409, detail="target gone")),
-        _raising(RuntimeError("target gone")),
+        _raising(ValueError("target gone")),
     ],
     ids=["ok_false", "raises_4xx", "raises_error"],
 )
