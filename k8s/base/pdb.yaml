@@ -1,0 +1,46 @@
+# #1250 — PodDisruptionBudgets so a node drain cannot evict every replica of
+# the api, worker or frontend at once. maxUnavailable, never minAvailable:
+# minAvailable: 1 on a one-pod workload blocks every drain (#3204). Beat is a
+# singleton and deliberately has none.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: api
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: spatiumddi-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: spatiumddi-worker
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: frontend
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: spatiumddi-frontend

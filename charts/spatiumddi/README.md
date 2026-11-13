@@ -321,6 +321,7 @@ them:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `api.replicas` | `2` | The api's count while `api.autoscaling.enabled` is `false`. With the autoscaler on (the default) the chart renders no count and the HPA alone sets it (#3111) |
+| `api.podDisruptionBudget.enabled` / `.maxUnavailable` (and `worker.…`, `frontend.…`) | `true` / `1` | #1250 — a PDB per replicated workload, so a drain cannot evict every pod at once. `maxUnavailable`, never `minAvailable`, so a drain always progresses; rendered only while the workload can run more than one pod (the api counts its `autoscaling.minReplicas`). Beat is a singleton and has none |
 | `api.service.type` | `ClusterIP` |  |
 | `api.service.port` | `8000` |  |
 | `api.service.trafficDistribution` | `""` | #1805 — `""` renders no field (kube-proxy spreads every caller over every api pod). `PreferSameNode` keeps each node's in-cluster callers (the supervisor, the DNS/DHCP agents, the frontend's `/api` proxy) on the api pod on their own node while it is ready, so a lost node's api pod cannot hold their requests. The appliance sets it (firstboot's `spatium-control` values and the supervisor's HelmChartConfig), where every control-plane node runs one api pod. Elsewhere it pins a node's callers to the one api pod on that node, which can leave the others idle and the HPA reacting late. Rendered on Kubernetes 1.34+ |
