@@ -45,13 +45,18 @@ class _FakeTechnitium:
         self.rrsets: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     async def call(self, client: Any, path: str, what: str, params: dict[str, Any]) -> Any:
+        if path == "zones/records/get":  # #1769 zone pre-check
+            return {}
         assert path == "zones/records/add"
         key = (params["domain"], params["type"])
         if params["overwrite"] == "true":
             self.rrsets[key] = []
-        self.rrsets.setdefault(key, []).append(
-            {k: v for k, v in params.items() if k not in self._NOT_RDATA}
-        )
+        rdata = {k: v for k, v in params.items() if k not in self._NOT_RDATA}
+        if rdata in self.rrsets.setdefault(key, []):
+            # Technitium refuses a duplicate append ("record already exists");
+            # the driver treats that as the idempotent no-op it is.
+            return {}
+        self.rrsets[key].append(rdata)
         return {}
 
 

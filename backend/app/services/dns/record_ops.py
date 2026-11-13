@@ -2608,6 +2608,7 @@ def _change_from_op_row(op_row: DNSRecordOp) -> RecordChange | None:
         ),
         target_serial=op_row.target_serial or 0,
         rrset=rrset_from_payload(record),
+        rrset_action=record.get("rrset_action") or None,
     )
 
 

@@ -1051,14 +1051,17 @@ Two details are worth knowing before touching either.
 
 **Value params are load-bearing on `delete`.** That is how Technitium identifies which member of an rrset to remove, and SpatiumDDI keys records per value — so dropping them takes out a sibling round-robin A record rather than the intended one.
 
-**`overwrite=false` on a create/update is a bug, not a style choice.** Technitium *appends* at that setting, so editing `www A 10.0.0.1` to `10.0.0.2` leaves the zone answering both, round-robin. That is documented at length in the agent driver, verified live against 15.4.0 — and it is worse here, because there is no structural reload to eventually re-converge it.
+**`overwrite=false` on an update is a bug, not a style choice.** Technitium *appends* at that setting, so editing `www A 10.0.0.1` to `10.0.0.2` leaves the zone answering both, round-robin. That is documented at length in the agent driver, verified live against 15.4.0 — and it is worse here, because there is no structural reload to eventually re-converge it.
 
 The write path therefore mirrors the agent's:
 
 | op | shape |
 |---|---|
-| `create` / `update` with `change.rrset` (#783) | replay the whole set — member 0 with `overwrite=true` to clear, the rest appended |
-| `create` / `update` without it (`rrset is None`) | single-value REPLACE, per the `RRsetData` contract's fallback rule |
+| `update` with `change.rrset` (#783) | replay the whole set — member 0 with `overwrite=true` to clear, the rest appended. This also removes any value at that name and type that SpatiumDDI does not hold, since the op does not carry the old value to delete |
+| `create` (#1769) | append every member with `overwrite=false`, never clearing, so a record the operator keeps at the name (a site-verification TXT beside an SPF TXT) survives. CNAME / DNAME are single-valued and replace |
+| DNS pool member (`rrset_action: add`, no `rrset`) | one append, never a replace: pool members share a name and type, and a replace left the pool serving only the last member written |
+| `update` without a set (`rrset is None`) | single-value REPLACE, per the `RRsetData` contract's fallback rule |
+| every write and every record read | the zone is looked up first, and refused when Technitium answers with an enclosing zone (it resolves a missing `zone=` to the nearest parent, so a write would land there and report success; a read would import the parent's records under mangled names) |
 | empty `members` | the RRset should not exist → value-scoped delete |
 | `delete` | value-scoped, always. The survivors are already correct on the server; a wipe-and-rebuild would open a window where the name serves less than it should |
 
