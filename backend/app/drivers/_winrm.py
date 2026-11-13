@@ -13,6 +13,7 @@ command-line cap and hard-failing an entire chunk (#426).
 from __future__ import annotations
 
 import base64
+import unicodedata
 from typing import Any
 
 import structlog
@@ -62,6 +63,20 @@ def ps_single_quote_escape(value: str | None) -> str:
 def ps_single_quote(value: str | None) -> str:
     """Return ``value`` as a complete PowerShell single-quoted literal."""
     return "'" + ps_single_quote_escape(value) + "'"
+
+
+def ps_one_line(value: str | None) -> str:
+    """``value`` with every control or line-separator character replaced by a space.
+
+    For a value written OUTSIDE a literal, such as in a ``#`` comment, where a
+    line break would end the comment and start a statement, and for script text
+    an operator copies out of a Markdown code fence, where a line break could
+    close the fence. No host or zone name legitimately contains one of these
+    characters, so nothing correct is lost.
+    """
+    return "".join(
+        " " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in (value or "")
+    )
 
 
 def encoded_command_len(script: str) -> int:

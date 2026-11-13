@@ -186,3 +186,97 @@ def test_no_private_single_quote_escaping_under_app() -> None:
         if pat.search(path.read_text()):
             bad.append(str(rel))
     assert not bad, f"use app.drivers._winrm.ps_single_quote*: {bad}"
+
+
+def _executable_outside_literals(script: str) -> str:
+    """Script text PowerShell would run: literals blanked, comments dropped.
+
+    A ``#`` outside a literal comments out the rest of its line, and only CR
+    and LF end a line (checked against pwsh), so quotes inside a comment are
+    not literals.
+    """
+    sq = set(_winrm._PS_SINGLE_QUOTES)
+    out: list[str] = []
+    i, n = 0, len(script)
+    while i < n:
+        c = script[i]
+        if c == "#":
+            while i < n and script[i] not in "\r\n":
+                i += 1
+        elif c in sq:
+            i += 1
+            while True:
+                if i >= n:
+                    raise AssertionError("unterminated literal")
+                if script[i] in sq:
+                    if i + 1 < n and script[i + 1] == script[i]:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append("''")
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+_LINE_BREAKS = ["\n", "\r", "\r\n", " ", "\u0085"]
+
+
+def _one_line_payloads() -> list[str]:
+    out = _payloads()
+    for nl in _LINE_BREAKS:
+        out.append(f"dc1{nl}Write-Output {MARKER}{nl}#")
+        out.append(f"dc1{nl}```{nl}Write-Output {MARKER}")
+    return out
+
+
+@pytest.mark.parametrize("value", _one_line_payloads())
+def test_cutover_ttl_script_keeps_value_out_of_code(value: str) -> None:
+    from app.services.cutover.preflight import windows_ttl_powershell
+
+    for computer_name in (None, value):
+        script = windows_ttl_powershell(value + ".com", 60, 3600, computer_name=computer_name)
+        assert MARKER not in _executable_outside_literals(script)
+        for line in script.splitlines():
+            assert not line.startswith("```")
+
+
+@pytest.mark.parametrize("value", _one_line_payloads())
+def test_cutover_runbook_blocks_keep_value_out_of_code(value: str) -> None:
+    from app.services.cutover import runbook
+
+    blocks = [
+        runbook._ps_disable_scavenging(value, value),
+        runbook._ps_scope_state(value, value, active=False),
+        runbook._ps_deauthorize_dhcp(value),
+        runbook._ps_lower_ttls(value, value, 60, 3600),
+    ]
+    for lines in blocks:
+        # A value must not open or close the Markdown fence the block sits in.
+        assert lines[0] == "```powershell"
+        fences = [i for i, ln in enumerate(lines) if ln.startswith("```")]
+        assert fences == [0, lines.index("```")]
+        body = "\n".join(lines[1 : fences[1]])
+        assert MARKER not in _executable_outside_literals(body)
+
+
+@pytest.mark.parametrize("value", _payloads())
+def test_event_log_filter_keeps_value_in_literal(value: str) -> None:
+    from app.drivers import windows_events
+
+    script = windows_events._build_filter_script(
+        log_name=value, max_events=10, level=None, since_iso=value, event_id=None
+    )
+    vals, rest = _literals(script)
+    assert MARKER not in rest
+    assert value in vals
+
+
+def test_one_line_replaces_every_line_break() -> None:
+    for nl in _LINE_BREAKS + ["\x00", " ", "\x0b"]:
+        assert _winrm.ps_one_line(f"a{nl}b") in ("a b", "a  b")
+    assert _winrm.ps_one_line(None) == ""
+    assert _winrm.ps_one_line("dc1.corp.example") == "dc1.corp.example"

@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
-from app.drivers._winrm import ps_single_quote
+from app.drivers._winrm import ps_one_line, ps_single_quote
 from app.models.cutover import CutoverItem, CutoverPlan
 from app.services.cutover.canonical import ParityReport
 from app.services.cutover.preflight import windows_ttl_powershell
@@ -341,6 +341,7 @@ def _ps_lower_ttls(host: str, zone: str, ttl: int, current_ttl: int) -> list[str
 
 
 def _ps_disable_scavenging(host: str, zone: str) -> list[str]:
+    host, zone = ps_one_line(host), ps_one_line(zone)
     return [
         "```powershell",
         "# Scavenging deletes 'stale' dynamically-registered records. Once clients",
@@ -362,6 +363,7 @@ def _ps_disable_scavenging(host: str, zone: str) -> list[str]:
 
 
 def _ps_scope_state(host: str, scope_id: str, *, active: bool) -> list[str]:
+    host, scope_id = ps_one_line(host), ps_one_line(scope_id)
     state = "Active" if active else "InActive"
     return [
         "```powershell",
@@ -376,6 +378,7 @@ def _ps_scope_state(host: str, scope_id: str, *, active: bool) -> list[str]:
 
 
 def _ps_deauthorize_dhcp(host: str) -> list[str]:
+    host = ps_one_line(host)
     return [
         "```powershell",
         "# Deauthorize the Windows DHCP server in Active Directory. Until this runs,",
