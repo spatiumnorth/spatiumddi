@@ -227,3 +227,63 @@ def test_the_bundle_is_a_fraction_of_the_size() -> None:
     after = len(json.dumps(pack_entries(entries), separators=(",", ":")))
     print(f"per-entry {before} B, packed {after} B ({before / after:.1f}x)")
     assert after * 5 < before
+
+
+# ── the long-poll serves the shape the polling agent can read ──────────────
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_agent_is_never_served_the_packed_bundle(
+    client: Any, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent rolled back to an older image polls before it heartbeats, and
+    the stored flag still says it reads packed runs: the stored bundle is
+    packed, and the older agent would crash on it. The request's own header
+    decides, and the packed bundle waits for the re-render."""
+    from app.api.v1.dns import agents as agents_api
+    from app.config import settings
+    from app.services.dns import agent_bundle_store as store
+    from app.services.dns.agent_bundle_render import render_and_store
+    from app.services.dns.agent_token import mint_agent_token
+
+    monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", False)
+    server = await _setup(db_session, monkeypatch, views=False)
+    await _set_flag(db_session, server, True)
+    token, _ = mint_agent_token(str(server.id), str(server.agent_id), "fp")
+    auth = {"Authorization": f"Bearer {token}"}
+    new = {**auth, "X-Spatium-Agent-Features": "soa-timers,packed-blocklists"}
+
+    async def render() -> None:
+        db_session.expunge_all()
+        row = await db_session.get(DNSServer, server.id)
+        assert row is not None
+        out = await render_and_store(db_session, row, rendered_by=store.RENDERED_BY_WORKER)
+        await db_session.commit()
+        assert out.bundle is not None
+
+    await render()
+    served = await client.get("/api/v1/dns/agents/config", headers=new)
+    assert served.status_code == 200
+    assert any("packed" in e for z in served.json()["blocklists"] for e in z["entries"])
+
+    # Rolled back: no features header on the very next poll.
+    old = await client.get("/api/v1/dns/agents/config", headers=auth)
+    assert old.status_code == 304, "the packed bundle was served to an agent that cannot read it"
+    db_session.expunge_all()
+    row = await db_session.get(DNSServer, server.id)
+    assert row is not None and row.agent_renders_packed_blocklists is False
+
+    await render()
+    legacy = await client.get("/api/v1/dns/agents/config", headers=auth)
+    assert legacy.status_code == 200
+    entries = [e for z in legacy.json()["blocklists"] for e in z["entries"]]
+    assert entries and all("packed" not in e and "domain" in e for e in entries)
+
+    # And the upgrade: the new agent is not served the legacy bundle either.
+    again = await client.get("/api/v1/dns/agents/config", headers=new)
+    assert again.status_code == 304
+    await render()
+    packed = await client.get("/api/v1/dns/agents/config", headers=new)
+    assert packed.status_code == 200
+    assert any("packed" in e for z in packed.json()["blocklists"] for e in z["entries"])

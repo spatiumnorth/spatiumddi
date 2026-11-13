@@ -672,6 +672,8 @@ class EncodedBody:
     structural_etag: str
     records: int
     has_views: bool
+    # #4040 — the blocklist entries went out as packed runs.
+    packed_blocklists: bool = False
 
 
 #: Blocklist entries read, serialised and hashed per step of the streamed
@@ -1207,6 +1209,7 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
         structural_etag=structural_etag,
         records=records,
         has_views=assembled.has_views,
+        packed_blocklists=bool(server.agent_renders_packed_blocklists),
     )
 
 

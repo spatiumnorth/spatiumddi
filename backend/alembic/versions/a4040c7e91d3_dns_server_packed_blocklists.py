@@ -37,5 +37,17 @@ def upgrade() -> None:
     )
 
 
+    op.add_column(
+        "dns_agent_bundle",
+        sa.Column(
+            "packed_blocklists",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
+        ),
+    )
+
+
 def downgrade() -> None:
+    op.drop_column("dns_agent_bundle", "packed_blocklists")
     op.drop_column("dns_server", "agent_renders_packed_blocklists")

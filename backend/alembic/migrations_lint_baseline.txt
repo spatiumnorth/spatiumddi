@@ -154,7 +154,7 @@ backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop
 backend/alembic/versions/a3f7c1e84d59_appliance_lldpd_running.py:drop_column:35
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:38
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
-backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:41
+backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:53
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:31
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:32

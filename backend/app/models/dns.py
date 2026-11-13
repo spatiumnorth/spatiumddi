@@ -780,6 +780,12 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     # ``RENDERER_REVISION`` of the code that rendered it (#1185); NULL on
     # bundles rendered before the column existed, which read as stale.
     renderer_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # #4040 — the blocklist entries are packed runs (the server's agent read
+    # them at render time). The long-poll serves a bundle only in the shape
+    # THIS request's agent can read.
+    packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -1100,6 +1100,16 @@ async def agent_config_longpoll(
     ):
         return _duplicate_instance_response(server)
 
+    # #4040 — the shape this agent can read is the one its request header
+    # says, not the stored flag, which is only as fresh as its last register
+    # or heartbeat: an agent rolled back to an older image polls before it
+    # heartbeats. A change is recorded (and the bundle re-rendered) here, and
+    # a stored bundle of the other shape is never served meanwhile.
+    req_packed = renders_packed_blocklists(request.headers.get(AGENT_FEATURES_HEADER))
+    if req_packed != bool(server.agent_renders_packed_blocklists):
+        await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
+        await db.commit()
+
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
     inline_tried = False
@@ -1125,7 +1135,12 @@ async def agent_config_longpoll(
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
             bundle = await bundle_store.newest(db, server)
-            if not bundle_store.is_current(server):
+            wrong_shape = bundle is not None and bundle.packed_blocklists != req_packed
+            if wrong_shape:
+                # Rendered for an agent that read packed entries (or the
+                # reverse): this one cannot read it. Wait for the re-render.
+                bundle = None
+            if wrong_shape or not bundle_store.is_current(server):
                 if settings.dns_agent_bundle_inline_fallback and not inline_tried:
                     try:
                         rendered = await _bounded_inline(db, server)
@@ -1137,7 +1152,9 @@ async def agent_config_longpoll(
                         inline_tried = True
                         await refresh_agent_server(db, server)
                         bundle = await bundle_store.newest(db, server)
-                if not enqueued and not bundle_store.is_current(server):
+                        if bundle is not None and bundle.packed_blocklists != req_packed:
+                            bundle = None
+                if not enqueued and (wrong_shape or not bundle_store.is_current(server)):
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:
