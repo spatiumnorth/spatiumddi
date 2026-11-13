@@ -3440,6 +3440,9 @@ class SyncFromServerResponse(BaseModel):
     zones_failed: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that was queued as record ops (a large
+    # agentless zone, #3817) rather than applied inline.
+    total_queued: int = 0
     total_push_errors: int
     # Zones listed by the server over WinRM (windows_dns Path B only).
     # Empty for BIND9 and Windows DNS without credentials — the caller can
@@ -3478,6 +3481,8 @@ class GroupSyncWithServersResponse(BaseModel):
     servers_succeeded: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that is queued for delivery, not yet applied.
+    total_queued: int = 0
     total_push_errors: int
     total_zones_imported: int
     total_zones_pushed_to_server: int
@@ -3681,6 +3686,7 @@ async def _sync_single_server(
     zones_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
 
     for zone in zones:
@@ -3692,6 +3698,8 @@ async def _sync_single_server(
             zones_succeeded += 1
             total_imported += result.pull.imported
             total_pushed += result.push.pushed
+            if result.push.queued_for_agent:
+                total_queued += result.push.pushed
             total_push_errors += len(result.push.push_errors)
             items.append(
                 ZoneSyncItem(
@@ -3758,6 +3766,7 @@ async def _sync_single_server(
         zones_failed=len(zones) - zones_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         zones_on_server=sorted(set(zones_on_server)),
         new_zones_on_server=new_zones,
@@ -3821,6 +3830,7 @@ async def sync_group_with_servers(
     servers_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
     total_zones_imported = 0
     total_zones_pushed_to_server = 0
@@ -3845,6 +3855,7 @@ async def sync_group_with_servers(
             servers_succeeded += 1
             total_imported += result.total_imported
             total_pushed += result.total_pushed
+            total_queued += result.total_queued
             total_push_errors += result.total_push_errors
             total_zones_imported += len(result.zones_imported)
             total_zones_pushed_to_server += len(result.zones_pushed_to_server)
@@ -3872,6 +3883,7 @@ async def sync_group_with_servers(
         servers_succeeded=servers_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         total_zones_imported=total_zones_imported,
         total_zones_pushed_to_server=total_zones_pushed_to_server,

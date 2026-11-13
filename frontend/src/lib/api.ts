@@ -5393,6 +5393,8 @@ export interface DNSZoneSyncItem {
   pushed: number;
   server_records: number;
   push_errors: string[];
+  /** The pushed records are queued for background delivery (#3817). */
+  queued_for_agent?: boolean;
   error: string | null;
 }
 
@@ -5402,6 +5404,8 @@ export interface DNSServerSyncResult {
   zones_failed: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   /** Zones listed on the server via WinRM — windows_dns Path B only.
    * Empty for BIND9 and windows_dns without credentials. */
@@ -5435,6 +5439,8 @@ export interface DNSGroupSyncResult {
   servers_succeeded: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   total_zones_imported: number;
   total_zones_pushed_to_server: number;
