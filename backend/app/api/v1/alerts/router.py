@@ -20,7 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_permission
@@ -432,14 +432,26 @@ async def update_rule(
     # request (``enabled: false`` sent), not on the column flipping, so a
     # rule disabled before this fix — whose events are stuck open — can
     # be cleared by sending the disable again. Resolution is silent, as
-    # the evaluator's own resolve is: no delivery fires for a close.
+    # the evaluator's own resolve is: no alert-forward delivery fires for a close, but webhook
+    # subscribers get ``alert.resolved``.
     if changes.get("enabled") is False:
-        closed = await db.execute(
-            update(AlertEvent)
-            .where(AlertEvent.rule_id == rule.id, AlertEvent.resolved_at.is_(None))
-            .values(resolved_at=datetime.now(UTC))
+        # Row by row, not a bulk UPDATE: the ORM flush is what publishes
+        # ``alert.resolved`` to webhook subscribers (#2145).
+        open_events = (
+            (
+                await db.execute(
+                    select(AlertEvent).where(
+                        AlertEvent.rule_id == rule.id, AlertEvent.resolved_at.is_(None)
+                    )
+                )
+            )
+            .scalars()
+            .all()
         )
-        closed_count = closed.rowcount or 0
+        closed_at = datetime.now(UTC)
+        for open_event in open_events:
+            open_event.resolved_at = closed_at
+        closed_count = len(open_events)
         if closed_count:
             changed["resolved_open_events"] = {"old": closed_count, "new": 0}
     if changed:

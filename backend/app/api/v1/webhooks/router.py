@@ -46,6 +46,7 @@ from app.services.event_publisher import (
     _RESOURCE_NAMESPACE,
     _SPECIAL_EVENT_MAP,
     _VERB_MAP,
+    ALERT_EVENT_TYPES,
     subscriptions_cache,
 )
 from app.services.forward_secrets import url_display
@@ -291,6 +292,7 @@ async def list_event_types(_: CurrentUser) -> dict[str, list[str]]:
     # create/update/delete trio. Surface them in the catalog so
     # operators can subscribe.
     types.update(_SPECIAL_EVENT_MAP.values())
+    types.update(ALERT_EVENT_TYPES)  # #2145 — from alert_event rows, not audit rows
     return {"event_types": sorted(types)}
 
 
