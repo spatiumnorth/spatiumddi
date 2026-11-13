@@ -1,4 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
+import {
+  captureSuccessors,
+  returnFocus,
+  type FocusSuccessor,
+} from "./focus-return";
 
 /** CSS for the outer flex-center backdrop. Same across every modal. */
 export const MODAL_BACKDROP_CLS =
@@ -207,8 +212,17 @@ export function useFocusTrap<T extends HTMLElement>() {
   // dialog on open and unmounts it on close, which is also what the trap
   // effect below assumes (it runs once, on mount).
   const openerRef = useRef<FocusReturnTargets | undefined>(undefined);
+  const successorsRef = useRef<FocusSuccessor[]>([]);
   if (openerRef.current === undefined) {
     openerRef.current = captureFocusReturnTargets();
+    // Where focus goes if the opener is gone by the close (#3909). Not for a
+    // dialog opened from a menu item: the menu's own owner places focus then
+    // (the right-click menu, #3908), and a heading fallback here would win.
+    const active = document.activeElement;
+    successorsRef.current =
+      active && !active.closest('[role="menu"]')
+        ? captureSuccessors(active)
+        : [];
   }
   useEffect(() => {
     const node = ref.current;
@@ -331,7 +345,9 @@ export function useFocusTrap<T extends HTMLElement>() {
       ) {
         target.setAttribute("tabindex", "-1");
       }
-      target?.focus?.();
+      // An opener already gone, or removed by the refetch that follows a
+      // delete, hands focus to a successor in the page, not the body (#3909).
+      returnFocus(target ? [target] : [], successorsRef.current);
     };
   }, [seq]);
   return ref;

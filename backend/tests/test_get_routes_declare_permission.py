@@ -77,6 +77,7 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/change-requests/{cr_id}": "own request unless an approver (checked in the handler)",
     "/api/v1/requests": "own requests unless provisioning_request read (_require_read)",
     "/api/v1/requests/{req_id}": "checked in the handler (_require_read)",
+    "/api/v1/requests/{req_id}/current-preview": "checked in the handler (_require_read + _load_visible)",
     "/api/v1/requests/catalog": "checked in the handler (_require_submit)",
     "/api/v1/requests/resource-options": "checked in the handler (_require_submit + per-type read)",
     "/api/v1/saved-views": _SELF,

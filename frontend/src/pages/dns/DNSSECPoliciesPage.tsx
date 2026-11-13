@@ -14,6 +14,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 const ALGORITHMS = [
   "ecdsap256sha256",
@@ -385,7 +386,9 @@ function PolicyModalForm({ existing, onClose }: PolicyModalProps) {
             config from applying.
           </p>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
