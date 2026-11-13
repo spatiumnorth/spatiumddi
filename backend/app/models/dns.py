@@ -1402,6 +1402,11 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("ip_address.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # #2251 — registered dynamically (DDNS / DHCP) rather than written by a
+    # person. True / False when the pull saw the Windows aging timestamp
+    # (Path B); NULL = unknown (AXFR carries no timestamp, and rows pulled
+    # before the column existed).
+    dynamic: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )

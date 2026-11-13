@@ -40,6 +40,7 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
         "/api/v1/ipam/blocks/{block_id}/plan-allocation",
         "/api/v1/ipam/blocks/{block_id}/resize/preview",
         "/api/v1/ipam/import/addresses/preview",
+        "/api/v1/ipam/import/dns/preview",
         "/api/v1/ipam/import/preview",
         "/api/v1/ipam/import/preview-json",
         "/api/v1/ipam/plans/validate-tree",

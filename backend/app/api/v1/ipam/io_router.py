@@ -21,6 +21,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
@@ -37,7 +38,7 @@ from app.core.permissions import (
 )
 from app.core.responses import PdfResponse
 from app.models.auth import User
-from app.services.api_token_scopes import read_only_post
+from app.services.api_token_scopes import read_only_post, token_write
 from app.services.ipam.address_set_gate import (
     load_writable_set_ranges,
     user_can_write_ip,
@@ -355,6 +356,123 @@ async def import_addresses_commit(
         strategy=strategy,
         can_write_ip=can_write,
     )
+    await db.commit()
+    return result.as_dict()
+
+
+class PopulateFromDnsIn(BaseModel):
+    """Body of the Populate-from-DNS preview and commit (#2251). Exactly one
+    of the three scope ids; the plan is recomputed on both calls."""
+
+    space_id: uuid.UUID | None = None
+    block_id: uuid.UUID | None = None
+    subnet_id: uuid.UUID | None = None
+    zone_ids: list[uuid.UUID] | None = Field(
+        default=None, description="Source zones; omitted = every forward zone you can read."
+    )
+    view_id: uuid.UUID | None = None
+    status: Literal["allocated", "reserved", "deprecated"] = "allocated"
+    dynamic_action: Literal["skip", "dhcp", "static"] = "skip"
+    link_ptr: bool = True
+    resolutions: dict[str, str] = Field(
+        default_factory=dict,
+        description="address -> the record id that wins a conflict, or 'keep'.",
+    )
+    exclude: list[str] = Field(default_factory=list, description="Addresses to leave out.")
+    # preview paging
+    category: str | None = None
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+async def _populate_plan(db: AsyncSession, user: User, body: PopulateFromDnsIn) -> tuple[Any, Any]:
+    from app.services.ipam.populate_from_dns import (  # noqa: PLC0415
+        PopulateError,
+        PopulateOptions,
+        build_plan,
+        resolve_subnets,
+    )
+
+    opts = PopulateOptions(
+        zone_ids=body.zone_ids,
+        view_id=body.view_id,
+        status=body.status,
+        dynamic_action=body.dynamic_action,
+        link_ptr=body.link_ptr,
+        resolutions=body.resolutions,
+        exclude=set(body.exclude),
+    )
+    try:
+        subnets = await resolve_subnets(
+            db, space_id=body.space_id, block_id=body.block_id, subnet_id=body.subnet_id
+        )
+        return await build_plan(db, user, subnets, opts), opts
+    except PopulateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@router.post(
+    "/import/dns/preview",
+    dependencies=[Depends(require_type_level("write", "subnet"))],
+)
+@read_only_post
+async def populate_from_dns_preview(
+    current_user: CurrentUser, db: DB, body: PopulateFromDnsIn
+) -> dict:
+    """Dry-run "Populate IPAM from DNS" (#2251): what the A / AAAA records of
+    the chosen zones would create, link, or skip in the chosen scope. Reads
+    only; the commit writes no DNS either."""
+    from app.api.v1.ipam.router import _enforce_zone_token_scope  # noqa: PLC0415
+
+    if body.subnet_id is not None:
+        _enforce_subnet_token_binding(current_user, body.subnet_id)
+    else:
+        _refuse_bound_token(current_user, "a block or space populate")
+    await _enforce_zone_token_scope(db, current_user, None, body.zone_ids or [])
+    plan, _opts = await _populate_plan(db, current_user, body)
+    items = [e for e in plan.entries if body.category in (None, e.category)]
+    return {
+        "records_scanned": plan.records_scanned,
+        "subnets_in_scope": plan.subnets_in_scope,
+        "zones": plan.zones,
+        "counts": plan.counts(),
+        "reasons": plan.reasons(),
+        "dynamic_unknown": plan.dynamic_unknown,
+        "outside": plan.outside,
+        "outside_total": plan.outside_total,
+        "total_items": len(items),
+        "items": [e.as_dict() for e in items[body.offset : body.offset + body.limit]],
+    }
+
+
+@router.post("/import/dns/commit")
+@token_write("Creates IPAM address rows linked to existing DNS records.")
+async def populate_from_dns_commit(
+    current_user: CurrentUser, db: DB, body: PopulateFromDnsIn
+) -> dict:
+    """Commit "Populate IPAM from DNS" (#2251). Creates / links IPAM rows only:
+    no DNS record is written, queued or re-published."""
+    from app.api.v1.ipam.router import _enforce_zone_token_scope  # noqa: PLC0415
+    from app.services.ipam.populate_from_dns import PopulateError, commit_plan  # noqa: PLC0415
+
+    if body.subnet_id is not None:
+        _enforce_subnet_token_binding(current_user, body.subnet_id)
+    else:
+        _refuse_bound_token(current_user, "a block or space populate")
+    await _enforce_zone_token_scope(db, current_user, None, body.zone_ids or [])
+    plan, opts = await _populate_plan(db, current_user, body)
+    scope_type, scope_id = (
+        ("subnet", body.subnet_id)
+        if body.subnet_id
+        else ("ip_block", body.block_id) if body.block_id else ("ip_space", body.space_id)
+    )
+    assert scope_id is not None
+    try:
+        result = await commit_plan(
+            db, current_user, plan, opts, scope_type=scope_type, scope_id=scope_id
+        )
+    except PopulateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await db.commit()
     return result.as_dict()
 

@@ -551,6 +551,7 @@ from app.services.ai.operations_writes import (  # noqa: E402
     CreateWebhookArgs,
     DeleteMulticastDomainArgs,
     EvaluateConformityPolicyArgs,
+    PopulateIpamFromDnsArgs,
     SignZoneDNSSECArgs,
     TestWebhookArgs,
     UnsignZoneDNSSECArgs,
@@ -941,6 +942,31 @@ async def propose_commit_netbox_import(
     db: AsyncSession, user: User, args: CommitNetboxImportArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="commit_netbox_import", args=args)
+
+
+# ── Populate IPAM from existing DNS records (#2251) ──────────────────
+
+
+@register_tool(
+    name="propose_populate_ipam_from_dns",
+    permission=("write", "subnet"),
+    description=(
+        "Prepare a 'populate IPAM from DNS' proposal: create IPAM addresses from A / AAAA "
+        "records that already exist in DNS and link them to those records. Writes NO DNS. "
+        "Pass exactly one of space_id / block_id / subnet_id, optional zone_ids, status "
+        "(allocated / reserved / deprecated) and dynamic_action (skip / dhcp / static). "
+        "Run preview_populate_ipam_from_dns first; conflicts need the UI to resolve. "
+        "The operator clicks Approve to commit. A bulk write, so off by default."
+    ),
+    args_model=PopulateIpamFromDnsArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=False,
+)
+async def propose_populate_ipam_from_dns(
+    db: AsyncSession, user: User, args: PopulateIpamFromDnsArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="populate_ipam_from_dns", args=args)
 
 
 # ── New-device watch proposals (issue #459) ──────────────────────────────────
