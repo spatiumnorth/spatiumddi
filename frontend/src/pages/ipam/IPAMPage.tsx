@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import { Field } from "@/pages/dhcp/_shared";
@@ -83,6 +84,7 @@ import {
   type EffectiveDdns,
   type FreeCidrRange,
   type Router as NetworkRouter,
+  type SubnetVLANRef,
   type VLAN,
   type DHCPLeaseSyncResult,
   type DnsSyncCommitResult,
@@ -296,11 +298,15 @@ export function ImportedChip({
   fields,
   kind,
   id,
+  writable = true,
   onUpdated,
 }: {
   fields: Record<string, unknown>;
   kind: "block" | "subnet";
   id: string;
+  /** False for a caller the write would be refused: the × is disabled with
+   * the reason instead of leading to a confirm the server then refuses (#3883). */
+  writable?: boolean;
   onUpdated: (updated: IPBlock | Subnet) => void;
 }) {
   const qc = useQueryClient();
@@ -359,7 +365,11 @@ export function ImportedChip({
           }}
           aria-label={`Remove import metadata from this ${kind}`}
           title="Remove import metadata"
-          className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
+          {...permissionGate(
+            writable,
+            kind === "block" ? NEEDS_BLOCK_WRITE : NEEDS_SUBNET_WRITE,
+          )}
+          className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 disabled:cursor-not-allowed disabled:opacity-50 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
         >
           ×
         </button>
@@ -2467,9 +2477,15 @@ function AdditionalZonesPicker({
 function VlanPicker({
   vlanRefId,
   onChange,
+  current,
 }: {
   vlanRefId: string | null;
   onChange: (vlanRefId: string | null) => void;
+  /** The VLAN the record already carries, as its own row names it (router
+   *  and VLAN). The router and VLAN lists are reads a grant scoped to one
+   *  subnet lacks, so the picker names this link itself rather than drawing
+   *  "None" over it (#3904). */
+  current?: SubnetVLANRef | null;
 }) {
   const qc = useQueryClient();
   const { data: routers = [] } = useQuery({
@@ -2477,8 +2493,10 @@ function VlanPicker({
     queryFn: vlansApi.listRouters,
   });
 
-  // Seed the router from the selected VLAN, if any.
-  const [routerId, setRouterId] = useState<string>("");
+  // Seed the router from the selected VLAN, if any (the record's own VLAN
+  // names it, so that read is skipped).
+  const known = current && current.id === vlanRefId ? current : null;
+  const [routerId, setRouterId] = useState<string>(known?.router_id ?? "");
   const { data: selectedVlan } = useQuery({
     queryKey: ["vlans", "vlan", vlanRefId],
     queryFn: () => vlansApi.getVlan(vlanRefId as string),
@@ -2543,6 +2561,13 @@ function VlanPicker({
             }}
           >
             <option value="">— None —</option>
+            {known &&
+              routerId === known.router_id &&
+              !routers.some((r: NetworkRouter) => r.id === routerId) && (
+                <option value={routerId}>
+                  {known.router_name ?? "(current router)"}
+                </option>
+              )}
             {routers.map((r: NetworkRouter) => (
               <option key={r.id} value={r.id}>
                 {r.name}
@@ -2558,6 +2583,13 @@ function VlanPicker({
             disabled={!routerId}
           >
             <option value="">— None —</option>
+            {known &&
+              routerId === known.router_id &&
+              !vlans.some((v: VLAN) => v.id === known.id) && (
+                <option value={known.id}>
+                  {known.vlan_id} — {known.name}
+                </option>
+              )}
             {vlans.map((v: VLAN) => (
               <option key={v.id} value={v.id}>
                 {v.vlan_id} — {v.name}
@@ -3290,7 +3322,7 @@ export function CreateSubnetModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={onClose}
@@ -3536,9 +3568,14 @@ function CollisionWarningBanner({
 export function AddAddressModal({
   subnetId,
   presetRange,
+  nextAvailable = true,
   onClose,
 }: {
   subnetId: string;
+  /** False for a holder the server refuses ``POST /subnets/{id}/next`` to (a
+   * grant scoped to this one subnet, #3902): the dialog opens in Specific IP
+   * and Next available is disabled with the reason. */
+  nextAvailable?: boolean;
   /** When set (e.g. operator clicked a "free range" gap row), the
    * modal opens locked to manual mode with the address pre-filled to
    * the start of the range and a row of quick-pick buttons for first
@@ -3548,7 +3585,7 @@ export function AddAddressModal({
 }) {
   const qc = useQueryClient();
   const [mode, setMode] = useState<"manual" | "next">(
-    presetRange ? "manual" : "next",
+    presetRange || !nextAvailable ? "manual" : "next",
   );
   const [address, setAddress] = useState(
     presetRange ? intToIpv4(presetRange.startIpInt) : "",
@@ -3649,6 +3686,9 @@ export function AddAddressModal({
     enabled: mode === "next",
     refetchOnMount: "always",
     staleTime: 0,
+    // The dialog mounts afresh on every open: a kept copy would offer the
+    // address the last open just allocated until the re-read answers (#3866).
+    gcTime: 0,
   });
 
   const { data: cfDefs = [] } = useQuery({
@@ -3732,6 +3772,20 @@ export function AddAddressModal({
           : null;
     if (target && target !== dnsZoneId) setDnsZoneId(target);
   }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // #3903: the zone the address will be published in. The zone list needs a
+  // type-level read on DNS zones, which a grant scoped to the subnet lacks, so
+  // `availableZones` can be empty while the subnet's own effective DNS (which
+  // that grant reads) names the zone. An untouched pick sends no zone, which
+  // the server reads as that zone (#2466).
+  const publishZoneId = dnsZoneTouched
+    ? dnsZoneId
+    : dnsZoneId || effectiveDns?.dns_zone_id || "";
+  const zoneListUnreadable =
+    dnsOn &&
+    zonesSettled &&
+    availableZones.length === 0 &&
+    !!effectiveDns?.dns_zone_id;
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
@@ -3866,6 +3920,9 @@ export function AddAddressModal({
           {(["next", "manual"] as const).map((m) => (
             <button
               key={m}
+              {...(m === "next" && !nextAvailable
+                ? { disabled: true, title: NEEDS_NEXT_ADDRESS }
+                : {})}
               onClick={() => {
                 // Carry the "next available" IP into the Specific-IP field so
                 // switching modes doesn't drop the operator on an empty input.
@@ -3886,6 +3943,9 @@ export function AddAddressModal({
                 mode === m
                   ? "bg-primary text-primary-foreground border-primary"
                   : "hover:bg-muted",
+                m === "next" &&
+                  !nextAvailable &&
+                  "cursor-not-allowed opacity-50",
               )}
             >
               {m === "next" ? "Next available" : "Specific IP"}
@@ -4006,6 +4066,15 @@ export function AddAddressModal({
           {isDefaultGatewayHostnameInput(hostname) &&
             availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
+        {zoneListUnreadable && (
+          <Field label="DNS Zone">
+            <p className="py-1 text-xs text-muted-foreground">
+              <Globe2 className="mr-1 inline h-3 w-3" />
+              Published in this subnet&apos;s DNS zone. Your permissions do not
+              list DNS zones, so its name is not shown.
+            </p>
+          </Field>
+        )}
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
           <Field label="DNS Zone">
@@ -4189,7 +4258,7 @@ export function AddAddressModal({
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
                 records point to the IP. Withdrawn while the IP is an orphan and
                 back when it is restored; deleted when the IP is purged.
-                {!dnsZoneId && (
+                {!publishZoneId && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
                   </span>
@@ -4248,7 +4317,7 @@ export function AddAddressModal({
                     { name: "", record_type: "CNAME" },
                   ])
                 }
-                disabled={!hostname || !dnsZoneId}
+                disabled={!hostname || !publishZoneId}
                 className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
               >
                 <Plus className="h-3 w-3" /> Add alias
@@ -4656,10 +4725,32 @@ const NEEDS_BLOCK_DNS_SYNC =
   "Requires read permission on IP blocks and IP addresses, and write permission on IP blocks";
 const NEEDS_SPACE_DNS_SYNC =
   "Requires read permission on IP spaces and IP addresses, and write permission on IP spaces";
+const NEEDS_NEXT_ADDRESS =
+  "Requires write permission on subnets, or on an address set in this subnet (a grant on this one subnet allows a specific IP only)";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
 const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
 const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
+
+/** Gate for a block's / space's selection Delete (n) (#3884): delete on
+ *  subnets when a subnet is ticked, delete on IP blocks when a block is. */
+function selectionDeleteGateFor(
+  perms: { can: (action: string, type: string) => boolean },
+  hasSubnets: boolean,
+  hasBlocks: boolean,
+) {
+  const subnetsOk = !hasSubnets || perms.can("delete", "subnet");
+  const blocksOk = !hasBlocks || perms.can("delete", "ip_block");
+  if (subnetsOk && blocksOk) return {};
+  return permissionGate(
+    false,
+    !subnetsOk && !blocksOk
+      ? `${NEEDS_SUBNET_DELETE}, and delete permission on IP blocks`
+      : !subnetsOk
+        ? NEEDS_SUBNET_DELETE
+        : NEEDS_BLOCK_DELETE,
+  );
+}
 
 // The IPAM router's gate for an address delete and Bulk delete
 // (``DELETE /addresses/{id}``, ``POST /addresses/bulk-delete``): ``delete`` on
@@ -4778,7 +4869,7 @@ function ToolsMenu({
           label: "Bulk allocate…",
           icon: Layers,
           onSelect: onBulkAllocate,
-          ...permissionGate(can.allocate, NEEDS_ADDRESS_WRITE),
+          ...permissionGate(can.allocate, NEEDS_NEXT_ADDRESS),
         },
         {
           key: "clean-orphans",
@@ -5182,8 +5273,13 @@ export function SubnetDetail({
     addressInSetRanges(writableRanges, address);
 
   // The full per-IP write decision used by gray-out + checkbox + menu.
+  // #3902: editing an existing address, bulk edit and the allocation tools are
+  // routes a grant scoped to this one subnet does not reach (only PUT
+  // /subnets/{id} and POST /subnets/{id}/addresses are on its instance list),
+  // so the subnet half is the type-level write, as the server asks.
+  const subnetTypeWritable = perms.can("write", "subnet");
   const permitsWriteIp = (address: string): boolean =>
-    subnetWritable || ipInWritableSet(address);
+    subnetTypeWritable || ipInWritableSet(address);
 
   // The same for removing the row: delete on subnets, or a delete grant on
   // an address set that contains the address (the server asks the same). The
@@ -5224,6 +5320,8 @@ export function SubnetDetail({
   // the type-level ask: the server still refuses them to a scoped holder.
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
+  // Next available, Bulk allocate and Import: not on a scoped grant's list.
+  const canAllocateBulk = subnetTypeWritable || writableSets.length > 0;
   const canScan =
     perms.can("write", "manage_nmap_scans") &&
     perms.can("read", "manage_nmap_scans");
@@ -5941,7 +6039,7 @@ export function SubnetDetail({
             />
             <SubnetImportExportButton
               subnet={subnet}
-              canImport={canAllocate}
+              canImport={canAllocateBulk}
               onCommitted={() => {
                 qc.invalidateQueries({ queryKey: ["addresses"] });
                 qc.invalidateQueries({ queryKey: ["subnets"] });
@@ -5950,7 +6048,7 @@ export function SubnetDetail({
             />
             <ToolsMenu
               can={{
-                allocate: canAllocate,
+                allocate: canAllocateBulk,
                 reshape: canWriteSubnets,
                 scan: canScan,
                 // Clean Orphans takes ``delete`` on ``subnet``: an
@@ -6139,6 +6237,7 @@ export function SubnetDetail({
                       fields={prov}
                       kind="subnet"
                       id={subnet.id}
+                      writable={canEditSubnet}
                       onUpdated={(u) => onSubnetEdited(u as Subnet)}
                     />
                   </div>
@@ -6297,7 +6396,8 @@ export function SubnetDetail({
                 onClick={() => setShowBulkDelete(true)}
                 className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-2.5 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
                 {...permissionGate(
-                  canAllocate && (subnetDeletable || deletableSets.length > 0),
+                  canAllocateBulk &&
+                    (subnetDeletable || deletableSets.length > 0),
                   NEEDS_ADDRESS_DELETE,
                 )}
               >
@@ -6367,7 +6467,8 @@ export function SubnetDetail({
               </p>
               <button
                 onClick={() => setShowAddModal(true)}
-                className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+                {...permissionGate(canAllocate, NEEDS_ADDRESS_WRITE)}
+                className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Plus className="h-3.5 w-3.5" />
                 Allocate first IP
@@ -6780,15 +6881,24 @@ export function SubnetDetail({
                           <tr
                             key={`gap-${row.startIpInt}-${row.endIpInt}`}
                             aria-label={`${count} unallocated IP${count === 1 ? "" : "s"} between rows`}
-                            className="cursor-pointer hover:bg-emerald-500/[0.10]"
+                            className={
+                              canAllocate
+                                ? "cursor-pointer hover:bg-emerald-500/[0.10]"
+                                : undefined
+                            }
                             onClick={() => {
+                              if (!canAllocate) return;
                               setAddModalRange({
                                 startIpInt: row.startIpInt,
                                 endIpInt: row.endIpInt,
                               });
                               setShowAddModal(true);
                             }}
-                            title={`Allocate an IP from this free range (${count} available)`}
+                            title={
+                              canAllocate
+                                ? `Allocate an IP from this free range (${count} available)`
+                                : `${count} free`
+                            }
                           >
                             <td
                               colSpan={12}
@@ -6798,9 +6908,11 @@ export function SubnetDetail({
                               <span className="ml-2 opacity-70">
                                 · {count} free
                               </span>
-                              <span className="ml-2 opacity-60">
-                                · click to allocate
-                              </span>
+                              {canAllocate && (
+                                <span className="ml-2 opacity-60">
+                                  · click to allocate
+                                </span>
+                              )}
                             </td>
                           </tr>
                         );
@@ -7380,6 +7492,7 @@ export function SubnetDetail({
         <AddAddressModal
           subnetId={subnet.id}
           presetRange={addModalRange}
+          nextAvailable={canAllocateBulk}
           onClose={() => {
             setShowAddModal(false);
             setAddModalRange(null);
@@ -8911,7 +9024,11 @@ function EditSubnetModalForm({
               placeholder="e.g. 10.0.1.1"
             />
           </Field>
-          <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+          <VlanPicker
+            vlanRefId={vlanRefId}
+            onChange={setVlanRefId}
+            current={subnet.vlan}
+          />
           {subnet.vlan_id != null && !vlanRefId && (
             <p className="text-[11px] text-muted-foreground italic">
               Current VLAN tag: {subnet.vlan_id} (unassigned — create a Router /
@@ -9131,7 +9248,7 @@ function EditSubnetModalForm({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={() => onClose()}
@@ -10361,9 +10478,11 @@ function _formatNatLine(m: NATMapping): {
   const subnetLabel =
     m.internal_subnet_cidr ??
     m.internal_subnet_name ??
-    (m.internal_subnet_id
-      ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
-      : "—");
+    (m.internal_subnet_redacted
+      ? "restricted subnet"
+      : m.internal_subnet_id
+        ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+        : "—");
   const internal =
     (m.internal_ip ?? (m.internal_subnet_id ? subnetLabel : "—")) +
     _formatNatPorts(m.internal_port_start, m.internal_port_end);
@@ -13376,7 +13495,7 @@ export function CreateBlockModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={onClose}
@@ -13870,7 +13989,7 @@ function EditBlockModalForm({
         </div>
       )}
 
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <FormError className="mt-3">{error}</FormError>
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={() => onClose()}
@@ -14420,6 +14539,14 @@ export function BlockDetailView({
   // at the type level: the bulk edit and the split and merge commits at the
   // router gate, and every handler, the previews included, itself.
   const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
+  // #3884: Delete (n) asks delete on subnets for a ticked subnet and delete
+  // on IP blocks for a ticked block, at the type level, before the approval
+  // gate (the delete handlers' own check).
+  const selectionDeleteGate = selectionDeleteGateFor(
+    perms,
+    selectedSubnetIds.length > 0,
+    hasBlocksSelected,
+  );
   const toggleOne = (key: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -14496,6 +14623,7 @@ export function BlockDetailView({
                     setBulkDeleteKeys([...selected]);
                     setShowBulkDelete(true);
                   }}
+                  {...selectionDeleteGate}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -14614,6 +14742,7 @@ export function BlockDetailView({
                     fields={prov}
                     kind="block"
                     id={block.id}
+                    writable={canEditBlock}
                     onUpdated={(u) => setBlock(u as IPBlock)}
                   />
                 )}
@@ -15908,6 +16037,12 @@ export function SpaceTableView({
   // #3384: Bulk Edit, Split… and Merge… ask write on subnets at the type
   // level, as on a block's selection.
   const subnetWriteGate = permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE);
+  // #3884: Delete (n), as on a block's selection.
+  const selectionDeleteGate = selectionDeleteGateFor(
+    perms,
+    selectedSubnetIds.length > 0,
+    hasBlocksSelected,
+  );
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -16024,6 +16159,7 @@ export function SpaceTableView({
                     setBulkDeleteKeys([...selected]);
                     setShowBulkDelete(true);
                   }}
+                  {...selectionDeleteGate}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>

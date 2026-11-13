@@ -1054,10 +1054,12 @@ async def test_soft_deleted_records_have_their_view_remapped_too(
     )
     await db_session.flush()
 
-    # It is not part of "records moving" — that count is live rows.
+    # It is not part of "records moving" — that count is live rows — nor of
+    # the view figures (#3921); it is reported as in the Trash.
     body = (await _preview(client, token, zone, dst)).json()
     assert body["records_total"] == 0
-    assert body["records_remapped"] == 1
+    assert body["records_remapped"] == 0
+    assert body["records_trashed"] == 1
 
     assert (await _commit(client, token, zone, dst)).status_code == 200
 
