@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef } from "react";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
@@ -2827,6 +2828,7 @@ function ZoneModalForm({
   initialName,
   onClose,
 }: ZoneModalProps) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
@@ -3404,13 +3406,15 @@ function ZoneModalForm({
                     : ""}
           </p>
         </Field>
-        <Field label="Customer (optional)">
-          <CustomerPicker
-            className={inputCls}
-            value={customerId}
-            onChange={setCustomerId}
-          />
-        </Field>
+        {own.customer && (
+          <Field label="Customer (optional)">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+        )}
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
           onClose={onClose}
