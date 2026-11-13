@@ -104,7 +104,10 @@ async def test_approve_refused_when_cname_appeared_after_submit(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "failed"
-    assert "is a CNAME" in resp.json()["error"]
+    # #3642 — composed under the requester's reads: the CNAME that appeared
+    # after submit is a record they may not be able to read, so the failure is
+    # worded generically for them (the approver's audit row keeps the reason).
+    assert resp.json()["error"] == "The request conflicts with something that already exists."
     ip = (
         await db_session.execute(
             select(IPAddress).where(

@@ -100,6 +100,11 @@ class FindProvisioningRequestsArgs(BaseModel):
         description="When true, only requests the current user submitted.",
     )
     limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Rows to skip (newest first), to page past ``limit``; see ``total``.",
+    )
 
 
 @register_tool(
@@ -138,9 +143,16 @@ async def find_provisioning_requests(
     # the ``mine`` arg.
     if args.mine or not _can_see_all(user):
         stmt = stmt.where(ChangeRequest.requested_by_user_id == user.id)
-    stmt = stmt.order_by(ChangeRequest.created_at.desc()).limit(args.limit)
+    # Rows matching the filters before the window, so the model can say
+    # "50 of 130" instead of presenting a cut list as complete (#3937).
+    total = int(await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    stmt = (
+        stmt.order_by(ChangeRequest.created_at.desc(), ChangeRequest.id)
+        .limit(args.limit)
+        .offset(args.offset)
+    )
     rows = list((await db.execute(stmt)).scalars().all())
-    return {"requests": [_to_dict(r) for r in rows], "count": len(rows)}
+    return {"requests": [_to_dict(r) for r in rows], "count": len(rows), "total": total}
 
 
 # ── count_provisioning_requests ──────────────────────────────────────

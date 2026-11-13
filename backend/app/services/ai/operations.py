@@ -412,9 +412,10 @@ class CreateIPAddressArgs(BaseModel):
             "'static_dhcp'. Static_dhcp requires mac_address."
         ),
     )
-    hostname: str | None = Field(default=None, description="Hostname (e.g. web01)")
+    hostname: str | None = Field(default=None, max_length=255, description="Hostname (e.g. web01)")
     fqdn: str | None = Field(
         default=None,
+        max_length=512,  # ``ip_address.fqdn`` column width
         description=(
             "Fully-qualified domain name in the subnet's DNS zone (e.g. "
             "web01.prod.example.com); the hostname is the part before the zone"
@@ -2180,7 +2181,9 @@ class AllocateSubnetArgs(BaseModel):
         le=128,
         description="Prefix length of the subnet to carve (e.g. 24 for a /24, 64 for a v6 /64)",
     )
-    name: str = Field(default="", description="Optional name for the new subnet")
+    # 255 is the ``subnet.name`` column width: past it the INSERT fails with a
+    # raw database error at approve time instead of a refusal at submit.
+    name: str = Field(default="", max_length=255, description="Optional name for the new subnet")
     description: str = Field(default="", description="Optional free-form description")
     template_id: str | None = Field(
         default=None, description="Optional IPAM template UUID to stamp onto the new subnet"
@@ -2662,11 +2665,12 @@ class CreateDNSRecordArgs(BaseModel):
         json_schema_extra={"x-resource": "dns_zone"},
     )
     name: str = Field(
+        max_length=255,  # ``dns_record.name`` column width
         description=(
             "Relative record name. Use ``@`` for the zone apex. Do NOT "
             "include the trailing zone (use ``host1`` not "
             "``host1.example.com``)."
-        )
+        ),
     )
     record_type: str = Field(
         description=(
@@ -3682,7 +3686,7 @@ class CreateDHCPStaticArgs(BaseModel):
     )
     ip_address: str = Field(description="IP to reserve (must fall inside the scope).")
     mac_address: str = Field(description="MAC address (any standard format).")
-    hostname: str | None = Field(default=None, description="Optional hostname.")
+    hostname: str | None = Field(default=None, max_length=255, description="Optional hostname.")
     description: str = Field(default="", description="Free-form description.")
 
     # The REST reservation create's rules (``StaticCreate``): a blank hostname
