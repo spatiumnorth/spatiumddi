@@ -181,3 +181,50 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
     assert len(await _a_records(db_session, zone_id)) == len(ips)
     # The batch's own commit, then the chunks: 8 names, then as many as fit.
     assert commits <= 8, commits
+
+
+@pytest.mark.asyncio
+async def test_a_replay_after_a_mid_ddns_outage_publishes_each_name_once(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch commits before its DDNS, so a connection lost in the DDNS
+    answers 503 with the receipt already committed (#3017: the agent must
+    spool and resend). The resend is a duplicate by that receipt and must
+    still publish what the first attempt did not."""
+    import asyncpg
+    from sqlalchemy.exc import InterfaceError
+
+    import app.services.dns.ddns as ddns
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    ips = _A_IPS[:6]
+    events = [_ev(i) for i in ips]
+    batch_id = uuid.uuid4().hex
+    real = ddns.apply_ddns_for_lease
+    calls = 0
+
+    async def _outage(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise InterfaceError("stmt", {}, asyncpg.exceptions.ConnectionDoesNotExistError("x"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(ddns, "apply_ddns_for_lease", _outage)
+    first = await _post_with_id(concurrent_client, peer_a, events, batch_id)
+    assert first.status_code == 503, first.text
+    assert len(await _a_records(db_session, zone_id)) < len(ips)
+
+    monkeypatch.setattr(ddns, "apply_ddns_for_lease", real)
+    again = await _post_with_id(concurrent_client, peer_a, events, batch_id)
+    assert again.status_code == 200, again.text
+    assert again.json()["duplicate"] is True
+    names = await _a_records(db_session, zone_id)
+    assert sorted(v for _n, v in names) == sorted(ips)
+    third = await _post_with_id(concurrent_client, peer_a, events, batch_id)
+    assert third.status_code == 200
+    assert await _a_records(db_session, zone_id) == names

@@ -1400,6 +1400,11 @@ async def agent_lease_events(
     if not await claim_batch(
         db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.lease_events"
     ):
+        # #3816 — the batch's DDNS runs after its commit, so a first attempt
+        # that lost the database in it answered 503 with the receipt already
+        # committed: this replay finishes the publishes. Idempotent: a name
+        # already published is a no-op, and a row since released is gone.
+        await _replay_deferred_ddns(db, body.leases, server)
         return duplicate_response(upserted=0)
     now = datetime.now(UTC)
     events = body.leases
@@ -2219,6 +2224,32 @@ _DDNS_CHUNK_MAX = 50
 _DDNS_HOLD_S = 2.0
 
 
+async def _replay_deferred_ddns(db: AsyncSession, events: list[Any], server: Any) -> None:
+    """The DDNS a duplicate batch's grants still owe (#3816): each address's
+    last event, when it is a grant, in its subnet."""
+    from app.services.dhcp.pull_leases import (
+        _find_containing_subnet,
+        _load_scope_cache,
+        _load_subnet_cache,
+    )
+
+    if not events:
+        return
+    subnets = await _load_subnet_cache(db)
+    scope_cache = await _load_scope_cache(db, server.server_group_id)
+    last: dict[str, Any] = {}
+    for ev in events:
+        last[ev.ip_address] = ev
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]] = {}
+    for ip, ev in last.items():
+        if ev.state != "active":
+            continue
+        subnet = _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
+        if subnet is not None:
+            deferred[(subnet.id, norm_ip(ip))] = (subnet, ev.hostname)
+    await _publish_deferred_ddns(db, deferred, server_id=str(server.id))
+
+
 async def _publish_deferred_ddns(
     db: AsyncSession,
     deferred: dict[tuple[Any, str], tuple[Any, str | None]],
@@ -2267,6 +2298,7 @@ async def _publish_deferred_ddns(
                             client_hostname=client_hostname,
                         )
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_ddns_failed",
                         server=server_id,
@@ -2277,6 +2309,9 @@ async def _publish_deferred_ddns(
             await db.commit()
         except Exception as exc:  # noqa: BLE001
             await db.rollback()
+            # The batch is committed but its publishes are not: the 503 has
+            # the agent resend it, and the replay finishes them.
+            _reraise_if_database_gone(exc)
             logger.warning("dhcp_agent_lease_ddns_chunk_failed", server=server_id, error=str(exc))
         if published:
             per_name = (time.monotonic() - began) / published
