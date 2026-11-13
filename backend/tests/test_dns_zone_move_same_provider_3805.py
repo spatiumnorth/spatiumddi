@@ -269,7 +269,7 @@ def test_technitium_identity_is_the_normalised_api_root() -> None:
     assert d.provider_identity(_row("d", {"token": "t"})) is None
 
 
-def test_windows_identity_is_host_and_winrm_port() -> None:
+def test_windows_identity_is_the_ad_domain() -> None:
     from app.drivers.dns.windows import WindowsDNSDriver
 
     d = WindowsDNSDriver()
@@ -277,8 +277,8 @@ def test_windows_identity_is_host_and_winrm_port() -> None:
     a = d.provider_identity(_row("DC1.corp.example.", creds))
     b = d.provider_identity(_row("dc1.corp.example", {**creds, "winrm_port": 5985}))
     tls = d.provider_identity(_row("dc1.corp.example", {**creds, "use_tls": True}))
-    assert a == b == "windows_dns:dc1.corp.example:5985"
-    assert tls == "windows_dns:dc1.corp.example:5986"
+    # #3888: the AD domain (DNS suffix of the host), not host + port.
+    assert a == b == tls == "windows_dns:ad:corp.example"
     assert "secret-pw" not in (a or "")
     assert d.provider_identity(_row("", creds)) is None
 

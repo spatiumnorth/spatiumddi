@@ -14,6 +14,7 @@ import {
   GRANT_ACTIONS,
   GRANT_RESOURCE_TYPES,
 } from "@/lib/permissionVocabulary";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -180,7 +181,9 @@ export function CreateTimeBoundGrantModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}

@@ -82,12 +82,17 @@ export function SitePicker({
   className,
   disabled,
 }: PickerProps) {
-  const { data } = useQuery({
+  const { data, isLoading } = useQuery({
     queryKey: ["sites-picker"],
     queryFn: () => sitesApi.list({ limit: 500 }),
     staleTime: 60_000,
   });
   const items = data?.items ?? [];
+  // A site the list cannot hold (the caller may not read sites, #3904, or it
+  // sits past the first page) keeps its value, named as the current site,
+  // instead of the select drawing "None" over a link the record has. Nothing
+  // is shown while the list is still loading.
+  const missing = !!value && !isLoading && !items.some((s) => s.id === value);
   return (
     <select
       className={className}
@@ -96,6 +101,7 @@ export function SitePicker({
       disabled={disabled}
     >
       <option value="">— None —</option>
+      {missing && <option value={value!}>(current site)</option>}
       {items.map((s) => (
         <option key={s.id} value={s.id}>
           {s.name}

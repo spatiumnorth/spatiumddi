@@ -17,6 +17,7 @@ import { formatApiError, savedViewsApi, type SavedView } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useDismissableMenu } from "@/hooks/useDismissableMenu";
+import { FormError } from "@/components/ui/form-error";
 
 export function SavedViewsMenu<P extends Record<string, unknown>>({
   page,
@@ -229,9 +230,9 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
               </p>
             )}
             {save.isError && (
-              <p className="mt-1 text-xs text-destructive">
+              <FormError className="mt-1 text-xs text-destructive">
                 Couldn't save — try a different name.
-              </p>
+              </FormError>
             )}
           </div>
         </div>

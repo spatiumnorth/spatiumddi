@@ -22,6 +22,7 @@ import {
   type ApiTokenCreated,
   type ApiTokenResourceGrant,
   type ApiTokenScope,
+  formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -36,6 +37,7 @@ import { QrCode } from "@/components/QrCode";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -333,9 +335,9 @@ function CreateTokenModal({
           />
         </div>
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -781,7 +783,9 @@ function ReenableTokenModal({
           onTotp={setStepTotp}
           autoFocus
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -832,6 +836,7 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setConfirmDelete(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
 
   return (
@@ -1046,6 +1051,11 @@ export function ApiTokensPage() {
                 )}
                 ? Any script still using it will start getting 401 responses.
               </p>
+              {deleteMut.isError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {formatApiError(deleteMut.error, "Failed to delete token")}
+                </p>
+              )}
               <div className="flex justify-end gap-2">
                 <button
                   onClick={() => setConfirmDelete(null)}
@@ -1054,7 +1064,10 @@ export function ApiTokensPage() {
                   Cancel
                 </button>
                 <button
-                  onClick={() => deleteMut.mutate(confirmDelete.id)}
+                  onClick={() => {
+                    deleteMut.reset();
+                    deleteMut.mutate(confirmDelete.id);
+                  }}
                   disabled={deleteMut.isPending}
                   className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
                 >

@@ -9,6 +9,7 @@ from __future__ import annotations
 import uuid
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -118,3 +119,30 @@ async def test_clearing_the_pin_is_allowed_and_shared_records_never_block(
     assert resp.status_code == 200, resp.text
     await db_session.refresh(zone)
     assert zone.view_id is None
+
+
+async def test_repin_of_a_pinned_zone_names_a_remedy_the_record_api_accepts(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3943 — while the zone is pinned, moving a record to the new view is 422."""
+    headers, grp, zone, v1, v2 = await _setup(db_session)
+    zone.view_id = v1.id
+    await db_session.commit()
+    # The record API refuses the "move" the old words named first.
+    rec = (
+        await db_session.execute(select(DNSRecord).where(DNSRecord.view_id == v1.id))
+    ).scalar_one()
+    mv = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/records/{rec.id}",
+        headers=headers,
+        json={"view_id": str(v2.id)},
+    )
+    assert mv.status_code == 422
+    resp = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}",
+        headers=headers,
+        json={"view_id": str(v2.id)},
+    )
+    assert resp.status_code == 422
+    assert "Move those records" not in resp.text
+    assert "Remove their view first" in resp.text

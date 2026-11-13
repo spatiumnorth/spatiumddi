@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import threading
 import time
 import uuid
@@ -708,7 +709,7 @@ class Shipper:
             if outcome != SENT:
                 log.warning(f"{self._event}_failed", status=status, outcome=outcome)
         if outcome == RETRY and self._backoff:
-            self._retry_after = time.monotonic() + self._backoff
+            self._retry_after = time.monotonic() + self._backoff * random.uniform(1.0, 1.5)
         self.last_send_outcome = outcome
         return outcome
 

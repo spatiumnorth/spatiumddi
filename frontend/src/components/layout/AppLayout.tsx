@@ -45,7 +45,10 @@ export function AppLayout() {
         <SetupBanner />
         <MaintenanceBanner />
         <MaintenanceModeBanner />
-        <Header onMobileMenu={() => setMobileOpen(true)} />
+        <Header
+          onMobileMenu={() => setMobileOpen(true)}
+          mobileNavOpen={mobileOpen}
+        />
         <main className="flex-1 overflow-auto">
           <ErrorBoundary
             key={pathname}

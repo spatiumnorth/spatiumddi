@@ -3121,7 +3121,7 @@ function ConfigApplyChip({
     return (
       <StatusChip
         tone="amber"
-        label="zones refused"
+        label="zones held back"
         title={`${PARTIAL_APPLY_EXPLAIN}\n\n${partialApplyDetail(error)}`}
       />
     );
