@@ -39,6 +39,7 @@ import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Relative "time ago" for the sync/pushed columns. Cheap, no dependency.
 function timeAgo(iso: string): string {
@@ -854,9 +855,9 @@ function ArmTargetModal({
         )}
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-2">
@@ -946,7 +947,11 @@ function RevealModal({
               placeholder="or 6-digit code"
               className={`${inputCls} font-mono`}
             />
-            {error && <p className="text-xs text-destructive">{error}</p>}
+            {error && (
+              <FormError className="text-xs text-destructive">
+                {error}
+              </FormError>
+            )}
             <div className="flex justify-end gap-2 pt-1">
               <button
                 type="button"
@@ -1168,9 +1173,9 @@ function NewBlockModal({
         </div>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-1">
