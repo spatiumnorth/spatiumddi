@@ -1,0 +1,3 @@
+### Added
+
+- **DNS views can have their own default forwarders (#3523).** A view now takes `forwarders`, a `forward` policy and, for DNS over TLS, a certificate name, rendered inside its `view {}` block so the clients it matches resolve through their own upstream (a guest VLAN through a filtering resolver, staff through the internal one). A view that sets none keeps the group's, so existing configs are unchanged. The view editor has a Forwarders section with the resolver presets; the same checks as the group's apply (one certificate name per forwarder set, no encrypted-only upstream over plain DNS). BIND9 groups only: a group that also holds PowerDNS, Technitium or Windows DNS refuses it.

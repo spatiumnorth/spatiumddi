@@ -905,7 +905,49 @@ def _render_tls_statements(
     return ("\n".join(blocks) + "\n") if blocks else ""
 
 
-def _render_zone_tls_statements(zones: list[dict[str, Any]] | None) -> str:
+def _view_forwarders(
+    view: dict[str, Any], opts: dict[str, Any]
+) -> tuple[str, str | None]:
+    """``(text, tls_hostname)`` for a view's own default forwarders (#3523).
+
+    ``text`` is the ``forwarders { … }; forward …;`` lines for inside the view
+    block, ``""`` when the view sets none, so it inherits the group's from
+    ``options {}`` exactly as before. ``tls_hostname`` is the upstream
+    certificate name whose top-level ``tls`` statement the lines name.
+
+    A view's transport is its own, like a forward zone's (#2121): it does not
+    inherit the group's ``forward_transport``. The policy falls back to the
+    group's, and is always written out for a view that forwards: a group set
+    to ``forward only`` would otherwise leave a view that asked for ``first``
+    forwarding ``only``, because the view block inherits ``options``.
+
+    One BIND refuses to render faithfully (TLS without a usable name, an
+    unknown transport) is logged and dropped, leaving the view on the
+    group's forwarders, never silently on plain DNS.
+    """
+    if not view.get("forwarders"):
+        return "", None
+    tokens, hostname, refusal = _bind_zone_forwarders(view)
+    if refusal or not tokens:
+        log.warning(
+            "bind9_view_forwarders_skipped",
+            view=view.get("name"),
+            reason=refusal or "no usable forwarder",
+        )
+        return "", None
+    policy = str(view.get("forward_policy") or opts.get("forward_policy") or "first").lower()
+    policy = "only" if policy == "only" else "first"
+    return (
+        f"forwarders {{ {'; '.join(tokens)}; }};\nforward {policy};\n",
+        hostname,
+    )
+
+
+def _render_zone_tls_statements(
+    zones: list[dict[str, Any]] | None,
+    views: list[dict[str, Any]] | None = None,
+    opts: dict[str, Any] | None = None,
+) -> str:
     """One ``tls`` statement per distinct upstream hostname that a TLS forward
     zone forwards to (#2121), sorted so the file is stable.
 
@@ -919,6 +961,11 @@ def _render_zone_tls_statements(zones: list[dict[str, Any]] | None) -> str:
         if zone.get("type") != "forward":
             continue
         _tokens, hostname, _refusal = _bind_zone_forwarders(zone)
+        if hostname:
+            hostnames.add(hostname)
+    # A view's own TLS forwarders (#3523) name the same kind of statement.
+    for view in views or []:
+        hostname = _view_forwarders(view, opts or {})[1]
         if hostname:
             hostnames.add(hostname)
     return "".join(_bind_zone_tls_statement(h) for h in sorted(hostnames))
@@ -3224,7 +3271,7 @@ class Bind9Driver(DriverBase):
             acl_statements=_render_acl_statements(bundle.get("acls")),
             tls_statements=(
                 _render_tls_statements(opts, self.state_dir, has_cert)
-                + _render_zone_tls_statements(bundle.get("zones"))
+                + _render_zone_tls_statements(bundle.get("zones"), bundle.get("views"), opts)
             ),
             encrypted_listeners=_render_encrypted_listeners(opts, has_cert),
         )
@@ -3525,6 +3572,10 @@ class Bind9Driver(DriverBase):
                     if aqc
                     else ""
                 )
+                # #3523 — the view's own default forwarders; none inherits the
+                # group's from ``options {}``.
+                fwd_text, _fwd_host = _view_forwarders(view, opts)
+                fwd_lines = _indent(fwd_text) if fwd_text else ""
                 conf += (
                     f'view "{vname}" {{\n'
                     f"    match-clients {{ {match_clients}; }};\n"
@@ -3532,6 +3583,7 @@ class Bind9Driver(DriverBase):
                     f"    recursion {recursion_v};\n"
                     f"{aq_line}"
                     f"{aqc_line}"
+                    f"{fwd_lines}"
                     f"{_indent(body)}"
                     f"}};\n"
                 )

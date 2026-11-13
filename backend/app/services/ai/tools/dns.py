@@ -1105,7 +1105,10 @@ class ListDNSViewsArgs(BaseModel):
         "different zone data. Each row carries id, name, "
         "description, group_id, match_clients (CIDR/ACL list), "
         "match_destinations, recursion flag, evaluation order, and "
-        "any per-view allow_query / allow_query_cache overrides. "
+        "any per-view allow_query / allow_query_cache overrides, and the "
+        "view's own default forwarders (forwarders / forward_policy / "
+        "forward_transport / forward_tls_hostname; null forwarders inherit "
+        "the group's). "
         "Use for 'which views does the corp group have?' or 'what "
         "clients does the internal view match?'."
     ),
@@ -1135,6 +1138,10 @@ async def list_dns_views(
             "order": v.order,
             "allow_query": v.allow_query,
             "allow_query_cache": v.allow_query_cache,
+            "forwarders": v.forwarders,
+            "forward_policy": v.forward_policy,
+            "forward_transport": v.forward_transport,
+            "forward_tls_hostname": v.forward_tls_hostname,
         }
         for v in rows
     ]

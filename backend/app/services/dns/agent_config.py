@@ -1746,6 +1746,24 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         }
         for vd in view_descs
     ]
+    # #3523 — a view's own default forwarders, shipped only when it has some so
+    # every other view's entry (and so the structural ETag) is unchanged. Only a
+    # BIND9 server receives them: the other drivers do not render a view's
+    # forwarders, and the API refuses to set them on a group holding one.
+    for vd, view_entry in zip(view_descs, views_block, strict=True):
+        # Written through the API's validator, but a row an importer or an older
+        # release stored is held to the same grammar rather than trusted:
+        # BIND refuses the whole file over one unparseable entry.
+        view_forwarders, _dropped = split_zone_forwarders(
+            [str(f) for f in (vd.get("forwarders") or []) if f]
+        )
+        if view_forwarders and server.driver == "bind9":
+            view_entry["forwarders"] = view_forwarders
+            if vd.get("forward_policy"):
+                view_entry["forward_policy"] = vd["forward_policy"]
+            if vd.get("forward_transport", "do53") != "do53":
+                view_entry["forward_transport"] = vd["forward_transport"]
+                view_entry["forward_tls_hostname"] = vd.get("forward_tls_hostname")
     # #920 — the key that lets the control plane's own transfers (drift,
     # sync-with-servers) select each view. The agent admits it into its view's
     # match-clients and refuses it in every other; without it a signed transfer

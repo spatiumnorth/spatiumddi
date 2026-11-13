@@ -5916,6 +5916,12 @@ export interface DNSView {
   order: number;
   allow_query: string[] | null;
   allow_query_cache: string[] | null;
+  /** #3523 — the view's own default forwarders (BIND9 only). `null` inherits
+   *  the group's; the policy likewise, and the transport is the view's own. */
+  forwarders: string[] | null;
+  forward_policy: "first" | "only" | null;
+  forward_transport: "do53" | "tls";
+  forward_tls_hostname: string | null;
   /** #3551 — set on the list when the group's estimated named memory is at
    *  80 % or more of its agents' limit. */
   memory_warning?: string | null;
