@@ -21,6 +21,7 @@ import {
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const REASON_LABELS: Record<DHCPMACBlockReason, string> = {
   rogue: "Rogue device",
@@ -486,7 +487,9 @@ function MacBlockModalForm({ groupId, block, onClose }: MacBlockModalProps) {
             <span>Enabled</span>
           </label>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>
