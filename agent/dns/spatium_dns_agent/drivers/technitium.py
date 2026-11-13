@@ -560,6 +560,10 @@ def _is_record_noop(message: Any) -> bool:
     return _norm_error(message) in _RECORD_NOOP_MESSAGES
 
 
+class _ZoneNotOwned(Exception):
+    """A same-named zone exists that this agent never created (#1775)."""
+
+
 def _is_zone_exists(message: Any) -> bool:
     """True for ``Zone already exists: <zone>`` (zone create on an existing zone)."""
     return _norm_error(message).startswith("zone already exists:")
@@ -2320,6 +2324,8 @@ class TechnitiumDriver(DriverBase):
     # ``swap_and_reload``: the cause is one group option, and a refusal per
     # zone would bury every other refusal in the truncated apply error.
     _unapplied_acl: dict[str, list[str]] | None = None
+    # Zone names in the ledger before the current pass; see _retire_dropped_zones.
+    _owned_before: frozenset[str] | None = None
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -2756,20 +2762,29 @@ class TechnitiumDriver(DriverBase):
         desired = {str(z.get("zone") or "").lower() for z in payload if z.get("zone")}
         path = self._managed_zones_path()
         managed: set[str]
+        # What this agent owned BEFORE this pass (#1775). The ledger is
+        # rewritten below with every zone the bundle names, so by the time
+        # the reconcile meets a zone that already exists on the daemon the
+        # file can no longer say whether we put it there. ``None`` = unknown.
+        self._owned_before = None
         try:
             managed = {str(n).lower() for n in json.loads(path.read_text())}
+            self._owned_before = frozenset(managed)
         except FileNotFoundError:
+            self._owned_before = frozenset()
             managed = set()
             try:
                 previous = json.loads(previous_render.read_text())
                 managed = {str(z.get("zone") or "").lower() for z in previous if z.get("zone")}
             except (OSError, ValueError, AttributeError):
                 pass
+            self._owned_before = frozenset(managed)
         except (OSError, ValueError, TypeError) as exc:
             # An unreadable ledger must not turn into "delete nothing ever"
             # silently, nor into a guess. Rebuild it from this bundle.
             log.warning("technitium_managed_zones_unreadable", error=str(exc))
             managed = set()
+            self._owned_before = None
 
         if not isinstance(bundle_zone_names, list):
             if managed - desired:
@@ -3954,7 +3969,10 @@ class TechnitiumDriver(DriverBase):
         release (agent killed mid-pass, release refused).
         """
         zone = zone_payload["zone"]
-        new_primary = self._ensure_zone_exists(token, zone_payload)
+        try:
+            new_primary = self._ensure_zone_exists(token, zone_payload, check_owned=True)
+        except _ZoneNotOwned:
+            return held
         is_primary = zone_payload.get("type", "Primary") == "Primary"
         options = zone_payload.get("options") or {}
         if new_primary and is_primary and self._hold_zone(token, zone):
@@ -4377,7 +4395,39 @@ class TechnitiumDriver(DriverBase):
                 ns_retimed=retimed,
             )
 
-    def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> bool:
+    def _zone_is_ours(self, zone: str) -> bool:
+        """May this agent take over a zone that already exists on the daemon?
+
+        Only a zone from its own ledger, or when the operator opted in with
+        ``TECHNITIUM_ADOPT_EXISTING_ZONES``. An unknown ledger (unreadable,
+        or the retire step never ran) does not block: refusing there would
+        stop every zone on a guess.
+        """
+        if self._owned_before is None or zone.lower() in self._owned_before:
+            return True
+        return os.environ.get("TECHNITIUM_ADOPT_EXISTING_ZONES", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _disown_zone(self, zone: str) -> None:
+        """Drop a refused zone from the ledger ``_retire_dropped_zones`` just wrote.
+
+        Left in, the next pass would read it as ours and wipe its records.
+        """
+        path = self._managed_zones_path()
+        try:
+            names = {str(n).lower() for n in json.loads(path.read_text())}
+        except (OSError, ValueError, TypeError):
+            return
+        names.discard(zone.lower())
+        self._write_secret(path, json.dumps(sorted(names)))
+
+    def _ensure_zone_exists(
+        self, token: str, entry: dict[str, Any], *, check_owned: bool = False
+    ) -> bool:
         """Create the zone if absent, with the params its type requires.
 
         Returns True when this call created the zone, or converted an
@@ -4424,6 +4474,20 @@ class TechnitiumDriver(DriverBase):
         body = resp.json()
         if body.get("status") == "error":
             if _is_zone_exists(body.get("errorMessage")):
+                if check_owned and not self._zone_is_ours(zone):
+                    # #1775: a zone the operator made on the daemon. Taking
+                    # it over deletes every record the bundle lacks, and
+                    # retiring it later deletes the zone, so leave it alone.
+                    self._disown_zone(zone)
+                    log.error("technitium_zone_not_owned", zone=zone)
+                    self._note_apply_failure(
+                        f"{zone}: a zone of that name already exists on this Technitium "
+                        "server and SpatiumDDI did not create it, so it was left untouched "
+                        "(applying the bundle would delete every record it does not list). "
+                        "Delete it in the Technitium console, or set "
+                        "TECHNITIUM_ADOPT_EXISTING_ZONES=true on the agent to take it over"
+                    )
+                    raise _ZoneNotOwned(zone)
                 # The create params carry the zone's UPSTREAM (a
                 # secondary/stub's primaries, a forwarder's target), and
                 # create is a no-op once the zone exists. Without this,

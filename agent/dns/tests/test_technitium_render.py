@@ -18,6 +18,7 @@ Two layers here:
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -4156,8 +4157,13 @@ def test_an_ipv4_mapped_prefix_is_refused() -> None:
 # Secondary TSIG
 
 
-def _secondary_calls(tmp_path: Path, bundle: dict[str, Any], responder: Any = None):
+def _secondary_calls(
+    tmp_path: Path, bundle: dict[str, Any], responder: Any = None, owned: list[str] | None = None
+):
     d = TechnitiumDriver(state_dir=tmp_path)
+    if owned is not None:
+        # Zones this agent put on the daemon earlier (#1775).
+        (tmp_path / "technitium-managed-zones.json").write_text(json.dumps(owned))
     _seed_token(d)
     d.daemon_running = lambda: True  # type: ignore[method-assign]
     d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
@@ -4204,6 +4210,7 @@ def test_an_existing_secondary_gets_the_key_through_options(tmp_path: Path) -> N
         tmp_path,
         {"zones": [sec], "options": {}, "tsig_keys": [_MASTER_KEY]},
         respond,
+        owned=["s.test"],
     )
     reapply = [
         c[3]
