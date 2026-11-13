@@ -125,7 +125,7 @@ export function ServerDetailModal({
           {server.driver === "technitium_api" && (
             <span
               className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
-              title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group or zone options."
+              title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group options, no zone transfer / notify / query ACLs."
             >
               Experimental
             </span>

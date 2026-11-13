@@ -3,9 +3,10 @@
 The driver writes into a Technitium server SpatiumDDI does not own and has
 no reconcile loop, so several things the platform offers on other drivers
 would either do nothing or do damage there (DNS pools collapse to one
-member, an overwrite wipes the operator's own records, SOA / ACL / zone
-options are never written, a second server never receives the zone).  Fixing
-them is tracked for 1.1.0 (#1769, #1771, #1774, #1775); for 1.0.0 the driver
+member, an overwrite wipes the operator's own records, group options and zone
+ACLs are never written, a second server never receives the zone). The zone's
+SOA, apex NS and serial are written since #1774 / #1779. Fixing the rest is
+tracked for 1.1.0 (#1769, #1771, #1774, #1775); for 1.0.0 the driver
 is labelled experimental and the API refuses what it cannot do, instead of
 accepting it and silently not doing it.
 
@@ -28,10 +29,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import (
-    ZONE_DEFAULT_EXPIRE,
-    ZONE_DEFAULT_MINIMUM,
-    ZONE_DEFAULT_REFRESH,
-    ZONE_DEFAULT_RETRY,
     DNSPool,
     DNSServer,
     DNSServerOptions,
@@ -40,16 +37,12 @@ from app.models.dns import (
 DRIVER = "technitium_api"
 EXPERIMENTAL = "technitium_api is experimental in 1.0"
 
-#: Zone fields the driver never writes (it sends only ``zone`` + ``type``),
-#: with the value they hold when left alone.
+#: Zone fields the driver never writes, with the value they hold when left
+#: alone. The SOA (Primary NS, Admin Email, timers, TTL) and apex NS are NOT
+#: here: the driver writes them (#1774). Transfer, notify and query access
+#: need the group's ACL and TSIG-key translation the agent does from its
+#: bundle, which this path has no equivalent of.
 ZONE_UNAPPLIED_DEFAULTS: dict[str, Any] = {
-    "ttl": 3600,
-    "refresh": ZONE_DEFAULT_REFRESH,
-    "retry": ZONE_DEFAULT_RETRY,
-    "expire": ZONE_DEFAULT_EXPIRE,
-    "minimum": ZONE_DEFAULT_MINIMUM,
-    "primary_ns": "",
-    "admin_email": "",
     "allow_query": None,
     "allow_transfer": None,
     "also_notify": None,
@@ -227,7 +220,7 @@ async def scope_warnings_by_group(
     for gid, n in servers.items():
         warnings = [
             f"{EXPERIMENTAL}: zones SpatiumDDI creates, one server per group, no "
-            "pools, no group or zone options."
+            "pools, no group options, no zone transfer / notify / query ACLs."
         ]
         if n > 1:
             warnings.append(

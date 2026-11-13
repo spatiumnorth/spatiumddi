@@ -1898,14 +1898,15 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
           <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
             <strong>Technitium (remote API) — Experimental in 1.0:</strong> one
             server per group, zones SpatiumDDI creates, no DNS pools and no
-            group or zone options (the API refuses them). Agentless. For a
-            Technitium server <em>you already run</em> — nothing is deployed,
-            and record CRUD runs from the SpatiumDDI control plane against its
-            HTTP API. Enter the API URL and a permanent token below; they're
-            stored Fernet-encrypted and never returned by the API. Use the
-            agent-managed <code>technitium</code> driver instead if you want
-            SpatiumDDI to run the daemon. DNSSEC, forwarders and the native
-            blocklists are agent-managed only for now.
+            group options or zone transfer / notify / query ACLs (the API
+            refuses them). Agentless. For a Technitium server{" "}
+            <em>you already run</em> — nothing is deployed, and record CRUD runs
+            from the SpatiumDDI control plane against its HTTP API. Enter the
+            API URL and a permanent token below; they're stored Fernet-encrypted
+            and never returned by the API. Use the agent-managed{" "}
+            <code>technitium</code> driver instead if you want SpatiumDDI to run
+            the daemon. DNSSEC, forwarders and the native blocklists are
+            agent-managed only for now.
           </div>
         )}
         {cloudDriver && (
@@ -2868,17 +2869,15 @@ function ZoneModalForm({
   const [pickedTtl, setPickedTtl] = useState<string | null>(
     zone ? String(zone.ttl ?? 3600) : null,
   );
-  // The agentless Technitium driver applies only a Primary zone at the
-  // stock TTL (above), so a stored default it would refuse is not offered.
+  // The agentless Technitium driver applies only a Primary zone, so a stored
+  // default zone type it would refuse is not offered.
   const zoneType =
     pickedZoneType ??
     (technitiumApi
       ? "primary"
       : (dnsDefaults?.dns_default_zone_type ?? "primary"));
   const setZoneType = setPickedZoneType;
-  const ttl =
-    pickedTtl ??
-    String(technitiumApi ? 3600 : (dnsDefaults?.dns_default_ttl ?? 3600));
+  const ttl = pickedTtl ?? String(dnsDefaults?.dns_default_ttl ?? 3600);
   const setTtl = setPickedTtl;
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
@@ -2985,7 +2984,7 @@ function ZoneModalForm({
   // On edit only a changed value is held to it (the API's rule too): a zone
   // stored before the check re-sends its value on every save, and an edit to
   // its TTL must still go through. Such a value is flagged, not blocked.
-  const primaryNsErr = technitiumApi ? null : primaryNsError(primaryNs);
+  const primaryNsErr = primaryNsError(primaryNs);
   const primaryNsBlocks =
     primaryNsErr !== null && (!zone || primaryNs !== (zone.primary_ns ?? ""));
 
@@ -3011,7 +3010,6 @@ function ZoneModalForm({
     // #2075 — a Primary NS that is not a host name stops BIND loading the
     // zone; a stored legacy value saved unchanged is let through (flagged).
     if (primaryNsBlocks && primaryNsErr) problems.push(primaryNsErr);
-    // #2073 / #2074 — the hidden field (technitium_api) keeps its default.
     const zoneTtl = parseTtlInput(ttl);
     if (zoneTtl === null || typeof zoneTtl === "string") {
       problems.push(`Default TTL ${zoneTtl ?? "is required"}`);
@@ -3274,62 +3272,50 @@ function ZoneModalForm({
             </select>
           </Field>
         )}
-        {technitiumApi && (
-          <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
-            This group runs the experimental <code>technitium_api</code> driver,
-            which writes only the zone itself: Primary NS, admin email and the
-            default TTL are not sent to the Technitium server, so they are not
-            editable here.
-          </p>
-        )}
-        {!technitiumApi && (
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Primary NS">
-              <input
-                className={inputCls}
-                value={primaryNs}
-                onChange={(e) => setPrimaryNs(e.target.value)}
-                placeholder="ns1.example.com."
-                aria-invalid={primaryNsBlocks || undefined}
-              />
-              {primaryNsErr &&
-                (primaryNsBlocks ? (
-                  <p className="text-xs text-destructive mt-0.5">
-                    {primaryNsErr}
-                  </p>
-                ) : (
-                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
-                    {primaryNsErr}. Stored before this was checked; a BIND9
-                    server serves the zone&apos;s first NS record (or
-                    ns1.&lt;zone&gt;) in its place. Change it to a host name.
-                  </p>
-                ))}
-            </Field>
-            <Field label="Admin Email">
-              <input
-                className={inputCls}
-                value={adminEmail}
-                onChange={(e) => setAdminEmail(e.target.value)}
-                placeholder="hostmaster.example.com."
-              />
-            </Field>
-          </div>
-        )}
         <div className="grid grid-cols-2 gap-3">
-          {!technitiumApi && (
-            <Field label="Default TTL (seconds)">
-              <input
-                type="number"
-                min={0}
-                max={DNS_TTL_MAX}
-                step={1}
-                className={inputCls}
-                value={ttl}
-                onChange={(e) => setTtl(e.target.value)}
-                placeholder="3600"
-              />
-            </Field>
-          )}
+          <Field label="Primary NS">
+            <input
+              className={inputCls}
+              value={primaryNs}
+              onChange={(e) => setPrimaryNs(e.target.value)}
+              placeholder="ns1.example.com."
+              aria-invalid={primaryNsBlocks || undefined}
+            />
+            {primaryNsErr &&
+              (primaryNsBlocks ? (
+                <p className="text-xs text-destructive mt-0.5">
+                  {primaryNsErr}
+                </p>
+              ) : (
+                <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                  {primaryNsErr}. Stored before this was checked; a BIND9 server
+                  serves the zone&apos;s first NS record (or ns1.&lt;zone&gt;)
+                  in its place. Change it to a host name.
+                </p>
+              ))}
+          </Field>
+          <Field label="Admin Email">
+            <input
+              className={inputCls}
+              value={adminEmail}
+              onChange={(e) => setAdminEmail(e.target.value)}
+              placeholder="hostmaster.example.com."
+            />
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Default TTL (seconds)">
+            <input
+              type="number"
+              min={0}
+              max={DNS_TTL_MAX}
+              step={1}
+              className={inputCls}
+              value={ttl}
+              onChange={(e) => setTtl(e.target.value)}
+              placeholder="3600"
+            />
+          </Field>
           <Field label="DNSSEC">
             {zone ? (
               <div className="mt-1 text-xs text-muted-foreground">
@@ -3901,8 +3887,9 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
   // even when the serial it reported matches.
   const inSync = counted.filter(
-    (s) =>
-      s.counted && s.current_serial === state.target_serial && !s.pending_ops,
+    // The server's own verdict, not an equality: Technitium numbers the zone
+    // itself and is in sync at or past our serial (#1779).
+    (s) => s.counted && s.in_sync,
   );
   const tooltip = state.servers
     .map((s) =>
@@ -3915,7 +3902,9 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
             : s.current_serial === null
               ? `${s.server_name}: not reported`
               : `${s.server_name}: serial ${s.current_serial}` +
-                (s.current_serial !== state.target_serial ? " (drift)" : "") +
+                (!s.in_sync && s.current_serial !== state.target_serial
+                  ? " (drift)"
+                  : "") +
                 (s.pending_ops
                   ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
                   : ""),
@@ -12369,7 +12358,7 @@ function ExperimentalBadge() {
   return (
     <span
       className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
-      title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group or zone options."
+      title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group options, no zone transfer / notify / query ACLs."
     >
       Experimental
     </span>

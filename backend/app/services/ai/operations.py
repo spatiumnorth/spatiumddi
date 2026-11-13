@@ -3287,7 +3287,7 @@ class CreateDNSZoneArgs(BaseModel):
 
 async def _effective_zone_ttl(db: AsyncSession, args: CreateDNSZoneArgs, group_id: UUID) -> int:
     """The TTL the zone will carry: the caller's, else the group's default
-    (Settings' Default Zone TTL; the stock value on ``technitium_api``) (#3087)."""
+    (Settings' Default Zone TTL) (#3087)."""
     if args.ttl is not None:
         return args.ttl
     return await default_zone_ttl(db, group_id)
@@ -3308,10 +3308,7 @@ def _technitium_api_zone_arg_conflict(
         return None
     try:
         technitium_api_scope.refuse_non_primary(args.zone_type)
-        technitium_api_scope.refuse_unapplied_zone_changes(
-            {"ttl": ttl, "primary_ns": args.primary_ns, "admin_email": args.admin_email},
-            None,
-        )
+        technitium_api_scope.refuse_unapplied_zone_changes({}, None)
     except HTTPException as exc:
         return str(exc.detail)
     return None
