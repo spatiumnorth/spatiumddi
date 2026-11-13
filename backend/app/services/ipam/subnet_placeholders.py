@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Collection
 from typing import Any
 
 from sqlalchemy import ColumnElement, and_, exists, false, func, or_, select, text
@@ -64,6 +65,30 @@ def boundary_rows(net: IPNetwork, kind: str | None = "unicast") -> list[tuple[st
 GATEWAY_STATUS = "reserved"
 GATEWAY_DESCRIPTION = "Gateway"
 GATEWAY_HOSTNAME = "gateway"
+
+
+async def registry_referenced_ip_ids(
+    db: AsyncSession, ids: Collection[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Which of these address rows a registry record is keyed to (#3958).
+
+    A BACnet / OT device, an E911 location binding or a multicast membership
+    cascades away with its address row, so a Split, Merge or Resize that would
+    delete a default-looking placeholder or Gateway row keeps one of these
+    instead (the same rule ``untouched_gateway_row`` applies for Edit Subnet).
+    """
+    from app.models.bacnet import BACnetDevice  # noqa: PLC0415
+    from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.multicast import MulticastMembership  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
+
+    if not ids:
+        return set()
+    found: set[uuid.UUID] = set()
+    for child in (BACnetDevice, OTDevice, ERLBinding, MulticastMembership):
+        res = await db.execute(select(child.ip_address_id).where(child.ip_address_id.in_(ids)))
+        found |= {i for (i,) in res.all()}
+    return found
 
 
 def untouched_gateway_row() -> ColumnElement[bool]:

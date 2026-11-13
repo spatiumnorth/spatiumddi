@@ -15,6 +15,7 @@ import {
   type SupportBundleDecodeMap,
   type SupportBundlePreview,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Support bundle (#875) — generate a scrubbed diagnostics archive for a
@@ -125,9 +126,9 @@ export function SupportBundleSection() {
       </div>
 
       {error && (
-        <p className="rounded border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+        <FormError className="rounded border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
           {error}
-        </p>
+        </FormError>
       )}
 
       {preview && (
