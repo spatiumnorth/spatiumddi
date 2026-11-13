@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.crypto import encrypt_str
@@ -29,12 +30,29 @@ NAME = "spatiumddi-backup-h-20261112-020000-ab12cd.zip"
 def test_sweep_stamp_survives_a_pool_connection_from_an_earlier_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Never touches the shared app engine: a test-local one-connection pool
+    stands in for ``app.db.AsyncSessionLocal`` for this test only, so the
+    cross-loop connection reuse is real but cannot leak into other tests."""
     import app.db as app_db
 
     db_url = os.environ["DATABASE_URL"]
+    app_name = f"t3939-{uuid.uuid4().hex[:12]}"
+    test_engine = create_async_engine(
+        db_url,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"server_settings": {"application_name": app_name}},
+    )
+    test_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    # The runner resolves the shared pool lazily from app.db.
+    monkeypatch.setattr(app_db, "AsyncSessionLocal", test_factory)
+    monkeypatch.setattr(app_db, "engine", test_engine)
+
+    def _plain_engine():
+        return create_async_engine(db_url, poolclass=NullPool)
 
     async def _make_target() -> object:
-        async with app_db.AsyncSessionLocal() as s:
+        async with test_factory() as s:
             # Wipe leftovers from earlier tests, then add a due target.
             await s.execute(text("DELETE FROM backup_target"))
             t = BackupTarget(
@@ -49,15 +67,12 @@ def test_sweep_stamp_survives_a_pool_connection_from_an_earlier_loop(
             )
             s.add(t)
             await s.commit()
-            loop1_pid[0] = (await s.execute(text("SELECT pg_backend_pid()"))).scalar_one()
             return t.id
 
-    loop1_pid = [0]
-
-    # Loop 1: leaves a connection in the SHARED pool, bound to this loop.
-    target_id = asyncio.run(_make_target())
-
     try:
+        # Loop 1: leaves a connection in the test pool, bound to this loop.
+        target_id = asyncio.run(_make_target())
+
         pid_box: dict[str, int] = {}
 
         class _Driver:
@@ -65,7 +80,7 @@ def test_sweep_stamp_survives_a_pool_connection_from_an_earlier_loop(
                 return None
 
             async def write(self, *, config, filename, archive_bytes) -> None:
-                eng = create_async_engine(db_url, poolclass=NullPool)
+                eng = _plain_engine()
                 try:
                     async with eng.connect() as other:
                         await other.execute(
@@ -88,29 +103,42 @@ def test_sweep_stamp_survives_a_pool_connection_from_an_earlier_loop(
         assert result["fired"] == 1
 
         async def _read():
-            async with app_db.task_session() as s:
-                return (
-                    await s.execute(select(BackupTarget).where(BackupTarget.id == target_id))
-                ).scalar_one()
+            eng = _plain_engine()
+            try:
+                async with eng.connect() as c:
+                    return (
+                        await c.execute(
+                            select(
+                                BackupTarget.last_run_status, BackupTarget.last_run_filename
+                            ).where(BackupTarget.id == target_id)
+                        )
+                    ).one()
+            finally:
+                await eng.dispose()
 
         row = asyncio.run(_read())
         assert row.last_run_status == "success"
         assert row.last_run_filename == NAME
 
     finally:
-        # Leave nothing behind for the next test on this worker/Postgres
-        # (#3939 CI shard 9): the loop-1 pooled connection is bound to a
-        # closed loop and cannot be closed gracefully, so end its backend
-        # server-side and drop the dead pool without touching the loop.
+        # Drop the dead-loop pool without awaiting it, then end every backend
+        # this test opened server-side (filtered by its unique application_name).
+        test_engine.sync_engine.dispose(close=False)
+
         async def _reap() -> None:
-            eng = create_async_engine(db_url, poolclass=NullPool)
+            eng = _plain_engine()
             try:
                 async with eng.connect() as c:
                     await c.execute(text("DELETE FROM backup_target"))
-                    await c.execute(text("SELECT pg_terminate_backend(:p)"), {"p": loop1_pid[0]})
+                    await c.execute(
+                        text(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE application_name = :n AND pid <> pg_backend_pid()"
+                        ),
+                        {"n": app_name},
+                    )
                     await c.commit()
             finally:
                 await eng.dispose()
 
         asyncio.run(_reap())
-        app_db.engine.sync_engine.dispose(close=False)
