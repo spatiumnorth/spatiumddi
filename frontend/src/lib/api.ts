@@ -3091,6 +3091,9 @@ export interface BackupManifestPreviewResponse {
    *  Absent from a server older than #2949. */
   restorable?: boolean;
   restore_refusal?: string | null;
+  /** The database dump is encrypted too (#1362); the same passphrase that
+   *  opens secrets.enc opens it. */
+  archive_encrypted?: boolean;
 }
 
 export const backupApi = {
@@ -3241,6 +3244,8 @@ export interface BackupTarget {
    * healthy.
    */
   write_only: boolean;
+  /** The database dump is encrypted as well as secrets.enc (#1362). */
+  encrypt_archive?: boolean;
   last_run_status: string;
   last_run_at: string | null;
   last_run_filename: string | null;
@@ -3275,6 +3280,7 @@ export interface BackupTargetCreate {
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
   write_only?: boolean;
+  encrypt_archive?: boolean;
 }
 
 export interface BackupTargetUpdate {
@@ -3288,6 +3294,7 @@ export interface BackupTargetUpdate {
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
   write_only?: boolean;
+  encrypt_archive?: boolean;
   drill_enabled?: boolean;
   drill_cron?: string | null;
 }

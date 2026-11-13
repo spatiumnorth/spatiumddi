@@ -57,9 +57,9 @@ CASES = {
         "secrets.enc",
     ),
     "newer_format": (
-        _zip({**_BASE, "format_version": 3, "dump_format": "custom"}, _GOOD),
+        _zip({**_BASE, "format_version": 99, "dump_format": "custom"}, _GOOD),
         False,
-        "unsupported backup format_version: 3",
+        "unsupported backup format_version: 99",
     ),
 }
 

@@ -224,6 +224,9 @@ class BackupTargetCreate(BaseModel):
     retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool = False
+    # Encrypt the database dump as well as secrets.enc (#1362). On for a
+    # new target; rows that pre-date the option keep it off.
+    encrypt_archive: bool = True
 
     @field_validator("kind")
     @classmethod
@@ -255,6 +258,7 @@ class BackupTargetUpdate(BaseModel):
     retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool | None = None
+    encrypt_archive: bool | None = None
     drill_enabled: bool | None = None
     drill_cron: str | None = Field(default=None, max_length=120)
 
@@ -272,6 +276,7 @@ class BackupTargetResponse(BaseModel):
     retention_keep_last_n: int | None
     retention_keep_days: int | None
     write_only: bool
+    encrypt_archive: bool = False
     last_run_status: str
     last_run_at: datetime | None
     last_run_filename: str | None
@@ -317,6 +322,7 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
         retention_keep_last_n=t.retention_keep_last_n,
         retention_keep_days=t.retention_keep_days,
         write_only=t.write_only,
+        encrypt_archive=t.encrypt_archive,
         last_run_status=t.last_run_status,
         last_run_at=t.last_run_at,
         last_run_filename=t.last_run_filename,
@@ -462,6 +468,7 @@ async def create_target(
         retention_keep_last_n=body.retention_keep_last_n,
         retention_keep_days=body.retention_keep_days,
         write_only=write_only,
+        encrypt_archive=body.encrypt_archive,
         next_run_at=next_run,
     )
     db.add(row)
@@ -480,6 +487,7 @@ async def create_target(
                 "enabled": body.enabled,
                 "schedule_cron": body.schedule_cron,
                 "write_only": write_only,
+                "encrypt_archive": body.encrypt_archive,
             },
         )
     )
@@ -635,6 +643,7 @@ async def update_target(
         "retention_keep_last_n",
         "retention_keep_days",
         "drill_enabled",
+        "encrypt_archive",
     ):
         if key in payload:
             # An explicit null on a NOT NULL column means "leave it"

@@ -47,7 +47,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.services.backup.crypto import encrypt_secrets, hint_reveals_passphrase
+from app.services.backup.crypto import (
+    STREAM_MAGIC,
+    DumpStreamEncryptor,
+    decrypt_dump_stream,
+    encrypt_secrets,
+    hint_reveals_passphrase,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -463,6 +469,44 @@ def _scrub_dump_text(dump_text: str) -> str:
     return "\n".join(out)
 
 
+#: ``format_version`` of an archive whose database member is encrypted (#1362).
+ARCHIVE_ENCRYPTED_FORMAT_VERSION = 3
+ARCHIVE_CIPHER = "aes-256-gcm-chunked/pbkdf2-hmac-sha256"
+
+
+def _write_encrypted_member(zf: zipfile.ZipFile, src: Path, member: str, passphrase: str) -> None:
+    """Stream ``src`` into ``zf`` as ``member``, deflated then encrypted a
+    chunk at a time. Stored, not deflated by zip: ciphertext does not
+    compress, the compression happens inside the encrypted stream."""
+    enc = DumpStreamEncryptor(passphrase)
+    info = zipfile.ZipInfo(member, date_time=datetime.now(UTC).timetuple()[:6])
+    info.compress_type = zipfile.ZIP_STORED
+    with zf.open(info, "w", force_zip64=True) as out, src.open("rb") as fh:
+        out.write(enc.header())
+        while chunk := fh.read(1024 * 1024):
+            out.write(enc.write(chunk))
+        out.write(enc.finish())
+
+
+def manifest_encrypted(manifest: dict[str, Any]) -> bool:
+    """True when the archive's database member is encrypted (#1362)."""
+    return isinstance(manifest.get("archive_encryption"), dict)
+
+
+def open_dump_member(manifest: dict[str, Any], db_bytes: bytes, passphrase: str) -> bytes:
+    """The dump bytes a restore or drill replays: ``db_bytes`` as extracted,
+    decrypted when the manifest says the member is encrypted. Raises
+    :class:`~app.services.backup.crypto.BackupCryptoError` for a wrong
+    passphrase or a tampered / truncated member. CPU-bound (PBKDF2 plus the
+    stream), so callers on the event loop run it in a thread."""
+    # The magic is checked too, so a manifest stripped of its flag still
+    # reaches the decryptor (and fails there, cleanly) instead of feeding
+    # ciphertext to pg_restore.
+    if not manifest_encrypted(manifest) and not db_bytes.startswith(STREAM_MAGIC):
+        return db_bytes
+    return decrypt_dump_stream(db_bytes, passphrase=passphrase, max_bytes=_MAX_DUMP_MEMBER_BYTES)
+
+
 async def build_backup_archive(
     db: AsyncSession,
     *,
@@ -471,6 +515,7 @@ async def build_backup_archive(
     exclude_secrets: bool = False,
     run_target_id: str | None = None,
     run_claimed_at: datetime | None = None,
+    encrypt_archive: bool = False,
 ) -> tuple[bytes, str]:
     """Build a complete backup zip in memory and return
     ``(archive_bytes, suggested_filename)``.
@@ -499,6 +544,13 @@ async def build_backup_archive(
     ``run_claimed_at`` is the ``last_run_at`` the claim stamped; the
     restore matches it exactly, so recognising the claim does not
     depend on two clock readings agreeing.
+
+    ``encrypt_archive`` (#1362) encrypts the database dump too, not only
+    ``secrets.enc``: the member keeps its name but holds a chunked
+    AES-256-GCM stream (:class:`~app.services.backup.crypto.DumpStreamEncryptor`)
+    under a key derived from ``passphrase``, the manifest carries
+    ``archive_encryption`` and ``format_version`` is 3 so a build that cannot
+    decrypt it refuses it rather than handing ciphertext to ``pg_restore``.
     """
     if not passphrase:
         raise BackupArchiveError("passphrase is required to build a backup")
@@ -538,7 +590,7 @@ async def build_backup_archive(
         # ``database.dump`` and ``dump_format`` is now declared
         # explicitly. Restore detects + handles both versions —
         # Phase 1 archives stay restorable.
-        "format_version": 2,
+        "format_version": ARCHIVE_ENCRYPTED_FORMAT_VERSION if encrypt_archive else 2,
         # Either ``"plain"`` (Phase 1 / Phase 3 exclude-secrets,
         # ``database.sql`` member) or ``"custom"`` (Phase 2+,
         # ``database.dump`` member). The restore-side
@@ -560,6 +612,11 @@ async def build_backup_archive(
         # auth-provider creds and reset local passwords by hand.
         "secrets_excluded": bool(exclude_secrets),
     }
+    if encrypt_archive:
+        # #1362 — the database member is encrypted (``secrets.enc`` always
+        # is). Advisory for the console's preview; the restore trusts the
+        # authenticated stream header, not this.
+        manifest["archive_encryption"] = {"scope": "whole-archive", "cipher": ARCHIVE_CIPHER}
     if run_target_id is not None:
         # #2097 — which backup target's run wrote this archive. Read
         # back by ``reconcile_restored_run_claims``; absent on a manual
@@ -625,7 +682,10 @@ async def build_backup_archive(
                 "manifest.json",
                 json.dumps(manifest, indent=2, sort_keys=True),
             )
-            zf.write(dump_path, arcname=dump_member)
+            if encrypt_archive:
+                _write_encrypted_member(zf, dump_path, dump_member, passphrase)
+            else:
+                zf.write(dump_path, arcname=dump_member)
             zf.writestr("secrets.enc", secrets_envelope)
             zf.writestr("README.txt", _readme_text(manifest))
         archive_bytes = buf.getvalue()
@@ -633,6 +693,7 @@ async def build_backup_archive(
     logger.info(
         "backup_archive_built",
         bytes=len(archive_bytes),
+        encrypted=encrypt_archive,
         hostname=hostname,
         schema_version=schema_head,
     )
@@ -783,6 +844,9 @@ def manifest_preview_payload(archive_bytes: bytes) -> dict[str, Any]:
         # recorded schema head it cannot migrate forward (#3287).
         "restorable": refusal is None,
         "restore_refusal": refusal,
+        # The database dump is encrypted as well as secrets.enc (#1362); the
+        # restore asks for the same passphrase either way.
+        "archive_encrypted": manifest_encrypted(manifest),
     }
 
 

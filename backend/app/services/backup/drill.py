@@ -62,6 +62,7 @@ from app.services.backup.archive import (
     _pg_env_from_url,
     _pg_subprocess_env,
     extract_archive_members,
+    open_dump_member,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.restore import SUPPORTED_FORMAT_VERSIONS
@@ -1166,6 +1167,18 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
             f"{len(payload)} secret key(s) recovered",
         )
     )
+    try:
+        db_bytes = await asyncio.to_thread(open_dump_member, manifest, db_bytes, passphrase)
+    except BackupCryptoError as exc:
+        assertions.append(
+            Assertion(
+                "archive_readable",
+                FAIL,
+                f"the archive's encrypted database member does not open — a restore "
+                f"from it would be impossible ({exc})",
+            )
+        )
+        return base
 
     # 3. Replay into a throwaway database and assert against it.
     try:

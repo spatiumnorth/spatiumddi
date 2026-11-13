@@ -386,7 +386,7 @@ A single `.zip` per backup, named `spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS
 
 | Member | Role |
 |---|---|
-| `manifest.json` | `app_version`, `schema_version` (alembic head), `hostname`, `created_at`, `dump_format` (`plain` or `custom`), `secret_passphrase_hint` |
+| `manifest.json` | `app_version`, `schema_version` (alembic head), `hostname`, `created_at`, `dump_format` (`plain` or `custom`), `secret_passphrase_hint`, and `archive_encryption` when the database member is encrypted (`format_version` 3; 2 otherwise) |
 | `database.dump` (or `database.sql` for Phase 1 archives) | Full `pg_dump --format=custom` of the SpatiumDDI database |
 | `secrets.enc` | Operator-passphrase-wrapped JSON envelope carrying the source install's `SECRET_KEY` + `CREDENTIAL_ENCRYPTION_KEY` (PBKDF2-HMAC-SHA256 600k → AES-256-GCM) |
 | `README.txt` | Human-readable note covering format, restore steps, version compatibility |
@@ -395,7 +395,9 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 #### What an archive exposes
 
-**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftover until the next release:** one of those was stored in clear until a recent release, and its old column is kept, unread, for one release so a rolling upgrade's old pods keep working. It still holds the pre-upgrade value:
+**Whole-archive encryption (#1362).** A backup target has an *Encrypt the whole archive* option (`encrypt_archive`; **on for a target created now, off for one that existed before it**, so no running schedule changes). With it on, the database dump is deflated and sealed in 1 MiB AES-256-GCM chunks under a key derived from the target's own passphrase (PBKDF2-HMAC-SHA256, 600k iterations, a fresh salt and nonce prefix per archive; the header and a final-chunk flag are authenticated, so a wrong passphrase, a flipped bit, a reordered chunk or a truncated tail is refused with a clear error before anything is replayed). The `database.dump` member keeps its name; its content is ciphertext and the manifest says `archive_encryption`. Restore, the restore preview, selective restore and restore drills all work on an encrypted archive and ask for the same passphrase `secrets.enc` already needs; archives written before the option (or with it off) keep restoring. The manual *Create and download* form takes `encrypt_archive` too (off by default). The pull-only route serves the bytes as stored, so for an encrypted archive that is ciphertext. Changing the option or the passphrase is audited by field name, never the value, and only affects archives written afterwards. The passages below describe an archive **with it off**.
+
+**With encryption off, only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftover until the next release:** one of those was stored in clear until a recent release, and its old column is kept, unread, for one release so a rolling upgrade's old pods keep working. It still holds the pre-upgrade value:
 
 - The group TSIG key (#1364, `dns_server_group.tsig_key_secret`). That key matters: the group's BIND9 servers grant zone transfers and dynamic updates to it from any address. Rotate each group's key once the upgrade has finished (**DNS → server group → Rotate group TSIG key**, or `POST /dns/groups/{id}/group-tsig-key/rotate`) and the leftover copy is a dead secret.
 
@@ -450,8 +452,8 @@ squash.
 **NFS has no authentication, and the form says so.** AUTH_SYS is the only
 security flavour v1 supports: the client asserts a uid and the server believes
 it. A passing connection test therefore says nothing about who *else* on the
-network can read the export, and an archive's database dump is not encrypted
-(see [What an archive exposes](#what-an-archive-exposes)), so an unrestricted
+network can read the export, and an archive's database dump is not encrypted unless
+*Encrypt the whole archive* is on (see [What an archive exposes](#what-an-archive-exposes)), so an unrestricted
 export exposes the contents of every archive on it. Restrict the export to the
 control plane's address on the server side, and set the destination's `uid` / `gid` to an
 identity the export grants write access (with the usual `root_squash` default,
@@ -587,7 +589,8 @@ stable to mount it by, since the kernel device name is reassigned on the next
 plug. An encrypted disk is refused for the same reason as any other filesystem:
 a LUKS container reports as `crypto_LUKS`, and the appliance carries no
 `cryptsetup` to unlock it. So the archives on a removable disk sit there in the
-clear, and an archive's database dump is not encrypted (see
+clear, and an archive's database dump is not encrypted unless
+*Encrypt the whole archive* is on (see
 [What an archive exposes](#what-an-archive-exposes)) — treat the disk as a copy
 of the install: keep it physically secured, and if it has to leave the building,
 use a destination that encrypts at rest instead.
@@ -690,7 +693,7 @@ Three things to know about this pull:
   re-downloads a multi-GB archive every run.
 * **The puller never needs the target passphrase**, and should not have it:
   without it the stored credentials in the archive stay encrypted. The rest of
-  the database dump is readable (see
+  the database dump is readable unless the target encrypts the whole archive (see
   [What an archive exposes](#what-an-archive-exposes)), so protect the token and
   wherever the puller writes the archive as you would the install itself.
 
