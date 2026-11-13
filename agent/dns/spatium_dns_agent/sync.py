@@ -98,8 +98,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # (``periodic_served_serials``) is asked between changes. Named also moves a
 # zone's serial through updates this agent never sent (a third party's RFC
 # 2136 client, a DNSSEC key event on a signed zone); nothing else reports
-# those, and the zone would read in sync at a serial no longer served.
-SERVED_REPORT_SECONDS = 120.0
+# those, and the zone would read in sync at a serial no longer served. A
+# secondary's transfer is the same (#4065): named takes a newer serial, or a
+# first one, with no apply here.
+SERVED_REPORT_SECONDS = 60.0
 
 # #2309 — how often the key directory is re-checked between structural
 # applies, so a zone's key files go when its grace period ends.
