@@ -43,6 +43,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ..blocklist_entries import entry_count, iter_entries
 from ..ingest import read_seen_keys as _read_seen_keys
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
 from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
@@ -144,6 +145,15 @@ logging {{
     category query-errors {{ queries_channel; }};
 """
 
+
+#: ``response-policy`` options, shared by the global and per-view forms.
+#: ``servfail-until-ready yes`` (#4064): a policy zone of hundreds of
+#: thousands of names loads in the background while named is already
+#: answering, so a blocked name resolved for the first 5-11 s after every
+#: start. Until the zones have loaded named SERVFAILs instead of leaking.
+_RPZ_POLICY_OPTIONS = (
+    "break-dnssec yes qname-wait-recurse no servfail-until-ready yes"
+)
 
 # RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
 # category, never to ``queries`` — so without these two lines a blocked
@@ -3229,9 +3239,15 @@ class Bind9Driver(DriverBase):
             # qname first and does not rewrite a failed lookup, so a blocked
             # name whose upstream is dead answered SERVFAIL after ~10 s instead
             # of the policy answer. A blocklist wants the opposite.
+            # servfail-until-ready (#4064): named answers while a large policy
+            # zone is still loading in the background, so for the first
+            # seconds after every start a blocked name resolved normally.
+            # With it, named SERVFAILs until the zones have loaded; a zone
+            # that fails to load counts as settled, so a broken one cannot
+            # keep named from serving.
             response_policy_block = (
                 f"    response-policy {{ {zones_list}; }} "
-                "break-dnssec yes qname-wait-recurse no;\n"
+                f"{_RPZ_POLICY_OPTIONS};\n"
             )
 
         logging_block = _render_logging_block(opts)
@@ -3487,7 +3503,7 @@ class Bind9Driver(DriverBase):
                     )
                     body += (
                         f"response-policy {{ {zlist}; }} "
-                        "break-dnssec yes qname-wait-recurse no;\n"
+                        f"{_RPZ_POLICY_OPTIONS};\n"
                     )
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
@@ -3950,7 +3966,7 @@ class Bind9Driver(DriverBase):
                     zone=bl["rpz_zone_name"],
                     source=tree,
                     via=how,
-                    entries=len(bl.get("entries") or []),
+                    entries=entry_count(bl),
                 )
                 return
         self._write_rpz_zone_file(path, bl)
@@ -4064,7 +4080,7 @@ class Bind9Driver(DriverBase):
         log.info(
             "bind9_rpz_written",
             zone=zname,
-            entries=len(bl.get("entries") or []),
+            entries=entry_count(bl),
             owners=len(seen),
         )
 
@@ -4091,7 +4107,7 @@ class Bind9Driver(DriverBase):
         # the zone must load, since the alternative is enforcing nothing
         # at all. Collisions are logged so the operator can reconcile the
         # lists rather than wonder which one is in effect.
-        for e in bl.get("entries") or []:
+        for e in iter_entries(bl):
             domain = e["domain"].rstrip(".")
             key = domain.lower()
             # An exception emits ``N`` and ``*.N`` as passthru, so a

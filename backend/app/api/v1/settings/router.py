@@ -4062,16 +4062,24 @@ async def test_audit_target(
         "min_severity": None,  # ignore filter on a probe
         "resource_types": None,
     }
+    reasons: list[str] = []
     try:
-        outcome = await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+        outcome = await audit_forward_svc._deliver_to_target(  # noqa: SLF001
+            target_dict, payload, reasons
+        )
     except Exception as exc:  # noqa: BLE001
-        reason = redact(str(exc), url, auth_header, smtp_password)
+        reason = audit_forward_svc._failure_reason(  # noqa: SLF001
+            exc, url, auth_header, smtp_password
+        )
         raise HTTPException(status_code=502, detail=f"delivery failed: {reason}") from exc
     if outcome != audit_forward_svc.DELIVERED:
         # #1577: a filtered target, a misconfigured one, or a rejected
         # webhook used to report "ok" here because delivery was merely
         # attempted.
-        raise HTTPException(status_code=502, detail=f"delivery failed: {outcome}")
+        # #3931: say why, not just the outcome word (already redacted).
+        raise HTTPException(
+            status_code=502, detail=f"delivery failed: {reasons[0] if reasons else outcome}"
+        )
     return {"status": "ok", "target": row.name}
 
 

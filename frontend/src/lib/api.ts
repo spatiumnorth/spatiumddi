@@ -6932,8 +6932,16 @@ export const dnsApi = {
         data,
       )
       .then((r) => r.data),
-  deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
-    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
+  // ``permanent`` is superadmin-only server-side (#4078).
+  deleteRecord: (
+    groupId: string,
+    zoneId: string,
+    recordId: string,
+    opts?: { permanent?: boolean },
+  ) =>
+    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, {
+      params: opts?.permanent ? { permanent: true } : undefined,
+    }),
 
   // Soft-deletes by default (#963) — the whole selection shares one
   // deletion_batch_id, so it restores from Admin → Trash in one action.
