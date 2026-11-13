@@ -471,7 +471,69 @@ async def authenticate_cert(
     return CertAuthPrincipal(appliance=row, scheme=scheme, content_sha256=content_sha256)
 
 
+_REGISTER_PROOF_PREFIX = "spatium-register-v1"
+_REGISTER_PROOF_TTL_SECONDS = 2 * _SKEW_TOLERANCE_SECONDS + 60
+
+
+def register_proof_payload(fingerprint: str, timestamp: str, nonce: str) -> bytes:
+    """The bytes a supervisor signs to show it holds the private key behind
+    the public key it registers with. Must match the supervisor's
+    ``cert_auth.register_proof_payload`` byte for byte."""
+    return "\n".join((_REGISTER_PROOF_PREFIX, fingerprint, timestamp, nonce)).encode("utf-8")
+
+
+class RegisterProofUnavailable(Exception):
+    """The nonce store could not be reached; the caller answers 503."""
+
+
+async def verify_register_proof(
+    pubkey: Ed25519PublicKey,
+    fingerprint: str,
+    timestamp: str,
+    nonce: str,
+    signature_b64: str,
+) -> bool:
+    """True when ``signature_b64`` is the registering key's signature over a
+    fresh timestamp and a nonce not seen before. The nonce is spent here, so a
+    captured registration cannot be sent again. Raises
+    :class:`RegisterProofUnavailable` when the nonce store is unreachable
+    (a registration retries; nothing is lost by failing closed)."""
+    if not _NONCE_RE.match(nonce):
+        return False
+    try:
+        ts = datetime.fromisoformat(timestamp)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        signature = base64.b64decode(signature_b64, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if abs((datetime.now(UTC) - ts).total_seconds()) > _SKEW_TOLERANCE_SECONDS:
+        return False
+    try:
+        pubkey.verify(signature, register_proof_payload(fingerprint, timestamp, nonce))
+    except InvalidSignature:
+        return False
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            return bool(
+                await r.set(
+                    f"appliance_register_nonce:{fingerprint}:{nonce}",
+                    "1",
+                    ex=_REGISTER_PROOF_TTL_SECONDS,
+                    nx=True,
+                )
+            )
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001
+        raise RegisterProofUnavailable(str(exc)[:200]) from exc
+
+
 __all__ = [
+    "RegisterProofUnavailable",
+    "register_proof_payload",
+    "verify_register_proof",
     "SIGNATURE_VERSION",
     "SIGNATURE_VERSIONS_HEADER",
     "CertAuthFailed",
