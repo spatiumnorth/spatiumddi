@@ -976,6 +976,25 @@ render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@
 echo "── CNPG WAL budget (umbrella, #2317)"
 python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster \
     "$OUT/umbrella-ha.yaml" "$OUT/umbrella-posture-ha.yaml" || failures=$((failures + 1))
+# #3932: a session whose client has gone must not outlive it, or its open
+# transaction holds a migration's ALTER for hours. Both Postgres shapes carry
+# the idle-in-transaction timeout and the TCP keepalives, and a CNPG change of
+# these is a reload (they are not restart-only parameters).
+echo "── Postgres drops dead-client sessions: idle_in_transaction_session_timeout + keepalives (#3932)"
+for want in 'idle_in_transaction_session_timeout: 1h' 'tcp_keepalives_idle: "60"' \
+        'tcp_keepalives_interval: "10"' 'tcp_keepalives_count: "6"'; do
+    if ! grep -qF "      $want" "$OUT/umbrella-ha.yaml"; then
+        echo "   FAIL: the CNPG Cluster render lacks: $want" >&2
+        failures=$((failures + 1))
+    fi
+done
+for want in 'idle_in_transaction_session_timeout=1h' 'tcp_keepalives_idle=60' \
+        'tcp_keepalives_interval=10' 'tcp_keepalives_count=6'; do
+    if ! grep -qF -- "- $want" "$OUT/umbrella-defaults.yaml"; then
+        echo "   FAIL: the standalone Postgres render lacks: $want" >&2
+        failures=$((failures + 1))
+    fi
+done
 # Negative controls: PostgreSQL's unbounded default, and a cap the volume
 # cannot hold, must each be refused naming #2317, or the pass above could be
 # reading a render it cannot parse.

@@ -57,3 +57,73 @@ def test_api_records_failed_requests_but_not_conflicts():
     assert a.failures == []
     assert a.call("POST", "/refused") is None
     assert a.failures == ["POST /refused -> 422"]
+
+
+class _SeedRecorder:
+    """Stand-in for ``Api`` that serves canned GETs and records writes."""
+
+    def __init__(self, zones=None) -> None:
+        self.zones = zones or []
+        self.writes: list[tuple[str, str, dict]] = []
+        self.failures: list[str] = []
+
+    def call(self, method, path, **kwargs):
+        if method == "GET" and path.endswith("/dns/groups"):
+            return [{"id": "g1", "name": "default"}]
+        if method == "GET" and path.endswith("/zones"):
+            return self.zones
+        if method == "GET":
+            return []
+        self.writes.append((method, path, kwargs.get("json", {})))
+        return None
+
+
+def test_seed_dns_finds_fully_qualified_zones_and_sends_valid_records():
+    """#3828: zone names come back with a trailing dot; the record block used
+    to be skipped silently, and the SRV payload was the old one."""
+    from app.api.v1.dns.router import RecordCreate
+
+    mod = _load_script()
+    rec = _SeedRecorder(
+        zones=[
+            {"id": "fz", "name": "corp.example.com."},
+            {"id": "rz", "name": "10.in-addr.arpa."},
+        ]
+    )
+    gid, fz_id, rz_id = mod.seed_dns(rec)
+    assert (fz_id, rz_id) == ("fz", "rz")
+    bodies = [b for _, p, b in rec.writes if p.endswith("/zones/fz/records")]
+    assert {b["record_type"] for b in bodies} >= {"A", "MX", "SRV", "TXT"}
+    for body in bodies:
+        RecordCreate(**body)
+
+
+def test_seed_dns_missing_zone_is_a_failure_not_a_silent_skip():
+    mod = _load_script()
+    rec = _SeedRecorder(zones=[])
+    mod.seed_dns(rec)
+    assert rec.failures
+
+
+def test_seeded_dhcp_scope_payload_validates():
+    from app.api.v1.dhcp.scopes import ScopeCreate
+
+    mod = _load_script()
+    rec = _SeedRecorder()
+    mod.seed_dhcp_scope(
+        rec, "00000000-0000-0000-0000-000000000001", [{"id": "s1", "name": "Servers"}]
+    )
+    bodies = [b for m, p, b in rec.writes if p.endswith("/dhcp-scopes")]
+    assert len(bodies) == 1
+    ScopeCreate(**bodies[0])
+    assert "ddns_enabled" not in bodies[0]
+
+
+def test_demo_modules_cover_every_gated_router_the_seeder_posts_to():
+    mod = _load_script()
+    assert {"network.domains", "ipam.nat"} <= set(mod.DEMO_MODULES)
+
+
+def test_demo_data_avoids_common_lan_ranges():
+    _load_script()
+    assert "192.168." not in _SCRIPT.read_text()
