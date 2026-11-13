@@ -65,6 +65,7 @@ from app.services.backup.archive import (
     _pg_subprocess_env,
     build_backup_archive,
     extract_archive_members,
+    open_dump_member,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.legacy_columns import (
@@ -93,7 +94,7 @@ CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
 # version 2 (custom-format dump). Both are accepted at restore;
 # the dispatcher below routes to psql or pg_restore based on the
 # manifest's ``dump_format`` field.
-SUPPORTED_FORMAT_VERSIONS = {1, 2}
+SUPPORTED_FORMAT_VERSIONS = {1, 2, 3}
 
 
 def format_version_refusal(fmt_version: object) -> str | None:
@@ -1217,6 +1218,13 @@ async def _apply_backup_restore_inner(
         secrets_payload = await asyncio.to_thread(
             decrypt_secrets, secrets_enc, passphrase=passphrase
         )
+    except BackupCryptoError as exc:
+        raise BackupRestoreError(str(exc)) from exc
+    # An encrypted archive (#1362): the same passphrase opens the dump. The
+    # secrets check above already proved it, so a failure here is a tampered
+    # or truncated database member, still before anything is deleted.
+    try:
+        db_bytes = await asyncio.to_thread(open_dump_member, manifest, db_bytes, passphrase)
     except BackupCryptoError as exc:
         raise BackupRestoreError(str(exc)) from exc
 
