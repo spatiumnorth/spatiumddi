@@ -1155,7 +1155,15 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     __tablename__ = "dns_zone"
     __table_args__ = (
-        UniqueConstraint("group_id", "view_id", "name", name="uq_dns_zone_group_view_name"),
+        # Partial: a trashed zone must not hold its name in a view (#3824).
+        Index(
+            "uq_dns_zone_group_view_name",
+            "group_id",
+            "view_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dns_zone_name", "name"),
     )
 
