@@ -3095,6 +3095,17 @@ class Bind9Driver(DriverBase):
         # (#2835, D5): lines collected here, kept as ONE bytes object below.
         self._apex_lines: list[str] = []
         self._apex_overlay: dict[str, dict[str, Any]] = {}
+        # #4065 — the secondary / stub zones named holds transferred copies of:
+        # what ``periodic_served_serials`` re-reads, since a transfer moves
+        # their serial with no render and no change to the bundle.
+        self._rendered_secondaries: list[str] = sorted(
+            {
+                str(z.get("name") or "").rstrip(".").lower()
+                for z in (bundle.get("zones") or [])
+                if z.get("type", "primary") in {"secondary", "slave", "stub"}
+                and str(z.get("name") or "").rstrip(".")
+            }
+        )
         try:
             self._render(bundle)
             # #2223 — state that outlives the poll must not be a web of small
@@ -6007,21 +6018,26 @@ class Bind9Driver(DriverBase):
     def periodic_served_serials(self) -> dict[str, int]:
         """Zone name (lowercase, no trailing dot) → the serial named serves,
         for every primary zone the last render wrote in a group without
-        views (#2835); the sync loop posts the ones that changed.
+        views (#2835) and every secondary / stub zone in any group (#4065);
+        the sync loop posts the ones that changed.
 
         Named moves a zone's serial through updates the agent never sent: a
-        third-party RFC 2136 client's, a DNSSEC key event on a signed zone.
-        A zone that cannot be read is left out. A group with views reports as
-        it always did, from its renders, and is not read here.
+        third-party RFC 2136 client's, a DNSSEC key event on a signed zone, a
+        transfer from the primary into a secondary. A zone that cannot be
+        read (a secondary not transferred yet) is left out. A primary zone of
+        a group with views reports as it always did, from its renders, and is
+        not read here. The reads run on the bounded apply pool.
         """
-        if getattr(self, "_rendered_has_views", True):
-            return {}
-        blob: bytes = getattr(self, "_apex_blob", b"")
-        keys = [
-            line.split(b"\t", 1)[0].decode()
-            for line in blob.split(b"\n")
-            if b"\t" in line
-        ]
+        keys: list[str] = []
+        if not getattr(self, "_rendered_has_views", True):
+            blob: bytes = getattr(self, "_apex_blob", b"")
+            keys = [
+                line.split(b"\t", 1)[0].decode()
+                for line in blob.split(b"\n")
+                if b"\t" in line
+            ]
+        have = set(keys)
+        keys += [k for k in getattr(self, "_rendered_secondaries", []) if k not in have]
         served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
         return {k: v for k, v in zip(keys, served) if v is not None}
 
