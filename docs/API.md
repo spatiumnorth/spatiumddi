@@ -601,8 +601,13 @@ in the browser or via query params on the specific endpoint.
 `GET /api/v1/ipam/subnets/{id}/addresses` stays backward-compatible
 (still a bare `list[IPAddressResponse]`) but now accepts optional
 `q` / `hostname` / `mac` / `sort` / `order` / `limit` / `offset`, and
-sets an `X-Total-Count` response header (CORS-exposed) when the result
-is windowed. For **cross-subnet** address queries use the envelope
+always sets an `X-Total-Count` response header (CORS-exposed) with the
+number of matching rows before the window. **Capped (#1256):** a call
+with no `limit` returns at most 10,000 rows, and `limit` itself may not
+exceed 10,000 (422). When the cap cuts a list short the response carries
+`X-Result-Truncated: true` and a `Warning: 299` header; page with
+`limit` / `offset` until `offset + len(rows) >= X-Total-Count`. Clients
+that read the whole list with no parameters must page. For **cross-subnet** address queries use the envelope
 endpoints `GET /api/v1/ipam/addresses/search` (paginated, joined
 subnet/space context) and `GET /api/v1/ipam/addresses/search/ids`
 (a capped id list for select-all-matches). Both are permission-scoped

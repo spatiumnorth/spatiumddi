@@ -1019,6 +1019,9 @@ export interface AddressSearchIdsResponse {
   capped: boolean;
 }
 
+/** Page size ``ipamApi.listAddresses`` reads a whole subnet in (#1256). */
+export const ADDRESS_PAGE_SIZE = 1000;
+
 /** Optional query params for the per-subnet address list + the
  *  cross-subnet search (issue #517 / #519 / #520). All fields are
  *  optional; an empty object reproduces the legacy full-list behavior. */
@@ -1949,12 +1952,33 @@ export const ipamApi = {
       )
       .then((r) => r.data),
 
-  listAddresses: (subnetId: string, params?: AddressQueryParams) =>
-    api
-      .get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`, {
-        params,
-      })
-      .then((r) => r.data),
+  /** A subnet's addresses. With an explicit ``limit`` this is ONE request
+   *  (the caller is windowing). Without one it reads the whole match set in
+   *  ``ADDRESS_PAGE_SIZE`` pages, because the server caps an unwindowed call
+   *  (#1256) — a dialog that needs only a few rows should say so with
+   *  ``status_filter`` / ``limit`` rather than load them all. */
+  listAddresses: async (
+    subnetId: string,
+    params?: AddressQueryParams,
+  ): Promise<IPAddress[]> => {
+    const url = `/ipam/subnets/${subnetId}/addresses`;
+    if (params?.limit !== undefined) {
+      return (await api.get<IPAddress[]>(url, { params })).data;
+    }
+    const rows: IPAddress[] = [];
+    for (;;) {
+      const r = await api.get<IPAddress[]>(url, {
+        params: { ...params, limit: ADDRESS_PAGE_SIZE, offset: rows.length },
+      });
+      rows.push(...r.data);
+      const total = Number(r.headers?.["x-total-count"] ?? NaN);
+      if (
+        r.data.length < ADDRESS_PAGE_SIZE ||
+        (Number.isFinite(total) && rows.length >= total)
+      )
+        return rows;
+    }
+  },
   /** Cross-subnet IP search (issue #520). Results are permission-scoped
    *  server-side — only IPs in subnets the caller can read come back. */
   searchAddresses: (params: AddressSearchParams) =>
