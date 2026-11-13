@@ -418,6 +418,9 @@ export interface FreeCidrRange {
   size: number;
   size_exact?: string;
   prefix_len: number;
+  /** Non-zero only on the last range of a capped answer: free ranges left out
+   *  past it (#3848). */
+  more_after?: number;
 }
 
 export interface PlanRequestItem {
@@ -1548,6 +1551,7 @@ export interface TemplateReapplyAllResponse {
   instances_processed: number;
   instances_skipped: number;
   cap_reached: boolean;
+  skipped: { target_id: string; network: string; reason: string }[];
 }
 
 export const ipamApi = {
@@ -1613,7 +1617,9 @@ export const ipamApi = {
       .then((r) => r.data),
   blockFreeSpace: (blockId: string) =>
     api
-      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
+      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`, {
+        params: { limit: 2000 },
+      })
       .then((r) => r.data),
   blockAggregationSuggestions: (
     blockId: string,
@@ -4508,7 +4514,7 @@ export const settingsApi = {
     api
       .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
       .then((r) => r.data),
-  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+  updateAuditTarget: (id: string, body: Partial<AuditForwardTargetWrite>) =>
     api
       .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
       .then((r) => r.data),
@@ -4529,7 +4535,7 @@ export const settingsApi = {
     api
       .post<InfluxDBTarget>("/settings/influxdb-targets", body)
       .then((r) => r.data),
-  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+  updateInfluxTarget: (id: string, body: Partial<InfluxDBTargetWrite>) =>
     api
       .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
       .then((r) => r.data),
@@ -12081,6 +12087,14 @@ export interface ProvisioningRequestListParams {
   offset?: number;
 }
 
+// What approving a pending request would do now, re-previewed server-side (#3934).
+export interface RequestCurrentPreview {
+  preview_text: string;
+  ok: boolean;
+  detail: string | null;
+  changed: boolean;
+}
+
 export interface SubmitRequestBody {
   kind: RequestKindId;
   args: Record<string, unknown>;
@@ -12113,6 +12127,20 @@ export const requestsApi = {
       .then((r) => r.data),
   list: (params: ProvisioningRequestListParams = {}) =>
     api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // page can say how many it did not draw (#3937).
+  listPage: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
+  currentPreview: (id: string) =>
+    api
+      .get<RequestCurrentPreview>(`/requests/${id}/current-preview`)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
   submit: (body: SubmitRequestBody) =>

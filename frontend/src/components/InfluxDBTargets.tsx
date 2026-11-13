@@ -21,6 +21,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { errMsg } from "@/pages/dhcp/_shared";
@@ -29,7 +31,9 @@ import {
   type InfluxDBTarget,
   type InfluxDBTargetWrite,
   type InfluxDBVersion,
+  formatApiError,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50";
@@ -131,9 +135,18 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
     Record<string, { status: "ok" | "error"; msg: string } | undefined>
   >({});
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: (id: string) => settingsApi.deleteInfluxTarget(id),
     onSuccess: () => {
+      setDeleteError(null);
+      qc.invalidateQueries({ queryKey: ["influxdb-targets"] });
+      setConfirmDelete(null);
+    },
+    // A refused delete (403 / 404 / 409) says why and re-reads the list, so
+    // a row already deleted elsewhere leaves it (#3822).
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({ queryKey: ["influxdb-targets"] });
       setConfirmDelete(null);
     },
@@ -180,6 +193,15 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
           </button>
         )}
       </div>
+
+      {deleteError && (
+        <div
+          role="alert"
+          className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400"
+        >
+          {deleteError}
+        </div>
+      )}
 
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[860px] text-xs">
@@ -355,18 +377,16 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
         </table>
       </div>
 
-      {editing && (
+      {editing?.mode === "create" && (
         <InfluxTargetModal
-          initial={
-            editing.mode === "create" ? EMPTY : targetToBody(editing.row)
-          }
-          existingId={editing.mode === "edit" ? editing.row.id : undefined}
-          passwordSet={
-            editing.mode === "edit" ? editing.row.password_set : false
-          }
-          tokenSet={editing.mode === "edit" ? editing.row.token_set : false}
+          initial={EMPTY}
+          passwordSet={false}
+          tokenSet={false}
           onClose={() => setEditing(null)}
         />
+      )}
+      {editing?.mode === "edit" && (
+        <EditInfluxTarget row={editing.row} onClose={() => setEditing(null)} />
       )}
 
       {confirmDelete && (
@@ -399,6 +419,41 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
   );
 }
 
+// Edit reads the target when it opens (#3926): the row the list holds can be
+// 30 s old, and the form is seeded once. The Save then sends only what the
+// operator changed against what was read.
+function EditInfluxTarget({
+  row,
+  onClose,
+}: {
+  row: InfluxDBTarget;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<InfluxDBTarget>(row, () =>
+    refetchRow<InfluxDBTarget>(qc, [["influxdb-targets"]], row.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit InfluxDB Target"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return (
+    <InfluxTargetModal
+      initial={targetToBody(fresh.row)}
+      existingId={fresh.row.id}
+      passwordSet={fresh.row.password_set}
+      tokenSet={fresh.row.token_set}
+      onClose={onClose}
+    />
+  );
+}
+
 function InfluxTargetModal({
   initial,
   existingId,
@@ -422,12 +477,18 @@ function InfluxTargetModal({
 
   const saveMut = useMutation({
     mutationFn: async () => {
-      const body: InfluxDBTargetWrite = { ...form };
+      // Edit sends only what the operator changed against what the dialog
+      // read when it opened (#3926), so a field another client set since is
+      // not put back. Create sends the whole form.
+      const { password, token, ...rest } = form;
+      const body: Partial<InfluxDBTargetWrite> = existingId
+        ? changedFields(initial as unknown as Record<string, unknown>, rest)
+        : { ...rest };
       // A blank secret field (never touched, or typed in and cleared) keeps
       // the stored secret; the server reads an absent key and "" the same
       // way. Only the explicit checkbox removes one.
-      if (!body.password) delete body.password;
-      if (!body.token) delete body.token;
+      if (password) body.password = password;
+      if (token) body.token = token;
       // The checkbox disables its field, so what it shows is what is sent.
       if (clearPassword) {
         delete body.password;
@@ -437,8 +498,9 @@ function InfluxTargetModal({
         delete body.token;
         body.clear_token = true;
       }
+      if (existingId && Object.keys(body).length === 0) return null;
       if (existingId) return settingsApi.updateInfluxTarget(existingId, body);
-      return settingsApi.createInfluxTarget(body);
+      return settingsApi.createInfluxTarget(body as InfluxDBTargetWrite);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["influxdb-targets"] });
@@ -460,9 +522,9 @@ function InfluxTargetModal({
     >
       <div className="space-y-3">
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+          <FormError className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

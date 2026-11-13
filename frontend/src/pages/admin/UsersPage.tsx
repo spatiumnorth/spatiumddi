@@ -29,6 +29,7 @@ import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { stepUpBody } from "@/lib/stepup";
 import { parsePasswordError } from "@/lib/password-policy";
+import { FormError } from "@/components/ui/form-error";
 
 /** A refused user dialog says what is wrong in words (#2435, #3040). */
 const userDialogError = formatDialogError;
@@ -212,7 +213,9 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <PolicyErrorList errors={policyErrors} />
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -334,7 +337,9 @@ function EditUserModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -432,7 +437,9 @@ function ProviderLink({ user }: { user: AppUser }) {
           Linked. The next sign-in as {user.username} claims the account.
         </p>
       )}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && (
+        <FormError className="text-xs text-destructive">{error}</FormError>
+      )}
     </div>
   );
 }
@@ -510,7 +517,9 @@ function ResetPasswordModal({
             onTotp={setStepTotp}
           />
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <PolicyErrorList errors={policyErrors} />
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -576,9 +585,9 @@ function DeleteUserModal({
           cannot be undone.
         </p>
         {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(mutation.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button
