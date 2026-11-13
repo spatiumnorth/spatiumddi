@@ -15,6 +15,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { cascadeList } from "@/lib/delete-cascade";
 import { ListReadError } from "@/components/ui/list-read-error";
 
 const TYPE_LABELS: Record<TrashEntryType, string> = {
@@ -291,7 +292,7 @@ function ConfirmRestoreModal({
 function purgeScope(entry: TrashEntry): string {
   switch (entry.type) {
     case "subnet":
-      return ` Its DHCP scopes (with their pools and static assignments), its addresses, the DNS records published for them, its address sets and its OT zones are removed with it. It cannot be purged while an E911 location binding names it or one of its addresses: remove the binding first.`;
+      return ` Its ${cascadeList("subnet")} are removed with it. It cannot be purged while an E911 location binding names it or one of its addresses: remove the binding first.`;
     case "dns_zone":
       return ` All of its DNS records, its DNS pools, its dynamic update ACLs, its DNSSEC keys and its ACME DNS-01 accounts are removed with it. An auto-created reverse zone that still holds another trashed subnet's records cannot be purged on its own: purge those subnets first, or purge or restore the subnet the zone was deleted with.`;
     case "dhcp_scope":
@@ -331,9 +332,9 @@ function ConfirmPermanentDeleteModal({
           <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
           {TYPE_LABELS[entry.type]}).
           {entry.type === "ip_block" || entry.type === "ip_space"
-            ? ` The subnets and blocks in the Trash under it, with their addresses, DHCP scopes and DNS records, are removed with it.${
+            ? ` The subnets and blocks in the Trash under it are removed with it, and so is everything on those subnets: ${cascadeList("subnet")}.${
                 entry.type === "ip_space"
-                  ? " So are its subnet plans, VLAN mappings and AV reserved ranges."
+                  ? ` So are its ${cascadeList("ip_space")}.`
                   : ""
               }`
             : ""}
