@@ -43,6 +43,27 @@ class WinRMCommandTooLong(RuntimeError):
     """
 
 
+# Every character PowerShell's tokenizer treats as a single quote. A
+# single-quoted literal ends at any of them, and a quote is written inside
+# the literal by doubling the same character, so each must be doubled.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+_PS_SINGLE_QUOTE_TABLE = {ord(c): c * 2 for c in _PS_SINGLE_QUOTES}
+
+
+def ps_single_quote_escape(value: str | None) -> str:
+    """Escape ``value`` for the inside of a PowerShell single-quoted literal.
+
+    The one definition of this rule: every driver, and the runbook text,
+    goes through it (a sweep test fails on a private copy).
+    """
+    return (value or "").translate(_PS_SINGLE_QUOTE_TABLE)
+
+
+def ps_single_quote(value: str | None) -> str:
+    """Return ``value`` as a complete PowerShell single-quoted literal."""
+    return "'" + ps_single_quote_escape(value) + "'"
+
+
 def encoded_command_len(script: str) -> int:
     """Length of the base64 ``-EncodedCommand`` payload pywinrm would
     send for ``script`` (UTF-16-LE → base64). Dispatchers use this to

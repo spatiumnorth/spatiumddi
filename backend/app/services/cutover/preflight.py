@@ -51,6 +51,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.drivers._winrm import ps_single_quote_escape
 from app.drivers.dns import is_agentless
 from app.models.auth import User
 from app.models.cutover import CutoverItem
@@ -230,12 +231,10 @@ def windows_ttl_powershell(
     run-it-on-the-box form.
     """
     label = zone_name.strip().rstrip(".")
-    escaped = label.replace("'", "''")
+    escaped = ps_single_quote_escape(label)
     where = "" if computer_name is None else " -ComputerName $Server"
     server_line = (
-        ""
-        if computer_name is None
-        else f"$Server = '{computer_name.replace(chr(39), chr(39) * 2)}'\n"
+        "" if computer_name is None else f"$Server = '{ps_single_quote_escape(computer_name)}'\n"
     )
     ran_on = (
         f"# Run on the Windows DNS server that is still authoritative for {label},"

@@ -30,6 +30,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
+from app.drivers._winrm import ps_single_quote
 from app.models.cutover import CutoverItem, CutoverPlan
 from app.services.cutover.canonical import ParityReport
 from app.services.cutover.preflight import windows_ttl_powershell
@@ -347,14 +348,14 @@ def _ps_disable_scavenging(host: str, zone: str) -> list[str]:
         "# stop refreshing and begins deleting them — during a parallel run that",
         "# silently empties the zone you are still falling back to. Turn it off",
         "# BEFORE the parallel run starts, not after.",
-        f"$Server = '{host}'",
+        f"$Server = {ps_single_quote(host)}",
         "",
         "Set-DnsServerScavenging -ComputerName $Server -ScavengingState $false -ApplyOnAllZones",
-        f"Set-DnsServerZoneAging -ComputerName $Server -Name '{zone}' -Aging $false",
+        f"Set-DnsServerZoneAging -ComputerName $Server -Name {ps_single_quote(zone)} -Aging $false",
         "",
         "# Verify",
         "Get-DnsServerScavenging -ComputerName $Server",
-        f"Get-DnsServerZoneAging -ComputerName $Server -Name '{zone}'",
+        f"Get-DnsServerZoneAging -ComputerName $Server -Name {ps_single_quote(zone)}",
         "```",
         "",
     ]
@@ -366,8 +367,8 @@ def _ps_scope_state(host: str, scope_id: str, *, active: bool) -> list[str]:
         "```powershell",
         "# Manual equivalent of what SpatiumDDI does for you. The Windows enum value",
         "# is 'InActive' — one word, capital A.",
-        f"Set-DhcpServerv4Scope -ComputerName '{host}' -ScopeId {scope_id} -State {state}",
-        f"Get-DhcpServerv4Scope -ComputerName '{host}' -ScopeId {scope_id} |",
+        f"Set-DhcpServerv4Scope -ComputerName {ps_single_quote(host)} -ScopeId {ps_single_quote(scope_id)} -State {state}",
+        f"Get-DhcpServerv4Scope -ComputerName {ps_single_quote(host)} -ScopeId {ps_single_quote(scope_id)} |",
         "    Select-Object ScopeId, Name, State, LeaseDuration",
         "```",
         "",
@@ -384,7 +385,7 @@ def _ps_deauthorize_dhcp(host: str) -> list[str]:
         "",
         "Get-DhcpServerInDC      # what AD authorizes today — note the exact DnsName/IPAddress",
         "",
-        f"Remove-DhcpServerInDC -DnsName '{host}' -IPAddress '<the IP listed above>'",
+        f"Remove-DhcpServerInDC -DnsName {ps_single_quote(host)} -IPAddress '<the IP listed above>'",
         "",
         "Get-DhcpServerInDC      # confirm it is gone",
         "```",
