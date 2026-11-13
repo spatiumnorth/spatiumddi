@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,6 +10,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import all models so Alembic can detect them for autogenerate
+from app.core import migrate_guard
 from app.core.schema_check import explain_unknown_revision
 from app.models import Base  # noqa: F401 — registers all mapped classes
 
@@ -94,15 +96,80 @@ def run_migrations_offline() -> None:
         _run_migrations()
 
 
+def _guard_enabled() -> bool:
+    """The lock guard (#3932) belongs to ``upgrade`` only.
+
+    ``alembic current`` (the ``wait-for-migrate`` init containers) and
+    ``stamp`` / ``downgrade`` must never end another session. A programmatic
+    ``command.upgrade`` has no ``cmd_opts`` and gets the guard.
+    """
+    opts = getattr(config, "cmd_opts", None)
+    cmd = getattr(opts, "cmd", None)
+    if not cmd:
+        return True
+    return getattr(cmd[0], "__name__", "") == "upgrade"
+
+
 def do_run_migrations(connection: Connection) -> None:
+    guard = _guard_enabled()
+    if guard:
+        # #3932 — a session left idle in transaction by a dead client held
+        # this migration's ALTER for 2 h+. Bound every lock wait so the
+        # revision leaves the lock queue (and stops stalling every query
+        # queued behind it) instead of waiting silently.
+        migrate_guard.apply_lock_timeout(connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
         transaction_per_migration=TRANSACTION_PER_MIGRATION,
     )
-    with context.begin_transaction():
-        _run_migrations()
+    retries = migrate_guard.lock_retries() if guard else 0
+    attempt = 0
+    watcher = None
+    if guard:
+        # Read pg_blocking_pids of this backend while it waits (#3932): the
+        # wait is over when the timeout fires, so it cannot be read then.
+        pid = connection.exec_driver_sql("SELECT pg_backend_pid()").scalar()
+        connection.commit()
+        watcher = migrate_guard.BlockerWatcher(
+            migrate_guard.asyncpg_dsn(config.get_main_option("sqlalchemy.url") or ""),
+            int(pid),
+            interval=max(0.2, min(2.0, migrate_guard.lock_timeout_seconds() / 4)),
+        )
+        watcher.start()
+    try:
+        _retry_loop(connection, guard, retries, attempt, watcher)
+    finally:
+        if watcher is not None:
+            watcher.stop()
+
+
+def _retry_loop(connection: Connection, guard: bool, retries, attempt: int, watcher) -> None:
+    while True:
+        try:
+            with context.begin_transaction():
+                _run_migrations()
+            return
+        except Exception as exc:  # noqa: BLE001 — re-raised unless a lock timeout
+            if not (guard and migrate_guard.is_lock_timeout(exc)):
+                raise
+            if retries is not None and attempt >= retries:
+                raise
+            attempt += 1
+            # Each revision commits on its own, so the retry resumes at the
+            # revision that was waiting (alembic re-reads alembic_version).
+            if connection.in_transaction():
+                connection.rollback()
+            blockers = watcher.take() if watcher is not None else []
+            migrate_guard.log_blockers(blockers, attempt=attempt, retries=retries)
+            # Only now, with a wait that has actually timed out, end the
+            # abandoned sessions the migration was seen waiting on; a
+            # legitimate long holder (a backup's pg_dump is active, not idle)
+            # and any session that blocks nothing are left alone, and the
+            # retries (unlimited by default) wait the holder out.
+            migrate_guard.terminate_stale_idle_sessions(connection, [b["pid"] for b in blockers])
+            time.sleep(migrate_guard.backoff_seconds(attempt))
 
 
 async def run_async_migrations() -> None:

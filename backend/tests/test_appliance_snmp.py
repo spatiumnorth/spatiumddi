@@ -63,8 +63,26 @@ def test_v2c_renders_rocommunity_for_each_source() -> None:
     # the line literally, so quotes would reach the NMS.
     assert "sysContact     ops@example.com" in text
     assert "sysLocation    Datacenter A, Rack 12" in text
-    # Standard agent listen line
-    assert "agentAddress udp:161,udp6:[::1]:161" in text
+    # An IPv6 source is listed, so snmpd must listen for IPv6 beyond ::1 (#3813)
+    assert "agentAddress udp:161,udp6:161\n" in text
+    assert "udp6:[::1]" not in text
+
+
+def test_ipv4_only_sources_keep_ipv6_on_loopback() -> None:
+    s = PlatformSettings()
+    s.snmp_enabled = True
+    s.snmp_version = "v2c"
+    s.snmp_community_encrypted = encrypt_str("s3cret")
+    s.snmp_allowed_sources = ["10.0.0.0/8"]
+    assert "agentAddress udp:161,udp6:[::1]:161" in render_snmpd_conf(s)
+
+
+def test_empty_sources_listen_on_all_ipv6() -> None:
+    s = PlatformSettings()
+    s.snmp_enabled = True
+    s.snmp_version = "v2c"
+    s.snmp_allowed_sources = []
+    assert "agentAddress udp:161,udp6:161\n" in render_snmpd_conf(s)
 
 
 def test_renders_agentx_master_for_subagents() -> None:
