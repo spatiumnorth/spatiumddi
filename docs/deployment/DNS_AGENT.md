@@ -203,6 +203,37 @@ Three channels:
 **Why not WebSocket / SSE?**
 - We considered it. Long-poll is simpler, survives hostile proxies, does not need sticky-session affinity on a multi-replica API. We can upgrade to SSE in a later phase without changing the agent contract (long-poll remains a compatible fallback).
 
+### Blocklist entries in the bundle — packed runs (#4040)
+
+A blocklist's `entries` list used to hold one JSON object per entry (~108
+bytes each): 69 MB for AdGuard + OISD + Hagezi, which the agent parsed whole
+and kept twice on disk (`current.json`, `previous.json`). An agent that sends
+`packed-blocklists` in its `X-Spatium-Agent-Features` header (register and
+every heartbeat, recorded as `dns_server.agent_renders_packed_blocklists`) is
+sent each run of **consecutive** entries that share every field but the
+domain as one element:
+
+```json
+{"packed": {"action": "block", "block_mode": "nxdomain", "target": null,
+            "is_wildcard": true},
+ "count": 100000, "domains_gz": "<base64 of gzip of the domains, one per line>"}
+```
+
+Runs are never regrouped, because the renderer keeps the first writer of an
+owner name (#878) and a reordered list would render a different zone. An
+entry a run cannot carry (a `target`, a newline in the name, a run under 32)
+stays an object, in place; a run is cut at 100,000 domains. The agent expands
+runs a line at a time (`blocklist_entries.iter_entries`), and the zone it
+writes is byte-identical to the per-entry one: `rpz_sha256`, and the SOA serial
+derived from it, are computed over the per-entry form in both shapes, so a
+server whose agent starts reading packed entries keeps its zone files. The
+bundle ETag is over the bundle as sent, so it differs between the two shapes
+and moves with every entry in either. An agent that has not advertised the
+feature (an older release, or one rolled back, which re-renders the bundle on
+its next heartbeat) is sent the per-entry shape. The cache holds the packed
+bundle as received, so a restart with the control plane down renders from it
+alone. Measured on three catalogue lists: 69 MB down to the figures in the PR.
+
 ### Stored bundles — rendered once, served as bytes (#1111)
 
 The bundle the long-poll hands out is **not assembled in the request**. It
@@ -719,6 +750,12 @@ heartbeat body is strict and an agent can be upgraded before its control plane.
 - `soa-timers`: the BIND9 driver writes each zone's own refresh / retry /
   expire / minimum into its SOA. Agents before #1171 send no header and write
   `3600 600 86400 300` for every zone.
+- `served-serials` (#3940): the BIND9 driver reports a secondary / stub zone's
+  serial as named serves it, and nothing for a zone named holds no copy of,
+  instead of the bundle's 0. Stored as `dns_server.agent_reports_served_serials`.
+  The control plane reads a secondary at a non-zero serial as in sync and 0
+  as not synced for every BIND9 agent: an older agent's start-up report also
+  reads each zone from named, and its 0 means "not reported".
 - Register and heartbeat store it as `dns_server.agent_renders_soa_timers`.
   A group's bundles carry each zone's own timers only while every BIND9 server
   of the group (run by an agent, enabled, approved) says `soa-timers`

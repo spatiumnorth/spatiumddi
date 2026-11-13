@@ -23,8 +23,14 @@ Policy:
   only the parent's network address to go on, so they follow the first child
   and the preview says so.
 
+* E911 location bindings keyed to the subnet (#3899): a split keeps the binding
+  on the first child and copies it onto every other, since every device in the
+  parent keeps its location; a merge keeps one binding when the sources agree
+  on the location and refuses when they name different ones. Bindings on
+  address rows travel with the rows.
+
 Not handled (a reconciler / ingest owns them): PAN-OS and BGP looking-glass
-subnet matches, which are re-derived. E911 bindings are #3899.
+subnet matches, which are re-derived.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from app.models.bacnet import BACnetDevice
 from app.models.circuit import Circuit
 from app.models.dicom import DICOMApplicationEntity
 from app.models.dns import DNSZone
+from app.models.e911 import ERLBinding
 from app.models.ipam import NATMapping
 from app.models.ot import OTZone
 from app.models.overlay import OverlaySite
@@ -64,6 +71,7 @@ LINKS: tuple[tuple[str, Any, str], ...] = (
 class Dependents:
     address_sets: list[AddressSet] = field(default_factory=list)
     ot_zones: list[OTZone] = field(default_factory=list)
+    e911_bindings: list[ERLBinding] = field(default_factory=list)
     links: dict[str, int] = field(default_factory=dict)
     # Grants (role permissions, API-token grants, live time-bound grants) that
     # name the subnet(s) by id, keyed by resource_type.
@@ -79,6 +87,11 @@ async def load_dependents(db: AsyncSession, subnet_ids: list[uuid.UUID]) -> Depe
     )
     out.ot_zones = list(
         (await db.execute(select(OTZone).where(OTZone.subnet_id.in_(subnet_ids)))).scalars().all()
+    )
+    out.e911_bindings = list(
+        (await db.execute(select(ERLBinding).where(ERLBinding.subnet_id.in_(subnet_ids))))
+        .scalars()
+        .all()
     )
     out.subnet_grants = await count_grants(db, "subnet", [str(i) for i in subnet_ids])
     for label, model, col in LINKS:
@@ -238,6 +251,11 @@ def split_warnings(dep: Dependents, child_nets: list[Any]) -> list[str]:
             "The parent's OT zone (Purdue level and cell) is kept on the first child "
             "and copied onto every other child."
         )
+    if dep.e911_bindings:
+        out.append(
+            "The parent's E911 location binding is kept on the first child and copied "
+            "onto every other child, so devices there keep their dispatchable location."
+        )
     if dep.subnet_grants:
         out.append(
             f"{dep.subnet_grants} permission grant(s) name the parent subnet; they are "
@@ -284,6 +302,18 @@ async def carry_for_split(
             db.add(copy)
             await db.flush()
             set_copies.setdefault(str(aset.id), []).append(str(copy.id))
+    for binding in dep.e911_bindings:
+        for child in children[1:]:
+            db.add(
+                ERLBinding(
+                    erl_id=binding.erl_id,
+                    rule_kind=binding.rule_kind,
+                    subnet_id=child.id,
+                    is_active=binding.is_active,
+                    notes=binding.notes,
+                )
+            )
+        binding.subnet_id = children[0].id
     for zone in dep.ot_zones:
         for child in children[1:]:
             db.add(
@@ -340,6 +370,16 @@ def merge_conflicts(dep: Dependents) -> list[tuple[str, str]]:
                 "Re-zone them to one level first.",
             )
         )
+    erls = {b.erl_id for b in dep.e911_bindings}
+    if len(erls) > 1:
+        out.append(
+            (
+                "e911_binding_conflict",
+                "The source subnets are bound to different E911 locations; a merged "
+                "subnet has one. Remove or align the bindings (Network > E911 > "
+                "Bindings) first.",
+            )
+        )
     return out
 
 
@@ -357,6 +397,11 @@ def merge_warnings(dep: Dependents) -> list[str]:
             f"{len(dep.ot_zones)} OT zones at the same Purdue level are folded into "
             "one on the merged subnet (the target's, else the first); the others' "
             "name and cell are dropped."
+        )
+    if dep.e911_bindings:
+        out.append(
+            "The sources' E911 location binding moves onto the merged subnet, so every "
+            "device in it, including those from a source that had none, gets that location."
         )
     if dep.subnet_grants:
         out.append(
@@ -386,5 +431,17 @@ async def carry_for_merge(
     await db.flush()
     if keep is not None:
         keep.subnet_id = merged_id
+    await db.flush()
+    # One location (merge_conflicts refused differing ones): keep the target's
+    # binding, else the first, and drop the duplicates.
+    kept = next((b for b in dep.e911_bindings if b.subnet_id == target_id), None) or (
+        dep.e911_bindings[0] if dep.e911_bindings else None
+    )
+    for binding in dep.e911_bindings:
+        if binding is not kept:
+            await db.delete(binding)
+    await db.flush()
+    if kept is not None:
+        kept.subnet_id = merged_id
     await db.flush()
     await _repoint_links(db, source_ids, merged_id)

@@ -281,6 +281,9 @@ api:
   # Off-appliance docker-compose installs leave this off; the
   # /appliance/* endpoints no-op there anyway via the
   # ``settings.appliance_mode`` gate.
+  # #3761 — also what makes Platform Insights > Containers show this release's
+  # pods + their (redacted) logs on a plain Helm install; without it that tab
+  # reports "Kubernetes not available: enable api.serviceAccount.enabled".
   serviceAccount:
     enabled: false
   # #296 Phase C/D/E — opt-in cluster-scoped + kube-system RBAC for
