@@ -39,6 +39,7 @@ import {
   type SplitSubnetPreviewResponse,
   type Subnet,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Shared bits ───────────────────────────────────────────────────────────
 
@@ -297,9 +298,9 @@ export function FindFreeModal({
         </div>
       )}
       {submitted && isError && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+        <FormError className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           {formatApiError(error)}
-        </div>
+        </FormError>
       )}
       {data && (
         <>
@@ -495,9 +496,9 @@ export function SplitSubnetModal({
       </div>
 
       {error && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+        <FormError className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           {error}
-        </div>
+        </FormError>
       )}
 
       {preview && (
@@ -714,9 +715,9 @@ export function MergeSubnetModal({
       )}
 
       {error && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+        <FormError className="rounded border border-red-300 bg-red-50 p-3 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           {error}
-        </div>
+        </FormError>
       )}
 
       {preview && (

@@ -754,8 +754,13 @@ export function AlertsPage() {
                       colSpan={7}
                       className="px-4 py-8 text-center text-xs text-muted-foreground"
                     >
-                      <ListEmpty error={rulesError} what="alert rules">
-                        No rules yet — click “New rule” to create one.
+                      <ListEmpty
+                        error={rulesError}
+                        what="alert rules"
+                        gate={superadminGate}
+                        hint={`Click “New rule” to create one.`}
+                      >
+                        No rules yet.
                       </ListEmpty>
                     </td>
                   </tr>

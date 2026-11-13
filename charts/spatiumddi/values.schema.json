@@ -1,0 +1,163 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SpatiumDDI chart values",
+  "description": "Types for the keys operators set most. Deliberately permissive about unknown keys (the chart has ~1,400 lines of values and CI renders many shapes); templates keep their own targeted validation messages, so no enums here.",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tag": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "global": {
+      "type": "object"
+    },
+    "openshift": {
+      "type": "object"
+    },
+    "fullnameOverride": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nameOverride": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "auth": {
+      "type": "object"
+    },
+    "sharedEnv": {
+      "type": "array"
+    },
+    "applianceVersion": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "api": {
+      "type": "object",
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "slotImageMirror": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "beat": {
+      "type": "object"
+    },
+    "initContainers": {
+      "type": "object"
+    },
+    "migrate": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "postgresql": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string"
+        }
+      }
+    },
+    "externalDatabase": {
+      "type": "object"
+    },
+    "redis": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string"
+        }
+      }
+    },
+    "externalRedis": {
+      "type": "object"
+    },
+    "dnsAgents": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "servers": {
+          "type": "array"
+        }
+      }
+    },
+    "dhcpAgents": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "servers": {
+          "type": "array"
+        }
+      }
+    }
+  }
+}
