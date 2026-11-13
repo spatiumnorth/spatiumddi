@@ -809,7 +809,8 @@ The token never reaches the control plane — same agent-local trust boundary as
     "incremental_updates": "rest_api",
     "zone_types": ["forward", "primary", "secondary", "stub"],
     "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
-                                       # TLSA/SSHFP/NAPTR/URI/SOA/SVCB/HTTPS/DNAME
+                                       # TLSA/SSHFP/NAPTR/SOA/SVCB/HTTPS/DNAME (no LOC, no URI:
+                                       # LOC is 422-gated off, URI is unmodelled, #1778)
     "alias_records": False,           # Technitium has ANAME/APP instead —
                                        # a different shape, not a drop-in
     "lua_records": False,

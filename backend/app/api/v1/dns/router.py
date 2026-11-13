@@ -505,6 +505,12 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
     # agentless one translates all three in both directions via
     # ``app.services.technitium.rdata``.
     "SVCB": frozenset({"bind9", "powerdns", "technitium", "technitium_api"}),
+    # LOC is rendered only by the zone-file / pdns writers. Technitium has no
+    # structured LOC parameters (only raw ``rdata`` hex, which neither driver
+    # sends), the Windows driver formats no LOC for RFC 2136, and the hosted
+    # providers advertise none, so on any of them the create returned 201 and
+    # the op then failed for good (#1778).
+    "LOC": frozenset({"bind9", "powerdns"}),
     "HTTPS": frozenset({"bind9", "powerdns", "technitium", "technitium_api"}),
     "DNAME": frozenset({"bind9", "powerdns", "technitium", "technitium_api"}),
 }

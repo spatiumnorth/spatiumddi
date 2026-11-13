@@ -410,7 +410,8 @@ class TechnitiumDriver(DNSDriver):
             "dnssec_inline_signing": False,  # #1783; full support is #1767
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
-            "record_types": sorted(_SUPPORTED_RECORD_TYPES),
+            # URI is translated but not modelled by SpatiumDDI (#1778).
+            "record_types": sorted(_SUPPORTED_RECORD_TYPES - {"URI"}),
             "alias_records": False,
             "lua_records": False,
             # #1782 — broken in both roles (producer members inherit the

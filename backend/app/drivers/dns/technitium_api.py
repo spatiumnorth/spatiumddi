@@ -83,6 +83,7 @@ from app.drivers.dns._cloud_base import (
 from app.drivers.dns.base import RecordChange, RecordData
 from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES,
+    MODELLED_RECORD_TYPES,
     SUPPORTED_RECORD_TYPES,
     int_or,
     is_idempotent_noop,
@@ -399,7 +400,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 # SOA is modelled on the zone row, not as a record; DNSSEC
                 # artefacts belong to the signer. Unsupported types drop
                 # rather than round-trip through a lossy value string.
-                if rtype in DNSSEC_RECORD_TYPES or rtype not in SUPPORTED_RECORD_TYPES:
+                if rtype in DNSSEC_RECORD_TYPES or rtype not in MODELLED_RECORD_TYPES:
                     continue
                 # Technitium marks a disabled record rather than omitting
                 # it. Mirroring one would claim SpatiumDDI serves a record
@@ -829,7 +830,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             "dnssec_inline_signing": False,
             "incremental_updates": "rest_api",
             "zone_types": sorted(_MANAGEABLE_ZONE_TYPES),
-            "record_types": sorted(SUPPORTED_RECORD_TYPES),
+            "record_types": sorted(MODELLED_RECORD_TYPES),
             "alias_records": False,
             "lua_records": False,
             "catalog_zones": False,
