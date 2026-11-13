@@ -10,6 +10,7 @@ import {
   type PlanRequestItem,
   formatApiError,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 interface RowDraft {
   count: string;
@@ -170,9 +171,9 @@ export function PlanAllocationModal({
           <p className="text-xs text-destructive">{validationError}</p>
         )}
         {planMut.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(planMut.error)}
-          </p>
+          </FormError>
         )}
 
         <div className="flex items-center justify-end gap-2">
