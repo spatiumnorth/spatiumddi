@@ -663,6 +663,13 @@ class DNSQueryAnalyticsRequest(BaseModel):
     # asking past that returns nothing useful anyway.
     since: datetime | None = None
     until: datetime | None = None
+    # Optional narrowing, same meaning as on ``DNSQueryLogRequest`` (#4072).
+    # Omitted = the whole window, as before.
+    q: str | None = None
+    qtype: str | None = None
+    client_ip: str | None = None
+    view: str | None = None
+    rcode: str | None = None
     limit: int = Field(default=10, ge=1, le=100)
 
 
@@ -715,9 +722,21 @@ async def query_dns_analytics(
     except LogScopeError as exc:
         raise _scope_http_error(exc) from exc
     server_ids = [s.id for s in servers]
-    a = await dns_query_analytics(
-        db, server_ids, since=body.since, until=body.until, limit=body.limit
-    )
+    try:
+        a = await dns_query_analytics(
+            db,
+            server_ids,
+            since=body.since,
+            until=body.until,
+            q=body.q,
+            qtype=body.qtype,
+            client_ip=body.client_ip,
+            view=body.view,
+            rcode=body.rcode,
+            limit=body.limit,
+        )
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     return DNSQueryAnalyticsResponse(
         server_id=body.server_id,
         group_id=body.group_id,

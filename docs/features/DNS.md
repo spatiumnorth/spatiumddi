@@ -3293,6 +3293,13 @@ analytics roll up across the selection. The selection is always narrowed
 to the servers the caller may read. See
 [`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
 
+`/logs/dns-queries/analytics` also takes the grid's `q`, `qtype`,
+`client_ip` (an address, a prefix or a CIDR), `view` and `rcode`
+filters (issue #4072). Omitted, it rolls up the whole window as before.
+The analytics strip's **Analytics follow filters** checkbox sends them;
+it is off by default, remembered for the browser session, and the strip
+header names the filters it is showing.
+
 ---
 
 ## 22. Zone name scope — public, private, undelegated (issue #986)

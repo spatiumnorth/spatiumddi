@@ -202,6 +202,50 @@ def _rcode_clause(rcode: str) -> Any:
     return DNSQueryLogEntry.rcode == wanted
 
 
+def _dns_query_filters(
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    q: str | None = None,
+    qname_contains: str | None = None,
+    qtype: str | None = None,
+    client_ip: str | None = None,
+    view: str | None = None,
+    rcode: str | None = None,
+) -> list[Any]:
+    """WHERE clauses shared by the grid and the analytics rollups (#4072), so
+    "analytics follow filters" can never disagree with the rows it summarises.
+
+    ``q`` matches the qname or the raw line (the UI search box);
+    ``qname_contains`` matches the qname only (the copilot's argument).
+    Both are substring matches with LIKE metacharacters neutralised.
+    """
+    out: list[Any] = []
+    if since is not None:
+        out.append(DNSQueryLogEntry.ts >= since)
+    if until is not None:
+        out.append(DNSQueryLogEntry.ts <= until)
+    if qtype:
+        out.append(DNSQueryLogEntry.qtype == qtype.strip().upper())
+    if client_ip:
+        out.append(ip_filter_clause(DNSQueryLogEntry.client_ip, client_ip, field="client_ip"))
+    if view:
+        out.append(DNSQueryLogEntry.view == view)
+    if rcode:
+        out.append(_rcode_clause(rcode))
+    if qname_contains:
+        out.append(DNSQueryLogEntry.qname.ilike(like_pattern(qname_contains.strip()), escape="\\"))
+    if q:
+        like = like_pattern(q.strip())
+        # qname is the common search; raw catches a fragment the operator
+        # remembers from the daemon's own output that did not parse.
+        out.append(
+            DNSQueryLogEntry.qname.ilike(like, escape="\\")
+            | DNSQueryLogEntry.raw.ilike(like, escape="\\")
+        )
+    return out
+
+
 async def search_dns_queries(
     db: AsyncSession,
     server_ids: Sequence[uuid.UUID],
@@ -218,39 +262,23 @@ async def search_dns_queries(
 ) -> list[DNSQueryLogEntry]:
     """Query-log rows for ``server_ids``, newest first, at most ``limit``.
 
-    ``q`` matches the qname or the raw line (the UI search box);
-    ``qname_contains`` matches the qname only (the copilot's argument).
-    Both are substring matches with LIKE metacharacters neutralised.
+    Filters are those of :func:`_dns_query_filters`.
     """
     if not server_ids:
         return []
-    stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.server_id.in_(list(server_ids)))
-    if since is not None:
-        stmt = stmt.where(DNSQueryLogEntry.ts >= since)
-    if until is not None:
-        stmt = stmt.where(DNSQueryLogEntry.ts <= until)
-    if qtype:
-        stmt = stmt.where(DNSQueryLogEntry.qtype == qtype.strip().upper())
-    if client_ip:
-        stmt = stmt.where(
-            ip_filter_clause(DNSQueryLogEntry.client_ip, client_ip, field="client_ip")
-        )
-    if view:
-        stmt = stmt.where(DNSQueryLogEntry.view == view)
-    if rcode:
-        stmt = stmt.where(_rcode_clause(rcode))
-    if qname_contains:
-        stmt = stmt.where(
-            DNSQueryLogEntry.qname.ilike(like_pattern(qname_contains.strip()), escape="\\")
-        )
-    if q:
-        like = like_pattern(q.strip())
-        # qname is the common search; raw catches a fragment the operator
-        # remembers from the daemon's own output that did not parse.
-        stmt = stmt.where(
-            DNSQueryLogEntry.qname.ilike(like, escape="\\")
-            | DNSQueryLogEntry.raw.ilike(like, escape="\\")
-        )
+    stmt = select(DNSQueryLogEntry).where(
+        DNSQueryLogEntry.server_id.in_(list(server_ids)),
+        *_dns_query_filters(
+            since=since,
+            until=until,
+            q=q,
+            qname_contains=qname_contains,
+            qtype=qtype,
+            client_ip=client_ip,
+            view=view,
+            rcode=rcode,
+        ),
+    )
     stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 
@@ -271,16 +299,29 @@ async def dns_query_analytics(
     *,
     since: datetime | None = None,
     until: datetime | None = None,
+    q: str | None = None,
+    qtype: str | None = None,
+    client_ip: str | None = None,
+    view: str | None = None,
+    rcode: str | None = None,
     limit: int = 10,
 ) -> DNSQueryAnalytics:
-    """Top-N rollups over every row the selected servers logged."""
+    """Top-N rollups over every row the selected servers logged that also
+    match the optional filters (#4072; none given = the whole window)."""
     if not server_ids:
         return DNSQueryAnalytics(0, [], [], [], [], [])
-    base_filter: list[Any] = [DNSQueryLogEntry.server_id.in_(list(server_ids))]
-    if since is not None:
-        base_filter.append(DNSQueryLogEntry.ts >= since)
-    if until is not None:
-        base_filter.append(DNSQueryLogEntry.ts <= until)
+    base_filter: list[Any] = [
+        DNSQueryLogEntry.server_id.in_(list(server_ids)),
+        *_dns_query_filters(
+            since=since,
+            until=until,
+            q=q,
+            qtype=qtype,
+            client_ip=client_ip,
+            view=view,
+            rcode=rcode,
+        ),
+    ]
 
     total = (
         await db.execute(select(func.count()).select_from(DNSQueryLogEntry).where(*base_filter))
