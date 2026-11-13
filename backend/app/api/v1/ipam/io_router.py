@@ -360,6 +360,61 @@ async def import_addresses_commit(
     return result.as_dict()
 
 
+class PopulateRecordOut(BaseModel):
+    id: str
+    zone_id: str
+    zone_name: str
+    name: str
+    fqdn: str
+    record_type: str
+    dynamic: bool | None = None
+
+
+class PopulateItemOut(BaseModel):
+    address: str
+    subnet_id: str
+    subnet: str
+    category: Literal["new", "link", "linked", "conflict", "dynamic", "skipped"]
+    reason: str
+    hostname: str
+    existing_ip_id: str | None = None
+    existing_hostname: str | None = None
+    ptr: Literal["none", "match", "mismatch"]
+    records: list[PopulateRecordOut]
+
+
+class PopulateZoneOut(BaseModel):
+    id: str
+    name: str
+
+
+class PopulateOutsideOut(BaseModel):
+    network: str
+    records: int
+    sample: list[str]
+
+
+class PopulateFromDnsPreviewOut(BaseModel):
+    records_scanned: int
+    subnets_in_scope: int
+    zones: list[PopulateZoneOut]
+    counts: dict[str, int]
+    reasons: dict[str, int]
+    dynamic_unknown: int
+    outside: list[PopulateOutsideOut]
+    outside_total: int
+    total_items: int
+    items: list[PopulateItemOut]
+
+
+class PopulateFromDnsCommitOut(BaseModel):
+    created: int
+    linked: int
+    updated: int
+    skipped: int
+    errors: list[str]
+
+
 class PopulateFromDnsIn(BaseModel):
     """Body of the Populate-from-DNS preview and commit (#2251). Exactly one
     of the three scope ids; the plan is recomputed on both calls."""
@@ -413,12 +468,13 @@ async def _populate_plan(db: AsyncSession, user: User, body: PopulateFromDnsIn) 
 
 @router.post(
     "/import/dns/preview",
+    response_model=PopulateFromDnsPreviewOut,
     dependencies=[Depends(require_type_level("write", "subnet"))],
 )
 @read_only_post
 async def populate_from_dns_preview(
     current_user: CurrentUser, db: DB, body: PopulateFromDnsIn
-) -> dict:
+) -> dict[str, Any]:
     """Dry-run "Populate IPAM from DNS" (#2251): what the A / AAAA records of
     the chosen zones would create, link, or skip in the chosen scope. Reads
     only; the commit writes no DNS either."""
@@ -445,11 +501,11 @@ async def populate_from_dns_preview(
     }
 
 
-@router.post("/import/dns/commit")
+@router.post("/import/dns/commit", response_model=PopulateFromDnsCommitOut)
 @token_write("Creates IPAM address rows linked to existing DNS records.")
 async def populate_from_dns_commit(
     current_user: CurrentUser, db: DB, body: PopulateFromDnsIn
-) -> dict:
+) -> dict[str, Any]:
     """Commit "Populate IPAM from DNS" (#2251). Creates / links IPAM rows only:
     no DNS record is written, queued or re-published."""
     from app.api.v1.ipam.router import _enforce_zone_token_scope  # noqa: PLC0415

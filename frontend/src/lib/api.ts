@@ -2393,6 +2393,7 @@ export interface PopulateFromDnsBody {
 }
 export interface PopulateRecord {
   id: string;
+  zone_id: string;
   zone_name: string;
   name: string;
   fqdn: string;
@@ -2401,10 +2402,12 @@ export interface PopulateRecord {
 }
 export interface PopulateItem {
   address: string;
+  subnet_id: string;
   subnet: string;
   category: "new" | "link" | "linked" | "conflict" | "dynamic" | "skipped";
   reason: string;
   hostname: string;
+  existing_ip_id: string | null;
   existing_hostname: string | null;
   ptr: "none" | "match" | "mismatch";
   records: PopulateRecord[];
@@ -2412,6 +2415,7 @@ export interface PopulateItem {
 export interface PopulateFromDnsPreview {
   records_scanned: number;
   subnets_in_scope: number;
+  zones: { id: string; name: string }[];
   counts: Record<string, number>;
   reasons: Record<string, number>;
   dynamic_unknown: number;
