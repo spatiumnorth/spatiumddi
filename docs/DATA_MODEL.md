@@ -412,6 +412,7 @@ File: [`appliance.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/back
 | `ApplianceUpgradeImage` | `appliance_upgrade_image` | uploaded A/B slot image metadata |
 | `PairingCode` | `pairing_code` | single-use or persistent join code; stored sha256, cleartext shown once |
 | `PairingClaim` | `pairing_claim` | one row per (code, supervisor) successful claim |
+| `PairingAttempt` | `pairing_attempt` | refused `supervisor/register` attempt, grouped per (code, hostname, reason), size-bounded; superadmin-visible only (#2225) |
 
 `DNSServer.appliance_id` and `DHCPServer.appliance_id` (`ON DELETE
 CASCADE`) tie managed service rows back to the supervisor that runs
