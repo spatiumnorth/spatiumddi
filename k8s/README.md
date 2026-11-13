@@ -519,6 +519,8 @@ patches:
 
 The Helm chart exposes the same thing as `migrate.annotations`.
 
+`spatiumddi-secrets` may also carry `credential-key`, the Fernet key stored credentials are encrypted under (`CREDENTIAL_ENCRYPTION_KEY`; `secrets.yaml.example` shows the command). Optional: without it the key is derived from `SECRET_KEY`. Adding it to a running install is safe, since the derived key stays a read fallback; restart api, worker and beat, then run `python -m app.core.rotate_credential_key` in the api pod to move existing values onto it. The Helm chart generates and keeps one for you.
+
 The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under the api pod's `/var/lib/spatiumddi/backups/` (passphrase is the literal string `pre-restore-safety`). For that path to survive pod recycle, mount it as a `PersistentVolumeClaim` on both the api and worker deployments — see Backup below.

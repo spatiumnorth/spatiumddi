@@ -116,7 +116,11 @@ nameOverride: ""
 # upgrades. Override only if you're consolidating secret management.
 auth:
   secretKey: ""
-  existingSecret: ""             # must carry key `secret-key`; `metrics-token` optional
+  existingSecret: ""             # must carry key `secret-key`; `metrics-token` and `credential-key` optional
+  # #1358 — CREDENTIAL_ENCRYPTION_KEY: the Fernet key stored credentials are
+  # encrypted under. Empty = generated and kept across upgrades, like secretKey.
+  # Set it explicitly when rendering without a cluster (helm template, GitOps).
+  credentialEncryptionKey: ""
   # #1159 — bearer token /metrics accepts (any API token works too). Empty =
   # generated on first install and kept across upgrades, like secretKey.
   metricsToken: ""

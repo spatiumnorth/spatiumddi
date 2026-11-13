@@ -327,9 +327,16 @@ All providers are configured at runtime from `/admin/auth-providers`. The
 | `secrets_encrypted` | bytes | Fernet-encrypted secrets dict. |
 
 **Secrets at rest.** Everything in `secrets_encrypted` is wrapped with
-Fernet. The encryption key is derived from `settings.credential_encryption_key`
-(explicit) or `SHA-256(secret_key)` (fallback), so a fresh deploy that only
-sets `SECRET_KEY` still works. See `backend/app/core/crypto.py`.
+Fernet. New writes use `settings.credential_encryption_key` (a random key,
+independent of `SECRET_KEY`) when it is set. The key derived as
+`SHA-256(secret_key)` is always a **read** fallback while a dedicated key is
+set, so values written before it existed still decrypt, and it is the only key
+when none is set, so a deploy that only sets `SECRET_KEY` still works (the api
+logs a `credential_encryption_key_not_set` warning, since anyone who can recover
+`SECRET_KEY` can then open every stored secret). To move existing values onto
+the dedicated key run `python -m app.core.rotate_credential_key` (see
+[Moving stored credentials onto a dedicated key](../deployment/DOCKER.md#moving-stored-credentials-onto-a-dedicated-key)).
+See `backend/app/core/crypto.py`.
 
 **Group mappings.** Each provider owns a list of `AuthGroupMapping` rows
 (`external_group` → `internal_group_id`). The unified sync in

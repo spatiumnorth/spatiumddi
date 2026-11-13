@@ -211,25 +211,44 @@ class RewrapOutcome:
     aborted: bool = False
 
 
-def _fernet_from_keys(secret_key: str, credential_encryption_key: str) -> Fernet:
-    """Build a Fernet using the same precedence rules as
-    :func:`app.core.crypto._fernet`. ``credential_encryption_key``
-    wins when set + parseable; otherwise SHA-256 over
-    ``secret_key`` produces the 32-byte key material.
+class _KeyRing:
+    """Fernet-compatible view of a key pair, in :func:`app.core.crypto._fernet`
+    order: ``encrypt`` uses the first key, ``decrypt`` tries each."""
 
-    Raises :class:`ValueError` only when *neither* path yields a
-    usable key — in practice the SHA-256 fallback always works.
+    def __init__(self, *fernets: Fernet) -> None:
+        self._fernets = fernets
+
+    def encrypt(self, data: bytes) -> bytes:
+        return self._fernets[0].encrypt(data)
+
+    def decrypt(self, token: bytes) -> bytes:
+        for f in self._fernets:
+            try:
+                return f.decrypt(token)
+            except InvalidToken:
+                continue
+        raise InvalidToken
+
+
+def _fernet_from_keys(secret_key: str, credential_encryption_key: str) -> _KeyRing:
+    """Build a key ring using the same precedence rules as
+    :func:`app.core.crypto._fernet`: a dedicated ``credential_encryption_key``
+    encrypts and is tried first, and the key derived from ``secret_key``
+    (SHA-256) is always a read fallback (#1358: values written before the
+    dedicated key was configured are still under it). With no usable
+    dedicated key the derived one does both.
     """
+    digest = hashlib.sha256((secret_key or "").encode()).digest()
+    derived = Fernet(base64.urlsafe_b64encode(digest))
     raw = (credential_encryption_key or "").strip()
     if raw:
         try:
-            return Fernet(raw.encode())
+            return _KeyRing(Fernet(raw.encode()), derived)
         except (ValueError, Exception):  # noqa: BLE001
             # Mirrors crypto.py: malformed explicit key → fall back
             # to the derived key so the install still functions.
             pass
-    digest = hashlib.sha256((secret_key or "").encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(digest))
+    return _KeyRing(derived)
 
 
 def _keys_identical(
@@ -238,16 +257,20 @@ def _keys_identical(
     dest_secret: str,
     dest_cred: str,
 ) -> bool:
-    """Return True when the source + destination Fernet keys would
-    produce identical decryption results. We compare the *derived*
-    32-byte key material — the explicit-credential-key path takes
-    precedence over the derived-from-secret_key path in both
-    crypto.py + _fernet_from_keys above, so the comparison must
-    match that precedence.
+    """Return True when the source + destination key rings would produce
+    identical decryption results, so there is nothing to rewrap.
+
+    The dedicated key takes precedence over the derived one (as in
+    crypto.py), but the derived key is also a read fallback whenever a
+    dedicated one is set (#1358), so two installs sharing a dedicated key but
+    not ``SECRET_KEY`` are NOT identical: values still under the old derived
+    key would be orphaned.
     """
-    source = (source_cred or "").strip() or _derived_b64(source_secret)
-    dest = (dest_cred or "").strip() or _derived_b64(dest_secret)
-    return source == dest
+    src_cred = (source_cred or "").strip()
+    dst_cred = (dest_cred or "").strip()
+    if src_cred or dst_cred:
+        return src_cred == dst_cred and _derived_b64(source_secret) == _derived_b64(dest_secret)
+    return _derived_b64(source_secret) == _derived_b64(dest_secret)
 
 
 def _derived_b64(secret_key: str) -> str:
@@ -255,7 +278,7 @@ def _derived_b64(secret_key: str) -> str:
     return base64.urlsafe_b64encode(digest).decode()
 
 
-def _rewrap_value(source: Fernet, dest: Fernet, ciphertext: bytes) -> tuple[bytes | None, str]:
+def _rewrap_value(source: _KeyRing, dest: _KeyRing, ciphertext: bytes) -> tuple[bytes | None, str]:
     """Decrypt ``ciphertext`` with the source key and re-encrypt
     with the destination key. Returns:
 
@@ -467,8 +490,8 @@ async def _rewrap_column(
     table: str,
     pk_col: str,
     enc_col: str,
-    source: Fernet,
-    dest: Fernet,
+    source: _KeyRing,
+    dest: _KeyRing,
     outcome: RewrapOutcome,
 ) -> None:
     """Rewrap every non-null value in one column. The whole
@@ -540,8 +563,8 @@ async def _rewrap_jsonb_field(
     *,
     conn: asyncpg.Connection,
     spec: JsonbSecret,
-    source: Fernet,
-    dest: Fernet,
+    source: _KeyRing,
+    dest: _KeyRing,
     outcome: RewrapOutcome,
 ) -> None:
     """Rewrap every Fernet string inside one JSONB column.

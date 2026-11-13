@@ -633,6 +633,15 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
     secretKeyRef:
       name: {{ include "spatiumddi.appSecretName" . }}
       key: secret-key
+# #1358 — the dedicated key stored credentials are encrypted under. Optional:
+# a Secret supplied through auth.existingSecret may not carry it, and the api
+# then derives the key from SECRET_KEY as before.
+- name: CREDENTIAL_ENCRYPTION_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: credential-key
+      optional: true
 # #1159 — the /metrics scrape token. Optional: a Secret supplied through
 # auth.existingSecret may not carry it, and then only API tokens can scrape.
 - name: PROMETHEUS_METRICS_TOKEN

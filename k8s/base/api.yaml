@@ -64,6 +64,14 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: secret-key
+            # #1358 — dedicated at-rest key for stored credentials. Optional:
+            # without it the key is derived from SECRET_KEY, as before.
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key
+                  optional: true
             # #1159 — /metrics scrape token. Optional: without it only API
             # tokens can scrape.
             - name: PROMETHEUS_METRICS_TOKEN

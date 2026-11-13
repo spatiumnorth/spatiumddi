@@ -41,6 +41,14 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: secret-key
+            # #1358 — dedicated at-rest key for stored credentials. Optional:
+            # without it the key is derived from SECRET_KEY, as before.
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key
+                  optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
           resources:

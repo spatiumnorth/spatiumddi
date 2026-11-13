@@ -2556,13 +2556,44 @@ reassert_control_plane_class() {
 # is refused, because a new key there is the bug this exists to prevent.
 # Returns non-zero when it could not make sure the Secret exists; the caller
 # then strips ``auth.existingSecret`` so the chart keeps its own Secret.
+# #1358 — the dedicated at-rest key (CREDENTIAL_ENCRYPTION_KEY) rides in the
+# same Secret as ``credential-key``; the chart wires it into api / worker /
+# beat / migrate as an OPTIONAL secretKeyRef. Adding it is safe on a running
+# install because the api keeps the SECRET_KEY-derived key as a read fallback
+# (app/core/crypto.py), so every value already stored still decrypts. Never
+# overwrites: an existing credential-key is the key, since values written under
+# it are unreadable without it. Best effort by design: ``auth.existingSecret``
+# stays on the strength of ``secret-key`` alone, so a failure here must not
+# make the caller strip it (that would swap in a chart-owned SECRET_KEY).
+_new_credential_key_b64() {
+    # A Fernet key is url-safe base64 of 32 random bytes; the Secret's data
+    # field is that string base64'd again.
+    openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_' | base64 | tr -d '\n'
+}
+
+ensure_credential_key() {
+    local kc="/usr/local/bin/k3s kubectl -n spatium"
+    local have="" ckey=""
+    have=$($kc get secret "$APP_KEY_SECRET" -o jsonpath='{.data.credential-key}' 2>/dev/null) || return 0
+    [ -z "$have" ] || return 0
+    ckey=$(_new_credential_key_b64) || return 0
+    [ -n "$ckey" ] || return 0
+    echo "Adding credential-key to ${APP_KEY_SECRET} (#1358)"
+    # Value via stdin (merge patch), never argv.
+    printf '%s' "{\"data\":{\"credential-key\":\"${ckey}\"}}" \
+        | $kc patch secret "$APP_KEY_SECRET" --type merge --patch-file /dev/stdin >/dev/null 2>&1 \
+        || echo "WARN: could not add credential-key to ${APP_KEY_SECRET}; stored credentials stay under the SECRET_KEY-derived key (#1358)." >&2
+    return 0
+}
+
 ensure_app_key_secret() {
     local kc="/usr/local/bin/k3s kubectl -n spatium"
     # Initialised: this script runs under ``set -u``, where a bare ``local
     # token`` is unset and the metrics-token check below would abort it.
-    local found="" key="" token=""
+    local found="" key="" token="" ckey=""
     found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
     if [ -n "$found" ]; then
+        ensure_credential_key
         date -Iseconds > "$APP_KEY_STAMP"
         return 0
     fi
@@ -2570,6 +2601,9 @@ ensure_app_key_secret() {
     if [ -n "$found" ]; then
         key=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.secret-key}' 2>/dev/null) || return 1
         token=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.metrics-token}' 2>/dev/null) || return 1
+        # A credential-key the chart already minted (#1358) is carried over:
+        # values may have been written under it.
+        ckey=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.credential-key}' 2>/dev/null) || ckey=""
         if [ -z "$key" ]; then
             echo "WARN: ${CHART_APP_SECRET} exists but carries no secret-key; not generating one (#1448)." >&2
             return 1
@@ -2579,6 +2613,7 @@ ensure_app_key_secret() {
         echo "Generating SECRET_KEY into ${APP_KEY_SECRET} (fresh install, #1448)"
         key=$(openssl rand -hex 32 | tr -d '\n' | base64 | tr -d '\n')
     fi
+    [ -n "$ckey" ] || ckey=$(_new_credential_key_b64) || return 1
     [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
     # Values go through stdin as base64, never argv, so they never show in a
     # process listing. ``create`` (not ``apply``) fails if the Secret appeared
@@ -2596,6 +2631,7 @@ ensure_app_key_secret() {
         "data:" \
         "  secret-key: ${key}" \
         "  metrics-token: ${token}" \
+        "  credential-key: ${ckey}" \
         | $kc create -f - >/dev/null 2>&1; then
         found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
         [ -n "$found" ] || return 1

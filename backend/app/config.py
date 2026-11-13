@@ -176,8 +176,9 @@ class Settings(BaseSettings):
 
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
-    # encrypted with the Fernet helper in app.core.crypto using
-    # credential_encryption_key (or falling back to secret_key).
+    # encrypted with the Fernet helper in app.core.crypto: new writes use
+    # credential_encryption_key when set (else a key derived from secret_key),
+    # and the derived key stays a read fallback (#1358).
 
     # Celery
     celery_broker_url: str = "redis://redis:6379/1"
