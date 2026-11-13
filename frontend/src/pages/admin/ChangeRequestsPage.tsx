@@ -162,6 +162,10 @@ function fmtTime(iso: string | null): string {
 // ConfirmModal carries only checkbox + password — no free-text field — so
 // the note-bearing decision uses the shared draggable Modal directly.
 
+// The server's bound on a decision note (`max_length=2000`); the box stops at
+// it so an over-long note is never sent and refused as "decision_note: ..." (#3835).
+const DECISION_NOTE_MAX = 2000;
+
 function DecisionModal({
   cr,
   mode,
@@ -223,6 +227,7 @@ function DecisionModal({
           </label>
           <textarea
             className={cn(inputCls, "min-h-[64px] resize-y")}
+            maxLength={DECISION_NOTE_MAX}
             value={note}
             onChange={(e) => setNote(e.target.value)}
             placeholder={
@@ -408,7 +413,9 @@ function RequestTable({
             <RequestRow
               key={cr.id}
               cr={cr}
-              canApprove={canApprove}
+              // The server refuses an approver's decision on their own
+              // request (#3834); only Cancel is offered on it.
+              canApprove={canApprove && !isRequester(cr)}
               canCancel={isRequester(cr) || isSuperadmin}
               onDecide={onDecide}
               onCancel={onCancel}
