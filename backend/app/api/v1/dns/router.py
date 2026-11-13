@@ -698,6 +698,11 @@ class ServerGroupResponse(BaseModel):
     # which cannot do them (Technitium). Existing groups keep rendering as
     # before; this is the visible warning.
     catalog_unsupported_warning: str | None = None
+    # #3578 — set when catalog zones are on for a group that has views. A BIND9
+    # catalog zone is a top-level zone, which named refuses next to views, so
+    # the agent publishes no catalog for such a group; this is the visible
+    # warning rather than a silently absent catalog.
+    catalog_views_warning: str | None = None
     # #1784 — set when the group holds an experimental ``technitium_api``
     # server, and says where an already-existing group falls outside the
     # supported scope (second server, pools). Empty for every other group.
@@ -718,6 +723,7 @@ class ServerGroupResponse(BaseModel):
         g: DNSServerGroup,
         drivers: list[str] | None = None,
         warnings: list[str] | None = None,
+        has_views: bool = False,
     ) -> ServerGroupResponse:
         return cls(
             id=g.id,
@@ -736,10 +742,32 @@ class ServerGroupResponse(BaseModel):
                 if g.catalog_zones_enabled and set(drivers or []) & CATALOG_UNSUPPORTED_DRIVERS
                 else None
             ),
+            catalog_views_warning=(
+                CATALOG_VIEWS_WARNING
+                if g.catalog_zones_enabled and has_views and "bind9" in (drivers or [])
+                else None
+            ),
             scope_warnings=list(warnings or []),
             created_at=g.created_at,
             modified_at=g.modified_at,
         )
+
+
+CATALOG_VIEWS_WARNING = (
+    "Catalog zones are on, but this group has DNS views. BIND9 does not allow "
+    "a catalog zone next to views, so no catalog is published for this group. "
+    "Remove the views or turn catalog zones off."
+)
+
+
+async def _groups_with_views(db: DB, group_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of these groups hold at least one DNS view, in ONE query (#3578)."""
+    if not group_ids:
+        return set()
+    rows = await db.execute(
+        select(DNSView.group_id).where(DNSView.group_id.in_(group_ids)).distinct()
+    )
+    return {gid for (gid,) in rows.all()}
 
 
 async def _drivers_by_group(db: DB, group_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
@@ -2257,7 +2285,11 @@ async def list_groups(db: DB, current_user: CurrentUser) -> list[ServerGroupResp
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
-    return [ServerGroupResponse.from_model(g, drivers.get(g.id), warns.get(g.id)) for g in groups]
+    with_views = await _groups_with_views(db, [g.id for g in groups])
+    return [
+        ServerGroupResponse.from_model(g, drivers.get(g.id), warns.get(g.id), g.id in with_views)
+        for g in groups
+    ]
 
 
 @router.post("/groups", response_model=ServerGroupResponse, status_code=status.HTTP_201_CREATED)
@@ -2306,7 +2338,12 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
-    out = ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    out = ServerGroupResponse.from_model(
+        group,
+        drivers.get(group.id),
+        warns.get(group.id),
+        group.id in await _groups_with_views(db, [group.id]),
+    )
     est = await group_memory_estimate(db, group.id)
     if est is not None:
         out.memory_estimate = DNSMemoryEstimateResponse.from_estimate(est)
@@ -2404,7 +2441,12 @@ async def update_group(
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    return ServerGroupResponse.from_model(
+        group,
+        drivers.get(group.id),
+        warns.get(group.id),
+        group.id in await _groups_with_views(db, [group.id]),
+    )
 
 
 @router.post("/groups/{group_id}/group-tsig-key/rotate", response_model=ServerGroupResponse)
@@ -2441,7 +2483,12 @@ async def rotate_group_key(
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    return ServerGroupResponse.from_model(
+        group,
+        drivers.get(group.id),
+        warns.get(group.id),
+        group.id in await _groups_with_views(db, [group.id]),
+    )
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)

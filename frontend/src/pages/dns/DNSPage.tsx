@@ -1392,6 +1392,11 @@ function GroupModalForm({
               {group.catalog_unsupported_warning}
             </p>
           )}
+          {group?.catalog_views_warning && (
+            <p className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-700 dark:text-amber-400">
+              {group.catalog_views_warning}
+            </p>
+          )}
           {catalogZonesEnabled && (
             <div className="mt-2">
               <label className="mb-0.5 block text-xs font-medium">

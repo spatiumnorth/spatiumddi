@@ -318,12 +318,17 @@ older control plane ignores it and logs `bind9_catalog_consumer_ignored` (or
 
 The catalog exists for **BIND secondaries outside the group**, an operator's
 own servers that should pick up every zone SpatiumDDI adds without per-zone
-config. On BIND9 the catalog zone itself is transferable by any client (on
-PowerDNS it carries the group's transfer grant); its member zones keep the
-group's transfer grant (§3.6), so the external secondary signs
-member transfers with the group's TSIG key (shown under **Group TSIG key** in
-the group editor) or with a key or address the operator adds to the group's
-or zone's `allow_transfer`. On the external BIND (9.18 or later):
+config. The catalog is the group's whole zone inventory, so on both BIND9 and
+PowerDNS it carries the same grant as its member zones (§3.6): the group's
+TSIG key plus whatever the operator put in the group's `allow_transfer`. On
+BIND9 the same list is also the catalog's `allow-query`, since a secondary's
+SOA refresh check is a query. The external secondary therefore signs with the
+group's TSIG key (shown under **Group TSIG key** in the group editor) or
+comes from a key or address the operator added to `allow_transfer`.
+Before #3578 the BIND9 catalog was transferable by any client; a secondary
+that pulled it unsigned from an address `allow_transfer` does not list now
+gets REFUSED and keeps its last copy of the catalog, until it is given the
+key or the address. On the external BIND (9.18 or later):
 
 ```
 key "<group key name>" { algorithm hmac-sha256; secret "<group key secret>"; };
@@ -347,8 +352,9 @@ zone "catalog.spatium.invalid." {
 NOTIFY for the catalog zone (its only NS is `invalid.`), so the external
 server sees new zones at the catalog's SOA refresh (24 h) or on
 `rndc refresh catalog.spatium.invalid.`. Catalog zones are skipped on a BIND9
-group with views (the flat render only), and are refused on Technitium
-(#1782).
+group with views (the flat render only; named refuses a top-level zone next
+to views), and the group editor shows a warning when both are on (#3578).
+They are refused on Technitium (#1782).
 
 ### Control-plane memory for large groups (#2227)
 

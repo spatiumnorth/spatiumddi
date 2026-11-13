@@ -495,8 +495,12 @@ def _zone_notify_clauses(zone: dict[str, Any]) -> str:
 def _render_allow_transfer(
     acl: list[Any] | None,
     key_grants: list[str],
+    clause: str = "allow-transfer",
 ) -> str:
     """Build an ``allow-transfer { ... };`` clause (issue #734).
+
+    ``clause`` renames the statement: the catalog zone's ``allow-query`` is
+    the same address-match list as its transfer grant (#3578).
 
     ``acl`` is the operator's own list in BIND's vocabulary (``["any"]``,
     ``["10.0.0.0/8", "192.0.2.1"]``, ``["none"]``, …) from
@@ -528,8 +532,8 @@ def _render_allow_transfer(
     if any(t.lower() != "none" for t in tokens):
         items += [f"{t};" for t in tokens]
     if not items:
-        return "allow-transfer { none; }; "
-    return f'allow-transfer {{ {" ".join(items)} }}; '
+        return f"{clause} {{ none; }}; "
+    return f'{clause} {{ {" ".join(items)} }}; '
 
 
 _UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
@@ -3540,14 +3544,15 @@ class Bind9Driver(DriverBase):
                 conf += _zone_stanza(zone, "")
 
             # BIND9 catalog zone (RFC 9432) — flat path only, producer only.
-            # Catalog + views is an unsupported combo in this cut (views
-            # render their own per-view zones); the producer assumes
-            # top-level zones, which BIND9 forbids alongside views. The
-            # catalog is published for secondaries outside the group: it is
-            # transferable by any client (``allow-transfer { any; }``, signed
-            # or not), while its member zones keep the options-level grant,
-            # so an external secondary signs member transfers with a key the
-            # group grants (#734).
+            # Catalog + views is an unsupported combo (views render their own
+            # per-view zones; BIND9 forbids top-level zones alongside views),
+            # so a group with views gets no catalog; the control plane warns
+            # on the group (#3578). The catalog is the group's whole zone
+            # inventory, so it is NOT world-readable: it carries the same
+            # grant as the member zones, the group's TSIG keys plus the
+            # operator's ``allow_transfer``, for transfers and for queries
+            # (a secondary's SOA refresh check is a query, so
+            # ``allow-query { none; }`` would stall it).
             catalog = bundle.get("catalog") or None
             if catalog and catalog.get("mode") == "producer":
                 cname = catalog["zone_name"]
@@ -3555,7 +3560,9 @@ class Bind9Driver(DriverBase):
                 abs_zfile = self.state_dir / self.rendered_dir_name / rel
                 conf += (
                     f'zone "{cname}" {{ type master; file "{abs_zfile}"; '
-                    f"allow-transfer {{ any; }}; notify yes; }};\n"
+                    f"{_render_allow_transfer(opts.get('allow_transfer'), key_grants)}"
+                    f"{_render_allow_transfer(opts.get('allow_transfer'), key_grants, 'allow-query')}"
+                    "notify yes; };\n"
                 )
                 self._write_catalog_zone_file(new_dir / rel, catalog)
             elif catalog and catalog.get("mode") == "consumer":
