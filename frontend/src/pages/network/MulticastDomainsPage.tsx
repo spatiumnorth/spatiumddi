@@ -261,14 +261,26 @@ export function MulticastDomainsTab() {
 
   const items = query.data ?? [];
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => multicastApi.deleteDomain(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["multicast-domains"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete PIM domain"));
+      qc.invalidateQueries({ queryKey: ["multicast-domains"] });
+    },
   });
 
   return (
     <>
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <p className="min-w-0 flex-1 text-sm text-muted-foreground">
             Network-layer routing context for multicast groups — PIM mode,

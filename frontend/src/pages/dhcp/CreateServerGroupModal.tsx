@@ -364,8 +364,11 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
             </p>
             <p className="text-[11px] text-muted-foreground">
               Rendered into <code>libdhcp_ha.so</code> on every Kea peer in this
-              group. Defaults match Kea&apos;s documented recommendations; only
-              tweak if your environment genuinely needs it.
+              group. The Max Response Delay, Max Ack Delay and Max Unacked
+              Clients defaults are Kea&apos;s documented ones. The 2 s Heartbeat
+              Delay is SpatiumDDI&apos;s own choice (Kea documents 10 s): it
+              keeps a config reload down to seconds. Only tweak these if your
+              environment genuinely needs it.
             </p>
             <div className="grid grid-cols-2 gap-3">
               <Field

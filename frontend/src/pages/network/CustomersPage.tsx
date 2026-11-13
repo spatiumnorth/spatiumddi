@@ -261,17 +261,27 @@ export function CustomersPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => customersApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["customers"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete customers")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => customersApi.remove(id),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["customers"] });
+    },
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete customer"));
       qc.invalidateQueries({ queryKey: ["customers"] });
     },
   });
@@ -296,6 +306,11 @@ export function CustomersPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Customers</h1>
@@ -413,8 +428,10 @@ export function CustomersPage() {
                         setSearch("");
                         setStatusFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New customer" to add one.`}
                     >
-                      No customers yet — click "New customer" to add one.
+                      No customers yet.
                     </ListEmpty>
                   </td>
                 </tr>

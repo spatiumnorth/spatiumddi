@@ -1546,6 +1546,7 @@ export interface TemplateReapplyAllResponse {
   instances_processed: number;
   instances_skipped: number;
   cap_reached: boolean;
+  skipped: { target_id: string; network: string; reason: string }[];
 }
 
 export const ipamApi = {
@@ -4506,7 +4507,7 @@ export const settingsApi = {
     api
       .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
       .then((r) => r.data),
-  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+  updateAuditTarget: (id: string, body: Partial<AuditForwardTargetWrite>) =>
     api
       .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
       .then((r) => r.data),
@@ -4527,7 +4528,7 @@ export const settingsApi = {
     api
       .post<InfluxDBTarget>("/settings/influxdb-targets", body)
       .then((r) => r.data),
-  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+  updateInfluxTarget: (id: string, body: Partial<InfluxDBTargetWrite>) =>
     api
       .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
       .then((r) => r.data),
@@ -10997,6 +10998,15 @@ export interface ApiToken {
   /** False when the owner is disabled: the token is refused (403) whatever
    *  its own flag says (#3431). Set by the list endpoint. */
   owner_is_active?: boolean | null;
+  owner_password_change_required?: boolean | null;
+  /** Effective state at auth (#3784); older servers omit it. */
+  status?:
+    | "active"
+    | "revoked"
+    | "expired"
+    | "owner_disabled"
+    | "password_change_required";
+  blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -11194,8 +11204,30 @@ export const alertsApi = {
     api.patch<AlertRule>(`/alerts/rules/${id}`, body).then((r) => r.data),
   deleteRule: (id: string) => api.delete(`/alerts/rules/${id}`),
   listEvents: (
-    params: { open_only?: boolean; rule_id?: string; limit?: number } = {},
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => r.data),
+  // One window of events plus the number matching the filters (the
+  // X-Total-Count header), so a page can say how many it did not draw (#3830).
+  listEventsPage: (
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
   resolveEvent: (id: string) =>
     api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
   evaluateNow: () =>

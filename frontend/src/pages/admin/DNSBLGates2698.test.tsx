@@ -105,6 +105,18 @@ describe("DNSBL page write gates (#2698)", () => {
     expect(sw.getAttribute("title")).toBe("Requires write on DNS blocklists");
   });
 
+  it("names a Viewer's Pinned IP inputs by what they take, the refusal as description (#3760)", async () => {
+    show(grants(["read", "*"]));
+    await screen.findByText("203.0.113.95");
+    const ip = await screen.findByRole("textbox", {
+      name: "Pinned IP address",
+    });
+    const note = screen.getByRole("textbox", { name: "Pinned IP note" });
+    expect(off(ip)).toBe(true);
+    expect(off(note)).toBe(true);
+    expect(ip.getAttribute("title")).toBe("Requires write on DNS blocklists");
+  });
+
   it("splits write from delete", async () => {
     show(grants(["write", "dnsbl"], ["read", "dnsbl"]));
     await screen.findByRole("button", { name: /Pin$/ });

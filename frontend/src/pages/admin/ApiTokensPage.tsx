@@ -22,6 +22,7 @@ import {
   type ApiTokenCreated,
   type ApiTokenResourceGrant,
   type ApiTokenScope,
+  formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -768,7 +769,11 @@ function ReenableTokenModal({
               <strong className="text-foreground">{ownerLabel(token)}</strong>)
             </>
           )}
-          ? It starts authenticating again immediately. Confirm it's you.
+          ?{" "}
+          {token.owner_password_change_required
+            ? "Its owner must still change their password, so it will keep being refused (403) until they do."
+            : "It starts authenticating again immediately."}{" "}
+          Confirm it's you.
         </p>
         <ReauthFields
           password={stepPassword}
@@ -828,6 +833,7 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setConfirmDelete(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
 
   return (
@@ -922,11 +928,13 @@ export function ApiTokensPage() {
                     </td>
                     <td className="px-3 py-2">
                       <span
+                        title={t.blocked_reason ?? undefined}
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
                           t.is_active &&
                             !isExpired(t.expires_at) &&
-                            t.owner_is_active !== false
+                            t.owner_is_active !== false &&
+                            !t.owner_password_change_required
                             ? "bg-emerald-500/15 text-emerald-600"
                             : "bg-muted text-muted-foreground",
                         )}
@@ -937,7 +945,9 @@ export function ApiTokensPage() {
                             ? "Expired"
                             : t.owner_is_active === false
                               ? "Owner disabled"
-                              : "Active"}
+                              : t.owner_password_change_required
+                                ? "Blocked: password change required"
+                                : "Active"}
                       </span>
                     </td>
                     <td className="px-3 py-2">
@@ -1038,6 +1048,11 @@ export function ApiTokensPage() {
                 )}
                 ? Any script still using it will start getting 401 responses.
               </p>
+              {deleteMut.isError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {formatApiError(deleteMut.error, "Failed to delete token")}
+                </p>
+              )}
               <div className="flex justify-end gap-2">
                 <button
                   onClick={() => setConfirmDelete(null)}
@@ -1046,7 +1061,10 @@ export function ApiTokensPage() {
                   Cancel
                 </button>
                 <button
-                  onClick={() => deleteMut.mutate(confirmDelete.id)}
+                  onClick={() => {
+                    deleteMut.reset();
+                    deleteMut.mutate(confirmDelete.id);
+                  }}
                   disabled={deleteMut.isPending}
                   className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
                 >
