@@ -352,7 +352,22 @@ def test_the_agents_key_may_write_the_soa_under_update_policy() -> None:
 # ── reporting what named serves after a structural apply ─────────────────────
 
 
-def test_served_zone_serials_reads_primaries_and_keeps_the_rest(
+def test_a_secondary_named_holds_nothing_of_is_not_reported_as_the_bundle_serial_3940(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refused(*_a: Any, **_kw: Any) -> Any:
+        raise OSError("SERVFAIL")
+
+    monkeypatch.setattr(dns.query, "tcp", refused)
+    monkeypatch.setattr(bind9.shutil, "which", lambda n: None)
+    bundle = {
+        "views": [{"name": "v"}],
+        "zones": [{"name": "sec.test.", "type": "secondary", "serial": 0}],
+    }
+    assert driver.served_zone_serials(bundle) == {}
+
+
+def test_served_zone_serials_reads_primaries_and_secondaries_and_keeps_the_rest(
     driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     named = _FakeNamed(2026102603)
@@ -366,7 +381,6 @@ def test_served_zone_serials_reads_primaries_and_keeps_the_rest(
     }
     assert driver.served_zone_serials(bundle) == {
         ORIGIN.rstrip("."): 2026102603,
-        "sec.test": 9,
         "fwd.test": 0,
     }
 

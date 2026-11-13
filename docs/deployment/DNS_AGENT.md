@@ -750,6 +750,12 @@ heartbeat body is strict and an agent can be upgraded before its control plane.
 - `soa-timers`: the BIND9 driver writes each zone's own refresh / retry /
   expire / minimum into its SOA. Agents before #1171 send no header and write
   `3600 600 86400 300` for every zone.
+- `served-serials` (#3940): the BIND9 driver reports a secondary / stub zone's
+  serial as named serves it, and nothing for a zone named holds no copy of,
+  instead of the bundle's 0. Stored as `dns_server.agent_reports_served_serials`.
+  The control plane reads a secondary at a non-zero serial as in sync and 0
+  as not synced for every BIND9 agent: an older agent's start-up report also
+  reads each zone from named, and its 0 means "not reported".
 - Register and heartbeat store it as `dns_server.agent_renders_soa_timers`.
   A group's bundles carry each zone's own timers only while every BIND9 server
   of the group (run by an agent, enabled, approved) says `soa-timers`
