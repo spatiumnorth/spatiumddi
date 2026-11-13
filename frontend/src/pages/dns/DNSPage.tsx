@@ -91,6 +91,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
+import { DeleteChoiceModal } from "@/components/ui/delete-choice-modal";
 import { Field } from "@/pages/dhcp/_shared";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -759,53 +760,6 @@ export function DeleteDNSGroupModal({
       error={error}
       notice={notice}
     />
-  );
-}
-
-/** Single-step destructive confirm (no checkbox). Used for low-stakes deletes
- * like individual DNS records — the two-step modal above stays for group /
- * blocklist deletes where the blast radius is much larger. */
-function ConfirmSingleModal({
-  title,
-  description,
-  onConfirm,
-  onClose,
-  isPending,
-  confirmLabel = "Delete",
-  error,
-}: {
-  title: string;
-  description: React.ReactNode;
-  onConfirm: () => void;
-  onClose: () => void;
-  isPending?: boolean;
-  confirmLabel?: string;
-  /** The server's reason when the action was refused, so a refused
-   *  delete says why instead of leaving the dialog as it was. */
-  error?: string | null;
-}) {
-  return (
-    <Modal title={title} onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">{description}</p>
-        {error && <p className="text-sm text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={isPending}
-            className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-          >
-            {isPending ? "Deleting…" : confirmLabel}
-          </button>
-        </div>
-      </div>
-    </Modal>
   );
 }
 
@@ -4472,7 +4426,8 @@ export function ZoneDetailView({
   });
 
   const deleteRecord = useMutation({
-    mutationFn: (r: DNSRecord) => dnsApi.deleteRecord(group.id, zone.id, r.id),
+    mutationFn: ({ rec, permanent }: { rec: DNSRecord; permanent: boolean }) =>
+      dnsApi.deleteRecord(group.id, zone.id, rec.id, { permanent }),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] }),
   });
@@ -4488,7 +4443,6 @@ export function ZoneDetailView({
   // may use it.
   const { isSuperadmin, can, canWriteRecords, canDeleteRecords } =
     useDnsGrants();
-  const [bulkPermanent, setBulkPermanent] = useState(false);
   // Outcome of the last bulk delete when some rows were skipped — the
   // selection persists across pages, so the count in the modal can differ
   // from what the server did (pool-managed or synthesised rows, wire
@@ -4501,7 +4455,13 @@ export function ZoneDetailView({
     // BULK_DELETE_CHUNK ids and the selection can exceed that across
     // pages, so chunk — and each chunk is its own trash batch, which the
     // confirm copy says rather than promising one restore.
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      permanent,
+    }: {
+      ids: string[];
+      permanent: boolean;
+    }) => {
       let deleted = 0;
       const skipped: { record_id: string; reason: string }[] = [];
       const batches: string[] = [];
@@ -4511,7 +4471,7 @@ export function ZoneDetailView({
           group.id,
           zone.id,
           ids.slice(i, i + BULK_DELETE_CHUNK),
-          { permanent: bulkPermanent },
+          { permanent },
         );
         deleted += res.deleted;
         skipped.push(...res.skipped);
@@ -4520,7 +4480,10 @@ export function ZoneDetailView({
       }
       return { deleted, skipped, batches, providerWarnings };
     },
-    onSuccess: ({ deleted, skipped, batches, providerWarnings }) => {
+    onSuccess: (
+      { deleted, skipped, batches, providerWarnings },
+      { permanent: bulkPermanent },
+    ) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
@@ -4547,7 +4510,6 @@ export function ZoneDetailView({
       } else {
         setBulkDeleteNotice(null);
       }
-      setBulkPermanent(false);
     },
   });
 
@@ -5743,28 +5705,44 @@ export function ZoneDetailView({
         />
       )}
       {confirmDeleteRecord && (
-        <ConfirmSingleModal
+        <DeleteChoiceModal
           title="Delete Record"
-          description={
+          intro={
             <>
               Delete{" "}
               <span className="font-mono">
                 {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
               </span>
-              ? This will remove the record from the zone and fire an RFC 2136
-              update.
+              ?
             </>
           }
-          isPending={deleteRecord.isPending}
+          softHeading="Move to Trash (reversible)"
+          softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
+          softButtonLabel="Move to Trash"
+          permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
+          allowPermanent={isSuperadmin}
+          isSoftPending={
+            deleteRecord.isPending && !deleteRecord.variables?.permanent
+          }
+          isPermanentPending={
+            deleteRecord.isPending && !!deleteRecord.variables?.permanent
+          }
           error={
             deleteRecord.isError
               ? formatApiError(deleteRecord.error, "Delete failed")
               : null
           }
-          onConfirm={() =>
-            deleteRecord.mutate(confirmDeleteRecord, {
-              onSuccess: () => setConfirmDeleteRecord(null),
-            })
+          onSoft={() =>
+            deleteRecord.mutate(
+              { rec: confirmDeleteRecord, permanent: false },
+              { onSuccess: () => setConfirmDeleteRecord(null) },
+            )
+          }
+          onPermanent={() =>
+            deleteRecord.mutate(
+              { rec: confirmDeleteRecord, permanent: true },
+              { onSuccess: () => setConfirmDeleteRecord(null) },
+            )
           }
           onClose={() => {
             deleteRecord.reset();
@@ -5773,46 +5751,47 @@ export function ZoneDetailView({
         />
       )}
       {confirmBulkDelete && (
-        <ConfirmSingleModal
-          title={
-            bulkPermanent
-              ? `Permanently delete ${selectedRecords.size} records`
-              : `Move ${selectedRecords.size} records to the trash`
+        <DeleteChoiceModal
+          title={`Delete ${selectedRecords.size} records`}
+          intro={
+            <>
+              Delete the{" "}
+              <span className="font-medium">{selectedRecords.size}</span>{" "}
+              selected records? Moved to Trash, a superadmin can restore them
+              from Administration → Trash. IPAM-managed records are excluded
+              automatically.
+            </>
           }
-          description={
-            <div className="space-y-2">
-              <p>
-                {bulkPermanent ? "Permanently delete the " : "Move the "}
-                <span className="font-medium">{selectedRecords.size}</span>{" "}
-                selected records
-                {bulkPermanent
-                  ? "? This cannot be undone."
-                  : selectedRecords.size > BULK_DELETE_CHUNK
-                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
-                    : " to the trash? A superadmin can restore them together from Administration → Trash."}{" "}
-                IPAM-managed records are excluded automatically.
-              </p>
-              {isSuperadmin && (
-                <label className="flex items-center gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={bulkPermanent}
-                    onChange={(e) => setBulkPermanent(e.target.checked)}
-                  />
-                  Delete permanently (skip the trash)
-                </label>
-              )}
-            </div>
+          softHeading="Move to Trash (reversible)"
+          softBody={
+            selectedRecords.size > BULK_DELETE_CHUNK
+              ? `The records are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
+              : "A superadmin can restore them together from Administration → Trash."
           }
-          confirmLabel={bulkPermanent ? "Delete permanently" : "Move to trash"}
-          isPending={bulkDeleteRecords.isPending}
-          onConfirm={() =>
-            bulkDeleteRecords.mutate(Array.from(selectedRecords))
+          softButtonLabel="Move to Trash"
+          permanentBody="The records are removed immediately and retracted from the DNS server. There's no undo."
+          allowPermanent={isSuperadmin}
+          isSoftPending={
+            bulkDeleteRecords.isPending &&
+            !bulkDeleteRecords.variables?.permanent
           }
-          onClose={() => {
-            setConfirmBulkDelete(false);
-            setBulkPermanent(false);
-          }}
+          isPermanentPending={
+            bulkDeleteRecords.isPending &&
+            !!bulkDeleteRecords.variables?.permanent
+          }
+          onSoft={() =>
+            bulkDeleteRecords.mutate({
+              ids: Array.from(selectedRecords),
+              permanent: false,
+            })
+          }
+          onPermanent={() =>
+            bulkDeleteRecords.mutate({
+              ids: Array.from(selectedRecords),
+              permanent: true,
+            })
+          }
+          onClose={() => setConfirmBulkDelete(false)}
         />
       )}
       {showMoveZone && (
