@@ -188,7 +188,7 @@ async def test_audit_row_written(db_session: AsyncSession, client: AsyncClient) 
         headers=headers,
         json={
             "ssh_authorized_keys": [{"name": "bob", "public_key": _ED, "comment": ""}],
-            "ssh_allow_root_login": False,
+            "ssh_port": 2222,
         },
     )
     assert resp.status_code == 200, resp.text
@@ -206,9 +206,14 @@ async def test_audit_row_written(db_session: AsyncSession, client: AsyncClient) 
     )
     assert len(rows) == 1
     assert rows[0].action == "update"
-    assert rows[0].new_value["allow_root_login"] is False
-    # Public keys are recorded in full (not secrets).
-    assert rows[0].new_value["authorized_keys"][0]["public_key"] == _ED
+    assert rows[0].new_value["port"] == 2222
+    assert rows[0].old_value["port"] == 22
+    assert rows[0].changed_fields == ["authorized_keys", "port"]
+    # Keys are recorded by fingerprint, never in full (#3995).
+    key = rows[0].new_value["authorized_keys"][0]
+    assert key["fingerprint"].startswith("SHA256:")
+    assert _ED.split()[1] not in repr(rows[0].new_value)
+    assert "public_key" not in key
 
 
 @pytest.mark.asyncio

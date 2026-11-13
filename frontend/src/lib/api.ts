@@ -418,6 +418,9 @@ export interface FreeCidrRange {
   size: number;
   size_exact?: string;
   prefix_len: number;
+  /** Non-zero only on the last range of a capped answer: free ranges left out
+   *  past it (#3848). */
+  more_after?: number;
 }
 
 export interface PlanRequestItem {
@@ -1277,6 +1280,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
@@ -1546,6 +1551,7 @@ export interface TemplateReapplyAllResponse {
   instances_processed: number;
   instances_skipped: number;
   cap_reached: boolean;
+  skipped: { target_id: string; network: string; reason: string }[];
 }
 
 export const ipamApi = {
@@ -1611,7 +1617,9 @@ export const ipamApi = {
       .then((r) => r.data),
   blockFreeSpace: (blockId: string) =>
     api
-      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
+      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`, {
+        params: { limit: 2000 },
+      })
       .then((r) => r.data),
   blockAggregationSuggestions: (
     blockId: string,
@@ -4506,7 +4514,7 @@ export const settingsApi = {
     api
       .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
       .then((r) => r.data),
-  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+  updateAuditTarget: (id: string, body: Partial<AuditForwardTargetWrite>) =>
     api
       .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
       .then((r) => r.data),
@@ -4527,7 +4535,7 @@ export const settingsApi = {
     api
       .post<InfluxDBTarget>("/settings/influxdb-targets", body)
       .then((r) => r.data),
-  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+  updateInfluxTarget: (id: string, body: Partial<InfluxDBTargetWrite>) =>
     api
       .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
       .then((r) => r.data),
@@ -5230,6 +5238,9 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
+  records_trashed_widened: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */
@@ -10997,6 +11008,15 @@ export interface ApiToken {
   /** False when the owner is disabled: the token is refused (403) whatever
    *  its own flag says (#3431). Set by the list endpoint. */
   owner_is_active?: boolean | null;
+  owner_password_change_required?: boolean | null;
+  /** Effective state at auth (#3784); older servers omit it. */
+  status?:
+    | "active"
+    | "revoked"
+    | "expired"
+    | "owner_disabled"
+    | "password_change_required";
+  blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -11194,8 +11214,30 @@ export const alertsApi = {
     api.patch<AlertRule>(`/alerts/rules/${id}`, body).then((r) => r.data),
   deleteRule: (id: string) => api.delete(`/alerts/rules/${id}`),
   listEvents: (
-    params: { open_only?: boolean; rule_id?: string; limit?: number } = {},
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => r.data),
+  // One window of events plus the number matching the filters (the
+  // X-Total-Count header), so a page can say how many it did not draw (#3830).
+  listEventsPage: (
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
   resolveEvent: (id: string) =>
     api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
   evaluateNow: () =>
@@ -12045,6 +12087,14 @@ export interface ProvisioningRequestListParams {
   offset?: number;
 }
 
+// What approving a pending request would do now, re-previewed server-side (#3934).
+export interface RequestCurrentPreview {
+  preview_text: string;
+  ok: boolean;
+  detail: string | null;
+  changed: boolean;
+}
+
 export interface SubmitRequestBody {
   kind: RequestKindId;
   args: Record<string, unknown>;
@@ -12077,6 +12127,20 @@ export const requestsApi = {
       .then((r) => r.data),
   list: (params: ProvisioningRequestListParams = {}) =>
     api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // page can say how many it did not draw (#3937).
+  listPage: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
+  currentPreview: (id: string) =>
+    api
+      .get<RequestCurrentPreview>(`/requests/${id}/current-preview`)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
   submit: (body: SubmitRequestBody) =>

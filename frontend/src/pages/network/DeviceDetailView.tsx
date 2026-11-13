@@ -43,6 +43,7 @@ import {
   inputCls,
 } from "./_shared";
 import { DeviceFormModal } from "./DeviceFormModal";
+import { FormError } from "@/components/ui/form-error";
 
 type Tab = "overview" | "interfaces" | "arp" | "fdb" | "neighbours";
 
@@ -1193,7 +1194,9 @@ function DeleteDeviceModal({
           This permanently removes the device along with its discovered
           interfaces, ARP, and FDB entries.
         </p>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
