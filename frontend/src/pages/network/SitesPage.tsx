@@ -572,15 +572,22 @@ function SiteTreeRow({
 
 function SiteTreeView({
   sites,
+  listError,
   onEdit,
   onMove,
   onDelete,
 }: {
   sites: SiteRead[];
+  /** The list query's error, so a refused read isn't drawn as an empty tree. */
+  listError?: unknown;
   onEdit: (s: SiteRead) => void;
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
 }) {
+  const writeGate = permissionGate(
+    usePermissions().can("write", "site"),
+    "Requires write permission on sites",
+  );
   const qc = useQueryClient();
   const [activeId, setActiveId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -671,11 +678,14 @@ function SiteTreeView({
           {error}
         </p>
       )}
-      <p className="text-xs text-muted-foreground">
-        Drag the <GripVertical className="inline h-3 w-3" /> handle onto another
-        site to re-parent, or use the <Move className="inline h-3 w-3" /> Move
-        button. Drop on the zone above to make a site top-level.
-      </p>
+      {!writeGate.disabled && (
+        <p className="text-xs text-muted-foreground">
+          Drag the <GripVertical className="inline h-3 w-3" /> handle onto
+          another site to re-parent, or use the{" "}
+          <Move className="inline h-3 w-3" /> Move button. Drop on the zone
+          above to make a site top-level.
+        </p>
+      )}
       <DndContext
         sensors={sensors}
         onDragStart={handleDragStart}
@@ -686,7 +696,10 @@ function SiteTreeView({
         <div className="divide-y rounded-lg border text-sm">
           {roots.length === 0 ? (
             <p className="px-3 py-6 text-center text-muted-foreground">
-              No sites yet — click “New site” to add one.
+              <ListEmpty error={listError} what="sites">
+                No sites yet.
+                {!writeGate.disabled && " Click “New site” to add one."}
+              </ListEmpty>
             </p>
           ) : (
             roots.map((s) => (
@@ -968,6 +981,7 @@ export function SitesPage() {
           ) : (
             <SiteTreeView
               sites={allSites}
+              listError={allSitesQuery.error}
               onEdit={(s) => setEditing(s)}
               onMove={(s) => setMoving(s)}
               onDelete={askDelete}
@@ -1019,8 +1033,10 @@ export function SitesPage() {
                           setSearch("");
                           setKindFilter("");
                         }}
+                        gate={writeGate}
+                        hint={`Click "New site" to add one.`}
                       >
-                        No sites yet — click "New site" to add one.
+                        No sites yet.
                       </ListEmpty>
                     </td>
                   </tr>

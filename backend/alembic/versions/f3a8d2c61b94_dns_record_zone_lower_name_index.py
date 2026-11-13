@@ -5,7 +5,7 @@
 unchanged DDNS renewal read the whole forward zone to check one name.
 
 Revision ID: f3a8d2c61b94
-Revises: ede3bcd2aff4
+Revises: d5a1c8e37b24
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "f3a8d2c61b94"
-down_revision: str | None = "ede3bcd2aff4"
+down_revision: str | None = "d5a1c8e37b24"
 branch_labels = None
 depends_on = None
 

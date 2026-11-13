@@ -459,6 +459,20 @@ def test_held_back_error_names_every_zone_and_stays_bounded() -> None:
     assert len(_partial_apply_error((long,), ())) <= MAX_ERROR_LEN
 
 
+def test_name_hold_is_not_worded_as_a_zone_file_named_checkzone_refused() -> None:
+    """#3843: a zone held for its name was never seen by named-checkzone."""
+    longz = HeldZone("l" * 249 + ".test", None, "the zone name is 253 characters", False, True)
+    text = _partial_apply_error((longz,), ())
+    assert "whose name is too long for its files" in text
+    assert "named-checkzone" not in text
+    assert "until the data loads" not in text
+    assert "the zone name is 253 characters" in text
+    # Alongside a zone the checker refused, each keeps its own lead-in.
+    both = _partial_apply_error((HELD, longz), ())
+    assert "named-checkzone refused a zone file, held back until the data loads" in both
+    assert "holds back a zone whose name is too long" in both
+
+
 def test_both_kinds_of_unserved_zone_are_named_in_one_verdict() -> None:
     """No driver both holds back and refuses today; if one did, the verdict
     names both rather than dropping one."""
