@@ -338,8 +338,8 @@ def test_validate_config_blocklists_are_warned_not_errored(zone: ZoneData) -> No
 def test_capabilities_scope() -> None:
     caps = TechnitiumDriver().capabilities()
     assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
-    # #1783: one-shot signing is no longer advertised.
-    assert caps["dnssec_inline_signing"] is False
+    # #1767: the agent reconciles signing from the bundle, so it is advertised.
+    assert caps["dnssec_inline_signing"] is True
     # ALIAS/LUA stay unsupported: Technitium's ANAME/APP are a different
     # shape, not a drop-in equivalent.
     assert caps["alias_records"] is False
@@ -437,20 +437,19 @@ def test_capabilities_report_zone_types_and_catalog() -> None:
     assert caps["catalog_zones"] is False
 
 
-def test_capabilities_do_not_report_dnssec_signing() -> None:
-    """#1783 — Technitium signing is one-shot (never re-signed, policy
-    ignored), so the driver stops advertising it. Full support: #1767."""
-    assert TechnitiumDriver().capabilities()["dnssec_inline_signing"] is False
+def test_capabilities_report_dnssec_signing() -> None:
+    """#1767 — signing is structural (re-signed from the bundle), so the
+    driver advertises it again after #1783 withdrew it."""
+    assert TechnitiumDriver().capabilities()["dnssec_inline_signing"] is True
 
 
 def test_dnssec_operations_gate_for_technitium() -> None:
     from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS
 
-    # Sign is refused (#1783); unsign stays so an already-signed zone can be
-    # turned off.
-    assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
+    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
     assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_unsign"]
-    assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_rollover"]
+    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_rollover"]
+    assert "technitium_api" not in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
 
 
 def test_forward_transports_are_driver_gated() -> None:

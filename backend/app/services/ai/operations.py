@@ -3221,8 +3221,8 @@ class CreateDNSZoneArgs(BaseModel):
             "``technitium_api`` (agentless, an install the operator "
             "already runs), or ``windows_dns``. Pair it with "
             "``dnssec_enabled=true`` to auto-select a group whose driver "
-            "can sign (``bind9`` and ``powerdns``; ``technitium``, "
-            "``technitium_api`` and ``windows_dns`` cannot, #1783). "
+            "can sign (``bind9``, ``powerdns`` and ``technitium``; "
+            "``technitium_api`` and ``windows_dns`` cannot). "
             "When ``group_id`` is set, this is validated against the "
             "group's actual driver mix."
         ),

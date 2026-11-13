@@ -5978,7 +5978,7 @@ export interface DNSZone {
   // #1762 — signed on a group with more than one DNS server, each signing
   // with its own keys (validating resolvers SERVFAIL on the mismatch).
   dnssec_multi_signer?: boolean;
-  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  /** Signed on an agentless Technitium API group; SpatiumDDI won't keep it signed. */
   dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
@@ -6394,7 +6394,7 @@ export interface ZoneDnssecInfo {
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
   signing_servers?: number;
-  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
 }

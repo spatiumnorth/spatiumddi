@@ -2553,7 +2553,7 @@ function DnssecCard({
   const signingServers = info.data?.signing_servers ?? 0;
   const signingUnmanaged = info.data?.signing_unmanaged ?? false;
   const unmanagedNote =
-    "DNSSEC is not supported on Technitium in 1.0: SpatiumDDI signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
+    "DNSSEC is not supported on the agentless Technitium API driver: there is no agent to keep the zone signed on a new server, a re-created zone or a lost volume. Use an agent-managed Technitium, BIND9 or PowerDNS group for signed zones.";
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
@@ -2588,7 +2588,7 @@ function DnssecCard({
       {signingUnmanaged && (
         <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
           {enabled
-            ? "DNSSEC not managed. This zone was signed on Technitium and keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume (#1767). You can still unsign it."
+            ? "DNSSEC not managed. This zone was signed through the Technitium API driver and keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume. You can still unsign it."
             : unmanagedNote}
         </div>
       )}
@@ -2722,7 +2722,7 @@ function DnssecCard({
                       disabled={busy}
                       onClick={() => rolloverMut.mutate(k.key_tag)}
                       className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent disabled:opacity-50"
-                      title="Force a key rollover (BIND9 rndc dnssec -rollover)"
+                      title="Force a key rollover (BIND9 rndc dnssec -rollover, Technitium rolloverDnsKey)"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       Roll
@@ -4673,7 +4673,7 @@ export function ZoneDetailView({
             {zone.dnssec_unmanaged_warning && (
               <span
                 className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-700 dark:text-amber-300"
-                title="This zone was signed on Technitium. It keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume (#1767)."
+                title="This zone was signed through the Technitium API driver. It keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume."
               >
                 DNSSEC not managed
               </span>

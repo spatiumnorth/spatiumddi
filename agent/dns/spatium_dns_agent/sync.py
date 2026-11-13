@@ -1195,8 +1195,9 @@ class SyncLoop:
 
             # DNSSEC (issue #49): BIND9 signs inline from the rendered
             # config, so after a structural reload we read each signed
-            # zone's DS + per-key state and report it. PowerDNS reports via
-            # the op path below instead (so its driver has no collector).
+            # zone's DS + per-key state and report it; Technitium does the
+            # same through its API (#1767). PowerDNS reports via the op path
+            # below instead (so its driver has no collector).
             self._dnssec_bundle = bundle
             self._refresh_dnssec_state(force=True)
 
