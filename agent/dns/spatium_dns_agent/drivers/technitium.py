@@ -104,6 +104,13 @@ _CREDS_RETRY_SECONDS = 15 * 60
 # Zones this agent created from a bundle — the only ones it may delete when
 # the bundle drops them (see ``_retire_dropped_zones``).
 _MANAGED_ZONES_FILE = "technitium-managed-zones.json"
+# Durable "this agent created the zone" marker, kept in Technitium itself so it
+# survives a lost state dir (#1775): the comment on the apex SOA record
+# (``zones/records/get`` returns it as ``comments``, ``zones/records/update``
+# takes ``comments``, 15.4.0). Plain text on purpose: a comment starting with
+# ``{`` is parsed as JSON by Technitium. Every SOA update must send it again,
+# because an update without ``comments`` clears it.
+_OWNER_MARKER = "managed by SpatiumDDI agent"
 
 # Record types whose zone-apex form is daemon-managed (SOA always; NS only
 # at the apex — an off-apex NS is a legitimate delegation record and IS
@@ -3980,6 +3987,8 @@ class TechnitiumDriver(DriverBase):
             self._save_held_zone_now(zone)
         if not held:
             self._reconcile_zone_body(token, zone, zone_payload, options)
+            if is_primary:
+                self._stamp_owner_marker(token, zone)
             return False
         try:
             # The zone's options, query access among them, are what release
@@ -3987,6 +3996,8 @@ class TechnitiumDriver(DriverBase):
             self._reconcile_zone_body(token, zone, zone_payload, None)
         finally:
             released = self._release_zone(token, zone, options)
+        if is_primary:
+            self._stamp_owner_marker(token, zone)
         return not released
 
     def _hold_zone(self, token: str, zone: str) -> bool:
@@ -4296,6 +4307,8 @@ class TechnitiumDriver(DriverBase):
                     "ttl": ttl if ttl is not None else soa.get("ttl"),
                     **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
                     **{f: current.get(f) for f in _SOA_TIMERS},
+                    # An update without it clears the owner marker (#1775).
+                    "comments": _OWNER_MARKER,
                 }
                 params.update(desired_soa)
                 body = self._call(token, "POST", "zones/records/update", params).json()
@@ -4395,15 +4408,19 @@ class TechnitiumDriver(DriverBase):
                 ns_retimed=retimed,
             )
 
-    def _zone_is_ours(self, zone: str) -> bool:
+    def _zone_is_ours(self, token: str, zone: str) -> bool:
         """May this agent take over a zone that already exists on the daemon?
 
-        Only a zone from its own ledger, or when the operator opted in with
-        ``TECHNITIUM_ADOPT_EXISTING_ZONES``. An unknown ledger (unreadable,
-        or the retire step never ran) does not block: refusing there would
-        stop every zone on a guess.
+        Only a zone from its own ledger, one carrying the owner marker on
+        its apex SOA (which outlives a lost state dir), or when the operator
+        opted in with ``TECHNITIUM_ADOPT_EXISTING_ZONES``. An unknown ledger
+        (unreadable, or the retire step never ran) does not block: refusing
+        there would stop every zone on a guess. Only a Primary can carry the
+        marker; a Secondary / Stub / Forwarder rests on the ledger alone.
         """
         if self._owned_before is None or zone.lower() in self._owned_before:
+            return True
+        if self._owner_marker_present(token, zone):
             return True
         return os.environ.get("TECHNITIUM_ADOPT_EXISTING_ZONES", "").strip().lower() in (
             "1",
@@ -4411,6 +4428,49 @@ class TechnitiumDriver(DriverBase):
             "yes",
             "on",
         )
+
+    def _owner_marker_present(self, token: str, zone: str) -> bool:
+        try:
+            apex = self._apex_records(token, zone)
+        except (httpx.HTTPError, ValueError):
+            return False
+        soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+        return soa is not None and soa.get("comments") == _OWNER_MARKER
+
+    def _stamp_owner_marker(self, token: str, zone: str) -> None:
+        """Write the owner marker on a Primary zone this agent owns (#1775).
+
+        Also the self-healing step for a zone an older agent created: it is
+        in the ledger, has no marker yet, and gets one on its next pass. A
+        SOA update bumps the serial once; a stamped zone writes nothing.
+        """
+        try:
+            apex = self._apex_records(token, zone)
+            soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+            if soa is None or soa.get("comments") == _OWNER_MARKER:
+                return
+            rdata = soa.get("rData") or {}
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/update",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "SOA",
+                    "ttl": soa.get("ttl"),
+                    "primaryNameServer": rdata.get("primaryNameServer") or "",
+                    "responsiblePerson": rdata.get("responsiblePerson") or "",
+                    "serial": rdata.get("serial"),
+                    **{f: rdata.get(f) for f in _SOA_TIMERS},
+                    "comments": _OWNER_MARKER,
+                },
+            ).json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("technitium_owner_marker_failed", zone=zone, error=str(exc))
+            return
+        if body.get("status") != "ok":
+            log.warning("technitium_owner_marker_failed", zone=zone, error=body.get("errorMessage"))
 
     def _disown_zone(self, zone: str) -> None:
         """Drop a refused zone from the ledger ``_retire_dropped_zones`` just wrote.
@@ -4474,7 +4534,7 @@ class TechnitiumDriver(DriverBase):
         body = resp.json()
         if body.get("status") == "error":
             if _is_zone_exists(body.get("errorMessage")):
-                if check_owned and not self._zone_is_ours(zone):
+                if check_owned and not self._zone_is_ours(token, zone):
                     # #1775: a zone the operator made on the daemon. Taking
                     # it over deletes every record the bundle lacks, and
                     # retiring it later deletes the zone, so leave it alone.
@@ -4780,6 +4840,7 @@ class TechnitiumDriver(DriverBase):
                 "retry": str(rdata.get("retry") or 300),
                 "expire": str(rdata.get("expire") or 604800),
                 "minimum": str(rdata.get("minimum") or 900),
+                "comments": _OWNER_MARKER,
             },
         ).json()
         if body.get("status") != "ok":

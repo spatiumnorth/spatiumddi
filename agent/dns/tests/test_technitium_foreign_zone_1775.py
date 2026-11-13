@@ -13,15 +13,19 @@ from pathlib import Path
 
 import pytest
 
-from spatium_dns_agent.drivers.technitium import _MANAGED_ZONES_FILE, TechnitiumDriver
+from spatium_dns_agent.drivers.technitium import (
+    _MANAGED_ZONES_FILE,
+    _OWNER_MARKER,
+    TechnitiumDriver,
+)
 
-from .test_technitium_reconcile_churn import _ZoneTypedFake
+from .test_technitium_first_create_soa import _SoaFake
 from .test_technitium_render import _install_fake_request, _seed_token, _zone
 
 FORWARD = "corp.test"
 
 
-def _run(tmp_path: Path, fake: _ZoneTypedFake, ledger: list[str] | None) -> TechnitiumDriver:
+def _run(tmp_path: Path, fake: _SoaFake, ledger: list[str] | None) -> TechnitiumDriver:
     d = TechnitiumDriver(state_dir=tmp_path)
     if ledger is not None:
         (tmp_path / _MANAGED_ZONES_FILE).write_text(json.dumps(ledger))
@@ -35,12 +39,12 @@ def _run(tmp_path: Path, fake: _ZoneTypedFake, ledger: list[str] | None) -> Tech
     return d
 
 
-def _deletes(fake: _ZoneTypedFake) -> list[str]:
+def _deletes(fake: _SoaFake) -> list[str]:
     return [p for p, _ in fake.writes if "delete" in p]
 
 
-def _foreign() -> _ZoneTypedFake:
-    fake = _ZoneTypedFake({FORWARD: "Primary"})
+def _foreign() -> _SoaFake:
+    fake = _SoaFake({FORWARD: "Primary"})
     fake.zones[FORWARD] = [
         {
             "name": f"keep.{FORWARD}",
@@ -82,3 +86,29 @@ def test_a_zone_in_the_ledger_is_still_reconciled(tmp_path: Path) -> None:
     d = _run(tmp_path, fake, ledger=[FORWARD])
     assert not d._refused_zones
     assert f"keep.{FORWARD}" not in [r["name"] for r in fake.zones[FORWARD]]
+
+
+def test_a_lost_ledger_with_the_marker_is_still_ours(tmp_path: Path) -> None:
+    fake = _foreign()
+    fake.soa_comments[FORWARD] = _OWNER_MARKER
+    d = _run(tmp_path, fake, ledger=[])  # state dir wiped: empty ledger
+    assert not d._refused_zones
+    assert f"keep.{FORWARD}" not in [r["name"] for r in fake.zones[FORWARD]]
+    assert FORWARD in json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
+    assert fake.soa_comments[FORWARD] == _OWNER_MARKER
+
+
+def test_a_zone_in_the_ledger_without_the_marker_is_stamped(tmp_path: Path) -> None:
+    fake = _foreign()
+    _run(tmp_path, fake, ledger=[FORWARD])
+    assert fake.soa_comments[FORWARD] == _OWNER_MARKER
+    stamps = [p for p, q in fake.writes if q.get("type") == "SOA"]
+    _run(tmp_path, fake, ledger=None)
+    # Stamped once: the second pass writes no further SOA.
+    assert [p for p, q in fake.writes if q.get("type") == "SOA"] == stamps
+
+
+def test_a_new_zone_is_stamped_at_creation(tmp_path: Path) -> None:
+    fake = _SoaFake({})
+    _run(tmp_path, fake, ledger=[])
+    assert fake.soa_comments[FORWARD] == _OWNER_MARKER

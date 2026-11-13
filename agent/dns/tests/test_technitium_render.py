@@ -55,6 +55,14 @@ class _FakeResponse:
         return self._body
 
 
+@pytest.fixture(autouse=True)
+def _no_owner_marker_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests assert the exact calls of a pass. The owner marker (#1775)
+    adds a read of the apex SOA per Primary; it has its own tests in
+    ``test_technitium_foreign_zone_1775.py``."""
+    monkeypatch.setattr(TechnitiumDriver, "_stamp_owner_marker", lambda *a, **k: None)
+
+
 def _without_create_hold(
     calls: list[tuple[str, str, str, dict[str, Any]]],
 ) -> list[tuple[str, str, str, dict[str, Any]]]:
