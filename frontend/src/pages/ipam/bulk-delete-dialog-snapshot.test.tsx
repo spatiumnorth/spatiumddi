@@ -135,6 +135,9 @@ describe("space bulk delete dialog after the approval queue took it", () => {
           ? QUEUED
           : Promise.resolve({ status: 204, data: "" }),
     );
+    answers.authApi = {
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    };
     answers.ipamApi = {
       listBlocks: () => Promise.resolve([block]),
       listSubnets: () => Promise.resolve([mk(5), mk(6)]),
@@ -249,6 +252,9 @@ describe("block bulk delete dialog after the approval queue took it", () => {
   it("still says 1 subnet + 1 block once the selection clears", async () => {
     const deleteSubnet = vi.fn(() => QUEUED);
     const deleteBlock = vi.fn(() => QUEUED);
+    answers.authApi = {
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    };
     answers.ipamApi = { deleteSubnet, deleteBlock };
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false } },
