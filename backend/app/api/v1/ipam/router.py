@@ -16,7 +16,19 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
-from sqlalchemy import String, asc, desc, func, or_, select, text
+from sqlalchemy import (
+    String,
+    asc,
+    desc,
+    exists,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    text,
+    true,
+)
 from sqlalchemy import cast as sa_cast
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
@@ -10192,27 +10204,100 @@ def _mac_like_condition(value: str) -> Any:
     )
 
 
+_TEXT_MATCH_MODES = ("contains", "begins", "ends", "regex")
+_MATCH_FIELDS = {"address", "hostname", "mac", "description", "tag_text"}
+
+
+def _text_match(expr: Any, value: str, mode: str | None) -> Any:
+    """One column filter in the subnet table's four match modes (#1256).
+
+    ``contains`` / ``begins`` / ``ends`` are wildcard-safe ``ILIKE``s; ``regex``
+    is a case-insensitive PostgreSQL regex. A regex that does not compile
+    matches everything, the same as the table's old client-side filter did
+    while the operator is still typing it.
+    """
+    esc = escape_like(value)
+    if mode == "begins":
+        return expr.ilike(f"{esc}%", escape="\\")
+    if mode == "ends":
+        return expr.ilike(f"%{esc}", escape="\\")
+    if mode == "regex":
+        try:
+            re.compile(value)
+        except re.error:
+            return true()
+        return expr.op("~*")(value)
+    return expr.ilike(f"%{esc}%", escape="\\")
+
+
+def _tag_text_condition(value: str, mode: str | None) -> Any:
+    """Free-text tag filter: matches a tag key, value or ``key=value``."""
+    kv = func.jsonb_each_text(IPAddress.tags).table_valued("key", "value").alias("kv")
+    hit = or_(
+        _text_match(kv.c.key, value, mode),
+        _text_match(kv.c.value, value, mode),
+        _text_match(kv.c.key + "=" + kv.c.value, value, mode),
+    )
+    return exists(select(literal(1)).select_from(kv).where(hit))
+
+
+def _parse_match_modes(match: list[str]) -> dict[str, str]:
+    """``["hostname:regex", ...]`` -> ``{"hostname": "regex"}``; 422 on junk."""
+    out: dict[str, str] = {}
+    for item in match:
+        field, _, mode = item.partition(":")
+        if field not in _MATCH_FIELDS or mode not in _TEXT_MATCH_MODES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"match must be <field>:<mode>, field one of {sorted(_MATCH_FIELDS)}, "
+                    f"mode one of {list(_TEXT_MATCH_MODES)}"
+                ),
+            )
+        out[field] = mode
+    return out
+
+
 def _address_search_conditions(
     *,
     q: str | None,
     hostname: str | None,
     mac: str | None,
     status_filter: str | None,
+    address: str | None = None,
+    description: str | None = None,
+    tag_text: str | None = None,
+    modes: dict[str, str] | None = None,
 ) -> list[Any]:
     """Build the shared WHERE conditions for an ``IPAddress`` filter.
 
     ``q`` is a case-insensitive substring matched across the host form of
     the address, hostname, FQDN, description and MAC. ``hostname`` / ``mac``
-    are targeted ``ILIKE %..%`` filters. All conditions AND together (and
-    with any tag filter the caller applies separately).
+    are targeted ``ILIKE %..%`` filters. ``address`` / ``description`` /
+    ``tag_text`` are the same for the other columns the subnet table filters
+    on (#1256 part 2), and ``modes`` (``{field: mode}``) switches any of the
+    five from "contains" to ``begins`` / ``ends`` / ``regex``. All conditions
+    AND together (and with any tag filter the caller applies separately).
     """
+    modes = modes or {}
     conds: list[Any] = []
     if status_filter:
         conds.append(IPAddress.status == status_filter)
     if hostname:
-        conds.append(IPAddress.hostname.ilike(like_pattern(hostname), escape="\\"))
+        conds.append(_text_match(IPAddress.hostname, hostname, modes.get("hostname")))
+    if address:
+        conds.append(_text_match(func.host(IPAddress.address), address, modes.get("address")))
+    if description:
+        conds.append(_text_match(IPAddress.description, description, modes.get("description")))
+    if tag_text:
+        conds.append(_tag_text_condition(tag_text, modes.get("tag_text")))
     if mac:
-        conds.append(_mac_like_condition(mac))
+        mac_mode = modes.get("mac")
+        if mac_mode in _TEXT_MATCH_MODES and mac_mode != "contains":
+            norm = shape_of(mac.strip()).mac_normalized or re.sub(r"[:\-.]", "", mac.lower())
+            conds.append(_text_match(literal_column(IP_MAC_NORMALIZED_SQL), norm, mac_mode))
+        else:
+            conds.append(_mac_like_condition(mac))
     if q:
         pat = like_pattern(q)
         alternatives = [
@@ -10252,7 +10337,9 @@ def _address_order_by(sort: str | None, order: str) -> list[Any]:
         "description": IPAddress.description,
     }
     col = colmap[sort]
-    primary = desc(col) if descending else asc(col)
+    # NULLs last in both directions, as the table's old client-side sort had
+    # them (a never-seen row is not "newest" under last_seen DESC).
+    primary = desc(col).nulls_last() if descending else asc(col).nulls_last()
     return [primary, text("CAST(address AS inet) ASC")]
 
 
@@ -10338,6 +10425,10 @@ async def list_addresses(
     q: str | None = None,
     hostname: str | None = None,
     mac: str | None = None,
+    address: str | None = None,
+    description: str | None = None,
+    tag_text: str | None = None,
+    match: list[str] = Query(default_factory=list),
     sort: str | None = None,
     order: str = "asc",
     limit: int | None = Query(default=None, ge=1, le=_ADDRESS_LIST_CAP),
@@ -10351,6 +10442,13 @@ async def list_addresses(
     ``X-Total-Count`` always carries the total matching rows *before* the
     limit/offset window (exposed to the browser via CORS ``expose_headers``).
 
+    The subnet table pages on this (#1256 part 2), so it also takes the column
+    filters the table has: ``address`` / ``description`` / ``tag_text`` beside
+    ``hostname`` / ``mac`` / ``status_filter`` / ``tag``, and repeatable
+    ``match=<field>:<mode>`` (mode ``contains`` | ``begins`` | ``ends`` |
+    ``regex``) to change how a text filter matches. Omitted, behaviour is as
+    before.
+
     A call with no ``limit`` is capped at ``_ADDRESS_LIST_CAP`` rows (#1256)
     rather than returning every row. When that cap cuts the list short the
     response says so: ``X-Result-Truncated: true`` and a ``Warning`` header,
@@ -10361,10 +10459,18 @@ async def list_addresses(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
     _validate_sort_order(sort, order)
+    modes = _parse_match_modes(match)
 
     base = select(IPAddress).where(IPAddress.subnet_id == subnet_id)
     for cond in _address_search_conditions(
-        q=q, hostname=hostname, mac=mac, status_filter=status_filter
+        q=q,
+        hostname=hostname,
+        mac=mac,
+        status_filter=status_filter,
+        address=address,
+        description=description,
+        tag_text=tag_text,
+        modes=modes,
     ):
         base = base.where(cond)
     base = apply_tag_filter(base, IPAddress.tags, tag)
@@ -10708,6 +10814,11 @@ async def search_address_ids(
     space_id: uuid.UUID | None = None,
     block_id: uuid.UUID | None = None,
     subnet_id: uuid.UUID | None = None,
+    address: str | None = None,
+    description: str | None = None,
+    tag_text: str | None = None,
+    match: list[str] = Query(default_factory=list),
+    selectable: bool = False,
 ) -> AddressSearchIdsResponse:
     """Id-only companion to ``/addresses/search`` (issue #520).
 
@@ -10717,7 +10828,14 @@ async def search_address_ids(
     bulk-delete" flow — those bulk endpoints re-check per-IP token scope +
     write delegation, so this list is a selection convenience, not an
     authorization bypass.
+
+    Takes the subnet table's column filters too (``address`` / ``description``
+    / ``tag_text`` / ``match``, #1256 part 2), so "select all N matching" in
+    the table selects exactly what its filters match. ``selectable=true``
+    leaves out what the table never offers a checkbox for: the network and
+    broadcast rows and rows mirrored from a DHCP lease.
     """
+    modes = _parse_match_modes(match)
     structural = _search_structural_conds(space_id, block_id, subnet_id)
     readable = await _readable_subnet_ids(db, current_user, structural)
 
@@ -10725,9 +10843,21 @@ async def search_address_ids(
     for cond in structural:
         stmt = stmt.where(cond)
     for cond in _address_search_conditions(
-        q=q, hostname=hostname, mac=mac, status_filter=status_filter
+        q=q,
+        hostname=hostname,
+        mac=mac,
+        status_filter=status_filter,
+        address=address,
+        description=description,
+        tag_text=tag_text,
+        modes=modes,
     ):
         stmt = stmt.where(cond)
+    if selectable:
+        stmt = stmt.where(
+            IPAddress.status.notin_(("network", "broadcast")),
+            IPAddress.auto_from_lease.is_(False),
+        )
     stmt = apply_tag_filter(stmt, IPAddress.tags, tag)
     if readable is not None:
         stmt = stmt.where(Subnet.id.in_(readable))

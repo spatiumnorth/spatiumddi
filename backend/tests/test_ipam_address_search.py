@@ -375,3 +375,141 @@ async def test_search_ids_permission_scoping(client: AsyncClient, db_session: As
     body = res.json()
     assert body["ids"] == [str(keep.id)]
     assert body["total"] == 1
+
+
+# ── 1256 part 2: the subnet table's column filters, server-side ───────
+
+
+async def _table_fixture(db: AsyncSession) -> tuple[Subnet, str]:
+    _, token = await _user(db, superadmin=True)
+    subnet = await _subnet(db)
+    rows = [
+        ("10.0.5.1", "gw", "network", "", {}),
+        ("10.0.5.10", "web-a", "allocated", "front end", {"env": "prod"}),
+        ("10.0.5.20", "web-b", "allocated", "front end", {"env": "dev"}),
+        ("10.0.5.110", "db-a", "reserved", "database", {"tier": "data"}),
+        ("10.0.5.255", None, "broadcast", "", {}),
+    ]
+    for addr, host, st, desc_, tags in rows:
+        db.add(
+            IPAddress(
+                subnet_id=subnet.id,
+                address=addr,
+                hostname=host,
+                status=st,
+                description=desc_,
+                tags=tags,
+            )
+        )
+    await db.flush()
+    return subnet, token
+
+
+async def _addrs(client: AsyncClient, token: str, subnet: Subnet, qs: str) -> tuple[list[str], str]:
+    res = await client.get(f"/api/v1/ipam/subnets/{subnet.id}/addresses?{qs}", headers=_auth(token))
+    assert res.status_code == 200, res.text
+    return [r["address"] for r in res.json()], res.headers["X-Total-Count"]
+
+
+@pytest.mark.asyncio
+async def test_subnet_list_column_filters_and_modes(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    subnet, token = await _table_fixture(db_session)
+    # address contains vs begins vs ends vs regex
+    assert (await _addrs(client, token, subnet, "address=10"))[0] == [
+        "10.0.5.1",
+        "10.0.5.10",
+        "10.0.5.20",
+        "10.0.5.110",
+        "10.0.5.255",
+    ]
+    got, total = await _addrs(client, token, subnet, "address=10.0.5.1&match=address:begins")
+    assert got == ["10.0.5.1", "10.0.5.10", "10.0.5.110"] and total == "3"
+    assert (await _addrs(client, token, subnet, "address=0&match=address:ends"))[0] == [
+        "10.0.5.10",
+        "10.0.5.20",
+        "10.0.5.110",
+    ]
+    assert (await _addrs(client, token, subnet, r"address=\.1\d{1,3}$&match=address:regex"))[0] == [
+        "10.0.5.10",
+        "10.0.5.110",
+    ]
+    # An uncompilable regex filters nothing (still being typed), not a 500.
+    assert (await _addrs(client, token, subnet, "address=(&match=address:regex"))[1] == "5"
+    # hostname regex, description, status
+    assert (await _addrs(client, token, subnet, "hostname=^web&match=hostname:regex"))[0] == [
+        "10.0.5.10",
+        "10.0.5.20",
+    ]
+    assert (await _addrs(client, token, subnet, "description=data"))[0] == ["10.0.5.110"]
+    assert (await _addrs(client, token, subnet, "status_filter=reserved"))[0] == ["10.0.5.110"]
+    # free-text tag: key, value or key=value
+    assert (await _addrs(client, token, subnet, "tag_text=env"))[0] == ["10.0.5.10", "10.0.5.20"]
+    assert (await _addrs(client, token, subnet, "tag_text=env=prod"))[0] == ["10.0.5.10"]
+    assert (await _addrs(client, token, subnet, "tag_text=data"))[0] == ["10.0.5.110"]
+    # filters AND together and the total counts the filtered set
+    got, total = await _addrs(client, token, subnet, "description=front&hostname=web-b")
+    assert got == ["10.0.5.20"] and total == "1"
+
+
+@pytest.mark.asyncio
+async def test_subnet_list_filtered_sorted_page_total(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    subnet, token = await _table_fixture(db_session)
+    got, total = await _addrs(
+        client,
+        token,
+        subnet,
+        "address=10.0.5.&match=address:begins&sort=hostname&order=desc&limit=2",
+    )
+    # NULL hostnames sort last in both directions; total is the whole filtered set.
+    assert got == ["10.0.5.20", "10.0.5.10"] and total == "5"
+    got, _ = await _addrs(
+        client,
+        token,
+        subnet,
+        "address=10.0.5.&match=address:begins&sort=hostname&order=desc&limit=2&offset=2",
+    )
+    assert got == ["10.0.5.1", "10.0.5.110"]
+    got, _ = await _addrs(
+        client,
+        token,
+        subnet,
+        "address=10.0.5.&match=address:begins&sort=hostname&order=desc&limit=2&offset=4",
+    )
+    assert got == ["10.0.5.255"]
+
+
+@pytest.mark.asyncio
+async def test_subnet_list_bad_match_is_422(client: AsyncClient, db_session: AsyncSession) -> None:
+    subnet, token = await _table_fixture(db_session)
+    for bad in ("address:fuzzy", "nosuch:begins", "address"):
+        res = await client.get(
+            f"/api/v1/ipam/subnets/{subnet.id}/addresses?address=1&match={bad}",
+            headers=_auth(token),
+        )
+        assert res.status_code == 422, bad
+
+
+@pytest.mark.asyncio
+async def test_search_ids_takes_table_filters_and_selectable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    subnet, token = await _table_fixture(db_session)
+    res = await client.get(
+        f"/api/v1/ipam/addresses/search/ids?subnet_id={subnet.id}"
+        "&address=10.0.5.1&match=address:begins&selectable=true",
+        headers=_auth(token),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # 10.0.5.1 is the network row, so the selectable view leaves it out.
+    assert body["total"] == 2 and len(body["ids"]) == 2
+    res = await client.get(
+        f"/api/v1/ipam/addresses/search/ids?subnet_id={subnet.id}"
+        "&address=10.0.5.1&match=address:begins",
+        headers=_auth(token),
+    )
+    assert res.json()["total"] == 3
