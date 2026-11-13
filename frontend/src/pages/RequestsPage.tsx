@@ -140,6 +140,10 @@ const STATE_FILTERS: { value: ChangeRequestState; label: string }[] = [
   { value: "expired", label: "Expired" },
 ];
 
+// The server's bound on a decision note and on a justification (2000); the boxes
+// stop at it so an over-long text is never sent and refused after the press (#3835).
+const NOTE_MAX = 2000;
+
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString();
@@ -489,6 +493,7 @@ function NewRequestModal({
           </label>
           <textarea
             rows={3}
+            maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             placeholder="Context for whoever reviews this — what it's for, how long you need it."
             value={justification}
@@ -669,6 +674,7 @@ function DecisionModal({
           </label>
           <textarea
             rows={2}
+            maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             value={note}
             onChange={(e) => setNote(e.target.value)}

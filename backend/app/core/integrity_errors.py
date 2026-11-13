@@ -78,7 +78,26 @@ def parse_foreign_key_detail(detail: str) -> ForeignKeyViolation | None:
 _UNIQUE_DETAIL_RE = re.compile(r"Key \((?P<cols>[^)]*)\)=\(.*\) already exists")
 
 
-def unique_violation_message(detail: str) -> str:
+# Keys whose violation deserves a sentence rather than a column list (#3824):
+# a DNS zone's key is (group_id, view_id, name), which names no zone at all.
+_FRIENDLY_UNIQUE: dict[str, str] = {
+    "uq_dns_zone_group_view_name": (
+        "A DNS zone with that name already exists in this server group and view."
+    ),
+}
+
+
+def unique_violation_constraint(exc: Any) -> str | None:
+    """The violated constraint / index name for a 23505, if the driver gives it."""
+    orig = getattr(exc, "orig", None)
+    for candidate in (getattr(orig, "__cause__", None), orig):
+        name = getattr(candidate, "constraint_name", None)
+        if name:
+            return str(name)
+    return None
+
+
+def unique_violation_message(detail: str, constraint: str | None = None) -> str:
     """The 409 text for a 23505, naming the conflicting field(s) (#2738).
 
     Only the column names are echoed, never the values: they are the caller's
@@ -86,6 +105,8 @@ def unique_violation_message(detail: str) -> str:
     back. An unparseable DETAIL keeps the generic sentence.
     """
     generic = "The request conflicts with existing data."
+    if constraint and constraint in _FRIENDLY_UNIQUE:
+        return _FRIENDLY_UNIQUE[constraint]
     match = _UNIQUE_DETAIL_RE.search(detail or "")
     if match is None:
         return generic

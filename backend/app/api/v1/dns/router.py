@@ -37,6 +37,7 @@ from pydantic import (
 )
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2055,11 +2056,17 @@ async def _refresh_record_or_404(db: AsyncSession, record: DNSRecord) -> None:
     The zone is gone, which is what ``404 Zone not found`` says to a request
     that arrives after the delete. Whether the row is gone is decided by
     looking for it, not by the exception's wording; anything else re-raises.
+    The id is read from the instance's identity, never ``record.id``: after the
+    failed refresh the instance is expired and an attribute read would lazy-load
+    on the sync path, raising ``MissingGreenlet`` (#4043).
     """
     try:
         await db.refresh(record)
     except InvalidRequestError as exc:
-        still_there = await db.scalar(select(DNSRecord.id).where(DNSRecord.id == record.id))
+        identity = sa_inspect(record).identity
+        if identity is None:
+            raise
+        still_there = await db.scalar(select(DNSRecord.id).where(DNSRecord.id == identity[0]))
         if still_there is not None:
             raise
         raise HTTPException(status_code=404, detail="Zone not found") from exc
@@ -3433,6 +3440,9 @@ class SyncFromServerResponse(BaseModel):
     zones_failed: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that was queued as record ops (a large
+    # agentless zone, #3817) rather than applied inline.
+    total_queued: int = 0
     total_push_errors: int
     # Zones listed by the server over WinRM (windows_dns Path B only).
     # Empty for BIND9 and Windows DNS without credentials — the caller can
@@ -3471,6 +3481,8 @@ class GroupSyncWithServersResponse(BaseModel):
     servers_succeeded: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that is queued for delivery, not yet applied.
+    total_queued: int = 0
     total_push_errors: int
     total_zones_imported: int
     total_zones_pushed_to_server: int
@@ -3674,6 +3686,7 @@ async def _sync_single_server(
     zones_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
 
     for zone in zones:
@@ -3685,6 +3698,8 @@ async def _sync_single_server(
             zones_succeeded += 1
             total_imported += result.pull.imported
             total_pushed += result.push.pushed
+            if result.push.queued_for_agent:
+                total_queued += result.push.pushed
             total_push_errors += len(result.push.push_errors)
             items.append(
                 ZoneSyncItem(
@@ -3751,6 +3766,7 @@ async def _sync_single_server(
         zones_failed=len(zones) - zones_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         zones_on_server=sorted(set(zones_on_server)),
         new_zones_on_server=new_zones,
@@ -3814,6 +3830,7 @@ async def sync_group_with_servers(
     servers_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
     total_zones_imported = 0
     total_zones_pushed_to_server = 0
@@ -3838,6 +3855,7 @@ async def sync_group_with_servers(
             servers_succeeded += 1
             total_imported += result.total_imported
             total_pushed += result.total_pushed
+            total_queued += result.total_queued
             total_push_errors += result.total_push_errors
             total_zones_imported += len(result.zones_imported)
             total_zones_pushed_to_server += len(result.zones_pushed_to_server)
@@ -3865,6 +3883,7 @@ async def sync_group_with_servers(
         servers_succeeded=servers_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         total_zones_imported=total_zones_imported,
         total_zones_pushed_to_server=total_zones_pushed_to_server,

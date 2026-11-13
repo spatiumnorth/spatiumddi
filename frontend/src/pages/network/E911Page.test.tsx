@@ -42,6 +42,7 @@ vi.mock("@/hooks/usePermissions", async () => {
 });
 
 const { E911Page } = await import("@/pages/network/E911Page");
+const { bindingTargetText } = await import("@/pages/network/bindingTarget");
 
 const erl = {
   id: "e1",
@@ -147,5 +148,26 @@ describe("E911 lists", () => {
       /No location bindings match the current search or filter/,
     );
     expect(screen.queryByText(/No bindings yet/)).toBeNull();
+  });
+});
+
+describe("binding target text (#4060)", () => {
+  it("shows the address, not the address row id", () => {
+    const text = bindingTargetText({
+      ...binding,
+      rule_kind: "ip",
+      ip_address_id: "f60208bf-4740",
+      target_label: "192.0.2.50 (subnet 192.0.2.0/24)",
+    } as never);
+    expect(text).toBe("192.0.2.50 (subnet 192.0.2.0/24)");
+  });
+  it("marks a binding whose target row is gone", () => {
+    const text = bindingTargetText({
+      ...binding,
+      ip_address_id: "f60208bf-4740",
+      target_label: null,
+      target_missing: true,
+    } as never);
+    expect(text).toBe("f60208bf-4740 (target deleted)");
   });
 });
