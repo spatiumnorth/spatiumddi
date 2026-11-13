@@ -6038,6 +6038,8 @@ export interface ZoneServerStateEntry {
   // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
+  // #1779 — this server's verdict; not always current == target (Technitium).
+  in_sync: boolean;
 }
 
 export interface ZoneServerState {

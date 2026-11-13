@@ -2535,6 +2535,13 @@ class TechnitiumDriver(DriverBase):
                 apex = _zone_apex(zname, zone)
                 if apex is not None:
                     entry["apex"] = apex
+                # The control plane's serial for the zone (#1779). Technitium
+                # numbers the zone itself and starts at 1, so a server created
+                # later, or a zone re-created, serves a lower one; the apex
+                # reconcile raises it to this when it is behind.
+                serial = zone.get("serial")
+                if isinstance(serial, int) and not isinstance(serial, bool) and serial > 0:
+                    entry["serial"] = serial
             zones_payload.append(entry)
 
 
@@ -2578,6 +2585,65 @@ class TechnitiumDriver(DriverBase):
             json.loads(zones_path.read_text())
         except ValueError as exc:
             raise RuntimeError(f"zones.json is not valid JSON: {exc}") from exc
+
+    def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
+        """Zone name (lowercase, no trailing dot) -> the serial the daemon serves (#1779).
+
+        The sync loop reported the BUNDLE's serial for every zone, so a zone the
+        driver skipped, or whose create the daemon refused, read as converged at
+        a serial nothing on the wire carried, and so did two servers whose own
+        counters had long diverged. A zone the daemon does not hold, or whose
+        SOA cannot be read, is left out and so is not reported; an unreadable
+        API returns an empty map: nothing is better than something unverified.
+        """
+        return self._read_served_serials(
+            [str(z["name"]) for z in bundle.get("zones") or [] if z.get("name")]
+        )
+
+    def periodic_served_serials(self) -> dict[str, int]:
+        """The same read over the zones of the last applied render, for the
+        sync loop's between-changes report: Technitium moves a zone's serial
+        itself on every record write."""
+        try:
+            payload = json.loads((self.state_dir / "rendered" / "zones.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        return self._read_served_serials(
+            [str(z["zone"]) for z in payload if isinstance(z, dict) and z.get("zone")]
+        )
+
+    def _read_served_serials(self, names: list[str]) -> dict[str, int]:
+        token = self._get_api_token()
+        if token is None:
+            return {}
+        out: dict[str, int] = {}
+        for name in names:
+            bare = name.rstrip(".").lower()
+            if not bare or bare in out:
+                continue
+            try:
+                body = self._call(
+                    token, "GET", "zones/records/get", {"domain": bare, "zone": bare}
+                ).json()
+            except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                log.warning("technitium_served_serial_unreadable", zone=bare, error=str(exc))
+                continue
+            if body.get("status") != "ok":
+                continue
+            response = body.get("response") or {}
+            # ``zone=`` resolves to the nearest ENCLOSING zone when the one
+            # asked for does not exist, so a zone the daemon lacks would read
+            # as its parent's serial. Only the zone itself counts.
+            resolved = str((response.get("zone") or {}).get("name") or bare).strip(".").lower()
+            if resolved != bare:
+                continue
+            for rec in response.get("records") or []:
+                if rec.get("type") == "SOA" and (rec.get("name") or "").lower() == bare:
+                    serial = (rec.get("rData") or {}).get("serial")
+                    if isinstance(serial, int) and not isinstance(serial, bool):
+                        out[bare] = serial
+                    break
+        return out
 
     def swap_and_reload(self) -> None:
         """Promote the new render into place and reconcile via REST.
@@ -4217,8 +4283,17 @@ class TechnitiumDriver(DriverBase):
                 deleted=deleted,
                 updated=updated,
             )
-        self._reconcile_zone_apex(token, zone, zone_payload.get("apex"))
-    def _reconcile_zone_apex(self, token: str, zone: str, apex: dict[str, Any] | None) -> None:
+        self._reconcile_zone_apex(
+            token, zone, zone_payload.get("apex"), zone_payload.get("serial")
+        )
+
+    def _reconcile_zone_apex(
+        self,
+        token: str,
+        zone: str,
+        apex: dict[str, Any] | None,
+        serial: int | None = None,
+    ) -> None:
         """Bring a primary zone's SOA and apex NS set in line with ``apex``.
 
         Both are written only when they differ from what the daemon serves.
@@ -4226,11 +4301,19 @@ class TechnitiumDriver(DriverBase):
         15.4: it requires the current serial and stores current + 1), so an
         unconditional write would change every zone's serial on every pass.
 
+        ``serial`` is the control plane's serial for the zone (#1779). A SOA
+        update carrying a serial HIGHER than the stored one is adopted as
+        given (``ApexZone.GetNewSerial``), so a zone behind it (a new server,
+        or a zone re-created at 1) is raised to it by one SOA write, and one
+        already at or past it is left alone: the serial is never lowered, and
+        each record write has already moved the daemon's own on.
+
         NS targets are added before the old ones are removed, so the zone is
         never left without a name server, even if a call fails halfway.
         """
-        if not apex:
+        if not apex and serial is None:
             return
+        apex = apex or {}
         resp = self._call(token, "GET", "zones/records/get", {"domain": zone, "zone": zone})
         try:
             body = resp.json()
@@ -4259,8 +4342,15 @@ class TechnitiumDriver(DriverBase):
         soa_changed = False
         desired_soa = apex.get("soa") or {}
         ttl = apex.get("ttl")
-        if soa is not None and (desired_soa or ttl is not None):
+        if soa is not None and (desired_soa or ttl is not None or serial is not None):
             current = soa.get("rData") or {}
+            current_serial = current.get("serial")
+            serial_behind = (
+                serial is not None
+                and isinstance(current_serial, int)
+                and not isinstance(current_serial, bool)
+                and serial > current_serial
+            )
             current_fields: dict[str, Any] = {
                 key: str(current.get(key) or "").rstrip(".").lower()
                 for key in ("primaryNameServer", "responsiblePerson")
@@ -4269,12 +4359,12 @@ class TechnitiumDriver(DriverBase):
             differs = any(current_fields.get(k) != v for k, v in desired_soa.items())
             if ttl is not None and soa.get("ttl") != ttl:
                 differs = True
-            if differs:
+            if differs or serial_behind:
                 params: dict[str, Any] = {
                     "zone": zone,
                     "domain": zone,
                     "type": "SOA",
-                    "serial": current.get("serial"),
+                    "serial": serial if serial_behind else current_serial,
                     "ttl": ttl if ttl is not None else soa.get("ttl"),
                     **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
                     **{f: current.get(f) for f in _SOA_TIMERS},

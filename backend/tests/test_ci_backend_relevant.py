@@ -124,6 +124,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_caa_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_caa.py"),
     # #1765 — the BIND address-match translator is duplicated in the agent.
     "test_technitium_acl_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
+    "test_technitium_apex_parity_1774.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
     # #2121 — the forward-zone transport helper is duplicated, whole, in the
     # agent; covered by the agent/dns/spatium_dns_agent/ carve-out.
     "test_zone_forward_transport.py": ("agent/dns/spatium_dns_agent/drivers/_forwarders.py"),

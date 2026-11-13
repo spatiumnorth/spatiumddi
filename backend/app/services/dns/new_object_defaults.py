@@ -21,7 +21,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNS_TTL_MAX, ZONE_DEFAULT_TTL, DNSServerGroup, DNSServerOptions
 from app.models.settings import PlatformSettings
-from app.services.dns import technitium_api_scope
 
 logger = structlog.get_logger(__name__)
 
@@ -75,15 +74,13 @@ async def load_dns_defaults(db: AsyncSession) -> DNSNewObjectDefaults:
 
 
 async def default_zone_ttl(db: AsyncSession, group_id: uuid.UUID) -> int:
-    """The TTL a new zone in ``group_id`` takes when none was given.
+    """The TTL a new zone in ``group_id`` takes when none was given: Settings'
+    default.
 
-    Settings' default, except in an experimental ``technitium_api`` group:
-    that driver never writes a zone TTL and its scope gate refuses anything
-    but the stock value (#1784), so the default would turn a create that
-    omits the TTL into a 422 (or store a value nothing serves).
+    Every driver takes it, the agentless Technitium one included since it
+    writes the zone TTL into the SOA (#1774). ``group_id`` stays for the callers
+    that pass it; the answer no longer depends on the group.
     """
-    if await technitium_api_scope.group_is_technitium_api(db, group_id):
-        return ZONE_DEFAULT_TTL
     return (await load_dns_defaults(db)).ttl
 
 
