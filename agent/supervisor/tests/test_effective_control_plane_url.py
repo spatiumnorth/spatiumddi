@@ -125,13 +125,13 @@ def test_member_uses_the_node_local_service(
     assert url != heartbeat._IN_CLUSTER_CONTROL_PLANE_URL
 
 
-def test_one_failure_keeps_the_node_local_service(
+def test_one_failure_falls_back_to_the_configured_url(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _member(monkeypatch)
     heartbeat.note_local_api_result(heartbeat._IN_CLUSTER_NODE_LOCAL_URL, False)
     cfg = _cfg("https://10.0.0.5", tmp_path)
-    assert heartbeat._effective_control_plane_url(cfg) == heartbeat._IN_CLUSTER_NODE_LOCAL_URL
+    assert heartbeat._effective_control_plane_url(cfg) == "https://10.0.0.5"
 
 
 def test_repeated_failures_fall_back_to_pinned_https_never_cluster_http(
@@ -179,10 +179,13 @@ def test_results_for_other_urls_do_not_count(
     assert heartbeat._local_api["failures"] == 0
 
 
-def test_no_configured_url_keeps_the_node_local_service(
+def test_no_configured_url_falls_back_to_the_cluster_service(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _member(monkeypatch)
     for _ in range(heartbeat._LOCAL_API_FAIL_THRESHOLD):
         heartbeat.note_local_api_result(heartbeat._IN_CLUSTER_NODE_LOCAL_URL, False)
-    assert heartbeat._effective_control_plane_url(_cfg("", tmp_path)) == heartbeat._IN_CLUSTER_NODE_LOCAL_URL
+    assert (
+        heartbeat._effective_control_plane_url(_cfg("", tmp_path))
+        == heartbeat._IN_CLUSTER_CONTROL_PLANE_URL
+    )

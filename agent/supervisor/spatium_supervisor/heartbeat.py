@@ -155,10 +155,14 @@ _IN_CLUSTER_NODE_LOCAL_URL = (
     "http://spatium-control-spatiumddi-api-local.spatium.svc.cluster.local.:8000"
 )
 
-# Consecutive connection failures to the node-local Service before the
-# supervisor stops using it, and how long it then waits before trying it again.
-_LOCAL_API_FAIL_THRESHOLD = 2
+# Connection failures to the node-local Service before the supervisor stops
+# using it, and how long it then waits before trying it again. One is enough:
+# the Service has no endpoint only while this node has no ready api pod.
+_LOCAL_API_FAIL_THRESHOLD = 1
 _LOCAL_API_RETRY_S = 60.0
+# A node with no ready api pod makes the Service DROP traffic (no refusal), so
+# the node-local attempt must not wait out the request timeout to find out.
+_LOCAL_API_CONNECT_TIMEOUT_S = 4.0
 
 _local_api: dict[str, Any] = {"failures": 0, "last_failure": 0.0, "fallback_logged": False}
 
@@ -196,21 +200,22 @@ def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     node-local Service (#3645), so the plain-http hop never leaves the node.
     While that node has no ready api pod, they use the configured
     ``CONTROL_PLANE_URL``, which goes over https against the pinned
-    certificate (``cp_tls``), never plain http across the node LAN.
-    Everyone else uses the configured URL. Returns ``""`` only when a
-    non-member has no configured URL — the caller skips the heartbeat.
+    certificate (``cp_tls``), never plain http across the node LAN. A
+    member with none configured (the seed: firstboot writes it empty on a
+    control-plane install) uses the cluster-wide api Service, as it did
+    before #3645, so no node is ever left without a path. Everyone else
+    uses the configured URL. Returns ``""`` only when a non-member has no
+    configured URL — the caller skips the heartbeat.
     """
     if not _is_control_plane_member():
         return cfg.control_plane_url
-    if _local_api_usable() or not cfg.control_plane_url:
+    if _local_api_usable():
         return _IN_CLUSTER_NODE_LOCAL_URL
+    fallback = cfg.control_plane_url or _IN_CLUSTER_CONTROL_PLANE_URL
     if not _local_api["fallback_logged"]:
         _local_api["fallback_logged"] = True
-        log.warning(
-            "supervisor.control_plane.node_local_unavailable",
-            fallback=cfg.control_plane_url,
-        )
-    return cfg.control_plane_url
+        log.warning("supervisor.control_plane.node_local_unavailable", fallback=fallback)
+    return fallback
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -1524,25 +1529,41 @@ def heartbeat_once(
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 
-    try:
-        resp = client.post(
-            url, content=body_bytes, headers=headers, timeout=float(hold_s) + 10.0
-        )
-    except httpx.HTTPError as exc:
-        # A read timeout means an api pod took the request; anything else
-        # (refused, no endpoint, DNS) means the node-local Service has none.
-        note_local_api_result(url, isinstance(exc, httpx.ReadTimeout))
-        # Transient network / DNS / timeout — don't count toward
-        # revocation strikes. The control plane is unreachable, not
-        # rejecting us; once it comes back the 200 path resumes.
-        log.warning("supervisor.heartbeat.failed", error=str(exc))
-        # #1219 — the control plane presented a certificate other than the
-        # pinned one. Re-pin if its CA vouches for the new one (a rotation),
-        # refuse if not (an interception). The next heartbeat uses the result.
-        if cp_tls.is_verification_failure(exc):
-            cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+    read_timeout = float(hold_s) + 10.0
+    resp = None
+    # Two attempts at most: the node-local Service, then (when that had no
+    # answer) the fallback target, in the same call so a node whose api pod is
+    # away loses one connect timeout, not a whole heartbeat interval.
+    for _attempt in range(2):
+        timeout = httpx.Timeout(read_timeout)
+        if url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+            timeout = httpx.Timeout(read_timeout, connect=_LOCAL_API_CONNECT_TIMEOUT_S)
+        try:
+            resp = client.post(url, content=body_bytes, headers=headers, timeout=timeout)
+        except httpx.HTTPError as exc:
+            # A read timeout means an api pod took the request; anything else
+            # (refused, connect timeout, no endpoint, DNS) means the node-local
+            # Service has none.
+            note_local_api_result(url, isinstance(exc, httpx.ReadTimeout))
+            # Transient network / DNS / timeout — don't count toward
+            # revocation strikes. The control plane is unreachable, not
+            # rejecting us; once it comes back the 200 path resumes.
+            log.warning("supervisor.heartbeat.failed", error=str(exc))
+            # #1219 — the control plane presented a certificate other than the
+            # pinned one. Re-pin if its CA vouches for the new one (a rotation),
+            # refuse if not (an interception). The next heartbeat uses the result.
+            if cp_tls.is_verification_failure(exc):
+                cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+                return None
+            retry = _effective_control_plane_url(cfg).rstrip("/") + url_path
+            if retry == url:
+                return None
+            url = retry
+            continue
+        note_local_api_result(url, True)
+        break
+    if resp is None:
         return None
-    note_local_api_result(url, True)
     revocation = revocation_reason(resp)
     if revocation is None and resp.status_code in (403, 404):
         # #2798 — a refusal that is NOT the control plane's revocation

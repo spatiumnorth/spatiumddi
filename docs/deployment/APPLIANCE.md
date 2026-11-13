@@ -821,7 +821,10 @@ only ever the api pod on its own node) rather than the seed node's IP it was
 installed/promoted against. With no ready api pod on its node it falls back to
 its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
 a node's api pod never strands a member's control plane and no plain http
-crosses the node LAN. Off-cluster DNS/DHCP
+crosses the node LAN. The seed has no `CONTROL_PLANE_URL` (firstboot writes it
+empty on a control-plane install), so it falls back to the cluster-wide api
+Service, as before #3645: a path through another node's api pod beats none.
+Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
@@ -842,9 +845,13 @@ appliance already runs one per node: `replicas` equals the control-plane size,
 with required anti-affinity). A node whose api pod is down (crashed, rolling,
 or not yet scheduled after a node join) has no local endpoint, and its
 supervisor does not wait:
-after two refused heartbeats it uses its `CONTROL_PLANE_URL` over https against
-the pinned certificate (`cp_tls`), and retries the local Service every 60 s.
-Plain http is therefore only ever node-local. The frontend's `/api` proxy is deliberately not on the
+the Service drops traffic rather than refusing it, so the node-local attempt has
+a 4 s connect timeout, and after the first failed attempt the same heartbeat is
+re-sent to its `CONTROL_PLANE_URL` over https against the pinned certificate
+(`cp_tls`; the seed uses the cluster Service). It tries the local Service again
+once 60 s have passed, on its next heartbeat, and goes back to it when that
+lands. Plain http is therefore only ever node-local, except for the seed's
+fallback. The frontend's `/api` proxy is deliberately not on the
 node-local Service: the node-local path has no fallback there, so it would turn
 an api pod rolling on a node into a UI outage on that node. It keeps the
 cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
