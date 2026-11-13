@@ -1,0 +1,167 @@
+name: Operator
+
+# The SpatiumDDI Operator for OperatorHub (#3862). Two lanes in one file:
+#
+#   check    (pull_request + workflow_dispatch) builds the operator image,
+#            proves the chart is vendored and stamped into it, scans it with
+#            Trivy, checks the operator's RBAC against what the chart renders,
+#            and validates the OLM bundle. Single-arch, no push, cheap.
+#            It is deliberately NOT a required check on protect-main.
+#
+#   publish  (tag push + workflow_dispatch) pushes the multi-arch image and
+#            uploads the community-catalog layout as a workflow artifact. It is
+#            OFF until a maintainer sets the repository VARIABLE
+#            OPERATOR_PUBLISH=true. Until then a release tag does nothing
+#            here, and nothing reaches ghcr.io.
+#
+# Why this is its own workflow and not a row in .github/images.json: that file
+# is read by release.yml and nightly.yml, so adding the image there would make
+# the next release and the next nightly publish it, no opt-in. Moving it into
+# images.json is the follow-up once the operator is listed.
+on:
+  pull_request:
+    paths:
+      - "operator/**"
+      - "charts/spatiumddi/**"
+      - "docs/assets/logo-icon.svg"
+      - ".github/workflows/operator.yml"
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer to build and publish (publish also needs vars.OPERATOR_PUBLISH=true)"
+        required: false
+        default: "0.0.0-dev"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Operator RBAC covers what the chart renders
+        run: |
+          docker run --rm --entrypoint sh -v "$PWD:/repo" -w /repo -e HOME=/tmp \
+            alpine/helm:4.3.1 -c 'apk add -q --no-cache python3 py3-yaml && python3 operator/hack/check_rbac.py'
+
+      - name: The checked-in bundle is what the generator produces
+        run: |
+          operator/hack/build-bundle.sh 0.0.0-dev
+          git diff --exit-code -- operator/bundle operator/bundle.Dockerfile
+
+      - name: Validate a release bundle in the community layout
+        run: |
+          operator/hack/build-bundle.sh 1.0.0 --community "$RUNNER_TEMP/community" --validate
+          test -f "$RUNNER_TEMP/community/operators/spatiumddi/ci.yaml"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the operator image (single-arch, loaded for the checks)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: operator/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: VERSION=1.0.0
+          tags: spatiumddi-operator:pr
+          cache-from: type=gha,scope=spatiumddi-operator
+          cache-to: type=gha,mode=max,scope=spatiumddi-operator
+
+      - name: The image carries the chart, stamped, and runs as non-root
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint grep spatiumddi-operator:pr -E '^(version|appVersion):' /opt/helm/helm-charts/spatiumddi/Chart.yaml
+          uid=$(docker image inspect spatiumddi-operator:pr -f '{{.Config.User}}')
+          [ -n "$uid" ] && [ "$uid" != "0" ] && [ "$uid" != "root" ]
+          # Any uid in group 0 (OpenShift restricted-v2) must be able to read the chart.
+          docker run --rm --user 1000650000:0 --entrypoint sh spatiumddi-operator:pr -c 'cat /opt/helm/watches.yaml >/dev/null && ls /opt/helm/helm-charts/spatiumddi/templates >/dev/null'
+
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          skip-setup-trivy: true
+          image-ref: spatiumddi-operator:pr
+          format: json
+          output: trivy-report.json
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+
+      # ADVISORY for now. The remaining HIGH findings (checked 2026-11) are Go
+      # dependencies and stdlib compiled into upstream's helm-operator binary
+      # (go1.26.4), which no Dockerfile change can fix; they clear only when
+      # operator-framework publishes a new release. Flip continue-on-error off
+      # once a clean base exists, or before publishing if a maintainer wants
+      # the gate hard.
+      - name: Gate on the scan
+        continue-on-error: true
+        run: .github/scripts/trivy-gate.sh trivy-report.json spatiumddi-operator:pr
+
+  publish:
+    # The opt-in guard. A repository variable, so turning it on needs no PR.
+    if: github.event_name != 'pull_request' && vars.OPERATOR_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version
+        id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = tag ]; then v="$REF_NAME"; else v="$INPUT_VERSION"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # Fails (loudly) on a CalVer tag: OLM cannot order those.
+      # The version reaches the shell through env, never interpolated into the
+      # script: a tag name or a dispatch input is text a writer chose.
+      - name: Build the community layout
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          operator/hack/build-bundle.sh "$VERSION" \
+            --community "$RUNNER_TEMP/community" --validate
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: operatorhub-community-layout
+          path: ${{ runner.temp }}/community
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the operator image (amd64 + arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: operator/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ steps.v.outputs.version }}
+          tags: ghcr.io/${{ github.repository_owner }}/spatiumddi-operator:${{ steps.v.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

@@ -26,7 +26,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
+{{- /* #3862: ``migrate.nameByContent`` (the OLM Operator sets it) names the Job
+       after a hash of what renders it instead of the Helm revision, and keeps
+       the finished Job instead of expiring it. helm-operator dry-runs an
+       upgrade on every reconcile and upgrades whenever that manifest differs
+       from the deployed one; a revision in the name always differs, so it
+       would upgrade forever, deleting the running migrate Job each time, and
+       a TTL-expired Job would be recreated and re-run. Same inputs, same
+       name: no diff. Any change to them is a new Job, so the pod template is
+       never patched in place (Job templates are immutable). */}}
+{{- $byContent := eq (toString .Values.migrate.nameByContent) "true" }}
+{{- if $byContent }}
+  name: {{ include "spatiumddi.fullname" . }}-migrate-{{ toJson (list .Values .Chart.Version .Chart.AppVersion .Capabilities.KubeVersion.Version .Release.Name .Release.Namespace) | sha256sum | trunc 10 }}
+{{- else }}
   name: {{ include "spatiumddi.fullname" . }}-migrate-r{{ .Release.Revision }}
+{{- end }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "migrate") .) | nindent 4 }}
@@ -36,7 +50,9 @@ metadata:
   {{- end }}
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
+  {{- if not $byContent }}
   ttlSecondsAfterFinished: {{ .Values.migrate.ttlSecondsAfterFinished | default 600 }}
+  {{- end }}
   template:
     metadata:
       labels:

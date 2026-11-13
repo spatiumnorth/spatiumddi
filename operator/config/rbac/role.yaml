@@ -1,0 +1,83 @@
+# NAMESPACED permissions (OLM turns every Role bound here into a ``permissions``
+# entry and creates it in the namespace the operator is installed into / watches).
+#
+# Why these and not wildcards: helm-operator runs ``helm install|upgrade`` as
+# the operator's own ServiceAccount, so it needs create/update/delete on every
+# kind the chart renders. Separately, the chart renders Roles (the SCC ``use``
+# grants and the CNPG CA publisher) and the Kubernetes API refuses to create a
+# Role or RoleBinding granting permissions the creator does not hold itself
+# (RBAC escalation prevention). The operator therefore holds, below, the
+# union of what the chart's own Roles grant, instead of being given the
+# ``escalate`` / ``bind`` verbs, which would let it grant ANYTHING.
+#
+# ``hack/check_rbac.py`` renders the chart (vanilla Kubernetes and OpenShift,
+# every supported toggle) and fails CI when a rendered kind or a rule in a
+# rendered Role is not covered here. Adding a template to the chart means
+# adding the matching line to this file.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatiumddi-operator
+rules:
+# The objects the chart renders. ``secrets`` also holds Helm's release record
+# (one Secret per revision) and the generated api secret key / DB password.
+- apiGroups: [""]
+  resources: [services, serviceaccounts, configmaps, persistentvolumeclaims, secrets]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [apps]
+  resources: [deployments, statefulsets]
+  verbs: [get, list, watch, create, update, patch, delete]
+# Read-only: the chart's ``lookup`` of the live ReplicaSets (the rollback-safe
+# rollout strategy, spatiumddi.newerReleaseServing). watches.yaml runs every
+# dry-run with lookup enabled, and a lookup the operator may not make fails
+# the whole render.
+- apiGroups: [apps]
+  resources: [replicasets]
+  verbs: [get, list, watch]
+- apiGroups: [batch]
+  resources: [jobs, cronjobs]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses]
+  verbs: [get, list, watch, create, update, patch, delete]
+# OpenShift Route for the frontend (openshift.route.enabled). custom-host is
+# the subresource the API requires to set spec.host on a Route.
+- apiGroups: [route.openshift.io]
+  resources: [routes]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [route.openshift.io]
+  resources: [routes/custom-host]
+  verbs: [create]
+# postgresql.kind=cnpg: the CloudNativePG Cluster (the CNPG operator itself is
+# NOT installed by this operator).
+- apiGroups: [postgresql.cnpg.io]
+  resources: [clusters]
+  verbs: [get, list, watch, create, update, patch, delete]
+# The chart's Roles / RoleBindings: SCC use grants for the DNS / DHCP agents
+# and the CNPG CA publisher's own Role.
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [roles, rolebindings]
+  verbs: [get, list, watch, create, update, patch, delete]
+# Escalation-prevention copies of what the chart's Roles grant (see header):
+# ``use`` on SCCs (the DNS / DHCP agent SCC grants) ...
+- apiGroups: [security.openshift.io]
+  resources: [securitycontextconstraints]
+  verbs: [use]
+# ... and the cnpg-ca-publisher Role (read the CA Secret, patch the ConfigMap).
+# ``secrets`` and ``configmaps`` get/patch are already held above.
+# Helm-operator emits events on the resource it reconciles.
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+# The custom resource itself, its status and its finalizer (helm-operator
+# uninstalls the release from a finalizer).
+- apiGroups: [ddi.spatiumddi.com]
+  resources: [spatiumddis, spatiumddis/status, spatiumddis/finalizers]
+  verbs: [get, list, watch, create, update, patch, delete]
+# Leader election.
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update, patch, delete]

@@ -345,6 +345,7 @@ them:
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job, a regular Job named per revision (`<release>-migrate-r<revision>`), not a Helm hook |
 | `migrate.annotations` | `{}` | Annotations on the Job object (not its pod). For GitOps, see below |
+| `migrate.nameByContent` | `false` | #3862 — name the Job `<release>-migrate-<hash>` from its inputs (values, chart and Kubernetes version) instead of the revision, and keep it once finished (no `ttlSecondsAfterFinished`). For controllers that re-render on a timer and upgrade on any difference; the OLM Operator sets it |
 | `migrate.nodeSelector` / `.tolerations` / `.affinity` | unset (follows `api.*`) | #3207 — placement of the migrate Job's pod. Unset runs it where the api runs: `api.nodeSelector`, `api.tolerations` and `api.affinity.nodeAffinity` (not the api's pod anti-affinity, which would keep the Job off the api's nodes), with `global.controlPlaneNodeSelector` merged into the selector. `{}` / `[]` opt out of the api's values |
 | `initContainers.resources` | requests `10m` / `32Mi`, limit `256Mi` memory | #3208 — resources of every `wait-for-postgres` / `wait-for-migrate` init container |
 | `postgresql.cnpg.enablePDB` | unset (auto) | #3204 — `kind: cnpg`. Unset enables the primary PodDisruptionBudget only when `instances > 1`, so a single instance can be drained; an explicit `true` / `false` wins |

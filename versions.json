@@ -114,6 +114,24 @@
       "note": "Lock-stepped to k3s's Kubernetes minor, not chosen independently -- the e2e exists to prove the chart on the Kubernetes the appliance actually runs. Digest-pinned because kindest/node tags are re-pushed. Bump with k3s, and take the digest kind publishes for the tag."
     },
 
+    "operator-sdk": {
+      "version": "v1.42.3",
+      "pinned_in": [
+        { "path": "operator/hack/build-bundle.sh", "match": "operator-sdk:{version}", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "operator-framework/operator-sdk" },
+      "note": "Build-time tool only (#3862) -- generates + validates the OLM bundle, run as a container by operator/hack/build-bundle.sh; never shipped. MUST equal the helm-operator base image below: the two are released together and the bundle records the sdk version that built it."
+    },
+
+    "helm-operator": {
+      "version": "v1.42.3",
+      "pinned_in": [
+        { "path": "operator/Dockerfile", "match": "helm-operator:{version}", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "operator-framework/operator-sdk" },
+      "note": "SHIPPED: the runtime base of the SpatiumDDI Operator image (#3862), quay.io/operator-framework/helm-operator, UBI 9 derived, amd64 + arm64. Lock-stepped to operator-sdk above. Apache-2.0 (the operator-sdk project); the UBI layers carry Red Hat's redistribution terms. Listed in NOTICE and docs/THIRD_PARTY.md."
+    },
+
     "helm": {
       "version": "v4.3.1",
       "pinned_in": [

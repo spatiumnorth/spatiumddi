@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: operator-bundle operator-check operator-image charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -442,6 +442,23 @@ charts-lint:
 	  $(HELM_IMAGE) -c 'apk add -q --no-cache bash curl python3 py3-yaml \
 	    && .github/scripts/install-kubeconform.sh \
 	    && .github/scripts/charts-render-check.sh'
+
+# SpatiumDDI Operator for OperatorHub (#3862). `operator-bundle` writes the
+# OLM bundle for one release (and, with COMMUNITY=<dir>, the layout the two
+# community catalogs expect); `operator-check` is the RBAC-vs-chart check CI's
+# operator.yml runs; `operator-image` builds the image locally. See
+# docs/deployment/OPERATOR.md.
+#   make operator-bundle VERSION=1.0.0 [COMMUNITY=/tmp/community] [VALIDATE=1]
+operator-bundle:
+	@test -n "$(VERSION)" || { echo "VERSION=<semver> is required"; exit 1; }
+	operator/hack/build-bundle.sh "$(VERSION)" $(if $(COMMUNITY),--community "$(COMMUNITY)") $(if $(VALIDATE),--validate)
+
+operator-check:
+	docker run --rm --entrypoint sh -v "$(PWD):/repo" -w /repo -e HOME=/tmp $(HELM_IMAGE) \
+	  -c 'apk add -q --no-cache python3 py3-yaml && python3 operator/hack/check_rbac.py'
+
+operator-image:
+	docker build -f operator/Dockerfile --build-arg VERSION=$(or $(VERSION),0.0.0-dev) -t spatiumddi-operator:$(or $(VERSION),dev) .
 
 # Version-pin manifest (#975). Asserts that every pin declared in the root
 # versions.json still appears, at that version, in each file that carries a

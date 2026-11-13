@@ -112,6 +112,7 @@ Notes worth carrying:
 | [frr-k8s](https://github.com/metallb/frr-k8s) | v0.0.21, MetalLB's BGP backend | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
 | [kube-rbac-proxy](https://github.com/brancz/kube-rbac-proxy) | v0.23.0, frr-k8s metrics sidecar | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
 | [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.1 (operator 1.30.1) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
+| [helm-operator](https://github.com/operator-framework/operator-sdk) (operator-sdk) | v1.42.3, runtime base of the SpatiumDDI Operator image (UBI 9 layers, Red Hat redistribution terms) | Apache 2.0 | Operator image (opt-in, #3862) | `operator/Dockerfile`, `versions.json` |
 | [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Compose HA overlay (non-functional, unsupported in 1.0, #1236) | `k8s/ha/` |
 | [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Compose Patroni overlay (non-functional, #1236) | `k8s/ha/` |
 
