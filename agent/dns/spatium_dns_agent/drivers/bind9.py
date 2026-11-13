@@ -3093,6 +3093,12 @@ class Bind9Driver(DriverBase):
     #: ingest mirrors (``learned`` in the bundle, #2850): for these named's
     #: copy wins at the carry (``_carry_zone``).
     _learned_rrsets: dict[str, set[str]] | None = None
+    #: Rendered paths (``zones/<view>/<zone>.db``) of the zones the last verify
+    #: found named had not loaded (#4080). Kept across applies: the retry after
+    #: a failed verify has to check them again though their bytes did not
+    #: change, and must render an RPZ one afresh rather than reuse the file
+    #: named could not load.
+    _unloaded_zones: set[str] = set()
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -3959,7 +3965,9 @@ class Bind9Driver(DriverBase):
         out of ``named-checkzone`` and out of every ``rndc reload``.
         """
         key = _rpz_render_key(bl)
-        if key is not None:
+        # A file named could not load is not reused again (#4080): its sidecar
+        # vouches for the bytes, not for named being able to read them.
+        if key is not None and rel not in self._unloaded_zones:
             for tree in (self.rendered_dir_name, "rendered.prev"):
                 src = self.state_dir / tree / rel
                 digest = _rpz_reusable(src, key)
@@ -4578,6 +4586,13 @@ class Bind9Driver(DriverBase):
         sources = _view_carry_sources(new_dir, prev_tree)
         if changed is not None:
             changed |= carry
+            # Zones named failed to load last time are checked again, bytes
+            # changed or not (#4080).
+            changed |= {
+                zv
+                for zv in _zone_views_under(new_dir)
+                if _zone_rel(*zv) in self._unloaded_zones
+            }
         frozen: dict[tuple[str, str | None], int | None] = {}
         running = bool(rndc and current.exists() and self.daemon_running())
         if running:
@@ -5551,6 +5566,7 @@ class Bind9Driver(DriverBase):
             if only is None or zv in only
         }
         total = len(pending)
+        checked = {_zone_rel(*zv) for zv in pending}
         why: dict[tuple[str, str | None], str] = {}
         deadline = time.monotonic() + _ZONE_LOAD_TIMEOUT_S
 
@@ -5586,6 +5602,11 @@ class Bind9Driver(DriverBase):
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(_ZONE_LOAD_POLL_S)
+        # Remember what named did not load, for the retry (#4080); a zone that
+        # loaded is forgotten.
+        self._unloaded_zones = (self._unloaded_zones - checked) | {
+            _zone_rel(*zv) for zv in pending
+        }
         if pending:
             listed = [
                 f"{_zone_label(*zv)}: {why.get(zv, 'no answer')}" for zv in pending
