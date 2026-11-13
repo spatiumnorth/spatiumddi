@@ -1525,6 +1525,7 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
               if (e.target.value) setCreateForSubnet(e.target.value);
               e.target.value = "";
             }}
+            aria-label="Serve leases on subnet"
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
             {...dhcpGate("write", "dhcp_scope")}
           >
