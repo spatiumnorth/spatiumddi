@@ -40,7 +40,8 @@ const previewReprovision = vi.fn(() => Promise.resolve(plan));
 const commitReprovision = vi.fn(() => Promise.resolve(plan));
 const findLeasesByIp = vi.fn();
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   dhcpApi: {
     previewReprovision: (...a: unknown[]) =>
       (previewReprovision as (...x: unknown[]) => unknown)(...a),

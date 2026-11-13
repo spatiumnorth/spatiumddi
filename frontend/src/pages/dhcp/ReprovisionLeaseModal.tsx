@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { dhcpApi, type DHCPLease } from "@/lib/api";
+import { dhcpApi, formatApiError, type DHCPLease } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { Field, inputCls } from "./_shared";
 
 function errText(e: unknown): string {
-  const err = e as { response?: { data?: { detail?: unknown } } };
-  const d = err?.response?.data?.detail;
-  if (typeof d === "string") return d;
-  return "Request failed — check your permissions and try again.";
+  return formatApiError(
+    e,
+    "Request failed — check your permissions and try again.",
+  );
 }
 
 function List({ title, items }: { title: string; items: string[] }) {
