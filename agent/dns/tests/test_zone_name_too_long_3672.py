@@ -374,6 +374,6 @@ def test_the_apply_error_words_a_name_length_hold_apart_from_bad_data() -> None:
         [],
     )
     assert "named-checkzone refused a zone file, held back until the data loads" in err
-    assert "zone name too long: a zone held back until renamed" in err
+    assert "the agent holds back a zone whose name is too long for its files" in err
     only = _partial_apply_error([HeldZone("b.test", None, "long", False, True)], [])
     assert "named-checkzone" not in only

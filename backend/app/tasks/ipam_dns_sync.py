@@ -188,6 +188,13 @@ async def _reapply_ddns_for_active_leases(
 # headroom for a slower box, where 200 (~22 s) would not have it.
 SYNC_BATCH_SIZE = 100
 
+# #3804 — addresses per transaction for the Trash-restore DDNS republish. It
+# runs the full DDNS policy per address (hostname resolution, record diff, op
+# enqueue), so it costs ~0.1-0.15 s a row where the auto-sync's diff costs far
+# less: one 100-row batch held its row locks 10-15 s. 20 rows commits in ~2 s.
+# Lock order is unchanged (address rows ascending, then zones).
+RESTORE_REPUBLISH_BATCH_SIZE = 20
+
 
 def _first_line(exc: BaseException) -> str:
     """``Type: first line`` of an exception. A cancelled statement's message
@@ -543,7 +550,7 @@ async def active_lease_mirror_ids(db: Any, subnet_id: Any) -> list[Any]:
 
 async def republish_restored_lease_ddns(db: Any, subnet_ids: list[Any]) -> tuple[int, set[Any]]:
     """Re-run the DDNS policy for the active lease mirrors of ``subnet_ids``
-    (the subnets a Trash restore brought back), ``SYNC_BATCH_SIZE`` addresses
+    (the subnets a Trash restore brought back), ``RESTORE_REPUBLISH_BATCH_SIZE`` addresses
     per transaction, address rows then zones locked first as the auto-sync does
     (#3724). Idempotent: a mirror whose records are already published is
     skipped, and a subnet whose effective DDNS is off publishes nothing.
@@ -561,12 +568,12 @@ async def republish_restored_lease_ddns(db: Any, subnet_ids: list[Any]) -> tuple
             continue
         ids = await active_lease_mirror_ids(db, subnet_id)
         await db.rollback()
-        for i in range(0, len(ids), SYNC_BATCH_SIZE):
+        for i in range(0, len(ids), RESTORE_REPUBLISH_BATCH_SIZE):
             try:
                 locked = set(
                     await _lock_dns_sync_rows(
                         db,
-                        ids[i : i + SYNC_BATCH_SIZE],
+                        ids[i : i + RESTORE_REPUBLISH_BATCH_SIZE],
                         ddns=True,
                         restrict_subnet_id=subnet_id,
                         gate_zones=True,
@@ -591,7 +598,7 @@ async def republish_restored_lease_ddns(db: Any, subnet_ids: list[Any]) -> tuple
                 logger.warning(
                     "restore_ddns_republish_batch_failed",
                     subnet=str(subnet_id),
-                    size=len(ids[i : i + SYNC_BATCH_SIZE]),
+                    size=len(ids[i : i + RESTORE_REPUBLISH_BATCH_SIZE]),
                     error=_first_line(exc),
                 )
     return fired, wake

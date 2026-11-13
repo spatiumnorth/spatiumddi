@@ -44,8 +44,9 @@ class HeldZone(NamedTuple):
     #: True: the daemon keeps serving the zone's last good copy. False: the
     #: zone never loaded, so it is not served at all.
     served: bool
-    #: True: held for its name's length, which no data change can fix (#3750).
-    name_too_long: bool = False
+    #: True: held for its NAME (too long for the agent's files, #3843), not for
+    #: anything in its data, so named-checkzone never saw it.
+    name_hold: bool = False
 
 
 class DriverBase(ABC):

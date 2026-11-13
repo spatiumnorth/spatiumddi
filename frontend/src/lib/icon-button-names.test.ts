@@ -74,6 +74,72 @@ const spreadMayName = (a: ts.JsxSpreadAttribute): boolean => {
  */
 const PENDING: Record<string, string> = {};
 
+/**
+ * Form controls (`input`, `select`, `textarea`) named only by a permission
+ * gate (#3760). A control with no label and no `aria-label` takes its name
+ * from `title`, which a gate replaces with the refusal while denied, so a
+ * read-only user hears why it is off and never what it does (a placeholder
+ * is no better: the title wins). It needs `aria-label` / `aria-labelledby`,
+ * or a wrapping `<label>` / `<Field label>`. Also flagged: a `title` computed from a gate's
+ * reason (`gate.title`, `permissionGate(...).title`) or chosen between an
+ * action and a reason (`ok ? "Edit" : "Only the creator..."`), on such a
+ * control or on an icon-only button, for the same reason.
+ */
+const FIELDS = new Set(["input", "select", "textarea"]);
+// A string in a conditional title that reads as a refusal rather than an action.
+const REFUSAL =
+  /\b(only|requires?|cannot|can't|can not|not allowed|read-only|permission|may not)\b/i;
+const titleIsReason = (a: ts.JsxAttribute): boolean => {
+  const init = a.initializer;
+  if (!init || !ts.isJsxExpression(init) || !init.expression) return false;
+  const t = init.expression.getText();
+  if (/\.title\b/.test(t)) return true;
+  return (
+    /\?[\s\S]*:/.test(t.replace(/\?\?/g, "")) &&
+    (t.match(/(["'`])(?:(?!\1)[^\\])*\1/g) ?? []).some((x) => REFUSAL.test(x))
+  );
+};
+
+function unnamedFields(fileName: string, code: string): number[] {
+  const sf = ts.createSourceFile(
+    fileName,
+    code,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const found: number[] = [];
+  const visit = (n: ts.Node, inLabel: boolean) => {
+    const el = ts.isJsxElement(n)
+      ? n.openingElement
+      : ts.isJsxSelfClosingElement(n)
+        ? n
+        : undefined;
+    const tag = el?.tagName.getText() ?? "";
+    if (el && FIELDS.has(tag) && !inLabel) {
+      const props = el.attributes.properties;
+      const attrs = props.filter(ts.isJsxAttribute);
+      const durable = attrs.some((a) => DURABLE.has(a.name.getText()));
+      const type = attrs.find((a) => a.name.getText() === "type");
+      const hidden = type?.initializer?.getText().includes("hidden");
+      const gated = props.some(
+        (a) =>
+          ts.isJsxSpreadAttribute(a) &&
+          GATE_SPREAD.test(a.expression.getText()),
+      );
+      const title = attrs.find((a) => a.name.getText() === "title");
+      const reasonTitle = !!title && titleIsReason(title);
+      if (!durable && !hidden && (gated || reasonTitle)) {
+        found.push(sf.getLineAndCharacterOfPosition(n.getStart()).line + 1);
+      }
+    }
+    const next = inLabel || tag === "label" || tag === "Field";
+    ts.forEachChild(n, (c) => visit(c, next));
+  };
+  visit(sf, false);
+  return found;
+}
+
 function sources(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
@@ -129,7 +195,9 @@ function unnamedIconButtons(fileName: string, code: string): number[] {
       const named = props.some(
         (a) =>
           (ts.isJsxSpreadAttribute(a) && spreadMayName(a)) ||
-          (ts.isJsxAttribute(a) && naming.has(a.name.getText())),
+          (ts.isJsxAttribute(a) &&
+            naming.has(a.name.getText()) &&
+            !(a.name.getText() === "title" && titleIsReason(a))),
       );
       let content = false;
       let icon = false;
@@ -176,6 +244,46 @@ describe("icon-only buttons", () => {
         .filter((o) => !(o.rel in PENDING))
         .map((o) => `${o.rel}:${o.line}`),
     ).toEqual([]);
+  });
+
+  const fieldOffenders = sources(SRC).flatMap((file) => {
+    const rel = file.slice(SRC.length + 1);
+    return unnamedFields(file, readFileSync(file, "utf8")).map((line) => ({
+      rel,
+      line,
+    }));
+  });
+
+  it("form controls under a permission gate carry an aria-label (#3760)", () => {
+    expect(fieldOffenders.map((o) => `${o.rel}:${o.line}`)).toEqual([]);
+  });
+
+  it.each([
+    ["a gate spread", "<input placeholder='IP' {...writeGate} />"],
+    ["a gate and a title", "<select title='Pick' {...dhcpGate('w','x')} />"],
+    [
+      "a title taken from a gate",
+      "<input type='checkbox' title={permissionGate(ok, why).title ?? 'Also'} />",
+    ],
+  ])("flags a form control named by %s", (_, jsx) => {
+    expect(unnamedFields("f.tsx", `const a = (${jsx});`)).toEqual([1]);
+  });
+
+  it.each([
+    ["an aria-label", "<input aria-label='IP' {...writeGate} />"],
+    ["a wrapping label", "<label>IP <input {...writeGate} /></label>"],
+    ["no gate", "<input placeholder='IP' title='hint' />"],
+  ])("passes a form control with %s", (_, jsx) => {
+    expect(unnamedFields("f.tsx", `const a = (${jsx});`)).toEqual([]);
+  });
+
+  it("flags an icon button whose title is a reason in a conditional", () => {
+    expect(
+      unnamedIconButtons(
+        "f.tsx",
+        "const a = (<button title={own ? 'Edit' : 'Only the creator'}><Pencil /></button>);",
+      ),
+    ).toEqual([1]);
   });
 
   it("has no stale pending entries", () => {

@@ -27,7 +27,7 @@ export function partialApplyDetail(error: string | null | undefined): string {
     : e;
 }
 
-export const PARTIAL_APPLY_LABEL = "Zones refused";
+export const PARTIAL_APPLY_LABEL = "Zones held back";
 
 export const PARTIAL_APPLY_EXPLAIN =
-  "This agent applied the saved configuration, but its daemon refused the zones named below. Every other zone is served as saved, and nothing was rolled back. Fix the refused zones' data, or shorten a zone name the reason says is too long.";
+  "This agent applied the saved configuration, but is holding back the zones named below: its daemon refused them, or the agent cannot store them (a name too long for its files). Every other zone is served as saved, and nothing was rolled back. The reason after each zone's name says what to change.";

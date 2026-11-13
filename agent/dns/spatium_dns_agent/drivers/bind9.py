@@ -4094,7 +4094,10 @@ class Bind9Driver(DriverBase):
         for e in bl.get("entries") or []:
             domain = e["domain"].rstrip(".")
             key = domain.lower()
-            if key in excluded:
+            # An exception emits ``N`` and ``*.N`` as passthru, so a
+            # subdomains-only entry ``*.N`` (adblock ``.N^``, #4037) would
+            # put a second CNAME on that owner.
+            if key in excluded or key.removeprefix("*.") in excluded:
                 continue
             action = e.get("action") or "block"
             block_mode = e.get("block_mode") or "nxdomain"

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Modal } from "./modal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Per-server maintenance-mode pause flow (issue #182). Shared between
@@ -66,9 +67,9 @@ export function PauseServerModal({
           />
         </div>
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <button

@@ -36,6 +36,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -321,7 +322,9 @@ export function MulticastGroupModal({
         <MembershipsTab groupId={existing.id} />
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -441,7 +444,11 @@ export function PortsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
       </div>
 
       {ports.length === 0 ? (
@@ -593,7 +600,11 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
       </div>
 
       {memberships.length === 0 ? (
@@ -910,7 +921,9 @@ function BulkAllocateModal({
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
