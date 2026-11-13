@@ -41,6 +41,9 @@ class AuditLog(Base):
 
     __tablename__ = "audit_log"
     __table_args__ = (
+        # Migration d92f4a18c763 creates this UNIQUE; it guards the hash chain
+        # (#1253: the model used to omit it, so create_all lacked it).
+        Index("ix_audit_log_seq", "seq", unique=True),
         Index("ix_audit_log_timestamp", "timestamp"),
         Index("ix_audit_log_user_id", "user_id"),
         Index("ix_audit_log_resource", "resource_type", "resource_id"),

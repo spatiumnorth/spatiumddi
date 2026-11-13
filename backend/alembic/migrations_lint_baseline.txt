@@ -139,6 +139,8 @@ backend/alembic/versions/a3d9f1e64c72_dns_zone_update_acl.py:drop_column:106
 backend/alembic/versions/a3d9f1e64c72_dns_zone_update_acl.py:drop_table:105
 backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:106
 backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:108
+backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:add_constraint_validating:76
+backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:create_index_blocking:84
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:139
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:140
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:141
@@ -152,6 +154,7 @@ backend/alembic/versions/a3f1e9c47b20_platform_settings_verbose_boot.py:drop_col
 backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop_column:33
 backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop_column:34
 backend/alembic/versions/a3f7c1e84d59_appliance_lldpd_running.py:drop_column:35
+backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:create_index_blocking:33
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:38
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
@@ -298,6 +301,7 @@ backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_column:11
 backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_column:119
 backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_column:120
 backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_constraint_fk:112
+backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:create_index_blocking:63
 backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:85
 backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:86
 backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:88
@@ -414,6 +418,9 @@ backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:37
 backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_column:63
 backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_table:65
 backend/alembic/versions/c5f1a2b3d4e6_firewall_logging_enabled.py:drop_column:37
+backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:add_constraint_validating:38
+backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:add_constraint_validating:46
+backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:add_constraint_validating:54
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:110
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:111
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:112
@@ -564,6 +571,7 @@ backend/alembic/versions/d4c1f7e3b821_appliance_k3s_cert_and_cidrs.py:drop_colum
 backend/alembic/versions/d4e2f7a9b1c6_utilization_max_prefix.py:drop_column:49
 backend/alembic/versions/d4e2f7a9b1c6_utilization_max_prefix.py:drop_column:50
 backend/alembic/versions/d4e9f2a7c1b8_saved_views.py:drop_table:79
+backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:add_constraint_validating:67
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:79
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:80
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:81
@@ -620,9 +628,10 @@ backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:57
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:58
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:59
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:60
-backend/alembic/versions/d8f3a61c2e47_dns_server_memory_limit.py:drop_column:30
+backend/alembic/versions/d8f3a61c2e47_dns_server_memory_limit.py:drop_column:31
 backend/alembic/versions/d8f3b6a41e52_e911_trail_bound_settings.py:drop_column:47
 backend/alembic/versions/d8f3b6a41e52_e911_trail_bound_settings.py:drop_column:48
+backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:create_index_blocking:139
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:166
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:167
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:168
@@ -684,6 +693,8 @@ backend/alembic/versions/e4a7f10b2c39_agent_last_seen_ip.py:drop_column:41
 backend/alembic/versions/e4a7f10b2c39_agent_last_seen_ip.py:drop_column:42
 backend/alembic/versions/e4b8073af215_wol_run_target_verify_evidence.py:drop_column:53
 backend/alembic/versions/e4b8c27d91f3_dns_server_zone_resync_seq.py:drop_column:32
+backend/alembic/versions/e4b8c2d17a95_dhcp_lease_identity_unique.py:create_index_blocking:62
+backend/alembic/versions/e4b8c2d17a95_dhcp_lease_identity_unique.py:create_index_blocking:69
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:321
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:346
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:453
@@ -845,6 +856,7 @@ backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:1
 backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:118
 backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:119
 backend/alembic/versions/f4c81a37e0b2_opnsense_last_sync_warning.py:drop_column:36
+backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:create_index_blocking:49
 backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:drop_column:57
 backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:drop_column:58
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_column:171
@@ -852,6 +864,8 @@ backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_table:169
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_table:178
 backend/alembic/versions/f59a5371bdfb_asn_management.py:drop_table:147
 backend/alembic/versions/f59a5371bdfb_asn_management.py:drop_table:153
+backend/alembic/versions/f5b1a8c3d927_dns_pool_healthcheck.py:add_constraint_validating:171
+backend/alembic/versions/f5b1a8c3d927_dns_pool_healthcheck.py:create_index_blocking:179
 backend/alembic/versions/f5b1a8c3d927_dns_pool_healthcheck.py:drop_column:190
 backend/alembic/versions/f5b1a8c3d927_dns_pool_healthcheck.py:drop_constraint_fk:189
 backend/alembic/versions/f5b1a8c3d927_dns_pool_healthcheck.py:drop_table:193
