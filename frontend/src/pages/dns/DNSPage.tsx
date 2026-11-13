@@ -788,7 +788,7 @@ function ConfirmSingleModal({
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">{description}</p>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -992,9 +992,9 @@ function ImportZoneModal({
         </p>
 
         {error && (
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
 
         {preview && (
@@ -1440,7 +1440,7 @@ function GroupModalForm({
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -2450,7 +2450,7 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
             <code>DNS_AGENT_KEY</code> in deployment docs.
           </p>
         )}
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -2688,9 +2688,9 @@ function DnssecCard({
       </div>
 
       {error && (
-        <div className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <FormError className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5">
           {error}
-        </div>
+        </FormError>
       )}
 
       {enabled && keys.length > 0 && (
@@ -3235,9 +3235,7 @@ function ZoneModalForm({
                 />
               </Field>
             )}
-            {transportErr && (
-              <p className="text-xs text-destructive">{transportErr}</p>
-            )}
+            {transportErr && <FormError>{transportErr}</FormError>}
           </div>
         )}
         {(zoneType === "secondary" || zoneType === "stub") && (
@@ -3411,7 +3409,7 @@ function ZoneModalForm({
             onChange={setCustomerId}
           />
         </Field>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -3637,7 +3635,7 @@ function RecordModalForm({
               required
               autoFocus
             />
-            {nameErr && <p className="text-xs text-destructive">{nameErr}</p>}
+            {nameErr && <FormError>{nameErr}</FormError>}
           </Field>
           <Field label="Type">
             <select
@@ -3883,7 +3881,7 @@ function RecordModalForm({
             </p>
           )}
         </Field>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -6951,7 +6949,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </div>
       )}
 
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {error && <FormError className="mt-2">{error}</FormError>}
 
       {(creating || editing) && (
         <ViewModal
@@ -7236,7 +7234,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </div>
         </details>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
@@ -7480,7 +7478,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
               placeholder={"10.0.0.0/8\n192.168.0.0/16\n!198.51.100.0/24"}
             />
           </Field>
-          {error && <p className="text-xs text-destructive">{error}</p>}
+          {error && <FormError>{error}</FormError>}
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -8040,9 +8038,7 @@ function TSIGKeyModalForm({
           />
         </div>
         {saveMut.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(saveMut.error, "Save failed")}
-          </p>
+          <FormError>{formatApiError(saveMut.error, "Save failed")}</FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -8593,9 +8589,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           button just flips back to "Save Changes" and the operator has no
           idea why nothing happened. */}
       {saveMut.isError && (
-        <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {formatApiError(saveMut.error, "Save failed")}
-        </p>
+        </FormError>
       )}
 
       {/* Stored values a Technitium server here will not apply (#1763):
@@ -10087,9 +10083,9 @@ function RecordsTab({
               Administration → Trash.
             </p>
             {deleteMut.isError && (
-              <p className="text-sm text-destructive">
+              <FormError className="text-sm">
                 {formatApiError(deleteMut.error, "Delete failed")}
-              </p>
+              </FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -10825,7 +10821,7 @@ export function BlocklistScopeModal({
           )}
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex items-center justify-between border-t pt-3">
           <span className="text-xs text-muted-foreground">
@@ -11752,7 +11748,7 @@ function BlocklistModalForm({
           />
           Enabled
         </label>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>
@@ -12765,9 +12761,9 @@ export function SyncWithServersResultModal({
           </div>
         )}
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
         {result && (
           <>
@@ -12865,9 +12861,9 @@ export function SyncWithServersResultModal({
                 </summary>
                 <div className="px-3 py-2 space-y-2">
                   {srv.error && (
-                    <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                    <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                       {srv.error}
-                    </div>
+                    </FormError>
                   )}
                   {srv.result && (
                     <>

@@ -2626,7 +2626,7 @@ function VlanPicker({
             />
           </div>
           {inlineError && (
-            <p className="text-[11px] text-destructive">{inlineError}</p>
+            <FormError className="text-[11px]">{inlineError}</FormError>
           )}
           <div className="flex justify-end gap-2">
             <button
@@ -7974,9 +7974,9 @@ export function DnsSyncModal({
             <p className="text-sm text-muted-foreground">Computing drift…</p>
           )}
           {error && (
-            <p className="text-sm text-destructive">
+            <FormError className="text-sm">
               Failed to load preview. {formatApiError(error)}
-            </p>
+            </FormError>
           )}
           {data && (
             <>
@@ -8885,9 +8885,9 @@ function EditSubnetModalForm({
             </span>
           </div>
           {deleteError && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </div>
+            </FormError>
           )}
           <div className="flex justify-end gap-2">
             <button
@@ -8936,9 +8936,9 @@ function EditSubnetModalForm({
             Trash.
           </label>
           {deleteError && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </div>
+            </FormError>
           )}
           {deleteNotice && (
             <div
@@ -11204,9 +11204,9 @@ function AddressSetModalForm({
           </Field>
         </div>
         {error && (
-          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -12926,9 +12926,9 @@ function EditSpaceModalForm({
             Trash.
           </label>
           {deleteError && (
-            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </p>
+            </FormError>
           )}
           {deleteNotice && (
             <div
@@ -13113,9 +13113,9 @@ function EditSpaceModalForm({
       )}
 
       {saveError && (
-        <p className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {saveError}
-        </p>
+        </FormError>
       )}
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -13832,9 +13832,9 @@ function EditBlockModalForm({
             to Trash.
           </label>
           {deleteError && (
-            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </p>
+            </FormError>
           )}
           {deleteNotice && (
             <div
@@ -16870,7 +16870,7 @@ function BulkEditSubnetsModal({
           />
         </label>
       </div>
-      {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
+      {error && <FormError className="mt-2">{error}</FormError>}
       <div className="mt-4 flex justify-end gap-2">
         <button
           onClick={onClose}
@@ -17718,9 +17718,9 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
           )}
 
           {error && (
-            <p className="text-sm text-destructive">
+            <FormError className="text-sm">
               {formatApiError(error, "Search failed.")}
-            </p>
+            </FormError>
           )}
 
           {hasQuery && (

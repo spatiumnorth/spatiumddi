@@ -33,6 +33,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -258,10 +259,10 @@ export function RuleEditorModal({
           </p>
         )}
         {catalogue.isError && (
-          <p className="text-xs text-red-600">
+          <FormError>
             Could not load the rule types
             {existing ? "; its parameters cannot be edited here." : "."}
-          </p>
+          </FormError>
         )}
         {existing && types && !spec && (
           // #2130 — the catalogue leaves out a type whose feature module is
@@ -381,7 +382,7 @@ export function RuleEditorModal({
           />
           Rule enabled
         </label>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
