@@ -39,6 +39,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.request_meta import get_trusted_client_ip
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.dns import DNS_TTL_MAX
@@ -64,8 +65,10 @@ from app.services.api_token_scopes import token_write
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
     mask_proxy_url,
+    mask_source_uris,
     render_sources_list,
     restore_proxy_credentials,
+    restore_source_uri,
 )
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
@@ -384,6 +387,9 @@ class SettingsResponse(BaseModel):
             # Mask the userinfo, keep the host; ``update_settings`` puts the
             # stored credential back when the form re-sends the mask.
             cols["apt_proxy_http"] = mask_proxy_url(cols.get("apt_proxy_http"))
+            # A source URI may embed ``user:pass@`` for a private mirror; mask
+            # it the same way. ``update_settings`` restores it from the mask.
+            cols["apt_sources"] = mask_source_uris(cols.get("apt_sources"))
             cols["apt_proxy_https"] = mask_proxy_url(cols.get("apt_proxy_https"))
             return cols
         return data
@@ -2382,6 +2388,18 @@ async def update_settings(
         for field in changes
     )
 
+    # The stored Authorization header goes with the legacy webhook's URL: a new
+    # URL needs the header sent again (or cleared).
+    require_secret_with_destination_change(
+        settings,
+        changes,
+        destination=(),
+        replaced=("audit_forward_webhook_url",),
+        secrets={
+            "audit_forward_webhook_auth_header": settings.audit_forward_webhook_auth_header_encrypted
+        },
+    )
+
     # fingerbank_api_key needs Fernet encryption + maps to a different
     # column name. Empty string = clear; non-empty = encrypt + store.
     # Pop it out of ``changes`` so the audit log doesn't capture the
@@ -2468,16 +2486,25 @@ async def update_settings(
     # lives in apt_gpg_keys). Normalise the pydantic models to JSON dicts.
     if "apt_sources" in changes:
         changes.pop("apt_sources")
+        stored_sources = list(settings.apt_sources or [])
+        try:
+            restored_uris = [
+                restore_source_uri(s.uri, s.name, stored_sources) for s in (body.apt_sources or [])
+            ]
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"apt_sources: {exc}"
+            ) from exc
         settings.apt_sources = [
             {
                 "name": s.name,
-                "uri": s.uri,
+                "uri": uri,
                 "suites": s.suites,
                 "components": s.components,
                 "signed_by_key_id": s.signed_by_key_id,
                 "enabled": s.enabled,
             }
-            for s in (body.apt_sources or [])
+            for s, uri in zip(body.apt_sources or [], restored_uris, strict=True)
         ]
 
     # apt_gpg_keys / apt_auth: atomic replace + per-entry secret merge,
@@ -3831,6 +3858,24 @@ def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None
             raise HTTPException(status_code=422, detail="url is required for a webhook target")
         if body.url is None and not t.url_encrypted:
             raise HTTPException(status_code=422, detail="url is required for a webhook target")
+    # The stored Authorization header and SMTP password go with the target's
+    # destination: a new webhook URL or SMTP server needs them sent again.
+    carried = {f: getattr(body, f) for f in sent}
+    if kind == "webhook":
+        require_secret_with_destination_change(
+            t,
+            carried,
+            destination=(),
+            replaced=("url",),
+            secrets={"auth_header": t.auth_header_encrypted},
+        )
+    elif kind == "smtp":
+        require_secret_with_destination_change(
+            t,
+            carried,
+            destination=("smtp_host", "smtp_port"),
+            secrets={"smtp_password": t.smtp_password_encrypted},
+        )
 
 
 def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
@@ -4407,6 +4452,18 @@ async def update_influxdb_target(
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    sent_fields = {f: getattr(body, f) for f in body.model_fields_set}
+    # A clear flag is the other way to say what happens to the stored secret.
+    if body.clear_password:
+        sent_fields["password"] = ""
+    if body.clear_token:
+        sent_fields["token"] = ""
+    require_secret_with_destination_change(
+        row,
+        sent_fields,
+        destination=("url",),
+        secrets={"password": row.password_encrypted, "token": row.token_encrypted},
+    )
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
     # Flush before the try, as create does: a taken name raises its unique

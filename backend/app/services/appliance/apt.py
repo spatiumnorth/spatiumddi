@@ -174,6 +174,37 @@ def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
     return f"{prefix}{stored_userinfo}@{rest}"
 
 
+def mask_source_uris(sources: Any) -> list[Any]:
+    """``apt_sources`` rows with any ``user:pass@`` in a ``uri`` masked.
+
+    A private mirror's URI may embed the credential apt reads from it; every
+    read surface shows it the way a proxy URL is shown (``***@host``).
+    """
+    out: list[Any] = []
+    for src in sources or []:
+        if isinstance(src, dict) and isinstance(src.get("uri"), str):
+            src = {**src, "uri": mask_proxy_url(src["uri"])}
+        out.append(src)
+    return out
+
+
+def restore_source_uri(incoming: str, name: str, stored_sources: Any) -> str:
+    """Put a stored source's credential back into a URI that carries the mask.
+
+    The stored row is the one with the same ``name``, else the one whose
+    masked URI equals ``incoming``. Raises ``ValueError`` when there is no
+    credential to keep.
+    """
+    _, userinfo, _ = _split_proxy_userinfo(incoming)
+    if userinfo != PROXY_USERINFO_MASK:
+        return incoming
+    rows = [s for s in (stored_sources or []) if isinstance(s, dict)]
+    match = next((s for s in rows if name and s.get("name") == name), None)
+    if match is None:
+        match = next((s for s in rows if mask_proxy_url(str(s.get("uri", ""))) == incoming), None)
+    return restore_proxy_credentials(incoming, str(match.get("uri", "")) if match else None)
+
+
 def render_proxy_conf(settings: PlatformSettings) -> str:
     """Render ``/etc/apt/apt.conf.d/95spatiumddi-proxy`` — empty string
     when no proxy is configured (the runner then removes the file)."""

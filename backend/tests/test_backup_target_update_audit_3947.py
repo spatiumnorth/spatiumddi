@@ -29,9 +29,12 @@ async def test_number_resent_as_text_is_not_a_change(client: AsyncClient, db_ses
 async def test_changed_number_is_recorded(client: AsyncClient, db_session: AsyncSession):
     headers = await _headers(db_session)
     t = await _target(db_session, "ftp", {**_FTP, "port": 21})
+    # A moved port brings the stored password along only if it is sent again.
     res = await client.patch(
-        f"/api/v1/backup/targets/{t.id}", json={"config": {"port": 2121}}, headers=headers
+        f"/api/v1/backup/targets/{t.id}",
+        json={"config": {"port": 2121, "password": "p2"}},
+        headers=headers,
     )
     assert res.status_code == 200, res.text
     (row,) = await _rows(db_session)
-    assert row.new_value == {"config_keys_changed": ["port"]}
+    assert row.new_value == {"config_keys_changed": ["password", "port"]}

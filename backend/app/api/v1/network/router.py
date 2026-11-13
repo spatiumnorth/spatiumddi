@@ -29,6 +29,7 @@ from app.api.pagination import MAX_PAGE
 from app.core.celery_dispatch import dispatch
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission, user_has_permission
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.ipam import IPSpace
 from app.models.network import (
@@ -310,6 +311,17 @@ async def update_device(
     if "ip_space_id" in changes:
         if (await db.get(IPSpace, changes["ip_space_id"])) is None:
             raise HTTPException(status_code=422, detail="ip_space_id not found")
+
+    require_secret_with_destination_change(
+        dev,
+        changes,
+        destination=("ip_address", "snmp_port"),
+        secrets={
+            "community": dev.community_encrypted,
+            "v3_auth_key": dev.v3_auth_key_encrypted,
+            "v3_priv_key": dev.v3_priv_key_encrypted,
+        },
+    )
 
     secret_keys = {"community", "v3_auth_key", "v3_priv_key"}
     encrypted_attrs = {
