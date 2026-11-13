@@ -566,6 +566,34 @@ Verified on k3s with the default (`false`): the worker's bounding set carries
 do only what an unprivileged process can, a TCP connect scan with no OS
 detection.
 
+### Container security contexts and disruption budgets
+
+Container-level hardening ([#1250](https://github.com/spatiumnorth/spatiumddi/issues/1250)),
+on top of the pod-level `seccompProfile: RuntimeDefault`:
+
+| Workload | Container context |
+|---|---|
+| beat, migrate Job | `runAsNonRoot`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` |
+| api, worker | `runAsNonRoot`, uid/gid 1000, and the capability set narrowed to the runtime default's `NET_RAW` + `NET_BIND_SERVICE` by dropping the others by name |
+| frontend | unchanged: stock nginx starts as root and drops privileges itself |
+| Kea and BIND9 agents | unchanged: their entrypoints start as root, `chown`, then drop with `su-exec` / `setpriv` |
+
+The api and worker deliberately do **not** use `drop: ["ALL"]` or
+`allowPrivilegeEscalation: false`. The image's nmap and tcpdump carry file
+capabilities: `no_new_privs` makes the kernel ignore them, and a bounding set
+without `NET_RAW` + `NET_BIND_SERVICE` makes it refuse to exec nmap. The
+narrowed set adds nothing, so Pod Security `baseline` still admits the pods
+(the opt-in `worker.netRawCapability` is the one exception, see above). On
+OpenShift the uid is left to the restricted SCC (it refuses a pinned one) and
+the api and worker keep the SCC's own context.
+
+Each of the api, worker and frontend gets a PodDisruptionBudget with
+`maxUnavailable: 1` (`<workload>.podDisruptionBudget.enabled` /
+`.maxUnavailable`). It is rendered only while the workload can run more than
+one pod, and is never `minAvailable`: a `minAvailable: 1` budget on a single pod
+allows no disruptions and blocks every drain (the lesson of #3204). Beat is a
+singleton and has none. The plain `k8s/base/pdb.yaml` carries the same three.
+
 ### Pod Security levels
 
 The [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)

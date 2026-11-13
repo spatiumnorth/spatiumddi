@@ -55,6 +55,18 @@ spec:
         - name: worker
           image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
+          # #1250 — non-root, bounding set narrowed to the runtime default's
+          # NET_RAW + NET_BIND_SERVICE. NOT ``drop: [ALL]`` and NOT
+          # ``allowPrivilegeEscalation: false``: nmap / tcpdump carry FILE
+          # capabilities, which ``no_new_privs`` disables and a bounding set
+          # without them refuses to exec. Nothing is added, so Pod Security
+          # ``baseline`` still admits the pod.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "MKNOD", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT", "AUDIT_WRITE"]
           # #3952 — no ``capabilities.add``. nmap's SYN scans and ``-O``
           # OS detection use a file capability (net_raw) that needs NET_RAW
           # in the bounding set; containerd's default set already carries
@@ -198,6 +210,14 @@ spec:
         - name: beat
           image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
+          # #1250 — full hardening: nothing here uses a file capability.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           command:
             - celery
             - -A

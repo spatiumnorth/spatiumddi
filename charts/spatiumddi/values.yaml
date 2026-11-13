@@ -139,6 +139,12 @@ applianceVersion: ""
 
 api:
   replicas: 2
+  # #1250 — PodDisruptionBudget so a node drain cannot evict every api pod at
+  # once. ``maxUnavailable`` (never ``minAvailable``: that blocks drains on a
+  # one-pod workload, #3204); rendered only while more than one pod can run.
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). UNSET by default.
   # REFUSED at render time while ``api.applianceHostMounts.enabled`` is on:
@@ -508,6 +514,12 @@ slotImageMirror:
 # ── Frontend (nginx + Vite build) ────────────────────────────────────────────
 frontend:
   replicas: 2
+  # #1250 — PodDisruptionBudget so a node drain cannot evict every frontend pod at
+  # once. ``maxUnavailable`` (never ``minAvailable``: that blocks drains on a
+  # one-pod workload, #3204); rendered only while more than one pod can run.
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   service:
     type: ClusterIP
@@ -616,6 +628,12 @@ frontend:
 # ── Worker (Celery queues: ipam, dns, dhcp, default, bundles) ─────────────────────────
 worker:
   replicas: 2
+  # #1250 — PodDisruptionBudget so a node drain cannot evict every worker pod at
+  # once. ``maxUnavailable`` (never ``minAvailable``: that blocks drains on a
+  # one-pod workload, #3204); rendered only while more than one pod can run.
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
   # #1754 — must exceed the worst-case warm shutdown (WORKER_TERMINATION_GRACE_S
   # in backend/app/celery_app.py); a lower value reopens the SIGKILL window.
   terminationGracePeriodSeconds: 90

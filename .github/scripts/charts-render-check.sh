@@ -1652,6 +1652,79 @@ for case in "1:false:unset" "1:true:true" "1:false:false" "3:true:unset" "3:true
         failures=$((failures + 1))
     fi
 done
+# #1250 — PodDisruptionBudgets + backend container securityContexts.
+# PDBs must be maxUnavailable (a minAvailable one blocks drains on a one-pod
+# workload, #3204) and absent while a workload cannot have two pods.
+echo "── PDBs and container securityContexts (#1250)"
+pdb_check() { # label expected-"kind:name,..." [helm args...]
+    local label="$1" want="$2"; shift 2
+    local out got
+    out="$(helm template pdb "$UMBRELLA" --kube-version "$K8S_VERSION" "$@")" || {
+        echo "   FAIL: #1250 $label did not render" >&2; failures=$((failures + 1)); return; }
+    got="$(printf '%s' "$out" | python3 -c '
+import sys, yaml
+names = []
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get("kind") == "PodDisruptionBudget":
+        sp = d["spec"]
+        if "minAvailable" in sp or "maxUnavailable" not in sp:
+            print("BAD:" + d["metadata"]["name"]); sys.exit(0)
+        names.append(d["metadata"]["name"].rsplit("-", 1)[-1])
+print(",".join(sorted(names)))')"
+    if [ "$got" = "$want" ]; then
+        echo "   ok: #1250 $label PDBs [$got]"
+    else
+        echo "   FAIL: #1250 $label rendered PDBs '$got', want '$want'" >&2; failures=$((failures + 1))
+    fi
+}
+pdb_check "defaults (2 replicas each)" "api,frontend,worker"
+pdb_check "one replica everywhere" "" --set api.autoscaling.enabled=false --set api.replicas=1 \
+    --set worker.replicas=1 --set frontend.replicas=1
+pdb_check "worker opted out" "api,frontend" --set worker.podDisruptionBudget.enabled=false
+pdb_check "api scales from 1 under the HPA" "frontend,worker" --set api.autoscaling.minReplicas=1
+for plat in kubernetes openshift; do
+    helm template sc "$UMBRELLA" --kube-version "$K8S_VERSION" --set global.platform=$plat \
+        --set worker.netRawCapability=true > "$OUT/umbrella-sc-$plat.yaml" || failures=$((failures + 1))
+    python3 - "$OUT/umbrella-sc-$plat.yaml" $plat <<'PY' || failures=$((failures + 1))
+import sys, yaml
+plat = sys.argv[2]
+bad = []
+for d in yaml.safe_load_all(open(sys.argv[1])):
+    if not d or d.get("kind") not in ("Deployment", "Job"):
+        continue
+    name = d["metadata"]["name"]
+    for c in d["spec"]["template"]["spec"]["containers"]:
+        sc = c.get("securityContext") or {}
+        caps = sc.get("capabilities") or {}
+        if name.endswith(("-beat", "-migrate")) or "migrate" in name:
+            if not (sc.get("runAsNonRoot") and sc.get("allowPrivilegeEscalation") is False
+                    and caps.get("drop") == ["ALL"]):
+                bad.append(f"{plat}: {name} is not fully hardened: {sc}")
+        elif name.endswith(("-api", "-worker")):
+            if plat == "kubernetes":
+                if not sc.get("runAsNonRoot") or sc.get("runAsUser") != 1000:
+                    bad.append(f"{plat}: {name} lacks runAsNonRoot/runAsUser 1000: {sc}")
+                # no_new_privs would disable the nmap/tcpdump file capabilities
+                if sc.get("allowPrivilegeEscalation") is False or "ALL" in (caps.get("drop") or []):
+                    bad.append(f"{plat}: {name} breaks the file capabilities: {sc}")
+                if "NET_RAW" in (caps.get("drop") or []) or "NET_BIND_SERVICE" in (caps.get("drop") or []):
+                    bad.append(f"{plat}: {name} drops a capability nmap/tcpdump need")
+                if name.endswith("-api") and caps.get("add"):
+                    bad.append(f"{plat}: api adds capabilities {caps}")
+                if name.endswith("-worker") and caps.get("add") != ["NET_RAW"]:
+                    bad.append(f"{plat}: worker lost its opt-in NET_RAW (#3952): {caps}")
+            else:
+                if "runAsUser" in sc or "runAsGroup" in sc:
+                    bad.append(f"{plat}: {name} pins a uid the restricted SCC refuses")
+        if plat == "openshift" and ("runAsUser" in sc or "runAsGroup" in sc):
+            bad.append(f"{plat}: {name} pins a uid the restricted SCC refuses")
+for b in bad:
+    print("   FAIL: #1250", b, file=sys.stderr)
+if not bad:
+    print(f"   ok: #1250 container securityContexts ({plat})")
+sys.exit(1 if bad else 0)
+PY
+done
 neg3209() { # label expected-message [helm args...]
     local label="$1" msg="$2"; shift 2
     local rel="${REL:-neg}"

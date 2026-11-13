@@ -4,7 +4,7 @@
 
 ```
 k8s/
-├── base/              # Core application manifests (namespace, API, worker, frontend, migrations)
+├── base/              # Core application manifests (namespace, API, worker, frontend, migrations, PodDisruptionBudgets)
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
 ├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)

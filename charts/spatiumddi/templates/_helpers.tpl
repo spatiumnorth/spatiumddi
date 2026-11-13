@@ -1264,3 +1264,52 @@ subjects:
     namespace: {{ $root.Release.Namespace }}
   {{- end }}
 {{- end -}}
+
+{{/*
+#1250 — container securityContext for the control-plane workloads that run the
+backend image (api, worker, beat, migrate Job). Two shapes, picked by ``full``:
+
+  full=true  (beat, migrate) — nothing in them uses a file capability, so they
+             get the whole set: runAsNonRoot, no privilege escalation, every
+             capability dropped.
+  full=false (api, worker)  — the image's nmap and tcpdump carry FILE
+             capabilities (net_raw, net_bind_service), and the kernel ignores
+             those under ``no_new_privs`` (allowPrivilegeEscalation: false), or
+             refuses to exec the binary when the bounding set lacks them
+             (``drop: [ALL]``). So privilege escalation stays allowed and the
+             bounding set is narrowed to the runtime default's NET_RAW and
+             NET_BIND_SERVICE by dropping the rest by name. Nothing is added
+             (``add`` is the worker's opt-in NET_RAW, #3952): adding NET_RAW
+             makes Pod Security ``baseline`` refuse the pod, dropping never does.
+
+``runAsUser`` / ``runAsGroup`` pin the image's ``app`` uid (1000) so
+``runAsNonRoot`` is verifiable against the image's named USER. They are left
+out on OpenShift, whose restricted SCC assigns the uid from the namespace
+range and refuses a pinned one (#3852). There, api / worker get nothing from
+this helper (they keep the SCC's own context and openshift.workerNetRaw), and
+only beat / migrate add the hardening restricted-v2 admits.
+
+Returns the YAML for the ``securityContext:`` VALUE (without the key), or
+nothing.
+*/}}
+{{- define "spatiumddi.backendContainerContext" -}}
+{{- $openshift := include "spatiumddi.isOpenShift" .root -}}
+{{- if or .full (not $openshift) -}}
+runAsNonRoot: true
+{{- if not $openshift }}
+runAsUser: 1000
+runAsGroup: 1000
+{{- end }}
+{{- if .full }}
+allowPrivilegeEscalation: false
+capabilities:
+  drop: ["ALL"]
+{{- else }}
+capabilities:
+  drop: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "MKNOD", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT", "AUDIT_WRITE"]
+  {{- with .add }}
+  add: {{ toJson . }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+{{- end -}}
