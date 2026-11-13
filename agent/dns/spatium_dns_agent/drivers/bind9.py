@@ -6136,10 +6136,12 @@ class Bind9Driver(DriverBase):
         that very serial with other data is served one past it
         (``_freeze_and_wait``), and reporting the bundle's would read in sync
         at a serial named does not serve. A zone that cannot be read is left
-        out, so it is not reported. Every other zone — any zone of a group
-        with views, which re-renders on each change and is reported as it
-        always was, and secondary / stub / forward zones — reports the
-        bundle's serial, unchanged.
+        out, so it is not reported. A secondary / stub zone is read back the
+        same way in every group, views or not (#3940): the bundle's serial for
+        it is 0, which says nothing about whether named holds a copy. Every
+        other zone — any primary zone of a group with views, which re-renders
+        on each change and is reported as it always was, and forward zones —
+        reports the bundle's serial, unchanged.
         """
         out: dict[str, int] = {}
         has_views = any(v.get("name") for v in (bundle.get("views") or []))
@@ -6149,7 +6151,13 @@ class Bind9Driver(DriverBase):
             serial = z.get("serial")
             if not name or serial is None:
                 continue
-            if has_views or z.get("type", "primary") not in {"primary", "master"}:
+            ztype = z.get("type", "primary")
+            if ztype in {"secondary", "slave", "stub"}:
+                # What the server holds, not the bundle's serial (0 for a
+                # secondary): a zone it never transferred must not read in
+                # sync (#3940). Unreadable = left out = not reported.
+                reads.append(name)
+            elif has_views or ztype not in {"primary", "master"}:
                 out[name.lower()] = int(serial)
             else:
                 reads.append(name)
