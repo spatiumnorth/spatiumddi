@@ -3756,7 +3756,7 @@ class Bind9Driver(DriverBase):
         log.warning("bind9_zone_file_name_too_long", zone=label, reason=reason)
         self._unwritable_zones = (
             *self._unwritable_zones,
-            HeldZone(zone, view, reason, False),
+            HeldZone(zone, view, reason, False, True),
         )
 
     def _write_zone_file(
