@@ -1416,6 +1416,20 @@ class ViewCreate(BaseModel):
     forward_transport: str = "do53"
     forward_tls_hostname: str | None = Field(default=None, max_length=255)
 
+    # Resolver overrides (#3569), BIND9 only; null inherits the group's.
+    dnssec_validation: str | None = None
+    allow_recursion: list[str] | None = None
+    rrl_enabled: bool | None = None
+    rrl_responses_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_window: int | None = Field(default=None, ge=1, le=3600)
+    rrl_slip: int | None = Field(default=None, ge=0, le=10)
+    minimal_responses: bool | None = None
+
+    @field_validator("dnssec_validation")
+    @classmethod
+    def validate_dnssec(cls, v: str | None) -> str | None:
+        return _validate_view_dnssec(v)
+
     @field_validator("forward_policy")
     @classmethod
     def validate_forward_policy(cls, v: str | None) -> str | None:
@@ -1440,6 +1454,20 @@ class ViewUpdate(BaseModel):
     forward_policy: str | None = None
     forward_transport: str | None = None
     forward_tls_hostname: str | None = Field(default=None, max_length=255)
+
+    # Resolver overrides (#3569), BIND9 only; null inherits the group's.
+    dnssec_validation: str | None = None
+    allow_recursion: list[str] | None = None
+    rrl_enabled: bool | None = None
+    rrl_responses_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_window: int | None = Field(default=None, ge=1, le=3600)
+    rrl_slip: int | None = Field(default=None, ge=0, le=10)
+    minimal_responses: bool | None = None
+
+    @field_validator("dnssec_validation")
+    @classmethod
+    def validate_dnssec(cls, v: str | None) -> str | None:
+        return _validate_view_dnssec(v)
 
     @field_validator("forward_policy")
     @classmethod
@@ -1467,6 +1495,13 @@ class ViewResponse(BaseModel):
     forward_policy: str | None = None
     forward_transport: str = "do53"
     forward_tls_hostname: str | None = None
+    dnssec_validation: str | None = None
+    allow_recursion: list[str] | None = None
+    rrl_enabled: bool | None = None
+    rrl_responses_per_second: int | None = None
+    rrl_window: int | None = None
+    rrl_slip: int | None = None
+    minimal_responses: bool | None = None
     # #3551 — set on ``GET /groups/{id}/views`` when the group's estimated
     # named memory is at 80 % or more of its agents' limit: each view that
     # applies a blocklist loads its own copy of it.
@@ -1566,6 +1601,13 @@ _SOA_TIMER_MAX = DNS_TTL_MAX
 def _validate_zone_forward_transport(v: str | None) -> str | None:
     if v is not None and v not in VALID_FORWARD_TRANSPORTS:
         raise ValueError(f"forward_transport must be one of {sorted(VALID_FORWARD_TRANSPORTS)}")
+    return v
+
+
+def _validate_view_dnssec(v: str | None) -> str | None:
+    """A view's ``dnssec-validation`` (#3569): yes | no | auto, or None to inherit the group's."""
+    if v is not None and v not in VALID_DNSSEC:
+        raise ValueError(f"dnssec_validation must be one of {sorted(VALID_DNSSEC)}")
     return v
 
 
@@ -5743,6 +5785,7 @@ async def _validated_view_fields(
             "match_destinations",
             "allow_query",
             "allow_query_cache",
+            "allow_recursion",
         ):
             value = getattr(body, attr, None)
             if value is not None:
@@ -5759,7 +5802,57 @@ async def _validated_view_fields(
             detail={"field": exc.field, "value": exc.value, "message": str(exc)},
         ) from exc
     await _check_view_forwarders(group_id, body, changes, view, db)
+    await _check_view_resolver_overrides(group_id, body, changes, db)
     return changes
+
+
+#: The #3569 per-view resolver overrides, every one nullable (null = the group's).
+_VIEW_RESOLVER_FIELDS = (
+    "dnssec_validation",
+    "allow_recursion",
+    "rrl_enabled",
+    "rrl_responses_per_second",
+    "rrl_window",
+    "rrl_slip",
+    "minimal_responses",
+)
+
+
+async def _check_view_resolver_overrides(
+    group_id: uuid.UUID,
+    body: ViewCreate | ViewUpdate,
+    changes: dict[str, Any],
+    db: DB,
+) -> None:
+    """422 a per-view resolver override the group cannot render faithfully (#3569).
+
+    Only BIND9 has per-view ``dnssec-validation`` / ``allow-recursion`` /
+    ``rate-limit`` / ``minimal-responses``; a group that also holds PowerDNS or
+    another driver would serve every view the group's value while the UI said
+    otherwise, so it refuses (as ``allow_query_cache`` does, #2264). An empty
+    ``allow_recursion`` list is stored as NULL (inherit): a view that should
+    recurse for nobody says ``none``. Clearing a field (null) is always allowed.
+    ``yes`` needs a trust anchor, as on the group (#3560): the view inherits the
+    group's anchors, and BIND refuses to load ``yes`` without one.
+    """
+    touched = {f for f in _VIEW_RESOLVER_FIELDS if f in body.model_fields_set}
+    if "allow_recursion" in touched and not changes.get("allow_recursion"):
+        changes["allow_recursion"] = None
+    setting = sorted(f for f in touched if changes.get(f, getattr(body, f, None)) is not None)
+    if not setting:
+        return
+    drivers = await _group_driver_names(db, group_id)
+    others = sorted(set(drivers) - {"bind9"})
+    if others:
+        raise HTTPException(
+            422,
+            f"{', '.join(setting)}: per-view resolver settings are only supported "
+            f"by BIND9, but this group also runs {', '.join(others)}, which cannot apply "
+            "them per view. Leave them empty to inherit the group's, or move those "
+            "servers to their own group.",
+        )
+    if getattr(body, "dnssec_validation", None) == "yes" and not await count_anchors(db, group_id):
+        raise HTTPException(status_code=422, detail=NEEDS_ANCHOR_MESSAGE)
 
 
 async def _check_view_forwarders(
@@ -5895,6 +5988,7 @@ async def update_view(
             "forwarders",
             "forward_policy",
             "forward_tls_hostname",
+            *_VIEW_RESOLVER_FIELDS,
         },
         non_nullable={
             "name",

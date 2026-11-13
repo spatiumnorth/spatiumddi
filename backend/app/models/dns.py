@@ -1090,6 +1090,20 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # View-level resolver overrides (#3569), BIND9 only. Every column is
+    # nullable and NULL means "inherit the group's" (``DNSServerOptions``), so a
+    # view that sets none renders exactly as before. The ``rrl_*`` names mirror
+    # the group's: ``rrl_enabled`` NULL inherits, True turns rate-limiting on
+    # for this view, False turns it off for it; the three numbers override the
+    # group's value for this view only.
+    dnssec_validation: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    allow_recursion: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    rrl_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    rrl_responses_per_second: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_slip: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    minimal_responses: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="views")
     zones: Mapped[list["DNSZone"]] = relationship("DNSZone", back_populates="view")
     blocklists: Mapped[list["DNSBlockList"]] = relationship(

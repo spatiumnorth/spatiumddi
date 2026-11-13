@@ -462,6 +462,10 @@ DNSView
   forward_policy: first | only | null   -- null = the group's
   forward_transport: do53 | tls  -- the view's OWN transport (not the group's)
   forward_tls_hostname: str | null      -- DoT certificate name, when forward_transport = tls
+  dnssec_validation: yes|no|auto|null   -- null = the group's (#3569)
+  allow_recursion: [address-match] | null  -- null = the group's
+  rrl_enabled: bool | null              -- null = the group's; rrl_responses_per_second / rrl_window / rrl_slip override per view
+  minimal_responses: bool | null        -- null = the group's
   zones: [DNSZone]               -- zones present in this view (may differ per view)
   order: int                     -- views are evaluated in order (first match wins)
 ```
@@ -1303,6 +1307,23 @@ view "guest" {
   server refuses (422) a view with forwarders, since those drivers have no
   per-view forwarding. This is per-view *default* forwarding; per-domain
   forwarding per view is a `forward` zone pinned to the view.
+- **A view can override `dnssec-validation`, `allow-recursion`, rate limiting
+  and `minimal-responses`**
+  ([#3569](https://github.com/spatiumnorth/spatiumddi/issues/3569)): every one
+  is nullable and NULL inherits the group's, so a view that sets none renders
+  as before. Set ones render inside the `view {}` block (an internal view that
+  validates and recurses for the LAN next to an authoritative-only external
+  one). `allow_recursion` takes the group's grammar and fails closed to `none`;
+  an empty list is stored as NULL (inherit), and it is skipped for a view with
+  recursion off. Rate limiting reuses the group's field names (`rrl_enabled`,
+  `rrl_responses_per_second`, `rrl_window`, `rrl_slip`): `rrl_enabled` true or
+  false overrides the group's, and a view that turns it off under a group that
+  has it on renders `responses-per-second 0`, since a view-level `rate-limit`
+  replaces the options-level one and BIND cannot unset it. Exempt clients,
+  qps-scale and log-only always come from the group. `dnssec_validation: yes`
+  needs a trust anchor on the group (#3560), which the view inherits. **BIND9
+  only**: a group that also holds a PowerDNS or other non-BIND9 server refuses
+  (422) a view that sets any of them.
 - **Deleting a view** leaves its zones in place (they fall back to being
   served from the remaining views) but any list scoped *only* to it stops
   applying anywhere.

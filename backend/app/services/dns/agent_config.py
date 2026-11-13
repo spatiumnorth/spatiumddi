@@ -1764,6 +1764,27 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             if vd.get("forward_transport", "do53") != "do53":
                 view_entry["forward_transport"] = vd["forward_transport"]
                 view_entry["forward_tls_hostname"] = vd.get("forward_tls_hostname")
+    # #3569 — per-view dnssec-validation / allow-recursion / rate-limit /
+    # minimal-responses, shipped only when set (and only to BIND9, the one driver
+    # that renders them) so every other view's entry and the ETag are unchanged.
+    # ``yes`` without a trust anchor is rendered as ``auto``, as for the group.
+    if server.driver == "bind9":
+        n_anchors = len(opts.trust_anchors or ()) if opts else 0
+        for vd, view_entry in zip(view_descs, views_block, strict=True):
+            for key in (
+                "allow_recursion",
+                "rrl_enabled",
+                "rrl_responses_per_second",
+                "rrl_window",
+                "rrl_slip",
+                "minimal_responses",
+            ):
+                if vd.get(key) is not None:
+                    view_entry[key] = vd[key]
+            if vd.get("dnssec_validation"):
+                view_entry["dnssec_validation"] = effective_dnssec_validation(
+                    vd["dnssec_validation"], server.driver, n_anchors
+                )
     # #920 — the key that lets the control plane's own transfers (drift,
     # sync-with-servers) select each view. The agent admits it into its view's
     # match-clients and refuses it in every other; without it a signed transfer

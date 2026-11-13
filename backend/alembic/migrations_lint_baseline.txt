@@ -595,6 +595,9 @@ backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_colu
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:66
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:67
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:68
+backend/alembic/versions/d7b2e5a91c46_dns_view_resolver_overrides.py:drop_column:41
+backend/alembic/versions/d7b2e5a91c46_dns_view_resolver_overrides.py:drop_column:42
+backend/alembic/versions/d7b2e5a91c46_dns_view_resolver_overrides.py:drop_column:43
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:62
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:63
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:64

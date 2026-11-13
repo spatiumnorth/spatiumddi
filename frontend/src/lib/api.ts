@@ -5922,6 +5922,15 @@ export interface DNSView {
   forward_policy: "first" | "only" | null;
   forward_transport: "do53" | "tls";
   forward_tls_hostname: string | null;
+  /** #3569 — per-view resolver overrides (BIND9 only). `null` inherits the
+   *  group's; `rrl_*` mirror the group's rate-limit field names. */
+  dnssec_validation: "yes" | "no" | "auto" | null;
+  allow_recursion: string[] | null;
+  rrl_enabled: boolean | null;
+  rrl_responses_per_second: number | null;
+  rrl_window: number | null;
+  rrl_slip: number | null;
+  minimal_responses: boolean | null;
   /** #3551 — set on the list when the group's estimated named memory is at
    *  80 % or more of its agents' limit. */
   memory_warning?: string | null;

@@ -777,6 +777,81 @@ def _render_rate_limit_block(opts: dict[str, Any]) -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
+def _view_rate_limit(view: dict[str, Any], opts: dict[str, Any]) -> str:
+    """The view's own ``rate-limit { … }`` (#3569), or ``""`` to inherit the group's.
+
+    ``rrl_enabled`` None inherits the group's setting; True or False overrides
+    it. The three numbers override the group's value for this view only and
+    apply whenever rate-limiting is effectively on for it. Exempt clients, the
+    qps scale and log-only always come from the group, so a view that only
+    raises ``responses-per-second`` keeps the group's exemptions.
+
+    A view that turns it OFF under a group that has it on writes
+    ``responses-per-second 0`` (BIND: no limit): a view-level ``rate-limit``
+    replaces the options-level one, and BIND has no way to unset it. A view
+    that does not override anything, or turns off what is off, renders nothing.
+    """
+    own = view.get("rrl_enabled")
+    nums = {k: view.get(k) for k in ("rrl_responses_per_second", "rrl_window", "rrl_slip")}
+    group_on = bool(opts.get("rrl_enabled"))
+    if own is None and all(v is None for v in nums.values()):
+        return ""
+    on = group_on if own is None else bool(own)
+    if not on:
+        if group_on and own is False:
+            return "    rate-limit { responses-per-second 0; };\n"
+        return ""
+
+    def pick(key: str, default: int) -> int:
+        v = nums.get(key)
+        return int(v if v is not None else opts.get(key, default))
+
+    parts = [
+        f"responses-per-second {pick('rrl_responses_per_second', 15)};",
+        f"window {pick('rrl_window', 15)};",
+        f"slip {pick('rrl_slip', 2)};",
+    ]
+    if opts.get("rrl_qps_scale") is not None:
+        parts.append(f"qps-scale {int(opts['rrl_qps_scale'])};")
+    exempt = [
+        c.strip()
+        for c in (opts.get("rrl_exempt_clients") or [])
+        if isinstance(c, str) and c.strip()
+    ]
+    if exempt:
+        parts.append("exempt-clients { " + "; ".join(exempt) + "; };")
+    if opts.get("rrl_log_only"):
+        parts.append("log-only yes;")
+    return "    rate-limit { " + " ".join(parts) + " };\n"
+
+
+def _view_resolver_overrides(
+    view: dict[str, Any],
+    opts: dict[str, Any],
+    acls: list[dict[str, Any]] | None = None,
+) -> str:
+    """The view's own ``dnssec-validation`` / ``allow-recursion`` /
+    ``rate-limit`` / ``minimal-responses`` lines (#3569), 4-space indented.
+
+    Each is written only when the view sets it, so a view that sets none
+    inherits the group's from ``options {}`` and renders as before.
+    ``allow-recursion`` is skipped for a view with recursion off (it would be
+    meaningless there). Elements named-checkconf would refuse are dropped
+    exactly as for the group (``_render_allow_recursion``), failing closed to
+    ``none``.
+    """
+    out = ""
+    dnssec = view.get("dnssec_validation")
+    if dnssec in ("yes", "no", "auto"):
+        out += f"    dnssec-validation {dnssec};\n"
+    allow = view.get("allow_recursion")
+    if allow and view.get("recursion", True):
+        out += _render_allow_recursion({"allow_recursion": allow, "recursion_enabled": True}, acls)
+    if view.get("minimal_responses") is not None:
+        out += f"    minimal-responses {'yes' if view['minimal_responses'] else 'no'};\n"
+    return out + _view_rate_limit(view, opts)
+
+
 # ── Encrypted transports (issue #50) ────────────────────────────────────────
 # Stable on-disk paths for the listener cert. Written outside ``rendered.new``
 # (like the TSIG key) so the atomic rendered-dir swap can't leave named.conf
@@ -3583,6 +3658,7 @@ class Bind9Driver(DriverBase):
                     f"    recursion {recursion_v};\n"
                     f"{aq_line}"
                     f"{aqc_line}"
+                    f"{_view_resolver_overrides(view, opts, bundle.get('acls'))}"
                     f"{fwd_lines}"
                     f"{_indent(body)}"
                     f"}};\n"
