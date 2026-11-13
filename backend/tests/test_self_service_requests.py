@@ -757,7 +757,8 @@ async def test_approve_when_apply_raises_generic_exception_records_failed(
 ) -> None:
     req_id, token, _, appr = await _pending_ip_request(client, db_session)
     _patched_apply(monkeypatch, RuntimeError("driver exploded"))
-    await _assert_failed_with(client, db_session, req_id, token, appr, "driver exploded")
+    # Not stored as ``str(exc)`` (#3642): the cause is in the server log.
+    await _assert_failed_with(client, db_session, req_id, token, appr, "internal error")
 
 
 @pytest.mark.asyncio

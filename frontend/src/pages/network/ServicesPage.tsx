@@ -39,6 +39,7 @@ import {
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -515,7 +516,11 @@ export function ResourcesTab({
             />
           </p>
         )}
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
         <p className="mt-2 text-[11px] text-muted-foreground/80">
           Common L3VPN roles: <code>primary</code> / <code>backup</code> /{" "}
           <code>hub</code> / <code>spoke</code>. Free-form — use whatever your
@@ -1055,7 +1060,9 @@ export function ServiceEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button

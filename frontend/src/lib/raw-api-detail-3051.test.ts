@@ -111,6 +111,7 @@ const ALLOWED: Record<string, Entry> = {
   "/src/pages/admin/PlatformInsightsPage.tsx": notError(),
   "/src/pages/admin/BackupTargetsSection.tsx": notError(),
   "/src/pages/dhcp/WindowsFailoverPanel.tsx": notError(),
+  "/src/pages/RequestsPage.tsx": notError(),
   "/src/pages/admin/DNSImportPage.tsx": pending(3050, 12),
   "/src/pages/admin/DHCPImportPage.tsx": pending(3050, 1),
   "/src/pages/admin/ApiTokensPage.tsx": pending(3056, 2),
