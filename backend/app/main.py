@@ -1396,6 +1396,7 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_constraint,
         unique_violation_message,
     )
 
@@ -1478,7 +1479,11 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": unique_violation_message(extract_detail(exc))},
+            content={
+                "detail": unique_violation_message(
+                    extract_detail(exc), unique_violation_constraint(exc)
+                )
+            },
         )
 
     @app.exception_handler(SADBAPIError)

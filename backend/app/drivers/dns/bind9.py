@@ -403,7 +403,9 @@ class BIND9Driver(DNSDriver):
             # Feed-sourced domains are untrusted; neutralize control chars
             # so a malformed feed entry can't inject a zone-file line (#597).
             dom = strip_control_chars(e.domain.lower().rstrip("."))
-            if dom in excluded or dom in seen:
+            # An exception emits ``N`` and ``*.N`` as passthru, so a subdomains-
+            # only entry ``*.N`` (adblock ``.N^``, #4037) is the same owner.
+            if dom in excluded or dom in seen or dom.removeprefix("*.") in excluded:
                 continue
             if e.action == "redirect" and e.target:
                 # An IP target is an A/AAAA; a hostname target is a CNAME.
