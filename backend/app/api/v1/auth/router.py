@@ -98,6 +98,7 @@ from app.services.account_lockout import (
     register_mfa_failure,
     register_success,
 )
+from app.services.api_token_revocation import count_live_api_tokens, revoke_user_api_tokens
 from app.services.mfa import (
     PENDING_ENROLMENT_TTL,
     clear_pending_enrolment,
@@ -222,6 +223,10 @@ class ChangePasswordRequest(BaseModel):
 
     current_password: str
     new_password: str
+    # #1359 — opt in to revoking the caller's API tokens with the change. Off
+    # by default: tokens are not sessions, and revoking them silently would
+    # break the automation that runs on them.
+    revoke_api_tokens: bool = False
 
     @field_validator("new_password")
     @classmethod
@@ -242,6 +247,13 @@ class ChangePasswordRequest(BaseModel):
         if not v:
             raise ValueError("Password cannot be empty")
         return v
+
+
+class ChangePasswordResponse(BaseModel):
+    """The password change's effect on the caller's API tokens (#1359)."""
+
+    api_tokens_revoked: int = 0
+    api_token_count: int = 0
 
 
 class PasswordPolicyResponse(BaseModel):
@@ -1048,13 +1060,13 @@ def _current_session_jti(request: Request) -> str | None:
     return request_session_jti(request)
 
 
-@router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/change-password", response_model=ChangePasswordResponse)
 async def change_password(
     body: ChangePasswordRequest,
     current_user: CurrentUser,
     request: Request,
     db: DB,
-) -> None:
+) -> ChangePasswordResponse:
     forbid_in_demo_mode("Password change is disabled")
     if not current_user.hashed_password or not verify_password(
         body.current_password, current_user.hashed_password
@@ -1113,6 +1125,11 @@ async def change_password(
     if current_jti is not None:
         revoke_where.append(UserSession.id != current_jti)
     await revoke_live_sessions(db, *revoke_where)
+    tokens_revoked = 0
+    if body.revoke_api_tokens:
+        tokens_revoked = await revoke_user_api_tokens(
+            db, current_user, current_user.id, "password_change"
+        )
 
     audit = AuditLog(
         user_id=current_user.id,
@@ -1124,11 +1141,16 @@ async def change_password(
         resource_display=current_user.username,
         changed_fields=["hashed_password", "force_password_change", "password_changed_at"]
         + (["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else []),
+        new_value={"api_tokens_revoked": tokens_revoked} if body.revoke_api_tokens else None,
         result="success",
     )
     db.add(audit)
     await db.commit()
     logger.info("password_changed", user_id=str(current_user.id))
+    return ChangePasswordResponse(
+        api_tokens_revoked=tokens_revoked,
+        api_token_count=await count_live_api_tokens(db, current_user.id),
+    )
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

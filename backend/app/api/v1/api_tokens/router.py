@@ -51,7 +51,12 @@ from app.models.audit import AuditLog
 from app.models.auth import APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
-from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
+from app.services.api_token_revocation import revoke_user_api_tokens
+from app.services.api_token_scopes import (
+    token_write,
+    validate_resource_grant_shape,
+    validate_scopes,
+)
 
 router = APIRouter()
 
@@ -385,6 +390,35 @@ async def create_token(
         "owner_is_active": True,
         "token": raw,
     }
+
+
+class RevokeAllResponse(BaseModel):
+    api_tokens_revoked: int
+
+
+@router.post("/revoke-all", response_model=RevokeAllResponse)
+@token_write("Revokes every API token the caller owns; a credential mutation.")
+async def revoke_all_own_tokens(db: DB, current_user: CurrentUser) -> RevokeAllResponse:
+    """Revoke every API token the caller owns (#1359). Own tokens only: the
+    path takes no user id, so it cannot reach anyone else's (an admin uses
+    ``POST /users/{id}/revoke-api-tokens``). Revoking is reversible nowhere
+    but by minting anew, and a token calling this revokes itself too."""
+    revoked = await revoke_user_api_tokens(db, current_user, current_user.id, "owner_revoke_all")
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="revoke_api_tokens",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            resource_display=current_user.username,
+            result="success",
+            new_value={"api_tokens_revoked": revoked},
+        )
+    )
+    await db.commit()
+    return RevokeAllResponse(api_tokens_revoked=revoked)
 
 
 @router.get("/enrolment-context", response_model=EnrolmentContext)

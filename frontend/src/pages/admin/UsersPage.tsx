@@ -15,17 +15,20 @@ import {
   ShieldOff,
   Lock,
   LockOpen,
+  Ban,
 } from "lucide-react";
 import {
   authProvidersApi,
   formatApiError,
   formatDialogError,
   usersApi,
+  type ApiTokenOutcome,
   type AppUser,
 } from "@/lib/api";
 import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { stepUpBody } from "@/lib/stepup";
 import { parsePasswordError } from "@/lib/password-policy";
@@ -375,8 +378,11 @@ function ProviderLink({ user }: { user: AppUser }) {
   });
   const [providerId, setProviderId] = useState(user.auth_provider_id ?? "");
   const [error, setError] = useState<string | null>(null);
+  // #1359 — a link ends the account's sessions, not its API tokens, unless
+  // asked.
+  const [revokeTokens, setRevokeTokens] = useState(false);
   const link = useMutation({
-    mutationFn: () => usersApi.linkProvider(user.id, providerId),
+    mutationFn: () => usersApi.linkProvider(user.id, providerId, revokeTokens),
     onSuccess: () => {
       setError(null);
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -404,8 +410,19 @@ function ProviderLink({ user }: { user: AppUser }) {
           </>
         )}{" "}
         Linking clears the stored identifier: the next sign-in through the
-        chosen provider as <code>{user.username}</code> claims this account.
+        chosen provider as <code>{user.username}</code> claims this account. It
+        ends the account's sessions; its API tokens keep working unless you
+        revoke them.
       </p>
+      <label className="flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={revokeTokens}
+          onChange={(e) => setRevokeTokens(e.target.checked)}
+        />
+        <span>Also revoke all of this user's API tokens</span>
+      </label>
       <div className="flex flex-col gap-2 sm:flex-row">
         <select
           className={inputCls}
@@ -430,6 +447,8 @@ function ProviderLink({ user }: { user: AppUser }) {
       {link.isSuccess && (
         <p className="text-xs text-emerald-700 dark:text-emerald-300">
           Linked. The next sign-in as {user.username} claims the account.
+          {(link.data?.api_token_count ?? 0) > 0 &&
+            ` ${link.data?.api_token_count} API token(s) are still active.`}
         </p>
       )}
       {error && <p className="text-xs text-destructive">{error}</p>}
@@ -452,6 +471,11 @@ function ResetPasswordModal({
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [policyErrors, setPolicyErrors] = useState<string[]>([]);
+  // #1359 — a reset ends the user's sessions, not their API tokens, unless
+  // asked. After it the modal reports how many are still live.
+  const [revokeTokens, setRevokeTokens] = useState(false);
+  const [outcome, setOutcome] = useState<ApiTokenOutcome | null>(null);
+  const qc = useQueryClient();
   // The server asks for a step-up on an effective superadmin (flag or a
   // wildcard role), the caller's own account included.
   const needsStepUp = user.is_effective_superadmin ?? user.is_superadmin;
@@ -462,8 +486,13 @@ function ResetPasswordModal({
         user.id,
         password,
         needsStepUp ? stepUpBody(stepPassword, stepTotp) : {},
+        revokeTokens,
       ),
-    onSuccess: onClose,
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      if (res && res.api_token_count > 0) setOutcome(res);
+      else onClose();
+    },
     onError: (err: unknown) => {
       const rules = passwordPolicyErrors(err);
       setPolicyErrors(rules);
@@ -474,6 +503,32 @@ function ResetPasswordModal({
   });
 
   const mismatch = confirm.length > 0 && password !== confirm;
+
+  if (outcome) {
+    return (
+      <Modal title={`Reset password — ${user.username}`} onClose={onClose}>
+        <div className="space-y-3">
+          <p className="text-sm">
+            Password reset; the user's sessions were ended.{" "}
+            <strong>
+              {outcome.api_token_count} API token
+              {outcome.api_token_count === 1 ? " is" : "s are"} still active
+            </strong>
+            : a reset does not revoke them. Use "Revoke all API tokens" on the
+            Users page to cut that access too.
+          </p>
+          <div className="flex justify-end pt-2">
+            <button
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal title={`Reset password — ${user.username}`} onClose={onClose}>
@@ -501,6 +556,21 @@ function ResetPasswordModal({
         <p className="text-xs text-muted-foreground">
           The user will be required to change their password on next login.
         </p>
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={revokeTokens}
+            onChange={(e) => setRevokeTokens(e.target.checked)}
+          />
+          <span>
+            Also revoke all of this user's API tokens
+            <span className="block text-xs text-muted-foreground">
+              A reset ends the user's sessions but leaves API tokens working;
+              revoking them can break automation that runs on them.
+            </span>
+          </span>
+        </label>
         {needsStepUp && (
           <StepUpSection
             reason="This account is a superadmin, and its password passes every re-confirmation, so resetting it needs yours."
@@ -613,6 +683,20 @@ export function UsersPage() {
   const [editUser, setEditUser] = useState<AppUser | null>(null);
   const [resetUser, setResetUser] = useState<AppUser | null>(null);
   const [deleteUser, setDeleteUser] = useState<AppUser | null>(null);
+  const [revokeUser, setRevokeUser] = useState<AppUser | null>(null);
+  const qc = useQueryClient();
+  const revokeMut = useMutation({
+    mutationFn: (u: AppUser) => usersApi.revokeApiTokens(u.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["users"] });
+      qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      setRevokeUser(null);
+    },
+  });
+  const closeRevoke = () => {
+    setRevokeUser(null);
+    revokeMut.reset();
+  };
 
   const {
     data: users,
@@ -779,6 +863,22 @@ export function UsersPage() {
                           <KeyRound className="h-3.5 w-3.5" />
                         </button>
                       )}
+                      {/* #1359 — revoke every API token the user holds. Shown
+                          while they hold any; the route takes a superadmin. */}
+                      {(user.api_token_count ?? 0) > 0 && (
+                        <button
+                          onClick={() => setRevokeUser(user)}
+                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                          title={
+                            superadminGate.title ??
+                            `Revoke all API tokens (${user.api_token_count})`
+                          }
+                          aria-label="Revoke all API tokens"
+                          disabled={superadminGate.disabled}
+                        >
+                          <Ban className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                       {user.locked && <UnlockButton userId={user.id} />}
                       <button
                         onClick={() => setDeleteUser(user)}
@@ -808,6 +908,33 @@ export function UsersPage() {
           onClose={() => setResetUser(null)}
         />
       )}
+      <ConfirmModal
+        open={revokeUser !== null}
+        title="Revoke all API tokens"
+        message={
+          revokeUser && (
+            <>
+              Revoke the {revokeUser.api_token_count} active API token(s) of{" "}
+              <strong>{revokeUser.username}</strong>? Automation using them
+              stops working. The account and its sessions are not affected. The
+              user can mint new tokens.
+              {revokeMut.isError && (
+                <span className="mt-2 block text-destructive">
+                  {userDialogError(
+                    revokeMut.error,
+                    "Failed to revoke API tokens",
+                  )}
+                </span>
+              )}
+            </>
+          )
+        }
+        confirmLabel="Revoke all"
+        tone="destructive"
+        loading={revokeMut.isPending}
+        onConfirm={() => revokeUser && revokeMut.mutate(revokeUser)}
+        onClose={closeRevoke}
+      />
       {deleteUser && (
         <DeleteUserModal
           user={deleteUser}

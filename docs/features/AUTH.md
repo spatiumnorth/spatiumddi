@@ -92,6 +92,26 @@ group membership.
     revoked with the rest) or waits and is refused. A force-logout from the
     session viewer follows a row that was rotated after the list was
     fetched to its live successor, and revokes that.
+- **A password change or an admin reset revokes sessions, not API tokens**
+  (#1359). API tokens are long-lived credentials separate from the password,
+  so a self-service change (`POST /auth/change-password`) and an admin reset
+  (`POST /users/{id}/reset-password`) leave them live: an operator cleaning
+  up after a compromise must revoke them too, or access is not cut off. Both
+  responses report `api_token_count`, the account's live tokens (active and
+  unexpired), which the UI shows after the action. Passing
+  `revoke_api_tokens: true` on either request revokes them in the same
+  transaction (`api_tokens_revoked` in the response and the audit row, and
+  one `api_token` audit row per token); it is off by default because
+  revoking silently would break automation that runs on them. To revoke
+  without changing a password, `POST /api-tokens/revoke-all` revokes the
+  caller's own tokens and a superadmin's `POST /users/{id}/revoke-api-tokens`
+  revokes a user's; the account stays active, and the Users page has a
+  "Revoke all API tokens" button. Linking an external account to its
+  provider (`POST /users/{id}/link-provider`) follows the same rule: it ends
+  the sessions, reports `api_token_count`, and takes the same opt-in
+  `revoke_api_tokens`. `GET /users` carries `api_token_count` per
+  user, as does the `list_users` copilot tool. No copilot tool revokes: that
+  is a broad-blast-radius credential write. `backend/app/services/api_token_revocation.py`.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
