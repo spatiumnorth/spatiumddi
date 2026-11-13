@@ -216,6 +216,39 @@ async def test_group_sync_with_nothing_to_send_keeps_the_serial(
     assert await _stored_serial(db_session, zone_id) == _SERIAL
 
 
+async def test_group_sync_reports_queued_records_separately(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3817: records queued as ops are counted in total_queued (a subset of
+    total_pushed) and flagged per zone, so the dialog cannot call them pushed."""
+    zone, _servers = await _zone(db_session, "bind9")
+    group_id = zone.group_id
+    user = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Test",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    token = create_access_token(str(user.id))
+    _serve(monkeypatch, _Driver(), [])
+
+    resp = await client.post(
+        f"/api/v1/dns/groups/{group_id}/sync-with-servers",
+        params={"import_new_zones": "false"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["total_pushed"], body["total_queued"]) == (1, 1)
+    (srv,) = body["items"]
+    assert srv["result"]["total_queued"] == 1
+    assert srv["result"]["items"][0]["queued_for_agent"] is True
+
+
 async def test_scheduled_sync_with_nothing_to_send_keeps_the_serial(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

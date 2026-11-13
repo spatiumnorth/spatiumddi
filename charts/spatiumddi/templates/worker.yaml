@@ -65,7 +65,7 @@ spec:
         - name: worker
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if and .Values.worker.netRawCapability (include "spatiumddi.isOpenShift" .) }}
+          {{- if include "spatiumddi.isOpenShift" . }}
           {{- if .Values.openshift.workerNetRaw }}
           # #3852 — OpenShift: NET_RAW is not in restricted-v2's allowed set,
           # and CRI-O's default capability set does not carry it. The image's
@@ -86,11 +86,13 @@ spec:
             allowPrivilegeEscalation: true
           {{- end }}
           {{- else if .Values.worker.netRawCapability }}
-          # NET_RAW unlocks nmap raw-socket scans (SYN, ``-O`` OS
-          # detection) for the device-profiling auto-nmap path. The
-          # image already grants the cap to the nmap binary via setcap;
-          # this line keeps it in the pod bounding set so restricted
-          # PSA / OpenShift-SCC clusters don't drop it.
+          # #3952 — opt-in, off by default. The image's nmap carries
+          # net_raw as a FILE capability, which works only while NET_RAW
+          # is in the bounding set. containerd's default set already has
+          # it, so this line matters only on a runtime whose set does not
+          # (CRI-O outside OpenShift). Adding it makes Pod Security
+          # ``baseline`` and ``restricted`` REFUSE the pod at admission,
+          # so the namespace must be ``privileged`` (or exempted).
           securityContext:
             capabilities:
               add: ["NET_RAW"]
