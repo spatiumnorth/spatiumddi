@@ -110,9 +110,27 @@ export function FreeSpaceBand({
       );
       if (s) out.push(s);
     }
+    // A capped answer names the rest on its last range (#3848): draw the
+    // block's remainder as one free span instead of leaving it blank.
+    const last = freeRanges[freeRanges.length - 1];
+    const lastSpan = last ? cidrSpan(last.network) : null;
+    if (last?.more_after && lastSpan) {
+      const start = lastSpan.base + lastSpan.size - parent.base;
+      const size = parent.size - start;
+      if (size > 0n) {
+        out.push({
+          start: bigFraction(start, parent.size),
+          width: bigFraction(size, parent.size),
+          kind: "free",
+          label: `Free — rest of the block after ${last.network} (${last.more_after.toLocaleString()} more free ranges not listed)`,
+          size,
+        });
+      }
+    }
     out.sort((a, b) => a.start - b.start);
     return out;
   }, [block.network, childBlocks, directSubnets, freeRanges]);
+  const omitted = freeRanges[freeRanges.length - 1]?.more_after ?? 0;
 
   const [hovered, setHovered] = useState<Segment | null>(null);
 
@@ -172,7 +190,9 @@ export function FreeSpaceBand({
                 "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.5)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.6)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.500/.6)_0_4px,transparent_4px_8px)] dark:hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
             )}
             aria-label={seg.label}
-            disabled={seg.kind !== "free" || !!createDisabledReason}
+            disabled={
+              seg.kind !== "free" || !seg.network || !!createDisabledReason
+            }
           >
             {(seg.kind === "block" || seg.kind === "subnet") && (
               <span
@@ -198,6 +218,13 @@ export function FreeSpaceBand({
         <span className="text-muted-foreground/70">
           (saturated portion = % allocated)
         </span>
+        {omitted > 0 && (
+          <span className="text-amber-600 dark:text-amber-400">
+            Showing {freeRanges.length.toLocaleString()} of{" "}
+            {(freeRanges.length + omitted).toLocaleString()} free ranges; the
+            rest of the block is drawn as one free span.
+          </span>
+        )}
         {hovered && (
           <span className="ml-auto font-mono text-foreground">
             {hovered.label}
