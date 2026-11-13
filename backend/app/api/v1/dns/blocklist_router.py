@@ -1407,8 +1407,10 @@ async def update_assignments(
                     f"blocklists are not applied to the Technitium server (group {g.name!r})."
                 )
             current[g.id] = g
-        bl.server_groups = [g for gid, g in current.items() if gid not in remove]
-        changed.append("server_group_ids")
+        new_groups = [g for gid, g in current.items() if gid not in remove]
+        if {g.id for g in new_groups} != old_direct_group_ids:
+            changed.append("server_group_ids")
+        bl.server_groups = new_groups
 
     if body.view_ids is not None:
         views = list(
@@ -1420,10 +1422,8 @@ async def update_assignments(
             changed.append("view_ids")
         bl.views = views
 
-    if not changed:
-        # #3738 — nothing stored changed: no audit row, no wake.
-        return await _respond(db, bl)
-
+    # #4042 — the view delta must run BEFORE the nothing-changed return below,
+    # or a request carrying only view deltas answered 200 and persisted nothing.
     if body.add_view_ids or body.remove_view_ids:
         vcurrent = {v.id: v for v in bl.views}
         vremove = set(body.remove_view_ids or [])
@@ -1435,8 +1435,14 @@ async def update_assignments(
             raise HTTPException(status_code=404, detail="One or more views not found")
         for v in vadded:
             vcurrent[v.id] = v
-        bl.views = [v for vid, v in vcurrent.items() if vid not in vremove]
-        changed.append("view_ids")
+        new_views = [v for vid, v in vcurrent.items() if vid not in vremove]
+        if {v.id for v in new_views} != old_view_ids:
+            changed.append("view_ids")
+        bl.views = new_views
+
+    if not changed:
+        # #3738 — nothing stored changed: no audit row, no wake.
+        return await _respond(db, bl)
 
     db.add(
         _audit(
