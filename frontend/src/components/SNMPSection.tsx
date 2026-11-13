@@ -608,7 +608,7 @@ export function SNMPSection({
 
       <Field
         label="Allowed source CIDRs"
-        description="Comma- or space-separated list of CIDRs allowed to query SNMP. The host firewall opens UDP 161 only to these sources, for v2c and v3. Empty = the port is open to any source (v2c still answers nothing until a source is listed; v3 is then protected only by its user credentials)."
+        description="Comma- or space-separated list of CIDRs allowed to query SNMP. The host firewall opens UDP 161 only to these sources, for v2c and v3. Empty = the port is open to any source (v2c still answers nothing until a source is listed; v3 is then protected only by its user credentials). A custom firewall_extra rule accepting UDP 161 adds its sources to this list."
       >
         <input
           type="text"

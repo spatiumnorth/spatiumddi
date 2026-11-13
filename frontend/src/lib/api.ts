@@ -1280,6 +1280,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
@@ -2128,6 +2130,8 @@ export const ipamApi = {
         skipped: string[];
         /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
         dns_cleared: string[];
+        /** Why each skipped row was skipped, keyed by id (#3905). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -5236,6 +5240,9 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
+  records_trashed_widened: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */
@@ -16394,6 +16401,8 @@ export interface NATMapping {
   // hide-NAT path); without these the UI can only show the bare UUID.
   internal_subnet_cidr: string | null;
   internal_subnet_name: string | null;
+  /** True when the caller cannot read the subnet, so the labels above are withheld (#3641). */
+  internal_subnet_redacted?: boolean;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;
