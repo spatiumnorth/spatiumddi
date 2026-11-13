@@ -2241,13 +2241,52 @@ async def _replay_deferred_ddns(db: AsyncSession, events: list[Any], server: Any
     for ev in events:
         last[ev.ip_address] = ev
     deferred: dict[tuple[Any, str], tuple[Any, str | None]] = {}
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]] = {}
     for ip, ev in last.items():
         if ev.state != "active":
             continue
         subnet = _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
         if subnet is not None:
-            deferred[(subnet.id, norm_ip(ip))] = (subnet, ev.hostname)
-    await _publish_deferred_ddns(db, deferred, server_id=str(server.id))
+            key = (subnet.id, norm_ip(ip))
+            deferred[key] = (subnet, ev.hostname)
+            grants[key] = (ev.mac_address, ev.hostname)
+    await _publish_deferred_ddns(db, deferred, server_id=str(server.id), grants=grants)
+
+
+async def _still_granted(
+    db: AsyncSession,
+    by_key: dict[tuple[Any, str], Any],
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]],
+    server_id: str,
+) -> dict[tuple[Any, str], Any]:
+    """``by_key`` less the addresses whose current active lease on this server
+    no longer has the MAC and hostname a replayed grant carried."""
+    from app.models.dhcp import DHCPLease
+
+    if not by_key:
+        return by_key
+    res = await db.execute(
+        select(DHCPLease)
+        .where(
+            DHCPLease.server_id == uuid.UUID(server_id),
+            DHCPLease.ip_address.in_([str(r.address) for r in by_key.values()]),
+            DHCPLease.state == "active",
+        )
+        .execution_options(populate_existing=True)
+    )
+    current = {norm_ip(str(le.ip_address)): le for le in res.scalars().all()}
+    kept = {}
+    for key, row in by_key.items():
+        lease = current.get(key[1])
+        mac, hostname = grants[key]
+        if (
+            lease is not None
+            and (str(lease.mac_address).lower() if lease.mac_address else None)
+            == (mac.lower() if mac else None)
+            and lease.hostname == hostname
+        ):
+            kept[key] = row
+    return kept
 
 
 async def _publish_deferred_ddns(
@@ -2255,6 +2294,7 @@ async def _publish_deferred_ddns(
     deferred: dict[tuple[Any, str], tuple[Any, str | None]],
     *,
     server_id: str,
+    grants: dict[tuple[Any, str], tuple[str | None, str | None]] | None = None,
 ) -> None:
     """Publish the DDNS of a lease-events batch's grants, after the batch's
     own transaction committed (#3816).
@@ -2267,7 +2307,13 @@ async def _publish_deferred_ddns(
     publishes nothing. A name that fails is logged and skipped, as it was in
     the batch: the address stays unpublished, so its next report is not a
     quiet renewal and publishes it. An agent replay of the batch is a
-    duplicate by its receipt and writes nothing twice."""
+    duplicate by its receipt and writes nothing twice.
+
+    ``grants`` (the replay of a duplicate batch) maps each key to the (MAC,
+    hostname) that batch granted: a name is published only if this server's
+    current lease for the address still carries both, read under the same
+    locks. A later batch that renamed or reassigned the client has published
+    it, and its publish is the authoritative one."""
     from app.services.dns.ddns import apply_ddns_for_lease
     from app.services.lock_order import lock_mirror_rows
 
@@ -2282,6 +2328,8 @@ async def _publish_deferred_ddns(
         try:
             rows = await lock_mirror_rows(db, chunk)
             by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
+            if grants is not None:
+                by_key = await _still_granted(db, by_key, grants, server_id)
             await lock_zones_for_addresses(
                 db,
                 publishing=[(by_key[k].subnet, by_key[k]) for k in by_key],

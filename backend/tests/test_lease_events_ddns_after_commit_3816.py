@@ -228,3 +228,37 @@ async def test_a_replay_after_a_mid_ddns_outage_publishes_each_name_once(
     third = await _post_with_id(concurrent_client, peer_a, events, batch_id)
     assert third.status_code == 200
     assert await _a_records(db_session, zone_id) == names
+
+
+@pytest.mark.asyncio
+async def test_a_replay_does_not_republish_a_name_a_later_batch_renamed(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncpg
+    from sqlalchemy.exc import InterfaceError
+
+    import app.services.dns.ddns as ddns
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    ip = _A_IPS[0]
+    first_batch = uuid.uuid4().hex
+    real = ddns.apply_ddns_for_lease
+
+    async def _outage(*args: Any, **kwargs: Any) -> Any:
+        raise InterfaceError("stmt", {}, asyncpg.exceptions.ConnectionDoesNotExistError("x"))
+
+    monkeypatch.setattr(ddns, "apply_ddns_for_lease", _outage)
+    r1 = await _post_with_id(concurrent_client, peer_a, [_ev(ip, "host-a")], first_batch)
+    assert r1.status_code == 503, r1.text
+    monkeypatch.setattr(ddns, "apply_ddns_for_lease", real)
+    r2 = await _post_with_id(concurrent_client, peer_a, [_ev(ip, "host-b")], uuid.uuid4().hex)
+    assert r2.status_code == 200, r2.text
+    assert [n for n, _v in await _a_records(db_session, zone_id)] == ["host-b"]
+
+    replay = await _post_with_id(concurrent_client, peer_a, [_ev(ip, "host-a")], first_batch)
+    assert replay.status_code == 200 and replay.json()["duplicate"] is True
+    assert [n for n, _v in await _a_records(db_session, zone_id)] == ["host-b"]
