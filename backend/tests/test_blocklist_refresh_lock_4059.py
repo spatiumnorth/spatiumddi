@@ -113,7 +113,7 @@ async def test_a_failure_mid_apply_keeps_the_old_entries_and_records_it(
     ).one()
     assert status == "error"
     assert err and "Refresh failed" in err
-    assert at is not None
+    assert at is None  # not stamped: the sweep still sees a never-synced list
 
 
 @pytest.mark.asyncio
@@ -149,3 +149,72 @@ async def test_refresh_peak_memory_on_a_large_feed(
 
 
 PEAK_LIMIT_MIB = 110  # measured: 140.7 MiB before the fix, 84.4 after
+
+
+@pytest.mark.asyncio
+async def test_apply_anti_join_is_a_hash_join_on_an_empty_vacuumed_table(
+    db_session: AsyncSession,
+) -> None:
+    """#4062: reltuples 0 on the entry table made the NOT EXISTS a quadratic
+    nested loop. After the apply's planner setup it must be a hash anti join."""
+    bl = await _make_list(db_session)
+    await db_session.commit()
+    # Empty + vacuumed, on its own autocommit connection (VACUUM cannot run
+    # inside the test's transaction).
+    other = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
+    async with other.connect() as c:
+        c = await c.execution_options(isolation_level="AUTOCOMMIT")
+        await c.execute(text("VACUUM dns_blocklist_entry"))
+    await other.dispose()
+
+    await db_session.execute(
+        text(
+            "CREATE TEMP TABLE _blocklist_feed_stage (domain text NOT NULL, literal boolean NOT NULL)"
+        )
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO _blocklist_feed_stage SELECT 'h' || g || '.example.com', false "
+            "FROM generate_series(1, 50000) g"
+        )
+    )
+    await dns_tasks._plan_set_apply(db_session)
+    rows = await db_session.execute(
+        text("EXPLAIN " + str(dns_tasks._ADD_FEED_ENTRIES_SQL)), {"lid": bl.id, "wild": True}
+    )
+    plan = "\n".join(r[0] for r in rows.all())
+    assert "Hash Anti Join" in plan, plan
+    assert "Nested Loop Anti Join" not in plan, plan
+
+
+@pytest.mark.asyncio
+async def test_a_failed_apply_does_not_stamp_last_synced_at(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hourly sweep retries a never-synced list; a failed apply must not
+    make it wait out the list's whole interval."""
+    bl = await _make_list(db_session)
+    bl_id = bl.id
+    await db_session.commit()
+    _wire(monkeypatch, db_session, "".join(f"new{i}.example\n" for i in range(10)))
+
+    async def _boom(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("lost")
+
+    monkeypatch.setattr("app.services.dns.bundle_dirty.mark_bundles_dirty", _boom)
+    with pytest.raises(RuntimeError):
+        await dns_tasks._refresh_blocklist_feed_async(str(bl_id))
+    row = (
+        await db_session.execute(
+            select(DNSBlockList.last_sync_status, DNSBlockList.last_synced_at).where(
+                DNSBlockList.id == bl_id
+            )
+        )
+    ).one()
+    assert row.last_sync_status == "error"
+    assert row.last_synced_at is None
+    from datetime import UTC, datetime
+
+    from app.tasks.blocklist_refresh_sweep import due_blocklist_ids
+
+    assert str(bl_id) in await due_blocklist_ids(db_session, datetime.now(UTC))

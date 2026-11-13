@@ -79,6 +79,31 @@ async def _unlock_list(db: AsyncSession, list_id: str) -> None:
         logger.warning("blocklist_feed_unlock_failed", list_id=list_id, error=str(exc))
 
 
+_ADD_FEED_ENTRIES_SQL = text(
+    "INSERT INTO dns_blocklist_entry "
+    "(id, list_id, domain, entry_type, source, is_wildcard, reason) "
+    "SELECT gen_random_uuid(), :lid, s.domain, 'block', 'feed', (NOT s.literal AND :wild), '' "
+    "FROM _blocklist_feed_stage s "
+    "WHERE NOT EXISTS (SELECT 1 FROM dns_blocklist_entry e "
+    "WHERE e.list_id = :lid AND e.domain = s.domain) "
+    "ON CONFLICT (list_id, domain) DO NOTHING"
+)
+
+
+async def _plan_set_apply(db: AsyncSession) -> None:
+    """Keep the apply's anti joins hash joins (#4062).
+
+    Against an entry table that is empty and freshly vacuumed (reltuples 0)
+    and an unanalysed staging table, Postgres plans ``NOT EXISTS`` as a nested
+    loop over a seq scan of the table being filled: quadratic in the feed,
+    cancelled at the command timeout with the list left empty. Real
+    statistics on the staging table, and no nested loops for the rest of this
+    transaction, make it a hash anti join whatever the entry table's stats say.
+    """
+    await db.execute(text("ANALYZE _blocklist_feed_stage"))
+    await db.execute(text("SET LOCAL enable_nestloop = off"))
+
+
 async def _refuse_feed_refresh(
     db: AsyncSession, bl: DNSBlockList, error: str, event: str
 ) -> dict[str, int | str]:
@@ -94,7 +119,11 @@ async def _refuse_feed_refresh(
 async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
     """Core async logic for refresh_blocklist_feed, reusable from tests."""
     engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
+        settings.database_url,
+        future=True,
+        # The apply is a handful of set statements over the whole feed, not
+        # row-at-a-time writes (#4062).
+        connect_args=task_connect_args(settings.task_db_long_command_timeout),
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -121,7 +150,6 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                     .values(
                         last_sync_status="error",
                         last_sync_error="Refresh failed: unexpected error (see server log)",
-                        last_synced_at=datetime.now(UTC),
                     )
                 )
                 await db.commit()
@@ -266,6 +294,9 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
         )
         return {"status": "error", "added": 0, "removed": 0}
     domains = parsed.domains  # deduped by the parser
+    # Entries whose reach the rule itself fixes (#4037): never follow the
+    # list's subdomain setting.
+    literals = parsed.literal_domains
     wildcard = bool(bl.feed_entries_are_wildcard)
 
     # #3607: a feed that parses to nothing is how an empty file, a
@@ -273,7 +304,7 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     # populated list with it would drop every feed entry, so refuse
     # when the list has feed entries; a first refresh of a genuinely
     # empty feed is allowed and reported below.
-    feed_empty = not domains and not parsed.exceptions
+    feed_empty = not domains and not literals and not parsed.exceptions
     if feed_empty:
         had_feed_entries = await db.scalar(
             select(func.count())
@@ -327,25 +358,28 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     # previous entries instead of leaving the list half-written or empty.
     await db.execute(text("DROP TABLE IF EXISTS _blocklist_feed_stage"))
     await db.execute(
-        text("CREATE TEMP TABLE _blocklist_feed_stage (domain text NOT NULL) ON COMMIT DROP")
-    )
-    stage_insert = text("INSERT INTO _blocklist_feed_stage (domain) VALUES (:d)")
-    for batch in _batched(domains, _FEED_WRITE_BATCH):
-        await db.execute(stage_insert, [{"d": d} for d in batch])
-    domains.clear()  # staged; the parsed copy is no longer needed
-
-    add_result = await db.execute(
         text(
-            "INSERT INTO dns_blocklist_entry "
-            "(id, list_id, domain, entry_type, source, is_wildcard, reason) "
-            "SELECT gen_random_uuid(), :lid, s.domain, 'block', 'feed', :wild, '' "
-            "FROM _blocklist_feed_stage s "
-            "WHERE NOT EXISTS (SELECT 1 FROM dns_blocklist_entry e "
-            "WHERE e.list_id = :lid AND e.domain = s.domain) "
-            "ON CONFLICT (list_id, domain) DO NOTHING"
-        ),
-        {"lid": bl.id, "wild": wildcard},
+            "CREATE TEMP TABLE _blocklist_feed_stage "
+            "(domain text NOT NULL, literal boolean NOT NULL) ON COMMIT DROP"
+        )
     )
+    stage_insert = text("INSERT INTO _blocklist_feed_stage (domain, literal) VALUES (:d, :l)")
+    literal_set = set(literals)
+    for batch in _batched([d for d in domains if d not in literal_set], _FEED_WRITE_BATCH):
+        await db.execute(stage_insert, [{"d": d, "l": False} for d in batch])
+    for batch in _batched(literals, _FEED_WRITE_BATCH):
+        await db.execute(stage_insert, [{"d": d, "l": True} for d in batch])
+    domains.clear()  # staged; the parsed copies are no longer needed
+    literals.clear()
+    literal_set.clear()
+    # A statement planned against an unanalysed temp table, or against an
+    # entry table that is empty and freshly vacuumed (reltuples 0), picks a
+    # nested-loop anti join that is quadratic in the feed and ran past the
+    # command timeout (#4062). Real statistics on the staging table plus no
+    # nested loops inside this transaction keep it a hash anti join.
+    await _plan_set_apply(db)
+
+    add_result = await db.execute(_ADD_FEED_ENTRIES_SQL, {"lid": bl.id, "wild": wildcard})
     n_added = int(getattr(add_result, "rowcount", 0) or 0)
     remove_result = await db.execute(
         text(
@@ -356,6 +390,18 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
         {"lid": bl.id},
     )
     n_removed = int(getattr(remove_result, "rowcount", 0) or 0)
+    # Feed rows that now come from a ``|name^`` / ``.name^`` rule keep their
+    # row, so a stale wildcard flag on it is cleared (#4037).
+    restamp_result = await db.execute(
+        text(
+            "UPDATE dns_blocklist_entry e SET is_wildcard = false "
+            "FROM _blocklist_feed_stage s "
+            "WHERE e.list_id = :lid AND e.source = 'feed' AND e.domain = s.domain "
+            "AND s.literal AND e.is_wildcard"
+        ),
+        {"lid": bl.id},
+    )
+    n_restamped = int(getattr(restamp_result, "rowcount", 0) or 0)
 
     # The feed's own exceptions (adblock ``@@||name^``, #2123). Same
     # diff as the entries, on ``source``: an exception the operator
@@ -439,7 +485,7 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     # relationships (no lazy access in async); published after.
     wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
     wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
-    feed_changed = bool(n_added or n_removed or exc_to_add or exc_to_remove)
+    feed_changed = bool(n_added or n_removed or n_restamped or exc_to_add or exc_to_remove)
 
     # The entries went in and out through Core INSERT / DELETE, which
     # the bundle_dirty listener never sees (it watches the ORM unit of

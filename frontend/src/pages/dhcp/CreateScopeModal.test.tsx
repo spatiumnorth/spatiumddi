@@ -145,16 +145,19 @@ describe("CreateScopeModal pre-fill (#1154)", () => {
     createPool.mockResolvedValue({});
 
     open(qc, SUBNET_A.id);
-    await waitFor(() =>
-      expect(control("Domain Name (option 15)").value).toBe(
-        "corp.example.test",
-      ),
-    );
-    expect(control("Routers (option 3)").value).toBe("");
+    // The defaults wait for the subnet: they depend on its address family
+    // (#4025), and on the settings read the dialog makes itself (#4026).
+    await screen.findByText("Routers (option 3)", { selector: "label" });
+    expect(control("Domain Name (option 15)").value).toBe("");
 
     await act(async () => subnet.resolve(SUBNET_A));
     await waitFor(() =>
       expect(control("Routers (option 3)").value).toBe("10.78.21.1"),
+    );
+    await waitFor(() =>
+      expect(control("Domain Name (option 15)").value).toBe(
+        "corp.example.test",
+      ),
     );
     expect(control("Start IP").value).toBe("10.78.21.10");
     expect(control("End IP").value).toBe("10.78.21.254");
@@ -229,11 +232,7 @@ describe("CreateScopeModal pre-fill (#1154)", () => {
     createPool.mockResolvedValue({});
 
     open(qc, SUBNET_A.id);
-    await waitFor(() =>
-      expect(control("Domain Name (option 15)").value).toBe(
-        "corp.example.test",
-      ),
-    );
+    await screen.findByText("Routers (option 3)", { selector: "label" });
     const routers = control("Routers (option 3)");
     fireEvent.change(routers, { target: { value: "10.78.21.254" } });
     fireEvent.blur(routers);
@@ -302,10 +301,10 @@ describe("CreateScopeModal pre-fill (#1154)", () => {
     getSubnet.mockResolvedValue(SUBNET_V6);
 
     open(qc, SUBNET_V6.id);
-    await waitFor(() =>
-      expect(control("DNS Servers (option 6)").value).toBe("10.0.0.53"),
-    );
+    await waitFor(() => expect(getSubnet).toHaveBeenCalled());
     await act(async () => {});
+    // The IPv4 defaults stay off an IPv6 scope too (#4025).
+    expect(control("DNS Servers (option 6)").value).toBe("");
     expect(control("Routers (option 3)").value).toBe("");
   });
 });
