@@ -39,6 +39,13 @@ from spatium_dns_agent.drivers.technitium import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ops_own_every_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests drive ``apply_record_op`` against a fake that has no SOA
+    owner marker; ownership (#1775) has its own tests."""
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
+
+
 class _FakeResponse:
     """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
     body is a plain-text one (``blocked/export``), whose ``.json()`` raises

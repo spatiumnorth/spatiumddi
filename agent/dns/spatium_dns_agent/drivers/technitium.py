@@ -2795,7 +2795,11 @@ class TechnitiumDriver(DriverBase):
                 managed = {str(z.get("zone") or "").lower() for z in previous if z.get("zone")}
             except (OSError, ValueError, AttributeError):
                 pass
-            self._owned_before = frozenset(managed)
+            # Not ``managed``: a zone named by a previous render is one we
+            # tried to apply, not one we created. A hand-made zone of the same
+            # name sits in rendered/ too, so only the ledger and the SOA owner
+            # marker prove ownership (#1775); ``managed`` here only keeps
+            # retirement working for a zone dropped while the ledger was gone.
         except (OSError, ValueError, TypeError) as exc:
             # An unreadable ledger must not turn into "delete nothing ever"
             # silently, nor into a guess. Rebuild it from this bundle.
@@ -3115,6 +3119,7 @@ class TechnitiumDriver(DriverBase):
 
         zone = op["zone_name"].rstrip(".")
         op_kind = op["op"]
+        self._require_owned_for_op(token, zone)
 
         # DNSSEC ops (issue #740) are zone-level, not rrset-shaped. They
         # ride the same record-op queue but branch off before any of the
@@ -4461,16 +4466,47 @@ class TechnitiumDriver(DriverBase):
         there would stop every zone on a guess. Only a Primary can carry the
         marker; a Secondary / Stub / Forwarder rests on the ledger alone.
         """
-        if self._owned_before is None or zone.lower() in self._owned_before:
+        return self._zone_owned(token, zone, self._owned_before)
+
+    def _ledger_names(self) -> frozenset[str] | None:
+        """The ledger as it stands now; ``None`` when unreadable (do not block)."""
+        try:
+            return frozenset(
+                str(n).lower() for n in json.loads(self._managed_zones_path().read_text())
+            )
+        except FileNotFoundError:
+            return frozenset()
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _require_owned_for_op(self, token: str, zone: str) -> None:
+        """Refuse a record or DNSSEC op for a zone this agent does not own (#1775).
+
+        The same decision as the full-zone reconcile, so a record change in the
+        group cannot write into (or delete from) a hand-made zone the reconcile
+        refused. Raising makes the op ack as an error naming the zone, never
+        as applied.
+        """
+        if not self._zone_owned(token, zone, self._ledger_names()):
+            log.error("technitium_zone_not_owned", zone=zone, via="record_op")
+            raise RuntimeError(
+                f"{zone}: a zone of that name already exists on this Technitium server "
+                "and SpatiumDDI did not create it, so the change was not applied. "
+                "Delete it in the Technitium console, or set "
+                "TECHNITIUM_ADOPT_EXISTING_ZONES=true on the agent to take it over"
+            )
+
+    def _zone_owned(self, token: str, zone: str, owned: frozenset[str] | None) -> bool:
+        if owned is None or zone.lower() in owned:
             return True
-        if self._owner_marker_present(token, zone):
-            return True
-        return os.environ.get("TECHNITIUM_ADOPT_EXISTING_ZONES", "").strip().lower() in (
+        if os.environ.get("TECHNITIUM_ADOPT_EXISTING_ZONES", "").strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
-        )
+        ):
+            return True
+        return self._owner_marker_present(token, zone)
 
     def _owner_marker_present(self, token: str, zone: str) -> bool:
         try:

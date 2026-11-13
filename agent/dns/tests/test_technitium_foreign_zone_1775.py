@@ -25,6 +25,11 @@ from .test_technitium_render import _install_fake_request, _seed_token, _zone
 FORWARD = "corp.test"
 
 
+@pytest.fixture(autouse=True)
+def _no_adopt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TECHNITIUM_ADOPT_EXISTING_ZONES", raising=False)
+
+
 def _run(tmp_path: Path, fake: _SoaFake, ledger: list[str] | None) -> TechnitiumDriver:
     d = TechnitiumDriver(state_dir=tmp_path)
     if ledger is not None:
@@ -112,3 +117,63 @@ def test_a_new_zone_is_stamped_at_creation(tmp_path: Path) -> None:
     fake = _SoaFake({})
     _run(tmp_path, fake, ledger=[])
     assert fake.soa_comments[FORWARD] == _OWNER_MARKER
+
+
+def _op(kind: str, name: str = "bundle", value: str = "203.0.113.86") -> dict:
+    return {
+        "op_id": "op-1",
+        "op": kind,
+        "zone_name": FORWARD,
+        "record": {"name": name, "type": "A", "value": value, "ttl": 60},
+    }
+
+
+def _writes(fake: _SoaFake) -> list[str]:
+    return [p for p, _ in fake.writes if p.startswith("zones/records/") and "get" not in p]
+
+
+@pytest.mark.parametrize("kind", ["create", "update", "delete", "dnssec_sign", "dnssec_unsign"])
+def test_a_record_op_never_reaches_a_zone_the_agent_did_not_create(
+    tmp_path: Path, kind: str
+) -> None:
+    fake = _foreign()
+    d = _run(tmp_path, fake, ledger=[])
+    before = list(fake.writes)
+    with pytest.raises(RuntimeError, match="did not create it"):
+        d.apply_record_op(_op(kind, name="keep", value="192.0.2.77"))
+    assert fake.writes == before
+    assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
+
+
+def test_a_record_op_still_lands_in_a_zone_the_agent_owns(tmp_path: Path) -> None:
+    fake = _SoaFake({})
+    d = _run(tmp_path, fake, ledger=[])
+    n = len(_writes(fake))
+    d.apply_record_op(_op("create"))
+    assert len(_writes(fake)) > n
+
+
+def test_a_record_op_lands_after_the_adopt_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
+    fake = _foreign()
+    d = _run(tmp_path, fake, ledger=[])
+    n = len(_writes(fake))
+    d.apply_record_op(_op("create"))
+    assert len(_writes(fake)) > n
+
+
+def test_a_wiped_state_dir_does_not_adopt_a_zone_a_previous_render_named(
+    tmp_path: Path,
+) -> None:
+    fake = _foreign()
+    # First pass: refused, but the render is on disk as rendered/.
+    _run(tmp_path, fake, ledger=[])
+    # State dir wiped except for the renders: no ledger, no marker.
+    (tmp_path / _MANAGED_ZONES_FILE).unlink()
+    d = _run(tmp_path, fake, ledger=None)
+    assert d._refused_zones
+    assert [r["name"] for r in fake.zones[FORWARD]] == [f"keep.{FORWARD}"]
+    assert fake.soa_comments.get(FORWARD) != _OWNER_MARKER
+    assert FORWARD not in json.loads((tmp_path / _MANAGED_ZONES_FILE).read_text())
