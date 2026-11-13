@@ -12716,15 +12716,34 @@ export function SyncWithServersResultModal({
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 text-xs">
               <SyncStat
                 label="Records pushed"
-                value={result.total_pushed}
-                accent={result.total_pushed ? "good" : undefined}
+                value={result.total_pushed - (result.total_queued ?? 0)}
+                accent={
+                  result.total_pushed - (result.total_queued ?? 0)
+                    ? "good"
+                    : undefined
+                }
               />
+              {(result.total_queued ?? 0) > 0 && (
+                <SyncStat
+                  label="Queued for delivery"
+                  value={result.total_queued ?? 0}
+                />
+              )}
               <SyncStat
                 label="Push errors"
                 value={result.total_push_errors}
                 accent={result.total_push_errors ? "bad" : undefined}
               />
             </div>
+            {(result.total_queued ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Queued records are not yet on the server. They are applied in
+                the background (an agent applies them on its next poll; for an
+                agentless server the retry sweep does, a batch at a time), so a
+                large zone can take a few minutes to converge. Failed writes are
+                retried; check the server's record-op queue for errors.
+              </p>
+            )}
 
             {result.items.length === 0 && (
               <p className="text-sm text-muted-foreground italic">
@@ -12864,8 +12883,14 @@ export function SyncWithServersResultModal({
                                   <td className="px-3 py-1 tabular-nums text-emerald-600">
                                     {item.imported || "—"}
                                   </td>
-                                  <td className="px-3 py-1 tabular-nums text-emerald-600">
-                                    {item.pushed || "—"}
+                                  <td
+                                    className={`px-3 py-1 tabular-nums ${item.queued_for_agent ? "text-amber-600" : "text-emerald-600"}`}
+                                  >
+                                    {item.pushed
+                                      ? item.queued_for_agent
+                                        ? `${item.pushed} queued`
+                                        : item.pushed
+                                      : "—"}
                                   </td>
                                   <td className="px-3 py-1">
                                     {item.error ? (
@@ -12875,6 +12900,11 @@ export function SyncWithServersResultModal({
                                     ) : item.push_errors.length > 0 ? (
                                       <span className="text-amber-600">
                                         {item.push_errors.length} push err
+                                      </span>
+                                    ) : item.queued_for_agent &&
+                                      item.pushed > 0 ? (
+                                      <span className="text-amber-600">
+                                        queued, not yet on the server
                                       </span>
                                     ) : (
                                       <span className="text-muted-foreground">
