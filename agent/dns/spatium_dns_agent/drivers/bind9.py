@@ -43,6 +43,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ..blocklist_entries import entry_count, iter_entries
 from ..ingest import read_seen_keys as _read_seen_keys
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
 from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
@@ -3913,7 +3914,7 @@ class Bind9Driver(DriverBase):
                     zone=bl["rpz_zone_name"],
                     source=tree,
                     via=how,
-                    entries=len(bl.get("entries") or []),
+                    entries=entry_count(bl),
                 )
                 return
         self._write_rpz_zone_file(path, bl)
@@ -4027,7 +4028,7 @@ class Bind9Driver(DriverBase):
         log.info(
             "bind9_rpz_written",
             zone=zname,
-            entries=len(bl.get("entries") or []),
+            entries=entry_count(bl),
             owners=len(seen),
         )
 
@@ -4054,7 +4055,7 @@ class Bind9Driver(DriverBase):
         # the zone must load, since the alternative is enforcing nothing
         # at all. Collisions are logged so the operator can reconcile the
         # lists rather than wonder which one is in effect.
-        for e in bl.get("entries") or []:
+        for e in iter_entries(bl):
             domain = e["domain"].rstrip(".")
             key = domain.lower()
             # An exception emits ``N`` and ``*.N`` as passthru, so a
