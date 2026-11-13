@@ -1356,11 +1356,16 @@ export function ApplyTemplateControl({
   currentOptions: DHCPOption[];
   onApply: (next: DHCPOption[]) => void;
 }) {
-  const { data: templates = [] } = useQuery({
+  // Re-read on open and hold the picker meanwhile: applying merges the
+  // template's options into the form, and a cached copy may predate another
+  // client's change (#4029, as #3868).
+  const { data: templates = [], isFetching } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
     queryFn: () =>
       groupId ? dhcpApi.listOptionTemplates(groupId) : Promise.resolve([]),
     enabled: !!groupId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const [overwritten, setOverwritten] = useState<string[]>([]);
   const [pickerKey, setPickerKey] = useState(0);
@@ -1411,6 +1416,7 @@ export function ApplyTemplateControl({
         aria-label="Apply template"
         key={pickerKey}
         defaultValue=""
+        disabled={isFetching}
         onChange={(e) => handleSelect(e.target.value)}
         className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
       >
