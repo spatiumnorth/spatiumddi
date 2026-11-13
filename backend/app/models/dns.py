@@ -1378,6 +1378,8 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "dns_record"
     __table_args__ = (
         Index("ix_dns_record_zone_name", "zone_id", "name"),
+        # The DDNS name-holder check (#3807) matches ``lower(name)``.
+        Index("ix_dns_record_zone_lower_name", "zone_id", sa_text("lower(name)")),
         Index("ix_dns_record_fqdn", "fqdn"),
     )
 
