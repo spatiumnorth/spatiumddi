@@ -162,7 +162,8 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
     """Each commit wakes the DNS agents to rebuild their bundle, so a fast box
     must not pay it every 8 names: 100 names went through 13 transactions
     after the batch's own and a first-acquisition batch took three times as
-    long as before the change. The chunk grows to fit the hold budget."""
+    long as before the change. The chunk starts at 25 and grows to fit the hold
+    budget."""
     subnet, _block = await _ddns_subnet(db_session)
     peer_a, _peer_b = await _two_agents(db_session, [subnet])
     zone_id = uuid.UUID(str(subnet.dns_zone_id))
@@ -179,8 +180,8 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
     resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
     assert resp.status_code == 200, resp.text
     assert len(await _a_records(db_session, zone_id)) == len(ips)
-    # The batch's own commit, then the chunks: 8 names, then as many as fit.
-    assert commits <= 8, commits
+    # The batch's own commit, then the chunks: 25 names, then as many as fit.
+    assert commits <= 5, commits
 
 
 @pytest.mark.asyncio
@@ -262,3 +263,72 @@ async def test_a_replay_does_not_republish_a_name_a_later_batch_renamed(
     replay = await _post_with_id(concurrent_client, peer_a, [_ev(ip, "host-a")], first_batch)
     assert replay.status_code == 200 and replay.json()["duplicate"] is True
     assert [n for n, _v in await _a_records(db_session, zone_id)] == ["host-b"]
+
+
+def _count_wakes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    import app.core.agent_wake as agent_wake
+
+    published: list[tuple[str, ...]] = []
+
+    async def _publish(*channels: str) -> None:
+        published.append(channels)
+
+    monkeypatch.setattr(agent_wake, "publish_wake", _publish)
+    return published
+
+
+@pytest.mark.asyncio
+async def test_a_hundred_new_names_wake_the_dns_agents_once(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chunks commit separately but the DNS agents are woken once for the
+    POST, after the last of them, so they rebuild once per batch."""
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    ips = [f"10.31.1.{n}" for n in range(100, 200)]
+    published = _count_wakes(monkeypatch)
+    resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
+    assert resp.status_code == 200, resp.text
+    assert len(await _a_records(db_session, zone_id)) == len(ips)
+    dns_wakes = [c for c in published if any(":dns:" in ch for ch in c)]
+    assert len(dns_wakes) == 1, published
+
+
+@pytest.mark.asyncio
+async def test_a_batch_that_lost_the_database_mid_ddns_still_wakes_for_what_committed(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 503 drops the request's collected wakes, so the names the earlier
+    chunks committed would wait for the safety tick."""
+    import asyncpg
+    from sqlalchemy.exc import InterfaceError
+
+    import app.api.v1.dhcp.agents as agents
+    import app.services.dns.ddns as ddns
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    monkeypatch.setattr(agents, "_DDNS_CHUNK_START", 3)
+    real = ddns.apply_ddns_for_lease
+    calls = 0
+
+    async def _outage(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 5:  # the second chunk
+            raise InterfaceError("stmt", {}, asyncpg.exceptions.ConnectionDoesNotExistError("x"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(ddns, "apply_ddns_for_lease", _outage)
+    published = _count_wakes(monkeypatch)
+    resp = await _post(concurrent_client, peer_a, [_ev(i) for i in _A_IPS[:8]])
+    assert resp.status_code == 503, resp.text
+    assert len(await _a_records(db_session, zone_id)) == 3
+    dns_wakes = [c for c in published if any(":dns:" in ch for ch in c)]
+    assert len(dns_wakes) == 1, published
