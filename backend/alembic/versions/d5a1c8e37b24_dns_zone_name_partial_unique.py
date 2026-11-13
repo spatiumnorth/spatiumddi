@@ -15,7 +15,7 @@ Downgrade restores the full constraint and fails if a trashed zone now shares
 its name and view with a live one; purge or rename the trashed zone first.
 
 Revision ID: d5a1c8e37b24
-Revises: ede3bcd2aff4
+Revises: a4040c7e91d3
 Create Date: 2026-11-12 09:00:00.000000
 """
 
@@ -26,7 +26,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "d5a1c8e37b24"
-down_revision = "ede3bcd2aff4"
+down_revision = "a4040c7e91d3"
 branch_labels = None
 depends_on = None
 

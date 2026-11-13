@@ -263,14 +263,14 @@ def test_adblock_parses_every_rule_shape_for_what_it_says() -> None:
         "modifier": 6,
         # three $badfilter rules
         "badfilter": 3,
-        # a path, a ``*`` inside a name, a ``|`` anchor, a bare word, and
-        # ``*.wild…`` (not ``||`` syntax)
-        "malformed": 5,
+        # a path, a ``*`` inside a name, a bare word, and ``*.wild…`` (not
+        # ``||`` syntax); ``|anchor.example.com^`` is an exact block (#4037)
+        "malformed": 4,
         # #3519: the reasons behind ``malformed``, one rule each
         "star_in_name": 1,  # ``||ad*.example.com^``
         "no_anchor": 1,  # ``plain.example.com``
         "trailing_dot": 0,
-        "start_anchor": 1,  # ``|anchor.example.com^``
+        "start_anchor": 0,
         "bare_star": 1,  # ``*.wild…``
         "dotless": 0,
         "other": 1,  # ``||path.example.com/banner.js``
@@ -613,15 +613,17 @@ def test_malformed_adblock_rules_are_split_by_reason_3519() -> None:
     assert p.skipped is not None
     d = p.skipped.as_dict()
     assert d["star_in_name"] == 1
-    assert d["no_anchor"] == 2
+    # ``.bbelements.com^`` and ``|a.klaviyo.com^`` are complete names and are
+    # enforced since #4037, so only the substring rule and ``|piwik.`` remain.
+    assert d["no_anchor"] == 1
     assert d["trailing_dot"] == 1
-    assert d["start_anchor"] == 2
+    assert d["start_anchor"] == 1
     assert d["bare_star"] == 3
     assert d["dotless"] == 1
     assert d["other"] == 1
     assert (
         d["malformed"]
-        == 11
+        == 9
         == sum(
             d[k]
             for k in (
@@ -635,4 +637,4 @@ def test_malformed_adblock_rules_are_split_by_reason_3519() -> None:
             )
         )
     )
-    assert p.skipped.total == 11
+    assert p.skipped.total == 9

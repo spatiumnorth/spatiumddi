@@ -2130,6 +2130,8 @@ export const ipamApi = {
         skipped: string[];
         /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
         dns_cleared: string[];
+        /** Why each skipped row was skipped, keyed by id (#3905). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -5391,6 +5393,8 @@ export interface DNSZoneSyncItem {
   pushed: number;
   server_records: number;
   push_errors: string[];
+  /** The pushed records are queued for background delivery (#3817). */
+  queued_for_agent?: boolean;
   error: string | null;
 }
 
@@ -5400,6 +5404,8 @@ export interface DNSServerSyncResult {
   zones_failed: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   /** Zones listed on the server via WinRM — windows_dns Path B only.
    * Empty for BIND9 and windows_dns without credentials. */
@@ -5433,6 +5439,8 @@ export interface DNSGroupSyncResult {
   servers_succeeded: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   total_zones_imported: number;
   total_zones_pushed_to_server: number;
@@ -13565,7 +13573,7 @@ export interface ApplianceRow {
   host_config_health: Record<
     string,
     {
-      state: "retrying" | "failing";
+      state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
     }
@@ -16399,6 +16407,8 @@ export interface NATMapping {
   // hide-NAT path); without these the UI can only show the bare UUID.
   internal_subnet_cidr: string | null;
   internal_subnet_name: string | null;
+  /** True when the caller cannot read the subnet, so the labels above are withheld (#3641). */
+  internal_subnet_redacted?: boolean;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;
@@ -16615,12 +16625,66 @@ export interface ContainerStatsResponse {
   rows: ContainerStat[];
 }
 
+/** #3761 — which runtimes the Containers tab can see. */
+export interface ContainerBackendStatus {
+  available: boolean;
+  reason: string | null;
+  detail: string | null;
+}
+export interface ContainerBackends {
+  docker: ContainerBackendStatus;
+  kubernetes: ContainerBackendStatus;
+  appliance: boolean;
+}
+export interface PodRow {
+  name: string;
+  component: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string | null;
+  started_at: string | null;
+  containers: string[];
+}
+export interface PodListResponse {
+  available: boolean;
+  reason: string | null;
+  rows: PodRow[];
+}
+
 export const containersApi = {
   stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
     api
       .get<ContainerStatsResponse>("/admin/containers/stats", { params })
       .then((r) => r.data),
+  backends: () =>
+    api
+      .get<ContainerBackends>("/admin/containers/backends")
+      .then((r) => r.data),
+  pods: () =>
+    api.get<PodListResponse>("/admin/containers/pods").then((r) => r.data),
+  podLogs: (name: string, tail = 200) =>
+    api
+      .get<{
+        name: string;
+        tail: string;
+      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, {
+        params: { tail },
+      })
+      .then((r) => r.data),
 };
+
+/** Follow one release pod's logs (redacted server-side) — #3761. */
+export function streamPodLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/admin/containers/pods/${encodeURIComponent(name)}/logs/stream?tail=${tail}`,
+    signal,
+  );
+}
 
 // ── Service lifecycle control (issue #890) ────────────────────────────────────
 
@@ -21544,6 +21608,8 @@ export interface ERLBinding {
   mac_address: string | null;
   ip_address_id: string | null;
   site_id: string | null;
+  target_label?: string | null;
+  target_missing?: boolean;
   is_active: boolean;
   notes: string;
   created_at: string;

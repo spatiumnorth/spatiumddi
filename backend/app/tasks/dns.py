@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import structlog
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -192,6 +192,9 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 )
                 return {"status": "error", "added": 0, "removed": 0}
             domains = set(parsed.domains)
+            # Entries whose reach the rule itself fixes (#4037): never follow
+            # the list's subdomain setting.
+            literals = set(parsed.literal_domains)
             wildcard = bool(bl.feed_entries_are_wildcard)
 
             # #3607: a feed that parses to nothing is how an empty file, a
@@ -199,7 +202,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             # populated list with it would drop every feed entry, so refuse
             # when the list has feed entries; a first refresh of a genuinely
             # empty feed is allowed and reported below.
-            feed_empty = not domains and not parsed.exceptions
+            feed_empty = not domains and not literals and not parsed.exceptions
             if feed_empty:
                 had_feed_entries = await db.scalar(
                     select(func.count())
@@ -248,16 +251,42 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             # insert failed the whole refresh on the constraint.
             feed_existing: set[str] = set()
             other_existing: set[str] = set()
+            # Feed rows that now come from a ``|name^`` / ``.name^`` rule keep
+            # their row, so a stale wildcard flag on it is cleared.
+            restamp: dict[bool, list[str]] = {False: []}
             existing_rows = await db.execute(
-                select(DNSBlockListEntry.domain, DNSBlockListEntry.source).where(
-                    DNSBlockListEntry.list_id == bl.id
-                )
+                select(
+                    DNSBlockListEntry.domain,
+                    DNSBlockListEntry.source,
+                    DNSBlockListEntry.is_wildcard,
+                ).where(DNSBlockListEntry.list_id == bl.id)
             )
-            for domain, source in existing_rows.tuples():
-                (feed_existing if source == "feed" else other_existing).add(domain)
+            for domain, source, flag in existing_rows.tuples():
+                if source != "feed":
+                    other_existing.add(domain)
+                    continue
+                feed_existing.add(domain)
+                # Only a row that moved INTO the literal class is restamped; a
+                # row's flag otherwise follows the list setting, which the
+                # list's own edit restamps (#894).
+                if domain in literals and flag:
+                    restamp[False].append(domain)
 
-            to_add = domains - feed_existing - other_existing
-            to_remove = feed_existing - domains
+            wanted = domains | literals
+            to_add = wanted - feed_existing - other_existing
+            to_remove = feed_existing - wanted
+            for want, names in restamp.items():
+                for batch in _batched(sorted(names), _FEED_WRITE_BATCH):
+                    await db.execute(
+                        update(DNSBlockListEntry)
+                        .where(
+                            DNSBlockListEntry.list_id == bl.id,
+                            DNSBlockListEntry.source == "feed",
+                            DNSBlockListEntry.domain.in_(batch),
+                        )
+                        .values(is_wildcard=want)
+                        .execution_options(synchronize_session=False)
+                    )
 
             for batch in _batched(sorted(to_add), _FEED_WRITE_BATCH):
                 await db.execute(
@@ -276,7 +305,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                             # `cdn.tracker.example` too, which is what every
                             # consumer of these feeds does — but a
                             # host-specific feed wants apex-only.
-                            "is_wildcard": wildcard,
+                            "is_wildcard": False if d in literals else wildcard,
                         }
                         for d in batch
                     ],
@@ -375,7 +404,9 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             # relationships (no lazy access in async); published after.
             wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
             wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
-            feed_changed = bool(to_add or to_remove or exc_to_add or exc_to_remove)
+            feed_changed = bool(
+                to_add or to_remove or any(restamp.values()) or exc_to_add or exc_to_remove
+            )
 
             # The entries went in and out through Core INSERT / DELETE, which
             # the bundle_dirty listener never sees (it watches the ORM unit of
