@@ -53,7 +53,9 @@ afterEach(() => {
   for (const name of Object.keys(answers)) delete answers[name];
 });
 
-function open(existing: VRF | null) {
+async function open(existing: VRF | null) {
+  // Edit reads the VRF when it opens (#3869).
+  if (existing) answers.vrfsApi = { get: () => Promise.resolve(existing) };
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -62,6 +64,7 @@ function open(existing: VRF | null) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  await screen.findByLabelText("Name");
 }
 
 const stored = {
@@ -83,8 +86,8 @@ function named(label: string): HTMLElement {
 }
 
 describe("the VRF dialog's labels (#3467)", () => {
-  it("Edit VRF: each text field is found by its label and shows the VRF's value", () => {
-    open(stored);
+  it("Edit VRF: each text field is found by its label and shows the VRF's value", async () => {
+    await open(stored);
     const values: [string, string, string][] = [
       ["Name", "INPUT", "PROD-CUST-001"],
       ["Description", "TEXTAREA", "production tenant"],
@@ -99,8 +102,8 @@ describe("the VRF dialog's labels (#3467)", () => {
     }
   });
 
-  it("New VRF: each text field is found by its label", () => {
-    open(null);
+  it("New VRF: each text field is found by its label", async () => {
+    await open(null);
     for (const label of [
       "Name",
       "Description",
@@ -112,8 +115,8 @@ describe("the VRF dialog's labels (#3467)", () => {
     }
   });
 
-  it("the Origin ASN and Customer pickers are named by their labels", () => {
-    open(stored);
+  it("the Origin ASN and Customer pickers are named by their labels", async () => {
+    await open(stored);
     for (const label of ["Origin ASN", "Customer"]) {
       const el = named(label);
       // A picker component is named as a group around its select (#3340);
@@ -125,15 +128,15 @@ describe("the VRF dialog's labels (#3467)", () => {
 
   it("a click on a label focuses its field", async () => {
     const user = userEvent.setup();
-    open(stored);
+    await open(stored);
     await user.click(screen.getByText("Description", { selector: "label" }));
     expect(document.activeElement).toBe(named("Description"));
     await user.click(screen.getByText("Export RTs", { selector: "label" }));
     expect(document.activeElement).toBe(named("Export RTs"));
   });
 
-  it("no label names nothing, points at a missing id, or shares an id", () => {
-    open(stored);
+  it("no label names nothing, points at a missing id, or shares an id", async () => {
+    await open(stored);
     const labelled = new Set(
       Array.from(document.querySelectorAll("[aria-labelledby]")).flatMap((e) =>
         e.getAttribute("aria-labelledby")!.split(/\s+/),
