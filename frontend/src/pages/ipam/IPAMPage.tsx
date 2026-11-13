@@ -2805,9 +2805,14 @@ export function CreateSubnetModal({
     queryKey: ["blocks", spaceId],
     queryFn: () => ipamApi.listBlocks(spaceId),
   });
-  const { data: subnetTemplates } = useQuery({
+  // Re-read on open, and hold the picker until it answers: applying a
+  // template copies its DHCP group into the form, and another client may have
+  // changed it since a cached list was taken (#4029, as #3868).
+  const { data: subnetTemplates, isFetching: templatesFetching } = useQuery({
     queryKey: ["ipam-templates", "subnet"],
     queryFn: () => ipamApi.listTemplates({ applies_to: "subnet" }),
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // #1304 — a picked template fills the fields it sets, where the operator
@@ -3160,6 +3165,7 @@ export function CreateSubnetModal({
               <select
                 className={inputCls}
                 value={templateId}
+                disabled={templatesFetching}
                 onChange={(e) => applyTemplate(e.target.value)}
               >
                 <option value="">— none —</option>
@@ -3725,7 +3731,11 @@ export function AddAddressModal({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
-      staleTime: 60_000,
+      // Re-read on open as well: the subnet's primary zone may be one created
+      // since the cached list was taken, and the pick must not settle on
+      // another zone before the list holds it (#4028, as #3078).
+      staleTime: 0,
+      refetchOnMount: "always" as const,
       enabled: dnsOn,
     })),
   });
@@ -3754,7 +3764,8 @@ export function AddAddressModal({
   // operator has chosen.
   const primaryZoneId = effectiveDns?.dns_zone_id;
   const zonesSettled = zoneQueries.every(
-    (q: { isLoading: boolean }) => !q.isLoading,
+    (q: { isLoading: boolean; isFetching: boolean }) =>
+      !q.isLoading && !q.isFetching,
   );
   // The pick is not final while zones are still on their way or the subnet's
   // DNS is being re-read over a cached copy: Allocate waits (#3080).
