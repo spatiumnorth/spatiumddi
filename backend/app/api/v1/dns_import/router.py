@@ -268,8 +268,15 @@ class TechnitiumPreviewIn(BaseModel):
 
     api_url: str = _ASCII
     api_token: str = _ASCII
+    # Off only for a self-signed / private-CA Technitium; same toggle the
+    # ``technitium_api`` driver carries.
+    verify_tls: bool = True
     target_group_id: uuid.UUID
     target_view_id: uuid.UUID | None = None
+    # Optional: the managed ``technitium_api`` server being imported from.
+    # Stamped on the preview so the commit does not push the records back
+    # to it (#1456).
+    source_server_id: uuid.UUID | None = None
 
 
 class TechnitiumTestIn(BaseModel):
@@ -277,6 +284,7 @@ class TechnitiumTestIn(BaseModel):
 
     api_url: str = _ASCII
     api_token: str = _ASCII
+    verify_tls: bool = True
 
 
 class TechnitiumTestOut(BaseModel):
@@ -404,6 +412,12 @@ def _preview_from_pydantic(o: PreviewOut) -> ImportPreview:
     )
 
 
+# A plan's ``source`` names the importer; the server row it came from carries
+# a driver name. They differ for Technitium: the importer is ``technitium``,
+# the agentless server it pulls from is ``technitium_api`` (#1777).
+_SOURCE_DRIVERS: dict[str, set[str]] = {"technitium": {"technitium_api"}}
+
+
 async def _check_source_server(db: DB, plan: PreviewOut) -> None:
     """Reject a plan whose ``source_server_id`` doesn't match its source.
 
@@ -413,13 +427,15 @@ async def _check_source_server(db: DB, plan: PreviewOut) -> None:
     """
     if plan.source_server_id is None:
         return
-    server = await db.get(DNSServer, plan.source_server_id)
-    if server is None or server.driver != plan.source:
+    await _assert_source_server(db, plan.source_server_id, plan.source)
+
+
+async def _assert_source_server(db: DB, server_id: uuid.UUID, source: str) -> None:
+    server = await db.get(DNSServer, server_id)
+    if server is None or server.driver not in _SOURCE_DRIVERS.get(source, {source}):
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Plan source_server_id {plan.source_server_id} is not a " f"{plan.source} server"
-            ),
+            detail=f"Plan source_server_id {server_id} is not a {source} server",
         )
 
 
@@ -903,7 +919,9 @@ async def technitium_test_connection(
     assert_safe_target(body.api_url, label="dns_import_technitium")
 
     try:
-        info = await test_technitium_connection(api_url=body.api_url, api_token=body.api_token)
+        info = await test_technitium_connection(
+            api_url=body.api_url, api_token=body.api_token, verify_tls=body.verify_tls
+        )
     except TechnitiumImportError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return TechnitiumTestOut(**info)
@@ -930,9 +948,14 @@ async def technitium_preview(
     assert_safe_target(body.api_url, label="dns_import_technitium")
 
     try:
-        preview = await parse_technitium_server(api_url=body.api_url, api_token=body.api_token)
+        preview = await parse_technitium_server(
+            api_url=body.api_url, api_token=body.api_token, verify_tls=body.verify_tls
+        )
     except TechnitiumImportError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+    if body.source_server_id is not None:
+        preview.source_server_id = body.source_server_id
+        await _assert_source_server(db, body.source_server_id, preview.source)
 
     zone_names = [(z.name if z.name.endswith(".") else z.name + ".").lower() for z in preview.zones]
     preview.conflicts = await detect_conflicts(

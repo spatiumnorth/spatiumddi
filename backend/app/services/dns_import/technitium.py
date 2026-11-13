@@ -45,6 +45,8 @@ from typing import Any
 import httpx
 
 from app.core.exc_text import describe_exc
+from app.drivers.dns._cloud_base import CloudDNSError
+from app.drivers.dns.technitium_api import TechnitiumAPIDriver
 from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES as _DNSSEC_RECORDS,
 )
@@ -87,6 +89,9 @@ _DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
 _MAX_ZONES_PER_PULL = 5000
 
+# Page size asked of ``zones/list``; pages are followed via ``totalPages``.
+_ZONES_PER_PAGE = 1000
+
 # Only these zone types can be imported as authoritative data. A Secondary
 # holds a copy of someone else's zone and a Forwarder holds no records at
 # all, so importing either would mint rows SpatiumDDI would then try to
@@ -94,10 +99,28 @@ _MAX_ZONES_PER_PULL = 5000
 _IMPORTABLE_ZONE_TYPES = {"Primary"}
 
 
+def _rname_to_soa_form(raw: str) -> str:
+    """Technitium's ``responsiblePerson`` (``hostmaster@example.com``, the
+    email form) as the domain-name form SpatiumDDI stores.
+
+    The local part's dots are escaped (``a.b@x.com`` is ``a\\.b.x.com``) and
+    the ``@`` becomes the first dot. A value already in domain form (no
+    ``@``) passes through. The result is stored via
+    :func:`importable_admin_email`, which refuses what BIND cannot serve.
+    """
+    value = raw.strip().rstrip(".")
+    if "@" not in value:
+        return _normalize_fqdn(value) if value else ""
+    local, _, domain = value.rpartition("@")
+    if not local or not domain:
+        return ""
+    return _normalize_fqdn(f"{local.replace('.', chr(92) + '.')}.{domain}")
+
+
 def _soa_from_rdata(rdata: dict[str, Any], ttl: int) -> ImportedSOA:
     return ImportedSOA(
         primary_ns=_normalize_fqdn(str(rdata.get("primaryNameServer") or "")),
-        admin_email=_normalize_fqdn(str(rdata.get("responsiblePerson") or "")),
+        admin_email=_rname_to_soa_form(str(rdata.get("responsiblePerson") or "")),
         serial=_int_or(rdata.get("serial"), 0),
         refresh=_int_or(rdata.get("refresh"), 86400),
         retry=_int_or(rdata.get("retry"), 7200),
@@ -178,7 +201,14 @@ def _build_imported_zone(zone_name: str, records_payload: list[dict[str, Any]]) 
 
 
 def _api_url(base: str, path: str) -> str:
-    return f"{base.rstrip('/')}/api/{path}"
+    """``<root>/api/<path>``, with the root normalised exactly as the
+    ``technitium_api`` driver does (``…/api`` and a trailing slash are
+    accepted; a scheme-less URL is refused rather than guessed)."""
+    try:
+        root = TechnitiumAPIDriver.normalize_api_url(base)
+    except CloudDNSError as exc:
+        raise TechnitiumImportError(str(exc)) from exc
+    return f"{root}/api/{path}"
 
 
 def _unwrap(payload: dict[str, Any], what: str) -> dict[str, Any]:
@@ -193,10 +223,55 @@ def _unwrap(payload: dict[str, Any], what: str) -> dict[str, Any]:
     return payload.get("response") or {}
 
 
+async def _list_zone_summaries(
+    client: httpx.AsyncClient, api_url: str, api_token: str
+) -> list[dict[str, Any]]:
+    """Every zone summary, following ``totalPages`` (Technitium paginates
+    ``zones/list`` and honours ``pageNumber`` / ``zonesPerPage``).
+
+    Stops at the per-pull cap rather than walking an unbounded estate.
+    """
+    out: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        try:
+            resp = await client.get(
+                _api_url(api_url, "zones/list"),
+                params={
+                    "token": api_token,
+                    "pageNumber": page,
+                    "zonesPerPage": _ZONES_PER_PAGE,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise TechnitiumImportError(
+                f"Could not reach the Technitium API at {api_url!r}: {describe_exc(exc)}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise TechnitiumImportError(
+                f"Technitium API returned HTTP {resp.status_code}: {resp.text[:200]!r}"
+            )
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise TechnitiumImportError(f"Technitium API returned invalid JSON: {exc}") from exc
+        # An expired or wrong token comes back as HTTP 200 with
+        # status="invalid-token", so this is the only place it surfaces.
+        listing = _unwrap(body, "zone list")
+        out.extend(z for z in listing.get("zones") or [] if isinstance(z, dict))
+        total_pages = listing.get("totalPages")
+        if len(out) > _MAX_ZONES_PER_PULL or not isinstance(total_pages, int):
+            return out
+        if page >= total_pages:
+            return out
+        page += 1
+
+
 async def parse_technitium_server(
     *,
     api_url: str,
     api_token: str,
+    verify_tls: bool = True,
     timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
 ) -> ImportPreview:
     """Live-pull every primary zone + its records from a Technitium server.
@@ -217,48 +292,8 @@ async def parse_technitium_server(
     zones: list[ImportedZone] = []
     warnings: list[str] = []
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            resp = await client.get(
-                _api_url(api_url, "zones/list"),
-                params={
-                    "token": api_token,
-                    # 15.4.0 returns every zone and ignores these, but a
-                    # version that paginated would hand back page 1 and we
-                    # would silently import a fraction of the estate. Ask
-                    # for one big page, then assert nothing was held back.
-                    "pageNumber": 1,
-                    "zonesPerPage": _MAX_ZONES_PER_PULL,
-                },
-            )
-        except httpx.HTTPError as exc:
-            raise TechnitiumImportError(
-                f"Could not reach the Technitium API at {api_url!r}: {describe_exc(exc)}"
-            ) from exc
-        if resp.status_code >= 400:
-            raise TechnitiumImportError(
-                f"Technitium API returned HTTP {resp.status_code}: {resp.text[:200]!r}"
-            )
-        try:
-            body = resp.json()
-        except ValueError as exc:
-            raise TechnitiumImportError(f"Technitium API returned invalid JSON: {exc}") from exc
-        # An expired or wrong token comes back as HTTP 200 with
-        # status="invalid-token", so this is the only place it surfaces.
-        listing = _unwrap(body, "zone list")
-
-        summaries = listing.get("zones") or []
-        # Refuse a truncated view. ``totalPages`` is absent on 15.4.0 (that
-        # endpoint is unpaginated there), so this guards against a future
-        # version quietly changing the contract, not today's behaviour.
-        total_pages = listing.get("totalPages")
-        if isinstance(total_pages, int) and total_pages > 1:
-            raise TechnitiumImportError(
-                f"The Technitium API paginated the zone list ({total_pages} pages) "
-                "and this importer reads one page. Importing now would silently "
-                "migrate only part of the estate — please report this, it means "
-                "the server's API contract has changed."
-            )
+    async with httpx.AsyncClient(timeout=timeout, verify=verify_tls, follow_redirects=False) as client:
+        summaries = await _list_zone_summaries(client, api_url, api_token)
         if len(summaries) > _MAX_ZONES_PER_PULL:
             raise TechnitiumImportError(
                 f"Source has {len(summaries)} zones — over the "
@@ -270,6 +305,11 @@ async def parse_technitium_server(
             name = str(summary.get("name") or "")
             ztype = str(summary.get("type") or "")
             if not name:
+                continue
+            # Technitium's own stubs (localhost, 0./127./255.in-addr.arpa, the
+            # ip6 loopback) are ``internal: true``; nobody created them, and
+            # the technitium_api driver drops them too.
+            if summary.get("internal"):
                 continue
             if ztype not in _IMPORTABLE_ZONE_TYPES:
                 warnings.append(
@@ -330,22 +370,16 @@ async def parse_technitium_server(
 
 
 async def test_technitium_connection(
-    *, api_url: str, api_token: str, timeout: httpx.Timeout = _DEFAULT_TIMEOUT
+    *,
+    api_url: str,
+    api_token: str,
+    verify_tls: bool = True,
+    timeout: httpx.Timeout = _DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """Cheap reachability + auth probe for the import form."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            resp = await client.get(_api_url(api_url, "zones/list"), params={"token": api_token})
-        except httpx.HTTPError as exc:
-            raise TechnitiumImportError(
-                f"Could not reach the Technitium API at {api_url!r}: {describe_exc(exc)}"
-            ) from exc
-        if resp.status_code >= 400:
-            raise TechnitiumImportError(
-                f"Technitium API returned HTTP {resp.status_code}: {resp.text[:200]!r}"
-            )
-        listing = _unwrap(resp.json(), "zone list")
-    summaries = listing.get("zones") or []
+    async with httpx.AsyncClient(timeout=timeout, verify=verify_tls, follow_redirects=False) as client:
+        summaries = await _list_zone_summaries(client, api_url, api_token)
+    summaries = [z for z in summaries if not z.get("internal")]
     importable = [z for z in summaries if str(z.get("type")) in _IMPORTABLE_ZONE_TYPES]
     return {
         "ok": True,
