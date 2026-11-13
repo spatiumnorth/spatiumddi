@@ -422,7 +422,9 @@ async def create_pool(
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
-async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser) -> DHCPPool:
+async def update_pool(
+    pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser
+) -> PoolResponse:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
@@ -507,7 +509,19 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
     )
     await db.commit()
     await db.refresh(pool)
-    return pool
+    resp = PoolResponse.model_validate(pool, from_attributes=True)
+    # #4027 — same notice as create (#2445), when the edit moved the range or
+    # made the pool dynamic; a rename of an unchanged range stays quiet.
+    if (
+        scope is not None
+        and pool.pool_type == "dynamic"
+        and ({"start_ip", "end_ip", "pool_type"} & changes.keys())
+    ):
+        existing = await _existing_ips_in_range(
+            db, scope.subnet_id, str(pool.start_ip), str(pool.end_ip)
+        )
+        resp.existing_ips_in_range = existing or None
+    return resp
 
 
 @router.delete("/pools/{pool_id}", status_code=status.HTTP_204_NO_CONTENT)
