@@ -9544,6 +9544,29 @@ export const dhcpApi = {
   // its scope/device is gone (the scope-delete path handles that automatically).
   deleteLease: (serverId: string, leaseId: string) =>
     api.delete(`/dhcp/servers/${serverId}/leases/${leaseId}`),
+  // Fleet-wide exact-IP lease lookup (the IPAM row → lease hop, #1287).
+  findLeasesByIp: (ip: string) =>
+    api
+      .get<Page<DHCPLease>>("/dhcp/leases", { params: { ip, page_size: 20 } })
+      .then((r) => r.data),
+  // Re-provision a dynamic lease onto a static address (#1287). Preview is
+  // read-only; commit re-validates everything and is SuperAdmin-only.
+  previewReprovision: (
+    leaseId: string,
+    params?: { target_ip?: string; hostname?: string },
+  ) =>
+    api
+      .get<ReprovisionPlan>(`/dhcp/leases/${leaseId}/reprovision/preview`, {
+        params,
+      })
+      .then((r) => r.data),
+  commitReprovision: (
+    leaseId: string,
+    body: { target_ip: string; hostname?: string | null },
+  ) =>
+    api
+      .post<ReprovisionPlan>(`/dhcp/leases/${leaseId}/reprovision`, body)
+      .then((r) => r.data),
 
   // Per-server detail (powers the DHCP ServerDetailModal — issue #181)
   getServerPendingOps: (serverId: string, limit = 50) =>
@@ -10321,6 +10344,33 @@ export interface DHCPMACBlockWrite {
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
+}
+
+export interface ReprovisionPlan {
+  lease_id: string;
+  scope_id: string;
+  subnet: string;
+  mac_address: string;
+  old_ip: string;
+  old_hostname: string;
+  target_ip: string;
+  /** requested | reserved_pool | outside_dynamic_pools */
+  target_source: string;
+  target_reason: string;
+  hostname: string;
+  fqdn: string | null;
+  dns_create: string[];
+  dns_remove: string[];
+  ipam_remove: string[];
+  ipam_create: string;
+  /** kept_until_moved | removed_now */
+  old_lease: string;
+  servers: string[];
+  expected_move: string;
+  t1_at: string | null;
+  warnings: string[];
+  static_assignment_id?: string | null;
+  ip_address_id?: string | null;
 }
 
 export interface DHCPLease {

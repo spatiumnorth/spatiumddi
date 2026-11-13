@@ -59,6 +59,7 @@ import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { ServerDetailModal } from "./ServerDetailModal";
+import { ReprovisionLeaseModal } from "./ReprovisionLeaseModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
@@ -2527,6 +2528,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   // offer it to superadmins. A still-live lease may be re-learned on the next
   // poll — this is for expired/stray leases; scope deletion handles the rest.
   const [del, setDel] = useState<DHCPLease | null>(null);
+  const [reprov, setReprov] = useState<DHCPLease | null>(null);
   const delMut = useMutation({
     mutationFn: (leaseId: string) => dhcpApi.deleteLease(server.id, leaseId),
     onSuccess: () => {
@@ -2784,6 +2786,14 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       Copy Hostname
                     </ContextMenuItem>
                   )}
+                  {isSuperadmin && l.mac_address && l.state === "active" && (
+                    <>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem onSelect={() => setReprov(l)}>
+                        Re-provision to static…
+                      </ContextMenuItem>
+                    </>
+                  )}
                   {isSuperadmin && (
                     <>
                       <ContextMenuSeparator />
@@ -2814,6 +2824,9 @@ function LeasesTab({ server }: { server: DHCPServer }) {
           onChange={setPage}
         />
       </div>
+      {reprov && (
+        <ReprovisionLeaseModal lease={reprov} onClose={() => setReprov(null)} />
+      )}
       {del && (
         <DeleteConfirmModal
           title="Delete Lease"
