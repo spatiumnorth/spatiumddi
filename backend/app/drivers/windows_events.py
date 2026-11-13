@@ -33,12 +33,14 @@ from typing import Any
 
 import structlog
 
+from app.drivers._winrm import ps_single_quote
+
 logger = structlog.get_logger(__name__)
 
 
 def _ps_single_quote(s: str) -> str:
     """Escape a string for a PowerShell single-quoted literal."""
-    return "'" + s.replace("'", "''") + "'"
+    return ps_single_quote(s)
 
 
 def _build_filter_script(
