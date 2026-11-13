@@ -39,7 +39,12 @@ from app.models.ipam import Subnet
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(dependencies=[Depends(require_any_resource_permission("address_set"))])
+# ``admit_scoped`` (#4007): a grant scoped to one set must reach the handlers,
+# which hold the real per-row boundary (admin on the row's own id; reads are
+# narrowed to the parent subnet).
+router = APIRouter(
+    dependencies=[Depends(require_any_resource_permission("address_set", admit_scoped=True))]
+)
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────
