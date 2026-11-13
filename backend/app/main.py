@@ -1183,7 +1183,12 @@ def create_app() -> FastAPI:
         # frontend the feature would silently degrade to the dead end it
         # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
         # step-up, so a dialog can prompt and resubmit (#1412).
-        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
+        expose_headers=[
+            "X-Total-Count",
+            "X-Result-Truncated",
+            "X-Adoption-Required",
+            "X-Stepup-Required",
+        ],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given

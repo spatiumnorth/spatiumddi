@@ -8108,9 +8108,10 @@ export function OrphansModal({
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [purgeError, setPurgeError] = useState<string | null>(null);
+  // Only the orphans — not the whole subnet (#1256).
   const { data: addrs, isLoading } = useQuery({
-    queryKey: ["addresses", subnetId],
-    queryFn: () => ipamApi.listAddresses(subnetId),
+    queryKey: ["addresses", subnetId, "orphans"],
+    queryFn: () => ipamApi.listAddresses(subnetId, { status_filter: "orphan" }),
   });
   const orphans = (addrs ?? []).filter((a) => a.status === "orphan");
 
@@ -8503,14 +8504,19 @@ function EditSubnetModalForm({
     tabChoice === "dns" && !dnsOn ? "general" : tabChoice;
 
   // Detect whether network/broadcast records currently exist
-  const { data: addresses } = useQuery({
-    queryKey: ["addresses", subnet.id],
-    queryFn: () => ipamApi.listAddresses(subnet.id),
+  // One row of each is enough to know (#1256).
+  const { data: autoAddressProbe } = useQuery({
+    queryKey: ["addresses", subnet.id, "auto-probe"],
+    queryFn: async () => {
+      const [net, bc] = await Promise.all(
+        ["network", "broadcast"].map((status_filter) =>
+          ipamApi.listAddresses(subnet.id, { status_filter, limit: 1 }),
+        ),
+      );
+      return net.length + bc.length > 0;
+    },
   });
-  const hasAutoAddresses =
-    addresses?.some(
-      (a) => a.status === "network" || a.status === "broadcast",
-    ) ?? true;
+  const hasAutoAddresses = autoAddressProbe ?? true;
   const [autoAddresses, setAutoAddresses] = useState<boolean | null>(null);
   // Use detected value as the default; allow override
   const effectiveAutoAddresses =
@@ -11227,7 +11233,8 @@ export function BulkEditAddressesModal({
   const { data: subnetAddresses = [] } = useQuery({
     queryKey: ["addresses", subnetId ?? "none"],
     queryFn: () => ipamApi.listAddresses(subnetId as string),
-    enabled: !!subnetId,
+    // Only "replace all tags" reads existing tag keys (#1256).
+    enabled: !!subnetId && replaceAllTags,
   });
   const selectedIpSet = new Set(ipIds);
   const existingTagKeys = new Set<string>();

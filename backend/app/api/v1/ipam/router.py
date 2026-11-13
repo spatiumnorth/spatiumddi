@@ -10319,6 +10319,14 @@ async def _readable_subnet_ids(
     return [sid for sid in candidate_ids if user_has_permission(user, "read", "subnet", sid)]
 
 
+# Most rows ``GET /subnets/{id}/addresses`` returns in one response (#1256).
+# It is both the ceiling on an explicit ``limit`` and the implicit window of a
+# call that sends none, so "fetch everything" can no longer be one request on a
+# subnet with hundreds of thousands of materialised rows. Page with
+# ``limit`` / ``offset`` (``X-Total-Count`` says when to stop).
+_ADDRESS_LIST_CAP = 10_000
+
+
 @router.get("/subnets/{subnet_id}/addresses", response_model=list[IPAddressResponse])
 async def list_addresses(
     subnet_id: uuid.UUID,
@@ -10332,17 +10340,22 @@ async def list_addresses(
     mac: str | None = None,
     sort: str | None = None,
     order: str = "asc",
-    limit: int | None = Query(default=None, ge=1),
+    limit: int | None = Query(default=None, ge=1, le=_ADDRESS_LIST_CAP),
     offset: int = Query(default=0, ge=0),
 ) -> list[IPAddress]:
     """List a subnet's IPs.
 
-    Backward compatible: with no filter / sort / paging params this returns
-    the full inet-sorted ``list[IPAddressResponse]`` as before. New optional
-    params (#517) add substring search (``q``), targeted ``hostname`` / ``mac``
-    filters, column ``sort`` + ``order``, and ``limit`` / ``offset`` windowing.
+    Still a bare inet-sorted ``list[IPAddressResponse]`` (#517), with optional
+    substring search (``q``), targeted ``hostname`` / ``mac`` filters, column
+    ``sort`` + ``order`` and ``limit`` / ``offset`` windowing.
     ``X-Total-Count`` always carries the total matching rows *before* the
     limit/offset window (exposed to the browser via CORS ``expose_headers``).
+
+    A call with no ``limit`` is capped at ``_ADDRESS_LIST_CAP`` rows (#1256)
+    rather than returning every row. When that cap cuts the list short the
+    response says so: ``X-Result-Truncated: true`` and a ``Warning`` header,
+    with ``X-Total-Count`` still the full match count. An explicit ``limit`` is
+    bounded by the same cap.
     """
     if await db.get(Subnet, subnet_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -10359,18 +10372,24 @@ async def list_addresses(
     query = base.order_by(*_address_order_by(sort, order))
     if offset:
         query = query.offset(offset)
-    if limit is not None:
-        query = query.limit(limit)
+    window = limit if limit is not None else _ADDRESS_LIST_CAP
+    query = query.limit(window)
     rows = list((await db.execute(query)).scalars().all())
 
-    # X-Total-Count carries the match total *before* the window. When no window
-    # is applied (the default, backward-compatible per-subnet call) the returned
-    # rows ARE the full match set, so skip the extra COUNT(*) on that hot path.
-    if limit is None and not offset:
+    # X-Total-Count carries the match total *before* the window. When the
+    # returned rows are provably the whole match set (no offset, and fewer
+    # rows than the window) skip the extra COUNT(*) on that hot path.
+    if not offset and len(rows) < window:
         total = len(rows)
     else:
         total = await db.scalar(select(func.count()).select_from(base.subquery())) or 0
     response.headers["X-Total-Count"] = str(total)
+    if limit is None and offset + len(rows) < total:
+        response.headers["X-Result-Truncated"] = "true"
+        response.headers["Warning"] = (
+            f'299 - "Address list truncated to {_ADDRESS_LIST_CAP} of {total} rows; '
+            'page with limit and offset"'
+        )
 
     await _enrich_addresses(db, rows)
     return rows
