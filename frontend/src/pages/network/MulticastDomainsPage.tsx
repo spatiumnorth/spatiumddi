@@ -328,9 +328,17 @@ export function MulticastDomainsTab() {
                     colSpan={6}
                     className="px-3 py-10 text-center text-sm text-muted-foreground"
                   >
-                    <ListEmpty error={query.error} what="PIM domains">
-                      No PIM domains yet. Click <strong>New domain</strong> to
-                      add the first.
+                    <ListEmpty
+                      error={query.error}
+                      what="PIM domains"
+                      gate={writeGate}
+                      hint={
+                        <>
+                          Click <strong>New domain</strong> to add the first.
+                        </>
+                      }
+                    >
+                      No PIM domains yet.
                     </ListEmpty>
                   </td>
                 </tr>

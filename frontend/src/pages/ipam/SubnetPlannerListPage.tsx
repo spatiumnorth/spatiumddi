@@ -96,8 +96,13 @@ export function SubnetPlannerListPage() {
           <div className="rounded-lg border border-dashed p-12 text-center">
             <Workflow className="mx-auto h-8 w-8 text-muted-foreground/40" />
             <p className="mt-3 text-sm text-muted-foreground">
-              <ListEmpty error={error} what="plans">
-                No plans yet. Create one to design a CIDR hierarchy.
+              <ListEmpty
+                error={error}
+                what="plans"
+                gate={writeGate}
+                hint="Create one to design a CIDR hierarchy."
+              >
+                No plans yet.
               </ListEmpty>
             </p>
           </div>

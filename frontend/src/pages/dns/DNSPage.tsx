@@ -5000,8 +5000,13 @@ export function ZoneDetailView({
               <div className="divide-y">
                 {zone.forwarders.length === 0 ? (
                   <p className="px-4 py-3 text-sm italic text-muted-foreground">
-                    No forwarders configured. Click <em>Edit Zone</em> to add
-                    upstream resolvers.
+                    No forwarders configured.
+                    {can("write", "dns_zone") && (
+                      <>
+                        {" "}
+                        Click <em>Edit Zone</em> to add upstream resolvers.
+                      </>
+                    )}
                   </p>
                 ) : (
                   zone.forwarders.map((ip, i) => (
@@ -6477,7 +6482,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
       )}
       {servers.length === 0 && !isFetching && (
         <p className="text-sm text-muted-foreground italic">
-          No servers. Add one manually or start a DNS agent container.
+          No servers.
+          {!serverGate.disabled &&
+            " Add one manually or start a DNS agent container."}
         </p>
       )}
       <div className="space-y-2">
