@@ -650,6 +650,48 @@ window. The outbox write happens after the audit row commits, so a
 process crash between the two drops the event. Receivers should
 de-duplicate on `event_id` (= `AuditLog.id`).
 
+**Alert events (`alert.fired` / `alert.resolved`, #2145).** Alerts write no
+audit row, so these two are published from the `alert_event` row itself:
+an insert is `alert.fired`, `resolved_at` going from NULL to a timestamp
+is `alert.resolved` (including a rule being disabled, which closes its
+open events). They use the same outbox, retry, dead-letter and
+HMAC + timestamp signing as every other type, and are subscribed to by
+name like any other type. The existing alert-forwarding targets
+(Alerts → Forwarding: syslog / webhook / SMTP) are unchanged. There is no
+new outbound host: deliveries go only to the subscription URLs an
+operator configured.
+
+Body, schema version 1 (adding a field does not bump it; removing or
+re-typing one does):
+
+| Field | Notes |
+|---|---|
+| `schema_version` | `1` |
+| `event_id` | The `alert_event` row id. The **same** for the fired and the resolved event of one alert: dedupe on `(event_id, event_type)`; `X-SpatiumDDI-Delivery` is unique per delivery |
+| `event_type` | `alert.fired` or `alert.resolved` |
+| `occurred_at` | `fired_at` for fired, `resolved_at` for resolved (ISO 8601 UTC) |
+| `rule_id`, `rule_name`, `rule_type` | The alert rule |
+| `severity` | `info` / `warning` / `critical` (at the moment of the transition) |
+| `subject_type`, `subject_id`, `subject_display` | What fired |
+| `message` | The alert message |
+| `fired_at`, `resolved_at` | `resolved_at` is `null` on `alert.fired` |
+| `url` | Link to the Alerts page: the External URL (Settings → Platform) plus `/admin/alerts`, or just `/admin/alerts` when no External URL is set |
+
+Subscriptions filter by event type only; filter on `severity` /
+`rule_type` in the receiver. Some one-shot "something changed" rules open
+an already-resolved event: those publish `alert.fired` only. Delivery is
+at-least-once and a rule's own resolution is silent for alert forwarding
+but not for this surface.
+
+**Home Assistant.** Create an automation with a *Webhook* trigger
+(`/api/webhook/<id>`), subscribe a SpatiumDDI webhook to `alert.fired` and
+`alert.resolved` pointed at that URL, and read `trigger.json.severity`,
+`trigger.json.message`, etc. Home Assistant cannot verify the HMAC
+natively, so leave the secret unset or treat the long random webhook id
+as the credential and keep the URL on a trusted network; to verify the
+signature, put a small proxy in front that recomputes
+`hmac(secret, <X-SpatiumDDI-Timestamp> + "." + <body>)`.
+
 **Operator controls.**
 - One-time secret reveal on subscription create (also rotatable on
   edit). Stored Fernet-encrypted; the response only reveals
