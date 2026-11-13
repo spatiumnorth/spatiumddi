@@ -377,7 +377,7 @@ async def test_put_then_get_redacts_secrets(client: AsyncClient, db_session):
     assert len(rows) == 1
     nv = rows[0].new_value or {}
     assert nv.get("managed") is True
-    assert nv.get("gpg_key_count") == 1
+    assert len(nv.get("gpg_keys")) == 1
     blob = repr(nv)
     assert "s3cret" not in blob and "PGP PUBLIC KEY" not in blob
 

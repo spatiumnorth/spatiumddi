@@ -325,3 +325,40 @@ describe("the Bulk edit subnets dialog (#3384)", () => {
     expect(screen.getByText("Set at least one field to apply")).toBeTruthy();
   });
 });
+
+// #3884: the selection's Delete (n) asks delete on subnets, as the delete
+// handler does before the approval gate.
+for (const [where, url] of [
+  ["a block's", "/ipam?block=blk-1"],
+  ["a space's", "/ipam?space=sp-1"],
+] as const) {
+  describe(`${where} subnet selection Delete (#3884)`, () => {
+    it("does not offer a Viewer Delete (n): disabled, with the reason, and it opens nothing", async () => {
+      signInAs(VIEWER);
+      await tick(url, FIRST.network);
+      expect(gates("Delete (1)")).toEqual({
+        "Delete (1)": {
+          disabled: true,
+          title: "Requires delete permission on subnets",
+        },
+      });
+      fireEvent.click(button("Delete (1)"));
+      await settle();
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("offers it to a holder with delete on subnets", async () => {
+      signInAs([...VIEWER, ["delete", "subnet", null]]);
+      await tick(url, FIRST.network);
+      expect(button("Delete (1)").disabled).toBe(false);
+      fireEvent.click(button("Delete (1)"));
+      expect(await screen.findByRole("dialog")).toBeTruthy();
+    });
+
+    it("offers it to a superadmin", async () => {
+      signInAs("superadmin");
+      await tick(url, FIRST.network);
+      expect(button("Delete (1)").disabled).toBe(false);
+    });
+  });
+}

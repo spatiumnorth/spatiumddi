@@ -74,6 +74,11 @@ from app.services.ipam.subnet_boundary import (
     ensure_boundary_rows,
 )
 from app.services.ipam.subnet_carry import NOT_CARRIED_PROVENANCE, split_inherited
+from app.services.ipam.subnet_dependents import (
+    carry_for_split,
+    load_dependents,
+    split_warnings,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -481,6 +486,8 @@ async def preview_subnet_split(
             "and additional zones."
         )
 
+    warnings.extend(split_warnings(await load_dependents(db, [subnet.id]), list(children_nets)))
+
     return SubnetSplitPreview(
         parent_cidr=str(parent),
         new_prefix_length=new_prefix_length,
@@ -790,10 +797,13 @@ async def commit_subnet_split(
         # utilisation queries count subnets too.
         await _update_block_utilization(db, subnet.block_id)
 
-    # Finally, delete the parent. We delete via session.delete so the
-    # ondelete=RESTRICT FKs fire one last sanity check — anything we
-    # missed will surface here as a clean DB error rather than silent
-    # orphaning.
+    # Address sets, the OT zone and the SET NULL links follow the children
+    # (#3957): their FKs are CASCADE / SET NULL, so the delete below would
+    # otherwise take or cut them without a word.
+    await carry_for_split(db, subnet.id, list(children_nets), new_children)
+
+    # Finally, delete the parent. Nothing keyed to it is RESTRICT, so every
+    # row that should survive has to be carried above.
     await db.delete(subnet)
     await db.flush()
 
