@@ -6038,11 +6038,16 @@ export interface ZoneServerStateEntry {
   // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
+  // The API's verdict on this server's report (#3940): a primary zone serves
+  // our serial, a secondary / stub zone holds a copy of its primary's zone
+  // (its serial is not ours to compare) and no op is pending.
+  in_sync?: boolean;
 }
 
 export interface ZoneServerState {
   zone_id: string;
   zone_name: string;
+  zone_type?: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
   // `false` while any server hasn't reported, is on a different serial, or

@@ -13,9 +13,12 @@ def test_bind9_secondary_serving_zero_is_not_in_sync(zone_type: str) -> None:
     assert zone_state_in_sync(z, 2026110101, 0, "bind9")
 
 
-def test_an_older_bind9_agent_keeps_the_old_verdict() -> None:
+def test_an_older_bind9_agent_start_up_serial_reads_in_sync() -> None:
+    """Its start-up report reads every zone from named, so a transferred
+    secondary arrives at its real serial; 0 is "not reported", never synced."""
     z = DNSZone(name="s.example.", zone_type="secondary")
-    assert zone_state_in_sync(z, 0, 0, "bind9", serials_read_back=False)
+    assert zone_state_in_sync(z, 2026111302, 0, "bind9")
+    assert not zone_state_in_sync(z, 0, 0, "bind9")
 
 
 def test_bind9_primary_still_compares_target() -> None:

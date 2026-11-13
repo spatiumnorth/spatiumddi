@@ -17,9 +17,8 @@ SOA, and the control plane counts only BIND9 servers.
 ``served-serials`` — the BIND9 driver reports, for a secondary / stub zone, the
 serial named serves (and nothing for a zone it holds no copy of) instead of the
 bundle's serial 0 (#3940). The control plane then counts a BIND9 secondary
-serving 0 as not synced; for an agent that does not say this it keeps comparing
-with the target, since that agent reports 0 for every secondary whatever named
-holds, and a strict rule would read every one of them as not synced.
+serving 0 as not synced, whatever the agent's release (an older agent's start-up
+report already carries real served serials, and its 0 means "not reported").
 """
 
 from __future__ import annotations

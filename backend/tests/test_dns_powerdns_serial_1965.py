@@ -240,21 +240,27 @@ async def test_a_bind9_secondary_reporting_zero_holds_no_copy_3940(
 
 
 @pytest.mark.asyncio
-async def test_an_older_bind9_agent_reporting_zero_keeps_the_old_verdict_3940(
-    client: AsyncClient, db_session: AsyncSession
+@pytest.mark.parametrize(("serial", "expected"), [(2026111302, True), (0, False)])
+async def test_an_older_bind9_agent_reads_by_the_serial_it_reports_3940(
+    client: AsyncClient, db_session: AsyncSession, serial: int, expected: bool
 ) -> None:
-    """An agent before #3940 reports the bundle's 0 for every secondary whatever
-    named holds; a strict rule would flag each one as not synced."""
+    """An agent before #3940 reports named's real serial at start-up (so a
+    transferred secondary is in sync) and 0 otherwise (not reported, never
+    synced); the per-server verdict reaches the zone's server-state too."""
     token = await _token(db_session)
     _, srv, zone = await _setup(db_session, "bind9", zone_type="secondary", serial=0)
-    srv_id = srv.id
+    srv_id, zone_id, group_id = srv.id, zone.id, zone.group_id
     await db_session.commit()
-    await _report(client, db_session, srv, [("lab.example.test.", 0)])
-    r = await client.get(
-        f"/api/v1/dns/servers/{srv_id}/zone-state", headers={"Authorization": f"Bearer {token}"}
-    )
+    await _report(client, db_session, srv, [("lab.example.test.", serial)])
+    hdr = {"Authorization": f"Bearer {token}"}
+    r = await client.get(f"/api/v1/dns/servers/{srv_id}/zone-state", headers=hdr)
     (entry,) = r.json()["zones"]
-    assert entry["in_sync"] is True
+    assert entry["in_sync"] is expected
+    r = await client.get(f"/api/v1/dns/groups/{group_id}/zones/{zone_id}/server-state", headers=hdr)
+    body = r.json()
+    assert body["zone_type"] == "secondary"
+    assert body["servers"][0]["in_sync"] is expected
+    assert body["in_sync"] is expected
 
 
 def test_the_control_plane_pdns_conf_mirror_declares_primary_and_secondary() -> None:

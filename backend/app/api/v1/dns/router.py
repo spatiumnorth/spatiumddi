@@ -6241,11 +6241,16 @@ class ServerZoneStateEntry(BaseModel):
     # for ``ok``.
     freshness: Literal["ok", "unreachable", "paused", "disabled"] = "ok"
     counted: bool = True
+    # The verdict on this server's report: a primary zone serves our serial, a
+    # secondary / stub zone holds a copy (its serial is its primary's, not
+    # ours) and no op is pending. False when it has not reported.
+    in_sync: bool = False
 
 
 class ServerZoneStateResponse(BaseModel):
     zone_id: uuid.UUID
     zone_name: str
+    zone_type: str = "primary"
     target_serial: int
     servers: list[ServerZoneStateEntry]
     in_sync: bool
@@ -6307,6 +6312,11 @@ async def get_zone_server_state(
             freshness = "unreachable"
         else:
             freshness = "ok"
+        entry_in_sync = (
+            current is not None
+            and not pending
+            and zone_state_in_sync(zone, current, target, srv.driver)
+        )
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -6317,6 +6327,7 @@ async def get_zone_server_state(
                 pending_ops=pending,
                 freshness=freshness,
                 counted=freshness == "ok",
+                in_sync=entry_in_sync,
             )
         )
         if freshness in ("paused", "disabled"):
@@ -6328,18 +6339,13 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if pending or not zone_state_in_sync(
-                zone,
-                current,
-                target,
-                srv.driver,
-                serials_read_back=srv.agent_reports_served_serials,
-            ):
+            if not entry_in_sync:
                 all_in_sync = False
 
     return ServerZoneStateResponse(
         zone_id=zone.id,
         zone_name=zone.name,
+        zone_type=zone.zone_type or "primary",
         target_serial=target,
         servers=entries,
         in_sync=all_in_sync and any_reported,
@@ -6526,13 +6532,7 @@ async def get_server_zone_state(
         # #2042 — an unacknowledged op is drift whatever the serial says.
         in_sync = (
             current is not None
-            and zone_state_in_sync(
-                z,
-                current,
-                target,
-                server.driver,
-                serials_read_back=server.agent_reports_served_serials,
-            )
+            and zone_state_in_sync(z, current, target, server.driver)
             and not pending
         )
         if current is None:
