@@ -49,53 +49,68 @@ def test_sweep_stamp_survives_a_pool_connection_from_an_earlier_loop(
             )
             s.add(t)
             await s.commit()
+            loop1_pid[0] = (await s.execute(text("SELECT pg_backend_pid()"))).scalar_one()
             return t.id
+
+    loop1_pid = [0]
 
     # Loop 1: leaves a connection in the SHARED pool, bound to this loop.
     target_id = asyncio.run(_make_target())
 
-    pid_box: dict[str, int] = {}
+    try:
+        pid_box: dict[str, int] = {}
 
-    class _Driver:
-        def validate_config(self, config) -> None:
-            return None
+        class _Driver:
+            def validate_config(self, config) -> None:
+                return None
 
-        async def write(self, *, config, filename, archive_bytes) -> None:
+            async def write(self, *, config, filename, archive_bytes) -> None:
+                eng = create_async_engine(db_url, poolclass=NullPool)
+                try:
+                    async with eng.connect() as other:
+                        await other.execute(
+                            text("SELECT pg_terminate_backend(:p)"), {"p": pid_box["pid"]}
+                        )
+                        await other.commit()
+                finally:
+                    await eng.dispose()
+
+        async def _build(db, **kw):
+            pid_box["pid"] = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            return b"zip", NAME
+
+        monkeypatch.setattr(runner_mod, "get_destination", lambda kind: _Driver())
+        monkeypatch.setattr(runner_mod, "decrypt_config_secrets", lambda d, c: c)
+        monkeypatch.setattr(runner_mod, "build_backup_archive", _build)
+
+        # Loop 2: the sweep fires the run; the run's session is ended mid-run.
+        result = asyncio.run(backup_sweep._sweep())
+        assert result["fired"] == 1
+
+        async def _read():
+            async with app_db.task_session() as s:
+                return (
+                    await s.execute(select(BackupTarget).where(BackupTarget.id == target_id))
+                ).scalar_one()
+
+        row = asyncio.run(_read())
+        assert row.last_run_status == "success"
+        assert row.last_run_filename == NAME
+
+    finally:
+        # Leave nothing behind for the next test on this worker/Postgres
+        # (#3939 CI shard 9): the loop-1 pooled connection is bound to a
+        # closed loop and cannot be closed gracefully, so end its backend
+        # server-side and drop the dead pool without touching the loop.
+        async def _reap() -> None:
             eng = create_async_engine(db_url, poolclass=NullPool)
             try:
-                async with eng.connect() as other:
-                    await other.execute(
-                        text("SELECT pg_terminate_backend(:p)"), {"p": pid_box["pid"]}
-                    )
-                    await other.commit()
+                async with eng.connect() as c:
+                    await c.execute(text("DELETE FROM backup_target"))
+                    await c.execute(text("SELECT pg_terminate_backend(:p)"), {"p": loop1_pid[0]})
+                    await c.commit()
             finally:
                 await eng.dispose()
 
-    async def _build(db, **kw):
-        pid_box["pid"] = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
-        return b"zip", NAME
-
-    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: _Driver())
-    monkeypatch.setattr(runner_mod, "decrypt_config_secrets", lambda d, c: c)
-    monkeypatch.setattr(runner_mod, "build_backup_archive", _build)
-
-    # Loop 2: the sweep fires the run; the run's session is ended mid-run.
-    result = asyncio.run(backup_sweep._sweep())
-    assert result["fired"] == 1
-
-    async def _read():
-        async with app_db.task_session() as s:
-            return (
-                await s.execute(select(BackupTarget).where(BackupTarget.id == target_id))
-            ).scalar_one()
-
-    row = asyncio.run(_read())
-    assert row.last_run_status == "success"
-    assert row.last_run_filename == NAME
-
-    async def _cleanup():
-        async with app_db.task_session() as s:
-            await s.execute(text("DELETE FROM backup_target"))
-            await s.commit()
-
-    asyncio.run(_cleanup())
+        asyncio.run(_reap())
+        app_db.engine.sync_engine.dispose(close=False)
