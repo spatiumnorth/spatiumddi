@@ -151,3 +151,33 @@ async def test_a_grant_released_in_the_same_batch_leaves_no_record(
     assert resp.status_code == 200, resp.text
     names = await _a_records(db_session, zone_id)
     assert [v for _n, v in names] == [_A_IPS[1]]
+
+
+@pytest.mark.asyncio
+async def test_a_hundred_new_names_publish_in_a_few_transactions(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each commit wakes the DNS agents to rebuild their bundle, so a fast box
+    must not pay it every 8 names: 100 names went through 13 transactions
+    after the batch's own and a first-acquisition batch took three times as
+    long as before the change. The chunk grows to fit the hold budget."""
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    ips = [f"10.31.1.{n}" for n in range(100, 200)]
+    commits = 0
+    real = AsyncSession.commit
+
+    async def _count(self: AsyncSession) -> None:
+        nonlocal commits
+        commits += 1
+        await real(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", _count)
+    resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
+    assert resp.status_code == 200, resp.text
+    assert len(await _a_records(db_session, zone_id)) == len(ips)
+    # The batch's own commit, then the chunks: 8 names, then as many as fit.
+    assert commits <= 8, commits

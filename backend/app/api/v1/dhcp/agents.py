@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import ipaddress
 import os
+import time
 import uuid
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -2206,10 +2207,16 @@ async def agent_lease_events(
     return {"upserted": upserted}
 
 
-#: Names a deferred DDNS transaction publishes before it commits and lets go
-#: of the zone rows (#3816). The other member's batch waits at most this many
-#: publishes for a zone it needs.
-_DDNS_CHUNK = 8
+#: A deferred DDNS transaction publishes this many names before it commits and
+#: lets go of the zone rows (#3816), until it has measured how long a name
+#: takes: then as many as fit ``_DDNS_HOLD_S``, up to ``_DDNS_CHUNK_MAX``. Each
+#: commit costs the DNS agents a wake and a bundle rebuild, so a fast box
+#: should make few big chunks and a slow one more, short ones.
+_DDNS_CHUNK_MIN = 8
+_DDNS_CHUNK_MAX = 50
+#: The longest the other member's batch should wait on a zone row one chunk of
+#: ours holds. The whole batch held it before (#3816).
+_DDNS_HOLD_S = 2.0
 
 
 async def _publish_deferred_ddns(
@@ -2223,19 +2230,24 @@ async def _publish_deferred_ddns(
 
     Each chunk is a transaction of its own that takes the lock order the
     batch does (``app.services.lock_order``): the chunk's mirror rows by id,
-    then their zones by id, then the writes, so it holds a zone row for a few
-    names, never the batch. The row is read again under its lock: one a later
-    batch released and deleted, or a reservation took over, publishes nothing.
-    A name that fails is logged and skipped, as it was in the batch: the
-    address stays unpublished, so its next report is not a quiet renewal and
-    publishes it. An agent replay of the batch is a duplicate by its receipt
-    and writes nothing twice."""
+    then their zones by id, then the writes, so it holds a zone row for about
+    ``_DDNS_HOLD_S``, never the batch. The row is read again under its lock:
+    one a later batch released and deleted, or a reservation took over,
+    publishes nothing. A name that fails is logged and skipped, as it was in
+    the batch: the address stays unpublished, so its next report is not a
+    quiet renewal and publishes it. An agent replay of the batch is a
+    duplicate by its receipt and writes nothing twice."""
     from app.services.dns.ddns import apply_ddns_for_lease
     from app.services.lock_order import lock_mirror_rows
 
     keys = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
-    for start in range(0, len(keys), _DDNS_CHUNK):
-        chunk = set(keys[start : start + _DDNS_CHUNK])
+    start = 0
+    size = _DDNS_CHUNK_MIN
+    while start < len(keys):
+        chunk = set(keys[start : start + size])
+        start += size
+        began = time.monotonic()
+        published = 0
         try:
             rows = await lock_mirror_rows(db, chunk)
             by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
@@ -2261,10 +2273,17 @@ async def _publish_deferred_ddns(
                         ip=str(row.address),
                         error=str(exc),
                     )
+            published = len(by_key)
             await db.commit()
         except Exception as exc:  # noqa: BLE001
             await db.rollback()
             logger.warning("dhcp_agent_lease_ddns_chunk_failed", server=server_id, error=str(exc))
+        if published:
+            per_name = (time.monotonic() - began) / published
+            size = max(
+                _DDNS_CHUNK_MIN,
+                min(_DDNS_CHUNK_MAX, int(_DDNS_HOLD_S / max(per_name, 1e-3))),
+            )
 
 
 class MacSightingEntry(BaseModel):
