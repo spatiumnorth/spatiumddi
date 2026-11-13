@@ -950,3 +950,41 @@ async def test_empty_push_is_not_recorded_as_accepted(db_session: AsyncSession) 
     assert row.last_push_error == "ConnectTimeout"  # failure not erased
     assert row.last_push_at == t2  # interval gating still advances
     assert row.last_push_points == 0
+
+
+@pytest.mark.asyncio
+async def test_update_applies_only_the_keys_it_carries(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3926: a PUT of one field must not put back what another client stored."""
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+    r = await client.post(url, headers=h, json=_v2_body())
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+
+    # Another client changes several fields.
+    other = {
+        "url": "http://influx2:8086",
+        "bucket": "other",
+        "measurement_prefix": "xq_",
+        "push_dhcp_metrics": False,
+    }
+    r = await client.put(f"{url}/{tid}", headers=h, json=other)
+    assert r.status_code == 200, r.text
+
+    # The stale dialog saves only the push interval.
+    r = await client.put(f"{url}/{tid}", headers=h, json={"push_interval_seconds": 120})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["push_interval_seconds"] == 120
+    assert got["url"] == "http://influx2:8086"
+    assert got["bucket"] == "other"
+    assert got["measurement_prefix"] == "xq_"
+    assert got["push_dhcp_metrics"] is False
+    assert got["name"] == "grafana"
+    assert got["token_set"] is True
+
+    # An explicit null name is refused, not applied.
+    r = await client.put(f"{url}/{tid}", headers=h, json={"name": None})
+    assert r.status_code == 422, r.text

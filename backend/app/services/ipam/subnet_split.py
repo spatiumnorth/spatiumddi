@@ -74,6 +74,12 @@ from app.services.ipam.subnet_boundary import (
     ensure_boundary_rows,
 )
 from app.services.ipam.subnet_carry import NOT_CARRIED_PROVENANCE, split_inherited
+from app.services.ipam.subnet_dependents import (
+    carry_for_split,
+    load_dependents,
+    split_warnings,
+)
+from app.services.ipam.subnet_placeholders import registry_referenced_ip_ids
 
 logger = structlog.get_logger(__name__)
 
@@ -481,6 +487,8 @@ async def preview_subnet_split(
             "and additional zones."
         )
 
+    warnings.extend(split_warnings(await load_dependents(db, [subnet.id]), list(children_nets)))
+
     return SubnetSplitPreview(
         parent_cidr=str(parent),
         new_prefix_length=new_prefix_length,
@@ -626,11 +634,21 @@ async def commit_subnet_split(
     )
     parent_boundary_ips = boundary_addresses(parent)
 
+    # A boundary row a registry record (E911 binding, device) is keyed to is the
+    # operator's: it moves to its child instead of being deleted (#3899).
+    registry_kept = await registry_referenced_ip_ids(
+        db, [r.id for r in addr_rows if str(r.address) in parent_boundary_ips]
+    )
+
     deleted_default_count = 0
     moved_count = 0
     for row in addr_rows:
         addr_str = str(row.address)
-        if addr_str in parent_boundary_ips and _is_default_placeholder(row):
+        if (
+            addr_str in parent_boundary_ips
+            and row.id not in registry_kept
+            and _is_default_placeholder(row)
+        ):
             await db.delete(row)
             deleted_default_count += 1
             continue
@@ -790,10 +808,13 @@ async def commit_subnet_split(
         # utilisation queries count subnets too.
         await _update_block_utilization(db, subnet.block_id)
 
-    # Finally, delete the parent. We delete via session.delete so the
-    # ondelete=RESTRICT FKs fire one last sanity check — anything we
-    # missed will surface here as a clean DB error rather than silent
-    # orphaning.
+    # Address sets, the OT zone and the SET NULL links follow the children
+    # (#3957): their FKs are CASCADE / SET NULL, so the delete below would
+    # otherwise take or cut them without a word.
+    await carry_for_split(db, subnet.id, list(children_nets), new_children)
+
+    # Finally, delete the parent. Nothing keyed to it is RESTRICT, so every
+    # row that should survive has to be carried above.
     await db.delete(subnet)
     await db.flush()
 

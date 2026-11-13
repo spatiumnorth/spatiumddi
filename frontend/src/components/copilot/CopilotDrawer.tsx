@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { hasOpenModal } from "@/components/ui/use-draggable-modal";
+import { captureSuccessors, returnFocus } from "@/components/ui/focus-return";
 import { useSessionState } from "@/lib/useSessionState";
 import {
   Archive,
@@ -404,12 +405,34 @@ export function CopilotDrawer({
     }
   }, [pendingContext]);
 
+  // Closing the drawer gives focus back to what opened it (Ask AI), not the
+  // page body (#3910). The opener is read at first render, before the
+  // drawer's own focus calls move focus into it.
+  const titleId = useId();
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+  const openerRef = useRef<HTMLElement | null | undefined>(undefined);
+  if (openerRef.current === undefined) {
+    openerRef.current = document.activeElement as HTMLElement | null;
+  }
+  useEffect(() => {
+    const node = drawerRef.current;
+    const opener = openerRef.current;
+    return () => {
+      // StrictMode's simulated unmount leaves the drawer in the page.
+      if (node?.isConnected) return;
+      returnFocus([opener], captureSuccessors(opener));
+    };
+  }, []);
+
   // Esc closes the drawer.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // A dialog over the drawer owns this Esc (#1947).
       // An Esc that ends an IME composition belongs to the input method.
       if (e.isComposing || e.keyCode === 229) return;
+      // An open popup inside the drawer (the Prompts list) owns this Esc and
+      // marks it handled: one Esc closes the topmost layer only (#3910).
+      if (e.defaultPrevented) return;
       if (e.key === "Escape" && !hasOpenModal()) onClose();
     }
     window.addEventListener("keydown", onKey);
@@ -654,8 +677,12 @@ export function CopilotDrawer({
     // Bubble — positioned, draggable, resizable; doesn't block the
     // page behind it (no backdrop). Operator can keep the chat open
     // while clicking around IPAM / DNS / DHCP, dragging it out of the
-    // way as needed (Gmail-compose pattern).
+    // way as needed (Gmail-compose pattern). A non-modal dialog named by
+    // its heading (#3910).
     <div
+      ref={drawerRef}
+      role="dialog"
+      aria-labelledby={titleId}
       className="fixed z-50 flex flex-col rounded-lg border bg-card shadow-2xl"
       style={{
         left: `${effectiveGeom.left}px`,
@@ -683,7 +710,9 @@ export function CopilotDrawer({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <Sparkles className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">Operator Copilot</h2>
+            <h2 id={titleId} className="text-sm font-semibold">
+              Operator Copilot
+            </h2>
           </div>
           {sessionLabel && (
             <div className="mt-0.5 truncate text-xs text-muted-foreground font-mono">
@@ -2152,7 +2181,11 @@ function PromptsPopover({
     }
     function onEsc(e: KeyboardEvent) {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        // Handled here: the drawer's own Esc listener must not also close.
+        e.preventDefault();
+        onClose();
+      }
     }
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onEsc);

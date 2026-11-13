@@ -102,8 +102,8 @@ VALUES: dict[str, Any] = {
             "enabled": True,
         }
     ],
-    "apt_gpg_keys": [],
-    "apt_auth": [],
+    "apt_gpg_keys": [{"key_id": "k1", "armoured_text": "gpg-armour-secret-3995"}],
+    "apt_auth": [{"machine": "m.lan", "login": "bob", "password": "mirror-pw-secret-3995"}],
     "apt_proxy_http": "http://proxy.example.test:3128",
     "apt_proxy_https": "http://proxy.example.test:3128",
     "apt_unattended_origins": ["origin=Debian"],
@@ -120,6 +120,8 @@ SECRETS = [
     "community-secret-3640",
     "authpass-secret-3640",
     "privpass-secret-3640",
+    "gpg-armour-secret-3995",
+    "mirror-pw-secret-3995",
 ]
 
 # field -> reason, for a field that legitimately writes no platform_settings
@@ -191,6 +193,8 @@ async def test_every_settings_field_is_audited(
     if field == "ssh_lockdown":
         body["ssh_allowed_source_networks"] = ["192.0.2.0/24"]
         body["ssh_lockdown_force"] = True
+    if field == "ssh_authorized_keys":
+        body[field] = [{"name": "k", "public_key": _ed25519_key()}]
     if field == "ssh_password_auth_enabled":
         body["ssh_authorized_keys"] = [{"name": "k", "public_key": _ed25519_key()}]
     before = {r.id for r in await _audit_rows(db_session)}
@@ -250,3 +254,28 @@ async def test_secret_rotation_is_recorded_without_the_value(
     assert rows[-1].old_value == {"snmp_community": "<set>"} or rows[0].old_value == {
         "snmp_community": "<set>"
     }
+
+
+@pytest.mark.asyncio
+async def test_branding_row_names_the_changed_field_and_old_value_3847(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.put("/api/v1/settings", headers=headers, json={"app_title": "Acme DDI"})
+    assert r.status_code == 200, r.text
+    rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
+    assert len(rows) == 1
+    assert rows[0].changed_fields == ["app_title"]
+    assert rows[0].old_value == {"app_title": "SpatiumDDI"}
+    assert rows[0].new_value == {"app_title": "Acme DDI"}
+
+
+@pytest.mark.asyncio
+async def test_branding_save_that_changes_nothing_writes_no_row_3847(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.put("/api/v1/settings", headers=headers, json={"app_title": "SpatiumDDI"})
+    assert r.status_code == 200, r.text
+    rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
+    assert rows == []

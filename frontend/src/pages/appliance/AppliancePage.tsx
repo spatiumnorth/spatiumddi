@@ -164,7 +164,8 @@ export function AppliancePage() {
   // here for the certificate store alone (#3067, below) would be refused it
   // on every load, each refusal a `denied` audit row under their name, so
   // only a caller who may read it asks.
-  const canReadAppliance = usePermissions().can("read", "appliance");
+  const { can, isSuperadmin } = usePermissions();
+  const canReadAppliance = can("read", "appliance");
   const { data: info } = useQuery({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
@@ -300,8 +301,9 @@ export function AppliancePage() {
           {deploymentIsAppliance === undefined ? null : isApplianceHost ? (
             <>
               Manage the SpatiumDDI OS appliance — fleet, firewall, cluster,
-              logs, host network, and lifecycle. Releases, rolling OS upgrades,
-              and the Web UI certificate now live under the Fleet sidebar.
+              logs, host network, and lifecycle.
+              {isSuperadmin &&
+                " Releases, rolling OS upgrades, and the Web UI certificate now live under the Fleet sidebar."}
             </>
           ) : (
             <>
