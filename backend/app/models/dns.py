@@ -331,6 +331,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_renders_soa_timers: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # #4040 — this server's agent reads blocklist entries packed as gzip +
+    # base64 runs of domains: it sent ``packed-blocklists`` in
+    # ``X-Spatium-Agent-Features`` on its last register or heartbeat. False for
+    # an agent of an older release, which is sent one JSON object per entry.
+    agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -773,6 +780,12 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     # ``RENDERER_REVISION`` of the code that rendered it (#1185); NULL on
     # bundles rendered before the column existed, which read as stale.
     renderer_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # #4040 — the blocklist entries are packed runs (the server's agent read
+    # them at render time). The long-poll serves a bundle only in the shape
+    # THIS request's agent can read.
+    packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -1142,7 +1155,15 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     __tablename__ = "dns_zone"
     __table_args__ = (
-        UniqueConstraint("group_id", "view_id", "name", name="uq_dns_zone_group_view_name"),
+        # Partial: a trashed zone must not hold its name in a view (#3824).
+        Index(
+            "uq_dns_zone_group_view_name",
+            "group_id",
+            "view_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dns_zone_name", "name"),
     )
 

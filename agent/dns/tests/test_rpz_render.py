@@ -527,3 +527,29 @@ def test_feed_exception_shipped_only_as_its_own_carve_out(tmp_path: Path) -> Non
     assert "x.example.test CNAME .\n" in text
     assert "c.feed.test CNAME rpz-passthru.\n" in text
     assert "x.example.test CNAME rpz-passthru." not in text
+
+
+def test_subdomain_only_entry_renders_as_written_and_leaves_the_apex(tmp_path: Path) -> None:
+    """Adblock ``.name^`` (#4037) is stored as ``*.name`` with no wildcard flag:
+    one RPZ line, subdomains only; the apex keeps resolving."""
+    lines = _render(
+        tmp_path,
+        [{"domain": "*.sub.example.test", "action": "block", "block_mode": "nxdomain",
+          "is_wildcard": False}],
+    )
+    assert lines == ["*.sub.example.test CNAME ."]
+
+
+def test_a_subdomain_only_entry_is_not_emitted_beside_its_exception(tmp_path: Path) -> None:
+    """An exception for ``N`` emits ``*.N`` as passthru; a ``*.N`` block would be
+    a second CNAME on that owner and BIND would reject the whole zone."""
+    lines = _render(
+        tmp_path,
+        [{"domain": "*.sub.example.test", "action": "block", "block_mode": "nxdomain",
+          "is_wildcard": False}],
+        ["sub.example.test"],
+    )
+    assert lines == [
+        "sub.example.test CNAME rpz-passthru.",
+        "*.sub.example.test CNAME rpz-passthru.",
+    ]

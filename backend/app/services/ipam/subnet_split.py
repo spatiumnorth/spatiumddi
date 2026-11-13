@@ -79,6 +79,7 @@ from app.services.ipam.subnet_dependents import (
     load_dependents,
     split_warnings,
 )
+from app.services.ipam.subnet_placeholders import registry_referenced_ip_ids
 
 logger = structlog.get_logger(__name__)
 
@@ -633,11 +634,21 @@ async def commit_subnet_split(
     )
     parent_boundary_ips = boundary_addresses(parent)
 
+    # A boundary row a registry record (E911 binding, device) is keyed to is the
+    # operator's: it moves to its child instead of being deleted (#3899).
+    registry_kept = await registry_referenced_ip_ids(
+        db, [r.id for r in addr_rows if str(r.address) in parent_boundary_ips]
+    )
+
     deleted_default_count = 0
     moved_count = 0
     for row in addr_rows:
         addr_str = str(row.address)
-        if addr_str in parent_boundary_ips and _is_default_placeholder(row):
+        if (
+            addr_str in parent_boundary_ips
+            and row.id not in registry_kept
+            and _is_default_placeholder(row)
+        ):
             await db.delete(row)
             deleted_default_count += 1
             continue

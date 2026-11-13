@@ -43,6 +43,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ..blocklist_entries import entry_count, iter_entries
 from ..ingest import read_seen_keys as _read_seen_keys
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
 from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
@@ -3771,7 +3772,7 @@ class Bind9Driver(DriverBase):
         log.warning("bind9_zone_file_name_too_long", zone=label, reason=reason)
         self._unwritable_zones = (
             *self._unwritable_zones,
-            HeldZone(zone, view, reason, False),
+            HeldZone(zone, view, reason, False, True),
         )
 
     def _write_zone_file(
@@ -3928,7 +3929,7 @@ class Bind9Driver(DriverBase):
                     zone=bl["rpz_zone_name"],
                     source=tree,
                     via=how,
-                    entries=len(bl.get("entries") or []),
+                    entries=entry_count(bl),
                 )
                 return
         self._write_rpz_zone_file(path, bl)
@@ -4042,7 +4043,7 @@ class Bind9Driver(DriverBase):
         log.info(
             "bind9_rpz_written",
             zone=zname,
-            entries=len(bl.get("entries") or []),
+            entries=entry_count(bl),
             owners=len(seen),
         )
 
@@ -4069,10 +4070,13 @@ class Bind9Driver(DriverBase):
         # the zone must load, since the alternative is enforcing nothing
         # at all. Collisions are logged so the operator can reconcile the
         # lists rather than wonder which one is in effect.
-        for e in bl.get("entries") or []:
+        for e in iter_entries(bl):
             domain = e["domain"].rstrip(".")
             key = domain.lower()
-            if key in excluded:
+            # An exception emits ``N`` and ``*.N`` as passthru, so a
+            # subdomains-only entry ``*.N`` (adblock ``.N^``, #4037) would
+            # put a second CNAME on that owner.
+            if key in excluded or key.removeprefix("*.") in excluded:
                 continue
             action = e.get("action") or "block"
             block_mode = e.get("block_mode") or "nxdomain"
