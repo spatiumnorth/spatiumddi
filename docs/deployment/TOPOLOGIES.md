@@ -286,7 +286,6 @@ postgresql.kind: cnpg           # HA Postgres via the CloudNativePG operator
 redis.kind: sentinel            # HA Redis via the in-chart sentinel shape
 api.autoscaling.minReplicas: 3  # the HPA sets the api's count (api.replicas only with it off)
 worker.replicas: 4
-worker.netRawCapability: true   # for passive DHCP fingerprinting
 dnsAgents.enabled: true         # spawns the bind9 StatefulSet
 dhcpAgents.enabled: true        # spawns the kea StatefulSet (group-centric HA)
 ```

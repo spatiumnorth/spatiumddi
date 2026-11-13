@@ -668,7 +668,7 @@ export function SubnetImportExportButton({
 
   const importGate = permissionGate(
     canImport,
-    "Requires write permission on this subnet or on an address set in it",
+    "Requires write permission on subnets, or on an address set in this subnet (a grant on this one subnet allows a specific IP only)",
   );
   const items: HeaderMenuItem[] = [
     {
