@@ -815,6 +815,15 @@ DNSServerOptions.rrl_qps_scale: int | null          -- optional; tighten the lim
 DNSServerOptions.rrl_exempt_clients: list[str]      -- CIDRs / ACL names never rate-limited (e.g. your secondaries)
 DNSServerOptions.rrl_log_only: bool                 -- default false; DRY RUN — count + log would-be drops without
                                                     --   actually dropping. Use to size the limit before enforcing.
+DNSServerOptions.rrl_nxdomains_per_second: int | null  -- #3577; null = BIND default (not rendered). Random-subdomain
+DNSServerOptions.rrl_errors_per_second: int | null     --   attacks answer NXDOMAIN / errors, which the plain
+                                                    --   responses-per-second budget does not cover.
+DNSServerOptions.rrl_referrals_per_second: int | null
+DNSServerOptions.rrl_nodata_per_second: int | null
+DNSServerOptions.rrl_all_per_second: int | null     -- cap across every response class
+DNSServerOptions.rrl_ipv4_prefix_length: int | null -- 0–32; BIND default 24
+DNSServerOptions.rrl_ipv6_prefix_length: int | null -- 1–128; BIND default 56
+DNSServerOptions.rrl_max_table_size: int | null     -- RRL accounting table cap
 
 DNSServerOptions.minimal_responses: bool            -- default false; emit "minimal-responses yes;" to shrink the
                                                     --   amplification payload (omit the extra section unless required)
@@ -831,6 +840,9 @@ DNSServerOptions.max_clients_per_query: int | null  -- optional; ceiling for cli
       slip 2;
       qps-scale 250;                       // only when set
       exempt-clients { 10.0.0.0/8; };      // only when non-empty
+      nxdomains-per-second 5;              // each extra knob only when set (#3577):
+      errors-per-second 5;                 //   errors / referrals / nodata / all-per-second,
+      ipv4-prefix-length 24;               //   ipv4- / ipv6-prefix-length, max-table-size
       log-only yes;                        // only when rrl_log_only
   };
   minimal-responses yes;                   // only when minimal_responses
@@ -838,6 +850,7 @@ DNSServerOptions.max_clients_per_query: int | null  -- optional; ceiling for cli
   clients-per-query 10;                    // only when set
   max-clients-per-query 100;               // only when set
   ```
+- **Public-facing groups start with RRL on (#3577).** Creating a group with `is_public_facing=true` creates its options row with `rrl_enabled=true` (the column default stays false, so every other group is unchanged). Flipping an *existing* group from internal to public-facing (`PUT /dns/groups/{id}`, False → True only) also turns `rrl_enabled` on, and the audit row lists it; turn it off under Server Options if you do not want it, and re-saving the flag does not turn it back on. **Upgrading changes nothing:** the migration only adds nullable columns, no existing group (public-facing or not) has RRL enabled by it, and its rendered `named.conf` is unchanged (the bundle etag shifts once because the options dict gains null keys, causing one graceful reconfig). The extra knobs are refused (422) on a group with a PowerDNS or Technitium server.
 - **Defaults are a no-op.** With `rrl_enabled=false`, `minimal_responses=false`, and the optional knobs unset, the rendered `named.conf` is byte-identical to before the feature existed — adding it never changes an existing group's behavior until an operator opts in.
 - **PowerDNS:** authoritative `pdns_server` has no RRL equivalent; the project's answer there is a **dnsdist front** (Phase 2 — see below). These RRL/amplification knobs are BIND9-only.
 - **Recommended starting point** for an internet-facing authoritative server: `rrl_enabled=true`, `responses-per-second≈15`, `window=15`, `slip=2`, exempt your own secondaries. Run with `log-only=true` first and watch the drop counters before enforcing.

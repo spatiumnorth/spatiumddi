@@ -5808,6 +5808,14 @@ export interface DNSServerOptions {
   rrl_qps_scale: number | null;
   rrl_exempt_clients: string[];
   rrl_log_only: boolean;
+  rrl_nxdomains_per_second: number | null;
+  rrl_errors_per_second: number | null;
+  rrl_referrals_per_second: number | null;
+  rrl_nodata_per_second: number | null;
+  rrl_all_per_second: number | null;
+  rrl_ipv4_prefix_length: number | null;
+  rrl_ipv6_prefix_length: number | null;
+  rrl_max_table_size: number | null;
   minimal_responses: boolean;
   tcp_clients: number | null;
   clients_per_query: number | null;

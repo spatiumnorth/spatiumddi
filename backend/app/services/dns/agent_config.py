@@ -1635,6 +1635,18 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "rrl_qps_scale": getattr(opts, "rrl_qps_scale", None) if opts else None,
         "rrl_exempt_clients": (list(getattr(opts, "rrl_exempt_clients", []) or []) if opts else []),
         "rrl_log_only": (bool(getattr(opts, "rrl_log_only", False)) if opts else False),
+        "rrl_nxdomains_per_second": (
+            getattr(opts, "rrl_nxdomains_per_second", None) if opts else None
+        ),
+        "rrl_errors_per_second": getattr(opts, "rrl_errors_per_second", None) if opts else None,
+        "rrl_referrals_per_second": (
+            getattr(opts, "rrl_referrals_per_second", None) if opts else None
+        ),
+        "rrl_nodata_per_second": getattr(opts, "rrl_nodata_per_second", None) if opts else None,
+        "rrl_all_per_second": getattr(opts, "rrl_all_per_second", None) if opts else None,
+        "rrl_ipv4_prefix_length": getattr(opts, "rrl_ipv4_prefix_length", None) if opts else None,
+        "rrl_ipv6_prefix_length": getattr(opts, "rrl_ipv6_prefix_length", None) if opts else None,
+        "rrl_max_table_size": getattr(opts, "rrl_max_table_size", None) if opts else None,
         "minimal_responses": (bool(getattr(opts, "minimal_responses", False)) if opts else False),
         "tcp_clients": getattr(opts, "tcp_clients", None) if opts else None,
         "clients_per_query": getattr(opts, "clients_per_query", None) if opts else None,

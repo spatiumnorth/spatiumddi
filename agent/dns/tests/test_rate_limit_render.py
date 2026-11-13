@@ -120,3 +120,39 @@ def test_dnsdist_dynblock() -> None:
     assert "dynBlockRulesGroup()" in out
     assert 'dbr:setQueryRate(200, 10, "exceeded query rate", 120)' in out
     assert "function maintenance() dbr:apply() end" in out
+
+
+def test_rrl_extra_knobs_render_when_set() -> None:
+    """#3577 — nxdomains / errors / prefix-length etc. land in rate-limit {}."""
+    out = _render_rate_limit_block(
+        {
+            "rrl_enabled": True,
+            "rrl_nxdomains_per_second": 5,
+            "rrl_errors_per_second": 6,
+            "rrl_referrals_per_second": 7,
+            "rrl_nodata_per_second": 8,
+            "rrl_all_per_second": 9,
+            "rrl_ipv4_prefix_length": 24,
+            "rrl_ipv6_prefix_length": 56,
+            "rrl_max_table_size": 20000,
+        }
+    )
+    for line in (
+        "nxdomains-per-second 5;",
+        "errors-per-second 6;",
+        "referrals-per-second 7;",
+        "nodata-per-second 8;",
+        "all-per-second 9;",
+        "ipv4-prefix-length 24;",
+        "ipv6-prefix-length 56;",
+        "max-table-size 20000;",
+    ):
+        assert line in out
+    # inside the stanza, before its closing brace
+    assert out.index("nxdomains-per-second") < out.rindex("};")
+
+
+def test_rrl_extra_knobs_unset_render_nothing() -> None:
+    out = _render_rate_limit_block({"rrl_enabled": True, "rrl_nxdomains_per_second": None})
+    assert "per-second" in out  # responses-per-second only
+    assert "nxdomains" not in out and "prefix-length" not in out
