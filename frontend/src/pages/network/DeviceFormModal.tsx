@@ -458,7 +458,7 @@ export function DeviceFormModal({
           {(snmpVersion === "v1" || snmpVersion === "v2c") && (
             <Field
               label="Community string"
-              hint="SNMP v1/v2c community. ``public`` is the most common default."
+              hint="SNMP v1/v2c community. ‘public’ is the most common default."
             >
               <input
                 type="text"

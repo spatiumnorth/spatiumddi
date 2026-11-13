@@ -10291,8 +10291,9 @@ function MacHistoryModal({
       <div className="space-y-3">
         <p className="text-xs text-muted-foreground">
           Every distinct MAC ever assigned to this IP, newest activity first.
-          ``last_seen`` bumps on every IP write that carries the same MAC; a MAC
-          change appends a new row instead of overwriting the previous one.
+          <code className="font-mono">last_seen</code> bumps on every IP write
+          that carries the same MAC; a MAC change appends a new row instead of
+          overwriting the previous one.
         </p>
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>

@@ -3119,10 +3119,11 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         Service health
       </h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Supervisor watchdog snapshot — refreshed every 5 min. ``missing`` /
-        ``unhealthy`` for more than one cadence means the auto-heal kicker
-        didn&apos;t bring the container back; SSH in and check{" "}
-        <code>docker logs &lt;service&gt;</code>.
+        Supervisor watchdog snapshot — refreshed every 5 min.{" "}
+        <code className="font-mono">missing</code> /
+        <code className="font-mono">unhealthy</code> for more than one cadence
+        means the auto-heal kicker didn&apos;t bring the container back; SSH in
+        and check <code>docker logs &lt;service&gt;</code>.
       </p>
       {stale && (
         <div
