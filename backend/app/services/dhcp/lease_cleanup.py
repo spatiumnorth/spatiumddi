@@ -41,6 +41,7 @@ from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.e911.address_bindings import keep_row_if_bound
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 from app.services.ipam.utilization import recount_subnets_and_blocks
 
@@ -297,7 +298,9 @@ async def purge_lease(
                         error=str(exc),
                     )
             await purge_trashed_address_records(db, [mirror.id])  # #3186
-            await db.delete(mirror)
+            # An address an E911 binding names stays (#3899), as a free row.
+            if not await keep_row_if_bound(db, mirror):
+                await db.delete(mirror)
             mirror_removed = True
             if touched_subnets is not None:
                 touched_subnets.add(sid)

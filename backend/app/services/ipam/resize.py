@@ -98,7 +98,11 @@ from app.services.ipam.subnet_boundary import (
     boundary_host_conflicts,
     ensure_boundary_rows,
 )
-from app.services.ipam.subnet_placeholders import add_gateway_row, gateway_target_problem
+from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
+    gateway_target_problem,
+    registry_referenced_ip_ids,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1242,6 +1246,10 @@ async def commit_subnet_resize(
     # IS NOT NULL`` into ``renamed`` (preserved), so ``default_named`` is
     # guaranteed to have no attached DNS records here.
     default_named, _renamed = await _load_boundary_placeholders(db, subnet.id, old_net)
+    # A row a registry record (E911 binding, device) is keyed to is the
+    # operator's, whatever its name: it is kept (#3958).
+    _registry_kept = await registry_referenced_ip_ids(db, [r.id for r in default_named])
+    default_named = [r for r in default_named if r.id not in _registry_kept]
     placeholders_deleted = 0
     if replace_default_placeholders:
         for row in default_named:
@@ -1273,7 +1281,8 @@ async def commit_subnet_resize(
     # 3b. A moved gateway is reserved the way create_subnet reserves a new
     # subnet's gateway, so Next available never offers it to a host (#2413).
     # The old default "Gateway" row is retired with the other default rows;
-    # a renamed / DNS-bearing one is the operator's and is kept.
+    # a renamed / DNS-bearing one, or one a registry record (E911 binding, device)
+    # is keyed to, is the operator's and is kept (#3958).
     gateway_row: IPAddress | None = None
     if move_gateway_to_first_usable and subnet.gateway and str(subnet.gateway) != old_gateway:
         new_gateway = str(subnet.gateway)
@@ -1292,7 +1301,7 @@ async def commit_subnet_resize(
                 # permanent zone delete takes them (#3691).
                 .with_for_update()
             )
-            if old_row is not None:
+            if old_row is not None and not await registry_referenced_ip_ids(db, [old_row.id]):
                 # Retract its auto A / PTR first, as Edit Subnet's gateway
                 # move does (#3709): a bare delete leaves the PTR served.
                 # The sync takes the zones it writes in id order (#3617).
