@@ -1,0 +1,61 @@
+{{- /* #3913 — `helm test <release>`: proves the control plane answers. Runs the
+       api image (python is already in it) so the test pulls no extra image,
+       and carries the restricted-profile securityContext so it also runs under
+       OpenShift's restricted SCC and Pod Security "restricted". */ -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-test-connection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "test") .) | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- with (include "spatiumddi.priorityClassName" (dict "fallback" (.Values.global).priorityClassName)) }}
+  priorityClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.image.pullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: test
+      image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
+      command:
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          targets = [
+              "http://{{ include "spatiumddi.fullname" . }}-api:{{ .Values.api.service.port }}/health/live",
+              "http://{{ include "spatiumddi.fullname" . }}-frontend:{{ .Values.frontend.service.port }}/nginx-health",
+          ]
+          bad = 0
+          for url in targets:
+              try:
+                  code = urllib.request.urlopen(url, timeout=10).status
+              except Exception as exc:
+                  print("FAIL", url, exc)
+                  bad += 1
+                  continue
+              print("ok", url, code)
+          sys.exit(1 if bad else 0)

@@ -92,6 +92,11 @@ function addr(id: string, address: string): IPAddress {
 }
 
 function show(network: string, over: Partial<Subnet> = {}, base = "10.1.0") {
+  // The "click to allocate" hint is drawn only for a caller who may allocate
+  // (#3883), so the rows under test need a writer.
+  answer("authApi", "myPermissions", () =>
+    Promise.resolve({ is_superadmin: true, grants: [] }),
+  );
   answer("ipamApi", "listAddresses", () =>
     Promise.resolve([addr("a", `${base}.1`), addr("b", `${base}.200`)]),
   );

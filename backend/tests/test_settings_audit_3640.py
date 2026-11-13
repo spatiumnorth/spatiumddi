@@ -102,8 +102,8 @@ VALUES: dict[str, Any] = {
             "enabled": True,
         }
     ],
-    "apt_gpg_keys": [],
-    "apt_auth": [],
+    "apt_gpg_keys": [{"key_id": "k1", "armoured_text": "gpg-armour-secret-3995"}],
+    "apt_auth": [{"machine": "m.lan", "login": "bob", "password": "mirror-pw-secret-3995"}],
     "apt_proxy_http": "http://proxy.example.test:3128",
     "apt_proxy_https": "http://proxy.example.test:3128",
     "apt_unattended_origins": ["origin=Debian"],
@@ -120,6 +120,8 @@ SECRETS = [
     "community-secret-3640",
     "authpass-secret-3640",
     "privpass-secret-3640",
+    "gpg-armour-secret-3995",
+    "mirror-pw-secret-3995",
 ]
 
 # field -> reason, for a field that legitimately writes no platform_settings
@@ -191,6 +193,8 @@ async def test_every_settings_field_is_audited(
     if field == "ssh_lockdown":
         body["ssh_allowed_source_networks"] = ["192.0.2.0/24"]
         body["ssh_lockdown_force"] = True
+    if field == "ssh_authorized_keys":
+        body[field] = [{"name": "k", "public_key": _ed25519_key()}]
     if field == "ssh_password_auth_enabled":
         body["ssh_authorized_keys"] = [{"name": "k", "public_key": _ed25519_key()}]
     before = {r.id for r in await _audit_rows(db_session)}
