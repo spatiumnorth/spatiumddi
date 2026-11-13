@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -558,6 +559,13 @@ function FirewallModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [vdom, setVdom] = useState(firewall?.vdom ?? "root");
   const [apiToken, setApiToken] = useState("");
+  // #4135 — a moved address needs the stored token entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    firewall && { host: firewall.host, port: firewall.port },
+    () => setApiToken(""),
+  );
+  const mustEnter = reask.asks(firewall?.api_token_present);
   const [spaceId, setSpaceId] = useState(firewall?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(firewall?.dns_group_id ?? "");
   const [mirrorAddressObjects, setMirrorAddressObjects] = useState(
@@ -748,7 +756,11 @@ function FirewallModal({
         <div className="space-y-2 border-t pt-3">
           <Field
             label="API token"
-            hint="The read-only REST API token. On edit, leave blank to keep the stored token."
+            hint={
+              mustEnter
+                ? reask.hint
+                : "The read-only REST API token. On edit, leave blank to keep the stored token."
+            }
           >
             <input
               className={`${inputCls} font-mono text-[11px]`}
@@ -757,11 +769,13 @@ function FirewallModal({
               value={apiToken}
               onChange={(e) => setApiToken(e.target.value)}
               placeholder={
-                editing && firewall?.api_token_present
-                  ? "••• stored — enter to replace"
-                  : "API token"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && firewall?.api_token_present
+                    ? "••• stored — enter to replace"
+                    : "API token"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -930,7 +944,9 @@ function FirewallModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending || (!editing && !apiToken)}
+            disabled={
+              saveMut.isPending || ((!editing || mustEnter) && !apiToken)
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

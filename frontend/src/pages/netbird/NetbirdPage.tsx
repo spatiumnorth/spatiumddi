@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -367,6 +368,13 @@ function InstanceModal({
   );
   const [verifyTls, setVerifyTls] = useState(instance?.verify_tls ?? true);
   const [apiKey, setApiKey] = useState("");
+  // #4135 — a moved address needs the stored token entered again.
+  const reask = useCredentialReask(
+    { apiUrl },
+    instance && { apiUrl: instance.api_url },
+    () => setApiKey(""),
+  );
+  const mustEnter = reask.asks(instance?.api_key_present);
   const [spaceId, setSpaceId] = useState(instance?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(instance?.dns_group_id ?? "");
   const [networkCidr, setNetworkCidr] = useState(
@@ -528,18 +536,20 @@ function InstanceModal({
               required
             />
           </Field>
-          <Field label="API token">
+          <Field label="API token" hint={mustEnter ? reask.hint : undefined}>
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={
-                editing && instance?.api_key_present
-                  ? "••• stored — enter to replace"
-                  : "nbp_..."
+                mustEnter
+                  ? reask.placeholder
+                  : editing && instance?.api_key_present
+                    ? "••• stored — enter to replace"
+                    : "nbp_..."
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -663,7 +673,7 @@ function InstanceModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !apiKey.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

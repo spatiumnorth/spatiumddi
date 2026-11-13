@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -750,6 +751,13 @@ function NodeModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [tokenId, setTokenId] = useState(node?.token_id ?? "");
   const [tokenSecret, setTokenSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    node && { host: node.host, port: node.port },
+    () => setTokenSecret(""),
+  );
+  const mustEnter = reask.asks(node?.token_secret_present);
   const [spaceId, setSpaceId] = useState(node?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(node?.dns_group_id ?? "");
   const [mirrorVms, setMirrorVms] = useState(node?.mirror_vms ?? true);
@@ -954,18 +962,20 @@ function NodeModal({
               required
             />
           </Field>
-          <Field label="Token Secret">
+          <Field label="Token Secret" hint={mustEnter ? reask.hint : undefined}>
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={tokenSecret}
               onChange={(e) => setTokenSecret(e.target.value)}
               placeholder={
-                editing && node?.token_secret_present
-                  ? "••• stored — enter to replace"
-                  : "UUID printed by pveum"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && node?.token_secret_present
+                    ? "••• stored — enter to replace"
+                    : "UUID printed by pveum"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -1146,7 +1156,7 @@ function NodeModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !tokenSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

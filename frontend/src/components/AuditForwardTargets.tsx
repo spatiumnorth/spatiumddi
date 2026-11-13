@@ -13,6 +13,7 @@
  */
 
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 
@@ -480,6 +481,39 @@ function TargetModal({
   const [clearSmtpPassword, setClearSmtpPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // #4135 — a new webhook URL (write-only, so any value typed is a move) or
+  // a moved SMTP host / port needs the stored credential entered again.
+  const reaskWebhook = form.kind === "webhook";
+  const reaskSmtp = form.kind === "smtp";
+  const reask = useCredentialReask(
+    reaskWebhook
+      ? { url: form.url ?? "" }
+      : { smtp_host: form.smtp_host, smtp_port: form.smtp_port },
+    !existingId
+      ? null
+      : reaskWebhook
+        ? { url: "" }
+        : reaskSmtp
+          ? { smtp_host: initial.smtp_host, smtp_port: initial.smtp_port }
+          : null,
+    () => {
+      setForm((f) => ({ ...f, auth_header: null, smtp_password: null }));
+      setClearAuthHeader(false);
+      setClearSmtpPassword(false);
+    },
+  );
+  const mustEnterAuthHeader =
+    reaskWebhook &&
+    form.webhook_flavor === "generic" &&
+    reask.asks(authHeaderSet) &&
+    !clearAuthHeader &&
+    !form.auth_header;
+  const mustEnterSmtpPassword =
+    reaskSmtp &&
+    reask.asks(smtpPasswordSet) &&
+    !clearSmtpPassword &&
+    !form.smtp_password;
+
   const saveMut = useMutation({
     mutationFn: async () => {
       // The three write-only secrets are handled apart from the plain
@@ -788,12 +822,20 @@ function TargetModal({
                     onChange={(e) =>
                       setForm({ ...form, auth_header: e.target.value })
                     }
+                    required={mustEnterAuthHeader}
                     placeholder={
-                      authHeaderSet
-                        ? "(stored — leave blank to keep unchanged)"
-                        : "Bearer …"
+                      reask.asks(authHeaderSet)
+                        ? reask.placeholder
+                        : authHeaderSet
+                          ? "(stored — leave blank to keep unchanged)"
+                          : "Bearer …"
                     }
                   />
+                  {reask.asks(authHeaderSet) && (
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {reask.hint} Or remove it below.
+                    </div>
+                  )}
                 </label>
                 {existingId && authHeaderSet && (
                   <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -890,12 +932,20 @@ function TargetModal({
                   onChange={(e) =>
                     setForm({ ...form, smtp_password: e.target.value })
                   }
+                  required={mustEnterSmtpPassword}
                   placeholder={
-                    smtpPasswordSet
-                      ? "(stored — leave blank to keep unchanged)"
-                      : ""
+                    reask.asks(smtpPasswordSet)
+                      ? reask.placeholder
+                      : smtpPasswordSet
+                        ? "(stored — leave blank to keep unchanged)"
+                        : ""
                   }
                 />
+                {reask.asks(smtpPasswordSet) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    {reask.hint} Or remove it below.
+                  </div>
+                )}
               </label>
               {existingId && smtpPasswordSet && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -1012,7 +1062,12 @@ function TargetModal({
           </button>
           <button
             onClick={() => saveMut.mutate()}
-            disabled={saveMut.isPending || !form.name}
+            disabled={
+              saveMut.isPending ||
+              !form.name ||
+              mustEnterAuthHeader ||
+              mustEnterSmtpPassword
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : existingId ? "Save" : "Create"}
