@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
+import { FormError } from "@/components/ui/form-error";
 
 const TYPE_LABELS: Record<AuthProviderType, string> = {
   ldap: "LDAP / Active Directory",
@@ -1481,7 +1482,9 @@ function MappingsSection({ providerId }: { providerId: string }) {
           </div>
         </div>
       )}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && (
+        <FormError className="text-xs text-destructive">{error}</FormError>
+      )}
       <ConfirmModal
         open={confirmDeleteId !== null}
         title="Delete mapping"
@@ -1844,9 +1847,9 @@ function ProviderModal({
           )}
 
           {(jsonError || error) && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
               {jsonError || error}
-            </div>
+            </FormError>
           )}
         </div>
 

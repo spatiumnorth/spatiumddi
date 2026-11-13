@@ -34,6 +34,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_db
+from app.core.denial_audit import note_denial_audited
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -621,6 +622,7 @@ async def _record_denial(
     resource_id: str | None,
 ) -> None:
     """Write a `denied` audit row. Best-effort — never raises."""
+    note_denial_audited()
     try:
         db.add(
             AuditLog(
@@ -663,6 +665,7 @@ async def refuse_and_audit(
     would be any pending change. Best-effort on the audit write, as
     :func:`_record_denial` is — the refusal never depends on it.
     """
+    note_denial_audited()
     try:
         db.add(
             AuditLog(

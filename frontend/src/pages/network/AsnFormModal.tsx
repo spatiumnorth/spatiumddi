@@ -14,6 +14,7 @@ import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { cn } from "@/lib/utils";
 
 import { Field, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -230,7 +231,9 @@ function AsnForm({
             onChange={(e) => setTagsRaw(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
