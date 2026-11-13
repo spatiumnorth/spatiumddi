@@ -1108,7 +1108,9 @@ class ListDNSViewsArgs(BaseModel):
         "any per-view allow_query / allow_query_cache overrides, and the "
         "view's own default forwarders (forwarders / forward_policy / "
         "forward_transport / forward_tls_hostname; null forwarders inherit "
-        "the group's). "
+        "the group's), and per-view dnssec_validation / allow_recursion / "
+        "rrl_enabled (+ rrl_responses_per_second / rrl_window / rrl_slip) / "
+        "minimal_responses overrides (null inherits the group's). "
         "Use for 'which views does the corp group have?' or 'what "
         "clients does the internal view match?'."
     ),
@@ -1142,6 +1144,13 @@ async def list_dns_views(
             "forward_policy": v.forward_policy,
             "forward_transport": v.forward_transport,
             "forward_tls_hostname": v.forward_tls_hostname,
+            "dnssec_validation": v.dnssec_validation,
+            "allow_recursion": v.allow_recursion,
+            "rrl_enabled": v.rrl_enabled,
+            "rrl_responses_per_second": v.rrl_responses_per_second,
+            "rrl_window": v.rrl_window,
+            "rrl_slip": v.rrl_slip,
+            "minimal_responses": v.minimal_responses,
         }
         for v in rows
     ]

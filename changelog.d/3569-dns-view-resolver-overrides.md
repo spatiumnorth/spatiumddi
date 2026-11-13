@@ -1,0 +1,3 @@
+### Added
+
+- **DNS views can override `dnssec-validation`, `allow-recursion`, rate limiting and `minimal-responses` (#3569).** An internal view can now validate DNSSEC and recurse for the LAN while an external one on the same group is authoritative-only. Each setting is optional per view and rendered inside its `view {}` block; leaving it on "Inherit" keeps the group's, so existing configs are unchanged. Rate limiting takes an on / off override plus per-view responses-per-second, window and slip (the group's exempt clients and qps scale still apply). `dnssec-validation yes` needs a trust anchor, as on the group. BIND9 groups only: a group that also holds PowerDNS or another driver refuses it.

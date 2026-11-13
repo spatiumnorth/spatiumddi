@@ -7011,6 +7011,26 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
   const [forwardTlsHostname, setForwardTlsHostname] = useState(
     view?.forward_tls_hostname ?? "",
   );
+  // Resolver overrides for this view (#3569); empty / "" inherits the group's.
+  const triStr = (b: boolean | null | undefined) =>
+    b == null ? "" : b ? "true" : "false";
+  const [dnssecValidation, setDnssecValidation] = useState<string>(
+    view?.dnssec_validation ?? "",
+  );
+  const [allowRecursion, setAllowRecursion] = useState(
+    (view?.allow_recursion ?? []).join("\n"),
+  );
+  const [rrlEnabled, setRrlEnabled] = useState(triStr(view?.rrl_enabled));
+  const [rrlRps, setRrlRps] = useState(
+    view?.rrl_responses_per_second?.toString() ?? "",
+  );
+  const [rrlWindow, setRrlWindow] = useState(
+    view?.rrl_window?.toString() ?? "",
+  );
+  const [rrlSlip, setRrlSlip] = useState(view?.rrl_slip?.toString() ?? "");
+  const [minimalResponses, setMinimalResponses] = useState(
+    triStr(view?.minimal_responses),
+  );
   const { data: presetCatalog } = useQuery({
     queryKey: ["dns", "forwarder-presets"],
     queryFn: () => dnsApi.forwarderPresets(),
@@ -7077,6 +7097,17 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
         forwardTlsHostname.trim()
           ? forwardTlsHostname.trim()
           : null,
+      dnssec_validation: (dnssecValidation ||
+        null) as DNSView["dnssec_validation"],
+      allow_recursion: lines(allowRecursion).length
+        ? lines(allowRecursion)
+        : null,
+      rrl_enabled: rrlEnabled === "" ? null : rrlEnabled === "true",
+      rrl_responses_per_second: rrlRps.trim() ? Number(rrlRps) : null,
+      rrl_window: rrlWindow.trim() ? Number(rrlWindow) : null,
+      rrl_slip: rrlSlip.trim() ? Number(rrlSlip) : null,
+      minimal_responses:
+        minimalResponses === "" ? null : minimalResponses === "true",
     };
     if (!view) {
       saveMut.mutate(body);
@@ -7097,6 +7128,15 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
         forward_tls_hostname: view.forwarders?.length
           ? view.forward_tls_hostname
           : null,
+        dnssec_validation: view.dnssec_validation ?? null,
+        allow_recursion: view.allow_recursion?.length
+          ? view.allow_recursion
+          : null,
+        rrl_enabled: view.rrl_enabled ?? null,
+        rrl_responses_per_second: view.rrl_responses_per_second ?? null,
+        rrl_window: view.rrl_window ?? null,
+        rrl_slip: view.rrl_slip ?? null,
+        minimal_responses: view.minimal_responses ?? null,
       },
       body,
     );
@@ -7291,6 +7331,108 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
                 />
               </Field>
             )}
+          </div>
+        </details>
+
+        <details
+          className="rounded border bg-muted/20 px-2 py-1.5"
+          open={
+            !!dnssecValidation ||
+            lines(allowRecursion).length > 0 ||
+            rrlEnabled !== "" ||
+            !!rrlRps ||
+            !!rrlWindow ||
+            !!rrlSlip ||
+            minimalResponses !== ""
+          }
+        >
+          <summary className="cursor-pointer text-xs text-muted-foreground">
+            Resolver overrides (BIND9 only)
+          </summary>
+          <div className="mt-2 space-y-2">
+            <p className="text-[11px] text-muted-foreground">
+              Each setting overrides the group&apos;s for the clients this view
+              matches, e.g. an internal view that validates DNSSEC next to an
+              external one that is authoritative-only. Leave on
+              &quot;Inherit&quot; to use the group&apos;s.
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="DNSSEC validation">
+                <select
+                  className={inputCls}
+                  value={dnssecValidation}
+                  onChange={(e) => setDnssecValidation(e.target.value)}
+                >
+                  <option value="">Inherit the group&apos;s</option>
+                  <option value="auto">auto — built-in root key</option>
+                  <option value="yes">yes — needs a trust anchor</option>
+                  <option value="no">no — do not validate</option>
+                </select>
+              </Field>
+              <Field label="Minimal responses">
+                <select
+                  className={inputCls}
+                  value={minimalResponses}
+                  onChange={(e) => setMinimalResponses(e.target.value)}
+                >
+                  <option value="">Inherit the group&apos;s</option>
+                  <option value="true">yes</option>
+                  <option value="false">no</option>
+                </select>
+              </Field>
+            </div>
+            <textarea
+              aria-label="View allow-recursion"
+              value={allowRecursion}
+              onChange={(e) => setAllowRecursion(e.target.value)}
+              className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
+              placeholder={
+                "Inherits the group's allow-recursion\n10.0.0.0/8\nnone"
+              }
+            />
+            <Field label="Response rate limiting">
+              <select
+                className={inputCls}
+                value={rrlEnabled}
+                onChange={(e) => setRrlEnabled(e.target.value)}
+              >
+                <option value="">Inherit the group&apos;s</option>
+                <option value="true">On for this view</option>
+                <option value="false">Off for this view</option>
+              </select>
+            </Field>
+            <div className="grid grid-cols-3 gap-3">
+              <Field label="Responses / second">
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={rrlRps}
+                  onChange={(e) => setRrlRps(e.target.value)}
+                  placeholder="Inherit"
+                />
+              </Field>
+              <Field label="Window (s)">
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={rrlWindow}
+                  onChange={(e) => setRrlWindow(e.target.value)}
+                  placeholder="Inherit"
+                />
+              </Field>
+              <Field label="Slip">
+                <input
+                  type="number"
+                  min={0}
+                  className={inputCls}
+                  value={rrlSlip}
+                  onChange={(e) => setRrlSlip(e.target.value)}
+                  placeholder="Inherit"
+                />
+              </Field>
+            </div>
           </div>
         </details>
 
