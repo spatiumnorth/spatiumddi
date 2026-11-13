@@ -1,0 +1,153 @@
+"""A lease-events batch no longer holds the DNS zone rows to its commit (#3816).
+
+A publish bumps its zone's serial, which holds the zone row until the
+transaction commits. A first-acquisition batch spent most of its time in
+DDNS, so under Kea HA the other member's batch of new leases queued on the
+zone row for the whole batch. The grants' DDNS now runs after the batch's own
+transaction committed, in short transactions of a few names each.
+
+Each test holds peer A's batch open just before its commit; B's batch of
+OTHER new leases in the same zone must answer while A is still held (before
+the fix it waited for A's zone row), and every name ends up published once.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from typing import Any
+
+import pytest
+from httpx import AsyncClient, Response
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.dhcp import DHCPServer
+from app.models.dns import DNSRecord
+from app.models.ipam import IPAddress
+from tests.test_lease_events_ha_renewal_3773 import _ev, _post
+from tests.test_lease_events_ha_row_locks_3789 import (
+    _a_records,
+    _b_while_a_held,
+    _held_open,
+)
+from tests.test_lease_events_insert_order_3480 import _ddns_subnet, _two_agents
+from tests.test_lease_events_trashed_scope_3733 import (
+    concurrent_client,  # noqa: F401 — the fixture, shared
+)
+
+
+async def _post_with_id(
+    client: AsyncClient, server: DHCPServer, events: list[dict[str, Any]], batch_id: str
+) -> Response:
+    return await client.post(
+        "/api/v1/dhcp/agents/lease-events",
+        headers={"x-test-server": str(server.id)},
+        json={"leases": events, "batch_id": batch_id},
+    )
+
+
+_A_IPS = [f"10.31.1.{n}" for n in range(60, 80)]
+_B_IPS = [f"10.31.1.{n}" for n in range(100, 120)]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_of_new_leases_does_not_hold_the_zone_for_the_other_members_batch(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+
+    async with _held_open(monkeypatch) as held:
+        batch_a = asyncio.create_task(_post(concurrent_client, peer_a, [_ev(i) for i in _A_IPS]))
+        await asyncio.wait_for(held.wait(), timeout=30)
+        batch_b = asyncio.create_task(_post(concurrent_client, peer_b, [_ev(i) for i in _B_IPS]))
+        await asyncio.wait({batch_b}, timeout=30)
+        answered_while_held = batch_b.done() and not batch_a.done()
+    resp_b = await asyncio.wait_for(batch_b, timeout=60)
+    resp_a = await asyncio.wait_for(batch_a, timeout=60)
+    assert resp_a.status_code == 200, resp_a.text
+    assert resp_b.status_code == 200, resp_b.text
+    assert answered_while_held, "peer B waited on the zone row peer A's batch held"
+
+    records = await _a_records(db_session, zone_id)
+    assert len(records) == len(_A_IPS) + len(_B_IPS), records
+    assert len({v for _n, v in records}) == len(records)
+
+
+@pytest.mark.asyncio
+async def test_both_members_reporting_the_same_new_leases_publish_each_name_once(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    events = [_ev(i) for i in _A_IPS]
+    resp_a, resp_b, _ = await _b_while_a_held(
+        concurrent_client, monkeypatch, peer_a, peer_b, events
+    )
+    assert resp_a.status_code == 200 and resp_b.status_code == 200
+    assert len(await _a_records(db_session, zone_id)) == len(_A_IPS)
+    # Every mirror points at its published record, forward and reverse.
+    mirrors = (
+        (
+            await db_session.execute(
+                select(IPAddress)
+                .where(IPAddress.address.in_(_A_IPS))
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(mirrors) == len(_A_IPS)
+    assert all(m.dns_record_id is not None for m in mirrors)
+    ptr = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(DNSRecord)
+            .where(DNSRecord.record_type == "PTR", DNSRecord.deleted_at.is_(None))
+        )
+    ).scalar_one()
+    assert ptr == len(_A_IPS)
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_batch_is_a_duplicate_and_publishes_nothing_twice(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    events = [_ev(i) for i in _A_IPS[:5]]
+    batch_id = uuid.uuid4().hex
+    first = await _post_with_id(concurrent_client, peer_a, events, batch_id)
+    assert first.status_code == 200, first.text
+    before = await _a_records(db_session, zone_id)
+    assert len(before) == 5
+    again = await _post_with_id(concurrent_client, peer_a, events, batch_id)
+    assert again.status_code == 200, again.text
+    assert await _a_records(db_session, zone_id) == before
+
+
+@pytest.mark.asyncio
+async def test_a_grant_released_in_the_same_batch_leaves_no_record(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+) -> None:
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    ip = _A_IPS[0]
+    resp = await _post(
+        concurrent_client, peer_a, [_ev(ip), {**_ev(ip), "state": "released"}, _ev(_A_IPS[1])]
+    )
+    assert resp.status_code == 200, resp.text
+    names = await _a_records(db_session, zone_id)
+    assert [v for _n, v in names] == [_A_IPS[1]]

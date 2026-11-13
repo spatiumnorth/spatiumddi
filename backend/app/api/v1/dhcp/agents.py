@@ -1996,7 +1996,6 @@ async def agent_lease_events(
     await ddns_reads.prefetch_generated(
         db, [row.id for row in ipam_by_key.values() if row.auto_from_lease]
     )
-    publishing: list[tuple[Any, IPAddress]] = []
     retracting: list[IPAddress] = []
     for idx, ev in enumerate(events):
         subnet = subnet_for_ip.get(ev.ip_address)
@@ -2009,27 +2008,15 @@ async def agent_lease_events(
             continue
         if subnet is not None and events_at[key] == 1 and await _ddns_quiet(subnet, row, ev):
             ddns_quiet.add(idx)
-            continue
-        publishing.append((subnet, row))
-    # #3687: a mirror this pass creates later (an address whose first event is
-    # a release, then a grant) is not in ``ipam_by_key`` yet, so its zones
-    # were left out, and an earlier event's purge of a trashed record had
-    # already run when its publish locked them. A transient row (never added
-    # to the session) names the zones its publish will write.
-    planned = set(ipam_by_key)
-    for idx, ev in enumerate(events):
-        subnet = subnet_for_ip.get(ev.ip_address)
-        if idx in stale or subnet is None or ev.state != "active":
-            continue
-        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
-        key = (subnet.id, norm_ip(ev.ip_address))
-        if lease.state != "active" or key in planned:
-            continue
-        planned.add(key)
-        publishing.append((subnet, _new_mirror_row(subnet, ev, lease)))
-    await lock_zones_for_addresses(db, publishing=publishing, retracting=retracting, ddns=True)
+        # A grant's publish runs after this transaction commits (#3816), so
+        # it locks no zone here; only a retraction does.
+    # #3687: the zones a release's purge of a trashed record writes are named
+    # by ``retracting``; a grant's publish no longer runs in this transaction
+    # (#3816), so a mirror created later in the pass needs no zone here.
+    await lock_zones_for_addresses(db, retracting=retracting, ddns=True)
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
+    deferred_ddns: dict[tuple[Any, str], tuple[Any, str | None]] = {}
     for idx, ev in enumerate(events):
         if idx in stale:
             continue  # replayed grant of a lease another client has superseded (#2391)
@@ -2080,27 +2067,14 @@ async def agent_lease_events(
                 to_observe.append((ipam_row, ev.mac_address))
 
             # DDNS — mirrors services/dhcp/pull_leases.py. Only fires on
-            # auto-from-lease rows inside DDNS-enabled subnets; errors are
-            # logged but never break the lease upsert pass (DNS will
-            # reconcile on the next event or sweep).
+            # auto-from-lease rows inside DDNS-enabled subnets. Not here: a
+            # publish holds its zone row to the commit, and under Kea HA the
+            # other member's batch of the same new leases queued on it for
+            # the whole batch (#3816). Collected, and run in short
+            # transactions after this one commits. The last event of an
+            # address names the hostname.
             if ipam_row is not None and ipam_row.auto_from_lease and idx not in ddns_quiet:
-                try:
-                    from app.services.dns.ddns import apply_ddns_for_lease
-
-                    await apply_ddns_for_lease(
-                        db,
-                        subnet=subnet,
-                        ipam_row=ipam_row,
-                        client_hostname=ev.hostname,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _reraise_if_database_gone(exc)
-                    logger.warning(
-                        "dhcp_agent_lease_ddns_failed",
-                        server=str(server.id),
-                        ip=ev.ip_address,
-                        error=str(exc),
-                    )
+                deferred_ddns[(subnet.id, norm_ip(ev.ip_address))] = (subnet, ev.hostname)
 
             # Auto-profile (Phase 1: active layer). Subnet-level opt-in;
             # the service applies the refresh-window dedupe + per-subnet
@@ -2228,7 +2202,69 @@ async def agent_lease_events(
     # its row locks, and a batch without them never waits for that lock.
     await recount_subnets_and_blocks(db, recount_ids, audit_lock=False)
     await db.commit()
+    await _publish_deferred_ddns(db, deferred_ddns, server_id=server_id)
     return {"upserted": upserted}
+
+
+#: Names a deferred DDNS transaction publishes before it commits and lets go
+#: of the zone rows (#3816). The other member's batch waits at most this many
+#: publishes for a zone it needs.
+_DDNS_CHUNK = 8
+
+
+async def _publish_deferred_ddns(
+    db: AsyncSession,
+    deferred: dict[tuple[Any, str], tuple[Any, str | None]],
+    *,
+    server_id: str,
+) -> None:
+    """Publish the DDNS of a lease-events batch's grants, after the batch's
+    own transaction committed (#3816).
+
+    Each chunk is a transaction of its own that takes the lock order the
+    batch does (``app.services.lock_order``): the chunk's mirror rows by id,
+    then their zones by id, then the writes, so it holds a zone row for a few
+    names, never the batch. The row is read again under its lock: one a later
+    batch released and deleted, or a reservation took over, publishes nothing.
+    A name that fails is logged and skipped, as it was in the batch: the
+    address stays unpublished, so its next report is not a quiet renewal and
+    publishes it. An agent replay of the batch is a duplicate by its receipt
+    and writes nothing twice."""
+    from app.services.dns.ddns import apply_ddns_for_lease
+    from app.services.lock_order import lock_mirror_rows
+
+    keys = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
+    for start in range(0, len(keys), _DDNS_CHUNK):
+        chunk = set(keys[start : start + _DDNS_CHUNK])
+        try:
+            rows = await lock_mirror_rows(db, chunk)
+            by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
+            await lock_zones_for_addresses(
+                db,
+                publishing=[(by_key[k].subnet, by_key[k]) for k in by_key],
+                ddns=True,
+            )
+            for key, row in by_key.items():
+                subnet, client_hostname = deferred[key]
+                try:
+                    async with db.begin_nested():
+                        await apply_ddns_for_lease(
+                            db,
+                            subnet=row.subnet or subnet,
+                            ipam_row=row,
+                            client_hostname=client_hostname,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dhcp_agent_lease_ddns_failed",
+                        server=server_id,
+                        ip=str(row.address),
+                        error=str(exc),
+                    )
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            await db.rollback()
+            logger.warning("dhcp_agent_lease_ddns_chunk_failed", server=server_id, error=str(exc))
 
 
 class MacSightingEntry(BaseModel):
