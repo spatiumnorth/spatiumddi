@@ -154,6 +154,7 @@ from app.services.appliance.ownership import current_dns_drivers as _current_dns
 from app.services.appliance.ownership import hostname_sql as _hostname_sql
 from app.services.appliance.ownership import k8s_node_name as _k8s_node_name
 from app.services.appliance.ownership import own_server_condition as _own_server_condition
+from app.services.appliance.pairing_attempts import record_pairing_attempt
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
@@ -1227,6 +1228,15 @@ async def supervisor_register(
         # always audited; an unknown one is a guess, audited for the first
         # failure from an address in each window (and the throttle trip
         # above). Later guesses are logged, and the throttle row counts them.
+        # #2225 — the operator-facing record, which Fleet shows. Bounded
+        # and grouped (see services/appliance/pairing_attempts.py).
+        await record_pairing_attempt(
+            db,
+            code_id=code_row.id if code_row is not None else None,
+            reason=failure_reason,
+            hostname=body.hostname,
+            source_ip=client_ip,
+        )
         if code_row is not None or ip_failures == 1:
             db.add(
                 AuditLog(
@@ -1250,7 +1260,7 @@ async def supervisor_register(
                     },
                 )
             )
-            await db.commit()
+        await db.commit()
         logger.warning(
             "supervisor_register_denied",
             reason=failure_reason,

@@ -18,6 +18,7 @@ import {
   appliancePairingApi,
   authApi,
   settingsApi,
+  type PairingAttemptRow,
   type PairingCodeCreated,
   type PairingCodeRow,
   formatApiError,
@@ -28,16 +29,18 @@ import { ReauthFields } from "@/components/ReauthFields";
 import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/clipboard";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
+import { attemptReasonText, codeRequestFor } from "./pairingCodes";
 
 /**
  * Appliance → Pairing codes tab (#169 + #170 Wave A3 reshape).
  *
- * Operator clicks "New pairing code" → modal asks ephemeral
- * (single-use) or persistent (multi-claim), optional expiry +
- * max_claims, generates an 8-digit code shown once in a large mono
- * box. Persistent codes can be re-revealed later via a password-
- * gated reveal action; ephemeral codes are gone after the create
- * response is closed.
+ * Operator clicks "New pairing code" → modal asks how many appliances
+ * will join (1 = single-use ephemeral, N = persistent capped at N,
+ * unlimited), optional expiry, generates an 8-digit code shown once in
+ * a large mono box. Persistent codes can be re-revealed later via a
+ * password-gated reveal action; single-use codes are gone after the
+ * create response is closed. Each code row shows who used it, and a
+ * Refused join attempts panel explains turned-away appliances (#2225).
  *
  * The table below polls every 2s while at least one pending code
  * exists (so a freshly-claimed ephemeral code flips state without
@@ -82,6 +85,18 @@ export function PairingTab() {
       return hasPending ? 2_000 : 15_000;
     },
     enabled: isSuperadmin,
+  });
+
+  const attemptsQuery = useQuery({
+    queryKey: ["appliance", "pairing-attempts"],
+    queryFn: appliancePairingApi.listAttempts,
+    refetchInterval: 15_000,
+    enabled: isSuperadmin,
+  });
+  const dismissMutation = useMutation({
+    mutationFn: (id: string) => appliancePairingApi.dismissAttempt(id),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["appliance", "pairing-attempts"] }),
   });
 
   const [modalOpen, setModalOpen] = useState(false);
@@ -156,8 +171,10 @@ export function PairingTab() {
             <code className="rounded bg-muted px-1">
               /api/v1/appliance/supervisor/register
             </code>
-            . Ephemeral codes are single-use with a short expiry; persistent
-            codes admit many appliances and can be re-revealed.
+            . A code admits as many appliances as you said when you made it
+            (one, a number, or unlimited); once it is used up, the next
+            appliance to try is refused and listed under Refused join attempts
+            below.
           </p>
         </div>
         <div className="flex flex-shrink-0 gap-2">
@@ -267,6 +284,13 @@ export function PairingTab() {
         />
       )}
 
+      <RefusedAttempts
+        attempts={attemptsQuery.data?.attempts ?? []}
+        onNewCode={() => setModalOpen(true)}
+        onDismiss={(id) => dismissMutation.mutate(id)}
+        dismissing={dismissMutation.isPending}
+      />
+
       {modalOpen && (
         <GenerateCodeModal
           onClose={() => setModalOpen(false)}
@@ -328,7 +352,7 @@ function CodesTable({
             <th className="px-3 py-2">Code</th>
             <th className="px-3 py-2">Kind</th>
             <th className="px-3 py-2">State</th>
-            <th className="px-3 py-2">Claims</th>
+            <th className="px-3 py-2">Used by</th>
             <th className="px-3 py-2">Expires</th>
             <th className="px-3 py-2">Note</th>
             <th className="px-3 py-2"></th>
@@ -347,13 +371,7 @@ function CodesTable({
                 <StateChip state={row.state} />
               </td>
               <td className="px-3 py-2 text-xs">
-                {row.claim_count}
-                {row.max_claims != null && (
-                  <span className="text-muted-foreground">
-                    {" "}
-                    / {row.max_claims}
-                  </span>
-                )}
+                <UsedBy row={row} />
               </td>
               <td className="px-3 py-2 text-xs text-muted-foreground">
                 {row.expires_at ? <RelativeTime iso={row.expires_at} /> : "—"}
@@ -404,6 +422,113 @@ function CodesTable({
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function UsedBy({ row }: { row: PairingCodeRow }) {
+  const names = row.claims.map((c) => c.hostname ?? "(unnamed)");
+  if (!row.persistent) {
+    const c = row.claims[0];
+    return c ? (
+      <span>
+        {c.hostname ?? "(unnamed)"}{" "}
+        <span className="text-muted-foreground">
+          at {new Date(c.claimed_at).toLocaleString()}
+        </span>
+      </span>
+    ) : (
+      <span className="text-muted-foreground">not used yet (1 appliance)</span>
+    );
+  }
+  return (
+    <span title={names.join(", ")}>
+      {row.claim_count} of {row.max_claims ?? "unlimited"} used
+      {names.length > 0 && (
+        <span className="block max-w-[14rem] truncate text-muted-foreground">
+          {names.join(", ")}
+        </span>
+      )}
+    </span>
+  );
+}
+
+function RefusedAttempts({
+  attempts,
+  onNewCode,
+  onDismiss,
+  dismissing,
+}: {
+  attempts: PairingAttemptRow[];
+  onNewCode: () => void;
+  onDismiss: (id: string) => void;
+  dismissing: boolean;
+}) {
+  if (attempts.length === 0) return null;
+  return (
+    <div className="mt-6" data-testid="refused-attempts">
+      <h3 className="text-sm font-semibold">Refused join attempts</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        An appliance that was turned away is told only that its code was
+        refused. The reason is shown here. Create a new code, then press F8
+        (Re-pair) on the appliance's console.
+      </p>
+      <div className="mt-2 overflow-x-auto rounded-md border">
+        <table className="min-w-full text-sm">
+          <thead className="bg-muted/40 text-left text-xs font-medium text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2">Last tried</th>
+              <th className="px-3 py-2">Appliance</th>
+              <th className="px-3 py-2">Code</th>
+              <th className="px-3 py-2">Why</th>
+              <th className="px-3 py-2">Tries</th>
+              <th className="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {attempts.map((a) => (
+              <tr key={a.id} className="border-t">
+                <td className="px-3 py-2 text-xs">
+                  {new Date(a.last_attempted_at).toLocaleString()}
+                </td>
+                <td className="px-3 py-2 text-xs">
+                  {a.hostname}
+                  {a.source_ip && (
+                    <span className="text-muted-foreground">
+                      {" "}
+                      ({a.source_ip})
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2 font-mono text-xs">
+                  {a.code_last_two ? `••${a.code_last_two}` : "—"}
+                </td>
+                <td className="px-3 py-2 text-xs">{attemptReasonText(a)}</td>
+                <td className="px-3 py-2 text-xs">{a.attempts}</td>
+                <td className="px-3 py-2">
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={onNewCode}
+                      className="rounded-md border px-2 py-1 text-xs hover:bg-muted"
+                    >
+                      Create a new code
+                    </button>
+                    <button
+                      type="button"
+                      disabled={dismissing}
+                      onClick={() => onDismiss(a.id)}
+                      className="rounded-md border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -466,9 +591,14 @@ export function GenerateCodeModal({
   onClose: () => void;
   onCreated: () => void;
 }) {
-  const [persistent, setPersistent] = useState(false);
+  // #2225 — ask how many appliances, not "persistent?": a single-use
+  // code silently refusing the second joiner was the surprise.
+  const [count, setCount] = useState<number>(1);
+  const [unlimited, setUnlimited] = useState(false);
+  const { persistent, max_claims: maxClaims } = codeRequestFor(
+    unlimited ? "unlimited" : count,
+  );
   const [expiresInMinutes, setExpiresInMinutes] = useState<number | null>(15);
-  const [maxClaims, setMaxClaims] = useState<number | "">("");
   const [note, setNote] = useState("");
   const [generated, setGenerated] = useState<PairingCodeCreated | null>(null);
   // #3222 — an ephemeral code's cleartext is shown once and is not
@@ -489,7 +619,6 @@ export function GenerateCodeModal({
   // to 15 min, persistent to 30 days (#1356). 0 = never, persistent only.
   useEffect(() => {
     setExpiresInMinutes(persistent ? PERSISTENT_DEFAULT_MINUTES : 15);
-    if (!persistent) setMaxClaims("");
   }, [persistent]);
 
   const mutation = useMutation({
@@ -497,7 +626,7 @@ export function GenerateCodeModal({
       appliancePairingApi.create({
         persistent,
         expires_in_minutes: expiresInMinutes,
-        max_claims: persistent && maxClaims !== "" ? Number(maxClaims) : null,
+        max_claims: maxClaims ?? null,
         note: note.trim() || null,
       }),
     onSuccess: (body) => {
@@ -525,44 +654,38 @@ export function GenerateCodeModal({
             }}
             className="flex flex-col gap-4"
           >
-            {/* Persistent toggle — two card-style radios */}
             <fieldset className="flex flex-col gap-2">
-              <legend className="text-sm font-medium">Flavour</legend>
-              <div className="grid grid-cols-2 gap-2">
-                {[
-                  {
-                    value: false,
-                    title: "Ephemeral",
-                    subtitle: "Single-use, short expiry",
-                  },
-                  {
-                    value: true,
-                    title: "Persistent",
-                    subtitle: "Multi-claim, re-revealable",
-                  },
-                ].map((opt) => (
-                  <label
-                    key={String(opt.value)}
-                    className={cn(
-                      "cursor-pointer rounded-md border p-2",
-                      persistent === opt.value
-                        ? "border-primary bg-primary/5"
-                        : "hover:bg-muted",
-                    )}
-                  >
-                    <input
-                      type="radio"
-                      className="sr-only"
-                      checked={persistent === opt.value}
-                      onChange={() => setPersistent(opt.value)}
-                    />
-                    <div className="text-sm font-medium">{opt.title}</div>
-                    <div className="text-xs text-muted-foreground">
-                      {opt.subtitle}
-                    </div>
-                  </label>
-                ))}
+              <legend className="text-sm font-medium">
+                How many appliances will join with this code?
+              </legend>
+              <div className="flex items-center gap-3">
+                <input
+                  type="number"
+                  aria-label="Number of appliances"
+                  className={cn(inputCls, "w-24")}
+                  min={1}
+                  value={count}
+                  disabled={unlimited}
+                  onChange={(e) =>
+                    setCount(Math.max(1, Number(e.target.value) || 1))
+                  }
+                />
+                <label className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={unlimited}
+                    onChange={(e) => setUnlimited(e.target.checked)}
+                  />
+                  Unlimited (advanced)
+                </label>
               </div>
+              <p className="text-xs text-muted-foreground">
+                {unlimited
+                  ? "Any number of appliances can join until the code expires or is revoked."
+                  : count <= 1
+                    ? "Single-use: the first appliance to join uses it up, and a second one is refused."
+                    : `The first ${count} appliances to join are accepted; the next one is refused.`}
+              </p>
             </fieldset>
 
             <label className="flex flex-col gap-1 text-sm">
@@ -589,26 +712,6 @@ export function GenerateCodeModal({
                 digits ask to join, for as long as the code exists. Prefer an
                 expiry, and revoke the code when the rollout is done.
               </p>
-            )}
-
-            {persistent && (
-              <label className="flex flex-col gap-1 text-sm">
-                <span className="text-xs font-medium">
-                  Max claims{" "}
-                  <span className="text-muted-foreground">
-                    (blank = unlimited)
-                  </span>
-                </span>
-                <input
-                  type="number"
-                  className={inputCls}
-                  min={1}
-                  value={maxClaims}
-                  onChange={(e) =>
-                    setMaxClaims(e.target.value ? Number(e.target.value) : "")
-                  }
-                />
-              </label>
             )}
 
             <label className="flex flex-col gap-1 text-sm">

@@ -4263,9 +4263,19 @@ the two 403 details it answered for the same refusals.
    path now. See #246 for the dead-endpoint cleanup.)
 7. The console dashboard's **Pairing** row (on agent-role
    appliances) shows ``Paired ✓`` (green), ``Pairing in progress…``
-   /  ``Registering…`` (yellow), or ``Pair failed — regenerate
-   code on control plane`` (red).
+   /  ``Registering…`` (yellow), or ``Pair failed: code refused (used,
+   expired or wrong)…`` (red, #2225). The control plane answers every
+   refusal with the same generic 403 on purpose (a specific reason would
+   let anyone probe which 8-digit codes exist), so the console names the
+   likely causes and the fix (make a new code, then F8 Re-pair); the
+   actual reason is shown to a superadmin under **Fleet → Pairing codes →
+   Refused join attempts**.
 
+The Pairing codes dialog asks how many appliances the code is for: one
+is a single-use code (a second joiner is refused), N is a persistent code
+capped at N, and "unlimited" is persistent with no cap. Each code row
+lists which appliances used it, and every refused join (hostname, time,
+why, repeats grouped) is kept for 30 days in a size-bounded list.
 Ephemeral codes are single-use + time-bound; persistent codes are
 multi-claim with an optional ``max_claims`` cap. A combined BIND9 + Kea
 box doesn't need a special code kind any more — the supervisor pairs

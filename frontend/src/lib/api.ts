@@ -13256,10 +13256,43 @@ export interface PairingCodeRow {
   expires_at: string | null;
   max_claims: number | null;
   claim_count: number;
+  // Who used the code, newest first (#2225). Capped server-side;
+  // claim_count is the true total.
+  claims: PairingClaimInfo[];
   revoked_at: string | null;
   note: string | null;
   created_at: string;
   created_by_user_id: string | null;
+}
+
+export interface PairingClaimInfo {
+  appliance_id: string;
+  hostname: string | null;
+  claimed_at: string;
+}
+
+export type PairingAttemptReason =
+  | "unknown_code"
+  | "revoked"
+  | "expired"
+  | "already_used"
+  | "disabled"
+  | "exhausted";
+
+// A refused join (#2225). The wire answer is a generic 403; the reason
+// is only ever shown here, to a superadmin.
+export interface PairingAttemptRow {
+  id: string;
+  reason: PairingAttemptReason;
+  hostname: string;
+  source_ip: string | null;
+  attempts: number;
+  first_attempted_at: string;
+  last_attempted_at: string;
+  pairing_code_id: string | null;
+  code_last_two: string | null;
+  code_note: string | null;
+  used_by: string[];
 }
 
 export interface PairingCodeRevealResponse {
@@ -13276,6 +13309,12 @@ export const appliancePairingApi = {
     api
       .post<PairingCodeCreated>("/appliance/pairing-codes", body)
       .then((r) => r.data),
+  listAttempts: () =>
+    api
+      .get<{ attempts: PairingAttemptRow[] }>("/appliance/pairing-attempts")
+      .then((r) => r.data),
+  dismissAttempt: (id: string) =>
+    api.delete<void>(`/appliance/pairing-attempts/${id}`).then((r) => r.data),
   revoke: (id: string) =>
     api.delete<void>(`/appliance/pairing-codes/${id}`).then((r) => r.data),
   enable: (id: string) =>
