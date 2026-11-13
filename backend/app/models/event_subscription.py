@@ -145,6 +145,12 @@ class EventOutbox(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             postgresql_where=sa_text("state IN ('pending', 'failed')"),
         ),
         Index("ix_event_outbox_subscription_id", "subscription_id"),
+        # #1254 — terminal-row age prune.
+        Index(
+            "ix_event_outbox_terminal_modified",
+            "modified_at",
+            postgresql_where=sa_text("state IN ('delivered', 'dead')"),
+        ),
     )
 
 

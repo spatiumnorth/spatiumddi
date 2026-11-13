@@ -614,6 +614,12 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     # Partial: only the ops actually waiting out a backoff.
     __table_args__ = (
         Index("ix_dns_record_op_server_created", "server_id", "created_at"),
+        # #1254 — terminal-row age prune.
+        Index(
+            "ix_dns_record_op_terminal_updated",
+            "updated_at",
+            postgresql_where=sa_text("state IN ('applied', 'superseded', 'failed')"),
+        ),
         Index(
             "ix_dns_record_op_server_backoff",
             "server_id",
