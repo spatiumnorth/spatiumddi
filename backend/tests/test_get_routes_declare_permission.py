@@ -117,6 +117,10 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── checked in the handler ──────────────────────────────────────────
     "/api/v1/tags/keys": "unions only the tagged tables the caller may read (_readable_tables)",
     "/api/v1/tags/values": "unions only the tagged tables the caller may read (_readable_tables)",
+    "/api/v1/summary": (
+        "the snapshot gates each section on the permission its own list route needs "
+        "and withholds the rest (app.services.platform_summary.resolve_access)"
+    ),
     "/api/v1/search": "the search engine filters every result type by the caller's read grant",
     "/api/v1/dashboards/security/summary": "per-panel user_has_permission in the handler",
     "/api/v1/sessions": "superadmin sees all, others their own (checked in the handler)",

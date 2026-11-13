@@ -723,7 +723,69 @@ A signed-in caller (a session or an API token) gets the full answer:
 }
 ```
 
+### 7.3 One-call status snapshot for pollers
+
+`GET /api/v1/summary` returns the state of the whole install in one read-only
+call, so a poller (Home Assistant, a status page, Uptime Kuma, a Grafana JSON
+source) makes one request a minute instead of about twenty. It works with a
+`read`-scoped API token, makes no outbound call, and costs a constant number of
+queries however large the estate is. The result is cached in-process for about
+5 seconds, so `generated_at` can lag that much.
+
+```json
+{
+  "generated_at": "2026-11-04T17:51:06.123Z",
+  "platform": {"version": "1.0.0", "health": "ok", "maintenance_mode": false,
+               "update_available": false, "latest_version": null,
+               "release_check_enabled": true},
+  "ipam": {"spaces": 2, "subnets": 41,
+           "tracked_subnets": [{"id": "…", "network": "10.9.0.0/24", "name": "iot",
+                                "utilization_percent": 50.0,
+                                "allocated_ips": 127, "total_ips": 254}]},
+  "new_devices": {"new": 3, "new_randomized": 1, "new_last_24h": 2,
+                  "acknowledged": 0, "known": 55, "allowlist": 4},
+  "dns": {"window_minutes": 5,
+          "groups": [{"id": "…", "name": "internal", "servers_total": 2,
+                      "servers_online": 2, "servers_config_failing": 0,
+                      "queries_total": 300, "queries_per_second": 1.0,
+                      "nxdomain_rate": 0.0667, "servfail_rate": 0.0333}],
+          "blocklists": [{"id": "…", "name": "OISD", "enabled": true, "group_ids": ["…"]}],
+          "rpz_blocked_24h": 1204},
+  "dhcp": {"groups": [{"id": "…", "name": "lan", "servers_total": 1,
+                       "servers_online": 1, "servers_config_failing": 0,
+                       "active_leases": 87}],
+           "fullest_pools": [{"pool_id": "…", "name": "dyn", "scope_id": "…",
+                              "scope_name": "10.0.0.0/24", "group_id": "…",
+                              "assigned": 90, "total": 100, "occupancy_percent": 90.0}]},
+  "alerts": {"open_total": 3, "open_by_severity": {"critical": 1, "warning": 2},
+             "newest": []},
+  "withheld": {}
+}
+```
+
+**Each section is gated on the permission its own list route needs**, and one the
+caller may not read is `null` with the reason in `withheld`; the call itself is
+never refused for it. The gates: `ipam` needs read on `ip_space` and `subnet`;
+`new_devices` read on `ip_address` (and the `security.new_device_watch` module); `dns`
+read on `dns_group` (and `core.dns`), with `dns.blocklists` needing
+`dns_blocklist` and `dns.rpz` needing `server` plus the DNS-threat module;
+`dhcp` read on `dhcp_server` (and `core.dhcp`), with `dhcp.pools` needing
+`dhcp_pool`; `alerts` read on `alert`. `platform` is for any signed-in caller.
+Reasons are `permission`, `module_disabled` and `token_scoped`. A sub-field
+withheld inside a shown section appears as `section.field`
+(`dns.blocklists`, `dns.rpz`, `dhcp.pools`).
+
+An API token bound to specific subnets or zones (`resource_grants`, #374) cannot
+be narrowed to them by a whole-estate count, so a section is shown to it only
+when it holds a type-wide grant (no `resource_id`) for every type that section
+reads; otherwise it is `token_scoped`.
+
+Subnets are pinned for the `ipam.tracked_subnets` list by tagging them
+`ha: track` (or the single key `ha:track`), at most 100. The same snapshot is
+the `get_platform_summary` Copilot tool.
+
 ---
+
 
 ## 8. Errors
 
