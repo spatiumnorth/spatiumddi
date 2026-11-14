@@ -486,6 +486,25 @@ ops/
 
 **Offline operation**: if the control plane is unreachable on boot, the agent loads `config/current.json`, renders configs if not already rendered, starts the daemon, and continues serving DNS. It enters a retry loop and resumes sync when the control plane returns. No query path ever depends on control-plane reachability.
 
+### BIND9 memory: jemalloc (#4192)
+
+Alpine's `named` is built without jemalloc and runs on musl's malloc, which
+keeps freed pages. With split-horizon every view loads its own copy of each
+RPZ (BIND refuses an RPZ defined by `in-view`), so removing a view or
+reloading a large list left the memory resident until the container
+restarted. The `dns-bind9` image links `libjemalloc` into `named` and ships
+`/etc/malloc.conf` as `background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`,
+so freed pages return to the OS about a second later. Measured with two
+views each loading a 300k-entry RPZ: removing one view took RSS from 439 MB
+to 274 MB (stock image: 439 MB stays).
+
+`MALLOC_CONF` and `LD_PRELOAD` do nothing here: `named` carries a file
+capability for port 53, and a binary with one ignores both. Set
+`SPATIUM_MALLOC_CONF` to replace the options instead. The entrypoint can
+only apply it when the container starts as root; under a random uid
+(OpenShift restricted SCC) it logs that it was ignored and the image default
+stays.
+
 ### Last-known-good revert (issue #882)
 
 Offline operation covers a *missing* control plane. It does not cover a
