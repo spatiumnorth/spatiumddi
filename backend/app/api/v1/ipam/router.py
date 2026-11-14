@@ -10714,7 +10714,7 @@ async def search_addresses(
 
     data_stmt = (
         _scoped(select(IPAddress, Subnet.network, Subnet.name, Subnet.space_id, IPSpace.name))
-        .order_by(*_address_order_by(sort, order))
+        .order_by(*_address_order_by(sort, order), IPAddress.id)
         .offset(offset)
         .limit(limit)
     )

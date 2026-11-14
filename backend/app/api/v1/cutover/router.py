@@ -1244,7 +1244,7 @@ async def list_events(
             await db.execute(
                 select(CutoverEvent)
                 .where(CutoverEvent.plan_id == plan.id)
-                .order_by(CutoverEvent.at.desc())
+                .order_by(CutoverEvent.at.desc(), CutoverEvent.id)
                 .limit(limit)
                 .offset(offset)
             )
