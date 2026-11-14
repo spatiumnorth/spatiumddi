@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     secret_key: str = _SECRET_KEY_DEV_SENTINEL
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
+    # Absolute session lifetime (#1252), in days from SIGN-IN. Refresh slides
+    # a session's ``expires_at`` by ``refresh_token_expire_days`` on every
+    # rotation, so without this cap a session that keeps refreshing never
+    # ends. ``0`` disables the cap. Compared against ``UserSession.created_at``,
+    # which rotation carries across (#1241).
+    session_absolute_max_days: int = 30
     credential_encryption_key: str = ""
 
     # CORS — comma-separated allowed origins (e.g.
