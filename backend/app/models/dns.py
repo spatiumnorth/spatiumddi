@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -1189,6 +1189,19 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     # name: FQDN with trailing dot, e.g. "example.com."
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    @validates("name")
+    def _check_name(self, _key: str, value: str) -> str:
+        # Every path that creates a zone (REST, Copilot, importers,
+        # reconcilers) lands here, so a name the DNS server cannot take
+        # as a config statement / file name is refused at the row.
+        from app.core.dns_names import zone_name_storage_error  # noqa: PLC0415
+
+        err = zone_name_storage_error(value)
+        if err is not None:
+            raise ValueError(err)
+        return value
+
     # zone_type values: primary | secondary | stub | forward
     zone_type: Mapped[str] = mapped_column(String(20), nullable=False, default="primary")
     # kind: forward | reverse
