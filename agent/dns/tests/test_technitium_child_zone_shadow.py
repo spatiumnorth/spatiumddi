@@ -8,12 +8,21 @@ not written, by the structural render or by a record op.
 
 from __future__ import annotations
 
+import pytest
+
 from pathlib import Path
 from typing import Any
 
 from spatium_dns_agent.drivers.technitium import TechnitiumDriver, _shadowing_zone
 
 from .test_technitium_render import _install_fake_request, _seed_token
+
+
+@pytest.fixture(autouse=True)
+def _ops_own_every_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests drive ``apply_record_op`` against a fake that has no SOA
+    owner marker; ownership (#1775) has its own tests."""
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
 
 
 def _bundle() -> dict[str, Any]:
