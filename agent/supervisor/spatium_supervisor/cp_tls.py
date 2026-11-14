@@ -50,6 +50,7 @@ import os
 import socket
 import ssl
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -84,7 +85,11 @@ _redirects: dict[str, str | None] = {}
 # Per-process flags, in a mutable holder rather than ``global`` rebinding:
 # whether the first-contact pin has been checked against the CA, and whether
 # the skip-verify warning has been logged.
-_state = {"vouch_checked": False, "skip_warned": False}
+_state: dict[str, Any] = {"vouch_checked": False, "skip_warned": False, "pin_refresh_at": None}
+#: How often a member on the node-local http path re-reads the signed list
+#: (#4223), and how soon it asks again after the list could not be fetched.
+PIN_REFRESH_INTERVAL_S = 300.0
+PIN_REFRESH_RETRY_S = 30.0
 
 
 class PinSetError(Exception):
@@ -344,6 +349,18 @@ def verify_pin_set(body: dict[str, Any], ca_pem: str, *, now: datetime | None = 
     Raises :class:`PinSetError` unless the signature verifies against the
     appliance CA and the list is recent.
     """
+    return set(_verify_signed(body, ca_pem, now=now)[0])
+
+
+def _verify_signed(
+    body: dict[str, Any], ca_pem: str, *, now: datetime | None = None
+) -> tuple[set[str], dict[str, str]]:
+    """Fingerprints and ``{fingerprint: PEM}`` of a verified signed list.
+
+    The PEMs (#4223) are read from the SIGNED payload and kept only when they
+    hash to a listed fingerprint; a list from before they were added yields
+    none.
+    """
     if body.get("algorithm") != PIN_SET_ALGORITHM:
         raise PinSetError(f"unexpected algorithm {body.get('algorithm')!r}")
     try:
@@ -362,13 +379,19 @@ def verify_pin_set(body: dict[str, Any], ca_pem: str, *, now: datetime | None = 
         data = json.loads(payload)
         issued = datetime.fromisoformat(data["issued_at"])
         vouched = {str(fp).lower() for fp in data["certs_sha256"]}
+        raw_pems = data.get("certs_pem") or []
+        pems: dict[str, str] = {}
+        for pem in raw_pems:
+            fp = cert_sha256(str(pem))
+            if fp in vouched:
+                pems[fp] = str(pem)
     except (ValueError, KeyError, TypeError) as exc:
         raise PinSetError(f"unreadable signed list: {exc}") from exc
     if issued.tzinfo is None:
         issued = issued.replace(tzinfo=UTC)
     if abs((now or datetime.now(UTC)) - issued) > PIN_SET_MAX_AGE:
         raise PinSetError(f"the signed list was issued at {issued.isoformat()}, too long ago")
-    return vouched
+    return vouched, pems
 
 
 def _fetch_vouched(target: str, trust_pem: str, ca_pem: str) -> set[str]:
@@ -384,6 +407,67 @@ def _fetch_vouched(target: str, trust_pem: str, ca_pem: str) -> set[str]:
     except ValueError as exc:
         raise PinSetError("the signed list is not JSON") from exc
     return verify_pin_set(body, ca_pem)
+
+
+def refresh_pin(state_dir: Path, url: str) -> bool:
+    """Keep the pin current while on the node-local http path (#4223).
+
+    A member heartbeats the in-cluster api over plain http, so nothing
+    exercises its pin until the first https fallback, which fails when the
+    pin went stale (the console certificate is re-minted at cluster
+    formation) and costs that heartbeat a repin round trip. This reads the
+    signed list over the in-cluster path instead. Trust comes from the CA
+    signature and its age, never from the transport. When the list carries
+    certificates the pin does not already cover, the pin becomes exactly the
+    vouched certificates. Returns True when the pin changed; a current pin,
+    an old-format list (no PEMs) or a list that fails verification change
+    nothing and write nothing.
+    """
+    if skip_verify() or tls_url(url) is not None or urlsplit(url).scheme.lower() != "http":
+        return False
+    ca_pem = _load_ca(state_dir)
+    pins = load_pins(state_dir)
+    if ca_pem is None or pins is None:
+        return False
+    with httpx.Client(timeout=_CONNECT_TIMEOUT_S) as c:
+        resp = c.get(_origin(url) + PIN_SET_PATH)
+    if resp.status_code >= 500:
+        raise PinSetUnavailable(f"the control plane answered HTTP {resp.status_code}")
+    if resp.status_code != 200:
+        raise PinSetError(f"the control plane answered HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise PinSetError("the signed list is not JSON") from exc
+    _vouched, pems = _verify_signed(body, ca_pem)
+    if not pems:
+        return False
+    with _lock:
+        old = load_pins(state_dir)
+        if old is None or set(pems) <= _pinned_fingerprints(old):
+            return False
+        _save_pins(state_dir, "".join(pems[fp] for fp in sorted(pems)))
+    log.info(
+        "supervisor.tls.pin_refreshed",
+        old=[display_fingerprint(fp) for fp in sorted(_pinned_fingerprints(old))],
+        new=[display_fingerprint(fp) for fp in sorted(pems)],
+    )
+    return True
+
+
+def refresh_pin_if_due(state_dir: Path, url: str, *, now: float | None = None) -> None:
+    """:func:`refresh_pin` at most every ``PIN_REFRESH_INTERVAL_S`` (sooner
+    after a failed fetch), never raising: a diagnostic, not a gate."""
+    t = time.monotonic() if now is None else now
+    due = _state.get("pin_refresh_at")
+    if due is not None and t < due:
+        return
+    _state["pin_refresh_at"] = t + PIN_REFRESH_INTERVAL_S
+    try:
+        refresh_pin(state_dir, url)
+    except (httpx.HTTPError, PinSetError, ValueError) as exc:
+        _state["pin_refresh_at"] = t + PIN_REFRESH_RETRY_S
+        log.warning("supervisor.tls.pin_refresh_failed", error=str(exc))
 
 
 def try_repin(state_dir: Path, url: str) -> bool:

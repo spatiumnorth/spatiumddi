@@ -634,7 +634,8 @@ class SupervisorRegisterRequest(BaseModel):
 class SupervisorTlsPinsResponse(BaseModel):
     """The certificates the control plane serves, signed by the appliance CA
     (#1219). ``payload`` is base64 of canonical JSON
-    ``{"version": 1, "certs_sha256": [...], "issued_at": "..."}``;
+    ``{"version": 1, "certs_sha256": [...], "certs_pem": [...], "issued_at": "..."}``
+    (``certs_pem``, #4223: the leaf PEMs those fingerprints name);
     ``signature`` is the CA's signature over exactly those bytes."""
 
     payload: str
