@@ -324,6 +324,8 @@ def test_validate_fqdn_accepts_classless_reverse_zone(name: str) -> None:
         "2.0/26.192.in-addr.arpa",  # the / is only legal in the first label
         "0/26.2.0.192.notin-addr.arpa",
         "0/26",
+        "\u0660/\u0662\u0666.2.0.192.in-addr.arpa",  # Arabic-Indic digits: \\d would match them
+        "0/\u0662\u0666.2.0.192.in-addr.arpa",
     ],
 )
 def test_validate_fqdn_still_rejects_other_slashes(name: str) -> None:
@@ -404,3 +406,16 @@ def test_classless_owner_check_ignores_the_zones_own_slash() -> None:
     zone = "64/26.2.0.192.in-addr.arpa."
     assert classless_owner_error("PTR", "65.64/26.2.0.192.in-addr.arpa", zone) is None
     assert classless_owner_error("A", "x.64/26.2.0.192.in-addr.arpa", zone) is None
+
+
+def test_classless_owner_refuses_non_ascii_digits() -> None:
+    """A record owner in non-ASCII digits is refused, not stored for BIND9 to
+    mishandle."""
+    from app.core.dns_names import classless_owner_error
+
+    assert (
+        classless_owner_error(
+            "NS", "\u0660/\u0662\u0666.2.0.192.in-addr.arpa", "2.0.192.in-addr.arpa"
+        )
+        is not None
+    )

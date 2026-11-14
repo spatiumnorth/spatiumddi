@@ -250,7 +250,8 @@ def validate_record_owner(
 # ``<prefix>`` its length, which must reach past the octets already named by the
 # parent labels (3 parent octets -> /25../32). The ``a-b`` range form needs no
 # special case: it is an ordinary LDH label.
-_CLASSLESS_LABEL_RE = re.compile(r"^(\d{1,3})/(\d{1,2})\Z")
+# [0-9], not \d: in Python \d also matches non-ASCII digits.
+_CLASSLESS_LABEL_RE = re.compile(r"^([0-9]{1,3})/([0-9]{1,2})\Z")
 _IN_ADDR_SUFFIX = ("in-addr", "arpa")
 
 
