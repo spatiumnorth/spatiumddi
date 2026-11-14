@@ -7253,6 +7253,8 @@ export interface DNSImportCommit {
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
 
+export type BlocklistWildcardMode = "by_syntax" | "always" | "never";
+
 export interface DNSBlockList {
   id: string;
   name: string;
@@ -7269,7 +7271,7 @@ export interface DNSBlockList {
    * line's own syntax, `always` blocks subdomains of every entry, `never`
    * is apex-only.
    */
-  feed_wildcard_mode: "by_syntax" | "always" | "never";
+  feed_wildcard_mode: BlocklistWildcardMode;
   enabled: boolean;
   last_synced_at: string | null;
   last_sync_status: string | null;

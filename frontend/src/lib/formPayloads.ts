@@ -8,7 +8,12 @@
 // #1596. On create there is no stored value to protect, so the hidden fields
 // keep going out as `null` exactly as before.
 
-import type { CustomField, DNSBlockList, DNSPoolWrite } from "@/lib/api";
+import type {
+  BlocklistWildcardMode,
+  CustomField,
+  DNSBlockList,
+  DNSPoolWrite,
+} from "@/lib/api";
 
 /** Blocking list: `feed_url` is shown for URL lists, `sinkhole_ip` for sinkhole mode. */
 export function blocklistPayload(
@@ -22,7 +27,7 @@ export function blocklistPayload(
     blockMode: string;
     sinkholeIp: string;
     updateHours: number;
-    feedWildcard: string;
+    feedWildcard: BlocklistWildcardMode;
     enabled: boolean;
   },
   editing: boolean,
@@ -35,7 +40,7 @@ export function blocklistPayload(
     feed_format: f.feedFormat,
     block_mode: f.blockMode,
     update_interval_hours: f.updateHours,
-    feed_wildcard_mode: f.feedWildcard as DNSBlockList["feed_wildcard_mode"],
+    feed_wildcard_mode: f.feedWildcard,
     enabled: f.enabled,
   };
   if (f.sourceType === "url") body.feed_url = f.feedUrl || null;

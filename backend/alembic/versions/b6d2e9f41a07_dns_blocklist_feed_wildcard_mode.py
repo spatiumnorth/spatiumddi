@@ -22,6 +22,10 @@ Mapping of existing rows:
   so it keeps its coverage. The next refresh restamps ``by_syntax``
   lists' stored rows; until then they are what they were.
 
+The old boolean column stays (expand/contract, #296) so a not-yet-upgraded
+api pod keeps working during a rolling upgrade; it is deprecated and a later
+release removes it.
+
 Revision ID: b6d2e9f41a07
 Revises: a3c9e5d1b7f2
 Create Date: 2026-11-14 10:00:00.000000
@@ -59,21 +63,15 @@ def upgrade() -> None:
     )
     for stmt in MAPPING_SQL:
         op.execute(stmt)
-    op.drop_column("dns_blocklist", "feed_entries_are_wildcard")
+    # ``feed_entries_are_wildcard`` is deliberately kept (expand/contract,
+    # #296): an api pod still on the old release reads and writes it during a
+    # rolling upgrade. The new code keeps it consistent on write (true unless
+    # the mode is ``never``). Deprecated; a later release drops it.
 
 
 def downgrade() -> None:
-    op.add_column(
-        "dns_blocklist",
-        sa.Column(
-            "feed_entries_are_wildcard",
-            sa.Boolean(),
-            nullable=False,
-            server_default=sa.text("true"),
-        ),
-    )
+    # The old column was never dropped; bring it in line with the mode first.
     op.execute(
-        "UPDATE dns_blocklist SET feed_entries_are_wildcard = false "
-        "WHERE feed_wildcard_mode = 'never'"
+        "UPDATE dns_blocklist SET feed_entries_are_wildcard = (feed_wildcard_mode <> 'never')"
     )
     op.drop_column("dns_blocklist", "feed_wildcard_mode")

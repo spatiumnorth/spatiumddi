@@ -1820,11 +1820,19 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
-    @property
-    def feed_entries_are_wildcard(self) -> bool:
-        """Legacy boolean view of :attr:`feed_wildcard_mode` (#4190): True
-        unless the list is apex-only. Read-only; kept for API clients."""
-        return self.feed_wildcard_mode != "never"
+    # DEPRECATED (#4190), removed in a later release: the pre-tri-state
+    # boolean, kept so an api pod still on the old release works during a
+    # rolling upgrade (expand/contract, #296). Derived from
+    # ``feed_wildcard_mode`` on every write (false only for ``never``); the
+    # API still returns it for old clients.
+    feed_entries_are_wildcard: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    @validates("feed_wildcard_mode")
+    def _sync_legacy_wildcard(self, _key: str, value: str) -> str:
+        self.feed_entries_are_wildcard = value != "never"
+        return value
 
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)

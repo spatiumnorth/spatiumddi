@@ -4,4 +4,4 @@
 
 ### Migrations
 
-- `b6d2e9f41a07` — #4190, replaces `dns_blocklist.feed_entries_are_wildcard` with `feed_wildcard_mode`. A list that had the box unticked becomes Never, one subscribed to a HaGeZi `wildcard/` or OISD `domainswild` feed becomes Always, every other list becomes By syntax and has its stored entries restamped by its next refresh.
+- `b6d2e9f41a07` — #4190, adds `dns_blocklist.feed_wildcard_mode` and backfills it from `feed_entries_are_wildcard`, which stays (deprecated) for rolling upgrades. A list that had the box unticked becomes Never, one subscribed to a HaGeZi `wildcard/` or OISD `domainswild` feed becomes Always, every other list becomes By syntax and has its stored entries restamped by its next refresh.

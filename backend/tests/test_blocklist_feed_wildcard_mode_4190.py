@@ -316,3 +316,21 @@ async def test_migration_maps_the_old_boolean(db_session: AsyncSession) -> None:
         "oisd": "always",
         "hagezi-off": "never",
     }
+
+
+async def test_legacy_boolean_column_follows_the_mode(db_session: AsyncSession) -> None:
+    """Kept for a rolling upgrade (expand/contract): true unless ``never``."""
+    bl = DNSBlockList(name="legacy-sync", feed_wildcard_mode="never")
+    db_session.add(bl)
+    await db_session.commit()
+    assert bl.feed_entries_are_wildcard is False
+    bl.feed_wildcard_mode = "always"
+    await db_session.commit()
+    assert bl.feed_entries_are_wildcard is True
+    assert (
+        await db_session.scalar(
+            text("SELECT feed_entries_are_wildcard FROM dns_blocklist WHERE id = :i"),
+            {"i": bl.id},
+        )
+        is True
+    )

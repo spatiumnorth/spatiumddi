@@ -11761,7 +11761,11 @@ function BlocklistModalForm({
               <select
                 className={inputCls}
                 value={feedWildcard}
-                onChange={(e) => setFeedWildcard(e.target.value)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "by_syntax" || v === "always" || v === "never")
+                    setFeedWildcard(v);
+                }}
               >
                 <option value="by_syntax">By syntax (recommended)</option>
                 <option value="always">Always block subdomains</option>
