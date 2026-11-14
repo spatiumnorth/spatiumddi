@@ -321,8 +321,8 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           Operator-curated BGP relationships involving this ASN. Direction shown
-          from this AS's perspective: ``→ outbound`` = this AS is the local
-          side; ``← inbound`` = the counterparty is.
+          from this AS's perspective: <code>→ outbound</code> = this AS is the
+          local side; <code>← inbound</code> = the counterparty is.
         </p>
         <button
           type="button"

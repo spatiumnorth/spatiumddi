@@ -75,6 +75,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 import structlog
 
+from ..blocklist_entries import iter_entries
 from ..secure_io import write_private
 from ._caa import parse_caa
 from ._forwarders import zone_forward_transport as _zone_forward_transport
@@ -86,6 +87,13 @@ log = structlog.get_logger(__name__)
 
 
 _API_BASE = "http://127.0.0.1:5380/api"
+
+# #1776: the web console + API are for the co-located agent only. Technitium's
+# default is 0.0.0.0 / [::]:5380 over plaintext HTTP, so every container on
+# the network (and the LAN, under host networking) could reach them. v4
+# loopback only: the agent dials 127.0.0.1, and listing ::1 would make
+# Kestrel throw on a container with IPv6 disabled and take the API down.
+_WEB_SERVICE_LOCAL_ADDRESSES = "127.0.0.1"
 _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
@@ -1976,7 +1984,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
         for exc in bl.get("exceptions") or []:
             if exc:
                 allowed.add(str(exc).rstrip(".").lower())
-        for entry in bl.get("entries") or []:
+        for entry in iter_entries(bl):
             domain = str(entry.get("domain") or "").rstrip(".").lower()
             if not domain:
                 continue
@@ -2622,6 +2630,8 @@ class TechnitiumDriver(DriverBase):
             log.error("technitium_reconcile_skipped_no_token")
             raise RuntimeError("technitium reconcile skipped: no API token available")
 
+        self._pin_web_service_to_loopback(token)
+
         # TSIG keys first: a zone's ``zoneTransferTsigKeyNames`` is accepted
         # even when it names a key the server does not have (verified — the
         # API stores it happily), and the failure only shows up later as a
@@ -2981,6 +2991,39 @@ class TechnitiumDriver(DriverBase):
                 zone=prev_name,
                 zone_type=prev_type,
             )
+
+    def _pin_web_service_to_loopback(self, token: str) -> None:
+        """Bind the daemon's web service to loopback on an existing ``/etc/dns`` (#1776).
+
+        ``DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES`` (see ``start_daemon``) is
+        read only when ``webservice.config`` does not exist yet, so a
+        daemon whose config predates the fix keeps listening everywhere.
+        ``settings/set webServiceLocalAddresses`` restarts the web service
+        (v15.4.0 ``WebServiceSettingsApi``), which drops this very
+        connection, so the reply is allowed to be lost and the API is
+        awaited again afterwards. Idempotent: a no-op once already pinned.
+        Best-effort: a failure leaves the daemon as it was, which is the
+        pre-fix state, so it must not fail the whole apply.
+        """
+        try:
+            got = self._call(token, "GET", "settings/get", {}).json()
+            current = (got.get("response") or {}).get("webServiceLocalAddresses")
+            if current == [_WEB_SERVICE_LOCAL_ADDRESSES]:
+                return
+        except (httpx.HTTPError, ValueError, RuntimeError, AttributeError) as exc:
+            log.warning("technitium_web_bind_read_failed", error=str(exc))
+        try:
+            self._call(
+                token,
+                "POST",
+                "settings/set",
+                {"webServiceLocalAddresses": _WEB_SERVICE_LOCAL_ADDRESSES},
+            )
+        except (httpx.HTTPError, RuntimeError) as exc:
+            # Expected when the restart cuts the reply short.
+            log.info("technitium_web_bind_reply_lost", error=str(exc))
+        log.info("technitium_web_service_pinned_to_loopback")
+        self._wait_for_api_up()
 
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
         deadline = time.monotonic() + timeout_s
@@ -5094,6 +5137,9 @@ class TechnitiumDriver(DriverBase):
             return
         env = dict(os.environ)
         env["DNS_SERVER_ADMIN_PASSWORD"] = self.admin_bootstrap_password()
+        # #1776: first-boot only (see _pin_web_service_to_loopback for
+        # an existing /etc/dns). Overrides an operator-set value on purpose.
+        env["DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES"] = _WEB_SERVICE_LOCAL_ADDRESSES
         log_path = self.state_dir / "technitium.log"
         log_fh = log_path.open("ab", buffering=0)
         self.daemon_pid = subprocess.Popen(

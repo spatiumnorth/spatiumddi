@@ -172,6 +172,7 @@ _LOCAL_INFRA_TOOLS: dict[str, str] = {
 }
 _LOCAL_INFRA_GET_ROUTES: dict[str, str] = {
     "/api/v1/admin/containers/stats": "the local docker socket",
+    "/api/v1/admin/containers/pods/{name}/logs/stream": "the local kubeapi (#3761)",
     "/api/v1/appliance/cluster/health": "cluster DNS + the cluster's own nodes' kubelets",
     "/api/v1/appliance/cluster/health/stream": "as /appliance/cluster/health",
     "/api/v1/appliance/containers/workloads/{component}/logs/stream": "the local kubeapi",

@@ -277,7 +277,7 @@ def test_an_rpz_zone_with_no_room_for_its_hash_sidecar_is_still_served(
     [
         pytest.param(248, False, False, id="248-journal-fits"),
         pytest.param(249, False, True, id="249-journal-too-long"),
-        pytest.param(241, True, False, id="241-signed-journal-fits"),
+        pytest.param(214, True, False, id="214-signed-fits"),  # 215+ held by #3750
         pytest.param(242, True, True, id="242-signed-journal-too-long"),
     ],
 )
@@ -327,3 +327,53 @@ def test_the_hold_is_cleared_when_the_zone_is_gone(tmp_path: Path) -> None:
     assert drv._unwritable_zones != ()
     drv.render(_bundle([_primary("good.test.")]))
     assert drv._unwritable_zones == ()
+
+
+@pytest.mark.parametrize(
+    ("length", "signed", "held"),
+    [
+        pytest.param(214, True, False, id="214-signed-key-files-fit"),
+        pytest.param(215, True, True, id="215-signed-key-files-too-long"),
+        pytest.param(215, False, False, id="215-unsigned-served"),
+        pytest.param(241, True, True, id="241-signed-held"),
+    ],
+)
+def test_a_signed_zone_whose_key_files_bind_cannot_write_is_held_back(
+    tmp_path: Path, length: int, signed: bool, held: bool
+) -> None:
+    """#3750: BIND writes no key for a signed zone of 215+ characters, so it
+    would be served unsigned with DNSSEC reading as on."""
+    long = _long(length)
+    extra: dict[str, Any] = (
+        {"dnssec_enabled": True, "dnssec_policy_name": "default"} if signed else {}
+    )
+    drv = Bind9Driver(tmp_path)
+    drv.render(_bundle([_primary(long + ".", **extra), _primary("good.test.")]))
+    new = tmp_path / "rendered.new"
+
+    assert (new / "zones" / "good.test.db").is_file()
+    assert (new / "zones" / f"{long}.db").is_file() is not held
+    if held:
+        assert [(h.zone, h.served) for h in drv._unwritable_zones] == [(long, False)]
+        reason = drv._unwritable_zones[0].reason
+        assert "too long to sign with DNSSEC" in reason
+        assert "at most 214 characters" in reason
+    else:
+        assert drv._unwritable_zones == ()
+
+
+def test_the_apply_error_words_a_name_length_hold_apart_from_bad_data() -> None:
+    from spatium_dns_agent.drivers.base import HeldZone
+    from spatium_dns_agent.sync import _partial_apply_error
+
+    err = _partial_apply_error(
+        [
+            HeldZone("a.test", None, "bad", False),
+            HeldZone("b.test", None, "long", False, True),
+        ],
+        [],
+    )
+    assert "named-checkzone refused a zone file, held back until the data loads" in err
+    assert "the agent holds back a zone whose name is too long for its files" in err
+    only = _partial_apply_error([HeldZone("b.test", None, "long", False, True)], [])
+    assert "named-checkzone" not in only
