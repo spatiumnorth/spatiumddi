@@ -701,11 +701,6 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             force_password_change=tokens.force_password_change,
         )
 
-    if user is None:
-        # No such account: do the one bcrypt compare a wrong local password
-        # costs, so the answer takes as long either way.
-        burn_password_check(body.password)
-
     # ── External provider fallthrough (LDAP / RADIUS / TACACS+) ─────────────
     external_response = await _try_external_password_login(
         db, request, body.username, body.password
@@ -717,6 +712,12 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             access_token=external_response.access_token,
             force_password_change=external_response.force_password_change,
         )
+
+    # A refused sign-in for any name that is not a local account (no row, or a
+    # directory/SSO row) costs the one password compare a wrong local password
+    # costs, on top of the provider chain, so those answers are equally
+    # expensive whichever of the two the name is.
+    burn_password_check(body.password)
 
     # Existing-but-external user with no matching provider → fall through to
     # the generic 401 so we don't leak account-existence information.
