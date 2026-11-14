@@ -367,9 +367,11 @@ OIDC discovery URL) and `host.docker.internal` (a local Ollama for the
 Copilot).
 
 **In-cluster addresses**, which never leave the node:
-`spatium-control-spatiumddi-api.spatium.svc.cluster.local` — the
-Kubernetes service name an appliance supervisor uses to reach the
-control plane it is already part of — and
+`spatium-control-spatiumddi-api.spatium.svc.cluster.local` and
+`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local` — the
+Kubernetes service names an appliance supervisor uses to reach the
+control plane it is already part of (the `-local` one keeps that
+traffic on the supervisor's own node) — and
 `kubernetes.default.svc.cluster.local`, the API-server service name the
 cluster-health check resolves from inside its own pod.
 
