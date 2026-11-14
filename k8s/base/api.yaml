@@ -20,6 +20,7 @@ spec:
     metadata:
       labels:
         app: spatiumddi-api
+        app.kubernetes.io/name: spatiumddi
         app.kubernetes.io/component: api
     spec:
       # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
@@ -64,6 +65,23 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: secret-key
+            # #1358 — dedicated at-rest key for stored credentials. Optional:
+            # without it the key is derived from SECRET_KEY, as before.
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key
+                  optional: true
+            # #1358 — the release whose rollout added credential-key to a running
+            # install: that release reads the key but keeps writing under the
+            # SECRET_KEY-derived one. Optional; see secrets.yaml.example.
+            - name: CREDENTIAL_KEY_SINCE
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key-since
+                  optional: true
             # #1159 — /metrics scrape token. Optional: without it only API
             # tokens can scrape.
             - name: PROMETHEUS_METRICS_TOKEN

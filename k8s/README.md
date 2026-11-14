@@ -8,7 +8,8 @@ k8s/
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
 ├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)
-└── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+├── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+└── pod-logs/           # Opt-in pod list + log read RBAC for Platform Insights > Containers (#3761)
 ```
 
 ## Managed DHCP servers (Kea)
@@ -518,6 +519,8 @@ patches:
 ```
 
 The Helm chart exposes the same thing as `migrate.annotations`.
+
+`spatiumddi-secrets` may also carry `credential-key`, the Fernet key stored credentials are encrypted under (`CREDENTIAL_ENCRYPTION_KEY`; `secrets.yaml.example` shows the command). Optional: without it the key is derived from `SECRET_KEY`. Adding it to a running install is safe, since the derived key stays a read fallback. Add `credential-key-since` set to the running version with it, so pods that have not restarted yet never meet a value written under a key they do not have (that version reads the key and keeps writing under the old one); after the next upgrade, run `python -m app.core.rotate_credential_key` in the api pod to move existing values onto it. The Helm chart generates and keeps one for you.
 
 The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 

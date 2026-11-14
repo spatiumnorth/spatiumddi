@@ -1406,8 +1406,10 @@ async def _enforce_zone_token_scope(
 # Subnet fields that point the subnet at ANOTHER resource. A caller who writes
 # the subnet only through a grant scoped to it (#2438) may not change them:
 # the grant names this subnet, not the customer, site, VLAN, DHCP server group
-# or DNS servers it would be attached to. (DNS zones are checked separately by
-# ``_assert_scoped_zones``, which also lets the subnet's own zones through.)
+# or DNS servers it would be attached to. The inherit switches count too:
+# flipping one re-points the subnet at the parent's servers and zones.
+# (DNS zones are checked separately by ``_assert_scoped_zones``, which also
+# lets the subnet's own zones through.)
 _SUBNET_BINDING_FIELDS = (
     "block_id",
     "customer_id",
@@ -1416,6 +1418,9 @@ _SUBNET_BINDING_FIELDS = (
     "dhcp_server_group_id",
     "dns_group_ids",
     "ddns_domain_override",
+    "dns_inherit_settings",
+    "dhcp_inherit_settings",
+    "ddns_inherit_settings",
 )
 
 
@@ -3863,6 +3868,44 @@ async def _sync_dns_record(
     return True
 
 
+def _free_networks(
+    block_network: str, child_networks: list[str]
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Every free CIDR inside ``block_network``, sorted by address, uncapped.
+
+    One sweep over the children sorted by address (O(n log n + output)): merge
+    the occupied intervals, then split each gap into its maximal aligned CIDRs.
+    The earlier repeated ``address_exclude`` was O(children x pieces), which
+    for a few thousand children in a /8 or an IPv6 /16 ran for minutes. Same
+    set and order of ranges as that algorithm (pinned by a fuzz test).
+    """
+    block = ipaddress.ip_network(block_network, strict=False)
+    lo = int(block.network_address)
+    hi = int(block.broadcast_address)
+    version = block.version
+    spans: list[tuple[int, int]] = []
+    for raw in child_networks:
+        child = ipaddress.ip_network(raw, strict=False)
+        if child.version != version:
+            continue
+        c_lo, c_hi = int(child.network_address), int(child.broadcast_address)
+        if c_hi < lo or c_lo > hi:
+            continue
+        spans.append((max(c_lo, lo), min(c_hi, hi)))
+    spans.sort()
+
+    addr = ipaddress.IPv4Address if version == 4 else ipaddress.IPv6Address
+    out: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    cursor = lo  # first address not yet known to be occupied
+    for s_lo, s_hi in spans:
+        if s_lo > cursor:
+            out.extend(ipaddress.summarize_address_range(addr(cursor), addr(s_lo - 1)))
+        cursor = max(cursor, s_hi + 1)
+    if cursor <= hi:
+        out.extend(ipaddress.summarize_address_range(addr(cursor), addr(hi)))
+    return out
+
+
 def _compute_free_cidrs(
     block_network: str,
     child_networks: list[str],
@@ -3880,31 +3923,7 @@ def _compute_free_cidrs(
     correct for arbitrary combinations of child sizes and does not
     require them to be aligned.
     """
-    block = ipaddress.ip_network(block_network, strict=False)
-
-    # Start with a single working set containing the block itself.
-    working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [block]
-
-    # Sort children by prefixlen desc so smaller ones excluded first is fine —
-    # address_exclude handles either ordering. We just iterate.
-    for raw in child_networks:
-        child = ipaddress.ip_network(raw, strict=False)
-        next_working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-        for net in working:
-            if child == net:
-                # fully consumed
-                continue
-            if child.subnet_of(net):  # type: ignore[arg-type]
-                next_working.extend(net.address_exclude(child))  # type: ignore[arg-type]
-            elif net.subnet_of(child):  # type: ignore[arg-type]
-                # net is fully covered by child → drop
-                continue
-            else:
-                next_working.append(net)
-        working = next_working
-
-    # Sort by network address and build result
-    working.sort(key=lambda n: int(n.network_address))
+    working = _free_networks(block_network, child_networks)
     out: list[dict[str, Any]] = []
     for net in working[:max_results]:
         out.append(
@@ -6064,15 +6083,21 @@ async def get_available_subnets(
     )
     existing += [ipaddress.ip_network(str(n), strict=False) for (n,) in child_blocks.all()]
 
+    # Walk the block's FREE ranges (maximal CIDRs, few) rather than every
+    # candidate of this size, which for an IPv6 /48 at /64 is 65,536 and for a
+    # /32 at /64 is 2^32. A candidate is free iff it sits inside one free
+    # range, so each range of prefix <= prefix_len yields its subnets lazily
+    # and the walk ends as soon as ``limit`` are found (#3849).
     available: list[str] = []
-    scanned = 0
-    max_scan = limit * 200  # cap iterations to avoid runaway loops on large sparse blocks
-    for candidate in block_net.subnets(new_prefix=prefix_len):
-        if len(available) >= limit or scanned >= max_scan:
-            break
-        scanned += 1
-        if not any(candidate.overlaps(ex) for ex in existing):
+    for free_net in _free_networks(str(block.network), [str(n) for n in existing]):
+        if free_net.prefixlen > prefix_len:
+            continue
+        for candidate in itertools.islice(
+            free_net.subnets(new_prefix=prefix_len), limit - len(available)
+        ):
             available.append(str(candidate))
+        if len(available) >= limit:
+            break
 
     return available
 
@@ -6084,11 +6109,22 @@ class FreeCidrRange(BaseModel):
     size: int = Field(description=_COUNT_DESC)
     size_exact: str = Field(description=_EXACT_DESC)
     prefix_len: int
+    more_after: int = Field(
+        0,
+        description=(
+            "Only ever non-zero on the LAST range of a capped answer: how many further "
+            "free ranges (higher addresses) were left out. Everything after this range "
+            "up to the end of the block is the omitted part (#3848)."
+        ),
+    )
 
 
 @router.get("/blocks/{block_id}/free-space", response_model=list[FreeCidrRange])
 async def get_block_free_space(
-    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+    block_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    limit: int = Query(200, ge=1, le=10000, description="Most free ranges to return"),
 ) -> list[FreeCidrRange]:
     """Return free CIDR ranges inside this block.
 
@@ -6106,18 +6142,23 @@ async def get_block_free_space(
     )
     child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
-    ranges = _compute_free_cidrs(str(block.network), occupied)
-    return [
+    all_free = _free_networks(str(block.network), occupied)
+    out = [
         FreeCidrRange(
-            network=r["network"],
-            first=r["first"],
-            last=r["last"],
-            size=_int64_count(r["size"]),
-            size_exact=str(r["size"]),
-            prefix_len=r["prefix_len"],
+            network=str(n),
+            first=str(n.network_address),
+            last=str(n.broadcast_address),
+            size=_int64_count(n.num_addresses),
+            size_exact=str(n.num_addresses),
+            prefix_len=n.prefixlen,
         )
-        for r in ranges
+        for n in all_free[:limit]
     ]
+    # A capped answer says so on its last range instead of reading as the
+    # whole block (#3848).
+    if out and len(all_free) > len(out):
+        out[-1].more_after = len(all_free) - len(out)
+    return out
 
 
 class PlanRequestItem(BaseModel):
@@ -8608,6 +8649,8 @@ class BlockMovePreviewResponse(BaseModel):
     target_space_id: str
     target_parent_id: str | None
     descendant_blocks_count: int
+    # Child blocks in the Trash: they move too, but are not in the count above.
+    descendant_blocks_trashed: int = 0
     descendant_subnets_count: int
     descendant_ip_addresses_total: int
     reparent_chain_block_ids: list[str]
@@ -8667,13 +8710,25 @@ async def move_block_preview(
         plan = await preview_move(db, block, body.target_space_id, body.target_parent_id)
     except BlockMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    # The Trash is left out of the count (#3922), as Resize's preview does
+    # (#3710); the commit still moves those blocks, so they are reported apart.
+    live_descendants = 0
+    if plan.descendant_block_ids:
+        live_descendants = (
+            await db.execute(
+                select(func.count())
+                .select_from(IPBlock)
+                .where(IPBlock.id.in_([uuid.UUID(b) for b in plan.descendant_block_ids]))
+            )
+        ).scalar_one()
     return BlockMovePreviewResponse(
         block_id=plan.block_id,
         block_network=plan.block_network,
         source_space_id=plan.source_space_id,
         target_space_id=plan.target_space_id,
         target_parent_id=plan.target_parent_id,
-        descendant_blocks_count=len(plan.descendant_block_ids),
+        descendant_blocks_count=live_descendants,
+        descendant_blocks_trashed=len(plan.descendant_block_ids) - live_descendants,
         descendant_subnets_count=len(plan.descendant_subnet_ids),
         descendant_ip_addresses_total=plan.descendant_ip_count,
         reparent_chain_block_ids=plan.reparent_chain_block_ids,
@@ -10659,7 +10714,7 @@ async def search_addresses(
 
     data_stmt = (
         _scoped(select(IPAddress, Subnet.network, Subnet.name, Subnet.space_id, IPSpace.name))
-        .order_by(*_address_order_by(sort, order))
+        .order_by(*_address_order_by(sort, order), IPAddress.id)
         .offset(offset)
         .limit(limit)
     )
@@ -13365,6 +13420,10 @@ class IPAddressBulkEditResponse(BaseModel):
     # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
     # removed. An updated address absent from it had none to remove (#2172).
     dns_cleared: list[uuid.UUID] = []
+    # Why a row in ``skipped`` was skipped, keyed by id (#3905), as the bulk
+    # delete does (#1714): a delegate must not be told its grant's gap is a
+    # "system row".
+    skipped_reasons: dict[str, str] = {}
 
 
 @router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
@@ -13409,6 +13468,7 @@ async def bulk_edit_addresses(
     found_ids = {ip.id for ip in rows}
     not_found = [i for i in body.ip_ids if i not in found_ids]
     updated = 0
+    skipped_reasons: dict[str, str] = {}
     skipped: list[uuid.UUID] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
@@ -13465,17 +13525,22 @@ async def bulk_edit_addresses(
         for ip in rows:
             if ip.status in ("network", "broadcast", "orphan"):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = (
+                    "System row (network, broadcast or orphan); not editable."
+                )
                 continue
             # Skip dynamic-lease mirrors — DHCP server owns their state and any
             # edit here would be overwritten on the next pull. The UI already
             # blocks these from being selected; this is defence-in-depth.
             if ip.auto_from_lease:
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = "DHCP lease mirror; the DHCP server owns it."
                 continue
             # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
             # IPs outside its bound subnet.
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = "Outside the subnet this API token is scoped to."
                 continue
             # GHSA-875w — nor move an IP into a zone the token holds no grant
             # on (the IP's own subnet zones and its current zone pass).
@@ -13503,6 +13568,7 @@ async def bulk_edit_addresses(
                     )
                 except HTTPException:
                     skipped.append(ip.id)
+                    skipped_reasons[str(ip.id)] = "Names a DNS zone this token or user may not use."
                     continue
             # Address-set write delegation (#103): skip IPs the caller has no
             # write permission on (subnet-wide nor any covering address set).
@@ -13514,6 +13580,9 @@ async def bulk_edit_addresses(
                 set_ranges,
             ):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = (
+                    "Not in an address set you can edit, and no write permission on its subnet."
+                )
                 continue
 
             old: dict[str, Any] = {}
@@ -13628,6 +13697,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        skipped_reasons=skipped_reasons,
         dns_cleared=dns_cleared,
     )
 

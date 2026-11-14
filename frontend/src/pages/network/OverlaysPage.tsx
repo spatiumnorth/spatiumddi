@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -24,6 +25,7 @@ import {
   MissingCustomerOption,
 } from "@/components/ownership/pickers";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -130,6 +132,7 @@ export function OverlayEditorModal({
   existing: OverlayRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [kind, setKind] = useState<OverlayKind>(existing?.kind ?? "sdwan");
@@ -153,6 +156,7 @@ export function OverlayEditorModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const customers = customersQ.data?.items ?? [];
 
@@ -216,24 +220,29 @@ export function OverlayEditorModal({
             ))}
           </select>
         </div>
-        <div>
-          <label className="text-xs font-medium text-muted-foreground">
-            Customer (optional)
-          </label>
-          <select
-            className={inputCls}
-            value={customerId ?? ""}
-            onChange={(e) => setCustomerId(e.target.value || null)}
-          >
-            <option value="">— None —</option>
-            <MissingCustomerOption customerId={customerId} list={customersQ} />
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-        </div>
+        {own.customer && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Customer (optional)
+            </label>
+            <select
+              className={inputCls}
+              value={customerId ?? ""}
+              onChange={(e) => setCustomerId(e.target.value || null)}
+            >
+              <option value="">— None —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div>
           <label className="text-xs font-medium text-muted-foreground">
             Vendor
@@ -316,7 +325,9 @@ export function OverlayEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -609,8 +620,10 @@ export function OverlaysPage() {
                         setCustomerFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New overlay" to add one.`}
                     >
-                      No overlays yet — click "New overlay" to add one.
+                      No overlays yet.
                     </ListEmpty>
                   </td>
                 </tr>

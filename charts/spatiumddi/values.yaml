@@ -102,8 +102,8 @@ openshift:
   # Give the worker NET_RAW + NET_BIND_SERVICE (and its own SCC) so nmap raw
   # scans work. OFF by default: the control plane then runs under plain
   # restricted-v2 with no grant at all, and nmap / tcpdump fall back to what an
-  # unprivileged process can do. Needs ``worker.serviceAccount.enabled`` and
-  # ``worker.netRawCapability`` (the default).
+  # unprivileged process can do. Needs ``worker.serviceAccount.enabled``.
+  # Independent of ``worker.netRawCapability``, which is ignored on OpenShift.
   workerNetRaw: false
 
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
@@ -116,7 +116,19 @@ nameOverride: ""
 # upgrades. Override only if you're consolidating secret management.
 auth:
   secretKey: ""
-  existingSecret: ""             # must carry key `secret-key`; `metrics-token` optional
+  existingSecret: ""             # must carry key `secret-key`; `metrics-token` and `credential-key` optional
+  # #1358 — CREDENTIAL_ENCRYPTION_KEY: the Fernet key stored credentials are
+  # encrypted under. Empty = generated and kept across upgrades, like secretKey.
+  # Set it explicitly when rendering without a cluster (helm template, GitOps).
+  credentialEncryptionKey: ""
+  # #1358 — CREDENTIAL_KEY_SINCE. Empty = the chart decides: it stamps the
+  # release that adds a key to an already-running install, and the api of
+  # that release keeps writing under the old key until the next upgrade (so a
+  # pod from before the key can still read everything). A render without
+  # cluster access (helm template, GitOps) cannot see the stored value, so it
+  # stamps the version being rendered every time and writes never move onto
+  # the key: there, set this to the version that first carried the key.
+  credentialKeySince: ""
   # #1159 — bearer token /metrics accepts (any API token works too). Empty =
   # generated on first install and kept across upgrades, like secretKey.
   metricsToken: ""
@@ -281,6 +293,9 @@ api:
   # Off-appliance docker-compose installs leave this off; the
   # /appliance/* endpoints no-op there anyway via the
   # ``settings.appliance_mode`` gate.
+  # #3761 — also what makes Platform Insights > Containers show this release's
+  # pods + their (redacted) logs on a plain Helm install; without it that tab
+  # reports "Kubernetes not available: enable api.serviceAccount.enabled".
   serviceAccount:
     enabled: false
   # #296 Phase C/D/E — opt-in cluster-scoped + kube-system RBAC for
@@ -665,13 +680,16 @@ worker:
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 2000m, memory: 2Gi }
-  # Add CAP_NET_RAW to the worker pod so nmap can do SYN scans + ``-O``
-  # OS detection from the device-profiling auto-nmap path. NET_RAW is
-  # in containerd's default cap set so this is a no-op on permissive
-  # clusters; on restricted PSA / OpenShift-SCC it's required.
-  # Set to false if you've turned off device profiling cluster-wide
-  # and want a tighter security posture.
-  netRawCapability: true
+  # Explicitly ADD CAP_NET_RAW to the worker container (#3952). Off by
+  # default, and leaving it off costs nothing on containerd (k3s, Talos,
+  # EKS, AKS, GKE): containerd's default capability set already carries
+  # NET_RAW, so nmap's SYN scans and ``-O`` OS detection work without it.
+  # Turning it on matters only on a runtime whose default set lacks NET_RAW
+  # (CRI-O outside OpenShift). It also makes the pod fail Pod Security
+  # ``baseline``: PSA refuses the whole pod at admission, it does not drop
+  # the capability. So with ``true`` the namespace must be ``privileged``,
+  # or exempted. OpenShift is handled by ``openshift.workerNetRaw`` instead.
+  netRawCapability: false
   nodeSelector: {}
   # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []
@@ -809,6 +827,11 @@ postgresql:
   # limit below to hold it (see ``resources``). Changing it, or the pools /
   # HPA it derives from, restarts the Postgres pod once.
   maxConnections: ""
+  # #3932 — standalone only: ``idle_in_transaction_session_timeout`` ("0"
+  # turns it off). The CNPG kind sets it in ``cnpg.parameters``. The pod's
+  # args also carry the TCP keepalives, so the first upgrade to this chart
+  # restarts a standalone Postgres once.
+  idleInTransactionSessionTimeout: "1h"
   image:
     repository: postgres
     tag: "16-alpine"
@@ -1029,6 +1052,33 @@ postgresql:
       # unbounded pg_wal fills the node's /var and everything else on it.
       # A reload, like ``wal_keep_size``.
       max_slot_wal_keep_size: "3GB"
+      # #3932 — a session whose client has gone must not outlive it. The
+      # 1.0.0 upgrade drill left an api pod's session idle in transaction on
+      # a primary that had since moved; PostgreSQL never noticed the peer
+      # was dead (default keepalive: 2 h + 9 x 75 s) and the migration's
+      # ALTER TABLE queued behind its lock for 2 h+, with the API
+      # "initialising" throughout. Two independent backstops:
+      # * the TCP keepalives make the server probe a silent peer after 60 s,
+      #   every 10 s, and drop it after 6 misses: a dead client's session is
+      #   gone within ~2 min of the peer dying. This is the half that fixes
+      #   the drill's case.
+      # * ``idle_in_transaction_session_timeout`` is the backstop for a
+      #   client that is alive but stuck in an open transaction. It has to
+      #   sit above the longest LEGITIMATE idle window, because Postgres
+      #   ending such a session turns slow work into an error: a scheduled
+      #   backup holds its session idle in transaction for the whole pg_dump
+      #   (up to 30 min) and upload, an agent bundle render for a very large
+      #   group can compute for many minutes between statements (#2240),
+      #   and a batched WinRM push idles between its chunks. Hence 1 h, not
+      #   minutes. The migrate command ends a stale holder that blocks it
+      #   after 5 min on its own (MIGRATION_STALE_IDLE_TXN_SECONDS).
+      #   "0" turns it off.
+      # All four are reloads (sighup / user context), not restarts: CNPG
+      # applies them to a formed cluster without a rolling restart.
+      idle_in_transaction_session_timeout: "1h"
+      tcp_keepalives_idle: "60"
+      tcp_keepalives_interval: "10"
+      tcp_keepalives_count: "6"
     # PodMonitor for Prometheus Operator. Default false because most
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:

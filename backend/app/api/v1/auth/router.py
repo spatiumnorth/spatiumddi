@@ -57,6 +57,7 @@ from app.core.auth_throttle import (
     refund_stepup_attempt,
 )
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.denial_audit import note_denial_audited
 from app.core.jwt_compat import JWTError
 from app.core.mfa_enrol_proof import (
     ProofUnavailable,
@@ -68,6 +69,7 @@ from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.core.responses import XmlResponse
 from app.core.security import (
+    burn_password_check,
     create_access_token,
     create_mfa_challenge_token,
     create_refresh_token,
@@ -656,7 +658,12 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is temporarily locked due to repeated failed logins.",
             )
-        if not user.hashed_password or not verify_password(body.password, user.hashed_password):
+        if not user.hashed_password:
+            burn_password_check(body.password)
+            password_ok = False
+        else:
+            password_ok = verify_password(body.password, user.hashed_password)
+        if not password_ok:
             await _audit_login_failure(db, request, body.username, reason="bad_password", user=user)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -693,6 +700,11 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             access_token=tokens.access_token,
             force_password_change=tokens.force_password_change,
         )
+
+    if user is None:
+        # No such account: do the one bcrypt compare a wrong local password
+        # costs, so the answer takes as long either way.
+        burn_password_check(body.password)
 
     # ── External provider fallthrough (LDAP / RADIUS / TACACS+) ─────────────
     external_response = await _try_external_password_login(
@@ -1383,6 +1395,7 @@ async def mfa_enroll_begin(
     if outcome is ReauthOutcome.BAD_CREDENTIAL:
         await record_stepup_password_failure(current_user.id)
     if outcome is not ReauthOutcome.OK:
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,

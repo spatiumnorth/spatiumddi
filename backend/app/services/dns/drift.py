@@ -62,20 +62,23 @@ SERIAL_GRACE = timedelta(seconds=120)
 
 
 def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
-    """Whether a server's reported serial for ``zone`` reads as in sync.
+    """Whether a server's reported serial says it serves the zone's saved state.
 
     A primary zone is in sync when the server serves our serial
     (``last_serial``). A secondary / stub zone's serial is its primary's, not
     ours to number, so it is never compared with ``last_serial`` (0 for a
-    secondary): a server that holds the zone is in sync. That is how BIND9
-    secondaries have always read — the BIND9 agent reports the bundle's serial,
-    0, which equals the target 0 — and it is kept for every driver that does
-    not read back what it serves. PowerDNS reports the serial it serves, so a
-    secondary there is in sync once it has transferred (a transferred zone
-    never serves 0) and not before: at 0 it holds no data and answers REFUSED
-    (#1967)."""
+    secondary): a server that holds the zone is in sync. PowerDNS and BIND9
+    report the serial they serve, so a secondary there is in sync once it has
+    transferred (a transferred zone never serves 0) and not before: at 0 it
+    holds no data and answers REFUSED / SERVFAIL (#1967, #3940). A BIND9 agent
+    that cannot read the zone back reports nothing, which is not in sync
+    either. A BIND9 agent from before #3940 reports 0 for a secondary it never
+    read back, but its start-up report reads every zone from named, so a
+    secondary at a non-zero serial is served at it whichever agent says so;
+    a 0 from such an agent is "not reported", never synced. Other drivers
+    compare with the target."""
     if (zone.zone_type or "primary") in ("secondary", "stub"):
-        if driver == "powerdns":
+        if driver in ("powerdns", "bind9"):
             return current != 0
         return current == target
     return current == target
@@ -258,7 +261,10 @@ async def _classify_transferred(
         if st is not None:
             e.current_serial = int(st.current_serial)
         behind_serial = e.current_serial is not None and _serial_behind(
-            zone, e.current_serial, target, by_id[e.server_id].driver
+            zone,
+            e.current_serial,
+            target,
+            by_id[e.server_id].driver,
         )
         # Under split-horizon a transfer not addressed to the zone's view was
         # answered by some view, maybe another one; an unviewed zone's
@@ -366,6 +372,8 @@ async def compute_zone_drift(
     # server_id -> the transfer was addressed to the zone's own view.
     view_addressed: dict[str, bool] = {}
 
+    is_secondary = (zone.zone_type or "primary") == "secondary"
+
     async def _drift_for_server(srv: DNSServer) -> ServerDrift:
         entry = ServerDrift(
             server_id=str(srv.id),
@@ -434,6 +442,14 @@ async def compute_zone_drift(
             return entry
 
         view_addressed[entry.server_id] = is_view_transfer_key(used)
+        # #4057 — a secondary's records come from its primary by transfer;
+        # SpatiumDDI holds none of them, so a diff against the zone's own rows
+        # would list every transferred record as "extra on the server". The
+        # transfer proves the zone is served; the serial check in
+        # ``_classify_transferred`` speaks for convergence.
+        if is_secondary:
+            entry.in_sync = len(on_wire)
+            return entry
         # #1794 — a dot-less name target is relative on a zone-file driver and
         # absolute on a cloud one, so the DB side is keyed per server.
         rel = targets_are_relative(srv)
@@ -463,6 +479,13 @@ async def compute_zone_drift(
     # isolates its own failures, so gather() is safe. Order is preserved.
     report.servers = list(await asyncio.gather(*(_drift_for_server(s) for s in servers)))
     await _classify_transferred(db, zone, servers, report.servers, view_addressed)
+    if is_secondary:
+        report.warnings.append(
+            "This is a secondary zone: its records come from the primary by zone "
+            "transfer and SpatiumDDI does not hold them, so they are not compared "
+            "record by record. Only whether each server is serving the zone, and "
+            "at which serial, is checked."
+        )
 
     # Split-horizon caveats. A zone that belongs to a view has one copy per
     # view it lives in, and an AXFR names only the zone. A transfer addressed

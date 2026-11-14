@@ -43,6 +43,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -382,7 +383,7 @@ export function SubscriptionEditor({
           hint={
             existing && existing.headers_set
               ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
-              : "One header per line, ``Key: value`` format. Values are encrypted at rest and never shown again. ``X-SpatiumDDI-*`` reserved for the platform."
+              : "One header per line, ‘Key: value’ format. Values are encrypted at rest and never shown again. ‘X-SpatiumDDI-*’ reserved for the platform."
           }
         >
           <textarea
@@ -445,7 +446,9 @@ export function SubscriptionEditor({
           </Field>
         </div>
 
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -733,7 +736,7 @@ export function WebhooksPage() {
                       disabled={test.isPending}
                       onClick={() => test.mutate(s.id)}
                       className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                      title="Send a synthetic ``test.ping`` event through the same signing + transport path the worker uses"
+                      title="Send a synthetic ‘test.ping’ event through the same signing + transport path the worker uses"
                       {...superadminGate}
                     >
                       <Send className="h-3 w-3" /> Test

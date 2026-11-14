@@ -21,6 +21,7 @@ import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
+import { FormError } from "@/components/ui/form-error";
 
 // A refusal raised by the dialog's own checks before anything is sent; its
 // message is the reason shown to the operator (#3082).
@@ -266,10 +267,15 @@ function ScopeModalForm({
     (g) => g.id === (editing ? scope?.group_id : defaultGroupId),
   );
   // Settings + specific subnet feed the auto-prefill for new scopes.
-  const { data: settings } = useQuery({
+  // Read fresh on open and pre-fill only from the settled answer (#4026): the
+  // tab usually holds a copy from sign-in, and another client may have changed
+  // the platform defaults since (same pattern as #3865).
+  const { data: settings, isFetching: settingsReading } = useQuery({
     queryKey: ["settings"],
     queryFn: settingsApi.get,
     enabled: !editing,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: subnetDetail, isFetching: subnetReading } = useQuery({
     queryKey: ["subnet", subnetId],
@@ -346,17 +352,33 @@ function ScopeModalForm({
   // pre-fill and each applied template, so the dialog always shows what it
   // will send.
   const [prefillGeneration, setPrefillGeneration] = useState(0);
-  const [settingsPrefilled, setSettingsPrefilled] = useState(false);
+  // The platform-defaults half, keyed by address family (#4025): the defaults
+  // are DHCPv4 values, so a v6 scope takes only what DHCPv6 can carry (IPv6
+  // DNS / NTP addresses, domain search; no domain-name) — the API refuses the
+  // rest. A change of family (picking another subnet) replaces the rows this
+  // filled, never one the operator has since changed.
+  const [settingsPrefill, setSettingsPrefill] = useState<{
+    v6: boolean;
+    rows: DHCPOption[];
+  } | null>(null);
+  // The family is known once the subnet answered, or when no subnet is chosen.
+  const familyKnown = !subnetId || selectedNetwork !== null;
   useEffect(() => {
-    if (editing || settingsPrefilled || !settings) return;
+    if (
+      editing ||
+      !settings ||
+      settingsReading ||
+      !familyKnown ||
+      settingsPrefill?.v6 === isV6
+    )
+      return;
+    const prev = settingsPrefill;
+    const only = (xs: string[] | undefined) =>
+      (xs ?? []).filter((x) => x.includes(":") === isV6);
     const defaults: DHCPOption[] = [];
-    if (settings.dhcp_default_dns_servers?.length)
-      defaults.push({
-        code: 6,
-        name: "dns-servers",
-        value: settings.dhcp_default_dns_servers,
-      });
-    if (settings.dhcp_default_domain_name)
+    const dns = only(settings.dhcp_default_dns_servers);
+    if (dns.length) defaults.push({ code: 6, name: "dns-servers", value: dns });
+    if (settings.dhcp_default_domain_name && !isV6)
       defaults.push({
         code: 15,
         name: "domain-name",
@@ -368,23 +390,31 @@ function ScopeModalForm({
         name: "domain-search",
         value: settings.dhcp_default_domain_search,
       });
-    if (settings.dhcp_default_ntp_servers?.length)
-      defaults.push({
-        code: 42,
-        name: "ntp-servers",
-        value: settings.dhcp_default_ntp_servers,
-      });
-    setOptions((cur) => [
-      ...cur,
-      ...defaults.filter((d) => !cur.some((o) => o.code === d.code)),
-    ]);
+    const ntp = only(settings.dhcp_default_ntp_servers);
+    if (ntp.length)
+      defaults.push({ code: 42, name: "ntp-servers", value: ntp });
+    setOptions((cur) => {
+      // Drop what an earlier pre-fill put there and the operator left alone.
+      const kept = cur.filter(
+        (o) =>
+          !prev?.rows.some(
+            (r) =>
+              r.code === o.code &&
+              JSON.stringify(r.value) === JSON.stringify(o.value),
+          ),
+      );
+      return [
+        ...kept,
+        ...defaults.filter((d) => !kept.some((o) => o.code === d.code)),
+      ];
+    });
     // Only over the field's own initial value — never over a typed one.
     const leaseDefault = settings.dhcp_default_lease_time;
-    if (leaseDefault)
+    if (leaseDefault && !prev)
       setLeaseTime((cur) => (cur === "86400" ? String(leaseDefault) : cur));
-    setSettingsPrefilled(true);
+    setSettingsPrefill({ v6: isV6, rows: defaults });
     setPrefillGeneration((g) => g + 1);
-  }, [editing, settingsPrefilled, settings]);
+  }, [editing, settings, settingsReading, familyKnown, isV6, settingsPrefill]);
 
   // The subnet half, keyed by subnet: picking another subnet in the dialog
   // replaces what this filled in for the last one — never a value the
@@ -1160,6 +1190,7 @@ function ScopeModalForm({
             <h3 className="text-sm font-semibold">Options</h3>
             <ApplyTemplateControl
               groupId={groupId}
+              addressFamily={isV6 ? "ipv6" : "ipv4"}
               currentOptions={options}
               onApply={(next) => {
                 setOptions(next);
@@ -1182,7 +1213,7 @@ function ScopeModalForm({
           onChange={setPxeProfileId}
         />
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         {adoptConflict && (
           <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
             <span>{adoptConflict}</span>
@@ -1349,19 +1380,30 @@ export function PXEProfileSection({
  */
 export function ApplyTemplateControl({
   groupId,
+  addressFamily,
   currentOptions,
   onApply,
 }: {
   groupId: string;
+  /** Only templates of this family are offered (#4025); all when omitted. */
+  addressFamily?: "ipv4" | "ipv6";
   currentOptions: DHCPOption[];
   onApply: (next: DHCPOption[]) => void;
 }) {
-  const { data: templates = [] } = useQuery({
+  // Re-read on open and hold the picker meanwhile: applying merges the
+  // template's options into the form, and a cached copy may predate another
+  // client's change (#4029, as #3868).
+  const { data: allTemplates = [], isFetching } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
     queryFn: () =>
       groupId ? dhcpApi.listOptionTemplates(groupId) : Promise.resolve([]),
     enabled: !!groupId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
+  const templates = addressFamily
+    ? allTemplates.filter((t) => (t.address_family ?? "ipv4") === addressFamily)
+    : allTemplates;
   const [overwritten, setOverwritten] = useState<string[]>([]);
   const [pickerKey, setPickerKey] = useState(0);
 
@@ -1411,6 +1453,7 @@ export function ApplyTemplateControl({
         aria-label="Apply template"
         key={pickerKey}
         defaultValue=""
+        disabled={isFetching}
         onChange={(e) => handleSelect(e.target.value)}
         className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
       >

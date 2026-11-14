@@ -15,6 +15,7 @@ spec:
     metadata:
       labels:
         app: spatiumddi-worker
+        app.kubernetes.io/name: spatiumddi
         app.kubernetes.io/component: worker
     spec:
       # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
@@ -55,17 +56,12 @@ spec:
         - name: worker
           image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
-          # NET_RAW lets the worker run nmap with raw sockets — required
-          # for SYN scans + ``-O`` OS detection in the device-profiling
-          # auto-nmap path. The image grants the cap to the nmap binary
-          # via setcap; this line keeps it in the pod's bounding set
-          # so restricted PSA / OpenShift-SCC clusters don't drop it.
-          # No effect on permissive clusters (NET_RAW is in the default
-          # set there). Drop NET_RAW with a values-level toggle if you
-          # disable device profiling cluster-wide.
-          securityContext:
-            capabilities:
-              add: ["NET_RAW"]
+          # #3952 — no ``capabilities.add``. nmap's SYN scans and ``-O``
+          # OS detection use a file capability (net_raw) that needs NET_RAW
+          # in the bounding set; containerd's default set already carries
+          # it. Adding it explicitly made Pod Security ``baseline`` refuse
+          # the pod. On a runtime without NET_RAW by default (CRI-O), add
+          # it back here and label the namespace ``privileged``.
           command:
             - celery
             - -A
@@ -100,6 +96,23 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: secret-key
+            # #1358 — dedicated at-rest key for stored credentials. Optional:
+            # without it the key is derived from SECRET_KEY, as before.
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key
+                  optional: true
+            # #1358 — the release whose rollout added credential-key to a running
+            # install: that release reads the key but keeps writing under the
+            # SECRET_KEY-derived one. Optional; see secrets.yaml.example.
+            - name: CREDENTIAL_KEY_SINCE
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key-since
+                  optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
             # #1547 — Redis password from the Secret, interpolated
@@ -190,6 +203,7 @@ spec:
     metadata:
       labels:
         app: spatiumddi-beat
+        app.kubernetes.io/name: spatiumddi
         app.kubernetes.io/component: beat
     spec:
       # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
@@ -220,6 +234,23 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: secret-key
+            # #1358 — dedicated at-rest key for stored credentials. Optional:
+            # without it the key is derived from SECRET_KEY, as before.
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key
+                  optional: true
+            # #1358 — the release whose rollout added credential-key to a running
+            # install: that release reads the key but keeps writing under the
+            # SECRET_KEY-derived one. Optional; see secrets.yaml.example.
+            - name: CREDENTIAL_KEY_SINCE
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: credential-key-since
+                  optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
             # #1547 — Redis password from the Secret, interpolated

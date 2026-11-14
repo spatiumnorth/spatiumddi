@@ -1039,8 +1039,14 @@ _PCT_RESOLVE_MARGIN = 5.0
 
 
 def _pct_resolve_floor(threshold: float) -> float:
-    """The value an open event must fall below to resolve."""
-    return threshold - _PCT_RESOLVE_MARGIN
+    """The value an open event must fall below to resolve.
+
+    ``threshold - margin``, except that a threshold within one margin of
+    zero would give a floor of 0% or below, which no reading is ever under
+    (#3831): the alert would stay open on an empty subnet for ever. There
+    the margin shrinks to half the threshold, so 0% always clears it."""
+    floor = threshold - _PCT_RESOLVE_MARGIN
+    return floor if floor > 0 else threshold / 2
 
 
 # #3542 — a matcher that keeps an open subject only because of the margin
@@ -4133,7 +4139,7 @@ async def _matching_agent_config_rejected_subjects(
                 refused = detail[len(PARTIAL_APPLY_PREFIX) :]
                 message = (
                     f"{kind} server '{row.name}' applied the configuration, but {refused}. "
-                    "Nothing was rolled back; fix the refused zones' data."
+                    "Nothing was rolled back; each reason says what to change."
                 )
             else:
                 message = (
@@ -8885,6 +8891,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     # stable severity, so the rank compare never trips and
                     # they're left untouched.
                     new_severity = severity_override or rule.severity
+                    # #3930 — the subject was renamed since the event opened.
+                    # Follow it: the display, and the old name inside the
+                    # stored message and peak (the peak is compared with the
+                    # current message below, and a name is no reading).
+                    old_display = existing.subject_display
+                    if old_display and display and old_display != display:
+                        lov0 = existing.last_observed_value or {}
+                        existing.subject_display = display
+                        existing.message = existing.message.replace(old_display, display)
+                        if isinstance(lov0.get("peak_message"), str):
+                            existing.last_observed_value = {
+                                **lov0,
+                                "peak_message": lov0["peak_message"].replace(old_display, display),
+                            }
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         # The peak stays clean; the stored (and delivered)

@@ -20,6 +20,7 @@ import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { deletePolicyDescription } from "./devicePolicyCopy";
 import { ListReadError } from "@/components/ui/list-read-error";
+import { FormError } from "@/components/ui/form-error";
 
 const KEY_BASE = "dhcp-device-policies";
 const OBS_KEY = "dhcp-device-observations";
@@ -571,7 +572,9 @@ function DevicePolicyForm({
         </label>
 
         {mut.isError && (
-          <div className="text-xs text-destructive">{errMsg(mut.error)}</div>
+          <FormError className="text-xs text-destructive">
+            {errMsg(mut.error)}
+          </FormError>
         )}
         <Btns
           onClose={onClose}

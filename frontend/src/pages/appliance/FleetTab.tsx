@@ -86,6 +86,7 @@ import { UpgradeImagesTable } from "./UpgradeImagesTable";
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { ReleasesTab } from "./ReleasesTab";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -3119,10 +3120,11 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         Service health
       </h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Supervisor watchdog snapshot — refreshed every 5 min. ``missing`` /
-        ``unhealthy`` for more than one cadence means the auto-heal kicker
-        didn&apos;t bring the container back; SSH in and check{" "}
-        <code>docker logs &lt;service&gt;</code>.
+        Supervisor watchdog snapshot — refreshed every 5 min.{" "}
+        <code className="font-mono">missing</code> /
+        <code className="font-mono">unhealthy</code> for more than one cadence
+        means the auto-heal kicker didn&apos;t bring the container back; SSH in
+        and check <code>docker logs &lt;service&gt;</code>.
       </p>
       {stale && (
         <div
@@ -3519,7 +3521,7 @@ function MountDiskModal({
             This appliance already has a mount named “{name}”.
           </p>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-1">
           <HeaderButton variant="secondary" onClick={onClose}>
             Cancel
@@ -4056,10 +4058,47 @@ const HOSTCFG_PLANE_LABELS: Record<string, string> = {
   console_mode: "Console mode",
 };
 
-function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
+// Each plane's host runner logs to its own file under
+// /var/log/spatiumddi/ (#3814); the runner script names are not all
+// ``<plane>-reload``; the firewall runner has no log file, only the journal (resolver → resolved-reload, console_mode →
+// verbose-boot-reload, timezone → tz-reload).
+const HOSTCFG_PLANE_LOGS: Record<string, string> = {
+  ntp: "chrony-reload.log",
+  snmp: "snmp-reload.log",
+  lldp: "lldp-reload.log",
+  syslog: "syslog-reload.log",
+  ssh: "ssh-reload.log",
+  resolver: "resolved-reload.log",
+  timezone: "tz-reload.log",
+  removable: "removable-reload.log",
+  apt: "apt-reload.log",
+  console_mode: "verbose-boot-reload.log",
+};
+
+function hostConfigLogHint(planes: string[]): string {
+  const hints = planes.map((p) =>
+    p === "firewall"
+      ? "journalctl -u spatium-firewall-reload"
+      : HOSTCFG_PLANE_LOGS[p]
+        ? `/var/log/spatiumddi/${HOSTCFG_PLANE_LOGS[p]}`
+        : "",
+  );
+  const uniq = [...new Set(hints.filter(Boolean))];
+  return uniq.length ? uniq.join(", ") : "/var/log/spatiumddi/";
+}
+
+export function ApplianceHostConfigHealthSection({
+  row,
+}: {
+  row: ApplianceRow;
+}) {
   const entries = Object.entries(row.host_config_health ?? {});
   entries.sort(([a], [b]) => a.localeCompare(b));
   const anyFailing = entries.some(([, h]) => h.state === "failing");
+  const anyRetrying = entries.some(([, h]) => h.state === "retrying");
+  const failingPlanes = entries
+    .filter(([, h]) => h.state === "failing")
+    .map(([p]) => p);
   return (
     <div className="border-t pt-4">
       <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -4074,8 +4113,12 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
         )}
       >
         {anyFailing
-          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (e.g. /var/log/spatiumddi/chrony-reload.log) for the cause."
-          : "A host-config change is still being applied (retrying)."}
+          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (" +
+            hostConfigLogHint(failingPlanes) +
+            ") for the cause."
+          : anyRetrying
+            ? "A host-config change is still being applied (retrying)."
+            : "A host-config change is being applied."}
       </p>
       <div className="mt-2 overflow-hidden rounded-md border">
         <table className="w-full text-xs">
@@ -4102,7 +4145,9 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
                         "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
                         failing
                           ? "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300"
-                          : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+                          : h.state === "applying"
+                            ? "bg-muted text-muted-foreground"
+                            : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
                       )}
                     >
                       <Icon

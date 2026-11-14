@@ -37,6 +37,7 @@ from pydantic import (
 )
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2055,11 +2056,17 @@ async def _refresh_record_or_404(db: AsyncSession, record: DNSRecord) -> None:
     The zone is gone, which is what ``404 Zone not found`` says to a request
     that arrives after the delete. Whether the row is gone is decided by
     looking for it, not by the exception's wording; anything else re-raises.
+    The id is read from the instance's identity, never ``record.id``: after the
+    failed refresh the instance is expired and an attribute read would lazy-load
+    on the sync path, raising ``MissingGreenlet`` (#4043).
     """
     try:
         await db.refresh(record)
     except InvalidRequestError as exc:
-        still_there = await db.scalar(select(DNSRecord.id).where(DNSRecord.id == record.id))
+        identity = sa_inspect(record).identity
+        if identity is None:
+            raise
+        still_there = await db.scalar(select(DNSRecord.id).where(DNSRecord.id == identity[0]))
         if still_there is not None:
             raise
         raise HTTPException(status_code=404, detail="Zone not found") from exc
@@ -3433,6 +3440,9 @@ class SyncFromServerResponse(BaseModel):
     zones_failed: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that was queued as record ops (a large
+    # agentless zone, #3817) rather than applied inline.
+    total_queued: int = 0
     total_push_errors: int
     # Zones listed by the server over WinRM (windows_dns Path B only).
     # Empty for BIND9 and Windows DNS without credentials — the caller can
@@ -3471,6 +3481,8 @@ class GroupSyncWithServersResponse(BaseModel):
     servers_succeeded: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that is queued for delivery, not yet applied.
+    total_queued: int = 0
     total_push_errors: int
     total_zones_imported: int
     total_zones_pushed_to_server: int
@@ -3674,6 +3686,7 @@ async def _sync_single_server(
     zones_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
 
     for zone in zones:
@@ -3685,6 +3698,8 @@ async def _sync_single_server(
             zones_succeeded += 1
             total_imported += result.pull.imported
             total_pushed += result.push.pushed
+            if result.push.queued_for_agent:
+                total_queued += result.push.pushed
             total_push_errors += len(result.push.push_errors)
             items.append(
                 ZoneSyncItem(
@@ -3751,6 +3766,7 @@ async def _sync_single_server(
         zones_failed=len(zones) - zones_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         zones_on_server=sorted(set(zones_on_server)),
         new_zones_on_server=new_zones,
@@ -3814,6 +3830,7 @@ async def sync_group_with_servers(
     servers_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
     total_zones_imported = 0
     total_zones_pushed_to_server = 0
@@ -3838,6 +3855,7 @@ async def sync_group_with_servers(
             servers_succeeded += 1
             total_imported += result.total_imported
             total_pushed += result.total_pushed
+            total_queued += result.total_queued
             total_push_errors += result.total_push_errors
             total_zones_imported += len(result.zones_imported)
             total_zones_pushed_to_server += len(result.zones_pushed_to_server)
@@ -3865,6 +3883,7 @@ async def sync_group_with_servers(
         servers_succeeded=servers_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         total_zones_imported=total_zones_imported,
         total_zones_pushed_to_server=total_zones_pushed_to_server,
@@ -6261,11 +6280,16 @@ class ServerZoneStateEntry(BaseModel):
     # for ``ok``.
     freshness: Literal["ok", "unreachable", "paused", "disabled"] = "ok"
     counted: bool = True
+    # The verdict on this server's report: a primary zone serves our serial, a
+    # secondary / stub zone holds a copy (its serial is its primary's, not
+    # ours) and no op is pending. False when it has not reported.
+    in_sync: bool = False
 
 
 class ServerZoneStateResponse(BaseModel):
     zone_id: uuid.UUID
     zone_name: str
+    zone_type: str = "primary"
     target_serial: int
     servers: list[ServerZoneStateEntry]
     in_sync: bool
@@ -6327,6 +6351,11 @@ async def get_zone_server_state(
             freshness = "unreachable"
         else:
             freshness = "ok"
+        entry_in_sync = (
+            current is not None
+            and not pending
+            and zone_state_in_sync(zone, current, target, srv.driver)
+        )
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -6337,6 +6366,7 @@ async def get_zone_server_state(
                 pending_ops=pending,
                 freshness=freshness,
                 counted=freshness == "ok",
+                in_sync=entry_in_sync,
             )
         )
         if freshness in ("paused", "disabled"):
@@ -6348,12 +6378,13 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if pending or not zone_state_in_sync(zone, current, target, srv.driver):
+            if not entry_in_sync:
                 all_in_sync = False
 
     return ServerZoneStateResponse(
         zone_id=zone.id,
         zone_name=zone.name,
+        zone_type=zone.zone_type or "primary",
         target_serial=target,
         servers=entries,
         in_sync=all_in_sync and any_reported,
@@ -8231,6 +8262,8 @@ class ZoneMovePreviewResponse(BaseModel):
     zone_view_action: str
     zone_view_from: str | None
     records_total: int
+    records_trashed: int = 0
+    records_trashed_widened: int = 0
     records_remapped: int
     records_widened: int
     records_cleared_inert: int
@@ -8282,6 +8315,8 @@ class ZoneMovePreviewResponse(BaseModel):
             zone_view_action=plan.zone_view_action,
             zone_view_from=plan.zone_view_from,
             records_total=plan.records_total,
+            records_trashed=plan.records_trashed,
+            records_trashed_widened=plan.records_trashed_widened,
             records_remapped=plan.records_remapped,
             records_widened=plan.records_widened,
             records_cleared_inert=plan.records_cleared_inert,
@@ -8423,6 +8458,12 @@ async def move_zone_commit(
     # and deleting through the source would remove it. Decided AFTER the
     # create, because a target that already held the zone is the evidence
     # that does not depend on the credentials naming the provider correctly.
+    # #3888: the name gate, before the source-copy check below reads other
+    # groups' zones (the target push takes it too; this covers a target with no
+    # agentless server, whose source delete still shares a provider).
+    from app.services.lock_order import lock_provider_zone_name  # noqa: PLC0415
+
+    await lock_provider_zone_name(db, zone.name)
     try:
         adopted_on = await _push_zone_to_agentless_servers(
             db,
@@ -9054,6 +9095,13 @@ async def _push_zone_to_agentless_servers(
     # ``skip_server_ids``: servers the caller has decided not to drive (the
     # move keeps a source copy that shares a provider with the target, #3805).
     skip = set(skip_server_ids or set())
+    group_servers = list(servers_res.scalars().all())
+    if any(is_agentless(s.driver) for s in group_servers):
+        # #3888: one zone name at a time per provider, before the shared-copy
+        # check reads other groups' rows and until this transaction commits.
+        from app.services.lock_order import lock_provider_zone_name  # noqa: PLC0415
+
+        await lock_provider_zone_name(db, zone.name)
     if op == "delete" and group_id is None:
         # #3812: the zone's own group is being deleted from; the move passes
         # ``group_id`` and decides its keeps itself (#3805).
@@ -9063,9 +9111,7 @@ async def _push_zone_to_agentless_servers(
             kept_notes.extend(shared.notes)
         for note in shared.notes:
             logger.warning("dns.zone.delete_kept_shared_provider_copy", zone=zone.name, note=note)
-    targets = [
-        s for s in servers_res.scalars().all() if is_agentless(s.driver) and s.id not in skip
-    ]
+    targets = [s for s in group_servers if is_agentless(s.driver) and s.id not in skip]
     if not targets:
         return []
 
@@ -10039,9 +10085,9 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
-    if "value" in changes:
+    if set(changes) - {"ttl"}:
         await _require_superadmin_for_lua(
-            db, current_user, [record.record_type], what="change a LUA record's value"
+            db, current_user, [record.record_type], what="change a LUA record other than its TTL"
         )
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
@@ -11935,7 +11981,12 @@ async def import_zone_spreadsheet_commit(
         db,
         current_user,
         [c.record_type for c in plan.creates]
-        + [u.candidate.record_type for u in plan.updates if "value" in u.changed],
+        + [
+            rt
+            for u in plan.updates
+            if set(u.changed) - {"ttl", "comment"}
+            for rt in (u.candidate.record_type, u.record.record_type)
+        ],
         what="import a LUA record",
     )
 

@@ -1439,6 +1439,7 @@ async def _apply_backup_restore_inner(
     # Runs AFTER the alembic upgrade so the schema is at the local
     # code's expected shape (encrypted columns may have moved /
     # been renamed across migrations).
+    from app.config import credential_key_writes_deferred  # noqa: PLC0415
     from app.config import settings as _settings  # noqa: PLC0415
 
     if "platform_secret_key" not in secrets_payload:
@@ -1454,6 +1455,10 @@ async def _apply_backup_restore_inner(
                 or "",
                 dest_secret_key=_settings.secret_key,
                 dest_credential_key=_settings.credential_encryption_key or "",
+                # #1358 — honour the same write deferral as app.core.crypto.
+                dest_defer_dedicated_writes=credential_key_writes_deferred(
+                    _settings.credential_key_since, _settings.version
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             # Rewrap failure shouldn't blow away the whole restore —

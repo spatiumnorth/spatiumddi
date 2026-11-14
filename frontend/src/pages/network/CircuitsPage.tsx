@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -29,6 +30,7 @@ import {
   SiteChip,
 } from "@/components/ownership/pickers";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -152,6 +154,7 @@ export function CircuitEditorModal({
   existing: CircuitRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [tab, setTab] = useState<EditorTab>("general");
 
@@ -208,11 +211,13 @@ export function CircuitEditorModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const sitesQ = useQuery({
     queryKey: ["sites", "all"],
     queryFn: () => sitesApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.site,
   });
   const providers = providersQ.data?.items ?? [];
   const customers = customersQ.data?.items ?? [];
@@ -315,27 +320,29 @@ export function CircuitEditorModal({
               ))}
             </select>
           </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer (optional)
-            </label>
-            <select
-              className={inputCls}
-              value={customerId ?? ""}
-              onChange={(e) => setCustomerId(e.target.value || null)}
-            >
-              <option value="">— None —</option>
-              <MissingCustomerOption
-                customerId={customerId}
-                list={customersQ}
-              />
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {own.customer && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer (optional)
+              </label>
+              <select
+                className={inputCls}
+                value={customerId ?? ""}
+                onChange={(e) => setCustomerId(e.target.value || null)}
+              >
+                <option value="">— None —</option>
+                <MissingCustomerOption
+                  customerId={customerId}
+                  list={customersQ}
+                />
+                {customers.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div>
             <label className="text-xs font-medium text-muted-foreground">
               Transport class
@@ -409,24 +416,26 @@ export function CircuitEditorModal({
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 A-end
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">
-                  Site
-                </label>
-                <select
-                  className={inputCls}
-                  value={aSiteId ?? ""}
-                  onChange={(e) => setASiteId(e.target.value || null)}
-                >
-                  <option value="">— None —</option>
-                  {sites.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                      {s.code ? ` (${s.code})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {own.site && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Site
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={aSiteId ?? ""}
+                    onChange={(e) => setASiteId(e.target.value || null)}
+                  >
+                    <option value="">— None —</option>
+                    {sites.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                        {s.code ? ` (${s.code})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-muted-foreground">
                   Subnet UUID (optional)
@@ -447,24 +456,26 @@ export function CircuitEditorModal({
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Z-end
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">
-                  Site
-                </label>
-                <select
-                  className={inputCls}
-                  value={zSiteId ?? ""}
-                  onChange={(e) => setZSiteId(e.target.value || null)}
-                >
-                  <option value="">— None —</option>
-                  {sites.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                      {s.code ? ` (${s.code})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {own.site && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Site
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={zSiteId ?? ""}
+                    onChange={(e) => setZSiteId(e.target.value || null)}
+                  >
+                    <option value="">— None —</option>
+                    {sites.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                        {s.code ? ` (${s.code})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-muted-foreground">
                   Subnet UUID (optional)
@@ -554,7 +565,9 @@ export function CircuitEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -883,8 +896,10 @@ export function CircuitsPage() {
                         setProviderFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New circuit" to add one.`}
                     >
-                      No circuits yet — click "New circuit" to add one.
+                      No circuits yet.
                     </ListEmpty>
                   </td>
                 </tr>

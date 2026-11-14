@@ -880,7 +880,7 @@ function AsnSummaryCard() {
   // Gate on ``ready`` so the query waits for the real module state (``enabled``
   // is optimistically true while loading → a one-shot 404 on hard load).
   const moduleOn = ready && enabled("network.asn");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["asns-summary"],
     queryFn: () => asnsApi.list({ limit: 200 }),
     staleTime: 30_000,
@@ -907,8 +907,8 @@ function AsnSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load ASN data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="ASNs" />
         </p>
       );
     }
@@ -1022,6 +1022,7 @@ function VrfSummaryCard() {
     data: vrfs = [],
     isLoading,
     isError,
+    error,
   } = useQuery<VRF[]>({
     queryKey: ["vrfs-summary"],
     queryFn: () => vrfsApi.list(),
@@ -1049,8 +1050,8 @@ function VrfSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load VRF data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="VRFs" />
         </p>
       );
     }
@@ -1118,7 +1119,7 @@ function DomainsSummaryCard() {
   // Wait for the real module state: ``enabled`` is optimistically true while
   // loading, which would fire one 404 on a hard load with the module off.
   const moduleOn = ready && enabled("network.domains");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
@@ -1142,8 +1143,8 @@ function DomainsSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load domain data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="domains" />
         </p>
       );
     }
@@ -1779,10 +1780,9 @@ export function DashboardPage() {
       ? (rows ?? []).filter((s) => ipamSpaceFilter.includes(s.space_id))
       : (rows ?? []);
 
-  // Derived stats — every utilization-driven counter reads from
-  // `reportSubnets` so small PTP / loopback subnets don't skew the
-  // dashboard. `subnets` (the unfiltered list) is still used for
-  // inventory counts like "N subnets". Both feed through `filterSpaces`
+  // Derived stats — the heatmap, Top Subnets and threshold counters read
+  // from `reportSubnets` so small PTP / loopback subnets don't skew them;
+  // the address totals and inventory counts read the unfiltered list. Both feed through `filterSpaces`
   // so the IPAM-tab filter, when active, scopes every downstream number.
   const reporting = filterSpaces(reportSubnets);
   const subnetsScoped = filterSpaces(subnets);
@@ -1791,8 +1791,12 @@ export function DashboardPage() {
   // meaningless (a single /64 swamps every IPv4 subnet combined). Restrict
   // the top-line counters to IPv4. The heatmap + per-subnet stats keep
   // IPv6 since per-subnet utilization_percent is still meaningful.
-  const reportingV4 = reporting.filter((s) => !s.network.includes(":"));
-  const reportingV6 = reporting.filter((s) => s.network.includes(":"));
+  // The totals count EVERY subnet's addresses (#3785): the
+  // utilization_max_prefix_* cut is for the heatmap, Top Subnets and alerts,
+  // and a total that left a /30's addresses out beside a Subnets card that
+  // counts the /30 told two stories.
+  const reportingV4 = subnetsScoped.filter((s) => !s.network.includes(":"));
+  const reportingV6 = subnetsScoped.filter((s) => s.network.includes(":"));
   const totalIPs = reportingV4.reduce((s, n) => s + n.total_ips, 0);
   const allocatedIPs = reportingV4.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
@@ -3117,7 +3121,7 @@ function ConfigApplyChip({
     return (
       <StatusChip
         tone="amber"
-        label="zones refused"
+        label="zones held back"
         title={`${PARTIAL_APPLY_EXPLAIN}\n\n${partialApplyDetail(error)}`}
       />
     );

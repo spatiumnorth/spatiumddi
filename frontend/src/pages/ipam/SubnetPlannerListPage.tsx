@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Loader2, Plus, Trash2, Workflow } from "lucide-react";
@@ -13,6 +14,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { newNodeId } from "@/lib/uuid";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Index of saved subnet plans. New plans bootstrap with a root node and a
@@ -36,7 +38,11 @@ export function SubnetPlannerListPage() {
   );
   const qc = useQueryClient();
 
-  const { data = [], isLoading } = useQuery({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["subnet-plans"],
     queryFn: () => ipamApi.listSubnetPlans(),
   });
@@ -91,7 +97,9 @@ export function SubnetPlannerListPage() {
           <div className="rounded-lg border border-dashed p-12 text-center">
             <Workflow className="mx-auto h-8 w-8 text-muted-foreground/40" />
             <p className="mt-3 text-sm text-muted-foreground">
-              No plans yet. Create one to design a CIDR hierarchy.
+              <ListEmpty error={error} what="plans">
+                No plans yet. Create one to design a CIDR hierarchy.
+              </ListEmpty>
             </p>
           </div>
         ) : (
@@ -351,9 +359,7 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
         {createMut.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(createMut.error)}
-          </p>
+          <FormError>{formatApiError(createMut.error)}</FormError>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <button

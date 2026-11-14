@@ -549,7 +549,9 @@ async def list_devices(
     )
     rows = (
         await db.execute(
-            stmt.order_by(BACnetDevice.device_instance.asc()).limit(limit).offset(offset)
+            stmt.order_by(BACnetDevice.device_instance.asc(), BACnetDevice.id)
+            .limit(limit)
+            .offset(offset)
         )
     ).all()
     return BACnetDeviceListResponse(

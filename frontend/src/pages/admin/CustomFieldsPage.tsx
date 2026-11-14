@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { customFieldsApi, formatApiError, type CustomField } from "@/lib/api";
 import {
@@ -11,6 +12,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { FormError } from "@/components/ui/form-error";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
 const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
@@ -132,9 +134,9 @@ function FieldModal({
         </div>
         <div className="space-y-4 px-5 py-4">
           {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
               {error}
-            </div>
+            </FormError>
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -385,7 +387,11 @@ export function CustomFieldsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState<CustomField | null>(null);
   const [modalError, setModalError] = useState<string>("");
 
-  const { data: fields = [], isLoading } = useQuery({
+  const {
+    data: fields = [],
+    isLoading,
+    error: fieldsError,
+  } = useQuery({
     queryKey: ["custom-fields"],
     queryFn: () => customFieldsApi.list(),
   });
@@ -508,8 +514,10 @@ export function CustomFieldsPage() {
 
       {fields.length === 0 && (
         <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
-          No custom fields defined yet.
-          {canWrite && ' Click "New Field" to add one.'}
+          <ListEmpty error={fieldsError} what="custom fields">
+            No custom fields defined yet.
+            {canWrite && ' Click "New Field" to add one.'}
+          </ListEmpty>
         </div>
       )}
 

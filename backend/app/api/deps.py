@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.token_binding import route_honours_token_binding
+from app.core.denial_audit import remember_caller
 from app.core.jwt_compat import JWTError
 from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.core.session_idle import (
@@ -222,6 +223,7 @@ async def _resolve_api_token(
                 "and this endpoint cannot be limited to them"
             ),
         )
+    remember_caller(request, user)
     return user
 
 
@@ -361,6 +363,7 @@ async def authenticate_bearer(
         )
 
     await _load_time_bound_grants(db, user)
+    remember_caller(request, user)
     return user
 
 
@@ -431,8 +434,10 @@ def ensure_superadmin(user: User) -> None:
 
     For a check that only applies on one branch of a handler (``?permanent=true``)
     or inside an operation the approval engine applies outside any route. It
-    raises the same 403 as :func:`require_superadmin` but writes no audit row,
-    because it has no request to attribute one to. Never call
+    raises the same 403 as :func:`require_superadmin` but writes no row of its
+    own, because it has no request to attribute one to. Inside a request the
+    central 403 handler still records the refusal (#3644); a call made outside
+    any route (the approval engine) leaves no row. Never call
     ``require_superadmin`` directly: it is an async dependency, so a bare call
     returns an un-awaited coroutine and checks nothing.
     """

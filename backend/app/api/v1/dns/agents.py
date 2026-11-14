@@ -95,7 +95,8 @@ from app.services.dns.agent_token import (
     needs_rotation,
     verify_agent_token,
 )
-from app.services.dns.bundle_dirty import enqueue_renders
+from app.services.dns.blocklist_pack import renders_packed_blocklists
+from app.services.dns.bundle_dirty import enqueue_renders, mark_bundles_dirty
 from app.services.dns.new_object_defaults import add_group_with_defaults
 from app.services.dns.record_ops import (
     ack_op,
@@ -115,6 +116,7 @@ from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
     renders_soa_timers,
+    reports_served_serials,
 )
 from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name, zone_holding_views
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
@@ -389,6 +391,18 @@ async def _agent_from_authorization(
         # Token rotated out — reject stale one
         raise HTTPException(status_code=401, detail="Stale token")
     return server, payload
+
+
+async def _set_packed_blocklists(db: AsyncSession, server: DNSServer, features: str | None) -> None:
+    """Record whether the agent reads packed blocklist entries (#4040), and
+    re-render the server's stored bundle when that changes: the shape is part
+    of the body, and an agent rolled back to a release that cannot read it
+    must not be served the packed one."""
+    packed = renders_packed_blocklists(features)
+    if server.agent_renders_packed_blocklists == packed:
+        return
+    server.agent_renders_packed_blocklists = packed
+    await mark_bundles_dirty(db, server_ids=[server.id])
 
 
 async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
@@ -711,6 +725,8 @@ async def agent_register(
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
     server.agent_renders_soa_timers = renders_soa_timers(agent_features)
+    server.agent_reports_served_serials = reports_served_serials(agent_features)
+    await _set_packed_blocklists(db, server, agent_features)
 
     db.add(
         AuditLog(
@@ -1086,6 +1102,16 @@ async def agent_config_longpoll(
     ):
         return _duplicate_instance_response(server)
 
+    # #4040 — the shape this agent can read is the one its request header
+    # says, not the stored flag, which is only as fresh as its last register
+    # or heartbeat: an agent rolled back to an older image polls before it
+    # heartbeats. A change is recorded (and the bundle re-rendered) here, and
+    # a stored bundle of the other shape is never served meanwhile.
+    req_packed = renders_packed_blocklists(request.headers.get(AGENT_FEATURES_HEADER))
+    if req_packed != bool(server.agent_renders_packed_blocklists):
+        await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
+        await db.commit()
+
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
     inline_tried = False
@@ -1111,7 +1137,12 @@ async def agent_config_longpoll(
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
             bundle = await bundle_store.newest(db, server)
-            if not bundle_store.is_current(server):
+            wrong_shape = bundle is not None and bundle.packed_blocklists != req_packed
+            if wrong_shape:
+                # Rendered for an agent that read packed entries (or the
+                # reverse): this one cannot read it. Wait for the re-render.
+                bundle = None
+            if wrong_shape or not bundle_store.is_current(server):
                 if settings.dns_agent_bundle_inline_fallback and not inline_tried:
                     try:
                         rendered = await _bounded_inline(db, server)
@@ -1123,7 +1154,9 @@ async def agent_config_longpoll(
                         inline_tried = True
                         await refresh_agent_server(db, server)
                         bundle = await bundle_store.newest(db, server)
-                if not enqueued and not bundle_store.is_current(server):
+                        if bundle is not None and bundle.packed_blocklists != req_packed:
+                            bundle = None
+                if not enqueued and (wrong_shape or not bundle_store.is_current(server)):
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:
@@ -1252,6 +1285,10 @@ async def agent_heartbeat(
         server.agent_renders_soa_timers = renders_soa_timers(
             request.headers.get(AGENT_FEATURES_HEADER)
         )
+        server.agent_reports_served_serials = reports_served_serials(
+            request.headers.get(AGENT_FEATURES_HEADER)
+        )
+        await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
 
         # Phase 8f-2 — persist whatever slot state the agent reported. Only
         # overwrite when the agent actually sent a value (older agents
@@ -1477,7 +1514,8 @@ async def agent_zone_state(
     does not hold (the zone was deleted from the control plane but the agent
     still serves it; the next config bundle drops it) or holds more than once
     (one zone per view, and the report names no view) is skipped, counted in
-    the answer, and logged once per report.
+    the answer, and logged once per report; the rows the server already has
+    for a name held more than once are dropped (#4133).
     """
     server, _ = auth
     now = datetime.now(UTC)
@@ -1520,12 +1558,27 @@ async def agent_zone_state(
     serial_by_zone: dict[uuid.UUID, int] = {}
     unknown: list[str] = []
     ambiguous: list[str] = []
+    ambiguous_zone_ids: set[uuid.UUID] = set()
     for entry in body.zones:
         matches = zones_by_key.get(_key(entry.zone_name), [])
         if len(matches) == 1:
             serial_by_zone[matches[0].id] = entry.serial
         else:
             (ambiguous if matches else unknown).append(entry.zone_name)
+            ambiguous_zone_ids.update(m.id for m in matches)
+
+    # #4133 — a row written while the name was held once is the serial of one
+    # copy as it was then. Once a second view holds the name the report cannot
+    # say whose serial it is, so nothing refreshes the row and the drift
+    # report reads that copy ``behind`` for good after its next change. Drop
+    # it: with no stored serial the report falls back to the records.
+    if ambiguous_zone_ids:
+        await db.execute(
+            sa_delete(DNSServerZoneState).where(
+                DNSServerZoneState.server_id == server.id,
+                DNSServerZoneState.zone_id.in_(ambiguous_zone_ids),
+            )
+        )
 
     # #1968 — a PowerDNS server never serves a serial below the one it already
     # held (the agent floors it), so after the upgrade to a build that owns the

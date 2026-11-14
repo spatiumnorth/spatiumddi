@@ -33,6 +33,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -133,6 +134,10 @@ export function RuleEditorModal({
   );
   const [notifySmtp, setNotifySmtp] = useState(existing?.notify_smtp ?? false);
   const [error, setError] = useState<string | null>(null);
+  // #3929 — a number input holding text the browser cannot read as a number
+  // (`85-`) reports value "", which would save as "use the default". Track
+  // those fields (from the input's validity) so Save refuses them in words.
+  const [unreadable, setUnreadable] = useState<Record<string, boolean>>({});
 
   const stored = existing as unknown as Record<string, unknown> | null;
   const current = (p: AlertParamSpec): number | string | null => {
@@ -258,10 +263,10 @@ export function RuleEditorModal({
           </p>
         )}
         {catalogue.isError && (
-          <p className="text-xs text-red-600">
+          <FormError>
             Could not load the rule types
             {existing ? "; its parameters cannot be edited here." : "."}
-          </p>
+          </FormError>
         )}
         {existing && types && !spec && (
           // #2130 — the catalogue leaves out a type whose feature module is
@@ -306,7 +311,13 @@ export function RuleEditorModal({
                 max={p.max ?? undefined}
                 className={inputCls}
                 value={numVal(current(p) as number | null)}
-                onChange={(e) => setParam(p.name, parseNum(e.target.value))}
+                onChange={(e) => {
+                  setUnreadable((u) => ({
+                    ...u,
+                    [p.name]: e.target.validity.badInput,
+                  }));
+                  setParam(p.name, parseNum(e.target.value));
+                }}
               />
             )}
           </Field>
@@ -381,7 +392,7 @@ export function RuleEditorModal({
           />
           Rule enabled
         </label>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -398,7 +409,19 @@ export function RuleEditorModal({
               catalogueBlocks ||
               (!!existing && catalogue.isLoading)
             }
-            onClick={() => mut.mutate()}
+            onClick={() => {
+              const bad = (spec?.params ?? []).filter(
+                (p) => p.kind !== "select" && unreadable[p.name],
+              );
+              if (bad.length > 0) {
+                setError(
+                  `${bad.map((p) => p.label).join(", ")}: not a number. Enter digits only, or clear the field to use the default.`,
+                );
+                return;
+              }
+              setError(null);
+              mut.mutate();
+            }}
             className={cn(
               "rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
               "hover:bg-primary/90 disabled:opacity-50",
@@ -732,8 +755,13 @@ export function AlertsPage() {
                       colSpan={7}
                       className="px-4 py-8 text-center text-xs text-muted-foreground"
                     >
-                      <ListEmpty error={rulesError} what="alert rules">
-                        No rules yet — click “New rule” to create one.
+                      <ListEmpty
+                        error={rulesError}
+                        what="alert rules"
+                        gate={superadminGate}
+                        hint={`Click “New rule” to create one.`}
+                      >
+                        No rules yet.
                       </ListEmpty>
                     </td>
                   </tr>

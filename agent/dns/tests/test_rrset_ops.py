@@ -54,6 +54,13 @@ from tests.test_technitium_render import _install_fake_request, _seed_token
 # ── BIND9: RFC 2136 wire interception ───────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _ops_own_every_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests drive ``apply_record_op`` against a fake that has no SOA
+    owner marker; ownership (#1775) has its own tests."""
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
+
+
 class _FakeDnsResponse:
     """Stand-in for the ``dns.message.Message`` ``dns.query.tcp`` returns —
     the driver only ever calls ``.rcode()`` on it.

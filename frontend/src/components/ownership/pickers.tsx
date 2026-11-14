@@ -7,6 +7,7 @@ import {
   type CustomerListResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { missingCustomerLabel, useReadsEveryCustomer } from "./missingCustomer";
 
 interface PickerProps {
@@ -51,11 +52,14 @@ export function CustomerPicker({
   className,
   disabled,
 }: PickerProps) {
+  const show = useOwnershipModules().customer;
   const list = useQuery({
     queryKey: ["customers-picker"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: show,
   });
+  if (!show) return null;
   const items = list.data?.items ?? [];
   return (
     <select
@@ -82,12 +86,20 @@ export function SitePicker({
   className,
   disabled,
 }: PickerProps) {
-  const { data } = useQuery({
+  const show = useOwnershipModules().site;
+  const { data, isLoading } = useQuery({
     queryKey: ["sites-picker"],
     queryFn: () => sitesApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: show,
   });
+  if (!show) return null;
   const items = data?.items ?? [];
+  // A site the list cannot hold (the caller may not read sites, #3904, or it
+  // sits past the first page) keeps its value, named as the current site,
+  // instead of the select drawing "None" over a link the record has. Nothing
+  // is shown while the list is still loading.
+  const missing = !!value && !isLoading && !items.some((s) => s.id === value);
   return (
     <select
       className={className}
@@ -96,6 +108,7 @@ export function SitePicker({
       disabled={disabled}
     >
       <option value="">— None —</option>
+      {missing && <option value={value!}>(current site)</option>}
       {items.map((s) => (
         <option key={s.id} value={s.id}>
           {s.name}
@@ -113,11 +126,14 @@ export function ProviderPicker({
   disabled,
   kind,
 }: PickerProps) {
+  const show = useOwnershipModules().provider;
   const { data } = useQuery({
     queryKey: ["providers-picker"],
     queryFn: () => providersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: show,
   });
+  if (!show) return null;
   const items = (data?.items ?? []).filter((p) => !kind || p.kind === kind);
   return (
     <select
@@ -144,6 +160,10 @@ export function ProviderPicker({
 // via the same shared queries the pickers use, so multiple chips on
 // one page share one fetch.
 //
+// Chips for a module that is off render nothing and fetch nothing (#4101):
+// the stored id stays on the row, the detail views just do not name an
+// entity the operator turned the feature off for.
+//
 // Returns null when the id is null OR when the lookup hasn't loaded
 // yet — saves a render-flash and keeps row heights stable. A customer id
 // a complete list read with type-wide customer read does not hold is a
@@ -159,14 +179,15 @@ export function CustomerChip({
   customerId: string | null | undefined;
   className?: string;
 }) {
+  const show = useOwnershipModules().customer;
   const list = useQuery({
     queryKey: ["customers-picker"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
-    enabled: !!customerId,
+    enabled: show && !!customerId,
   });
   const readsEvery = useReadsEveryCustomer();
-  if (!customerId) return null;
+  if (!customerId || !show) return null;
   const c = (list.data?.items ?? []).find((x) => x.id === customerId);
   if (!c) {
     // Only a complete, unnarrowed list can say Trash; a truncated one, or one
@@ -210,13 +231,14 @@ export function SiteChip({
   siteId: string | null | undefined;
   className?: string;
 }) {
+  const show = useOwnershipModules().site;
   const { data } = useQuery({
     queryKey: ["sites-picker"],
     queryFn: () => sitesApi.list({ limit: 500 }),
     staleTime: 60_000,
-    enabled: !!siteId,
+    enabled: show && !!siteId,
   });
-  if (!siteId) return null;
+  if (!siteId || !show) return null;
   const s = (data?.items ?? []).find((x) => x.id === siteId);
   if (!s) return null;
   const label = s.code || s.name;
@@ -241,13 +263,14 @@ export function ProviderChip({
   providerId: string | null | undefined;
   className?: string;
 }) {
+  const show = useOwnershipModules().provider;
   const { data } = useQuery({
     queryKey: ["providers-picker"],
     queryFn: () => providersApi.list({ limit: 500 }),
     staleTime: 60_000,
-    enabled: !!providerId,
+    enabled: show && !!providerId,
   });
-  if (!providerId) return null;
+  if (!providerId || !show) return null;
   const p = (data?.items ?? []).find((x) => x.id === providerId);
   if (!p) return null;
   return (
