@@ -174,6 +174,15 @@ the server then refuses to load. Which side is kept:
   `replace` frees the names of the records it deletes, so the preview takes
   `conflict_strategy` as the commit does.
 
+**BIND check-names (#4155).** BIND refuses to load a zone whose A / AAAA / MX
+owner, or MX / NS / SRV target, is not a host name (an `_` label, say), so the
+zone answers SERVFAIL; the record API 422s such a record and the zone-file
+import skips it (#2912). The configuration importers (BIND9, Windows DNS,
+PowerDNS, Technitium, cloud) apply the same rule
+(`app.core.dns_names.bind_check_names_error`): the preview lists each such
+record as a `Name rule:` warning, and the commit skips it and names it in the
+result's warnings, while the zone and its other records import.
+
 The preview lists each such record as a warning (or under **Will not be
 imported** for a zone file), the commit's warnings repeat it, and the zone's
 audit row names it (`records_skipped_unsafe`, or `skipped` for a zone file).
