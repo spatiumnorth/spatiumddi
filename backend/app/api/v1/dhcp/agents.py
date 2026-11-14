@@ -1319,6 +1319,24 @@ async def agent_heartbeat(
     # spool and host describes a process that is not being served, so it
     # stays off the row.
     displaced = is_displaced(server, instance)
+    # #4139 — the takeover that retires a predecessor's stale ``ok`` happens on
+    # the announce heartbeat a new process sends before its boot apply, not on
+    # its first config poll (which comes after). An older agent that names no
+    # process is served exactly as before.
+    if (
+        instance is not None
+        and not displaced
+        and server.agent_instance not in (None, instance)
+        and not await claim_poll(
+            db,
+            server,
+            instance,
+            kind="dhcp",
+            now=now,
+            client_ip=request.client.host if request.client is not None else None,
+        )
+    ):
+        displaced = True
     server.agent_last_seen = now
     server.last_health_check_at = now
     server.status = "active"
