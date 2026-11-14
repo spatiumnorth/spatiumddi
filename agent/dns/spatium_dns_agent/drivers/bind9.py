@@ -1899,6 +1899,26 @@ def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
     return out
 
 
+_ZONE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
+
+
+def _zone_name_renderable(zname: str) -> bool:
+    """True when *zname* is safe to write into ``named.conf`` and a file path.
+
+    Mirrors the control plane's zone-name floor: no quote, whitespace, ``;``,
+    brace, backslash or control character, no ``..`` segment; ``/`` is kept
+    for RFC 2317 classless reverse zones. The root zone ``.`` is allowed.
+    """
+    if zname == ".":
+        return True
+    return bool(
+        _ZONE_NAME_RE.match(zname)
+        and ".." not in zname
+        and "/." not in zname
+        and "./" not in zname
+    )
+
+
 def _zone_rel(zname: str, view: str | None) -> str:
     return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
 
@@ -3347,6 +3367,12 @@ class Bind9Driver(DriverBase):
             """
             zname = zone.get("name") or ""
             if not zname:
+                return ""
+            if not _zone_name_renderable(zname):
+                # Never interpolated into named.conf or a file path: a name
+                # with quotes, braces, ``;``, whitespace or a ``..`` segment
+                # would otherwise rewrite the config or escape ``zones/``.
+                log.warning("bind9_zone_skipped_invalid_name", zone=repr(zname))
                 return ""
             zone_type = zone.get("type", "primary")
             # Forward zones: just a forwarders block, no file / allow-update.
