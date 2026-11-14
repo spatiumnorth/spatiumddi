@@ -123,7 +123,7 @@ def test_k8s_proxy_polls_the_in_cluster_url_on_a_member(
     )
     identity, _ = load_or_generate(tmp_path)
     k8s_proxy._proxy_once(cfg, identity, _Client())  # type: ignore[arg-type]
-    base = heartbeat._IN_CLUSTER_CONTROL_PLANE_URL.rstrip("/")
+    base = heartbeat._IN_CLUSTER_NODE_LOCAL_URL.rstrip("/")
     assert len(urls) == 2
     assert all(
         u.startswith(base + "/api/v1/appliance/supervisor/k8s-proxy/") for u in urls
