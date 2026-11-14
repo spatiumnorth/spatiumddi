@@ -28,6 +28,11 @@
   given. The DNS drift report lists each locked record whose live value
   on a server differs from the saved one (#3361).
 
+- The locks show in the UI on every lockable type: a padlock and a
+  Lock / Unlock action (reason dialog, behind the `lock` grant), Delete
+  disabled with the reason on a locked row, and a "Locked" filter on the
+  IPAM, DNS record / zone and DHCP scope / static lists (#3361).
+
 ### Migrations
 
 - `a3361c0de1f7` — #3361, adds the lock columns to `ip_space`,

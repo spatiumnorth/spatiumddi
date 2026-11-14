@@ -2321,6 +2321,7 @@ mirror, a dynamic-lease mirror) cannot be locked: the integration would
 overwrite them. The Copilot has `find_locked_resources`, and its delete
 proposals are refused on a locked target; it has no way to unlock.
 
+In the UI each server group, view, zone and record shows a padlock (level, who and why in its tooltip) and a Lock / Unlock action behind the `lock` grant, which asks for the reason. Delete is disabled on a locked row with the reason as its tooltip; Edit stays on for an edit lock, since annotations stay editable. The lists that have filters have a Locked filter (all / locked / unlocked).
 The optional **Resource lock removed** alert rule (Alerts → Rules; seeded disabled) opens one event per unlock, naming who removed the lock, what it protected and the reason they gave. Each event resolves by itself after `threshold_days` (default 1). A lock that merely expires does not fire it.
 
 ## 17. GSLB pools (health-checked) + geo / topology-aware steering (issue #530)

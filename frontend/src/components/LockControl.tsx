@@ -10,7 +10,7 @@ import {
   type LockLevel,
 } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
-import { lockTitle } from "@/lib/locks";
+import { lockTitle, type LockedFilter } from "@/lib/locks";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 
@@ -210,5 +210,39 @@ export function LockControl({
         />
       )}
     </>
+  );
+}
+
+// The "Locked" filter a list that has filters offers (#3361): all / locked /
+// unlocked. ``value`` is the empty string for "all", so it composes with the
+// filter objects that test ``Object.values(f).some(Boolean)``.
+export function LockedFilterSelect({
+  value,
+  onChange,
+  className,
+}: {
+  value: string;
+  onChange: (v: LockedFilter) => void;
+  className?: string;
+}) {
+  return (
+    <select
+      value={value || "all"}
+      onChange={(e) =>
+        onChange(
+          e.target.value === "all" ? "all" : (e.target.value as LockedFilter),
+        )
+      }
+      aria-label="Filter by lock"
+      title="Show locked or unlocked objects"
+      className={
+        className ??
+        "w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+      }
+    >
+      <option value="all">Lock: any</option>
+      <option value="locked">Locked</option>
+      <option value="unlocked">Unlocked</option>
+    </select>
   );
 }
