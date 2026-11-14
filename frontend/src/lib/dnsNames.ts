@@ -102,13 +102,36 @@ export function recordOwnerError(name: string): string | null {
   return null;
 }
 
+const CLASSLESS_LABEL_RE = /^(\d{1,3})\/(\d{1,2})$/;
+
+/**
+ * RFC 2317 classless reverse zone (#4156): `<octet>/<prefix>.<1-3 octets>.in-addr.arpa`,
+ * the one place a `/` is legal in a zone name. Mirror of `_is_classless_reverse`
+ * (`app/core/dns_names.py`): the prefix must reach past the octets the parent
+ * labels already name (3 parents -> /25../32).
+ */
+export function isClasslessReverse(labels: string[]): boolean {
+  const l = labels.map((x) => x.toLowerCase());
+  if (l.length < 4 || l.length > 6) return false;
+  if (l[l.length - 2] !== "in-addr" || l[l.length - 1] !== "arpa") return false;
+  const m = CLASSLESS_LABEL_RE.exec(l[0]);
+  if (!m) return false;
+  const parents = l.slice(1, -2);
+  if (!parents.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255))
+    return false;
+  const prefix = Number(m[2]);
+  return Number(m[1]) <= 255 && prefix > 8 * parents.length && prefix <= 32;
+}
+
 /** Validate an FQDN (zone name, domain-name option). Permits `_` labels. */
 export function fqdnError(name: string): string | null {
   const raw = name.trim();
   if (!raw) return "must not be empty";
   const body = raw.endsWith(".") ? raw.slice(0, -1) : raw;
   if (!body) return "must not be the root domain";
-  for (const label of body.split(".")) {
+  const parts = body.split(".");
+  if (isClasslessReverse(parts)) return null;
+  for (const label of parts) {
     if (!label) return "contains an empty label";
     if (!isAscii(label))
       return `label "${label}" must be ASCII (use its punycode xn-- form)`;

@@ -232,6 +232,33 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
     return normalized
 
 
+# RFC 2317 classless reverse delegation: the first label of a zone under
+# ``in-addr.arpa`` may be ``<octet>/<prefix>`` (``0/26.2.0.192.in-addr.arpa``),
+# the one place a ``/`` is legal in a zone name (#4156). BIND serves it and a
+# DNS configuration import creates it; the zone form, REST create and copilot
+# must agree. ``<octet>`` is the first address of the delegated block and
+# ``<prefix>`` its length, which must reach past the octets already named by the
+# parent labels (3 parent octets -> /25../32). The ``a-b`` range form needs no
+# special case: it is an ordinary LDH label.
+_CLASSLESS_LABEL_RE = re.compile(r"^(\d{1,3})/(\d{1,2})\Z")
+_IN_ADDR_SUFFIX = ("in-addr", "arpa")
+
+
+def _is_classless_reverse(labels: list[str]) -> bool:
+    """True when *labels* is an RFC 2317 ``<octet>/<prefix>.<1-3 octets>.in-addr.arpa`` name."""
+    lowered = [lbl.lower() for lbl in labels]
+    if len(lowered) < 4 or len(lowered) > 6 or tuple(lowered[-2:]) != _IN_ADDR_SUFFIX:
+        return False
+    m = _CLASSLESS_LABEL_RE.match(lowered[0])
+    if not m:
+        return False
+    parents = lowered[1:-2]
+    if not all(p.isascii() and p.isdigit() and len(p) <= 3 and int(p) <= 255 for p in parents):
+        return False
+    octet, prefix = int(m.group(1)), int(m.group(2))
+    return octet <= 255 and 8 * len(parents) < prefix <= 32
+
+
 def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = True) -> str:
     """Validate a fully-qualified domain name; return the normalized form.
 
@@ -240,7 +267,8 @@ def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = 
     (``allow_underscore=True``, the default — some zones legitimately carry
     underscore labels, e.g. ``_msdcs.example.com``) or the strict host rule
     when *allow_underscore* is False. Wildcards are not permitted in an
-    FQDN. A single trailing root dot is tolerated and stripped.
+    FQDN. The one ``/`` allowed is the first label of an RFC 2317 classless
+    reverse zone (``0/26.2.0.192.in-addr.arpa``, #4156). A single trailing root dot is tolerated and stripped.
     """
     raw = name.strip()
     if not raw:
@@ -248,11 +276,16 @@ def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = 
     body, _ = _strip_root(raw)
     if not body:
         raise ValueError(f"{field} must not be the root domain")
-    if allow_underscore:
-        labels = [validate_dns_label(lbl, field=field) for lbl in body.split(".")]
+    parts = body.split(".")
+    if _is_classless_reverse(parts):
+        # RFC 2317 (#4156): the ``/`` first label is already shape-checked.
+        normalized = body.lower()
     else:
-        labels = [validate_host_label(lbl, field=field) for lbl in body.split(".")]
-    normalized = ".".join(labels)
+        if allow_underscore:
+            labels = [validate_dns_label(lbl, field=field) for lbl in parts]
+        else:
+            labels = [validate_host_label(lbl, field=field) for lbl in parts]
+        normalized = ".".join(labels)
     if len(normalized) > MAX_NAME_LEN:
         raise ValueError(f"{field} '{normalized}' exceeds {MAX_NAME_LEN} characters")
     return normalized

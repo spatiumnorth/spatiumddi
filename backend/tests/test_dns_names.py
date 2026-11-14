@@ -286,3 +286,44 @@ def test_sanitize_hostname_respects_length_cap() -> None:
 def test_a_label_ending_in_a_newline_is_refused(validate: Callable[..., str], value: str) -> None:
     with pytest.raises(ValueError):
         validate(value)
+
+
+# ── RFC 2317 classless reverse zones (#4156) ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "0/26.2.0.192.in-addr.arpa",
+        "64/26.2.0.192.in-addr.arpa.",
+        "128/25.2.0.192.in-addr.arpa",
+        "0/17.1.10.in-addr.arpa",
+        "0/9.10.in-addr.arpa",
+        "0/26.2.0.192.IN-ADDR.ARPA",
+    ],
+)
+def test_validate_fqdn_accepts_classless_reverse_zone(name: str) -> None:
+    assert validate_fqdn(name) == name.rstrip(".").lower()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "0/26.example.com",  # only under in-addr.arpa
+        "0/26.2.0.192.ip6.arpa",
+        "a/26.2.0.192.in-addr.arpa",  # octet not numeric
+        "256/26.2.0.192.in-addr.arpa",  # octet out of range
+        "0/33.2.0.192.in-addr.arpa",  # prefix out of range
+        "0/24.2.0.192.in-addr.arpa",  # prefix does not reach past the parents
+        "0/26.in-addr.arpa",  # no parent octets
+        "0/26.2.0.192.168.in-addr.arpa",  # four parent octets
+        "0/26/27.2.0.192.in-addr.arpa",
+        "0/26.x.0.192.in-addr.arpa",  # a parent that is not an octet
+        "2.0/26.192.in-addr.arpa",  # the / is only legal in the first label
+        "0/26.2.0.192.notin-addr.arpa",
+        "0/26",
+    ],
+)
+def test_validate_fqdn_still_rejects_other_slashes(name: str) -> None:
+    with pytest.raises(ValueError):
+        validate_fqdn(name)

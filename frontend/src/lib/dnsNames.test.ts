@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  fqdnError,
   nameInZoneError,
   parseTtlInput,
   reversePointerName,
@@ -108,5 +109,30 @@ describe("reversePointerName (#3210)", () => {
     expect(reversePointerName("not-an-ip")).toBeNull();
     expect(reversePointerName("300.1.1.1")).toBeNull();
     expect(reversePointerName("::ffff:1.2.3.4")).toBeNull();
+  });
+});
+
+describe("fqdnError classless reverse zones (#4156)", () => {
+  it.each([
+    "0/26.2.0.192.in-addr.arpa",
+    "64/26.2.0.192.in-addr.arpa.",
+    "0/17.1.10.in-addr.arpa",
+    "0/26.2.0.192.IN-ADDR.ARPA",
+  ])("accepts %s", (name) => {
+    expect(fqdnError(name)).toBeNull();
+  });
+
+  it.each([
+    "0/26.example.com",
+    "0/26.2.0.192.ip6.arpa",
+    "a/26.2.0.192.in-addr.arpa",
+    "256/26.2.0.192.in-addr.arpa",
+    "0/33.2.0.192.in-addr.arpa",
+    "0/24.2.0.192.in-addr.arpa",
+    "0/26.in-addr.arpa",
+    "2.0/26.192.in-addr.arpa",
+    "0/26",
+  ])("still refuses %s", (name) => {
+    expect(fqdnError(name)).not.toBeNull();
   });
 });
