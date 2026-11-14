@@ -1,8 +1,9 @@
 """The startup zone-state report keeps each zone's type and the views (#4053).
 
 ``Bind9Driver.served_zone_serials`` reads a zone back from named only when it
-is a primary of a group without views; secondary / stub / forward zones and
-every zone of a group with views report the bundle's serial. The startup
+is a primary of a group without views, or a secondary / stub zone (#3940);
+forward zones and every primary of a group with views report the bundle's
+serial. The startup
 report stored only name + serial, so every zone looked like a primary of a
 group without views and a transferred secondary was reported at the serial
 named serves (which the control plane reads as drift against its own 0).
@@ -37,18 +38,26 @@ def _report(loop: SyncLoop) -> dict[str, int]:
     return loop.driver.served_zone_serials(loop._boot_report_bundle)  # type: ignore[attr-defined]
 
 
-def test_boot_report_does_not_read_a_secondary_back(agent_cfg: AgentConfig) -> None:
+def test_boot_report_keeps_each_zone_type(agent_cfg: AgentConfig) -> None:
+    """A forward zone reports the bundle's serial; a secondary is read back
+    from named (#3940), like a primary; a zone with no type is a primary."""
     loop = _loop(agent_cfg)
     bundle: dict[str, Any] = {
         "zones": [
             {"name": "p.example.", "serial": 5, "type": "primary"},
             {"name": "s.example.", "serial": 0, "type": "secondary"},
+            {"name": "f.example.", "serial": 3, "type": "forward"},
             {"name": "legacy.example.", "serial": 7},  # no type: a primary
         ]
     }
     loop._arm_boot_report(bundle)
     out = _report(loop)
-    assert out == {"p.example": SERVED, "s.example": 0, "legacy.example": SERVED}
+    assert out == {
+        "p.example": SERVED,
+        "s.example": SERVED,
+        "f.example": 3,
+        "legacy.example": SERVED,
+    }
 
 
 def test_boot_report_keeps_views(agent_cfg: AgentConfig) -> None:

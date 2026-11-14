@@ -5665,6 +5665,15 @@ export interface AgentSpoolStreamStatus {
   expired_entries_total: number;
   rejected_entries_total: number;
   write_failures_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
 }
 
 /**
@@ -5686,6 +5695,15 @@ export interface AgentSpoolStatus {
   trimmed_bytes_total: number;
   last_trim_at: string | null;
   expired_entries_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
   streams: Record<string, AgentSpoolStreamStatus>;
 }
 
@@ -6058,11 +6076,16 @@ export interface ZoneServerStateEntry {
   // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
+  // The API's verdict on this server's report (#3940): a primary zone serves
+  // our serial, a secondary / stub zone holds a copy of its primary's zone
+  // (its serial is not ours to compare) and no op is pending.
+  in_sync?: boolean;
 }
 
 export interface ZoneServerState {
   zone_id: string;
   zone_name: string;
+  zone_type?: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
   // `false` while any server hasn't reported, is on a different serial, or
@@ -6933,8 +6956,16 @@ export const dnsApi = {
         data,
       )
       .then((r) => r.data),
-  deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
-    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
+  // ``permanent`` is superadmin-only server-side (#4078).
+  deleteRecord: (
+    groupId: string,
+    zoneId: string,
+    recordId: string,
+    opts?: { permanent?: boolean },
+  ) =>
+    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, {
+      params: opts?.permanent ? { permanent: true } : undefined,
+    }),
 
   // Soft-deletes by default (#963) — the whole selection shares one
   // deletion_batch_id, so it restores from Admin → Trash in one action.

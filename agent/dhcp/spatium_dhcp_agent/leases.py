@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -70,6 +71,7 @@ _BATCH_MAX_SECONDS = 5.0
 # spool-disabled fallback, where a persistent failure leaves _pending
 # unflushed while run() keeps appending new lease rows. Trim-half on overflow.
 _BATCH_MAX_BUFFER = 5000
+_DEFAULT_ROW_BYTES = 160  # typical Kea CSV lease row, until some are parsed
 # #1077 — idle backlog replay cadence, and how long one replay may run before
 # the thread goes back to tailing.
 _DRAIN_INTERVAL = 5.0
@@ -208,6 +210,27 @@ class LeaseWatcher:
         self._pending: list[dict[str, Any]] = []
         # #1141 — v6 events, batched apart from v4 (see the module docstring).
         self._pending_v6: list[dict[str, Any]] = []
+        # #3782 — events already read from Kea's CSV but not yet delivered or
+        # spooled: ``_pending`` plus the slice a flush has taken out of it and
+        # is posting right now (``_inflight``, of the list ``_inflight_attr``),
+        # plus the rows a read has taken out of the file that ``_tail`` has not
+        # yet appended (``_chunks[attr]["held"]``). The on-disk spool counts
+        # none of them, so a watcher blocked in a slow POST read as an empty
+        # spool while the lease files grew unread behind it.
+        self._inflight = 0
+        self._inflight_attr = ""
+        # Per list: the last file read still being delivered. ``n`` rows that
+        # appeared between wall clocks ``lo`` and ``hi``; ``held`` of them not
+        # yet appended to the list. The age of the oldest undelivered row is
+        # read off that span by how many have been delivered, so it falls as
+        # the agent drains instead of waiting for the whole chunk to clear.
+        self._chunks: dict[str, dict[str, float]] = {}
+        # Row-size observations (bytes / rows actually parsed) turn the unread
+        # byte count into an event estimate; ``_read_at`` is when each file
+        # was last read to its end, so rows still unread are at most that old.
+        self._row_bytes = 0
+        self._rows_read = 0
+        self._read_at: dict[Path, float] = {}
         self._last_flush = time.monotonic()
         self._last_drain = 0.0
         # Read offset per tailed file (v4 and v6 CSVs rotate independently).
@@ -246,6 +269,72 @@ class LeaseWatcher:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _undelivered(self, attr: str) -> int:
+        """Rows of ``attr``'s last read not yet delivered or spooled."""
+        chunk = self._chunks.get(attr)
+        held = int(chunk["held"]) if chunk else 0
+        inflight = self._inflight if self._inflight_attr == attr else 0
+        return held + len(getattr(self, attr)) + inflight
+
+    def _chunk_oldest(self, attr: str) -> float | None:
+        """Wall clock of the oldest undelivered row of ``attr``'s last read.
+
+        Rows are taken to be evenly spread over the span the read covered, so
+        the answer moves forward as rows are delivered."""
+        chunk = self._chunks.get(attr)
+        undelivered = self._undelivered(attr)
+        if not chunk or undelivered <= 0:
+            return None
+        n = chunk["n"]
+        delivered = min(max(n - undelivered, 0), n)
+        return chunk["lo"] + (chunk["hi"] - chunk["lo"]) * (delivered / n if n else 0)
+
+    def pending_status(self) -> dict[str, Any]:
+        """What the spool cannot see (#3782), for the heartbeat's ``spool``.
+
+        ``pending_events`` is the whole backlog: rows read from Kea's CSV but
+        not yet delivered or spooled (held in ``_tail``, buffered, or in
+        flight), plus an estimate (``unread_events_estimated``) of the rows
+        still unread in the file (``unread_bytes``). ``pending_oldest_at``
+        dates the oldest of them and ``pending_lag_seconds`` is that age at
+        the moment of this report, so the page need not guess it from a
+        heartbeat that is already up to a heartbeat interval old. Both fall as
+        the agent catches up.
+        """
+        now = time.time()
+        unread = 0
+        oldest_candidates: list[float] = []
+        for path in (self.cfg.kea_lease_file, self.cfg.kea_lease_file_v6):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            offset = self._offsets.get(path, 0)
+            left = size if size < offset else size - offset
+            unread += left
+            if left > 0 and path in self._read_at:
+                # An unread row is at most as old as the file's last full read.
+                oldest_candidates.append(self._read_at[path])
+        # An ESTIMATE: unread bytes / the mean row size this agent has parsed
+        # (a typical Kea CSV row when it has parsed none yet).
+        avg = self._row_bytes / self._rows_read if self._rows_read else _DEFAULT_ROW_BYTES
+        est_unread = math.ceil(unread / avg) if unread else 0
+        in_hand = self._undelivered("_pending") + self._undelivered("_pending_v6")
+        for attr in ("_pending", "_pending_v6"):
+            t = self._chunk_oldest(attr)
+            if t is not None:
+                oldest_candidates.append(t)
+        oldest = min(oldest_candidates) if oldest_candidates else None
+        return {
+            "pending_events": in_hand + est_unread,
+            "unread_events_estimated": est_unread,
+            "pending_oldest_at": (
+                datetime.fromtimestamp(oldest, tz=timezone.utc).isoformat() if oldest else None
+            ),
+            "pending_lag_seconds": max(0.0, round(now - oldest, 1)) if oldest else None,
+            "unread_bytes": unread,
+        }
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -312,8 +401,16 @@ class LeaseWatcher:
             if self._shipper.spool.enabled:
                 # Sent, or durably queued behind the backlog — either way no
                 # longer this process's to lose.
+                # In flight first, so a heartbeat between the two statements
+                # never sees the batch in neither place.
+                self._inflight_attr = attr
+                self._inflight = len(batch)
                 setattr(self, attr, pending[len(batch) :])
-                outcome = self._shipper.ship({"leases": batch})
+                try:
+                    outcome = self._shipper.ship({"leases": batch})
+                finally:
+                    self._inflight = 0
+                    self._inflight_attr = ""
                 if outcome == SENT:
                     log.info("lease_events_flushed", count=len(batch))
             else:
@@ -370,28 +467,53 @@ class LeaseWatcher:
             offset = 0
         if size == offset:
             self._offsets[path] = offset
+            self._read_at[path] = time.time()
             return []
         with path.open("r", encoding="utf-8", errors="replace") as f:
             f.seek(offset)
             data = f.read()
             self._offsets[path] = f.tell()
+        self._read_at[path] = time.time()
         if not data:
             return []
-        reader = csv.reader(io.StringIO(data))
-        return list(reader)
+        rows = list(csv.reader(io.StringIO(data)))
+        self._row_bytes += len(data.encode("utf-8", errors="replace"))
+        self._rows_read += len(rows)
+        return rows
 
     def _tail(self, path: Path, parse: Any, attr: str) -> None:
-        for row in self._read_new_rows(path):
-            evt = parse(row)
-            if evt is not None:
-                pending: list[dict[str, Any]] = getattr(self, attr)
-                if len(pending) >= _BATCH_MAX_BUFFER:
-                    drop = _BATCH_MAX_BUFFER // 2
-                    setattr(self, attr, pending[drop:])
-                    log.warning("lease_events_buffer_trimmed", dropped=drop)
-                getattr(self, attr).append(evt)
-            if len(getattr(self, attr)) >= _BATCH_MAX_EVENTS and self._shipper.spool.enabled:
-                self._flush()
+        prev_read = self._read_at.get(path)
+        rows = self._read_new_rows(path)
+        if rows:
+            now = self._read_at.get(path, time.time())
+            # The rows appeared since the previous read (now, on the first).
+            lo = prev_read if prev_read is not None else now
+            old = self._chunks.get(attr)
+            if self._undelivered(attr) > 0 and old:
+                # The last read is still being delivered: its oldest row stays
+                # the oldest, and the new rows queue behind it.
+                lo = self._chunk_oldest(attr) or lo
+                n = self._undelivered(attr) + len(rows)
+                held = old["held"] + len(rows)
+            else:
+                n, held = len(rows), len(rows)
+            self._chunks[attr] = {"n": n, "lo": lo, "hi": now, "held": held}
+        try:
+            for row in rows:
+                evt = parse(row)
+                if evt is not None:
+                    pending: list[dict[str, Any]] = getattr(self, attr)
+                    if len(pending) >= _BATCH_MAX_BUFFER:
+                        drop = _BATCH_MAX_BUFFER // 2
+                        setattr(self, attr, pending[drop:])
+                        log.warning("lease_events_buffer_trimmed", dropped=drop)
+                    getattr(self, attr).append(evt)
+                self._chunks[attr]["held"] -= 1
+                if len(getattr(self, attr)) >= _BATCH_MAX_EVENTS and self._shipper.spool.enabled:
+                    self._flush()
+        finally:
+            if rows:
+                self._chunks[attr]["held"] = 0
 
     def tick(self) -> None:
         """One loop iteration: tail, flush, replay, snapshot."""

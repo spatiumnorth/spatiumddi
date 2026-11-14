@@ -133,7 +133,7 @@ import {
   type IpDnsState,
 } from "@/lib/gatewayDns";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
-import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -169,6 +169,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
 import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { DeleteChoiceModal } from "@/components/ui/delete-choice-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { TagRows, TagsField } from "@/components/ipam/TagRows";
 import {
@@ -2635,7 +2636,7 @@ function VlanPicker({
             />
           </div>
           {inlineError && (
-            <p className="text-[11px] text-destructive">{inlineError}</p>
+            <FormError className="text-[11px]">{inlineError}</FormError>
           )}
           <div className="flex justify-end gap-2">
             <button
@@ -7035,7 +7036,7 @@ export function SubnetDetail({
                                   addr.status !== "orphan" &&
                                   !permitsWrite &&
                                   "opacity-50",
-                                rowSelected && "bg-primary/5",
+                                selectedRowClass(rowSelected),
                                 isHighlightedRow(addr.id) &&
                                   "spatium-row-highlight",
                               )}
@@ -8046,9 +8047,9 @@ export function DnsSyncModal({
             <p className="text-sm text-muted-foreground">Computing drift…</p>
           )}
           {error && (
-            <p className="text-sm text-destructive">
+            <FormError className="text-sm">
               Failed to load preview. {formatApiError(error)}
-            </p>
+            </FormError>
           )}
           {data && (
             <>
@@ -8962,9 +8963,9 @@ function EditSubnetModalForm({
             </span>
           </div>
           {deleteError && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </div>
+            </FormError>
           )}
           <div className="flex justify-end gap-2">
             <button
@@ -9013,9 +9014,9 @@ function EditSubnetModalForm({
             Trash.
           </label>
           {deleteError && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </div>
+            </FormError>
           )}
           {deleteNotice && (
             <div
@@ -10511,8 +10512,9 @@ function MacHistoryModal({
       <div className="space-y-3">
         <p className="text-xs text-muted-foreground">
           Every distinct MAC ever assigned to this IP, newest activity first.
-          ``last_seen`` bumps on every IP write that carries the same MAC; a MAC
-          change appends a new row instead of overwriting the previous one.
+          <code className="font-mono">last_seen</code> bumps on every IP write
+          that carries the same MAC; a MAC change appends a new row instead of
+          overwriting the previous one.
         </p>
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
@@ -11297,9 +11299,9 @@ function AddressSetModalForm({
           </Field>
         </div>
         {error && (
-          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -12386,9 +12388,10 @@ export function DeleteOrOrphanModal({
     />
   );
   return (
-    <Modal title="Delete IP Address" onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">
+    <DeleteChoiceModal
+      title="Delete IP Address"
+      intro={
+        <>
           What should happen to{" "}
           <span className="font-mono font-medium">{address.address}</span>
           {host && (
@@ -12398,55 +12401,28 @@ export function DeleteOrOrphanModal({
             </>
           )}
           ?
-        </p>
-        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
-          <div className="text-xs font-medium text-amber-700 dark:text-amber-400">
-            Mark as Orphan (reversible)
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            The row is kept but marked <code>orphan</code>, greyed out in the
-            list, and excluded from next-free allocation. DNS and DHCP cascades
-            still run: its DNS records and aliases leave the zone. You can
-            restore or permanently delete it later from the orphans view;
-            restoring it publishes its DNS records and aliases again.
-          </p>
-          {recordsNote}
-        </div>
-        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
-          <div className="text-xs font-medium text-destructive">
-            Delete Permanently (irreversible)
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            The IPAM row is removed immediately. DNS records and DHCP static
-            assignments tied to this IP are also cascaded. There's no undo —
-            skip the orphan state entirely.
-          </p>
-          {recordsNote}
-        </div>
-        <div className="flex flex-wrap justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onPurge}
-            disabled={isOrphanPending || isPurgePending}
-            className="rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-          >
-            {isPurgePending ? "…" : "Delete Permanently"}
-          </button>
-          <button
-            onClick={onOrphan}
-            disabled={isOrphanPending || isPurgePending}
-            className="rounded-md bg-amber-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50 dark:bg-amber-600 dark:hover:bg-amber-700"
-          >
-            {isOrphanPending ? "…" : "Mark as Orphan"}
-          </button>
-        </div>
-      </div>
-    </Modal>
+        </>
+      }
+      softHeading="Mark as Orphan (reversible)"
+      softBody={
+        <>
+          The row is kept but marked <code>orphan</code>, greyed out in the
+          list, and excluded from next-free allocation. DNS and DHCP cascades
+          still run: its DNS records and aliases leave the zone. You can restore
+          or permanently delete it later from the orphans view; restoring it
+          publishes its DNS records and aliases again.
+        </>
+      }
+      softExtra={recordsNote}
+      softButtonLabel="Mark as Orphan"
+      permanentBody="The IPAM row is removed immediately. DNS records and DHCP static assignments tied to this IP are also cascaded. There's no undo — skip the orphan state entirely."
+      permanentExtra={recordsNote}
+      onSoft={onOrphan}
+      onPermanent={onPurge}
+      onClose={onClose}
+      isSoftPending={isOrphanPending}
+      isPermanentPending={isPurgePending}
+    />
   );
 }
 
@@ -12954,9 +12930,9 @@ function EditSpaceModalForm({
             Trash.
           </label>
           {deleteError && (
-            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </p>
+            </FormError>
           )}
           {deleteNotice && (
             <div
@@ -13142,9 +13118,9 @@ function EditSpaceModalForm({
       )}
 
       {saveError && (
-        <p className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {saveError}
-        </p>
+        </FormError>
       )}
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -13884,9 +13860,9 @@ function EditBlockModalForm({
             to Trash.
           </label>
           {deleteError && (
-            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {deleteError}
-            </p>
+            </FormError>
           )}
           {deleteNotice && (
             <div
@@ -15474,7 +15450,10 @@ export function BlockDetailView({
                         <tr
                           key={item.key}
                           onClick={() => onSelectBlock(b)}
-                          className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                          className={cn(
+                            "border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10",
+                            selectedRowClass(selected.has(blockKey)),
+                          )}
                         >
                           <td
                             className="w-8 px-2 py-2"
@@ -15560,7 +15539,7 @@ export function BlockDetailView({
                           onClick={() => onSelectSubnet(s)}
                           className={cn(
                             "border-b last:border-0 cursor-pointer hover:bg-muted/30",
-                            selected.has(`subnet:${s.id}`) && "bg-primary/5",
+                            selectedRowClass(selected.has(`subnet:${s.id}`)),
                           )}
                         >
                           <td
@@ -16529,7 +16508,10 @@ export function SpaceTableView({
                       <tr
                         key={item.key}
                         onClick={() => onSelectBlock(b)}
-                        className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                        className={cn(
+                          "border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10",
+                          selectedRowClass(selected.has(key)),
+                        )}
                       >
                         <td
                           className="w-8 px-2 py-2"
@@ -16936,7 +16918,7 @@ function BulkEditSubnetsModal({
           />
         </label>
       </div>
-      {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
+      {error && <FormError className="mt-2">{error}</FormError>}
       <div className="mt-4 flex justify-end gap-2">
         <button
           onClick={onClose}
@@ -17784,9 +17766,9 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
           )}
 
           {error && (
-            <p className="text-sm text-destructive">
+            <FormError className="text-sm">
               {formatApiError(error, "Search failed.")}
-            </p>
+            </FormError>
           )}
 
           {hasQuery && (
