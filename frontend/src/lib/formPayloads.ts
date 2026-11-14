@@ -22,7 +22,7 @@ export function blocklistPayload(
     blockMode: string;
     sinkholeIp: string;
     updateHours: number;
-    feedWildcard: boolean;
+    feedWildcard: string;
     enabled: boolean;
   },
   editing: boolean,
@@ -35,7 +35,7 @@ export function blocklistPayload(
     feed_format: f.feedFormat,
     block_mode: f.blockMode,
     update_interval_hours: f.updateHours,
-    feed_entries_are_wildcard: f.feedWildcard,
+    feed_wildcard_mode: f.feedWildcard as DNSBlockList["feed_wildcard_mode"],
     enabled: f.enabled,
   };
   if (f.sourceType === "url") body.feed_url = f.feedUrl || null;

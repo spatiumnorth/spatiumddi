@@ -7264,8 +7264,12 @@ export interface DNSBlockList {
   update_interval_hours: number;
   block_mode: string;
   sinkhole_ip: string | null;
-  /** Whether feed-sourced entries block subdomains too (#894). */
-  feed_entries_are_wildcard: boolean;
+  /**
+   * How feed entries treat subdomains (#4190): `by_syntax` follows each
+   * line's own syntax, `always` blocks subdomains of every entry, `never`
+   * is apex-only.
+   */
+  feed_wildcard_mode: "by_syntax" | "always" | "never";
   enabled: boolean;
   last_synced_at: string | null;
   last_sync_status: string | null;
