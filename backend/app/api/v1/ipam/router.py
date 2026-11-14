@@ -2069,7 +2069,7 @@ async def _enqueue_dns_op(
     when the batched op comes back ``failed`` (#1536)."""
     from app.drivers.dns import is_agentless
     from app.services.dns.record_ops import enqueue_record_op, resolve_primary_server
-    from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.serial import bump_zone_serial_once
 
     if op == "delete" and _never_publishable(name, rtype, value):
         # Only where the primary could never have taken the name: a Windows
@@ -2089,7 +2089,7 @@ async def _enqueue_dns_op(
             )
             return None
 
-    target_serial = bump_zone_serial(zone)
+    target_serial = bump_zone_serial_once(zone)
     record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}
     if record_id is not None:
         # #1230 — names the row being retracted, so a delete drops exactly it
@@ -7906,6 +7906,24 @@ async def update_subnet(
             ):
                 continue  # a null block_id leaves the parent alone, as below
             if _binding_value(getattr(body, field)) != _binding_value(getattr(subnet, field)):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=scoped_grant_refusal(field, "subnet"),
+                )
+        # The switches are judged on the value the update will STORE, not only
+        # on the body: ``ddns_enabled: true`` and a primary ``dns_zone_id``
+        # clear DDNS / DNS inheritance further down, whatever the body says
+        # about the switch itself.
+        for field, flips in (
+            ("dns_inherit_settings", bool(body.dns_zone_id)),
+            ("ddns_inherit_settings", body.ddns_enabled is True),
+        ):
+            stored = getattr(subnet, field)
+            if field in body.model_fields_set and getattr(body, field) is not None:
+                stored = getattr(body, field)
+            if flips:
+                stored = False
+            if stored != getattr(subnet, field):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=scoped_grant_refusal(field, "subnet"),
