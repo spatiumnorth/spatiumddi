@@ -177,6 +177,59 @@ async def test_apt_source_uri_userinfo_is_masked_and_kept_on_resave(
     assert r.status_code == 422, r.text
 
 
+async def test_apt_source_masked_uri_on_a_new_host_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    src: dict[str, Any] = {
+        "name": "lan",
+        "uri": "http://bob:hunter2@mirror.lan:8080/apt/",
+        "suites": "trixie",
+        "components": "main",
+        "enabled": True,
+    }
+    r = await client.put("/api/v1/settings", headers=h, json={"apt_sources": [src]})
+    assert r.status_code == 200, r.text
+    stored = "http://bob:hunter2@mirror.lan:8080/apt/"
+
+    async def _stored() -> str:
+        st = await db_session.get(PlatformSettings, 1)
+        assert st is not None
+        await db_session.refresh(st)
+        return str(st.apt_sources[0]["uri"])
+
+    # Host, port or scheme moved with the mask left in: refused, unchanged.
+    for moved in (
+        "http://***@other.lan:8080/apt/",
+        "http://***@mirror.lan:9090/apt/",
+        "https://***@mirror.lan:8080/apt/",
+    ):
+        r = await client.put(
+            "/api/v1/settings", headers=h, json={"apt_sources": [{**src, "uri": moved}]}
+        )
+        assert r.status_code == 422, r.text
+        assert "re-enter" in r.text and "hunter2" not in r.text
+        assert await _stored() == stored
+
+    # Same host and port, new path: the credential is kept.
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={"apt_sources": [{**src, "uri": "http://***@mirror.lan:8080/other/"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert await _stored() == "http://bob:hunter2@mirror.lan:8080/other/"
+
+    # A new host with a real credential supplied is stored as sent.
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={"apt_sources": [{**src, "uri": "http://amy:pw2@other.lan:8080/apt/"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert await _stored() == "http://amy:pw2@other.lan:8080/apt/"
+
+
 async def test_guard_rule_cases() -> None:
     from types import SimpleNamespace
 

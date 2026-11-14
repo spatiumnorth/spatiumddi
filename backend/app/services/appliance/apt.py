@@ -152,6 +152,16 @@ def mask_proxy_url(url: str | None) -> str:
     return f"{prefix}{PROXY_USERINFO_MASK}@{rest}"
 
 
+def _destination(prefix: str, rest: str) -> tuple[str, str]:
+    """Scheme and ``host[:port]`` of a URL split by ``_split_proxy_userinfo``."""
+    end = len(rest)
+    for ch in "/?#":
+        idx = rest.find(ch)
+        if idx != -1:
+            end = min(end, idx)
+    return prefix.lower(), rest[:end].lower()
+
+
 def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
     """Put the stored credential back into a proxy URL that carries the mask.
 
@@ -159,17 +169,25 @@ def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
     the masked one; writing that literally would replace the real
     credential with ``***``. So a userinfo of exactly ``***`` means "keep
     the stored one", spliced onto whatever host / port / path the caller
-    sent. Raises ``ValueError`` when there is no stored credential to keep.
+    sent, as long as the scheme, host and port are the stored ones (a path
+    may change). Raises ``ValueError`` when there is no stored credential to
+    keep, or when the destination moved: the credential is then asked for
+    again rather than sent to the new host.
     """
     prefix, userinfo, rest = _split_proxy_userinfo(incoming)
     if userinfo != PROXY_USERINFO_MASK:
         return incoming
-    _, stored_userinfo, _ = _split_proxy_userinfo(stored or "")
+    stored_prefix, stored_userinfo, stored_rest = _split_proxy_userinfo(stored or "")
     if not stored_userinfo:
         raise ValueError(
             "proxy URL carries the '***' credential placeholder, but no "
             "credential is stored to keep; enter the user:password or remove "
             "the '***@'"
+        )
+    if _destination(prefix, rest) != _destination(stored_prefix, stored_rest):
+        raise ValueError(
+            "the host, port or scheme changed: re-enter the user:password in the "
+            "same request (stored credentials are not re-sent to a different destination)"
         )
     return f"{prefix}{stored_userinfo}@{rest}"
 

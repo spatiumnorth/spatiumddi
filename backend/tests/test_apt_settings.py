@@ -513,13 +513,21 @@ async def test_put_of_the_masked_value_keeps_the_stored_credential(client: Async
     await db_session.refresh(settings)
     assert settings.apt_proxy_http == _PROXY_WITH_CREDS
 
-    # Editing the host / port while leaving the mask keeps the credential.
+    # A path-only edit while leaving the mask keeps the credential.
     r = await client.put(
-        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy2.lan:8080/"}
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy.lan:3128/other"}
     )
     assert r.status_code == 200, r.text
     await db_session.refresh(settings)
-    assert settings.apt_proxy_http == "http://bob:hunter2@proxy2.lan:8080/"
+    assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128/other"
+
+    # Moving the host / port with the mask left in is refused, nothing stored.
+    for moved in ("http://***@proxy2.lan:3128/other", "http://***@proxy.lan:8080/other"):
+        r = await client.put("/api/v1/settings", headers=h, json={"apt_proxy_http": moved})
+        assert r.status_code == 422, r.text
+        assert "re-enter" in r.text and "hunter2" not in r.text
+        await db_session.refresh(settings)
+        assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128/other"
 
     # A real new credential replaces it; clearing still clears.
     r = await client.put(
