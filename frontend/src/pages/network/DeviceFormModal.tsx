@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import {
   AlertCircle,
   CheckCircle2,
@@ -108,6 +109,34 @@ export function DeviceFormModal({
     device?.v3_priv_protocol ?? "AES128",
   );
   const [v3PrivKey, setV3PrivKey] = useState("");
+  // #4135 — a moved address / SNMP port needs the stored community or v3 keys
+  // entered again.
+  const reask = useCredentialReask(
+    { ip_address: ipAddress.trim(), snmp_port: snmpPort },
+    device && { ip_address: device.ip_address, snmp_port: device.snmp_port },
+    () => {
+      setCommunity("");
+      setV3AuthKey("");
+      setV3PrivKey("");
+    },
+  );
+  const isV2 = snmpVersion === "v1" || snmpVersion === "v2c";
+  const mustEnterCommunity =
+    isV2 && reask.asks(device?.has_community) && !community.trim();
+  const needsAuth =
+    v3SecurityLevel === "authNoPriv" || v3SecurityLevel === "authPriv";
+  const mustEnterAuthKey =
+    snmpVersion === "v3" &&
+    needsAuth &&
+    reask.asks(device?.has_auth_key) &&
+    !v3AuthKey.trim();
+  const mustEnterPrivKey =
+    snmpVersion === "v3" &&
+    v3SecurityLevel === "authPriv" &&
+    reask.asks(device?.has_priv_key) &&
+    !v3PrivKey.trim();
+  const mustEnterAny =
+    mustEnterCommunity || mustEnterAuthKey || mustEnterPrivKey;
   const [v3ContextName, setV3ContextName] = useState(
     device?.v3_context_name ?? "",
   );
@@ -458,17 +487,24 @@ export function DeviceFormModal({
           {(snmpVersion === "v1" || snmpVersion === "v2c") && (
             <Field
               label="Community string"
-              hint="SNMP v1/v2c community. ‘public’ is the most common default."
+              hint={
+                reask.asks(device?.has_community)
+                  ? reask.hint
+                  : "SNMP v1/v2c community. ‘public’ is the most common default."
+              }
             >
               <input
                 type="text"
                 className={inputCls}
                 value={community}
                 onChange={(e) => setCommunity(e.target.value)}
+                required={mustEnterCommunity}
                 placeholder={
-                  editing && device?.has_community
-                    ? "(unchanged — leave blank to keep existing)"
-                    : "public"
+                  reask.asks(device?.has_community)
+                    ? reask.placeholder
+                    : editing && device?.has_community
+                      ? "(unchanged — leave blank to keep existing)"
+                      : "public"
                 }
                 autoComplete="off"
                 spellCheck={false}
@@ -523,16 +559,24 @@ export function DeviceFormModal({
                       ))}
                     </select>
                   </Field>
-                  <Field label="Auth key">
+                  <Field
+                    label="Auth key"
+                    hint={
+                      reask.asks(device?.has_auth_key) ? reask.hint : undefined
+                    }
+                  >
                     <input
                       type="password"
                       className={inputCls}
                       value={v3AuthKey}
                       onChange={(e) => setV3AuthKey(e.target.value)}
+                      required={mustEnterAuthKey}
                       placeholder={
-                        editing && device?.has_auth_key
-                          ? "(unchanged — leave blank to keep existing)"
-                          : ""
+                        reask.asks(device?.has_auth_key)
+                          ? reask.placeholder
+                          : editing && device?.has_auth_key
+                            ? "(unchanged — leave blank to keep existing)"
+                            : ""
                       }
                       autoComplete="new-password"
                     />
@@ -558,16 +602,24 @@ export function DeviceFormModal({
                       ))}
                     </select>
                   </Field>
-                  <Field label="Privacy key">
+                  <Field
+                    label="Privacy key"
+                    hint={
+                      reask.asks(device?.has_priv_key) ? reask.hint : undefined
+                    }
+                  >
                     <input
                       type="password"
                       className={inputCls}
                       value={v3PrivKey}
                       onChange={(e) => setV3PrivKey(e.target.value)}
+                      required={mustEnterPrivKey}
                       placeholder={
-                        editing && device?.has_priv_key
-                          ? "(unchanged — leave blank to keep existing)"
-                          : ""
+                        reask.asks(device?.has_priv_key)
+                          ? reask.placeholder
+                          : editing && device?.has_priv_key
+                            ? "(unchanged — leave blank to keep existing)"
+                            : ""
                       }
                       autoComplete="new-password"
                     />
@@ -712,7 +764,7 @@ export function DeviceFormModal({
             </button>
             <button
               type="submit"
-              disabled={saveMut.isPending}
+              disabled={saveMut.isPending || mustEnterAny}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {saveMut.isPending ? "Saving…" : editing ? "Save" : "Add Device"}

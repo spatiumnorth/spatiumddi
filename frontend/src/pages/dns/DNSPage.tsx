@@ -83,6 +83,7 @@ import {
   CertsCompactTable,
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -1521,12 +1522,36 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
 
   const hasExistingCreds = !!server?.has_credentials;
 
+  // #4135 — a moved host / port needs the stored WinRM password or API token
+  // entered again (or cleared).
+  const reask = useCredentialReask(
+    { host, port },
+    server && { host: server.host, port: server.port },
+    () => {
+      setWinPassword("");
+      setCloudCreds((c) => {
+        const { api_token: _drop, ...rest } = c;
+        return rest;
+      });
+    },
+  );
+  const mustEnterWinPassword =
+    driver === "windows_dns" &&
+    reask.asks(hasExistingCreds) &&
+    !winClearCreds &&
+    !winPassword;
+
   const cloudDriver = isCloudDriver(driver) ? driver : null;
   // Any driver that takes a credential dict — the cloud providers plus
   // self-hosted technitium_api (#810). ``cloudDriver`` stays the narrower
   // test for the bits that are genuinely cloud-only: the hosted-provider
   // setup guide, the "no host/port" layout, and the hosted-zone import link.
   const credFields = CRED_FIELDS_BY_DRIVER[driver] ?? null;
+  const mustEnterApiToken =
+    !!credFields?.some((f) => f.key === "api_token") &&
+    reask.asks(hasExistingCreds) &&
+    !cloudClearCreds &&
+    !(cloudCreds.api_token ?? "").trim();
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -2135,13 +2160,23 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                   autoComplete="off"
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterWinPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={winPassword}
                   onChange={(e) => setWinPassword(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "optional"}
+                  required={mustEnterWinPassword}
+                  placeholder={
+                    mustEnterWinPassword
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "optional"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -2307,7 +2342,15 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                     </span>
                   </label>
                 ) : (
-                  <Field key={f.key} label={f.label}>
+                  <Field
+                    key={f.key}
+                    label={f.label}
+                    hint={
+                      f.key === "api_token" && mustEnterApiToken
+                        ? reask.hint
+                        : undefined
+                    }
+                  >
                     {f.textarea ? (
                       <textarea
                         className={`${inputCls} font-mono text-xs`}
@@ -2337,10 +2380,13 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                             [f.key]: e.target.value,
                           }))
                         }
+                        required={f.key === "api_token" && mustEnterApiToken}
                         placeholder={
-                          editing && hasExistingCreds
-                            ? "(unchanged)"
-                            : (f.placeholder ?? "")
+                          f.key === "api_token" && mustEnterApiToken
+                            ? reask.placeholder
+                            : editing && hasExistingCreds
+                              ? "(unchanged)"
+                              : (f.placeholder ?? "")
                         }
                         autoComplete="off"
                       />
@@ -2410,6 +2456,7 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
           onClose={onClose}
           pending={mut.isPending}
           label={server ? "Save" : "Add Server"}
+          disabled={mustEnterWinPassword || mustEnterApiToken}
         />
       </form>
     </Modal>

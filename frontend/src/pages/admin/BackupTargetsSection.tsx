@@ -25,6 +25,7 @@ import {
   type BackupTargetKind,
   type BackupTargetUpdate,
 } from "@/lib/api";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
@@ -53,6 +54,16 @@ const CRON_PRESETS: { label: string; value: string }[] = [
   { label: "Daily 04:00 UTC", value: "0 4 * * *" },
   { label: "Weekly Sunday 03:00 UTC", value: "0 3 * * 0" },
   { label: "Monthly 1st 03:00 UTC", value: "0 3 1 * *" },
+];
+
+// Config keys that decide where a stored credential is sent (#4135); the
+// same list the API compares before accepting an edit.
+const BACKUP_DESTINATION_KEYS = [
+  "host",
+  "port",
+  "server",
+  "url",
+  "endpoint_url",
 ];
 
 // Settings the API reads as numbers (#3946). The form holds every value as
@@ -863,6 +874,31 @@ function TargetFormModal({
     () => kindsQ.data?.find((k) => k.kind === kind),
     [kindsQ.data, kind],
   );
+  // #4135 — a moved host / port / server / URL needs every stored secret of
+  // this destination entered again (the same keys the API compares).
+  const secretFieldNames = (kindMeta?.config_fields ?? [])
+    .filter((f) => f.secret)
+    .map((f) => f.name);
+  const destKeys = Object.keys(config).filter((k) =>
+    BACKUP_DESTINATION_KEYS.includes(k),
+  );
+  const reask = useCredentialReask(
+    Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+    mode === "edit" && existing
+      ? Object.fromEntries(destKeys.map((k) => [k, existing.config?.[k] ?? ""]))
+      : null,
+    () =>
+      setConfig((prev) => {
+        const next = { ...prev };
+        for (const n of secretFieldNames) next[n] = "";
+        return next;
+      }),
+  );
+  const mustEnter = (name: string) =>
+    mode === "edit" &&
+    reask.asks(Boolean(existing?.config?.[name])) &&
+    !(config[name] ?? "").trim();
+  const missingSecret = secretFieldNames.some(mustEnter);
   // A kind with no listing and no delete is write-only whatever the
   // operator picks — the server forces it, so the form shows the real
   // resulting state rather than a choice that gets silently overridden.
@@ -1029,12 +1065,13 @@ function TargetFormModal({
             // unset secret back as "" and a set one as a sentinel (#3289).
             const isSecretStored =
               isSecretInEdit && Boolean(existing?.config?.[f.name]);
+            const askAgain = f.secret && mustEnter(f.name);
             return (
               <Field
                 key={f.name}
                 label={f.label}
-                required={f.required && !isSecretInEdit}
-                help={f.description}
+                required={(f.required && !isSecretInEdit) || askAgain}
+                help={askAgain ? reask.hint : f.description}
               >
                 {f.multiline ? (
                   // A PEM key, a known_hosts file or one header per line:
@@ -1043,7 +1080,7 @@ function TargetFormModal({
                   <MultilineConfigField
                     name={f.name}
                     masked={f.type === "password" || f.secret}
-                    stored={isSecretStored}
+                    stored={isSecretStored && !askAgain}
                     value={config[f.name] ?? ""}
                     onChange={(v) => setConfig({ ...config, [f.name]: v })}
                   />
@@ -1056,10 +1093,13 @@ function TargetFormModal({
                     onChange={(e) =>
                       setConfig({ ...config, [f.name]: e.target.value })
                     }
+                    required={askAgain}
                     placeholder={
-                      isSecretStored
-                        ? "(set — leave empty to keep, type to replace)"
-                        : undefined
+                      askAgain
+                        ? reask.placeholder
+                        : isSecretStored
+                          ? "(set — leave empty to keep, type to replace)"
+                          : undefined
                     }
                     autoComplete={f.secret ? "new-password" : undefined}
                     className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -1258,7 +1298,7 @@ function TargetFormModal({
             </button>
             <button
               type="submit"
-              disabled={saveMut.isPending}
+              disabled={saveMut.isPending || missingSecret}
               className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {saveMut.isPending

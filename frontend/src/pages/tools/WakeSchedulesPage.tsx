@@ -44,6 +44,7 @@ import {
   type WolVerifyMethod,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1599,6 +1600,20 @@ function CalendarModal({
   // types one (or explicitly clears an existing secret).
   const [password, setPassword] = useState("");
   const [clearPassword, setClearPassword] = useState(false);
+  // #4135 — a moved URL needs the stored password typed again, or cleared.
+  const reask = useCredentialReask(
+    { url: url.trim() },
+    existing && { url: existing.url },
+    () => {
+      setPassword("");
+      setClearPassword(false);
+    },
+  );
+  const mustEnterPassword =
+    kind === "caldav" &&
+    reask.asks(existing?.password_set) &&
+    !clearPassword &&
+    !password;
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [refreshInterval, setRefreshInterval] = useState(
     existing?.refresh_interval_minutes ?? 360,
@@ -1644,7 +1659,11 @@ function CalendarModal({
   });
 
   const canSave =
-    name.trim().length > 0 && urlValid && intervalValid && !save.isPending;
+    name.trim().length > 0 &&
+    urlValid &&
+    intervalValid &&
+    !mustEnterPassword &&
+    !save.isPending;
 
   return (
     <Modal
@@ -1733,12 +1752,20 @@ function CalendarModal({
                   if (e.target.value) setClearPassword(false);
                 }}
                 placeholder={
-                  existing?.password_set
-                    ? "Leave blank to keep the stored password"
-                    : "App password / token"
+                  reask.asks(existing?.password_set)
+                    ? reask.placeholder
+                    : existing?.password_set
+                      ? "Leave blank to keep the stored password"
+                      : "App password / token"
                 }
+                required={mustEnterPassword}
                 autoComplete="new-password"
               />
+              {reask.asks(existing?.password_set) && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  {reask.hint} Or clear it below.
+                </p>
+              )}
               {existing?.password_set && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                   <input

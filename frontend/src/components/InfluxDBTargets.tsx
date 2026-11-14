@@ -17,6 +17,7 @@
  */
 
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 
@@ -474,6 +475,24 @@ function InfluxTargetModal({
   // means "keep" — typing in it and deleting again must not clear (#1989).
   const [clearPassword, setClearPassword] = useState(false);
   const [clearToken, setClearToken] = useState(false);
+  // #4135 — a moved URL needs the stored password / token entered again, or
+  // removed.
+  const reask = useCredentialReask(
+    { url: form.url.trim() },
+    existingId ? { url: initial.url.trim() } : null,
+    () => {
+      setForm((f) => ({ ...f, password: null, token: null }));
+      setClearPassword(false);
+      setClearToken(false);
+    },
+  );
+  const mustEnterPassword =
+    form.version === "v1" &&
+    reask.asks(passwordSet) &&
+    !clearPassword &&
+    !form.password;
+  const mustEnterToken =
+    form.version !== "v1" && reask.asks(tokenSet) && !clearToken && !form.token;
 
   const saveMut = useMutation({
     mutationFn: async () => {
@@ -630,10 +649,20 @@ function InfluxTargetModal({
                   onChange={(e) =>
                     setForm({ ...form, password: e.target.value })
                   }
+                  required={mustEnterPassword}
                   placeholder={
-                    passwordSet ? "(stored — leave blank to keep)" : "Password"
+                    reask.asks(passwordSet)
+                      ? reask.placeholder
+                      : passwordSet
+                        ? "(stored — leave blank to keep)"
+                        : "Password"
                   }
                 />
+                {reask.asks(passwordSet) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    {reask.hint} Or clear it below.
+                  </div>
+                )}
               </label>
               {existingId && passwordSet && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -684,10 +713,20 @@ function InfluxTargetModal({
                   value={form.token ?? ""}
                   disabled={clearToken}
                   onChange={(e) => setForm({ ...form, token: e.target.value })}
+                  required={mustEnterToken}
                   placeholder={
-                    tokenSet ? "(stored — leave blank to keep)" : "API token"
+                    reask.asks(tokenSet)
+                      ? reask.placeholder
+                      : tokenSet
+                        ? "(stored — leave blank to keep)"
+                        : "API token"
                   }
                 />
+                {reask.asks(tokenSet) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    {reask.hint} Or clear it below.
+                  </div>
+                )}
               </label>
               {existingId && tokenSet && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -815,7 +854,13 @@ function InfluxTargetModal({
           </button>
           <button
             onClick={() => saveMut.mutate()}
-            disabled={saveMut.isPending || !form.name || !form.url}
+            disabled={
+              saveMut.isPending ||
+              !form.name ||
+              !form.url ||
+              mustEnterPassword ||
+              mustEnterToken
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : existingId ? "Save" : "Create"}

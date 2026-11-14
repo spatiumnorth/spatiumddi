@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -395,6 +396,15 @@ function HostModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [clientCertPem, setClientCertPem] = useState("");
   const [clientKeyPem, setClientKeyPem] = useState("");
+  // #4135 — a moved endpoint needs the stored client key pasted again (only
+  // asked while the key field is on screen, i.e. for a TCP endpoint).
+  const reask = useCredentialReask(
+    { connectionType, endpoint },
+    host && { connectionType: host.connection_type, endpoint: host.endpoint },
+    () => setClientKeyPem(""),
+  );
+  const mustEnter =
+    connectionType === "tcp" && reask.asks(host?.client_key_present);
   const [spaceId, setSpaceId] = useState(host?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(host?.dns_group_id ?? "");
   const [mirrorContainers, setMirrorContainers] = useState(
@@ -626,17 +636,23 @@ function HostModal({
                   }
                 />
               </Field>
-              <Field label="Client key (PEM)">
+              <Field
+                label="Client key (PEM)"
+                hint={mustEnter ? reask.hint : undefined}
+              >
                 <textarea
                   className={`${inputCls} font-mono text-[11px]`}
                   rows={3}
                   value={clientKeyPem}
                   onChange={(e) => setClientKeyPem(e.target.value)}
                   placeholder={
-                    editing && host?.client_key_present
-                      ? "••• stored — paste to replace"
-                      : "-----BEGIN PRIVATE KEY-----\n..."
+                    mustEnter
+                      ? reask.placeholder
+                      : editing && host?.client_key_present
+                        ? "••• stored — paste to replace"
+                        : "-----BEGIN PRIVATE KEY-----\n..."
                   }
+                  required={mustEnter}
                 />
               </Field>
             </div>
@@ -768,7 +784,7 @@ function HostModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !clientKeyPem.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
