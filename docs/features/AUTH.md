@@ -42,6 +42,14 @@ provider, and returns to `/auth/{provider_id}/callback`. Only external
 users pass through `sync_external_user()`; a local login never changes
 group membership.
 
+A refused sign-in costs one password-hash comparison for every kind of
+name: a local account with a wrong password, a local account with no
+password, a name with no account, and a directory account. With no
+LDAP / RADIUS / TACACS+ provider configured those answers take about the
+same time. With providers configured, a local account is answered without
+contacting them, so its response is faster than a directory-backed or
+unknown name, whose time also includes the round trips to the providers.
+
 ## Local auth
 
 - `POST /auth/login` accepts JSON `{username, password}`. Returns

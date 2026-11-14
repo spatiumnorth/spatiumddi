@@ -232,6 +232,25 @@ def collect_wake(*channels: str) -> None:
             bucket.add(ch)
 
 
+async def flush_collected_wakes() -> None:
+    """Publish and clear what ``collect_wake`` has stashed so far, now.
+
+    For a handler that commits in several steps and must wake the agents
+    once, after the last commit it made, on every way out of it: the
+    collector's own flush runs only on a clean exit, so a handler that
+    commits and then raises (a 503 after some of its chunks committed) would
+    leave those commits to the ``WAKE_TICK_SECONDS`` tick. Emptying the
+    bucket makes the collector's flush a no-op, so the wake is one publish
+    per request, not one per commit. No-op without a collector.
+    """
+    bucket = _wake_collector.get()
+    if not bucket:
+        return
+    channels = list(bucket)
+    bucket.clear()
+    await publish_wake(*channels)
+
+
 async def wake_publishing() -> AsyncIterator[None]:
     """FastAPI dependency: open a request-scoped wake collector so any
     ``collect_wake`` calls made while handling the request publish once,

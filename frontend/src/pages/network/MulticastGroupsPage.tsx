@@ -1412,6 +1412,12 @@ function GroupsTabBody({
                   <ListEmpty
                     error={query.error}
                     what="multicast groups"
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>New group</strong> to add the first.
+                      </>
+                    }
                     filtered={
                       search !== "" ||
                       spaceFilter !== "" ||
@@ -1423,8 +1429,7 @@ function GroupsTabBody({
                       setCustomerFilter("");
                     }}
                   >
-                    No multicast groups yet. Click <strong>New group</strong> to
-                    add the first.
+                    No multicast groups yet.
                   </ListEmpty>
                 </td>
               </tr>
