@@ -228,6 +228,11 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
+    # #4185 — BIND ``max-cache-size`` for each recursive view's cache (``64m``,
+    # ``512m``, ``1g``). NULL = the agent's own default. Validated by the
+    # server-group API; ``unlimited`` / ``0`` are never stored (#3565).
+    max_cache_size: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )

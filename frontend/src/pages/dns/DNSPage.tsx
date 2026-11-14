@@ -1164,6 +1164,8 @@ function GroupModalForm({
   const [isPublicFacing, setIsPublicFacing] = useState(
     group?.is_public_facing ?? false,
   );
+  // #4185 — BIND resolver cache ceiling per recursive view; blank = default.
+  const [maxCacheSize, setMaxCacheSize] = useState(group?.max_cache_size ?? "");
   // #1932 — subnet reverse zones in a cloud DNS group are opt-in.
   const [autoReverseAtProvider, setAutoReverseAtProvider] = useState(
     group?.auto_reverse_zones_at_provider ?? false,
@@ -1216,6 +1218,7 @@ function GroupModalForm({
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
             auto_reverse_zones_at_provider: autoReverseAtProvider,
+            max_cache_size: maxCacheSize.trim() || null,
           };
           if (!group) {
             mut.mutate(body);
@@ -1234,6 +1237,7 @@ function GroupModalForm({
               is_public_facing: group.is_public_facing ?? false,
               auto_reverse_zones_at_provider:
                 group.auto_reverse_zones_at_provider ?? false,
+              max_cache_size: group.max_cache_size ?? null,
             },
             body,
           );
@@ -1368,6 +1372,24 @@ function GroupModalForm({
             </div>
           )}
         </div>
+
+        <Field label="Resolver cache size per view (BIND9)">
+          <input
+            className={inputCls}
+            value={maxCacheSize}
+            onChange={(e) => setMaxCacheSize(e.target.value)}
+            placeholder="default (a quarter of the container limit, split across views)"
+            aria-label="Resolver cache size per view"
+          />
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            BIND <code>max-cache-size</code> for each recursive view, e.g.{" "}
+            <code>64m</code>, <code>512m</code> or <code>1g</code>.{" "}
+            <code>unlimited</code> and <code>0</code> are not accepted. A home
+            or small office at about 10 queries/s is fine with 64–128m per view.
+            Total cache memory = this value × the number of recursive views, on
+            top of the zones and blocklists named loads.
+          </p>
+        </Field>
 
         {group && (
           <div className="rounded border bg-muted/20 p-3">

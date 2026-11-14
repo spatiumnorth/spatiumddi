@@ -5316,6 +5316,9 @@ export interface DNSServerGroup {
    *  cloud DNS driver. Off by default: the provider bills per hosted zone.
    *  Groups on other drivers ignore it. */
   auto_reverse_zones_at_provider?: boolean;
+  /** #4185 — BIND `max-cache-size` for each recursive view's cache of a
+   *  BIND9 group (e.g. `64m`); null = the agent's default. */
+  max_cache_size?: string | null;
   /** Distinct drivers of the servers currently in this group (#934
    *  follow-up). Empty = an empty group, compatible with anything. A group
    *  is single-driver, so one entry is normal; two or more means the group

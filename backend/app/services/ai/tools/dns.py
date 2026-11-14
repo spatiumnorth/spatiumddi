@@ -297,7 +297,9 @@ class ListServerGroupsArgs(BaseModel):
         "List DNS server groups (logical groupings of authoritative "
         "DNS servers). Each summary includes name, group type, "
         "default view, recursive flag, and whether subnet reverse zones "
-        "are auto-created in it when it runs a cloud DNS driver."
+        "are auto-created in it when it runs a cloud DNS driver. "
+        "max_cache_size is the BIND9 resolver cache ceiling per recursive view "
+        "(null = the agent's default)."
     ),
     args_model=ListServerGroupsArgs,
     category="dns",
@@ -319,6 +321,7 @@ async def list_dns_server_groups(
             "default_view": g.default_view,
             "is_recursive": g.is_recursive,
             "auto_reverse_zones_at_provider": g.auto_reverse_zones_at_provider,
+            "max_cache_size": g.max_cache_size,
         }
         for g in rows
     ]
