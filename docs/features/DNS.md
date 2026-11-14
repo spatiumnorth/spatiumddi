@@ -1148,12 +1148,24 @@ DNSBlockListException
     `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow
     a rule, and DNS cannot express that, so keeping the bare name would
     block more than the feed asked for.
+  - Two non-`||` shapes that name a complete DNS name **are** enforced
+    (#4037), and neither follows the list's "Block subdomains" setting:
+    a dot-led `.name^` blocks the name's subdomains only (stored as
+    `*.name`; the apex keeps resolving), and `|name^` blocks exactly that
+    name (no subdomains). Both need the closing `^` (without it adblock
+    reads a substring), and a name with an all-digit label or a file
+    extension as its last label (`.n.2.1.js^`) is a filename fragment and
+    stays skipped. `@@|name^` becomes an exception for the name, which
+    every renderer applies to its subdomains too; `@@.name^` has no
+    exception to map to and stays skipped.
   - Regex rules (`/…/`), paths (`||host/ads`), a `*` inside a name and
     other non-`||name^` rules are skipped.
 
   Skipped rules are counted by category (regex / modifier / badfilter /
   malformed), stored on the list as `feed_parse_skipped`, and shown on the
-  list as "N rules not enforced". Every `||name^` rule means "this name and
+  list as "N rules skipped", with the list's entry count first and the
+  reasons in plain words on hover and on the list's detail page: they are
+  rules only a browser ad blocker can apply, not a fault. Every `||name^` rule means "this name and
   its subdomains", so an adblock feed on a list set to apex-only logs the
   same override warning a `*.`-prefixed feed does (#894).
 
@@ -2194,7 +2206,9 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   bundle applies. An RPZ zone with no room for its hash sidecar (246 to
   248 characters) is still served, just rendered on every apply. The
   control plane does not refuse these names: PowerDNS and the agentless
-  drivers serve them.
+  drivers serve them. A DNSSEC-signed zone is held back from 215 characters
+  (issue #3750): BIND cannot write the key files it names after the zone, so
+  it would serve the zone unsigned with no key.
 
 ### Servers & server groups
 
