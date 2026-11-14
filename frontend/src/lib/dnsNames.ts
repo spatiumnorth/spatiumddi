@@ -76,13 +76,32 @@ export function nameInZoneError(host: string, zone: string): string | null {
   return null;
 }
 
-/** Validate a DNS record owner (RFC 2181 — permits `_`, leftmost `*`, and `@`). */
-export function recordOwnerError(name: string): string | null {
+/**
+ * Validate a DNS record owner (RFC 2181 — permits `_`, leftmost `*`, and `@`).
+ * With the record's type and zone, a lone `<octet>/<prefix>` owner is also
+ * accepted for the RFC 2317 delegation NS / DS of a classless child (#4166).
+ * Mirror of `validate_record_owner` + `classless_owner_error`.
+ */
+export function recordOwnerError(
+  name: string,
+  recordType?: string,
+  zoneName?: string,
+): string | null {
   const raw = name.trim();
   if (raw === "" || raw === "@") return null; // apex
   if (CONTROL_RE.test(raw)) return "contains a control character";
   const body = raw.endsWith(".") ? raw.slice(0, -1) : raw;
   if (!body) return null;
+  if (CLASSLESS_LABEL_RE.test(body)) {
+    const zone = (zoneName ?? "").trim().replace(/\.+$/, "");
+    if (
+      zone &&
+      ["NS", "DS"].includes((recordType ?? "").toUpperCase()) &&
+      isClasslessReverse([body, ...zone.split(".")])
+    )
+      return null;
+    return `"${body}" holds a "/", which is only valid as the NS (or DS) delegating an RFC 2317 classless reverse zone, such as "64/26" in 2.0.192.in-addr.arpa`;
+  }
   const parts = body.split(".");
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -121,6 +140,22 @@ export function isClasslessReverse(labels: string[]): boolean {
     return false;
   const prefix = Number(m[2]);
   return Number(m[1]) <= 255 && prefix > 8 * parents.length && prefix <= 32;
+}
+
+/**
+ * The target of an RFC 2317 CNAME in the parent zone (#4166): one numeric host
+ * label in front of a classless reverse name (`65.64/26.2.0.192.in-addr.arpa`).
+ * Mirror of `is_classless_cname_target`.
+ */
+export function isClasslessCnameTarget(target: string): boolean {
+  const t = target.trim();
+  const labels = (t.endsWith(".") ? t.slice(0, -1) : t).split(".");
+  return (
+    labels.length >= 5 &&
+    /^\d{1,3}$/.test(labels[0]) &&
+    Number(labels[0]) <= 255 &&
+    isClasslessReverse(labels.slice(1))
+  );
 }
 
 /** Validate an FQDN (zone name, domain-name option). Permits `_` labels. */

@@ -16,8 +16,11 @@ import pytest
 
 from app.core.dns_names import (
     MAX_NAME_LEN,
+    bind_check_names_error,
+    classless_owner_error,
     contains_control_chars,
     contains_zonefile_unsafe,
+    record_value_error,
     sanitize_hostname,
     validate_dns_label,
     validate_fqdn,
@@ -295,7 +298,6 @@ def test_a_label_ending_in_a_newline_is_refused(validate: Callable[..., str], va
     "name",
     [
         "0/26.2.0.192.in-addr.arpa",
-        "64/26.2.0.192.in-addr.arpa.",
         "128/25.2.0.192.in-addr.arpa",
         "0/17.1.10.in-addr.arpa",
         "0/9.10.in-addr.arpa",
@@ -327,3 +329,78 @@ def test_validate_fqdn_accepts_classless_reverse_zone(name: str) -> None:
 def test_validate_fqdn_still_rejects_other_slashes(name: str) -> None:
     with pytest.raises(ValueError):
         validate_fqdn(name)
+
+
+# ── RFC 2317 records in the parent zone (#4166) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "65.64/26.2.0.192.in-addr.arpa.",
+        "65.64/26.2.0.192.in-addr.arpa",
+        "1.0/17.1.10.in-addr.arpa.",
+    ],
+)
+def test_classless_cname_target_is_accepted(target: str) -> None:
+    assert record_value_error("CNAME", target) is None
+    assert record_value_error("DNAME", target) is None
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "x.64/26.2.0.192.in-addr.arpa.",
+        "65.64/24.2.0.192.in-addr.arpa.",
+        "65.64/26.example.com.",
+        "65.66.64/26.2.0.192.in-addr.arpa.",
+        "256.64/26.2.0.192.in-addr.arpa.",
+    ],
+)
+def test_other_slash_targets_are_refused(target: str) -> None:
+    assert record_value_error("CNAME", target) is not None
+
+
+def test_classless_target_only_for_cname_and_dname() -> None:
+    assert record_value_error("PTR", "65.64/26.2.0.192.in-addr.arpa.") is not None
+
+
+def test_classless_owner_needs_allow_flag() -> None:
+    assert validate_record_owner("64/26", allow_classless=True) == "64/26"
+    with pytest.raises(ValueError):
+        validate_record_owner("64/26")
+    with pytest.raises(ValueError):
+        validate_record_owner("x.64/26", allow_classless=True)
+
+
+@pytest.mark.parametrize("rtype", ["NS", "DS", "ns"])
+def test_classless_owner_ok_for_delegation(rtype: str) -> None:
+    assert (
+        classless_owner_error(rtype, "64/26.2.0.192.in-addr.arpa", "2.0.192.in-addr.arpa.") is None
+    )
+    assert (
+        bind_check_names_error(
+            rtype, "64/26.2.0.192.in-addr.arpa", "ns1.example.net.", origin="2.0.192.in-addr.arpa."
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("rtype", "owner", "origin"),
+    [
+        ("A", "64/26.2.0.192.in-addr.arpa", "2.0.192.in-addr.arpa."),
+        ("PTR", "64/26.2.0.192.in-addr.arpa", "2.0.192.in-addr.arpa."),
+        ("NS", "64/24.2.0.192.in-addr.arpa", "2.0.192.in-addr.arpa."),
+        ("NS", "64/26.example.com", "example.com."),
+        ("NS", "x.64/26.2.0.192.in-addr.arpa", "2.0.192.in-addr.arpa."),
+    ],
+)
+def test_classless_owner_refused_elsewhere(rtype: str, owner: str, origin: str) -> None:
+    assert classless_owner_error(rtype, owner, origin) is not None
+
+
+def test_classless_owner_check_ignores_the_zones_own_slash() -> None:
+    zone = "64/26.2.0.192.in-addr.arpa."
+    assert classless_owner_error("PTR", "65.64/26.2.0.192.in-addr.arpa", zone) is None
+    assert classless_owner_error("A", "x.64/26.2.0.192.in-addr.arpa", zone) is None
