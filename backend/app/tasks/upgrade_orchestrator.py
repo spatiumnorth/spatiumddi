@@ -47,7 +47,13 @@ from sqlalchemy import select
 from app.config import settings
 from app.core.db_transient import is_transient_db_error
 from app.db import task_session
-from app.services.upgrades.orchestrator import OrchestratorError, drive_upgrade
+from app.services.upgrades.orchestrator import (
+    HOP_HEARTBEAT_TTL_S,
+    OrchestratorError,
+    drive_upgrade,
+    hop_heartbeat_key,
+    touch_hop_heartbeat,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -305,6 +311,7 @@ def drive_upgrade_run(  # type: ignore[type-arg]
     the run."""
     own = os.environ.get("NODE_NAME") or None
     if avoid_node and own == avoid_node and hops < _MAX_HANDOFF_HOPS:
+        touch_hop_heartbeat(run_id)
         drive_upgrade_run.apply_async(  # type: ignore[attr-defined]
             args=[run_id],
             kwargs={"avoid_node": avoid_node, "hops": hops + 1},
@@ -313,6 +320,7 @@ def drive_upgrade_run(  # type: ignore[type-arg]
         logger.info("upgrade_drive_passed_on", run_id=run_id, node=own, hops=hops + 1)
         return {"run_id": run_id, "state": "passed_on"}
     if avoid_version and settings.version == avoid_version and hops < _MAX_VERSION_HOPS:
+        touch_hop_heartbeat(run_id)  # #3851: the chain is alive; the sweep reads it
         drive_upgrade_run.apply_async(  # type: ignore[attr-defined]
             args=[run_id],
             kwargs={"avoid_version": avoid_version, "hops": hops + 1},
@@ -406,14 +414,36 @@ _HANDOFF_GRACE_S = _MAX_HANDOFF_HOPS * _HANDOFF_HOP_DELAY_S + 150
 _VERSION_HANDOFF_GRACE_S = _MAX_VERSION_HOPS * _HANDOFF_HOP_DELAY_S + 300
 
 
-def _redrive_kwargs(progress: dict[str, Any], now: float) -> dict[str, Any] | None:
+def _hop_chain_lost(run_id: Any, at: float, now: float, redis_client: Any) -> bool:
+    """#3851 — True only when the hand-off's hop heartbeat is confirmed
+    expired: past its first TTL and the key absent. Any doubt (no client, a
+    Redis error) answers False, i.e. still in transit."""
+    if redis_client is None or run_id is None or now - at <= HOP_HEARTBEAT_TTL_S:
+        return False
+    try:
+        return redis_client.get(hop_heartbeat_key(run_id)) is None
+    except RedisError:
+        return False
+
+
+def _redrive_kwargs(
+    progress: dict[str, Any],
+    now: float,
+    redis_client: Any = None,
+    run_id: Any = None,
+) -> dict[str, Any] | None:
     """The ``drive_upgrade_run`` kwargs that carry a run on as its last drive
     meant to, or None while a hand-off it made is still in transit.
 
     A re-drive keeps the hand-off's request: a drive that handed off before
     draining its own node asked not to run there (#1449), and one that moved
     the shared tags asked for a worker off the old tag (#1710). Dropping
-    either would land the re-driven drive exactly where it must not be."""
+    either would land the re-driven drive exactly where it must not be.
+
+    A version hand-off marked ``hop_heartbeat`` (#3851) is in transit only
+    while its heartbeat key lives; once it has expired the hop was lost with
+    its worker and the run is re-driven without waiting out the full grace.
+    Unmarked (older build) hand-offs keep the grace."""
     from datetime import datetime  # noqa: PLC0415
 
     from app.services.upgrades import shared_tags  # noqa: PLC0415
@@ -443,7 +473,8 @@ def _redrive_kwargs(progress: dict[str, Any], now: float) -> dict[str, Any] | No
     if flip.get("handed_off_at") and record.get("from_tag"):
         at = _ts(flip["handed_off_at"])
         if at >= taken_over_at and now - at < _VERSION_HANDOFF_GRACE_S:
-            return None
+            if not (flip.get("hop_heartbeat") and _hop_chain_lost(run_id, at, now, redis_client)):
+                return None
         kwargs["avoid_version"] = str(record["from_tag"])
     return kwargs
 
@@ -498,7 +529,7 @@ def resume_orphaned_runs_sync(
             # A live drive renews it. The next free sighting starts over.
             redis_client.delete(seen_key)
             continue
-        kwargs = _redrive_kwargs(progress, now)
+        kwargs = _redrive_kwargs(progress, now, redis_client, rid)
         if kwargs is None:
             redis_client.delete(seen_key)
             continue  # a hand-off is still carrying the run on
@@ -514,6 +545,8 @@ def resume_orphaned_runs_sync(
         ):
             continue
         redis_client.delete(seen_key)
+        if "avoid_version" in kwargs:
+            touch_hop_heartbeat(rid)  # the re-driven chain's first hop (#3851)
         drive_upgrade_run.apply_async(args=[str(rid)], kwargs=kwargs)  # type: ignore[attr-defined]
         logger.warning("upgrade_orphaned_run_redriven", run_id=str(rid), **kwargs)
         redriven.append(str(rid))
