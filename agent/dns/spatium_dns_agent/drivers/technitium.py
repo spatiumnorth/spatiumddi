@@ -94,6 +94,8 @@ _API_BASE = "http://127.0.0.1:5380/api"
 # loopback only: the agent dials 127.0.0.1, and listing ::1 would make
 # Kestrel throw on a container with IPv6 disabled and take the API down.
 _WEB_SERVICE_LOCAL_ADDRESSES = "127.0.0.1"
+_CONFIG_DIR = Path("/etc/dns")
+_WEB_CONFIG_NAME = "webservice.config"
 _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
@@ -2291,6 +2293,81 @@ def _creds_message(reason: str, detail: str = "") -> str:
         "clear of Technitium's 5-attempt login lockout"
     )
     return f"{what}. {fix}." + (f" Technitium said: {detail}" if detail else "")
+
+
+def _web_config_bind_span(blob: bytes) -> tuple[int, int, list[str]] | None:
+    """Locate the stored web-service address list in a ``webservice.config``.
+
+    Layout (Technitium 15.x, versions 1-4 share this prefix): ``"WC"``,
+    version byte, int32 HTTP port, int32 TLS port, a count byte, then
+    ``count`` addresses each tagged ``1`` + 4 bytes or ``2`` + 16 bytes.
+    Returns ``(start, end, addresses)`` of the count byte + addresses, or
+    ``None`` when the bytes are not that layout.
+    """
+    if len(blob) < 12 or blob[:2] != b"WC" or not 1 <= blob[2] <= 4:
+        return None
+    start = 11
+    count = blob[start]
+    pos = start + 1
+    addrs: list[str] = []
+    for _ in range(count):
+        if pos >= len(blob) or blob[pos] not in (1, 2):
+            return None
+        size = 4 if blob[pos] == 1 else 16
+        raw = blob[pos + 1 : pos + 1 + size]
+        if len(raw) != size:
+            return None
+        addrs.append(str(ipaddress.ip_address(raw)))
+        pos += 1 + size
+    return start, pos, addrs
+
+
+def pin_stored_web_service_bind(config_dir: Path = _CONFIG_DIR) -> bool:
+    """Make an existing ``webservice.config`` bind to loopback before the daemon starts.
+
+    ``DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES`` only applies to a fresh
+    ``/etc/dns``; an older one keeps its stored bind, and the daemon would
+    listen on it from its first start until ``_pin_web_service_to_loopback``
+    corrected it through the API. Only the address list is rewritten, the
+    rest of the file is copied byte for byte; the original is kept once as
+    ``webservice.config.spatium-bak`` and the new file lands atomically. A
+    missing file (fresh install: the env var handles it) or an unrecognised
+    layout is left untouched. Returns True when the file was rewritten.
+    """
+    path = config_dir / _WEB_CONFIG_NAME
+    try:
+        blob = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("technitium_web_config_unreadable", error=str(exc))
+        return False
+    span = _web_config_bind_span(blob)
+    if span is None:
+        log.warning("technitium_web_config_format_unrecognised", path=str(path))
+        return False
+    start, end, addrs = span
+    if addrs == [_WEB_SERVICE_LOCAL_ADDRESSES]:
+        return False
+    loopback = ipaddress.ip_address(_WEB_SERVICE_LOCAL_ADDRESSES).packed
+    new = blob[:start] + bytes([1, 1]) + loopback + blob[end:]
+    tmp = config_dir / (_WEB_CONFIG_NAME + ".spatium-tmp")
+    try:
+        backup = config_dir / (_WEB_CONFIG_NAME + ".spatium-bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        with tmp.open("wb") as fh:
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("technitium_web_config_rewrite_failed", error=str(exc))
+        tmp.unlink(missing_ok=True)
+        return False
+    log.info("technitium_web_config_bind_rewritten", previous=addrs)
+    return True
 
 
 class TechnitiumDriver(DriverBase):
@@ -5135,10 +5212,14 @@ class TechnitiumDriver(DriverBase):
                 note="did not spawn a second daemon",
             )
             return
+        # An existing /etc/dns keeps its stored bind, so rewrite it before
+        # the daemon's first listener rather than via the API afterwards.
+        pin_stored_web_service_bind(_CONFIG_DIR)
         env = dict(os.environ)
         env["DNS_SERVER_ADMIN_PASSWORD"] = self.admin_bootstrap_password()
-        # #1776: first-boot only (see _pin_web_service_to_loopback for
-        # an existing /etc/dns). Overrides an operator-set value on purpose.
+        # #1776: first-boot only (an existing config is rewritten by
+        # pin_stored_web_service_bind above; _pin_web_service_to_loopback is
+        # the second line). Overrides an operator-set value on purpose.
         env["DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES"] = _WEB_SERVICE_LOCAL_ADDRESSES
         log_path = self.state_dir / "technitium.log"
         log_fh = log_path.open("ab", buffering=0)
