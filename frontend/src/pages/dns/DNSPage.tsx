@@ -1,5 +1,5 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
@@ -6762,12 +6762,14 @@ function SyncStat({
  * guest VLAN only" is a view whose match_clients is the guest CIDRs plus
  * a blocklist scoped to that view.
  */
-function ViewsTab({ group }: { group: DNSServerGroup }) {
+export function ViewsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { can } = useDnsGrants();
   const [editing, setEditing] = useState<DNSView | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
+  // #4180 — the read-only detail modal a row click / Enter opens.
+  const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const { data: viewsData, error: viewsError } = useQuery({
@@ -6783,6 +6785,11 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
     queryKey: ["dns-blocklists"],
     queryFn: () => dnsBlocklistApi.list(),
   });
+  const { data: groupZones = [] } = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+  const detailView = views.find((v) => v.id === detailId) ?? null;
 
   // Per-view RPZ is rendered by the BIND9 driver only — render_rpz_zone is
   // a no-op on Windows / PowerDNS / cloud, and Technitium blocks natively
@@ -6888,7 +6895,18 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
             return (
               <div
                 key={v.id}
-                className="rounded-md border bg-card px-3 py-2.5 group"
+                role="button"
+                tabIndex={0}
+                aria-label={`View details of ${v.name}`}
+                onClick={() => setDetailId(v.id)}
+                onKeyDown={(e) => {
+                  // Only the row itself: Enter on an inner button is its own.
+                  if (e.target === e.currentTarget && e.key === "Enter") {
+                    e.preventDefault();
+                    setDetailId(v.id);
+                  }
+                }}
+                className="cursor-pointer rounded-md border bg-card px-3 py-2.5 hover:bg-accent/30 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -6904,12 +6922,13 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                       </span>
                     )}
                   </div>
-                  <div className="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100">
+                  <div className="flex shrink-0 items-center gap-1">
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                       title="Edit view"
                       aria-label="Edit view"
-                      onClick={() => {
+                      onClick={(e) => {
+                        e.stopPropagation();
                         setError("");
                         setEditing(v);
                       }}
@@ -6924,7 +6943,8 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                       title="Delete view"
                       aria-label="Delete view"
-                      onClick={() => {
+                      onClick={(e) => {
+                        e.stopPropagation();
                         setError("");
                         setConfirmDelete(v);
                       }}
@@ -6979,6 +6999,27 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
 
       {error && <FormError className="mt-2">{error}</FormError>}
 
+      {detailView && !editing && !confirmDelete && (
+        <ViewDetailModal
+          view={detailView}
+          zones={groupZones.filter((z) => z.view_id === detailView.id)}
+          blocklists={blocklists.filter((b) =>
+            b.applied_view_ids?.includes(detailView.id),
+          )}
+          canEdit={can("write", "dns_group")}
+          canDelete={can("delete", "dns_group")}
+          onClose={() => setDetailId(null)}
+          onEdit={() => {
+            setError("");
+            setEditing(detailView);
+          }}
+          onDelete={() => {
+            setError("");
+            setConfirmDelete(detailView);
+          }}
+        />
+      )}
+
       {(creating || editing) && (
         <ViewModal
           groupId={group.id}
@@ -7032,6 +7073,112 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
     </div>
+  );
+}
+
+/** Read-only detail of one view (#4180). Edit / Delete hand over to the
+ * existing edit form and delete confirm, under the row actions' gates. */
+function ViewDetailModal({
+  view,
+  zones,
+  blocklists,
+  canEdit,
+  canDelete,
+  onClose,
+  onEdit,
+  onDelete,
+}: {
+  view: DNSView;
+  zones: DNSZone[];
+  blocklists: { id: string; name: string }[];
+  canEdit: boolean;
+  canDelete: boolean;
+  onClose: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const chips = (items: string[] | null | undefined, empty: string) =>
+    items && items.length > 0 ? (
+      <div className="flex flex-wrap gap-1">
+        {items.map((c) => (
+          <span
+            key={c}
+            className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-xs font-mono"
+          >
+            {c}
+          </span>
+        ))}
+      </div>
+    ) : (
+      <span className="text-xs text-muted-foreground">{empty}</span>
+    );
+  const row = (label: string, body: ReactNode) => (
+    <div className="grid grid-cols-[9rem_1fr] gap-2 py-1.5 text-sm">
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div>{body}</div>
+    </div>
+  );
+  return (
+    <Modal title={`View ${view.name}`} onClose={onClose} wide>
+      <div className="divide-y">
+        {row("Name", <span className="font-mono">{view.name}</span>)}
+        {view.description && row("Description", view.description)}
+        {row("Order", view.order)}
+        {row("Match clients", chips(view.match_clients, "none"))}
+        {row("Match destinations", chips(view.match_destinations, "any"))}
+        {row("Recursion", view.recursion ? "Enabled" : "Disabled")}
+        {row(
+          "Allow query",
+          chips(view.allow_query, "inherited from the group"),
+        )}
+        {row(
+          "Allow query cache",
+          chips(view.allow_query_cache, "inherited from the group"),
+        )}
+        {blocklists.length > 0 &&
+          row(
+            "Blocking lists",
+            chips(
+              blocklists.map((b) => b.name),
+              "none",
+            ),
+          )}
+        {row(
+          `Zones (${zones.length})`,
+          zones.length === 0 ? (
+            <span className="text-xs text-muted-foreground">
+              No zone is scoped to this view.
+            </span>
+          ) : (
+            <ul className="space-y-0.5 font-mono text-xs">
+              {zones.map((z) => (
+                <li key={z.id}>{z.name}</li>
+              ))}
+            </ul>
+          ),
+        )}
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <button
+          type="button"
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={onDelete}
+          {...permissionGate(canDelete, NEEDS_GROUP_DELETE)}
+        >
+          Delete
+        </button>
+        <button
+          type="button"
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={onEdit}
+          {...permissionGate(canEdit, NEEDS_GROUP_WRITE)}
+        >
+          Edit
+        </button>
+      </div>
+    </Modal>
   );
 }
 
