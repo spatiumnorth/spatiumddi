@@ -185,3 +185,49 @@ def test_heartbeat_write_failure_does_not_break_the_pass_on(
     out = t.drive_upgrade_run.run(str(uuid.uuid4()), avoid_version=OLD, hops=1)
     assert out["state"] == "passed_on" and len(calls) == 1
     assert orchestrator.touch_hop_heartbeat(uuid.uuid4()) is False
+
+
+def test_beat_start_enqueues_the_orphan_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared-tag flip recreates beat mid hand-off; its first scheduled
+    sweep is a full interval away, so one is queued as beat starts."""
+    from celery.signals import beat_init
+
+    from app import celery_app as ca
+
+    assert any(
+        getattr(r(), "__name__", "") == "_queue_orphan_sweep_at_start"
+        for _, r in beat_init.receivers
+    )
+    sent: list[str] = []
+    monkeypatch.setattr(ca.celery_app, "send_task", lambda name, *a, **kw: sent.append(name))
+    ca._queue_orphan_sweep_at_start()
+    assert sent == ["app.tasks.upgrade_orchestrator.resume_orphaned_runs"]
+
+
+def test_beat_start_sweep_failing_to_queue_never_blocks_beat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import celery_app as ca
+
+    def boom(*a: Any, **kw: Any) -> None:
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(ca.celery_app, "send_task", boom)
+    ca._queue_orphan_sweep_at_start()  # must not raise
+
+
+def test_sighting_before_a_beat_restart_counts_after_it(
+    env: tuple[FakeRedis, list[Any]],
+) -> None:
+    """The first sighting is in Redis, not in the beat process: a sweep run
+    by the restarted beat at start is the second sighting and re-drives."""
+    from app.tasks import upgrade_orchestrator as t
+
+    r, calls = env
+    rid = uuid.uuid4()
+    p = _progress()
+    assert _sweep(r, rid, T0 + 70, p) == []  # old beat: first sighting
+    # old beat killed; ~200 s with no sweep; the new beat's start-up sweep:
+    r.clock = T0 + 270
+    assert t.resume_orphaned_runs_sync([(rid, p)], r, now=T0 + 270) == [str(rid)]
+    assert len(calls) == 1
