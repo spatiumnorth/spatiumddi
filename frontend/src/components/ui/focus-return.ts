@@ -31,27 +31,50 @@ function focusProgrammatic(el: HTMLElement) {
   el.focus();
 }
 
+const ROW = 'tr, [role="row"], li, [role="treeitem"]';
+
+/** The repeated unit `from` sits in: a row, a tree item, or (#4221) a card,
+ *  a `div` whose next or previous sibling has the same tag and classes. */
+function repeatedUnit(from: Element): HTMLElement | null {
+  const row = from.closest<HTMLElement>(ROW);
+  if (row) return row;
+  let a: HTMLElement | null = from.parentElement;
+  for (let i = 0; a && i < 6; i++, a = a.parentElement) {
+    if (a.matches('main, body, [role="dialog"]')) return null;
+    const twin = (s: Element | null) =>
+      !!s && s.tagName === a!.tagName && s.className === a!.className;
+    if (twin(a.nextElementSibling) || twin(a.previousElementSibling)) return a;
+  }
+  return null;
+}
+
 /** Fallbacks for the control `from`, resolved at use time: the same control
- *  in the next row, then in the previous row, then the list or table, then
- *  the page's heading. Rows are `tr`, `[role=row]` or `li`. */
+ *  in the next row, then in the previous row, then the list, table or tree,
+ *  then the page's heading. A unit is a `tr`, `[role=row]`, `li`, tree item
+ *  or card. */
 export function captureSuccessors(
   from: Element | null | undefined,
 ): FocusSuccessor[] {
   const out: FocusSuccessor[] = [];
   if (from) {
-    const row = from.closest<HTMLElement>('tr, [role="row"], li');
+    const row = repeatedUnit(from);
     if (row) {
-      const idx = focusables(row).indexOf(from as HTMLElement);
+      // `from` is the unit itself (a tree item that takes focus): the
+      // neighbour unit is the target, not a control inside it.
+      const idx =
+        from === row ? -1 : focusables(row).indexOf(from as HTMLElement);
       const pick = (r: Element | null) => () => {
         if (!r || !r.isConnected) return null;
+        if (from === row) return r as HTMLElement;
         const items = focusables(r);
         return items[Math.max(idx, 0)] ?? items[0] ?? null;
       };
       out.push(pick(row.nextElementSibling), pick(row.previousElementSibling));
-      const list = row.closest<HTMLElement>(
-        'table, [role="table"], [role="grid"], ul, ol',
+      const list = row.parentElement?.closest<HTMLElement>(
+        'table, [role="table"], [role="grid"], [role="tree"], ul, ol',
       );
-      if (list) out.push(() => (list.isConnected ? list : null));
+      const container = list ?? row.parentElement;
+      if (container) out.push(() => (container.isConnected ? container : null));
     }
   }
   out.push(() =>
@@ -88,14 +111,10 @@ export function returnFocus(
   const target = targets.find(usable);
   if (target) focusProgrammatic(target);
   if (target && document.activeElement === target) {
-    // Only a control in a list row can be removed by a refetch; anything
-    // else keeps no watcher.
-    if (
-      typeof MutationObserver === "undefined" ||
-      !target.closest('tr, [role="row"], li')
-    ) {
-      return;
-    }
+    // Any control can be removed by a refetch (a table row's button, a tree
+    // item, a card's Delete, #4221). The watcher acts only if the target
+    // leaves the page and focus falls to the body.
+    if (typeof MutationObserver === "undefined") return;
     const obs = new MutationObserver(() => {
       if (target.isConnected) return;
       obs.disconnect();
