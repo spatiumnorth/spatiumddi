@@ -495,3 +495,63 @@ async def test_scoped_holder_cannot_flip_the_inherit_switches(
     db_session.expire_all()
     await db_session.refresh(x)
     assert x.dns_inherit_settings is False
+
+
+@pytest.mark.asyncio
+async def test_scoped_holder_cannot_clear_inheritance_through_a_zone_or_ddns_opt_in(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Naming the inherited zone, or turning DDNS on, also stores the matching
+    inherit switch as off. The grant may not change that switch, so both are
+    refused and nothing is stored; a type-level writer still gets the flip."""
+    x, y, _o = await _two_subnets(db_session)
+    own, _foreign = await _zones(db_session)
+    block = await db_session.get(IPBlock, x.block_id)
+    assert block is not None
+    block.dns_zone_id = str(own.id)
+    block.dns_inherit_settings = False
+    own_id = str(own.id)
+    y_id = y.id
+    h = await _user(db_session, _rw(x))
+    full = await _user(db_session, [{"action": "*", "resource_type": "*"}])
+    await db_session.commit()
+
+    for body in ({"dns_zone_id": own_id}, {"ddns_enabled": True}):
+        r = await client.put(f"/api/v1/ipam/subnets/{x.id}", json=body, headers=h)
+        assert r.status_code == 403, (body, r.text)
+        # An explicit "stay inherited" next to the opt-in does not hide it.
+        r = await client.put(
+            f"/api/v1/ipam/subnets/{x.id}",
+            json={**body, "dns_inherit_settings": True, "ddns_inherit_settings": True},
+            headers=h,
+        )
+        assert r.status_code == 403, (body, r.text)
+    db_session.expire_all()
+    await db_session.refresh(x)
+    assert x.dns_inherit_settings is True
+    assert x.ddns_inherit_settings is True
+    assert x.ddns_enabled is False
+
+    # The grant keeps what it had: a plain edit still passes.
+    r = await client.put(f"/api/v1/ipam/subnets/{x.id}", json={"description": "d"}, headers=h)
+    assert r.status_code == 200, r.text
+
+    r = await client.put(f"/api/v1/ipam/subnets/{y_id}", json={"dns_zone_id": own_id}, headers=full)
+    assert r.status_code == 200, r.text
+    r = await client.put(f"/api/v1/ipam/subnets/{y_id}", json={"ddns_enabled": True}, headers=full)
+    assert r.status_code == 200, r.text
+    assert r.json()["dns_inherit_settings"] is False
+    assert r.json()["ddns_inherit_settings"] is False
+
+
+@pytest.mark.asyncio
+async def test_scoped_holder_may_change_ddns_on_a_subnet_with_its_own_settings(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    x, _y, _o = await _two_subnets(db_session)
+    x.ddns_inherit_settings = False
+    h = await _user(db_session, _rw(x))
+    await db_session.commit()
+    r = await client.put(f"/api/v1/ipam/subnets/{x.id}", json={"ddns_enabled": True}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["ddns_enabled"] is True
