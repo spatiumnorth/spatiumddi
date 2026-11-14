@@ -492,9 +492,13 @@ when there are none.
 
 Every 403 the permission gates produce leaves a `denied` audit row, including a
 refusal from a route that takes `SuperAdmin` (recorded as `access` on
-`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
-dependency rather than check `is_effective_superadmin` and raise by hand, or its
-refusal is invisible to the audit log and the security dashboard.
+`superadmin`, #2304). A 403 a handler raises itself, after its own
+`user_has_permission` check, is recorded too (#3644): the API's 403 handler writes
+a `denied` row (`endpoint` as the resource, the method and path as the display)
+when the caller was authenticated and no gate already wrote one. Prefer a gate,
+or `SuperAdmin` for a superadmin-only handler, because the row then names the
+permission refused. A refusal with no request to attribute (the approval engine)
+leaves no row.
 
 ## The console mirrors the server, it does not enforce
 

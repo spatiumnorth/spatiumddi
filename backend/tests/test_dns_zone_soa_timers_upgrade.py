@@ -404,3 +404,29 @@ async def test_a_failed_switch_never_fails_the_heartbeat(
         .execution_options(populate_existing=True)
     )
     assert renders is True
+
+
+@pytest.mark.asyncio
+async def test_register_records_whether_the_agent_reports_served_serials_3940(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DNS_AGENT_KEY", "psk-3940")
+    grp = await _group(db_session, serves=False)
+    await db_session.commit()
+    for name, header in (("ns-new", "soa-timers,served-serials"), ("ns-old", "soa-timers")):
+        r = await client.post(
+            REGISTER,
+            headers={"X-DNS-Agent-Key": "psk-3940", AGENT_FEATURES_HEADER: header},
+            json={"hostname": name, "fingerprint": f"fp-{name}", "group_name": grp.name},
+        )
+        assert r.status_code == 200, r.text
+    flags = dict(
+        (
+            await db_session.execute(
+                select(DNSServer.name, DNSServer.agent_reports_served_serials)
+                .where(DNSServer.group_id == grp.id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    assert flags == {"ns-new": True, "ns-old": False}

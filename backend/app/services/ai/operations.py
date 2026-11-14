@@ -69,6 +69,7 @@ from app.services.pcap import (
     validate_bpf_filter,
     validate_interface,
 )
+from app.services.refusal import HTTPRefusal, ValueRefusal
 
 # Per-proposal TTL. 30 minutes is a generous window for a thoughtful
 # review without keeping yesterday's proposals lying around — the
@@ -613,7 +614,12 @@ async def _preview_create_ip_address(
             )
             if clash is not None:
                 owner = f"{args.hostname}.{zone.name.rstrip('.')}"
-                return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
+                return PreviewResult(
+                    ok=False,
+                    detail=describe_cname_conflict(
+                        rtype, owner, clash, requester_safe=preview_is_for_requester()
+                    ),
+                )
             parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
@@ -638,10 +644,8 @@ def _describe_address_warnings(warnings: list[dict[str, Any]], subnet: Subnet) -
             # Not the reverse zone's name: the requester may not read it.
             parts.append("the reverse DNS name for this address already holds a PTR record")
         elif kind == "dynamic_pool":
-            parts.append(
-                f"{w.get('address')} is inside the DHCP dynamic pool "
-                f"{w.get('pool_start')} to {w.get('pool_end')}"
-            )
+            # Not the pool's bounds: the requester may hold no read on the scope.
+            parts.append(f"{w.get('address')} is inside a DHCP dynamic pool")
         elif kind == "public_facing_private_ip":
             parts.append(
                 f"{w.get('address') or 'a private address'} would be published into zone "
@@ -2334,15 +2338,10 @@ async def _validate_submit_allocate_subnet(
         try:
             apply_template_on_create_subnet(template, body)
         except TemplateError as exc:
-            # The allocate's words name the template; the requester may hold
-            # no read on templates, so say what is wrong without the name.
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=(
-                    f"The IPAM template {template_id} is for {template.applies_to}s, "
-                    "not subnets."
-                ),
-            ) from exc
+            # The allocate's words name the template, and a template of the
+            # wrong kind must not read differently from an unknown id: the
+            # requester may hold no read on templates.
+            raise HTTPException(status_code=404, detail="No IPAM template has that id.") from exc
     await enforce_required_custom_fields(
         db,
         "subnet",
@@ -2377,6 +2376,20 @@ async def _apply_allocate_subnet(
         refusal = _target_block_refusal(user, block)
         if refusal is not None:
             raise refusal
+
+    if args.template_id:
+        from app.models.ipam import IPAMTemplate  # noqa: PLC0415
+
+        tmpl = await db.get(IPAMTemplate, UUID(args.template_id))
+        unknown = "No IPAM template has that id."
+        if tmpl is None:
+            raise HTTPRefusal(404, "Template not found", requester_text=unknown)
+        if tmpl.applies_to != "subnet":
+            raise HTTPRefusal(
+                422,
+                f"Template {tmpl.name!r} applies to {tmpl.applies_to!r}, not 'subnet'.",
+                requester_text=unknown,
+            )
 
     alloc = SubnetAllocate(
         prefix_len=args.prefix_len,
@@ -2862,7 +2875,12 @@ async def _preview_create_dns_record(
         return PreviewResult(ok=False, detail=APEX_CNAME_DETAIL)
     clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
     if clash is not None:
-        return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
+        return PreviewResult(
+            ok=False,
+            detail=describe_cname_conflict(
+                rtype, owner, clash, requester_safe=preview_is_for_requester()
+            ),
+        )
 
     # Surface a heads-up if a row with the same (zone, name, type, value)
     # already exists; preview doesn't reject — operator may want a parallel
@@ -3034,13 +3052,22 @@ async def _apply_create_dns_record(
         port=port,
     )
     if existing is not None:
-        raise ValueError(describe_identical(existing))
+        raise ValueRefusal(
+            describe_identical(existing),
+            requester_text=(
+                f"An identical {existing.record_type} record {existing.fqdn} -> "
+                f"{existing.value} already exists."
+            ),
+        )
     # #1381 — a CNAME stands alone at its name, as on the REST path.
     if rtype == "CNAME" and is_apex(name):
         raise ValueError(APEX_CNAME_DETAIL)
     clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
     if clash is not None:
-        raise ValueError(describe_cname_conflict(rtype, fqdn, clash))
+        raise ValueRefusal(
+            describe_cname_conflict(rtype, fqdn, clash),
+            requester_text=describe_cname_conflict(rtype, fqdn, clash, requester_safe=True),
+        )
 
     row = DNSRecord(
         zone_id=zone.id,
