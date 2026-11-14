@@ -5803,6 +5803,9 @@ export interface DNSServer {
   duplicate_agent_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
+  /** A delete was requested and a worker is still removing the server's rows
+   * (#4173). The row shows "Removing…" until it disappears. */
+  removing?: boolean;
   is_primary: boolean;
   /** Per-server maintenance mode (issue #182). When true the control
    * plane skips shipping pending DNSRecordOp rows + suppresses the
@@ -10633,8 +10636,9 @@ export interface AgentLogScopeEcho {
 export interface DNSQueryLogRow {
   id: number;
   ts: string;
-  /** Which server logged it (#2120). */
-  server_id: string;
+  /** Which server logged it (#2120). NULL once the server was deleted
+   * (#4173); `server_name` is then the name it logged under. */
+  server_id: string | null;
   server_name: string;
   client_ip: string | null;
   client_port: number | null;
@@ -10675,8 +10679,9 @@ export interface DNSQueryLogResponse extends AgentLogScopeEcho {
 export interface DHCPActivityLogRow {
   id: number;
   ts: string;
-  /** Which server logged it (#2120). */
-  server_id: string;
+  /** Which server logged it (#2120). NULL once the server was deleted
+   * (#4173); `server_name` is then the name it logged under. */
+  server_id: string | null;
   server_name: string;
   severity: string | null;
   code: string | null;
@@ -10841,6 +10846,8 @@ export interface RPZHitRow {
   id: string;
   ts: string;
   server_id: string | null;
+  /** Name at ingest; the only attribution once the server is deleted (#4173). */
+  server_name?: string | null;
   client_ip: string | null;
   qname: string | null;
   trigger: string;

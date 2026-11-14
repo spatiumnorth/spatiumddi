@@ -6412,8 +6412,10 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
     queryKey: ["dns-servers", group.id],
     queryFn: () => dnsApi.listServers(group.id),
     // Refetch frequently so the health dot stays fresh as the Celery
-    // Beat-scheduled dns-health-sweep task updates server rows.
-    refetchInterval: 30_000,
+    // Beat-scheduled dns-health-sweep task updates server rows. While a
+    // delete is being worked off (#4173) poll quickly so "Removing…" clears.
+    refetchInterval: (query) =>
+      query.state.data?.some((s) => s.removing) ? 3_000 : 30_000,
   });
   // The serials line counts the group's zones, so it waits for that read: a
   // refused or failed one draws no "no zones" (#3385).
@@ -6544,11 +6546,20 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   >
                     {s.name}
                   </button>
-                  <span
-                    className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusCls[s.status] ?? "bg-muted text-muted-foreground"}`}
-                  >
-                    {s.status}
-                  </span>
+                  {s.removing ? (
+                    <span
+                      className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-400"
+                      title="Being deleted in the background; its agent is refused and the row disappears when done"
+                    >
+                      Removing…
+                    </span>
+                  ) : (
+                    <span
+                      className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusCls[s.status] ?? "bg-muted text-muted-foreground"}`}
+                    >
+                      {s.status}
+                    </span>
+                  )}
                   <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
                     {s.driver}
                   </span>
@@ -6709,7 +6720,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
       {confirmDeleteServer && (
         <ConfirmDestroyModal
           title="Delete DNS Server"
-          description={`Remove "${confirmDeleteServer.name}" (${confirmDeleteServer.host}:${confirmDeleteServer.port}) from this group?`}
+          description={`Remove "${confirmDeleteServer.name}" (${confirmDeleteServer.host}:${confirmDeleteServer.port}) from this group? Its query log and RPZ history is kept; the rest is removed in the background.`}
           checkLabel="I understand this server will be removed from SpatiumDDI management."
           onConfirm={() => del.mutate(confirmDeleteServer)}
           onClose={() => setConfirmDeleteServer(null)}

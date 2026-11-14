@@ -291,6 +291,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     # status: active | unreachable | syncing | error | disabled
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
+    # #4173 — set when the operator asked for the server to be deleted; the
+    # heavy cascade runs in a worker task (``dns_server_removal``). While set the
+    # row shows as "Removing…" and its agent is refused. Not ``status``: the
+    # heartbeat and health sweep rewrite that every cycle.
+    removing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
