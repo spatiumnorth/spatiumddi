@@ -2088,7 +2088,7 @@ object, the level, who locked it and why. A parent delete (or split, merge,
 move) that would take a locked object with it is refused with the first five
 locked descendants named. Bulk edits and deletes skip the locked rows and list
 each one in the response (`skipped_locked` / `locked`); importers leave a locked
-row as it is and report it under `skipped`. An edit-locked scope also freezes its pools (its ranges); a locked reservation is not rewritten by the IPAM address it is linked to.
+row as it is and report it under `skipped`. An edit-locked scope also freezes its pools (its ranges); a locked reservation is not rewritten by the IPAM address it is linked to. The other direction holds too: an edit-locked IP address that mirrors a reservation refuses the reservation's own edit of hostname / MAC / address and its delete (a `delete` lock on the address does not, because the reservation's edit does not remove the address), naming the address.
 
 Lock and unlock with `PUT /api/v1/locks/{resource_type}/{id}` and
 `POST /api/v1/locks/{resource_type}/{id}/unlock` (a reason in both bodies);

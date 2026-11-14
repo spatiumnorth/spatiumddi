@@ -16,6 +16,10 @@
   `find_locked_resources` Copilot tool. Integration-owned rows cannot be
   locked.
 
+- An edit-locked IP address that mirrors a DHCP reservation now also
+  refuses the reservation's own hostname / MAC / address edit and its
+  delete (#3361).
+
 ### Migrations
 
 - `a3361c0de1f7` — #3361, adds the lock columns to `ip_space`,

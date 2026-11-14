@@ -675,6 +675,57 @@ async def assert_static_sync_unlocked(
         )
 
 
+# Reservation fields the DHCP -> IPAM mirror writes into the linked address row
+# (``upsert_ipam_for_static``): the reservation is the source of truth for them.
+STATIC_TO_IP_FIELDS: frozenset[str] = frozenset({"hostname", "mac_address", "ip_address"})
+
+
+async def assert_ip_mirror_unlocked(
+    db: AsyncSession,
+    static: DHCPStaticAssignment,
+    subnet_id: uuid.UUID,
+    changes: Mapping[str, Any] | None,
+) -> None:
+    """Refuse a reservation edit or delete that the DHCP -> IPAM mirror would
+    carry into an edit-locked IP address row (the reverse direction of
+    :func:`assert_static_sync_unlocked`).
+
+    The mirror rewrites the address row's hostname / MAC / address on an edit
+    and releases or removes it on a delete, so an edit lock on the address
+    would otherwise be bypassed from the DHCP side. ``changes=None`` is the
+    delete. The row is found by the reservation's own link, by the address's
+    back-link, and by the subnet + address the mirror itself keys on.
+    """
+    removing = changes is None
+    if not removing:
+        touched = [k for k in operative_changes(static, changes) if k in STATIC_TO_IP_FIELDS]
+        if not touched:
+            return
+    conds = [
+        IPAddress.static_assignment_id == str(static.id),
+        and_(IPAddress.subnet_id == subnet_id, IPAddress.address == str(static.ip_address)),
+    ]
+    if static.ip_address_id:
+        conds.append(IPAddress.id == static.ip_address_id)
+    children = await _locked_rows(
+        db,
+        "ip_address",
+        select(IPAddress).where(or_(*conds)),
+        DESCENDANT_LIMIT,
+        edit_only=True,
+    )
+    if children:
+        raise cascade_refusal(
+            "dhcp_static",
+            static,
+            children,
+            "deleted" if removing else "changed",
+            "the IPAM mirror of this reservation would be "
+            + ("removed" if removing else "rewritten")
+            + " in the edit-locked address(es)",
+        )
+
+
 async def sync_blocked_by_locked_records(
     db: AsyncSession, ip: IPAddress, action: str
 ) -> list[LockedChild]:

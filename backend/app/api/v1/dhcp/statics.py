@@ -308,6 +308,7 @@ async def update_static(
     # edit) stored since.
     changes = {k: v for k, v in changes.items() if not _same_value(k, getattr(st, k), v)}
     lock_svc.assert_editable("dhcp_static", st, changes)  # #3361
+    await lock_svc.assert_ip_mirror_unlocked(db, st, scope.subnet_id, changes)
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
@@ -346,6 +347,8 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
         raise HTTPException(status_code=404, detail="Static assignment not found")
     lock_svc.assert_deletable("dhcp_static", st)  # #3361
     scope = await db.get(DHCPScope, st.scope_id)
+    if scope is not None:
+        await lock_svc.assert_ip_mirror_unlocked(db, st, scope.subnet_id, None)
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
