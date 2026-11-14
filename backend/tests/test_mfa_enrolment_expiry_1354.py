@@ -121,7 +121,7 @@ async def test_an_expired_enrolment_cannot_be_verified(
     user, headers = await _user(db_session)
     secret = generate_secret()
     minted = int(time.time() - PENDING_ENROLMENT_TTL.total_seconds() - 60)
-    user.totp_secret_encrypted = _fernet().encrypt_at_time(secret.encode(), minted)
+    user.totp_secret_encrypted = _fernet()[0].encrypt_at_time(secret.encode(), minted)
     await db_session.commit()
 
     status = await client.get("/api/v1/auth/mfa/status", headers=headers)
