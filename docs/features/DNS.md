@@ -1195,7 +1195,7 @@ lists to `nxdomain`, which changes nothing they answer.
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
 - Block list entries are written as RPZ zone records
-- Updating the RPZ zone uses `rndc reload <rpz-zone>` (no full restart)
+- Updating the RPZ zone is an incremental RFC 2136 update when only a few names changed, else `rndc reload <rpz-zone>` (no full restart). The zone is dynamic, so a manual `rndc reload` alone does not re-read it: use `rndc freeze <rpz-zone>`, `rndc reload <rpz-zone>`, `rndc thaw <rpz-zone>`. See [DNS drivers](../drivers/DNS_DRIVERS.md)
 - Every list a scope draws on is folded into ONE RPZ zone per view (plus one group zone), so BIND's limit of 64 zones per `response-policy` statement can never be reached by assigning lists; there is deliberately no assignment-time cap (#3564)
 
 ### UI Features

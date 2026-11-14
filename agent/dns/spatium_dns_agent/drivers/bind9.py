@@ -2118,7 +2118,9 @@ def _zone_label(zname: str, view: str | None) -> str:
 #: ``CNAME rpz-drop.``. An entry whose list names no address ships the same
 #: bytes as before, so its ``rpz_sha256`` does not move and only this bump
 #: stops a #2157 agent's dropping file from being linked forward.
-_RPZ_RENDER_REVISION = 2
+#:
+#: 3 (#4191): a ``*.N`` owner is written once however many entries name it.
+_RPZ_RENDER_REVISION = 3
 _RPZ_HASH_SUFFIX = ".sha256"
 
 
@@ -2455,7 +2457,7 @@ def _rpz_diff(old: Path, new: Path) -> _RpzDiff | None:
 
     Both are our renders: ``$TTL``, an SOA whose serial moves with the content,
     an NS, then one resource record per line. Only the record lines are
-    compared, as a multiset of 128-bit hashes, so the working set is ~100 B a
+    compared, as a set of 128-bit hashes, so the working set is ~100 B a
     line rather than the lines themselves; the set shrinks as the new file is
     read, so what is left is exactly the removed lines, which a second pass
     over the old file turns back into text. Stops reading as soon as the budget
@@ -2471,10 +2473,13 @@ def _rpz_diff(old: Path, new: Path) -> _RpzDiff | None:
     m = re.fullmatch(rb"\$TTL (\d+)", new_head[0])
     if m is None:
         return None
+    # A zone is a set of records: a line written twice means nothing, so both
+    # sides are compared as sets and a repeat never counts as a change.
     keys: set[bytes] = set()
     for i, line in enumerate(_rpz_lines(old)):
         if i >= _RPZ_HEADER_LINES and line:
             keys.add(hashlib.blake2b(line, digest_size=16).digest())
+    in_new: set[bytes] = set()
     budget = min(
         _RPZ_INCR_MAX_CHANGES,
         max(_RPZ_INCR_MIN_BUDGET, int(len(keys) * _RPZ_INCR_MAX_FRACTION)),
@@ -2484,6 +2489,9 @@ def _rpz_diff(old: Path, new: Path) -> _RpzDiff | None:
         if i < _RPZ_HEADER_LINES or not line:
             continue
         digest = hashlib.blake2b(line, digest_size=16).digest()
+        if digest in in_new:
+            continue
+        in_new.add(digest)
         if digest in keys:
             keys.discard(digest)
         elif len(adds) >= budget:
@@ -2497,7 +2505,9 @@ def _rpz_diff(old: Path, new: Path) -> _RpzDiff | None:
         for i, line in enumerate(_rpz_lines(old)):
             if i < _RPZ_HEADER_LINES or not line:
                 continue
-            if hashlib.blake2b(line, digest_size=16).digest() in keys:
+            digest = hashlib.blake2b(line, digest_size=16).digest()
+            if digest in keys:
+                keys.discard(digest)  # once, however often the old file had it
                 removes.append(line.decode("utf-8"))
     return _RpzDiff(int(m.group(1)), removes, adds)
 
@@ -4442,6 +4452,15 @@ class Bind9Driver(DriverBase):
             for rdata in rdatas:
                 yield f"{domain} {rdata}"
             if is_wildcard:
+                # The ``*.`` twin is an owner of its own: an explicit
+                # ``*.N`` entry (adblock ``.N^``, #4037) beside a wildcard
+                # ``N`` would otherwise write the same lines twice (#4191).
+                wkey = f"*.{key}"
+                if wkey in seen:
+                    if seen[wkey] != rdatas:
+                        collisions.append(f"*.{domain}")
+                    continue
+                seen[wkey] = rdatas
                 for rdata in rdatas:
                     yield f"*.{domain} {rdata}"
         # Exceptions → passthrough (never blocked even if a broader rule

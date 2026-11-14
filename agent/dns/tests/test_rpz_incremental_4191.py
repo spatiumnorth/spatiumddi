@@ -538,3 +538,38 @@ def test_a_sighup_fallback_does_not_vouch_for_what_named_holds(
 
     assert named.messages == []
     assert "spatium-blocklist.rpz" in named.verbs("reload")
+
+
+# ── Duplicate lines ───────────────────────────────────────────────────────────
+
+
+def test_a_wildcard_owner_is_rendered_once_however_many_entries_name_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: _Named
+) -> None:
+    """``adonweb.ru`` (wildcard) and an explicit ``*.adonweb.ru`` both own
+    ``*.adonweb.ru``; the renderer wrote its lines twice."""
+    drv = _driver(tmp_path, monkeypatch)
+    bl = _bl(["adonweb.ru", "*.adonweb.ru", "other.example.test"])
+    bl["entries"][0]["is_wildcard"] = True
+    bl["entries"][1]["is_wildcard"] = False
+    _apply(drv, _flat([bl]))
+    lines = (tmp_path / "rendered" / RPZ_FILE).read_text().splitlines()
+    assert lines.count("*.adonweb.ru CNAME .") == 1
+
+
+def test_duplicate_lines_do_not_count_as_changes(tmp_path: Path) -> None:
+    """A file that repeats lines (an older render, a hand edit): +2 / -3 is
+    exactly 2 adds and 3 removes, repeats neither re-sent nor counted."""
+    head = "$TTL 60\n@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )\n@ IN NS localhost.\n"
+    base = [f"n{i}.example.test CNAME ." for i in range(200)]
+    old = base + base[:10] + base[:3]  # ten lines twice, three of them thrice
+    new_lines = base[3:] + ["x.example.test CNAME .", "y.example.test CNAME ."]
+    new = new_lines + new_lines[:10]
+    (tmp_path / "old.db").write_text(head.replace("( 1 ", "( 1 ") + "\n".join(old) + "\n")
+    (tmp_path / "new.db").write_text(head.replace("( 1 ", "( 2 ") + "\n".join(new) + "\n")
+
+    diff = bind9._rpz_diff(tmp_path / "old.db", tmp_path / "new.db")
+
+    assert diff is not None
+    assert sorted(diff.adds) == ["x.example.test CNAME .", "y.example.test CNAME ."]
+    assert sorted(diff.removes) == [f"n{i}.example.test CNAME ." for i in range(3)]
