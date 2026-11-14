@@ -1073,6 +1073,67 @@ function buildDnsTree(zones: DNSZone[]): DnsTreeNode[] {
   return roots;
 }
 
+// ── Reverse-zone folders for the sidebar tree (#4203) ────────────────────────
+
+// Reserved expand-state keys. A colon cannot appear in a zone name, so these
+// can never collide with a `DnsTreeNode.domain` in the same session set.
+const REVERSE_V4_KEY = "reverse:ipv4";
+const REVERSE_V6_KEY = "reverse:ipv6";
+
+interface ReverseFolder {
+  key: string;
+  label: string;
+  count: number;
+  children: DnsTreeNode[];
+}
+
+function isReverseV4(z: DNSZone): boolean {
+  return /(^|\.)in-addr\.arpa$/i.test(z.name.replace(/\.$/, ""));
+}
+function isReverseV6(z: DNSZone): boolean {
+  return /(^|\.)ip6\.arpa$/i.test(z.name.replace(/\.$/, ""));
+}
+
+/**
+ * Split `zones` into forward tree roots (as `buildDnsTree` builds them) and
+ * up to two reverse folders, IPv4 then IPv6. A folder is present only when
+ * the group has a zone of that family; its children are the family's zones
+ * nested as before, minus the empty `arpa` / `in-addr` / `ip6` scaffolding.
+ * `buildDnsTree` itself is unchanged for its other caller.
+ */
+function buildZoneTreeWithReverseFolders(zones: DNSZone[]): {
+  forward: DnsTreeNode[];
+  folders: ReverseFolder[];
+} {
+  const forwardZones = zones.filter((z) => !isReverseV4(z) && !isReverseV6(z));
+  const folders: ReverseFolder[] = [];
+  const mk = (
+    key: string,
+    label: string,
+    fam: DNSZone[],
+    suffix: string,
+  ): void => {
+    if (fam.length === 0) return;
+    const root = buildDnsTree(fam)[0]; // the "arpa" root
+    const apex = root?.children.find((c) => c.domain === suffix);
+    const children = !apex ? [] : apex.zone ? [apex] : apex.children;
+    folders.push({ key, label, count: fam.length, children });
+  };
+  mk(
+    REVERSE_V4_KEY,
+    "Reverse zones (IPv4)",
+    zones.filter(isReverseV4),
+    "in-addr.arpa",
+  );
+  mk(
+    REVERSE_V6_KEY,
+    "Reverse zones (IPv6)",
+    zones.filter(isReverseV6),
+    "ip6.arpa",
+  );
+  return { forward: buildDnsTree(forwardZones), folders };
+}
+
 // ── Cached-list write-back after an edit (#2830) ─────────────────────────────
 
 /**
@@ -13057,7 +13118,7 @@ export function SyncWithServersResultModal({
 
 // ── Sidebar zone tree rows ────────────────────────────────────────────────────
 
-function ZoneTreeRows({
+export function ZoneTreeRows({
   groupId,
   selectedZoneId,
   onSelectZone,
@@ -13082,9 +13143,29 @@ function ZoneTreeRows({
     staleTime: 30_000,
   });
 
-  const tree = buildDnsTree(zones);
+  const { forward: tree, folders } = buildZoneTreeWithReverseFolders(zones);
 
-  if (tree.length === 0)
+  // A zone selected from a link, search result or deep link opens the reverse
+  // folder it sits in (#4203). An effect, not a derived value, so the operator
+  // can still collapse the folder afterwards.
+  const selectedFolderKey = (() => {
+    const sel = zones.find((z) => z.id === selectedZoneId);
+    if (!sel) return null;
+    return isReverseV4(sel)
+      ? REVERSE_V4_KEY
+      : isReverseV6(sel)
+        ? REVERSE_V6_KEY
+        : null;
+  })();
+  useEffect(() => {
+    if (!selectedFolderKey) return;
+    setExpandedNodes((prev: Set<string>) =>
+      prev.has(selectedFolderKey) ? prev : new Set(prev).add(selectedFolderKey),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFolderKey, selectedZoneId]);
+
+  if (tree.length === 0 && folders.length === 0)
     return (
       <p className="px-3 py-1.5 text-xs text-muted-foreground italic">
         {zonesError != null ? (
@@ -13224,9 +13305,39 @@ function ZoneTreeRows({
     );
   }
 
+  function renderFolder(f: ReverseFolder): React.ReactNode {
+    const open = expandedNodes.has(f.key);
+    return (
+      <div key={f.key}>
+        <button
+          type="button"
+          className="flex w-full items-center gap-1.5 rounded py-1 pr-2 text-left text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+          style={{ paddingLeft: 12 }}
+          onClick={() => toggleNode(f.key)}
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          {open ? (
+            <FolderOpen className="h-3 w-3 flex-shrink-0" />
+          ) : (
+            <Folder className="h-3 w-3 flex-shrink-0" />
+          )}
+          <span className="truncate">{f.label}</span>
+          <span className="ml-auto flex-shrink-0 text-[10px] tabular-nums">
+            {f.count}
+          </span>
+        </button>
+        {open && <div>{f.children.map((c) => renderNode(c, 1))}</div>}
+      </div>
+    );
+  }
+
   return (
     <>
-      <div>{tree.map((root) => renderNode(root, 0))}</div>
+      <div>
+        {tree.map((root) => renderNode(root, 0))}
+        {folders.map(renderFolder)}
+      </div>
       {createZoneName && (
         <ZoneModal
           groupId={groupId}
