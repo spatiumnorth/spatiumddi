@@ -116,6 +116,7 @@ from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
     renders_soa_timers,
+    reports_served_serials,
 )
 from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name, zone_holding_views
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
@@ -724,6 +725,7 @@ async def agent_register(
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
     server.agent_renders_soa_timers = renders_soa_timers(agent_features)
+    server.agent_reports_served_serials = reports_served_serials(agent_features)
     await _set_packed_blocklists(db, server, agent_features)
 
     db.add(
@@ -1283,6 +1285,9 @@ async def agent_heartbeat(
         server.agent_renders_soa_timers = renders_soa_timers(
             request.headers.get(AGENT_FEATURES_HEADER)
         )
+        server.agent_reports_served_serials = reports_served_serials(
+            request.headers.get(AGENT_FEATURES_HEADER)
+        )
         await _set_packed_blocklists(db, server, request.headers.get(AGENT_FEATURES_HEADER))
 
         # Phase 8f-2 — persist whatever slot state the agent reported. Only
@@ -1509,7 +1514,8 @@ async def agent_zone_state(
     does not hold (the zone was deleted from the control plane but the agent
     still serves it; the next config bundle drops it) or holds more than once
     (one zone per view, and the report names no view) is skipped, counted in
-    the answer, and logged once per report.
+    the answer, and logged once per report; the rows the server already has
+    for a name held more than once are dropped (#4133).
     """
     server, _ = auth
     now = datetime.now(UTC)
@@ -1552,12 +1558,27 @@ async def agent_zone_state(
     serial_by_zone: dict[uuid.UUID, int] = {}
     unknown: list[str] = []
     ambiguous: list[str] = []
+    ambiguous_zone_ids: set[uuid.UUID] = set()
     for entry in body.zones:
         matches = zones_by_key.get(_key(entry.zone_name), [])
         if len(matches) == 1:
             serial_by_zone[matches[0].id] = entry.serial
         else:
             (ambiguous if matches else unknown).append(entry.zone_name)
+            ambiguous_zone_ids.update(m.id for m in matches)
+
+    # #4133 — a row written while the name was held once is the serial of one
+    # copy as it was then. Once a second view holds the name the report cannot
+    # say whose serial it is, so nothing refreshes the row and the drift
+    # report reads that copy ``behind`` for good after its next change. Drop
+    # it: with no stored serial the report falls back to the records.
+    if ambiguous_zone_ids:
+        await db.execute(
+            sa_delete(DNSServerZoneState).where(
+                DNSServerZoneState.server_id == server.id,
+                DNSServerZoneState.zone_id.in_(ambiguous_zone_ids),
+            )
+        )
 
     # #1968 — a PowerDNS server never serves a serial below the one it already
     # held (the agent floors it), so after the upgrade to a build that owns the

@@ -697,7 +697,9 @@ async def list_aes(
     )
     rows = (
         await db.execute(
-            stmt.order_by(DICOMApplicationEntity.ae_title.asc()).limit(limit).offset(offset)
+            stmt.order_by(DICOMApplicationEntity.ae_title.asc(), DICOMApplicationEntity.id)
+            .limit(limit)
+            .offset(offset)
         )
     ).all()
     return DICOMAEListResponse(

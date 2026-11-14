@@ -750,6 +750,12 @@ heartbeat body is strict and an agent can be upgraded before its control plane.
 - `soa-timers`: the BIND9 driver writes each zone's own refresh / retry /
   expire / minimum into its SOA. Agents before #1171 send no header and write
   `3600 600 86400 300` for every zone.
+- `served-serials` (#3940): the BIND9 driver reports a secondary / stub zone's
+  serial as named serves it, and nothing for a zone named holds no copy of,
+  instead of the bundle's 0. Stored as `dns_server.agent_reports_served_serials`.
+  The control plane reads a secondary at a non-zero serial as in sync and 0
+  as not synced for every BIND9 agent: an older agent's start-up report also
+  reads each zone from named, and its 0 means "not reported".
 - Register and heartbeat store it as `dns_server.agent_renders_soa_timers`.
   A group's bundles carry each zone's own timers only while every BIND9 server
   of the group (run by an agent, enabled, approved) says `soa-timers`
@@ -999,7 +1005,7 @@ codebase and the same `spatium-dns-entrypoint`, and exposes the same
 The `dns-technitium` image follows the same agent/entrypoint shape too,
 but has no config file for the agent to render at all — Technitium is
 configured entirely over its own HTTP API (the agent calls
-`http://127.0.0.1:5380`; the daemon listens on every interface, see the note
+`http://127.0.0.1:5380`; the daemon listens on loopback only, see the note
 below), so
 `render()`/`validate()`/`swap_and_reload()` collapse into "stash the
 desired zone/record state as JSON, then reconcile it against the live
@@ -1007,7 +1013,7 @@ API." The agent provisions a permanent API bearer token on first-ever
 boot (via `DNS_SERVER_ADMIN_PASSWORD` + `/api/user/createToken`) the same
 way the PowerDNS driver provisions its local API key.
 
-**Technitium console reachability (#1776).** The daemon's web console and API listen on `0.0.0.0` / `[::]:5380` over plaintext HTTP, not on loopback ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776); the bind change is planned for 1.1.0). The agent itself calls it over `127.0.0.1`. Who can reach it from outside depends on the deployment: on the default appliance path it is not reachable from the LAN or from pods; in Docker Compose, the umbrella chart and DNS-VIP mode every other container or pod on the same network can reach it; and in the host-network standalone compose it is reachable from the LAN. The `admin` account carries a random 192-bit password generated at first boot (there is no `admin`/`admin` window). For the host-network standalone compose, add a host firewall rule that drops inbound TCP 5380 from anything but the host itself.
+**Technitium console reachability (#1776).** The daemon's web console and API listen on loopback only (`127.0.0.1:5380`, plaintext HTTP), so nothing outside the container, pod or host can reach them ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776)). A fresh `/etc/dns` takes the bind from `DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES=127.0.0.1`, which the agent sets on every daemon start; Technitium reads that variable only when `webservice.config` does not exist yet, so on an existing `/etc/dns` the agent sends `settings/set webServiceLocalAddresses=127.0.0.1` once (it restarts the web service) after reading `settings/get`, and does nothing once pinned. Loopback is IPv4 only on purpose: Kestrel fails to start on `::1` where IPv6 is disabled in the container. The `admin` account still carries a random 192-bit password generated at first boot. To reach the console for debugging, run `curl` inside the container with `docker exec` / `kubectl exec`; `kubectl port-forward` does not work, as it connects to the pod IP rather than loopback. An operator who sets a different bind in the console will see it reset on the next structural apply.
 
 
 ### Volumes
