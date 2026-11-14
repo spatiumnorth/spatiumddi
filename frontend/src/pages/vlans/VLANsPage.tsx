@@ -62,6 +62,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -555,9 +556,9 @@ function RouterDetail({
               <strong>{router.name}</strong> and all its VLANs.
             </label>
             {deleteError && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                 {deleteError}
-              </div>
+              </FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -807,7 +808,7 @@ function VLANDetail({
               </p>
             )}
             {deleteError && (
-              <p className="text-sm text-destructive">{deleteError}</p>
+              <FormError className="text-sm">{deleteError}</FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -1030,7 +1031,7 @@ function RouterFormModal({
             onChange={(e) => setNotes(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -1199,7 +1200,7 @@ function VLANFormModal({
             onChange={(e) => setDescription(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}

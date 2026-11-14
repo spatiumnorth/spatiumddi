@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -196,6 +197,7 @@ function VRFEditorForm({
   existing: VRF | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -324,34 +326,36 @@ function VRFEditorForm({
         >
           <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
         </Field>
-        <Field label="Customer" hint="Optional logical owner of this VRF.">
-          {canReadCustomers ? (
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          ) : (
-            // Disabled, so the form still sends the unchanged id (never a clear).
-            <select
-              className={inputCls}
-              value={customerId ? "linked" : ""}
-              disabled
-              title={
-                customerPerms.unanswered ??
-                "Your role cannot read customers, so this cannot be changed here."
-              }
-            >
-              <option value="">{"\u2014 None \u2014"}</option>
-              {customerId && (
-                <option value="linked">
-                  {customerPerms.unanswered ??
-                    "Linked (not visible to your role)"}
-                </option>
-              )}
-            </select>
-          )}
-        </Field>
+        {own.customer && (
+          <Field label="Customer" hint="Optional logical owner of this VRF.">
+            {canReadCustomers ? (
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            ) : (
+              // Disabled, so the form still sends the unchanged id (never a clear).
+              <select
+                className={inputCls}
+                value={customerId ? "linked" : ""}
+                disabled
+                title={
+                  customerPerms.unanswered ??
+                  "Your role cannot read customers, so this cannot be changed here."
+                }
+              >
+                <option value="">{"\u2014 None \u2014"}</option>
+                {customerId && (
+                  <option value="linked">
+                    {customerPerms.unanswered ??
+                      "Linked (not visible to your role)"}
+                  </option>
+                )}
+              </select>
+            )}
+          </Field>
+        )}
         <Field label="Route distinguisher (RD)" hint={rdHint}>
           <input
             className={cn(inputCls, !rdValid && "border-destructive")}

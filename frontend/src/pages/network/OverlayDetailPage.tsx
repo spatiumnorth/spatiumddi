@@ -1467,6 +1467,8 @@ function PolicyEditorModal({
 // ── Simulate tab ───────────────────────────────────────────────────
 
 function SimulateTab({ overlayId }: { overlayId: string }) {
+  // #4118 — the route is write-scoped on 'overlay_network' even though it
+  // never writes, so the run button asks what the route asks.
   const { writeGate } = useOverlayGates();
   const [downCircuits, setDownCircuits] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<SimulateResponse | null>(null);
@@ -1568,6 +1570,7 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
           type="button"
           disabled={sim.isPending}
           onClick={() => sim.mutate()}
+          {...writeGate}
           className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
           {sim.isPending ? "Simulating…" : "Run simulation"}
@@ -1586,7 +1589,7 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
         )}
         {sim.isError && (
           <FormError className="text-xs text-destructive">
-            Simulation failed
+            {formatApiError(sim.error, "Simulation failed")}
           </FormError>
         )}
       </div>

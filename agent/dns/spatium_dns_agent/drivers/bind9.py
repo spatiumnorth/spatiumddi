@@ -2254,6 +2254,37 @@ def _named_files_fit(path: Path, signed: bool) -> bool:
     return len(path.name.encode()) + len(suffix) <= _NAME_MAX
 
 
+#: A signed zone's key files are ``K<zone>.+AAA+IIIII.private`` (also ``.key``
+#: and ``.state``): the algorithm and key id are fixed width, so the name is the
+#: zone name plus this many characters whatever the policy (#3750).
+_KEY_FILE_EXTRA_CHARS = 20
+#: The longest key file name BIND 9.20.30 managed to write. BIND creates a key
+#: file through a longer temporary name, so it fails well below ``NAME_MAX``:
+#: measured, a 214-character zone (``.private`` name 234) signs and a
+#: 215-character one (235) gets a ``.key`` and ``.state`` but no ``.private``,
+#: and from 216 no key file at all. The zone is then served unsigned, with
+#: DNSSEC reading as on and no key.
+_KEY_FILE_NAME_MAX = 234
+
+
+def _key_files_fit(zname: str) -> bool:
+    """Whether BIND can write the key files of a signed zone named ``zname``
+    (#3750)."""
+    return len(zname.rstrip(".")) + _KEY_FILE_EXTRA_CHARS <= _KEY_FILE_NAME_MAX
+
+
+def _key_file_refusal(zname: str) -> str:
+    """The held-back reason for a signed zone whose key files cannot be written
+    (#3750)."""
+    limit = _KEY_FILE_NAME_MAX - _KEY_FILE_EXTRA_CHARS
+    return (
+        f"the zone name is {len(zname)} characters, too long to sign with "
+        f"DNSSEC: the DNS server cannot write the key files it names after the "
+        f"zone, and would serve the zone unsigned. A signed zone's name can be "
+        f"at most {limit} characters. Shorten the zone name or turn DNSSEC off"
+    )
+
+
 def _file_name_refusal(zname: str) -> str:
     """The held-back reason for a zone whose files cannot be named (#3672)."""
     return (
@@ -3064,6 +3095,17 @@ class Bind9Driver(DriverBase):
         # (#2835, D5): lines collected here, kept as ONE bytes object below.
         self._apex_lines: list[str] = []
         self._apex_overlay: dict[str, dict[str, Any]] = {}
+        # #4065 — the secondary / stub zones named holds transferred copies of:
+        # what ``periodic_served_serials`` re-reads, since a transfer moves
+        # their serial with no render and no change to the bundle.
+        self._rendered_secondaries: list[str] = sorted(
+            {
+                str(z.get("name") or "").rstrip(".").lower()
+                for z in (bundle.get("zones") or [])
+                if z.get("type", "primary") in {"secondary", "slave", "stub"}
+                and str(z.get("name") or "").rstrip(".")
+            }
+        )
         try:
             self._render(bundle)
             # #2223 — state that outlives the poll must not be a web of small
@@ -3367,9 +3409,13 @@ class Bind9Driver(DriverBase):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
             self._primary_rels.add(rel_zfile)
-            if not _named_files_fit(
-                new_dir / rel_zfile, bool(zone.get("dnssec_enabled"))
-            ):
+            signed = bool(zone.get("dnssec_enabled"))
+            if signed and not _key_files_fit(zname):
+                # Checked first: it bites at a shorter name than the journal.
+                self._hold_unwritable(
+                    new_dir / rel_zfile, zname, file_prefix, _key_file_refusal(zname)
+                )
+            elif not _named_files_fit(new_dir / rel_zfile, signed):
                 self._hold_unwritable(new_dir / rel_zfile, zname, file_prefix)
             else:
                 try:
@@ -3749,7 +3795,9 @@ class Bind9Driver(DriverBase):
             lines.append(f"{digest}.zones IN PTR {text_with_dot}")
         path.write_text("\n".join(lines) + "\n")
 
-    def _hold_unwritable(self, path: Path, zname: str, file_prefix: str) -> None:
+    def _hold_unwritable(
+        self, path: Path, zname: str, file_prefix: str, reason: str | None = None
+    ) -> None:
         """Hold back a zone whose file, or a sidecar of it, cannot be named (#3672).
 
         Only a name too long comes here (an ``ENAMETOOLONG`` from the write,
@@ -3768,7 +3816,7 @@ class Bind9Driver(DriverBase):
         # would be read as a render it is not.
         for staged in (path, _rpz_sidecar(path), _owned_sidecar(path)):
             _discard(staged, label)
-        reason = _file_name_refusal(zone)
+        reason = reason or _file_name_refusal(zone)
         log.warning("bind9_zone_file_name_too_long", zone=label, reason=reason)
         self._unwritable_zones = (
             *self._unwritable_zones,
@@ -5970,21 +6018,26 @@ class Bind9Driver(DriverBase):
     def periodic_served_serials(self) -> dict[str, int]:
         """Zone name (lowercase, no trailing dot) → the serial named serves,
         for every primary zone the last render wrote in a group without
-        views (#2835); the sync loop posts the ones that changed.
+        views (#2835) and every secondary / stub zone in any group (#4065);
+        the sync loop posts the ones that changed.
 
         Named moves a zone's serial through updates the agent never sent: a
-        third-party RFC 2136 client's, a DNSSEC key event on a signed zone.
-        A zone that cannot be read is left out. A group with views reports as
-        it always did, from its renders, and is not read here.
+        third-party RFC 2136 client's, a DNSSEC key event on a signed zone, a
+        transfer from the primary into a secondary. A zone that cannot be
+        read (a secondary not transferred yet) is left out. A primary zone of
+        a group with views reports as it always did, from its renders, and is
+        not read here. The reads run on the bounded apply pool.
         """
-        if getattr(self, "_rendered_has_views", True):
-            return {}
-        blob: bytes = getattr(self, "_apex_blob", b"")
-        keys = [
-            line.split(b"\t", 1)[0].decode()
-            for line in blob.split(b"\n")
-            if b"\t" in line
-        ]
+        keys: list[str] = []
+        if not getattr(self, "_rendered_has_views", True):
+            blob: bytes = getattr(self, "_apex_blob", b"")
+            keys = [
+                line.split(b"\t", 1)[0].decode()
+                for line in blob.split(b"\n")
+                if b"\t" in line
+            ]
+        have = set(keys)
+        keys += [k for k in getattr(self, "_rendered_secondaries", []) if k not in have]
         served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
         return {k: v for k, v in zip(keys, served) if v is not None}
 
@@ -6099,10 +6152,12 @@ class Bind9Driver(DriverBase):
         that very serial with other data is served one past it
         (``_freeze_and_wait``), and reporting the bundle's would read in sync
         at a serial named does not serve. A zone that cannot be read is left
-        out, so it is not reported. Every other zone — any zone of a group
-        with views, which re-renders on each change and is reported as it
-        always was, and secondary / stub / forward zones — reports the
-        bundle's serial, unchanged.
+        out, so it is not reported. A secondary / stub zone is read back the
+        same way in every group, views or not (#3940): the bundle's serial for
+        it is 0, which says nothing about whether named holds a copy. Every
+        other zone — any primary zone of a group with views, which re-renders
+        on each change and is reported as it always was, and forward zones —
+        reports the bundle's serial, unchanged.
         """
         out: dict[str, int] = {}
         has_views = any(v.get("name") for v in (bundle.get("views") or []))
@@ -6112,7 +6167,13 @@ class Bind9Driver(DriverBase):
             serial = z.get("serial")
             if not name or serial is None:
                 continue
-            if has_views or z.get("type", "primary") not in {"primary", "master"}:
+            ztype = z.get("type", "primary")
+            if ztype in {"secondary", "slave", "stub"}:
+                # What the server holds, not the bundle's serial (0 for a
+                # secondary): a zone it never transferred must not read in
+                # sync (#3940). Unreadable = left out = not reported.
+                reads.append(name)
+            elif has_views or ztype not in {"primary", "master"}:
                 out[name.lower()] = int(serial)
             else:
                 reads.append(name)
