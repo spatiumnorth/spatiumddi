@@ -73,11 +73,11 @@ class HeartbeatClient:
     def stop(self) -> None:
         self._stop.set()
 
-    def _client(self) -> httpx.Client:
+    def _client(self, timeout: float = 15.0) -> httpx.Client:
         return httpx.Client(
             base_url=self.cfg.control_plane_url,
             verify=self.cfg.httpx_verify(),
-            timeout=15.0,
+            timeout=timeout,
         )
 
     def _kea_version(self) -> str | None:
@@ -109,7 +109,24 @@ class HeartbeatClient:
         oom = self.oom_watch.daemon_status() if self.oom_watch is not None else None
         return oom if oom is not None else self.daemon_status
 
-    def send_once(self) -> None:
+    def announce(self) -> None:
+        """Name this process to the control plane before the boot apply (#4139).
+
+        The first heartbeat of a new process, sent before the sync loop's
+        bootstrap apply. Its ``X-Spatium-Agent-Instance`` makes the control
+        plane take the server over from the previous process and retire that
+        process's stale ``ok`` now, instead of at the first config poll, which
+        comes only after the boot apply. Best effort and short: with the
+        control plane down the agent boots from its cache at once
+        (non-negotiable #5), and a control plane that predates this simply
+        records an ordinary heartbeat.
+        """
+        try:
+            self.send_once(announce=True)
+        except Exception as exc:  # noqa: BLE001 — never costs the boot
+            log.warning("dhcp_agent_announce_failed", error=str(exc))
+
+    def send_once(self, *, announce: bool = False) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
         while self.pending_acks:
@@ -132,7 +149,7 @@ class HeartbeatClient:
             # node-at-a-time upgrade across that boundary breaks HA mid-run.
             # None = daemon not up yet / didn't answer; the control plane must
             # treat that as "unknown", never as "old".
-            "kea_version": self._kea_version(),
+            "kea_version": None if announce else self._kea_version(),
         }
         if time.monotonic() >= self._capabilities_retry_at:
             body["capabilities"] = list(AGENT_CAPABILITIES)
@@ -148,7 +165,7 @@ class HeartbeatClient:
         # so it can no longer read those signals anyway.
         sent_token = self.token_ref[0]
         try:
-            with self._client() as c:
+            with (self._client(timeout=3.0) if announce else self._client()) as c:
                 resp = c.post(
                     "/api/v1/dhcp/agents/heartbeat",
                     json=body,

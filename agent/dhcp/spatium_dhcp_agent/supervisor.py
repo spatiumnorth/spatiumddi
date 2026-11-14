@@ -95,6 +95,10 @@ def run(cfg: AgentConfig) -> int:
     # heartbeat on, so a crash loop does not read ``ok`` between restarts.
     oom = OomWatch(cfg.state_dir, limit_bytes=cgroup_memory_limit_bytes())
     heartbeat.oom_watch = oom
+    # #4139 — name this process to the control plane BEFORE the sync loop's
+    # boot apply below, so the server stops reading the previous process's
+    # ``ok`` at once rather than at the first poll after the apply.
+    heartbeat.announce()
     ha_poller = HAStatusPoller(cfg, token_ref)
     # Construct the watcher first (SyncLoop needs the reference in its
     # ``__init__``), then arm it once the SyncLoop exists. Issue #265 —

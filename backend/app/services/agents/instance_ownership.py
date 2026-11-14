@@ -285,7 +285,9 @@ async def claim_poll[ServerT: (
     locked.agent_instance = instance
     locked.agent_instance_seen_at = now
     # #4139 — a new process has applied nothing yet: the previous one's ``ok``
-    # (config and daemon) is not its word. Its own heartbeat restores them.
+    # (config and daemon) is not its word. Its own heartbeat restores them. The
+    # announce heartbeat a new agent sends before its boot apply gets here first
+    # (``agent_heartbeat``); the poll is the fallback for an agent without it.
     config_forget_stale_ok(locked)
     daemon_forget_stale_ok(locked)
     await db.commit()

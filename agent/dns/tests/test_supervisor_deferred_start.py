@@ -261,6 +261,10 @@ class _Idle:
     def run(self) -> None:
         self._stop.wait()
 
+    def announce(self) -> None:
+        # HeartbeatClient's (#4139): the pre-boot-apply announce heartbeat.
+        pass
+
     def note_orderly_exit(self) -> None:
         # SyncLoop's (#2019): the exit was the agent's choice, not a death.
         self.orderly_exits += 1

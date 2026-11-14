@@ -1252,7 +1252,26 @@ async def agent_heartbeat(
     # agents on one identity) still heartbeats. Its liveness and acks count;
     # what it reports about its daemon, config and spool describes a process
     # that is not being served, so it stays off the row.
-    displaced = is_displaced(server, _agent_instance(agent_instance))
+    instance = _agent_instance(agent_instance)
+    displaced = is_displaced(server, instance)
+    # #4139 — a new process announces itself with a heartbeat BEFORE its boot
+    # apply (1.4 s to a minute: a zone that will not load is waited on). The
+    # takeover that retires its predecessor's stale ``ok`` happens here, not on
+    # the first config poll, which comes only after the boot apply. A heartbeat
+    # that names no process (an older agent) is served exactly as before.
+    if (
+        instance is not None
+        and not displaced
+        and server.agent_instance not in (None, instance)
+        and not await claim_poll(
+            db,
+            server,
+            instance,
+            now=now,
+            client_ip=request.client.host if request.client is not None else None,
+        )
+    ):
+        displaced = True
     # #1929 — the ops this heartbeat writes are locked before the server row
     # (``row_locks``): its first write to the server row is flushed by the
     # next statement, so the lock has to come before any of them.
