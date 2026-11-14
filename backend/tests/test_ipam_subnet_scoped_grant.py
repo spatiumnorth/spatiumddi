@@ -471,3 +471,27 @@ async def test_null_and_empty_dns_group_ids_are_the_same_no_binding(
         headers=h,
     )
     assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_scoped_holder_cannot_flip_the_inherit_switches(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    x, _y, _o = await _two_subnets(db_session)
+    x.dns_inherit_settings = False
+    x.dhcp_inherit_settings = False
+    x.ddns_inherit_settings = False
+    h = await _user(db_session, _rw(x))
+    await db_session.commit()
+
+    for field in ("dns_inherit_settings", "dhcp_inherit_settings", "ddns_inherit_settings"):
+        r = await client.put(f"/api/v1/ipam/subnets/{x.id}", json={field: True}, headers=h)
+        assert r.status_code == 403, (field, r.text)
+    # Re-sending the stored value is a form re-save, not a change.
+    r = await client.put(
+        f"/api/v1/ipam/subnets/{x.id}", json={"dns_inherit_settings": False}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    db_session.expire_all()
+    await db_session.refresh(x)
+    assert x.dns_inherit_settings is False
