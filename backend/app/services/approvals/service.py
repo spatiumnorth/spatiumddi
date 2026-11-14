@@ -651,7 +651,7 @@ def _exception_text(exc: Exception) -> str:
     """Worded text for an exception that is not an HTTP refusal. A ValueError
     is an operation's own sentence; anything else (a database error above all)
     is not fit to show."""
-    if type(exc) is ValueError:
+    if type(exc) is ValueError or hasattr(exc, "requester_text"):
         return str(exc)
     return _INTERNAL_FAILURE_TEXT
 
@@ -781,6 +781,7 @@ async def _requester_error(
     error: str,
     detail: Any,
     rerun_preview: bool,
+    requester_text: str | None = None,
 ) -> str:
     """The failure text a portal requester may read (#3642).
 
@@ -813,6 +814,10 @@ async def _requester_error(
         hidden = unreadable_target_detail(requester, op, args)
         if hidden is not None:
             return hidden
+        if requester_text is not None:
+            # The refusal carried its own wording for the requester
+            # (:mod:`app.services.refusal`); ``error`` keeps the full one.
+            return requester_text
         if rerun_preview:
             with previewing_for_requester():
                 again = await op.preview(db, requester, args)
@@ -837,6 +842,7 @@ async def _stamp_apply_failed(
     error: str,
     detail: Any = None,
     rerun_preview: bool = False,
+    requester_text: str | None = None,
 ) -> ChangeRequest:
     """Re-lock the (rolled-back) row and stamp ``pending → approved → failed``.
 
@@ -861,7 +867,12 @@ async def _stamp_apply_failed(
     shown = error
     if cr.origin == "portal":
         shown = await _requester_error(
-            db, cr, error=error, detail=detail, rerun_preview=rerun_preview
+            db,
+            cr,
+            error=error,
+            detail=detail,
+            rerun_preview=rerun_preview,
+            requester_text=requester_text,
         )
     await mark_failed(
         db,
@@ -1227,6 +1238,7 @@ async def approve_change_request(
             note=note,
             error=_refusal_text(exc.detail),
             detail=exc.detail,
+            requester_text=getattr(exc, "requester_text", None),
         )
     except Exception as exc:  # noqa: BLE001
         # apply() rolled back its own transaction; reload + lock to stamp the
@@ -1240,6 +1252,7 @@ async def approve_change_request(
             request=request,
             note=note,
             error=_exception_text(exc),
+            requester_text=getattr(exc, "requester_text", None),
         )
 
     if not approval_audit["written"]:

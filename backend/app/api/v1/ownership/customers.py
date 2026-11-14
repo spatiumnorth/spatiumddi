@@ -147,7 +147,7 @@ async def list_customers(
             )
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Customer.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Customer.name.asc(), Customer.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return CustomerListResponse(
         items=[CustomerRead.model_validate(r) for r in rows],

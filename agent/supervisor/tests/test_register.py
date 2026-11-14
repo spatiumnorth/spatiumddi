@@ -229,3 +229,42 @@ def test_register_503_honours_a_capped_retry_after(
     )
     register(**_kwargs(tmp_path, lambda _req: next(responses)))
     assert slept == [register_mod._MAX_RETRY_AFTER_S, 0]
+
+
+def test_register_request_carries_a_verifiable_key_signature(tmp_path: Path) -> None:
+    import base64
+    import json
+
+    from spatium_supervisor.cert_auth import register_proof_payload
+
+    identity, _ = load_or_generate(tmp_path)
+    seen: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(req.read()))
+        return httpx.Response(
+            200,
+            json={
+                "appliance_id": "11111111-2222-3333-4444-555555555555",
+                "state": "pending_approval",
+                "public_key_fingerprint": identity.fingerprint,
+                "session_token": "t",
+            },
+        )
+
+    kwargs = dict(
+        control_plane_url="https://ddi.example.com",
+        pairing_code="12345678",
+        identity=identity,
+        hostname="h",
+        supervisor_version="1",
+        client=_client_for(handler),
+    )
+    register(**kwargs)
+    register(**kwargs)
+    first, second = seen
+    identity.public_key.verify(
+        base64.b64decode(first["proof_signature"]),
+        register_proof_payload(identity.fingerprint, first["proof_timestamp"], first["proof_nonce"]),
+    )
+    assert first["proof_nonce"] != second["proof_nonce"]

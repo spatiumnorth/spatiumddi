@@ -75,7 +75,8 @@ function focusSuccessor(successors: FocusSuccessor[]) {
 const WATCH_MS = 5000;
 
 /**
- * Focus the first of `targets` that is still in the page. When none is, or
+ * Focus the first of `targets` that is still in the page. When none is (and
+ * focus has not already been placed elsewhere in the page), or
  * the one chosen leaves the page within a few seconds (the list refetch that
  * removes the deleted row's own button), and focus has then fallen to the
  * body, move it to the first usable successor instead.
@@ -106,5 +107,12 @@ export function returnFocus(
     obs.observe(document.body, { childList: true, subtree: true });
     return;
   }
-  if (!target) focusSuccessor(successors);
+  if (!target) {
+    // The dialog's owner already placed focus (a panel's trigger, handed
+    // focus as the confirm closes, #3484): a successor must not take it
+    // back. Only a focus that fell to the body is lost (#4111).
+    const a = document.activeElement;
+    if (a instanceof HTMLElement && usable(a)) return;
+    focusSuccessor(successors);
+  }
 }
