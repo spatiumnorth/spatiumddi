@@ -1,5 +1,6 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef } from "react";
+import { useSharedSessionSet } from "./zoneTreeState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
@@ -28,6 +29,7 @@ import {
   Plus,
   Trash2,
   Pencil,
+  ChevronDown,
   ChevronRight,
   Settings2,
   Shield,
@@ -10215,7 +10217,7 @@ export function RecordsTab({
 
 // ── Zones Tab ─────────────────────────────────────────────────────────────────
 
-function ZonesTab({
+export function ZonesTab({
   group,
   onSelectZone,
 }: {
@@ -10236,6 +10238,14 @@ function ZonesTab({
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  // Grouping-row collapse (#4203). The reverse folders share the sidebar's
+  // set (present = open); every other group is open unless toggled here.
+  const [sidebarOpen, setSidebarOpen] = useSharedSessionSet(
+    `spatium.dns.expandedZones.${group.id}`,
+  );
+  const [rowToggled, setRowToggled] = useSharedSessionSet(
+    `spatium.dns.zoneRowsToggled.${group.id}`,
+  );
 
   const {
     data: zonesData,
@@ -10270,6 +10280,47 @@ function ZonesTab({
       })
     : zones;
   const tree = buildDnsTree(filteredZones);
+  // A tag or column filter leaves only matches in the list, so every group is
+  // held open while one is active rather than hiding what was searched for.
+  const filterActive = hasZoneFilter || tagFilters.length > 0;
+
+  function groupFlag(domain: string): {
+    open: boolean;
+    toggle: () => void;
+  } {
+    const shared =
+      domain === "in-addr.arpa"
+        ? REVERSE_V4_KEY
+        : domain === "ip6.arpa"
+          ? REVERSE_V6_KEY
+          : null;
+    if (shared) {
+      return {
+        open: sidebarOpen.has(shared),
+        toggle: () =>
+          setSidebarOpen((prev) => {
+            const n = new Set(prev);
+            if (n.has(shared)) n.delete(shared);
+            else n.add(shared);
+            return n;
+          }),
+      };
+    }
+    const toggled = rowToggled.has(domain);
+    return {
+      open: (domain !== "arpa") !== toggled,
+      toggle: () =>
+        setRowToggled((prev) => {
+          const n = new Set(prev);
+          if (n.has(domain)) n.delete(domain);
+          else n.add(domain);
+          return n;
+        }),
+    };
+  }
+  function countZones(n: DnsTreeNode): number {
+    return (n.zone ? 1 : 0) + n.children.reduce((a, c) => a + countZones(c), 0);
+  }
 
   const typeBadge: Record<string, string> = {
     primary: "bg-blue-500/15 text-blue-600",
@@ -10474,6 +10525,8 @@ function ZonesTab({
         </ContextMenu>,
       );
     } else {
+      const flag = groupFlag(node.domain);
+      const open = filterActive || flag.open;
       rows.push(
         <tr
           key={`folder:${node.domain}`}
@@ -10481,15 +10534,35 @@ function ZonesTab({
         >
           <td />
           <td colSpan={7} className="py-0.5">
-            <span
-              className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70"
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70 hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground/70"
               style={{ paddingLeft: indent }}
+              aria-expanded={open}
+              disabled={filterActive}
+              title={
+                filterActive
+                  ? "Clear the filter to collapse"
+                  : open
+                    ? "Collapse"
+                    : "Expand"
+              }
+              onClick={flag.toggle}
             >
+              {open ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronRight className="h-3 w-3" />
+              )}
               <Folder className="h-3 w-3" />.{node.domain}
-            </span>
+              {!open && (
+                <span className="tabular-nums">({countZones(node)})</span>
+              )}
+            </button>
           </td>
         </tr>,
       );
+      if (!open) return rows;
     }
     for (const child of node.children) {
       rows.push(...renderZoneRows(child, depth + 1));
@@ -13127,9 +13200,8 @@ export function ZoneTreeRows({
   selectedZoneId: string | null;
   onSelectZone: (z: DNSZone) => void;
 }) {
-  const [expandedNodes, setExpandedNodes] = useSessionState<Set<string>>(
+  const [expandedNodes, setExpandedNodes] = useSharedSessionSet(
     `spatium.dns.expandedZones.${groupId}`,
-    new Set(),
   );
   const [createZoneName, setCreateZoneName] = useState<string | null>(null);
 
