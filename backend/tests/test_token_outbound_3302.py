@@ -245,6 +245,15 @@ def _resolve_function(dotted: str) -> tuple[str, str] | None:
     return None
 
 
+# ``socket`` functions that only convert an address between spellings and
+# never open a socket or resolve a name (``nettools.schemas._numeric_ipv4``
+# uses them to recognise ``127.1``). Listed by exact name so a ``socket.``
+# call that does I/O still counts.
+_PURE_SOCKET_FUNCS: frozenset[str] = frozenset(
+    f"socket.{n}" for n in ("inet_aton", "inet_ntoa", "inet_pton", "inet_ntop")
+)
+
+
 def _references(fn: Any) -> list[tuple[str, int]]:
     """Fully-qualified names ``fn`` reaches, with the call depth at which each
     is named: 0 for ``fn``'s own module (its local helpers included), +1 for
@@ -262,12 +271,23 @@ def _references(fn: Any) -> list[tuple[str, int]]:
         if index is None or fname not in index[1]:
             continue
         imports, funcs = index
-        for n in ast.walk(funcs[fname]):
+        body = list(ast.walk(funcs[fname]))
+        # A Name that roots an attribute chain is reported through the full
+        # chain; naming it again bare would flag ``socket.inet_aton`` as a
+        # use of the ``socket`` module itself.
+        chain_roots = {
+            id(v)
+            for n in body
+            if isinstance(n, ast.Attribute)
+            for v in [n.value]
+            if isinstance(v, ast.Name)
+        }
+        for n in body:
             ref = None
             if isinstance(n, ast.Name):
                 if n.id in funcs and n.id != fname:
                     stack.append((modname, n.id, depth))
-                ref = imports.get(n.id)
+                ref = None if id(n) in chain_roots else imports.get(n.id)
             elif isinstance(n, ast.Attribute):
                 chain = [n.attr]
                 v = n.value
@@ -276,7 +296,7 @@ def _references(fn: Any) -> list[tuple[str, int]]:
                     v = v.value
                 if isinstance(v, ast.Name) and v.id in imports:
                     ref = ".".join([imports[v.id], *reversed(chain)])
-            if ref is None:
+            if ref is None or ref in _PURE_SOCKET_FUNCS:
                 continue
             found.append((ref, depth))
             if (

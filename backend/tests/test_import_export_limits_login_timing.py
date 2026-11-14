@@ -94,3 +94,130 @@ async def test_unknown_username_costs_one_password_hash(
     )
     assert resp.status_code == 401
     assert len(calls) == 1
+
+
+async def _directory_login(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    username: str,
+    row_source: str | None,
+) -> tuple[int, int, int]:
+    """Wrong-password sign-in; returns (status, password compares, provider calls)."""
+    from app.api.v1.auth import router as auth_router
+    from app.models.auth_provider import AuthProvider
+
+    if row_source is not None:
+        db_session.add(
+            User(
+                username=username,
+                email=f"{uuid.uuid4().hex[:8]}@x.com",
+                display_name="d",
+                hashed_password="",
+                auth_source=row_source,
+                is_active=True,
+                is_superadmin=False,
+            )
+        )
+    for i in range(2 if row_source is not None else 0):
+        db_session.add(
+            AuthProvider(
+                name=f"dir-{uuid.uuid4().hex[:6]}",
+                type="ldap" if i == 0 else "radius",
+                is_enabled=True,
+                priority=10 * (i + 1),
+                config={},
+            )
+        )
+    await db_session.commit()
+
+    compares: list[int] = []
+    real = security.bcrypt.checkpw
+
+    def counting(*a, **k):  # type: ignore[no-untyped-def]
+        compares.append(1)
+        return real(*a, **k)
+
+    provider_calls: list[int] = []
+
+    def reject(provider, user, password):  # type: ignore[no-untyped-def]
+        provider_calls.append(1)
+        return None
+
+    monkeypatch.setattr(security.bcrypt, "checkpw", counting)
+    monkeypatch.setitem(auth_router._PASSWORD_AUTH_DISPATCH, "ldap", (reject, Exception))
+    monkeypatch.setitem(auth_router._PASSWORD_AUTH_DISPATCH, "radius", (reject, Exception))
+    resp = await client.post(
+        "/api/v1/auth/login", json={"username": username, "password": "x" * 12}
+    )
+    return resp.status_code, len(compares), len(provider_calls)
+
+
+@pytest.mark.asyncio
+async def test_refused_directory_signin_costs_the_same_as_an_unknown_name(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    known = await _directory_login(
+        db_session, client, monkeypatch, f"dir-{uuid.uuid4().hex[:8]}", "ldap"
+    )
+    unknown = await _directory_login(
+        db_session, client, monkeypatch, f"nobody-{uuid.uuid4().hex[:8]}", None
+    )
+    assert known == (401, 1, 2)
+    assert unknown == known
+
+
+def test_ldap_unknown_name_does_the_same_binds_as_a_known_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ldap3.core.exceptions import LDAPInvalidCredentialsResult
+
+    from app.core.auth import ldap as ldap_mod
+
+    class Conn:
+        def unbind(self) -> None:
+            pass
+
+    binds: list[str] = []
+    passwords: list[str] = []
+
+    def fake_open(cfg, user, password):  # type: ignore[no-untyped-def]
+        binds.append(user)
+        passwords.append(password)
+        if user != "cn=svc":
+            raise LDAPInvalidCredentialsResult()
+        return Conn()
+
+    cfg = ldap_mod.LDAPConfig(
+        host="h",
+        port=389,
+        backup_hosts=[],
+        use_ssl=False,
+        start_tls=False,
+        bind_dn="cn=svc",
+        bind_password="p",
+        user_base_dn="ou=u,dc=x",
+        user_filter="(uid={username})",
+        group_base_dn="ou=g,dc=x",
+        attr_username="uid",
+        attr_email="mail",
+        attr_display_name="cn",
+        attr_member_of="memberOf",
+    )
+    monkeypatch.setattr(ldap_mod.LDAPConfig, "from_provider", classmethod(lambda c, p: cfg))
+    monkeypatch.setattr(ldap_mod, "_open", fake_open)
+
+    monkeypatch.setattr(
+        ldap_mod, "_search_user", lambda conn, c, u: {"dn": "uid=a,ou=u,dc=x", "attributes": {}}
+    )
+    assert ldap_mod.authenticate_ldap(object(), "a", "wrong-pass") is None  # type: ignore[arg-type]
+    known_binds = len(binds)
+
+    binds.clear()
+    passwords.clear()
+    monkeypatch.setattr(ldap_mod, "_search_user", lambda conn, c, u: None)
+    assert ldap_mod.authenticate_ldap(object(), "zz", "wrong-pass") is None  # type: ignore[arg-type]
+    assert len(binds) == known_binds == 2
+    assert binds[1].endswith(",ou=u,dc=x")
+    # The bind against the empty DN never carries the password that was typed.
+    assert passwords[1] not in ("wrong-pass", "")

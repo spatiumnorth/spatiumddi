@@ -147,7 +147,7 @@ async def list_providers(
             )
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Provider.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Provider.name.asc(), Provider.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return ProviderListResponse(
         items=[ProviderRead.model_validate(r) for r in rows],

@@ -31,6 +31,7 @@ import {
   type MulticastPortTransport,
   formatApiError,
 } from "@/lib/api";
+import { cascadeList } from "@/lib/delete-cascade";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -1368,7 +1369,7 @@ function GroupsTabBody({
               const ids = Array.from(selectedIds);
               setConfirm({
                 title: "Delete multicast groups",
-                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? Ports + memberships cascade.`,
+                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? ${ids.length === 1 ? "Its" : "Their"} ${cascadeList("multicast_group")} are deleted with ${ids.length === 1 ? "it" : "them"}.`,
                 confirmLabel: "Delete",
                 onConfirm: () => bulkDelete.mutate(ids),
               });
@@ -1411,6 +1412,12 @@ function GroupsTabBody({
                   <ListEmpty
                     error={query.error}
                     what="multicast groups"
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>New group</strong> to add the first.
+                      </>
+                    }
                     filtered={
                       search !== "" ||
                       spaceFilter !== "" ||
@@ -1422,8 +1429,7 @@ function GroupsTabBody({
                       setCustomerFilter("");
                     }}
                   >
-                    No multicast groups yet. Click <strong>New group</strong> to
-                    add the first.
+                    No multicast groups yet.
                   </ListEmpty>
                 </td>
               </tr>
