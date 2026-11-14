@@ -36,6 +36,7 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { FormError } from "@/components/ui/form-error";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -307,7 +308,7 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
         )}
       </div>
 
-      {error && <p className="mb-2 text-sm text-rose-600">{error}</p>}
+      <FormError className="mb-2 text-sm text-rose-600">{error}</FormError>
 
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[56rem] text-sm">
@@ -745,7 +746,7 @@ function ERLModal({
           back to a coarser rule
         </label>
 
-        {error && <p className="text-sm text-rose-600">{error}</p>}
+        <FormError className="text-sm text-rose-600">{error}</FormError>
 
         <div className="flex justify-end gap-2">
           <HeaderButton type="button" onClick={onClose}>
@@ -840,7 +841,7 @@ function VerdictModal({
             className="w-full rounded-md border bg-background px-2 py-1.5"
           />
         </label>
-        {error && <p className="text-sm text-rose-600">{error}</p>}
+        <FormError className="text-sm text-rose-600">{error}</FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton type="button" onClick={onClose}>
             Cancel
@@ -1173,7 +1174,7 @@ function BindingModal({
             className="w-full rounded-md border bg-background px-2 py-1.5"
           />
         </label>
-        {error && <p className="text-sm text-rose-600">{error}</p>}
+        <FormError className="text-sm text-rose-600">{error}</FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton type="button" onClick={onClose}>
             Cancel
@@ -1283,7 +1284,7 @@ function LookupTab({ canQuery }: { canQuery: boolean }) {
         </div>
       </form>
 
-      {error && <p className="mb-3 text-sm text-rose-600">{error}</p>}
+      <FormError className="mb-3 text-sm text-rose-600">{error}</FormError>
 
       {result && (
         <div className="rounded-md border">

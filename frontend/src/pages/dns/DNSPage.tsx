@@ -4233,9 +4233,9 @@ function MoveZoneModal({
           </>
         )}
 
-        {error && (
-          <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
-        )}
+        <FormError className="text-sm text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
 
         <div className="flex justify-end gap-2 pt-1">
           <HeaderButton onClick={onClose}>Cancel</HeaderButton>

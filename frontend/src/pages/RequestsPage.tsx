@@ -21,6 +21,7 @@
  * That means the form fields ARE the server's contract: adding a field to an
  * operation surfaces it here with no frontend change, and the two can't drift.
  */
+import { FormError } from "@/components/ui/form-error";
 import { useEffect, useMemo, useState } from "react";
 import {
   useInfiniteQuery,
@@ -501,11 +502,9 @@ function NewRequestModal({
           />
         </div>
 
-        {error ? (
-          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        ) : null}
+        <FormError className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
 
         <p className="text-xs text-muted-foreground">
           Submitting changes nothing yet. Your request goes to an approver who
@@ -680,11 +679,9 @@ function DecisionModal({
             onChange={(e) => setNote(e.target.value)}
           />
         </div>
-        {error ? (
-          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        ) : null}
+        <FormError className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
             {failed ? "Close" : "Cancel"}
