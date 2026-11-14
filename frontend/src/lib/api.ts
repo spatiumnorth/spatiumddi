@@ -10616,6 +10616,18 @@ export interface DNSQueryLogRequest extends AgentLogScope {
   max_events?: number;
 }
 
+/** Filters an export honours: the query log's own request, minus paging. */
+export type DNSQueryExportParams = Omit<DNSQueryLogRequest, "max_events">;
+
+/** What the export response headers say about the file (#4171). */
+export interface DNSQueryExportResult {
+  filename: string;
+  rows: number;
+  /** More rows matched than the cap, so the file holds only the newest. */
+  truncated: boolean;
+  rowCap: number;
+}
+
 export interface DNSQueryLogResponse extends AgentLogScopeEcho {
   events: DNSQueryLogRow[];
   truncated: boolean;
@@ -10926,6 +10938,45 @@ export const logsApi = {
     api
       .post<DNSQueryLogResponse>("/logs/dns-queries", body)
       .then((r) => r.data),
+  /**
+   * Download exactly the DNS query-log slice the filters select (#4171) as CSV
+   * or JSON Lines. The server streams and caps the file; `truncated` says it
+   * stopped at the cap so the page can tell the operator to narrow the filter.
+   */
+  exportDnsQueries: async (
+    params: DNSQueryExportParams,
+    format: "csv" | "jsonl",
+  ): Promise<DNSQueryExportResult> => {
+    const query: Record<string, string> = {};
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== null && v !== undefined && v !== "") query[k] = String(v);
+    }
+    const res = await api
+      .get(`/logs/dns-queries/export.${format}`, {
+        params: query,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    // YYYYMMDDTHHMM from the UTC ISO string, plus the Z the server's name has.
+    const stamp = `${new Date().toISOString().replace(/[-:]/g, "").slice(0, 13)}Z`;
+    const filename = match ? match[1] : `dns-queries-${stamp}.${format}`;
+    const url = URL.createObjectURL(new Blob([res.data as BlobPart]));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return {
+      filename,
+      rows: Number(res.headers["x-export-rows"] ?? 0),
+      truncated: res.headers["x-export-truncated"] === "true",
+      rowCap: Number(res.headers["x-export-row-cap"] ?? 0),
+    };
+  },
   dnsQueryAnalytics: (body: DNSQueryAnalyticsRequest) =>
     api
       .post<DNSQueryAnalyticsResponse>("/logs/dns-queries/analytics", body)

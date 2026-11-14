@@ -28,12 +28,12 @@ and group ids are distinct UUIDs, so the two readings never collide.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -202,8 +202,7 @@ def _rcode_clause(rcode: str) -> Any:
     return DNSQueryLogEntry.rcode == wanted
 
 
-async def search_dns_queries(
-    db: AsyncSession,
+def _dns_queries_stmt(
     server_ids: Sequence[uuid.UUID],
     *,
     since: datetime | None = None,
@@ -214,16 +213,10 @@ async def search_dns_queries(
     client_ip: str | None = None,
     view: str | None = None,
     rcode: str | None = None,
-    limit: int = 200,
-) -> list[DNSQueryLogEntry]:
-    """Query-log rows for ``server_ids``, newest first, at most ``limit``.
-
-    ``q`` matches the qname or the raw line (the UI search box);
-    ``qname_contains`` matches the qname only (the copilot's argument).
-    Both are substring matches with LIKE metacharacters neutralised.
-    """
-    if not server_ids:
-        return []
+) -> Select[tuple[DNSQueryLogEntry]]:
+    """The filtered, newest-first query-log SELECT shared by the paged read
+    (:func:`search_dns_queries`) and the export stream (:func:`stream_dns_queries`),
+    so an export selects exactly the rows the page shows (#4171)."""
     stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.server_id.in_(list(server_ids)))
     if since is not None:
         stmt = stmt.where(DNSQueryLogEntry.ts >= since)
@@ -251,8 +244,72 @@ async def search_dns_queries(
             DNSQueryLogEntry.qname.ilike(like, escape="\\")
             | DNSQueryLogEntry.raw.ilike(like, escape="\\")
         )
-    stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(limit)
+    return stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc())
+
+
+async def search_dns_queries(
+    db: AsyncSession,
+    server_ids: Sequence[uuid.UUID],
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    q: str | None = None,
+    qname_contains: str | None = None,
+    qtype: str | None = None,
+    client_ip: str | None = None,
+    view: str | None = None,
+    rcode: str | None = None,
+    limit: int = 200,
+) -> list[DNSQueryLogEntry]:
+    """Query-log rows for ``server_ids``, newest first, at most ``limit``.
+
+    ``q`` matches the qname or the raw line (the UI search box);
+    ``qname_contains`` matches the qname only (the copilot's argument).
+    Both are substring matches with LIKE metacharacters neutralised.
+    """
+    if not server_ids:
+        return []
+    stmt = _dns_queries_stmt(
+        server_ids,
+        since=since,
+        until=until,
+        q=q,
+        qname_contains=qname_contains,
+        qtype=qtype,
+        client_ip=client_ip,
+        view=view,
+        rcode=rcode,
+    ).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
+
+
+async def count_dns_queries_capped(
+    db: AsyncSession, server_ids: Sequence[uuid.UUID], *, cap: int, **filters: Any
+) -> int:
+    """Rows the filter selects, counted only up to ``cap + 1`` — enough to say
+    "more than the cap" without scanning a whole busy day of queries."""
+    if not server_ids:
+        return 0
+    inner = _dns_queries_stmt(server_ids, **filters).order_by(None).limit(cap + 1).subquery()
+    return int((await db.execute(select(func.count()).select_from(inner))).scalar_one())
+
+
+async def stream_dns_queries(
+    db: AsyncSession,
+    server_ids: Sequence[uuid.UUID],
+    *,
+    limit: int,
+    batch_size: int = 1000,
+    **filters: Any,
+) -> AsyncIterator[DNSQueryLogEntry]:
+    """Yield matching rows newest first, at most ``limit``, fetched in batches
+    through a server-side cursor so an export never holds the result in memory."""
+    if not server_ids:
+        return
+    stmt = _dns_queries_stmt(server_ids, **filters).limit(limit)
+    result = await db.stream_scalars(stmt.execution_options(yield_per=batch_size))
+    async for row in result:
+        yield row
 
 
 @dataclass

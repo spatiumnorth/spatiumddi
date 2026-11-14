@@ -128,3 +128,22 @@ export function selectionHost(
     ? sources.find((s) => s.server_id === server_id)?.host
     : undefined;
 }
+
+/**
+ * The DNS server group whose configured views the View filter should list
+ * (#4170): the group itself, the selected server's group, or — for "All
+ * servers" — null, since views belong to one group and the list would mix
+ * groups' names.
+ */
+export function selectionGroupId(
+  sel: AgentLogSelection | null,
+  sources: AgentLogSource[],
+): string | null {
+  if (!sel) return null;
+  const { group_id, server_id } = selectionToScope(sel);
+  if (group_id) return group_id;
+  if (server_id) {
+    return sources.find((s) => s.server_id === server_id)?.group_id ?? null;
+  }
+  return null;
+}
