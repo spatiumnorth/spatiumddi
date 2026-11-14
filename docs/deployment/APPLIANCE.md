@@ -397,7 +397,7 @@ separate profiles that STATE does not model.
 k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
 `*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
 way, the frontend nginx finds the api, and on a multi-node control plane a
-member's supervisor heartbeats the in-cluster api Service name. Nothing on
+member's supervisor heartbeats the node-local api Service name. Nothing on
 the appliance talks to it from the LAN — it is not a DNS server operators put
 zones on, and it is unrelated to the BIND9 / Kea role containers.
 
@@ -696,7 +696,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.service.nodeLocal` (`true` at every size, #3645); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -815,15 +815,51 @@ agent). Dismissal requires a deliberate checkbox and is remembered
 client-side.
 
 **Heartbeat targets.** A supervisor that is itself a control-plane
-cluster member heartbeats the **in-cluster api Service**
-(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
-than the seed node's IP it was installed/promoted against — so losing any
-single node never strands a member's control plane, and kube-proxy
-load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+cluster member heartbeats the **node-local api Service**
+(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local:8000`, #3645:
+only ever the api pod on its own node) rather than the seed node's IP it was
+installed/promoted against. With no ready api pod on its node it falls back to
+its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
+a node's api pod never strands a member's control plane and no plain http
+crosses the node LAN. The seed has no `CONTROL_PLANE_URL` (firstboot writes it
+empty on a control-plane install), so it falls back to the cluster-wide api
+Service, as before #3645: a path through another node's api pod beats none.
+Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
 `heartbeat.py`).
+
+**Node-local api traffic (#3645).** Pod-to-pod traffic between nodes is flannel
+`host-gw`: routed over the node LAN, not tunnelled or encrypted, and the api
+speaks plain http. So the two callers that carry credentials keep that hop on
+their own node: firstboot and the seed supervisor set `api.service.nodeLocal`,
+which renders a second Service, `spatium-control-spatiumddi-api-local`, with
+`internalTrafficPolicy: Local`. It answers only from an api pod on the caller's
+node. A member's supervisor uses it; the original `-api` Service is unchanged,
+for the frontend nginx, the worker, the role agents and the probes, and an
+older supervisor keeps using it.
+
+The requirement is **a ready api pod on every control-plane node** (the
+appliance already runs one per node: `replicas` equals the control-plane size,
+with required anti-affinity). A node whose api pod is down (crashed, rolling,
+or not yet scheduled after a node join) has no local endpoint, and its
+supervisor does not wait:
+the Service drops traffic rather than refusing it, so the node-local attempt has
+a 4 s connect timeout, and after the first failed attempt the same heartbeat is
+re-sent to its `CONTROL_PLANE_URL` over https against the pinned certificate
+(`cp_tls`; the seed uses the cluster Service). It tries the local Service again
+once 60 s have passed, on its next heartbeat, and goes back to it when that
+lands. Plain http is therefore only ever node-local, except for the seed's
+fallback. The frontend's `/api` proxy is deliberately not on the
+node-local Service: the node-local path has no fallback there, so it would turn
+an api pod rolling on a node into a UI outage on that node. It keeps the
+cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
+ready). Not covered yet, and tracked in #4019: the frontend's fallback window,
+the role agents, the worker and beat still reach the api over the
+cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
+On a network where the node LAN is not trusted, put a WireGuard-capable CNI
+under the cluster instead of relying on this alone.
 
 ### Guided etcd restore (Phase 9b)
 
@@ -1580,7 +1616,7 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate.
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned; a supervisor from before that was added is accepted unsigned, and logged as `supervisor_register_unsigned`, while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true. On a multi-node control plane the supervisor-to-api hop inside the cluster is plain HTTP (it is not given TLS in this release); the join token is the only secret answered on it, and is sealed to a one-off key, but the request bodies a supervisor sends (heartbeat state, kubeconfig, join token it reports) are not encrypted on that hop.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
 - **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
@@ -3755,7 +3791,15 @@ so a first-time operator never gets stuck looking for the upload.
    gives up (finishing only the node it is on) 8 minutes after its last
    renewal, before the Lease could lapse for anyone else. If a drive
    exits with the run still `running`, a beat sweep re-drives it once
-   the Lease has been free on two sweeps a minute apart (#1713). If the drive itself died, the Lease lapses after its
+   the Lease has been free on two sweeps a minute apart (#1713). After the shared-tag
+   hand-off the hop chain refreshes a 45 s heartbeat; if it stops (the worker holding
+   the hop was killed) the sweep re-drives the run on its second sighting, about
+   two minutes after the last hop when beat keeps running. The shared-tag flip
+   also recreates beat, and a restarted beat runs one sweep as it starts, so on
+   a rolling upgrade expect the re-drive within a few minutes (about five
+   measured on a three-node roll) rather than two. Otherwise (a hand-off from a
+   build without the heartbeat, or Redis unreadable) the sweep waits out the
+   15-minute grace (#3851). If the drive itself died, the Lease lapses after its
    10-minute duration; a superadmin can free it sooner with
    **Force release** beside the Lease pill (`POST
    /api/v1/upgrades/lease/force-release`). That is refused while the

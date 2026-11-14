@@ -1,0 +1,3 @@
+### Fixed
+
+- **A rolling upgrade no longer flips the Web UI certificate (#4164).** The api's startup certificate bootstrap read the active certificate and wrote the TLS Secret without the lock the reconcile loops use, so an api pod starting mid-roll could write a stale copy over a certificate a sibling pod had just regenerated for a joined member. The console then presented the old certificate and, a tick later, the new one, and every member supervisor had to repin. The bootstrap now takes the same lock and re-reads the active certificate before it writes; a pod that loses the lock changes nothing and the periodic sync converges on the active certificate.

@@ -12,6 +12,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { FormError } from "@/components/ui/form-error";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
 const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
@@ -133,9 +134,9 @@ function FieldModal({
         </div>
         <div className="space-y-4 px-5 py-4">
           {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
               {error}
-            </div>
+            </FormError>
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>

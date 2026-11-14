@@ -733,7 +733,7 @@ async def list_routes(
     total = (
         await db.execute(select(func.count()).select_from(q.order_by(None).subquery()))
     ).scalar_one()
-    q = q.order_by(BGPLGRoute.prefix, BGPLGRoute.peer_id).offset(offset).limit(limit)
+    q = q.order_by(BGPLGRoute.prefix, BGPLGRoute.peer_id, BGPLGRoute.id).offset(offset).limit(limit)
     rows = (await db.execute(q)).scalars().all()
     return RouteListResponse(
         items=[_route_to_read(r) for r in rows],

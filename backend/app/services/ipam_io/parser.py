@@ -269,6 +269,22 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
             detail="openpyxl is required for XLSX import but is not installed",
         ) from exc
 
+    # Same limits as the DNS spreadsheet import: the upload cap bounds the
+    # compressed size only. Imported lazily (dns_io imports ipam_io.export).
+    from app.services.dns_io.spreadsheet import (
+        MAX_SHEET_ROWS,
+        SpreadsheetError,
+        check_xlsx_size,
+    )
+
+    try:
+        check_xlsx_size(data)
+    except SpreadsheetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid XLSX file: {exc}",
+        ) from exc
+
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as exc:
@@ -290,7 +306,14 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
             return []
         headers = [str(h).strip() if h is not None else "" for h in header]
         out: list[dict[str, Any]] = []
-        for raw in rows:
+        for n, raw in enumerate(rows, 1):
+            if n > MAX_SHEET_ROWS:
+                wb.close()
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Invalid XLSX file: sheet {sheet_name!r} has more than "
+                    f"{MAX_SHEET_ROWS} rows; split it or use CSV",
+                )
             if raw is None or all(c is None or c == "" for c in raw):
                 continue
             row = {headers[i]: raw[i] for i in range(min(len(headers), len(raw))) if headers[i]}

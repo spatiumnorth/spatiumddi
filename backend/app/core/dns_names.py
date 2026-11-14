@@ -232,6 +232,32 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
     return normalized
 
 
+_ZONE_STORAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
+
+
+def zone_name_storage_error(name: str) -> str | None:
+    """Why *name* cannot be stored as a zone name, or None.
+
+    The floor every zone-creating path shares, whatever its own parsing: the
+    name is written into the DNS server's config and used as a file name, so it
+    must carry no quote, whitespace, ``;``, braces, backslash or control
+    character, and no ``..`` path segment. ``/`` stays legal for RFC 2317
+    classless reverse zones (``0/26.2.0.192.in-addr.arpa``). The root zone
+    ``"."`` is accepted. The BIND9 agent applies the same rule before it renders.
+    """
+    if name == ".":
+        return None
+    if (
+        not _ZONE_STORAGE_RE.match(name)
+        or ".." in name
+        or "/." in name
+        or "./" in name
+        or len(name) > MAX_NAME_LEN + 1
+    ):
+        return f"zone name {name!r} is not a valid domain name"
+    return None
+
+
 def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = True) -> str:
     """Validate a fully-qualified domain name; return the normalized form.
 

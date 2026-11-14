@@ -21,6 +21,7 @@ import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
+import { FormError } from "@/components/ui/form-error";
 
 // A refusal raised by the dialog's own checks before anything is sent; its
 // message is the reason shown to the operator (#3082).
@@ -1212,7 +1213,7 @@ function ScopeModalForm({
           onChange={setPxeProfileId}
         />
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         {adoptConflict && (
           <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
             <span>{adoptConflict}</span>
