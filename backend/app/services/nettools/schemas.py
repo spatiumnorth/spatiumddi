@@ -150,6 +150,10 @@ def is_blocked_target(value: str) -> bool:
     return any(ip in net for net in _BLOCKED_NETWORKS)
 
 
+async def _getaddrinfo(host: str) -> list:
+    return await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+
+
 async def resolve_checked_target(host: str) -> tuple[str | None, str | None]:
     """Resolve ``host`` once; return ``(address, None)`` or ``(None, error)``.
 
@@ -168,9 +172,7 @@ async def resolve_checked_target(host: str) -> tuple[str | None, str | None]:
     if numeric is not None:
         canonical = str(numeric)
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            canonical, None, type=socket.SOCK_STREAM
-        )
+        infos = await _getaddrinfo(canonical)
     except (OSError, UnicodeError) as exc:
         return None, f"DNS resolution failed: {exc}"
     chosen: str | None = None
@@ -199,8 +201,9 @@ def assert_target_allowed(value: str) -> str:
     Returns the normalised host on success; raises ``ValueError`` (→ 422
     for Pydantic callers) on a blocked literal.
 
-    Hostnames are checked for shape here and, for the socket tools, resolved
-    and checked again at connect time (:func:`resolve_checked_target`).
+    Hostnames are checked for shape here and, for the socket tools, ping,
+    traceroute, mtr and dig ``@server``, resolved and checked again where the
+    tool runs (:func:`resolve_checked_target`), which then uses the address.
     """
     host = validate_host(value)
     if is_blocked_target(host):

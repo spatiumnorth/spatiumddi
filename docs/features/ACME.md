@@ -410,6 +410,12 @@ such as step-ca on an internal address works unchanged. A response from a
 server that does not answer with an ACME problem document is reported with a
 fixed message rather than its body.
 
+Saving the account applies the same rule to the directory URL's host, however
+it is spelled: `localhost`, a short or numeric IPv4 form such as `127.1`,
+`2130706433` or `0x7f000001`, or a name that resolves to such an address, is
+refused with a 422. A name that does not resolve from the API at save time is
+accepted, because the client checks it again on every connection.
+
 ### Feature module
 
 The whole surface lives behind the **`security.certificates`**
