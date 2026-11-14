@@ -204,7 +204,7 @@ class ListRequestKindsArgs(BaseModel):
 
 @register_tool(
     name="list_request_kinds",
-    permission="authenticated",
+    permission=("write", "provisioning_request"),  # the REST catalog needs submit rights
     description=(
         "List what can be asked for through the self-service request portal "
         "(subnet / IP address / DNS record / DHCP reservation), with a "
