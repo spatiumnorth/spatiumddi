@@ -110,6 +110,7 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+import { cascadeList } from "@/lib/delete-cascade";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   customFieldChecked,
@@ -12444,7 +12445,7 @@ export function DeleteOrOrphanModal({
       }
       softExtra={recordsNote}
       softButtonLabel="Mark as Orphan"
-      permanentBody="The IPAM row is removed immediately. DNS records and DHCP static assignments tied to this IP are also cascaded. There's no undo — skip the orphan state entirely."
+      permanentBody={`The IPAM row is removed immediately. ${cascadeList("ip_address")} tied to this IP are also deleted. There's no undo — skip the orphan state entirely.`}
       permanentExtra={recordsNote}
       onSoft={onOrphan}
       onPermanent={onPurge}
