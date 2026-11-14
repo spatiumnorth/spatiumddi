@@ -164,7 +164,7 @@ async def list_sites(
             Site.id.in_([i for i in ids if user_has_permission(user, "read", "site", str(i))])
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Site.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Site.name.asc(), Site.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return SiteListResponse(
         items=[SiteRead.model_validate(r) for r in rows],

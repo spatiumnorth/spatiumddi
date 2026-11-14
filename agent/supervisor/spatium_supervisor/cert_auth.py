@@ -154,6 +154,25 @@ def canonical_payload_v2(
     ).encode("utf-8")
 
 
+def register_proof_payload(fingerprint: str, timestamp: str, nonce: str) -> bytes:
+    """The bytes signed to show this supervisor holds the key it registers
+    with. Must match the backend's ``register_proof_payload`` byte for byte."""
+    return "\n".join(("spatium-register-v1", fingerprint, timestamp, nonce)).encode("utf-8")
+
+
+def register_proof_fields(private_key: Ed25519PrivateKey, fingerprint: str) -> dict[str, str]:
+    """Fresh ``proof_*`` fields for one registration request. A control plane
+    that predates them ignores them. Build per attempt: each is accepted once."""
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+    nonce = secrets.token_hex(16)
+    signature = private_key.sign(register_proof_payload(fingerprint, timestamp, nonce))
+    return {
+        "proof_timestamp": timestamp,
+        "proof_nonce": nonce,
+        "proof_signature": base64.b64encode(signature).decode("ascii"),
+    }
+
+
 def note_control_plane_signature_support(headers: object) -> str | None:
     """Record what the control plane's heartbeat answer advertises.
 
@@ -257,6 +276,8 @@ __all__ = [
     "encode_json",
     "load_cert",
     "note_control_plane_signature_support",
+    "register_proof_fields",
+    "register_proof_payload",
     "save_cert",
     "signing_mode",
 ]

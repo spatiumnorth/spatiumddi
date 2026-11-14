@@ -18,6 +18,7 @@ Two layers here:
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,13 @@ from spatium_dns_agent.drivers.technitium import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ops_own_every_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests drive ``apply_record_op`` against a fake that has no SOA
+    owner marker; ownership (#1775) has its own tests."""
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
+
+
 class _FakeResponse:
     """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
     body is a plain-text one (``blocked/export``), whose ``.json()`` raises
@@ -52,6 +60,14 @@ class _FakeResponse:
         if isinstance(self._body, str):
             raise ValueError("not JSON")
         return self._body
+
+
+@pytest.fixture(autouse=True)
+def _no_owner_marker_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests assert the exact calls of a pass. The owner marker (#1775)
+    adds a read of the apex SOA per Primary; it has its own tests in
+    ``test_technitium_foreign_zone_1775.py``."""
+    monkeypatch.setattr(TechnitiumDriver, "_stamp_owner_marker", lambda *a, **k: None)
 
 
 def _without_create_hold(
@@ -4156,8 +4172,13 @@ def test_an_ipv4_mapped_prefix_is_refused() -> None:
 # Secondary TSIG
 
 
-def _secondary_calls(tmp_path: Path, bundle: dict[str, Any], responder: Any = None):
+def _secondary_calls(
+    tmp_path: Path, bundle: dict[str, Any], responder: Any = None, owned: list[str] | None = None
+):
     d = TechnitiumDriver(state_dir=tmp_path)
+    if owned is not None:
+        # Zones this agent put on the daemon earlier (#1775).
+        (tmp_path / "technitium-managed-zones.json").write_text(json.dumps(owned))
     _seed_token(d)
     d.daemon_running = lambda: True  # type: ignore[method-assign]
     d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
@@ -4204,6 +4225,7 @@ def test_an_existing_secondary_gets_the_key_through_options(tmp_path: Path) -> N
         tmp_path,
         {"zones": [sec], "options": {}, "tsig_keys": [_MASTER_KEY]},
         respond,
+        owned=["s.test"],
     )
     reapply = [
         c[3]
