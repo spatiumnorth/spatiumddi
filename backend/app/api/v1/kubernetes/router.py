@@ -36,6 +36,7 @@ from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_credential_problem, header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -606,6 +607,12 @@ async def update_cluster(
         raise HTTPException(status_code=404, detail="Cluster not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        c,
+        changes,
+        destination=["api_server_url"],
+        secrets={"token": c.token_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", c.ipam_space_id)
     new_dns = changes.get("dns_group_id", c.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:

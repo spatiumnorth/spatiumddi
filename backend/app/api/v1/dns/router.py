@@ -84,6 +84,10 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
 from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -2884,6 +2888,19 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    require_secret_with_destination_change(
+        server,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+            "api_key": body.api_key,
+        },
+        destination=("host", "port"),
+        secrets={
+            "credentials": server.credentials_encrypted,
+            "api_key": server.api_key_encrypted,
+        },
+    )
     reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():

@@ -26,6 +26,7 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
@@ -357,6 +358,12 @@ async def update_firewall(
         raise HTTPException(status_code=404, detail="Palo Alto firewall not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        f,
+        changes,
+        destination=["host", "port"],
+        secrets={"api_key": f.api_key_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", f.ipam_space_id)
     new_dns = changes.get("dns_group_id", f.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:

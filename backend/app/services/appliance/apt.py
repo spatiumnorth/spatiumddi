@@ -152,6 +152,16 @@ def mask_proxy_url(url: str | None) -> str:
     return f"{prefix}{PROXY_USERINFO_MASK}@{rest}"
 
 
+def _destination(prefix: str, rest: str) -> tuple[str, str]:
+    """Scheme and ``host[:port]`` of a URL split by ``_split_proxy_userinfo``."""
+    end = len(rest)
+    for ch in "/?#":
+        idx = rest.find(ch)
+        if idx != -1:
+            end = min(end, idx)
+    return prefix.lower(), rest[:end].lower()
+
+
 def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
     """Put the stored credential back into a proxy URL that carries the mask.
 
@@ -159,19 +169,58 @@ def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
     the masked one; writing that literally would replace the real
     credential with ``***``. So a userinfo of exactly ``***`` means "keep
     the stored one", spliced onto whatever host / port / path the caller
-    sent. Raises ``ValueError`` when there is no stored credential to keep.
+    sent, as long as the scheme, host and port are the stored ones (a path
+    may change). Raises ``ValueError`` when there is no stored credential to
+    keep, or when the destination moved: the credential is then asked for
+    again rather than sent to the new host.
     """
     prefix, userinfo, rest = _split_proxy_userinfo(incoming)
     if userinfo != PROXY_USERINFO_MASK:
         return incoming
-    _, stored_userinfo, _ = _split_proxy_userinfo(stored or "")
+    stored_prefix, stored_userinfo, stored_rest = _split_proxy_userinfo(stored or "")
     if not stored_userinfo:
         raise ValueError(
             "proxy URL carries the '***' credential placeholder, but no "
             "credential is stored to keep; enter the user:password or remove "
             "the '***@'"
         )
+    if _destination(prefix, rest) != _destination(stored_prefix, stored_rest):
+        raise ValueError(
+            "the host, port or scheme changed: re-enter the user:password in the "
+            "same request (stored credentials are not re-sent to a different destination)"
+        )
     return f"{prefix}{stored_userinfo}@{rest}"
+
+
+def mask_source_uris(sources: Any) -> list[Any]:
+    """``apt_sources`` rows with any ``user:pass@`` in a ``uri`` masked.
+
+    A private mirror's URI may embed the credential apt reads from it; every
+    read surface shows it the way a proxy URL is shown (``***@host``).
+    """
+    out: list[Any] = []
+    for src in sources or []:
+        if isinstance(src, dict) and isinstance(src.get("uri"), str):
+            src = {**src, "uri": mask_proxy_url(src["uri"])}
+        out.append(src)
+    return out
+
+
+def restore_source_uri(incoming: str, name: str, stored_sources: Any) -> str:
+    """Put a stored source's credential back into a URI that carries the mask.
+
+    The stored row is the one with the same ``name``, else the one whose
+    masked URI equals ``incoming``. Raises ``ValueError`` when there is no
+    credential to keep.
+    """
+    _, userinfo, _ = _split_proxy_userinfo(incoming)
+    if userinfo != PROXY_USERINFO_MASK:
+        return incoming
+    rows = [s for s in (stored_sources or []) if isinstance(s, dict)]
+    match = next((s for s in rows if name and s.get("name") == name), None)
+    if match is None:
+        match = next((s for s in rows if mask_proxy_url(str(s.get("uri", ""))) == incoming), None)
+    return restore_proxy_credentials(incoming, str(match.get("uri", "")) if match else None)
 
 
 def render_proxy_conf(settings: PlatformSettings) -> str:
