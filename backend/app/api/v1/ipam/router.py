@@ -2064,7 +2064,7 @@ async def _enqueue_dns_op(
     when the batched op comes back ``failed`` (#1536)."""
     from app.drivers.dns import is_agentless
     from app.services.dns.record_ops import enqueue_record_op, resolve_primary_server
-    from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.serial import bump_zone_serial_once
 
     if op == "delete" and _never_publishable(name, rtype, value):
         # Only where the primary could never have taken the name: a Windows
@@ -2084,7 +2084,7 @@ async def _enqueue_dns_op(
             )
             return None
 
-    target_serial = bump_zone_serial(zone)
+    target_serial = bump_zone_serial_once(zone)
     record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}
     if record_id is not None:
         # #1230 — names the row being retracted, so a delete drops exactly it

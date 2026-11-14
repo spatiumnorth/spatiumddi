@@ -14,6 +14,7 @@ import os
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
@@ -2213,17 +2214,20 @@ async def agent_lease_events(
     return {"upserted": upserted}
 
 
-#: A deferred DDNS transaction (#3816) publishes this many names first, then
-#: sizes the next one from how long the last one HELD its zone rows: doubled
-#: when it held them under half of ``_DDNS_HOLD_S``, halved when over it.
-#: Every commit makes the DNS agents' next poll rebuild and apply, so a fast
-#: box should make few big chunks and a slow one more, short ones.
-_DDNS_CHUNK_START = 25
+#: A deferred DDNS transaction (#3816) holds its zone rows for at most
+#: ``_DDNS_HOLD_S`` of publishing, measured as it runs: it stops taking names
+#: once that is spent and the rest go to the next transaction. The first one
+#: takes ``_DDNS_CHUNK_START`` names; each next one is sized from what the last
+#: one's names cost each, so the stop is the exception and a 100-name batch is
+#: a few transactions. Every commit makes the DNS agents' next poll rebuild
+#: and apply, so a commit per few names (this was 8) cost more than the lock
+#: wait it saved.
+_DDNS_CHUNK_START = 40
 _DDNS_CHUNK_MIN = 8
 _DDNS_CHUNK_MAX = 100
 #: The longest the other member's batch should wait on a zone row one chunk of
 #: ours holds. The whole batch held it before (#3816).
-_DDNS_HOLD_S = 2.0
+_DDNS_HOLD_S = 5.0
 
 
 async def _replay_deferred_ddns(db: AsyncSession, events: list[Any], server: Any) -> None:
@@ -2316,20 +2320,19 @@ async def _publish_deferred_ddns(
     current lease for the address still carries both, read under the same
     locks. A later batch that renamed or reassigned the client has published
     it, and its publish is the authoritative one."""
-    keys = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
-    start = 0
+    pending = sorted(deferred, key=lambda k: (str(k[0]), k[1]))
     size = _DDNS_CHUNK_START
     try:
-        while start < len(keys):
-            chunk = set(keys[start : start + size])
-            start += size
-            held = await _publish_ddns_chunk(db, chunk, deferred, grants, server_id)
-            if held is None:
+        while pending:
+            chunk, pending = pending[:size], pending[size:]
+            outcome = await _publish_ddns_chunk(db, chunk, deferred, grants, server_id)
+            if outcome is None:
                 continue
-            if held > _DDNS_HOLD_S:
-                size = max(_DDNS_CHUNK_MIN, size // 2)
-            elif held < _DDNS_HOLD_S / 2:
-                size = min(_DDNS_CHUNK_MAX, size * 2)
+            # Names the chunk ran out of hold before reaching go first in the next.
+            pending = outcome.unreached + pending
+            if outcome.published >= 3:
+                per_name = max(outcome.held / outcome.published, 0.001)
+                size = max(_DDNS_CHUNK_MIN, min(_DDNS_CHUNK_MAX, int(_DDNS_HOLD_S / per_name)))
     finally:
         # One wake for the whole POST, after the last chunk that committed,
         # also when a database outage ends the loop with a 503: the
@@ -2339,21 +2342,37 @@ async def _publish_deferred_ddns(
         await flush_collected_wakes()
 
 
+@dataclass
+class _DDNSChunk:
+    """What one DDNS chunk's transaction did: ``held`` seconds with its zone
+    rows locked, over ``published`` names it ran, and the ``unreached`` keys
+    it left for the next one."""
+
+    held: float
+    published: int
+    unreached: list[tuple[Any, str]]
+
+
 async def _publish_ddns_chunk(
     db: AsyncSession,
-    chunk: set[tuple[Any, str]],
+    chunk: list[tuple[Any, str]],
     deferred: dict[tuple[Any, str], tuple[Any, str | None]],
     grants: dict[tuple[Any, str], tuple[str | None, str | None]] | None,
     server_id: str,
-) -> float | None:
-    """One chunk's transaction. Returns how long it held its zone rows (taken
-    to commit; the wait for them is the other member's hold, not ours), or
-    ``None`` when it published nothing."""
+) -> _DDNSChunk | None:
+    """One chunk's transaction. Returns what it did, timed from the zone locks
+    to the commit (the wait for them is the other member's hold, not ours), or
+    ``None`` when it published nothing.
+
+    Every zone the chunk writes has its serial bumped once for the chunk
+    (``coalesced_zone_serials``), not once per name: still a higher serial
+    for every chunk that changes the zone, and the agents see every op."""
     from app.services.dns.ddns import apply_ddns_for_lease
+    from app.services.dns.serial import coalesced_zone_serials
     from app.services.lock_order import lock_mirror_rows
 
     try:
-        rows = await lock_mirror_rows(db, chunk)
+        rows = await lock_mirror_rows(db, set(chunk))
         by_key = {(r.subnet_id, norm_ip(str(r.address))): r for r in rows}
         if grants is not None:
             by_key = await _still_granted(db, by_key, grants, server_id)
@@ -2363,26 +2382,37 @@ async def _publish_ddns_chunk(
             ddns=True,
         )
         began = time.monotonic()
-        for key, row in by_key.items():
-            subnet, client_hostname = deferred[key]
-            try:
-                async with db.begin_nested():
-                    await apply_ddns_for_lease(
-                        db,
-                        subnet=row.subnet or subnet,
-                        ipam_row=row,
-                        client_hostname=client_hostname,
+        unreached: list[tuple[Any, str]] = []
+        published = 0
+        order = [k for k in chunk if k in by_key]
+        with coalesced_zone_serials():
+            for pos, key in enumerate(order):
+                if published and time.monotonic() - began >= _DDNS_HOLD_S:
+                    unreached = order[pos:]
+                    break
+                row = by_key[key]
+                subnet, client_hostname = deferred[key]
+                published += 1
+                try:
+                    async with db.begin_nested():
+                        await apply_ddns_for_lease(
+                            db,
+                            subnet=row.subnet or subnet,
+                            ipam_row=row,
+                            client_hostname=client_hostname,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
+                    logger.warning(
+                        "dhcp_agent_lease_ddns_failed",
+                        server=server_id,
+                        ip=str(row.address),
+                        error=str(exc),
                     )
-            except Exception as exc:  # noqa: BLE001
-                _reraise_if_database_gone(exc)
-                logger.warning(
-                    "dhcp_agent_lease_ddns_failed",
-                    server=server_id,
-                    ip=str(row.address),
-                    error=str(exc),
-                )
         await db.commit()
-        return time.monotonic() - began if by_key else None
+        if not by_key:
+            return None
+        return _DDNSChunk(time.monotonic() - began, published, unreached)
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         # The batch is committed but its publishes are not: the 503 has

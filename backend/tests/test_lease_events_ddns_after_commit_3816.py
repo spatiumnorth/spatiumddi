@@ -159,11 +159,11 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Each commit wakes the DNS agents to rebuild their bundle, so a fast box
-    must not pay it every 8 names: 100 names went through 13 transactions
-    after the batch's own and a first-acquisition batch took three times as
-    long as before the change. The chunk starts at 25 and grows to fit the hold
-    budget."""
+    """Each commit wakes the DNS agents to rebuild their bundle, so a box must
+    not pay it every few names: 100 names went through 13 transactions after
+    the batch's own and a first-acquisition batch took three times as long as
+    before the change, then 7 to 10 when the chunk halved past a 2 s hold. The
+    first chunk is 40 names and the next is sized from what those cost."""
     subnet, _block = await _ddns_subnet(db_session)
     peer_a, _peer_b = await _two_agents(db_session, [subnet])
     zone_id = uuid.UUID(str(subnet.dns_zone_id))
@@ -180,8 +180,8 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
     resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
     assert resp.status_code == 200, resp.text
     assert len(await _a_records(db_session, zone_id)) == len(ips)
-    # The batch's own commit, then the chunks: 25 names, then as many as fit.
-    assert commits <= 5, commits
+    # The batch's own commit, then the chunks: 40 names, then the rest.
+    assert commits <= 3, commits
 
 
 @pytest.mark.asyncio
@@ -332,3 +332,77 @@ async def test_a_batch_that_lost_the_database_mid_ddns_still_wakes_for_what_comm
     assert len(await _a_records(db_session, zone_id)) == 3
     dns_wakes = [c for c in published if any(":dns:" in ch for ch in c)]
     assert len(dns_wakes) == 1, published
+
+
+async def _chunk_serials(db_session: AsyncSession, zone_id: uuid.UUID) -> tuple[int, list[int]]:
+    """The zone's stored serial and the distinct target serials its ops carry."""
+    from app.models.dns import DNSRecordOp, DNSZone
+
+    zone = (
+        await db_session.execute(
+            select(DNSZone).where(DNSZone.id == zone_id).execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    targets = (
+        (
+            await db_session.execute(
+                select(DNSRecordOp.target_serial).where(DNSRecordOp.zone_id == zone_id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return int(zone.last_serial), sorted(t for t in targets if t is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_bumps_each_zone_serial_once_not_once_per_name(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bumped per name, 100 names moved the zone's serial 100 times and flushed
+    an UPDATE of the row they hold locked for each. A chunk is one transaction
+    and moves it once; the zone still ends on the serial its last op names."""
+    import app.api.v1.dhcp.agents as agents
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    before, _ = await _chunk_serials(db_session, zone_id)
+    monkeypatch.setattr(agents, "_DDNS_CHUNK_START", 30)
+    ips = [f"10.31.1.{n}" for n in range(100, 200)]
+    resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
+    assert resp.status_code == 200, resp.text
+    assert len(await _a_records(db_session, zone_id)) == len(ips)
+    after, targets = await _chunk_serials(db_session, zone_id)
+    # 30 names, then the other 70 in one chunk: two chunks, two bumps.
+    assert len(targets) == 2, targets
+    assert after == targets[-1]
+    assert after - before <= 2, (before, after)
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_that_runs_out_of_hold_leaves_the_rest_for_the_next(
+    concurrent_client: AsyncClient,  # noqa: F811
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hold is measured as the chunk runs: with none left after its first
+    name each chunk publishes one name and the rest follow, every name once,
+    and the zone's serial rises for every chunk that changed it."""
+    import app.api.v1.dhcp.agents as agents
+
+    subnet, _block = await _ddns_subnet(db_session)
+    peer_a, _peer_b = await _two_agents(db_session, [subnet])
+    zone_id = uuid.UUID(str(subnet.dns_zone_id))
+    before, _ = await _chunk_serials(db_session, zone_id)
+    monkeypatch.setattr(agents, "_DDNS_HOLD_S", 0.0)
+    ips = _A_IPS[:12]
+    resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
+    assert resp.status_code == 200, resp.text
+    records = await _a_records(db_session, zone_id)
+    assert sorted(v for _n, v in records) == sorted(ips)
+    after, targets = await _chunk_serials(db_session, zone_id)
+    assert len(targets) == len(ips), targets  # one chunk per name, each its own serial
+    assert targets == sorted(set(targets)) and after == targets[-1] > before
