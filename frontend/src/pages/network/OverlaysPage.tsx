@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -131,6 +132,7 @@ export function OverlayEditorModal({
   existing: OverlayRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [kind, setKind] = useState<OverlayKind>(existing?.kind ?? "sdwan");
@@ -154,6 +156,7 @@ export function OverlayEditorModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const customers = customersQ.data?.items ?? [];
 
@@ -217,24 +220,29 @@ export function OverlayEditorModal({
             ))}
           </select>
         </div>
-        <div>
-          <label className="text-xs font-medium text-muted-foreground">
-            Customer (optional)
-          </label>
-          <select
-            className={inputCls}
-            value={customerId ?? ""}
-            onChange={(e) => setCustomerId(e.target.value || null)}
-          >
-            <option value="">— None —</option>
-            <MissingCustomerOption customerId={customerId} list={customersQ} />
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-        </div>
+        {own.customer && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Customer (optional)
+            </label>
+            <select
+              className={inputCls}
+              value={customerId ?? ""}
+              onChange={(e) => setCustomerId(e.target.value || null)}
+            >
+              <option value="">— None —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div>
           <label className="text-xs font-medium text-muted-foreground">
             Vendor
