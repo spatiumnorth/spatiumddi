@@ -309,6 +309,56 @@ def assert_editable(
         raise HTTPException(status_code=423, detail=detail)
 
 
+# What a DNS server group's edit lock freezes beyond the group row itself (#3361):
+# the config the group renders into every server it holds. ``what`` in
+# :func:`assert_group_content_editable` is one of these.
+GROUP_CONTENT_ACLS = "ACLs"
+GROUP_CONTENT_TSIG_KEYS = "TSIG keys"
+GROUP_CONTENT_TRUST_ANCHORS = "trust anchors"
+GROUP_CONTENT_OPTIONS = "server options"
+
+# Annotations of the group's sub-resources, on top of :data:`ANNOTATION_FIELDS`
+# (an ACL's ``description`` is already there): a TSIG key's free-text notes.
+GROUP_CONTENT_ANNOTATIONS: frozenset[str] = ANNOTATION_FIELDS | {"notes"}
+
+
+def assert_group_content_editable(
+    group: Any,
+    what: str,
+    *,
+    current: Any = None,
+    changes: Mapping[str, Any] | None = None,
+) -> None:
+    """Refuse a change to a DNS server group's ``what`` (ACLs, TSIG keys, trust
+    anchors, server options) while the group is edit-locked.
+
+    These are operative: an ACL, a key or an option is rendered into the config
+    of every server in the group, so freezing the group row alone would let the
+    freeze be undone through them. A ``delete`` lock does not freeze them (it
+    protects only the group's existence). With ``changes`` (an update's field
+    dict) and ``current`` (the row it updates) only a field that actually
+    differs, and is not an annotation, is refused; a create, a delete, a key
+    rotation or any call without ``changes`` is always a change.
+    """
+    info = active_lock(group)
+    if info is None or info.level != LEVEL_EDIT:
+        return
+    frozen: list[str] = []
+    if changes is not None:
+        frozen = [
+            k
+            for k, v in changes.items()
+            if k not in GROUP_CONTENT_ANNOTATIONS and _differs(getattr(current, k, None), v, k)
+        ]
+        if not frozen:
+            return
+    detail = lock_detail("dns_group", group, info, f"changed: its {what} are frozen")
+    if frozen:
+        detail["fields"] = sorted(frozen)
+        detail["message"] += f" Locked fields: {', '.join(sorted(frozen))}."
+    raise HTTPException(status_code=423, detail=detail)
+
+
 def refusal_message(exc: HTTPException) -> str:
     """The one-sentence reason of an :class:`HTTPException` this module (or any
     handler) raised, for a preview that reports instead of raising."""

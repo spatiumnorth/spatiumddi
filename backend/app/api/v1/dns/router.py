@@ -12,6 +12,7 @@ import zipfile
 import zlib
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal, Self
 
 import structlog
@@ -2429,6 +2430,7 @@ async def rotate_group_key(
     retried (#1232). The secret is never returned.
     """
     group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TSIG_KEYS)  # #3361
     rotate_group_tsig_key(group)
     db.add(
         AuditLog(
@@ -4582,15 +4584,30 @@ def _refuse_plain_port_forwarders_on_encrypted(
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
 ) -> ServerOptionsResponse:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     stored_opts = opts
+    changes = body.model_dump(exclude_none=True)
+    # #3361 — judged before a missing row is created, against the stored values
+    # (or the column defaults for a group with no row yet).
+    lock_svc.assert_group_content_editable(
+        group,
+        lock_svc.GROUP_CONTENT_OPTIONS,
+        current=opts or _default_options(group_id),
+        changes={
+            **changes,
+            **{
+                f: None
+                for f in body.model_fields_set
+                if getattr(body, f) is None and f not in changes
+            },
+        },
+    )
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
         db.add(opts)
         await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
-    changes = body.model_dump(exclude_none=True)
     # #1817: a blank allow_recursion means "the default", not "nobody". An
     # empty list would render ``allow-recursion { none; }`` / Technitium
     # ``Deny`` and lock every client out of recursion, which is not what
@@ -4759,7 +4776,8 @@ async def update_options(
 async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TRUST_ANCHORS)  # #3361
     # #3609: a static root anchor is never right — BIND refuses it under
     # ``auto`` and it breaks at the next root key rollover under ``yes``.
     if is_root_zone(body.zone_name) and not body.is_initial_key:
@@ -4818,7 +4836,8 @@ async def add_trust_anchor(
 async def delete_trust_anchor(
     group_id: uuid.UUID, anchor_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TRUST_ANCHORS)  # #3361
     result = await db.execute(
         select(DNSTrustAnchor)
         .join(DNSServerOptions)
@@ -5063,7 +5082,8 @@ async def list_acls(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSAcl]
 async def create_acl(
     group_id: uuid.UUID, body: AclCreate, db: DB, current_user: CurrentUser
 ) -> DNSAcl:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_ACLS)  # #3361
 
     acl_names, key_names = await _group_symbol_names(group_id, db)
     try:
@@ -5126,6 +5146,30 @@ async def update_acl(
     current_user: CurrentUser,
 ) -> DNSAcl:
     acl = await _require_acl(group_id, acl_id, db)
+    # #3361 — an ACL of an edit-locked group is frozen, its description aside.
+    # Entries compare as (value, negate, order) lists, so re-sending the
+    # stored ones is not a change.
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db),
+        lock_svc.GROUP_CONTENT_ACLS,
+        current=SimpleNamespace(
+            name=acl.name,
+            description=acl.description,
+            entries=[(e.value, e.negate, e.order) for e in sorted(acl.entries, key=_entry_order)],
+        ),
+        changes={
+            **body.model_dump(exclude_none=True, exclude={"entries"}),
+            **(
+                {
+                    "entries": [
+                        (e.value, e.negate, e.order) for e in sorted(body.entries, key=_entry_order)
+                    ]
+                }
+                if body.entries is not None
+                else {}
+            ),
+        },
+    )
     # Exclude this ACL from the citable set: an entry naming its own ACL is
     # a self-reference, and reporting it as an undefined name points at the
     # field the operator is editing.
@@ -5193,6 +5237,9 @@ async def delete_acl(
     group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> None:
     acl = await _require_acl(group_id, acl_id, db)
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db), lock_svc.GROUP_CONTENT_ACLS
+    )  # #3361
     await _assert_acl_is_unreferenced(group_id, acl, db, action="delete")
     db.add(
         AuditLog(
@@ -5481,7 +5528,8 @@ async def create_tsig_key(
     current_user: SuperAdmin,
 ) -> TSIGKeyResponse:
     """Create a TSIG key. Secret is returned in the response *exactly once*."""
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    lock_svc.assert_group_content_editable(group, lock_svc.GROUP_CONTENT_TSIG_KEYS)  # #3361
     # #1858 — an algorithm a driver in the group cannot use is refused, not
     # installed and left to fail every signed transfer with BADKEY.
     if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
@@ -5546,6 +5594,12 @@ async def update_tsig_key(
         raise HTTPException(status_code=404, detail="TSIG key not found")
     changes = body.model_dump(exclude_unset=True)
     changes.pop("secret", None)  # never a column write; see TSIGKeyUpdate
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db),
+        lock_svc.GROUP_CONTENT_TSIG_KEYS,
+        current=key,
+        changes=changes,
+    )  # #3361
     # #1858 — only a CHANGE of algorithm is refused: re-saving a key the group
     # already holds (the form posts every field) must keep working.
     new_algo = changes.get("algorithm")
@@ -5592,6 +5646,9 @@ async def rotate_tsig_key(
     key = await db.get(DNSTSIGKey, key_id)
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db), lock_svc.GROUP_CONTENT_TSIG_KEYS
+    )  # #3361
     plaintext = _generate_tsig_secret(key.algorithm)
     key.secret_encrypted = encrypt_str(plaintext)
     key.last_rotated_at = datetime.now(UTC)
@@ -5622,6 +5679,9 @@ async def delete_tsig_key(
     key = await db.get(DNSTSIGKey, key_id)
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
+    lock_svc.assert_group_content_editable(
+        await _require_group(group_id, db), lock_svc.GROUP_CONTENT_TSIG_KEYS
+    )  # #3361
     await _assert_tsig_key_is_unreferenced(group_id, key, db, action="delete")
     # The update-grant rows cascade with the key (fail-closed, but the
     # operator should hear about it).
@@ -12040,6 +12100,10 @@ async def _require_server(group_id: uuid.UUID, server_id: uuid.UUID, db: DB) -> 
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
     return server
+
+
+def _entry_order(e: Any) -> int:
+    return e.order
 
 
 async def _require_acl(group_id: uuid.UUID, acl_id: uuid.UUID, db: DB) -> DNSAcl:

@@ -20,6 +20,14 @@
   refuses the reservation's own hostname / MAC / address edit and its
   delete (#3361).
 
+- A DNS server group's edit lock now also freezes its ACLs, TSIG keys,
+  trust anchors and server options (an ACL's description and a key's
+  notes stay editable) (#3361).
+- New `resource_lock_removed` alert rule (seeded disabled): one event per
+  unlock naming who removed the lock, what it protected and the reason
+  given. The DNS drift report lists each locked record whose live value
+  on a server differs from the saved one (#3361).
+
 ### Migrations
 
 - `a3361c0de1f7` — #3361, adds the lock columns to `ip_space`,
