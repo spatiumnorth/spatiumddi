@@ -37,7 +37,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -76,6 +76,10 @@ async def ensure_self_signed_cert() -> None:
         Re-deploy the cert to the TLS Secret (the frontend reloads it in
         place) — but ONLY when the Secret doesn't already hold this
         exact cert. Covers wipe-of-Secret edge cases; a no-op otherwise.
+        The row is read and the Secret written under the reconcile
+        advisory lock (#4164), so a pod starting mid-roll cannot write a
+        stale copy over a cert a sibling just regenerated; a pod that
+        loses the lock does nothing and the periodic loops converge.
 
     Path B — no active row, but the TLS Secret holds a usable cert
     covering every desired SAN (the fresh-appliance case: firstboot
@@ -118,6 +122,24 @@ async def ensure_self_signed_cert() -> None:
     desired_sans = _desired_sans(hostname, ips, extra_sans)
 
     async with AsyncSessionLocal() as db:
+        # #4164 — the same advisory lock the reconcile loops take, held while
+        # the active row is read and (on the regenerate branch) replaced.
+        # Without it a pod starting during a roll read the active row, a
+        # sibling pod then committed a regenerated cert, and this pod
+        # PATCHed its stale copy over the Secret: the Web UI certificate
+        # flipped to the old one and back within a tick, and every member
+        # supervisor saw a certificate it had not pinned. A pod that loses
+        # the lock changes nothing; the reconcile loops converge on the
+        # active row (``sync_active_cert_to_secret`` re-checks every tick).
+        got = (
+            await db.execute(
+                text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_RECONCILE_LOCK_KEY}
+            )
+        ).scalar()
+        if not got:
+            logger.info("appliance_cert_bootstrap_deferred", reason="reconcile-lock-held")
+            return
+
         active_row = (
             await db.execute(
                 select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
@@ -142,18 +164,6 @@ async def ensure_self_signed_cert() -> None:
                 await _generate_activate_deploy(db, hostname, ips, extra_sans)
                 return
 
-            # Path A — replay the active cert to disk in case the volume
-            # was reset. Decrypts the key inside this function only; the
-            # plaintext never leaves the deployer's scope.
-            try:
-                key_pem = decrypt_str(active_row.key_encrypted)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "appliance_active_cert_decrypt_failed",
-                    cert_id=str(active_row.id),
-                    error=str(exc),
-                )
-                return
             if not covered:
                 logger.warning(
                     "appliance_active_cert_missing_sans",
@@ -161,30 +171,33 @@ async def ensure_self_signed_cert() -> None:
                     source=active_row.source,
                     missing=[s for s in desired_sans if not _sans_cover(active_row.sans_json, [s])],
                 )
-            # Only deploy when the Secret doesn't ALREADY hold exactly this
-            # cert (#767). Path A exists to recover a wiped Secret, not to
-            # re-push a cert that is already deployed. (Until #1173 a
-            # re-push also rolled the frontend: live on the #767 test
-            # appliance, the first api restart after adoption moved it to
-            # a new ReplicaSet for no reason.) An unchanged Secret means the
-            # mounted copy is already correct, so there is nothing for a
-            # reload to pick up.
-            if read_deployed_cert() == (active_row.cert_pem, key_pem):
+            cert_id, cert_name, cert_source = str(active_row.id), active_row.name, active_row.source
+            # End this transaction (releasing the lock) before the sync
+            # below takes it again in its own session.
+            await db.rollback()
+
+            # Path A — replay the active cert to the Secret in case it was
+            # wiped or reverted. Only deploys when the Secret doesn't
+            # ALREADY hold exactly this cert (#767; until #1173 a re-push
+            # also rolled the frontend). Shared with the periodic tick so
+            # the read-compare-patch is one locked step that re-reads the
+            # active row, never a copy this function read earlier.
+            result = await sync_active_cert_to_secret()
+            status = result.get("status")
+            if status == "in-sync":
                 logger.info(
                     "appliance_active_cert_already_deployed",
-                    cert_id=str(active_row.id),
-                    name=active_row.name,
-                    source=active_row.source,
+                    cert_id=cert_id,
+                    name=cert_name,
+                    source=cert_source,
                 )
-                return
-
-            deploy_and_reload(active_row.cert_pem, key_pem, name=active_row.name)
-            logger.info(
-                "appliance_active_cert_redeployed",
-                cert_id=str(active_row.id),
-                name=active_row.name,
-                source=active_row.source,
-            )
+            elif status == "deployed":
+                logger.info(
+                    "appliance_active_cert_redeployed",
+                    cert_id=cert_id,
+                    name=cert_name,
+                    source=cert_source,
+                )
             return
 
         # Path B — no active row. Before minting anything, try to ADOPT
@@ -464,8 +477,6 @@ async def sync_active_cert_to_secret() -> dict[str, object]:
     if not settings.appliance_mode:
         return {"status": "disabled"}
 
-    from sqlalchemy import text  # noqa: PLC0415
-
     async with AsyncSessionLocal() as db:
         # Transaction-scoped: held until this session's transaction ends,
         # i.e. across the kubeapi calls below.
@@ -528,8 +539,6 @@ async def reconcile_cluster_cert_sans() -> dict[str, object]:
     """
     if not settings.appliance_mode:
         return {"status": "disabled"}
-
-    from sqlalchemy import text  # noqa: PLC0415
 
     from app.models.appliance import (  # noqa: PLC0415
         APPLIANCE_STATE_APPROVED,
