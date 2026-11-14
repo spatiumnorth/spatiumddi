@@ -1,0 +1,4 @@
+### Fixed
+
+- A Technitium agent no longer takes over a zone of the same name that an operator created on the daemon itself: it used to delete every record the bundle did not list and later delete the zone. The zone is left untouched, reported as a refused zone, and is recognised as the agent's own by a ledger entry or by a marker comment on its apex SOA (so a wiped agent state dir does not strand its own zones), and can be adopted deliberately with `TECHNITIUM_ADOPT_EXISTING_ZONES=true` on the agent (the agentless driver already refuses non-empty and non-Primary zones, #1784).
+- The same refusal now covers record changes and DNSSEC sign / unsign: a record op for a zone the agent does not own is not written and is reported as an error naming the zone (it used to overwrite or delete the operator's own records), and a lost state dir no longer counts a zone named in an old render as the agent's own.

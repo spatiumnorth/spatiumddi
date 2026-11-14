@@ -344,7 +344,9 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
           <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
           <p className="text-sm font-medium">No DHCP scopes on this subnet</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Create a scope to start serving leases from a DHCP server.
+            {perms.can("write", "dhcp_scope")
+              ? "Create a scope to start serving leases from a DHCP server."
+              : "Scopes serve leases from a DHCP server."}
           </p>
         </div>
       )}

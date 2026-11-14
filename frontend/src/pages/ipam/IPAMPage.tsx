@@ -110,6 +110,7 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+import { cascadeList } from "@/lib/delete-cascade";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   customFieldChecked,
@@ -12444,7 +12445,7 @@ export function DeleteOrOrphanModal({
       }
       softExtra={recordsNote}
       softButtonLabel="Mark as Orphan"
-      permanentBody="The IPAM row is removed immediately. DNS records and DHCP static assignments tied to this IP are also cascaded. There's no undo — skip the orphan state entirely."
+      permanentBody={`The IPAM row is removed immediately. ${cascadeList("ip_address")} tied to this IP are also deleted. There's no undo — skip the orphan state entirely.`}
       permanentExtra={recordsNote}
       onSoft={onOrphan}
       onPermanent={onPurge}
@@ -17571,6 +17572,12 @@ function getBlockAncestors(block: IPBlock, allBlocks: IPBlock[]): IPBlock[] {
 // #465). Hidden by default — toggled by the Help button so the dense view
 // stays uncluttered for experts while newcomers can decode the icons.
 function IpamHelpLegend() {
+  // The gap row is inert for a reader who may not allocate (#4003), so the
+  // legend only says to click it for one who may (#4116).
+  const legendPerms = usePermissions();
+  const mayAllocate =
+    legendPerms.can("write", "subnet") ||
+    legendPerms.can("write", "ip_address");
   const seen: Array<[string, string]> = [
     ["alive", "bg-emerald-500"],
     ["stale", "bg-amber-500"],
@@ -17624,7 +17631,10 @@ function IpamHelpLegend() {
           <span className="flex-shrink-0 rounded border border-dashed border-emerald-500/60 px-1 text-emerald-600 dark:text-emerald-400">
             free
           </span>
-          <span>Dashed gap row — unused addresses; click it to allocate</span>
+          <span>
+            Dashed gap row — unused addresses
+            {mayAllocate && "; click it to allocate"}
+          </span>
         </li>
       </ul>
     </div>

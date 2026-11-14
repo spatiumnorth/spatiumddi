@@ -33,6 +33,7 @@ from dataclasses import dataclass
 import httpx
 import structlog
 
+from .cert_auth import register_proof_fields
 from .identity import Identity
 
 log = structlog.get_logger()
@@ -129,7 +130,9 @@ def register(
     last_error: str | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = client.post(url, json=payload, timeout=10.0)
+            # Signed afresh per attempt: the control plane accepts each once.
+            signed = {**payload, **register_proof_fields(identity.private_key, identity.fingerprint)}
+            resp = client.post(url, json=signed, timeout=10.0)
         except httpx.HTTPError as exc:
             last_error = f"network: {exc}"
             log.warning(

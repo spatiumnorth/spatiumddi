@@ -553,6 +553,8 @@ function LiveTab({
 }) {
   const qc = useQueryClient();
   // Stop and delete take delete on 'manage_packet_capture' (pcap/router.py).
+  // Start capture asks write (#4116): the empty-state "start one" hint follows it.
+  const canStart = usePermissions().can("write", "manage_packet_capture");
   const deleteGate = permissionGate(
     usePermissions().can("delete", "manage_packet_capture"),
     "Requires delete permission on packet captures",
@@ -586,7 +588,8 @@ function LiveTab({
   if (!captureId || !data) {
     return (
       <p className="text-xs text-muted-foreground">
-        No capture running — start one on the left. Live progress shows here.
+        No capture running
+        {canStart ? " — start one on the left. Live progress shows here." : "."}
       </p>
     );
   }
@@ -732,6 +735,8 @@ function ResultTab({ captureId }: { captureId: string | null }) {
 function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
   const qc = useQueryClient();
   // Stop and delete take delete on 'manage_packet_capture' (pcap/router.py).
+  // Start capture asks write (#4116): the empty-state "start one" hint follows it.
+  const canStart = usePermissions().can("write", "manage_packet_capture");
   const deleteGate = permissionGate(
     usePermissions().can("delete", "manage_packet_capture"),
     "Requires delete permission on packet captures",
@@ -800,7 +805,7 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
   if (items.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
-        No captures yet — start one on the left.
+        No captures yet{canStart ? " — start one on the left." : "."}
       </p>
     );
   }

@@ -413,7 +413,9 @@ async def list_nat_mappings(
     rows = (
         (
             await db.execute(
-                base.order_by(NATMapping.name).offset((page - 1) * per_page).limit(per_page)
+                base.order_by(NATMapping.name, NATMapping.id)
+                .offset((page - 1) * per_page)
+                .limit(per_page)
             )
         )
         .scalars()

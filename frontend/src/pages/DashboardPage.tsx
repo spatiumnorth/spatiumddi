@@ -1349,6 +1349,8 @@ function SubnetDecomCard() {
 function LookingGlassHealthCard() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.looking_glass");
+  // Add Peer on the Looking Glass page is a write on bgp_lg_peer (#4116).
+  const canConfigure = usePermissions().can("write", "bgp_lg_peer");
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
@@ -1390,12 +1392,14 @@ function LookingGlassHealthCard() {
           <p className="text-xs text-muted-foreground">
             No Looking Glass peers configured.
           </p>
-          <Link
-            to="/network/looking-glass"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Configure a peer →
-          </Link>
+          {canConfigure && (
+            <Link
+              to="/network/looking-glass"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Configure a peer →
+            </Link>
+          )}
         </div>
       );
     }
@@ -2625,7 +2629,10 @@ export function DashboardPage() {
                     </div>
                   ) : !recent || recent.items.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                      No recent activity. Try creating a subnet or a DNS record.
+                      No recent activity.
+                      {(canRead("write", "subnet") ||
+                        canRead("write", "dns_record")) &&
+                        " Try creating a subnet or a DNS record."}
                     </div>
                   ) : (
                     recent.items.slice(0, 12).map((entry) => (
