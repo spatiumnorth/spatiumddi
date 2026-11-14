@@ -1483,7 +1483,7 @@ async def list_entries(
         await db.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
     ).scalar_one()
     items_result = await db.execute(
-        stmt.order_by(DNSBlockListEntry.domain).limit(limit).offset(offset)
+        stmt.order_by(DNSBlockListEntry.domain, DNSBlockListEntry.id).limit(limit).offset(offset)
     )
     return EntryPage(
         total=total,
