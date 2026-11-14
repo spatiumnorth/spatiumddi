@@ -63,6 +63,10 @@ class _DeploySpy:
         return True
 
 
+async def _no_snapshot(_cert_pem: str) -> None:
+    return None
+
+
 async def _active_row(db: AsyncSession) -> ApplianceCertificate:
     return (
         await db.execute(
@@ -353,6 +357,9 @@ async def test_path_a_still_recovers_a_wiped_secret(
     spy = _DeploySpy()
     monkeypatch.setattr(bootstrap, "read_deployed_cert", lambda: None)  # Secret wiped
     monkeypatch.setattr(bootstrap, "deploy_and_reload", spy)
+    # Path A deploys through sync_active_cert_to_secret (#4164).
+    monkeypatch.setattr(bootstrap, "deploy_active_cert", spy)
+    monkeypatch.setattr(bootstrap, "_write_served_cert_snapshot", _no_snapshot)
 
     await ensure_self_signed_cert()
 
@@ -389,6 +396,9 @@ async def test_existing_active_row_still_wins_over_the_secret(
     spy = _DeploySpy()
     monkeypatch.setattr(bootstrap, "read_deployed_cert", lambda: (secret_pem, secret_key))
     monkeypatch.setattr(bootstrap, "deploy_and_reload", spy)
+    # Path A deploys through sync_active_cert_to_secret (#4164).
+    monkeypatch.setattr(bootstrap, "deploy_active_cert", spy)
+    monkeypatch.setattr(bootstrap, "_write_served_cert_snapshot", _no_snapshot)
 
     await ensure_self_signed_cert()
 
