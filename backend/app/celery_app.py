@@ -1133,6 +1133,41 @@ class SpatiumConsumer(Consumer):
         )
         return super().ensure_connected(conn)
 
+    def on_connection_error_after_connected(self, exc: Exception) -> None:
+        """Reconnect even when kombu cannot restore the unacked messages (#4159).
+
+        celery's cleanup after a lost broker calls ``connection.collect()``,
+        which drops the transport's ``client`` back-reference, and then
+        ``connection.close()``. With a delivered-but-unacked message (every
+        running ``acks_late`` task) the channel's close restores it, which on
+        a Sentinel broker whose old master now refuses needs a *new* pool, and
+        kombu 5.7.0 builds that from ``self.connection.client.hostname``:
+        ``AttributeError: 'NoneType' object has no attribute 'hostname'``.
+        ``ignore_errors`` only swallows connection errors, so the
+        AttributeError escaped the consumer loop as "Unrecoverable error" and
+        the worker stopped answering pings until its liveness probe killed it,
+        with a long task (the upgrade drive) still running in the pool.
+        kombu 5.7.0 is the newest release and has no fix. The connection is
+        being thrown away, so a failed restore is logged and the reconnect
+        goes on; the message stays in kombu's unacked index and is
+        redelivered by its visibility-timeout restore, as for a lost worker.
+        """
+        connection = self.connection
+        if connection is not None:
+            real_close = connection.close
+
+            def close_tolerating_failed_restore() -> None:
+                try:
+                    real_close()
+                except AttributeError as close_exc:
+                    structlog.get_logger(__name__).warning(
+                        "celery_broker_close_failed_restore",
+                        error=repr(close_exc),
+                    )
+
+            connection.close = close_tolerating_failed_restore
+        super().on_connection_error_after_connected(exc)
+
 
 # kombu's retry_over_time sleeps through fxrange(start, interval_max + start,
 # step), so interval_max=1 with start=1 yields 1, 2, 2, 2 ... seconds.
