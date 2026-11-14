@@ -19,6 +19,7 @@ from sqlalchemy import Select, select
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
 from app.services import locks as lock_svc
+from app.services.api_token_scopes import token_write
 
 router = APIRouter()
 
@@ -154,6 +155,7 @@ async def set_lock(
 
 
 @router.post("/{resource_type}/{resource_id}/unlock", status_code=status.HTTP_204_NO_CONTENT)
+@token_write("Clears a resource lock")
 async def clear_lock(
     resource_type: str,
     resource_id: uuid.UUID,
