@@ -5,13 +5,7 @@
  * read in the edit form. They are always visible, and a row opens a detail modal.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { DNSServerGroup } from "@/lib/api";
@@ -140,7 +134,7 @@ describe("Views row actions and detail (#4180)", () => {
     );
     await screen.findByText(/Zones \(1\)/);
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-    await waitFor(() => expect(screen.getByText("Edit View")).toBeTruthy());
+    expect(await screen.findByText('Edit view "guest"')).toBeTruthy();
   });
 
   it("without permission both modal buttons are disabled", async () => {
