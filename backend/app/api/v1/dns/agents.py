@@ -1252,7 +1252,26 @@ async def agent_heartbeat(
     # agents on one identity) still heartbeats. Its liveness and acks count;
     # what it reports about its daemon, config and spool describes a process
     # that is not being served, so it stays off the row.
-    displaced = is_displaced(server, _agent_instance(agent_instance))
+    instance = _agent_instance(agent_instance)
+    displaced = is_displaced(server, instance)
+    # #4139 — a new process announces itself with a heartbeat BEFORE its boot
+    # apply (1.4 s to a minute: a zone that will not load is waited on). The
+    # takeover that retires its predecessor's stale ``ok`` happens here, not on
+    # the first config poll, which comes only after the boot apply. A heartbeat
+    # that names no process (an older agent) is served exactly as before.
+    if (
+        instance is not None
+        and not displaced
+        and server.agent_instance not in (None, instance)
+        and not await claim_poll(
+            db,
+            server,
+            instance,
+            now=now,
+            client_ip=request.client.host if request.client is not None else None,
+        )
+    ):
+        displaced = True
     # #1929 — the ops this heartbeat writes are locked before the server row
     # (``row_locks``): its first write to the server row is flushed by the
     # next statement, so the lock has to come before any of them.
@@ -1514,7 +1533,8 @@ async def agent_zone_state(
     does not hold (the zone was deleted from the control plane but the agent
     still serves it; the next config bundle drops it) or holds more than once
     (one zone per view, and the report names no view) is skipped, counted in
-    the answer, and logged once per report.
+    the answer, and logged once per report; the rows the server already has
+    for a name held more than once are dropped (#4133).
     """
     server, _ = auth
     now = datetime.now(UTC)
@@ -1557,12 +1577,27 @@ async def agent_zone_state(
     serial_by_zone: dict[uuid.UUID, int] = {}
     unknown: list[str] = []
     ambiguous: list[str] = []
+    ambiguous_zone_ids: set[uuid.UUID] = set()
     for entry in body.zones:
         matches = zones_by_key.get(_key(entry.zone_name), [])
         if len(matches) == 1:
             serial_by_zone[matches[0].id] = entry.serial
         else:
             (ambiguous if matches else unknown).append(entry.zone_name)
+            ambiguous_zone_ids.update(m.id for m in matches)
+
+    # #4133 — a row written while the name was held once is the serial of one
+    # copy as it was then. Once a second view holds the name the report cannot
+    # say whose serial it is, so nothing refreshes the row and the drift
+    # report reads that copy ``behind`` for good after its next change. Drop
+    # it: with no stored serial the report falls back to the records.
+    if ambiguous_zone_ids:
+        await db.execute(
+            sa_delete(DNSServerZoneState).where(
+                DNSServerZoneState.server_id == server.id,
+                DNSServerZoneState.zone_id.in_(ambiguous_zone_ids),
+            )
+        )
 
     # #1968 — a PowerDNS server never serves a serial below the one it already
     # held (the agent floors it), so after the upgrade to a build that owns the

@@ -69,6 +69,7 @@ from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.core.responses import XmlResponse
 from app.core.security import (
+    burn_password_check,
     create_access_token,
     create_mfa_challenge_token,
     create_refresh_token,
@@ -657,7 +658,12 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is temporarily locked due to repeated failed logins.",
             )
-        if not user.hashed_password or not verify_password(body.password, user.hashed_password):
+        if not user.hashed_password:
+            burn_password_check(body.password)
+            password_ok = False
+        else:
+            password_ok = verify_password(body.password, user.hashed_password)
+        if not password_ok:
             await _audit_login_failure(db, request, body.username, reason="bad_password", user=user)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -706,6 +712,12 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             access_token=external_response.access_token,
             force_password_change=external_response.force_password_change,
         )
+
+    # A refused sign-in for any name that is not a local account (no row, or a
+    # directory/SSO row) costs the one password compare a wrong local password
+    # costs, on top of the provider chain, so those answers are equally
+    # expensive whichever of the two the name is.
+    burn_password_check(body.password)
 
     # Existing-but-external user with no matching provider → fall through to
     # the generic 401 so we don't leak account-existence information.

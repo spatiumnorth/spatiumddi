@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import Group, Role, User
 
 pytestmark = pytest.mark.asyncio
 
@@ -89,3 +89,28 @@ async def test_403_body_and_status_match_the_stock_response(
     assert resp.status_code == 403
     assert list(resp.json()) == ["detail"]
     assert resp.headers["content-type"] == "application/json"
+
+
+async def test_domain_create_with_read_only_grant_writes_one_denied_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # The router-level gate passes on ``read``; the refusal is the handler's own.
+    user, headers = await _plain_user(db_session)
+    user_id = user.id
+    role = Role(
+        name=f"r-{uuid.uuid4().hex[:6]}",
+        description="",
+        permissions=[{"action": "read", "resource_type": "manage_domains"}],
+    )
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    await db_session.refresh(user, ["groups"])
+    group.users = [user]
+    db_session.add_all([role, group])
+    await db_session.commit()
+    resp = await client.post("/api/v1/domains", headers=headers, json={"name": "example.org"})
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"detail": "Permission denied"}
+    rows = await _denied(db_session, user_id)
+    assert len(rows) == 1, [r.resource_display for r in rows]
+    assert rows[0].resource_display == "POST /api/v1/domains"

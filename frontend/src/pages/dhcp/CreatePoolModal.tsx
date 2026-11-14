@@ -4,6 +4,7 @@ import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 type CreatePoolModalProps = {
   pool?: DHCPPool;
@@ -252,7 +253,7 @@ function PoolModalForm({ pool, scope, onClose }: CreatePoolModalProps) {
             </select>
           </Field>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         {existingWarning && (
           <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
             <p className="text-sm font-medium text-amber-700 dark:text-amber-400">

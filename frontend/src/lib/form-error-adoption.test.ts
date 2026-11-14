@@ -8,37 +8,10 @@ import { describe, expect, it } from "vitest";
 
 const SRC = join(__dirname, "..");
 
-// Files with open PRs at the time of the sweep: converting them then would
-// conflict. Each is a follow-up; the list may only shrink (the second test
-// fails when an entry no longer has a plain box, so it must be removed).
-const OPEN_PR_FOLLOW_UP = [
-  "components/copilot/CopilotDrawer.tsx",
-  "pages/SettingsPage.tsx",
-  "pages/admin/AlertsPage.tsx",
-  "pages/admin/ChangeRequestsPage.tsx",
-  "pages/admin/CustomFieldsPage.tsx",
-  "pages/appliance/FleetTab.tsx",
-  "pages/dhcp/CreatePoolModal.tsx",
-  "pages/dhcp/CreateScopeModal.tsx",
-  "pages/dns/DNSPage.tsx",
-  "pages/ipam/BulkAllocateModal.tsx",
-  "pages/ipam/IPAMPage.tsx",
-  "pages/ipam/ImportExportModals.tsx",
-  "pages/ipam/MoveBlockModal.tsx",
-  "pages/ipam/NATPage.tsx",
-  "pages/ipam/SubnetPlannerListPage.tsx",
-  "pages/network/DICOMPage.tsx",
-  "pages/network/SitesPage.tsx",
-  "pages/security/NewDevicesPage.tsx",
-  "pages/vlans/VLANsPage.tsx",
-].map((p) => p + " (open PR, follow-up)");
-
-const allowed = new Set(OPEN_PR_FOLLOW_UP.map((s) => s.split(" ")[0]));
-
 // Conditions that are not a refusal of a save (stored last-run state, field
 // hints, page-level notices).
 const NOT_A_REFUSAL =
-  /last_|fingerbank|error_message|valueError|hostnameErr|errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError/;
+  /last_|fingerbank|error_message|valueError|hostnameErr|errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"/;
 
 const PLAIN_BOX =
   /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>p|div)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
@@ -82,18 +55,10 @@ describe("dialog refusals are announced (#3821)", () => {
     );
   });
 
-  it("no dialog outside the allowlist draws a plain refusal box", () => {
-    const offenders = [...found.keys()].filter((f) => !allowed.has(f)).sort();
+  it("no dialog draws a plain refusal box", () => {
     expect(
-      offenders,
+      [...found.keys()].sort(),
       "use <FormError> from components/ui/form-error instead of a plain red <p>/<div>",
     ).toEqual([]);
-  });
-
-  it("the allowlist only shrinks: every entry still has a plain box", () => {
-    const stale = [...allowed].filter((f) => !found.has(f)).sort();
-    expect(stale, "converted already: remove from OPEN_PR_FOLLOW_UP").toEqual(
-      [],
-    );
   });
 });

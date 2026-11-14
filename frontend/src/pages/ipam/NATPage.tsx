@@ -19,6 +19,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { FormError } from "@/components/ui/form-error";
 
 const KIND_LABEL: Record<NATKind, string> = {
   "1to1": "1:1 NAT",
@@ -348,7 +349,7 @@ function NATMappingModalForm({
           />
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

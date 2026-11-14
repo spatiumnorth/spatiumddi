@@ -299,7 +299,7 @@ async def list_domains(
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())
 
-    stmt = base.order_by(Domain.name).limit(page_size).offset((page - 1) * page_size)
+    stmt = base.order_by(Domain.name, Domain.id).limit(page_size).offset((page - 1) * page_size)
     rows = list((await db.execute(stmt)).scalars().all())
     tlds = (await effective_registry(db)).tlds
     return DomainListResponse(

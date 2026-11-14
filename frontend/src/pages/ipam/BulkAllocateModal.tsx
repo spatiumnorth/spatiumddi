@@ -54,6 +54,7 @@ import {
   templateFormatError,
   templateStartError,
 } from "@/lib/bulk-allocate-template";
+import { FormError } from "@/components/ui/form-error";
 
 function ipToBigInt(ip: string): bigint | null {
   if (ip.includes(":")) {
@@ -655,10 +656,10 @@ export function BulkAllocateModal({
           )}
 
           {serverError && (
-            <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-3 text-xs text-red-900 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+            <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
               <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
               <span>{serverError}</span>
-            </div>
+            </FormError>
           )}
         </>
       )}
