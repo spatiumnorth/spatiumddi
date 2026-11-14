@@ -2367,6 +2367,201 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     return how
 
 
+# ── Incremental RPZ apply (#4191) ───────────────────────────────────────────
+#
+# A blocklist refresh used to re-render the whole RPZ zone and ``rndc reload``
+# it, so named held the old and the new copy of a zone of hundreds of thousands
+# of names at once: a ~1.5x memory peak (measured on BIND 9.20: 315 MB resident
+# -> 484 MB peak for a 350k-name zone and a three-line change), and a pod
+# limit that fits the steady state OOM-kills named on exactly that apply
+# (#3552). Most refreshes change a handful of names. So when the zone is
+# dynamic and the diff against what named already holds is small, the diff is
+# sent to named as RFC 2136 updates instead (measured: 315 MB -> 321 MB peak),
+# and the zone is not frozen, reloaded or thawed.
+#
+# What named holds is remembered as ``<state>/rpz-applied/<zone file>``: a
+# hard link of the render it last took (sidecar-vouched like any RPZ file),
+# kept apart from the rendered trees. Named dumps a dynamic zone over its file
+# within ~15 minutes of an update, in its own text format; the snapshot is the
+# only copy that is still in ours to diff against, and the render links it
+# forward when a bundle has not changed (so a dump does not make the next
+# structural apply reload a zone nothing changed in).
+#
+# The file in the new tree is ALWAYS the full render, so a restart, a fallback
+# or a revert never depends on named's journal. Anything unusual falls back to
+# the reload this replaces: no snapshot, a diff over the budget, a header that
+# moved, a zone that is not dynamic (no usable key; a first apply after an
+# upgrade), any update error or a sample that does not read back.
+_RPZ_APPLIED_DIR = "rpz-applied"
+_RPZ_HEADER_LINES = 3
+
+#: A diff of more than this many added + removed lines is reloaded instead.
+#: Each update message makes named re-scan the whole zone to refresh its
+#: policy summary, so the cost of the incremental path is roughly
+#: (changes / ``_RPZ_UPDATE_BYTES``-sized messages) full scans of the zone, plus
+#: a journal entry per change; a reload is one parse of the file and the 1.5x
+#: peak. 5000 lines is ~10 messages: a few seconds, ~0.5 MB of journal, and a
+#: tiny fraction of a 350k-name list; past it the peak is the cheaper price.
+_RPZ_INCR_MAX_CHANGES = 5000
+#: ...and never more than this fraction of the zone's lines, so a small list
+#: that is mostly replaced is reloaded (a reload of it is cheap)...
+_RPZ_INCR_MAX_FRACTION = 0.10
+#: ...except that a diff this small is always sent.
+_RPZ_INCR_MIN_BUDGET = 50
+#: One update message stays well below the 64 KiB a TCP DNS message can carry.
+_RPZ_UPDATE_BYTES = 40000
+#: How many added / removed names are read back after an update.
+_RPZ_CONFIRM_SAMPLE = 4
+
+
+class _RpzDiff(NamedTuple):
+    ttl: int
+    removes: list[str]
+    adds: list[str]
+
+
+class _RpzFile(NamedTuple):
+    key: str
+    digest: str
+
+
+def _rpz_intact(path: Path) -> _RpzFile | None:
+    """The sidecar's key and digest when ``path`` is a regular file that still
+    hashes to what its sidecar recorded (the check ``_rpz_reusable`` makes,
+    without insisting on a particular key), else None."""
+    try:
+        recorded = _rpz_sidecar(path).read_text(encoding="utf-8").split()
+        if not path.is_file() or path.is_symlink() or len(recorded) != 3:
+            return None
+        if recorded[1] != str(path.stat().st_size):
+            return None
+        if _hash_file(path) != recorded[2]:
+            return None
+    except (OSError, UnicodeDecodeError):
+        return None
+    return _RpzFile(recorded[0], recorded[2])
+
+
+def _rpz_lines(path: Path) -> Iterator[bytes]:
+    """The lines of an RPZ zone file we rendered, newline stripped."""
+    with open(path, "rb") as fh:
+        for raw in fh:
+            yield raw.rstrip(b"\n")
+
+
+def _rpz_diff(old: Path, new: Path) -> _RpzDiff | None:
+    """What turns the RPZ render ``old`` into ``new``, or None when it is not
+    worth sending as updates (over the budget, or not comparable).
+
+    Both are our renders: ``$TTL``, an SOA whose serial moves with the content,
+    an NS, then one resource record per line. Only the record lines are
+    compared, as a multiset of 128-bit hashes, so the working set is ~100 B a
+    line rather than the lines themselves; the set shrinks as the new file is
+    read, so what is left is exactly the removed lines, which a second pass
+    over the old file turns back into text. Stops reading as soon as the budget
+    is spent.
+    """
+    old_head = list(_head(old))
+    new_head = list(_head(new))
+    if len(old_head) < _RPZ_HEADER_LINES or len(new_head) < _RPZ_HEADER_LINES:
+        return None
+    # The SOA (line 2) differs by its serial and nothing else is allowed to.
+    if old_head[0] != new_head[0] or old_head[2] != new_head[2]:
+        return None
+    m = re.fullmatch(rb"\$TTL (\d+)", new_head[0])
+    if m is None:
+        return None
+    keys: set[bytes] = set()
+    for i, line in enumerate(_rpz_lines(old)):
+        if i >= _RPZ_HEADER_LINES and line:
+            keys.add(hashlib.blake2b(line, digest_size=16).digest())
+    budget = min(
+        _RPZ_INCR_MAX_CHANGES,
+        max(_RPZ_INCR_MIN_BUDGET, int(len(keys) * _RPZ_INCR_MAX_FRACTION)),
+    )
+    adds: list[str] = []
+    for i, line in enumerate(_rpz_lines(new)):
+        if i < _RPZ_HEADER_LINES or not line:
+            continue
+        digest = hashlib.blake2b(line, digest_size=16).digest()
+        if digest in keys:
+            keys.discard(digest)
+        elif len(adds) >= budget:
+            return None
+        else:
+            adds.append(line.decode("utf-8"))
+    if len(adds) + len(keys) > budget:
+        return None
+    removes: list[str] = []
+    if keys:
+        for i, line in enumerate(_rpz_lines(old)):
+            if i < _RPZ_HEADER_LINES or not line:
+                continue
+            if hashlib.blake2b(line, digest_size=16).digest() in keys:
+                removes.append(line.decode("utf-8"))
+    return _RpzDiff(int(m.group(1)), removes, adds)
+
+
+def _head(path: Path) -> Iterator[bytes]:
+    for i, line in enumerate(_rpz_lines(path)):
+        if i >= _RPZ_HEADER_LINES:
+            return
+        yield line
+
+
+def _rpz_split(line: str) -> tuple[str, str, str]:
+    """``owner rdata`` of one rendered record, as (owner, type, rdata text)."""
+    owner, rest = line.split(" ", 1)
+    rtype, _, rdata = rest.partition(" ")
+    return owner, rtype, rdata
+
+
+def _rpz_update_messages(
+    zone: str,
+    keyring: Any,
+    keyname: str,
+    algorithm: str,
+    diff: _RpzDiff,
+) -> list[Any]:
+    """The RFC 2136 messages for ``diff``: every removal first, then every
+    addition, so a name that changes its rewrite (a CNAME that becomes an
+    address) is never asked to hold both. A message carries as many as fit
+    ``_RPZ_UPDATE_BYTES``."""
+    messages: list[Any] = []
+    upd: Any = None
+    size = 0
+
+    def fresh() -> Any:
+        return dns.update.Update(
+            zone,
+            keyring=keyring,
+            keyname=keyname,
+            keyalgorithm=dns.name.from_text(algorithm),
+        )
+
+    for kind, lines in (("delete", diff.removes), ("add", diff.adds)):
+        for line in lines:
+            if upd is None or size >= _RPZ_UPDATE_BYTES:
+                upd = fresh()
+                messages.append(upd)
+                size = 0
+            owner, rtype, rdata = _rpz_split(line)
+            if kind == "delete":
+                upd.delete(owner, rtype, rdata)
+            else:
+                upd.add(owner, diff.ttl, rtype, rdata)
+            size += len(line) + 24
+    return messages
+
+
+def _sample(items: list[str], n: int) -> list[str]:
+    """``n`` items spread evenly over ``items`` (all of them when fewer)."""
+    if len(items) <= n:
+        return list(items)
+    step = len(items) / n
+    return [items[int(i * step)] for i in range(n)]
+
+
 # ── Dynamic-update records survive a re-render (#2850) ──────────────────────
 #
 # A zone that takes RFC 2136 updates from a third party (an AD DC, a DHCP
@@ -3131,6 +3326,8 @@ class Bind9Driver(DriverBase):
         self._skipped_records = set()
         self._unwritable_zones = ()
         self._learned_rrsets = {}
+        # The RPZ zones this render makes dynamic, by file (#4191).
+        self._rpz_update_keys = {}
         # A new render may grant the SOA where the last one did not (#2835).
         self._soa_refused_zones: set[str] = set()
         # What each zone's apex is computed from, re-filled by this render
@@ -3276,14 +3473,32 @@ class Bind9Driver(DriverBase):
             opts.get("allow_transfer"), key_grants
         )
 
+        def _rpz_key(view: str | None) -> dict[str, Any] | None:
+            """The key an RPZ zone of ``view`` takes RFC 2136 updates from
+            (#4191): the view's transfer key, which selects exactly that view
+            from loopback, or without views the group's loopback key. None
+            leaves the zone static, as it always was: every change reloads."""
+            if has_views:
+                return view_keys.get(view or "")
+            return tsig_keys[0] if tsig_keys else None
+
+        def _rpz_policy_zone(bl: dict[str, Any], view: str | None) -> str:
+            """One ``zone`` element of a ``response-policy`` clause. A dynamic
+            zone also gets ``min-update-interval 0``: named applies an update
+            to its policy summary at most once per interval, default 60 s
+            (measured on 9.20: a name added by update was not blocked for ~50
+            s), where a reload applies the whole zone at once."""
+            name = bl["rpz_zone_name"].rstrip(".")
+            return f'zone "{name}"' + (
+                " min-update-interval 0" if _rpz_key(view) else ""
+            )
+
         # Response-policy block needs to list every RPZ zone we're about to
         # declare, otherwise BIND9 won't consult them on lookups.
         blocklists = bundle.get("blocklists") or []
         response_policy_block = ""
         if blocklists and not has_views:
-            zones_list = "; ".join(
-                f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
-            )
+            zones_list = "; ".join(_rpz_policy_zone(bl, None) for bl in blocklists)
             # break-dnssec lets RPZ rewrite answers for DNSSEC-signed names to
             # clients that set DO=1 too; with ``no``, BIND serves those clients
             # the real signed answer, so the block would not apply to them.
@@ -3491,6 +3706,18 @@ class Bind9Driver(DriverBase):
             zname = bl["rpz_zone_name"]
             rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
+            # Dynamic for the agent's own key only (#4191), so a small list
+            # change can go to named as RFC 2136 updates; nothing else may
+            # write the zone.
+            rpz_key = _rpz_key(file_prefix.rstrip("/") or None)
+            update_clause = ""
+            if rpz_key:
+                update_clause = f'allow-update {{ key "{rpz_key["name"]}"; }}; '
+                self._rpz_update_keys[rel] = (
+                    rpz_key["name"],
+                    rpz_key["secret"],
+                    rpz_key.get("algorithm", "hmac-sha256"),
+                )
             try:
                 if _named_files_fit(new_dir / rel, False):
                     self._place_rpz_zone_file(new_dir / rel, bl, rel)
@@ -3502,7 +3729,7 @@ class Bind9Driver(DriverBase):
                 self._hold_unwritable(new_dir / rel, zname, file_prefix)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
-                f"allow-query {{ localhost; }}; }};\n"
+                f"{update_clause}allow-query {{ localhost; }}; }};\n"
             )
 
         def _indent(text: str, spaces: int = 4) -> str:
@@ -3557,9 +3784,7 @@ class Bind9Driver(DriverBase):
                 view_bls = own_bls if own_bls else list(global_bls)
                 body = ""
                 if view_bls:
-                    zlist = "; ".join(
-                        f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in view_bls
-                    )
+                    zlist = "; ".join(_rpz_policy_zone(bl, vname) for bl in view_bls)
                     body += (
                         f"response-policy {{ {zlist}; }} "
                         f"{_RPZ_POLICY_OPTIONS};\n"
@@ -3996,7 +4221,8 @@ class Bind9Driver(DriverBase):
         Reused (#2157) when the bundle's content hash matches the sidecar of
         the live tree's file, or of the backup's — the backup matters on a
         #882 revert, which re-renders the previous bundle while the live tree
-        holds the failed one. A reused file is hard-linked, so it costs no
+        holds the failed one — or of the snapshot of what named holds (#4191),
+        which named's own dump of a dynamic zone cannot overwrite. A reused file is hard-linked, so it costs no
         write and no blocks; its bytes are by construction the bytes this
         render would have produced, so the zone stays out of the changed set,
         out of ``named-checkzone`` and out of every ``rndc reload``.
@@ -4005,7 +4231,9 @@ class Bind9Driver(DriverBase):
         # A file named could not load is not reused again (#4080): its sidecar
         # vouches for the bytes, not for named being able to read them.
         if key is not None and rel not in self._unloaded_zones:
-            for tree in (self.rendered_dir_name, "rendered.prev"):
+            # The snapshot (#4191) is the last source: named's own dump can
+            # have overwritten the live file, and it still holds our render.
+            for tree in (self.rendered_dir_name, "rendered.prev", _RPZ_APPLIED_DIR):
                 src = self.state_dir / tree / rel
                 digest = _rpz_reusable(src, key)
                 if digest is None:
@@ -4632,10 +4860,19 @@ class Bind9Driver(DriverBase):
             }
         frozen: dict[tuple[str, str | None], int | None] = {}
         running = bool(rndc and current.exists() and self.daemon_running())
+        # RPZ zones whose small change named takes as RFC 2136 updates (#4191)
+        # leave ``changed``: no freeze, no reload, no second copy in memory.
+        rpz_updated: set[tuple[str, str | None]] = set()
+        if running and changed is not None:
+            rpz_updated = self._rpz_incremental(new_dir, changed)
         if running:
-            frozen = self._freeze_before_swap(
-                base, new_dir, current, changed, carry=carry, sources=sources
-            )
+            try:
+                frozen = self._freeze_before_swap(
+                    base, new_dir, current, changed, carry=carry, sources=sources
+                )
+            except BaseException:
+                self._rpz_incremental_undo(rpz_updated)
+                raise
         # Until thawed, a zone frozen here refuses every update: whatever
         # fails below, nothing may leave it frozen.
         still_frozen = set(frozen)
@@ -4685,12 +4922,24 @@ class Bind9Driver(DriverBase):
                 self.start_daemon()
                 if self._await_named_started():
                     self._verify_zones_loaded(self._rndc_base(), None)
+                self._rpz_refresh_snapshots()
                 return
-            self._signal_reload(
+            verified = self._signal_reload(
                 base if rndc else None, changed, frozen, still_frozen, rendered
             )
             if rndc:
                 self._sync_set_aside_journals(base, backup, frozen)
+            if verified:
+                self._rpz_refresh_snapshots()
+            else:
+                # SIGHUP verified nothing and re-reads no dynamic zone: what
+                # named holds of each RPZ zone is not known.
+                self._rpz_incremental_undo(
+                    {zv for zv in self.rendered_zone_views() if _zone_rel(*zv) in self._rpz_update_keys}
+                )
+        except BaseException:
+            self._rpz_incremental_undo(rpz_updated)
+            raise
         finally:
             if still_frozen:
                 self._thaw(base, still_frozen)
@@ -5204,11 +5453,15 @@ class Bind9Driver(DriverBase):
         frozen: dict[tuple[str, str | None], int | None],
         still_frozen: set[tuple[str, str | None]],
         rendered: dict[tuple[str, str | None], int | None],
-    ) -> None:
+    ) -> bool:
         """Have the running named take the swapped-in tree, and confirm it did.
 
         ``frozen`` maps each zone frozen before the swap to the serial named
-        served it under; ``still_frozen`` is emptied once they are thawed."""
+        served it under; ``still_frozen`` is emptied once they are thawed.
+
+        True when named took it through rndc and every changed zone was
+        verified loaded; False on the SIGHUP fallback, which can verify
+        nothing (and does not re-read a dynamic zone's file)."""
         # Signal daemon. Try rndc first; if the control channel cannot be
         # reached, fall back to SIGHUP, which named handles as a config +
         # zone reload.
@@ -5251,7 +5504,7 @@ class Bind9Driver(DriverBase):
                 still_frozen.clear()
                 self._sync_logging_runtime(base)
                 self._verify_zones_loaded(base, changed, before, rendered)
-                return
+                return True
             error = _first_line(res.stderr, res.stdout)
             # "rndc: 'reconfig' failed: TLS error" is named ANSWERING, and
             # refusing: a config ``named-checkconf`` passed but named cannot
@@ -5268,6 +5521,7 @@ class Bind9Driver(DriverBase):
             self._thaw(base, still_frozen)
             still_frozen.clear()
         self._sighup_reload()
+        return False
 
     def _sighup_reload(self) -> None:
         """The no-rndc fallback. Degraded, and cannot be verified.
@@ -5485,6 +5739,11 @@ class Bind9Driver(DriverBase):
             self._carry_dynamic_updates(new_dir, live, carried, frozen, sources=sources)
         for (zname, view), serving in frozen.items():
             staged = new_dir / _zone_rel(zname, view)
+            # An RPZ zone's serial is a hash of its content and nothing
+            # transfers it (#2157): there is no secondary to keep ahead, and
+            # comparing two 350k-name zones for it costs minutes (#4191).
+            if _zone_rel(zname, view) in self._rpz_update_keys:
+                continue
             serial = _soa_serial(staged)
             if serving is None or serial is None or _serial_later(serial, serving):
                 continue
@@ -5830,6 +6089,173 @@ class Bind9Driver(DriverBase):
             of=len(all_zones),
             selective=only is not None,
         )
+
+    # ── Incremental RPZ apply (#4191) ───────────────────────────────────────
+
+    #: ``zone file rel -> (key name, secret, algorithm)`` for every RPZ zone
+    #: the last render made dynamic: the key named is told may update it, and
+    #: the one this agent signs the updates with. Empty when the bundle has no
+    #: usable key (no loopback key; a view without a transfer key).
+    _rpz_update_keys: dict[str, tuple[str, str, str]] = {}  # noqa: RUF012
+
+    def _rpz_applied_path(self, rel: str) -> Path:
+        return self.state_dir / _RPZ_APPLIED_DIR / rel
+
+    def _rpz_drop_snapshot(self, rel: str) -> None:
+        for p in (self._rpz_applied_path(rel), _rpz_sidecar(self._rpz_applied_path(rel))):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass  # a snapshot that cannot be removed fails its hash check
+
+    def _rpz_incremental(
+        self,
+        new_dir: Path,
+        changed: set[tuple[str, str | None]],
+    ) -> set[tuple[str, str | None]]:
+        """Settle every changed RPZ zone that named can take as updates, and
+        take it out of ``changed`` (#4191).
+
+        Runs before the freeze that precedes the swap, against the running
+        named and the config it already has. Returns the zones named now holds
+        the new content of, by update; a zone whose update fails stays in
+        ``changed`` and goes through the freeze / reload it always did.
+        A zone whose render is exactly what the snapshot says named holds is
+        not changed at all (named's own dump had overwritten its live file).
+        """
+        done: set[tuple[str, str | None]] = set()
+        if not self._rpz_update_keys or dns is None:
+            return done
+        for zv in sorted(changed, key=lambda z: (z[0], z[1] or "")):
+            rel = _zone_rel(*zv)
+            key = self._rpz_update_keys.get(rel)
+            if key is None or rel in self._unloaded_zones:
+                continue
+            snap = self._rpz_applied_path(rel)
+            new = new_dir / rel
+            if not new.is_file() or _rpz_intact(snap) is None:
+                continue
+            try:
+                if os.path.samefile(snap, new) or _same_file_bytes(snap, new):
+                    changed.discard(zv)
+                    continue
+                diff = _rpz_diff(snap, new)
+                if diff is None:
+                    log.info("bind9_rpz_incremental_skipped", zone=zv[0], view=zv[1])
+                    continue
+                self._rpz_send(zv, key, diff)
+            except Exception as exc:  # noqa: BLE001 - any failure means: reload
+                log.warning(
+                    "bind9_rpz_incremental_failed",
+                    zone=zv[0],
+                    view=zv[1],
+                    error=str(exc)[:200],
+                    detail="falling back to a full render and reload",
+                )
+                # named may hold part of the change: the snapshot no longer
+                # says what it holds.
+                self._rpz_drop_snapshot(rel)
+                continue
+            changed.discard(zv)
+            done.add(zv)
+            log.info(
+                "bind9_rpz_incremental_applied",
+                zone=zv[0],
+                view=zv[1],
+                added=len(diff.adds),
+                removed=len(diff.removes),
+            )
+        return done
+
+    def _rpz_send(
+        self,
+        zv: tuple[str, str | None],
+        key: tuple[str, str, str],
+        diff: _RpzDiff,
+    ) -> None:
+        """Send ``diff`` to the zone ``zv`` over loopback and read a sample
+        back; raises on any refusal or mismatch."""
+        zname = zv[0].rstrip(".") + "."
+        name, secret, algorithm = key
+        keyring = dns.tsigkeyring.from_text({name: secret})
+        for msg in _rpz_update_messages(zname, keyring, name, algorithm, diff):
+            resp = dns.query.tcp(msg, "127.0.0.1", timeout=30)
+            if resp.rcode() != 0:
+                raise RuntimeError(f"update refused: rcode={resp.rcode()}")
+        self._rpz_confirm(zname, keyring, name, algorithm, diff)
+
+    def _rpz_confirm(
+        self, zone: str, keyring: Any, keyname: str, algorithm: str, diff: _RpzDiff
+    ) -> None:
+        """An RFC 2136 update that names nothing it can apply still answers
+        NOERROR, so read a spread of the added and removed records back."""
+        origin = dns.name.from_text(zone)
+        for lines, want in ((diff.adds, True), (diff.removes, False)):
+            for line in _sample(lines, _RPZ_CONFIRM_SAMPLE):
+                owner, rtype, rdata = _rpz_split(line)
+                qname = dns.name.from_text(owner, origin)
+                q = dns.message.make_query(
+                    qname, rtype, flags=0, use_edns=False
+                )
+                q.use_tsig(
+                    keyring, keyname=keyname, algorithm=dns.name.from_text(algorithm)
+                )
+                resp = dns.query.tcp(q, "127.0.0.1", timeout=10)
+                have = any(
+                    rr.to_text() == dns.rdata.from_text(
+                        dns.rdataclass.IN, dns.rdatatype.from_text(rtype), rdata, origin
+                    ).to_text()
+                    for rrset in resp.answer
+                    for rr in rrset
+                )
+                if have != want:
+                    raise RuntimeError(
+                        f"{owner} {rtype} is "
+                        f"{'missing after' if want else 'still present after'} the update"
+                    )
+
+    def _rpz_incremental_undo(self, done: Collection[tuple[str, str | None]]) -> None:
+        """An apply failed after named took updates for ``done``: it holds
+        content the (reverted) tree does not, so the zones are checked again
+        by the next apply instead of being trusted."""
+        for zname, view in done:
+            rel = _zone_rel(zname, view)
+            self._rpz_drop_snapshot(rel)
+            self._unloaded_zones = self._unloaded_zones | {rel}
+
+    def _rpz_refresh_snapshots(self) -> None:
+        """Record what named now holds of each dynamic RPZ zone: a link to the
+        file the live tree has, when its sidecar vouches for it. Everything
+        else is dropped, so a snapshot never outlives the zone or says more
+        than was verified."""
+        live = self.state_dir / self.rendered_dir_name
+        for rel in self._rpz_update_keys:
+            src = live / rel
+            snap = self._rpz_applied_path(rel)
+            try:
+                if snap.is_file() and src.is_file() and os.path.samefile(snap, src):
+                    continue
+                info = _rpz_intact(src)
+                if info is None:
+                    self._rpz_drop_snapshot(rel)
+                    continue
+                old = _rpz_intact(snap)
+                if old is not None and old.digest == info.digest:
+                    continue
+                snap.parent.mkdir(parents=True, exist_ok=True)
+                _link_or_copy(src, snap)
+                _write_rpz_sidecar(snap, info.key, info.digest)
+            except OSError as exc:
+                log.warning("bind9_rpz_snapshot_failed", zone=rel, error=str(exc)[:200])
+                self._rpz_drop_snapshot(rel)
+        root = self.state_dir / _RPZ_APPLIED_DIR
+        if root.is_dir():
+            for p in list(root.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(root).as_posix().removesuffix(_RPZ_HASH_SUFFIX)
+                if rel not in self._rpz_update_keys:
+                    p.unlink(missing_ok=True)
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 

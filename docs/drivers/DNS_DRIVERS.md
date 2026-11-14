@@ -124,8 +124,20 @@ class DNSDriver(ABC):
 | Update zone options (SOA, TTL) | `nsupdate` SOA record replacement | Incremental |
 | Add/update view | Regenerate `named.conf` → SCP → `rndc reconfig` | No restart; new config loaded in-place |
 | Update forwarders, options | Regenerate `named.conf` → SCP → `rndc reconfig` | No restart |
-| Update RPZ (blocking) | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
+| Update RPZ (blocking), small change | RFC 2136 update of the added / removed names to the RPZ zone ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191)) | No reload, no second copy of the zone in memory |
+| Update RPZ (blocking), large change | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
+
+### RPZ zones are updated incrementally ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191))
+
+A blocklist refresh used to re-render the RPZ zone and `rndc reload` it, so `named` held the old and the new copy at once: on BIND 9.20 a 350k-name zone went from 315 MB resident to a 484 MB peak for a three-line change, which is what an agent pod's memory limit has to be sized for. When only a few names changed, the BIND9 agent now sends the difference to `named` as RFC 2136 updates instead (315 MB to a 321 MB peak) and does not freeze, reload or thaw the zone.
+
+- **What makes it possible.** The RPZ `zone` stanza carries `allow-update { key "<key>"; }` for the agent's own key only: the group's loopback key, or under views that view's transfer key (which selects exactly that view from loopback, so each view's RPZ gets its own diff). A bundle with no usable key renders a static zone and always reloads. The `response-policy` entry also gets `min-update-interval 0`: `named` applies an update to its policy summary at most once per interval, default 60 s, and a name added by update was measured not blocked for ~50 s without it.
+- **What is diffed.** The agent keeps `<state>/rpz-applied/<zone file>`, a hard link of the render `named` last took (sidecar-verified, like every RPZ file). The diff is new render against it, record lines only, as a set of 128-bit hashes (about 100 bytes a line). It is a snapshot rather than the live file because `named` writes a dynamic zone over its file, in its own format, within ~15 minutes of an update. The same snapshot lets the render link the file forward when the bundle did not change, so that dump never makes an unchanged list reload.
+- **The file is always the full render.** The new tree gets the complete zone file either way, so a restart, a fallback or a #882 revert never depends on `named`'s journal.
+- **When it falls back to the reload.** No snapshot (the first apply after an upgrade, a restart of the agent's state, a zone that is new); a diff over `min(5000, max(50, 10 % of the zone's lines))` added + removed lines; a header that moved; any update the server refuses; or a sample of four added and four removed names that does not read back as sent (an update `named` cannot apply still answers NOERROR). 5000 lines is about ten update messages: each makes `named` re-scan the zone to refresh its policy summary, so past it the one-off reload peak is the cheaper price. The 10 % cap sends a small list that is mostly replaced through the reload, which is cheap for it.
+- **Journal.** Updates are journalled beside the zone file (`<file>.jnl`) in the live tree; the swap sets that tree aside with its journal and the new file already holds the content, so the journal never grows past one apply's changes.
+- **If the apply then fails.** `named` holds content the reverted tree does not, so the zone's snapshot is dropped and the zone is marked unloaded: the next apply reloads it instead of trusting it.
 
 ### Record ops carry the whole RRset ([#773](https://github.com/spatiumnorth/spatiumddi/issues/773))
 
