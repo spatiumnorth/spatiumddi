@@ -281,6 +281,9 @@ def _capabilities_payload() -> dict[str, Any]:
         # plane refuses to promote a node whose supervisor does not say so,
         # since it would never be handed the join token.
         "sealed_join_token": True,
+        # Registrations are signed with the supervisor's own key; once a row
+        # has reported this, an unsigned registration of it is refused.
+        "register_proof": True,
     }
     # Every baked appliance has every service image preloaded; the
     # control plane's role-checkbox UI uses these flags to gate
