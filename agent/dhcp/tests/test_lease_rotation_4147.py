@@ -32,6 +32,12 @@ def _watcher(tmp_path: Path) -> LeaseWatcher:
     w = LeaseWatcher.__new__(LeaseWatcher)
     w._offsets = {}
     w._handles = {}
+    w._read_at = {}
+    w._row_bytes = 0
+    w._rows_read = 0
+    w._chunks = {}
+    w._inflight = 0
+    w._inflight_attr = ""
     return w
 
 

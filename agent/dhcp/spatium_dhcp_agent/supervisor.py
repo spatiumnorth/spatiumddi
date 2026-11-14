@@ -116,6 +116,7 @@ def run(cfg: AgentConfig) -> int:
         )
     )
     leases = LeaseWatcher(cfg, token_ref, heartbeat, spool=spools.get("lease_events"))
+    heartbeat.pending_provider = leases.pending_status
     metrics = MetricsPoller(cfg, token_ref, spool=spools.get("metrics"))
     log_shipper = LogShipper(cfg, token_ref, spool=spools.get("dhcp_log"))
 
