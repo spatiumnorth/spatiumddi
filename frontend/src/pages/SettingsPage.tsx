@@ -28,6 +28,7 @@ import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 import { InfluxDBTargets } from "@/components/InfluxDBTargets";
 import { TldRegistrySection } from "@/components/TldRegistrySection";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
+import { WebExposureSection } from "@/components/WebExposureSection";
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -145,6 +146,7 @@ type SectionId =
   | "password-policy"
   | "account-lockout"
   | "agent-bootstrap-keys"
+  | "web-exposure"
   | "maintenance-mode"
   | "session"
   | "subnet-tree"
@@ -289,6 +291,8 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // "Reset to defaults" button, so this key just exists for the
   // type-completeness check.
   "agent-bootstrap-keys": [],
+  // Held in platform_settings.web_exposure and edited by its own section.
+  "web-exposure": [],
   "maintenance-mode": ["maintenance_mode_enabled", "maintenance_message"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
@@ -969,6 +973,30 @@ const SECTIONS: SectionDef[] = [
       "appliance",
       "role",
       "split",
+    ],
+  },
+  {
+    id: "web-exposure",
+    title: "Reachability",
+    group: "Security",
+    module: "security.web_exposure",
+    description:
+      "Is this install reachable from outside your networks? A verdict with its evidence, the trusted-networks list, and opt-in responses (a stricter sign-in throttle, a temporary source ban, a second factor from outside, an appliance Web UI allow-list). Entirely local; every mitigation is off by default and never touches your own networks.",
+    keywords: [
+      "exposure",
+      "exposed",
+      "internet",
+      "reachability",
+      "public",
+      "trusted",
+      "networks",
+      "ban",
+      "throttle",
+      "mfa",
+      "brute",
+      "force",
+      "allow-list",
+      "firewall",
     ],
   },
   {
@@ -2760,6 +2788,8 @@ export function SettingsPage() {
             {activeId === "agent-bootstrap-keys" && (
               <AgentBootstrapKeysSection />
             )}
+
+            {activeId === "web-exposure" && <WebExposureSection />}
 
             {activeId === "subnet-tree" && (
               <Field

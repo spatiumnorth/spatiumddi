@@ -130,6 +130,12 @@ from app.services.reauth import (
     sign_in_is_recent,
     uses_local_password,
 )
+from app.services.web_exposure.mitigations import (
+    MFA_OUTSIDE_DETAIL,
+    check_login_allowed,
+    mfa_required_from_outside,
+)
+from app.services.web_exposure.signals import note_login_failure
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -425,6 +431,10 @@ async def _audit_login_failure(
         policy = LockoutPolicy.from_row(settings_row)
         just_locked = register_failure(user, policy)
 
+    # #3651 — count a failed sign-in from outside the operator's networks, and
+    # feed the opt-in source ban. A no-op unless the web-exposure module is on.
+    await note_login_failure(_client_ip(request), username)
+
     db.add(
         AuditLog(
             user_id=user.id if user else None,
@@ -615,6 +625,20 @@ async def _try_external_password_login(
     return None
 
 
+async def _enforce_external_source_limits(request: Request) -> None:
+    """#3651 tiers 1a / 1b (opt-in, default off): a stricter budget and a
+    temporary ban for EXTERNAL sources only. Internal and trusted sources, a
+    disabled module and the ``WEB_EXPOSURE_MITIGATIONS=off`` break glass all
+    pass untouched; Redis trouble fails open."""
+    decision = await check_login_allowed(_client_ip(request))
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again shortly.",
+            headers={"Retry-After": str(decision.retry_after)},
+        )
+
+
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request, response: Response, db: DB) -> LoginResponse:
     # Per-IP rate limit (#4) — complements the per-account lockout, which
@@ -625,6 +649,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many login attempts. Try again shortly.",
         )
+    await _enforce_external_source_limits(request)
     # Failed-password ceilings per submitted username and across the install,
     # which no choice of source address escapes. Spent before the password is
     # checked and refunded below on a right one. The refusal is the same for
@@ -687,6 +712,14 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
         if user.totp_enabled and user.totp_secret_encrypted is not None:
             challenge = create_mfa_challenge_token(str(user.id))
             return LoginResponse(mfa_required=True, mfa_token=challenge)
+        # #3651 tier 2 (opt-in, default off): a local account with no second
+        # factor is refused from an external source. Reached only after the
+        # password was right, so it says nothing about which names exist.
+        if await mfa_required_from_outside(_client_ip(request)):
+            await _audit_login_failure(
+                db, request, body.username, reason="mfa_required_from_outside", user=user
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MFA_OUTSIDE_DETAIL)
         tokens = await _issue_tokens(db, request, user, auth_source="local")
         _set_refresh_cookie(response, request, tokens.refresh_token)
         return LoginResponse(
@@ -748,6 +781,7 @@ async def login_mfa(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many login attempts. Try again shortly.",
         )
+    await _enforce_external_source_limits(request)
 
     if (body.code and body.recovery_code) or (not body.code and not body.recovery_code):
         raise HTTPException(

@@ -68,6 +68,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     tls_certs,
     upgrades,
     vendor,
+    web_exposure,
     webhooks,
     whois,
     wol_scheduler,

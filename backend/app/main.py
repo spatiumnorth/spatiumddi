@@ -22,6 +22,7 @@ from app.core.body_limit import RequestBodyLimitMiddleware
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
+from app.core.web_exposure import WebExposureMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
@@ -870,6 +871,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_dga_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_dga_alert_rule_seed_skipped", reason=str(exc))
+    try:
+        from app.services.alerts import seed_web_ui_exposed_alert_rule  # noqa: PLC0415
+
+        await seed_web_ui_exposed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("web_ui_exposed_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs
@@ -1136,8 +1143,8 @@ def create_app() -> FastAPI:
 
     # Middleware (outermost first). Note Starlette wraps in REVERSE add
     # order: the LAST-added middleware runs outermost. So the request
-    # flows in as RequestBodyLimit → TrustedProxy → TrustedHost → CORS →
-    # Prometheus → Maintenance → RequestContext, and the response unwinds
+    # flows in as RequestBodyLimit → TrustedProxy → TrustedHost → WebExposure →
+    # CORS → Prometheus → Maintenance → RequestContext, and the response unwinds
     # the other way.
     app.add_middleware(RequestContextMiddleware)
 
@@ -1185,6 +1192,12 @@ def create_app() -> FastAPI:
         # step-up, so a dialog can prompt and resubmit (#1412).
         expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
     )
+
+    # #3651 — web exposure detection. Added before TrustedHost / TrustedProxy so
+    # it runs inside both: it sees the resolved client address, and a refused
+    # Host never reaches it (that is counted in LoggingTrustedHostMiddleware).
+    # Observes only; never alters or refuses a request.
+    app.add_middleware(WebExposureMiddleware)
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given
     # Starlette's reverse wrap — it runs OUTERMOST and rejects a forged /

@@ -40,6 +40,7 @@ SETTINGS_SIDEBAR: dict[str, tuple[str, ...]] = {
         "Audit Event Forwarding",
         "Maintenance Mode",
         "Password Policy",
+        "Reachability",
         "Session & Security",
     ),
     "IPAM": (

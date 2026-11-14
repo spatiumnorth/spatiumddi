@@ -928,6 +928,15 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Web exposure detection (#3651) ──────────────────────────────
+    # The ``security.web_exposure`` module's configuration as one validated
+    # blob (``services.web_exposure.config.WebExposureConfig``): the trusted
+    # networks, the "intentional" acknowledgement, the window / threshold and
+    # the opt-in mitigation switches. ``{}`` is the shipped default.
+    web_exposure: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
+    )
+
     # ── Appliance DNS resolver (issue #158) ─────────────────────────
     # systemd-resolved runs at the Debian host level on every appliance
     # host (same host-config plane as SNMP / chrony / lldpd / rsyslog /

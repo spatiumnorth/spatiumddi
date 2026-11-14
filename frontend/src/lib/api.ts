@@ -21870,3 +21870,121 @@ export const otApi = {
       .post<OTDeviceImportCommitResponse>("/ot/devices/import/commit", data)
       .then((r) => r.data),
 };
+
+// ── Web exposure detection (#3651) ─────────────────────────────────
+
+export type WebExposureVerdictName =
+  | "exposed"
+  | "reached_from_outside"
+  | "not_observed"
+  | "unknown";
+
+export interface WebExposureBucket {
+  bucket: string;
+  requests: number;
+  signals: Record<string, number>;
+  first_seen: string | null;
+  last_seen: string | null;
+  endpoints: string[];
+  /** Exact sample addresses; null unless the caller is a superadmin. */
+  addresses: string[] | null;
+  login_page: number;
+  other_api: number;
+  login_failures: number;
+}
+
+export interface WebExposureVerdict {
+  verdict: WebExposureVerdictName;
+  severity: "info" | "warning" | "critical" | null;
+  window_hours: number;
+  threshold: number;
+  distinct_external_buckets: number;
+  since: string | null;
+  totals: Record<string, number>;
+  distinct_usernames: number;
+  attack_evidence: boolean;
+  intentional: boolean;
+  attribution_warning: boolean;
+  deployment_shape: "appliance" | "kubernetes" | "compose" | "unknown";
+  fix_hint: string;
+  summary: string;
+  buckets: WebExposureBucket[];
+}
+
+export interface WebExposureConfig {
+  trusted_networks: string[];
+  intentional: boolean;
+  window_hours: number;
+  threshold: number;
+  external_throttle_enabled: boolean;
+  external_throttle_attempts: number;
+  external_throttle_window_seconds: number;
+  ban_enabled: boolean;
+  ban_failures: number;
+  ban_failure_window_minutes: number;
+  ban_base_minutes: number;
+  ban_max_hours: number;
+  require_mfa_external: boolean;
+}
+
+export interface WebExposureBan {
+  bucket: string;
+  until: number;
+  since: number;
+  level: number;
+  minutes: number;
+  failures: number;
+}
+
+export interface WebExposureConfigResponse {
+  config: WebExposureConfig;
+  warnings?: string[];
+  caller_ip: string | null;
+  caller_class: "trusted" | "internal" | "external" | null;
+  caller_bucket: string | null;
+  deployment_shape: "appliance" | "kubernetes" | "compose" | "unknown";
+  appliance: boolean;
+  break_glass_active: boolean;
+  superadmins_without_totp: string[];
+  bans: WebExposureBan[] | null;
+  bans_available: boolean;
+  private_ranges: string[];
+}
+
+/**
+ * Web exposure detection. The whole prefix 404s unless the default-off
+ * ``security.web_exposure`` module is enabled.
+ */
+export const webExposureApi = {
+  verdict: () =>
+    api.get<WebExposureVerdict>("/web-exposure/verdict").then((r) => r.data),
+  getConfig: () =>
+    api
+      .get<WebExposureConfigResponse>("/web-exposure/config")
+      .then((r) => r.data),
+  putConfig: (body: WebExposureConfig) =>
+    api
+      .put<WebExposureConfigResponse>("/web-exposure/config", body)
+      .then((r) => r.data),
+  trustNetwork: (cidr: string) =>
+    api
+      .post<WebExposureConfigResponse>("/web-exposure/trusted-networks", {
+        cidr,
+      })
+      .then((r) => r.data),
+  clearBans: (bucket?: string) =>
+    api
+      .delete<{ cleared: number }>("/web-exposure/bans", {
+        params: bucket ? { bucket } : undefined,
+      })
+      .then((r) => r.data),
+  applyWebUiAllowList: (body: {
+    override_lockout?: boolean;
+    acknowledge_console_only?: boolean;
+  }) =>
+    api
+      .post<{
+        allowed_cidrs: string[];
+      }>("/web-exposure/apply-web-ui-allow-list", body)
+      .then((r) => r.data),
+};
