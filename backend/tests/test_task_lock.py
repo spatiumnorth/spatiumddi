@@ -45,12 +45,33 @@ class FakeRedis:
         del self.store[key]
         return 1
 
+    def exists(self, key: str) -> int:
+        return int(self._live(key) is not None)
+
     def close(self) -> None:
         pass
 
 
+class _Exhausted(Exception):
+    pass
+
+
+class _Retried(Exception):
+    def __init__(self, **kw: Any) -> None:
+        self.kw = kw
+
+
+def _retry(**kw: Any) -> Exception:
+    return _Retried(**kw)
+
+
 def _self(task_id: str | None = None) -> Any:
-    return SimpleNamespace(name="t.task", request=SimpleNamespace(id=task_id or uuid.uuid4().hex))
+    return SimpleNamespace(
+        name="t.task",
+        request=SimpleNamespace(id=task_id or uuid.uuid4().hex),
+        retry=_retry,
+        MaxRetriesExceededError=_Exhausted,
+    )
 
 
 @pytest.fixture
@@ -76,7 +97,9 @@ def test_concurrent_duplicate_is_noop(redis: FakeRedis) -> None:
     t.start()
     assert started.wait(5)
     # The redelivery has a different worker but the same natural key.
-    assert body(_self("b"), "scan-1") == {"status": "duplicate_skipped"}
+    with pytest.raises(_Retried) as ei:  # live first run: wait, never ack
+        body(_self("b"), "scan-1")
+    assert ei.value.kw["countdown"] > task_lock.LOCK_TTL_SECONDS
     release.set()
     t.join(5)
     assert first == ["ran"]
@@ -87,7 +110,8 @@ def test_lock_extended_past_ttl(redis: FakeRedis) -> None:
     @single_flight(lambda scan: scan, ttl=1, heartbeat=0.2)
     def body(self: Any, scan: str) -> str:
         time.sleep(1.6)  # longer than the TTL
-        assert body_second(_self("b"), scan) == {"status": "duplicate_skipped"}
+        with pytest.raises(_Retried):
+            body_second(_self("b"), scan)
         return "ran"
 
     @single_flight(lambda scan: scan, ttl=1, heartbeat=0.2)
@@ -117,8 +141,8 @@ def test_redelivery_after_finish_runs_and_lock_released(redis: FakeRedis) -> Non
         return "ran"
 
     assert body(_self("a"), "s") == "ran"
-    assert redis.store == {}
-    assert body(_self("a"), "s") == "ran"
+    assert not any(k.startswith(task_lock.LOCK_KEY_PREFIX) for k in redis.store)
+    assert body(_self("b"), "s") == "ran"  # a new message after release runs
 
 
 def test_lock_released_when_task_raises(redis: FakeRedis) -> None:
@@ -128,7 +152,7 @@ def test_lock_released_when_task_raises(redis: FakeRedis) -> None:
 
     with pytest.raises(RuntimeError):
         body(_self("tid"))
-    assert redis.store == {}
+    assert redis.store == {}  # no lock, no done marker
 
 
 def test_default_key_is_task_id(redis: FakeRedis) -> None:
@@ -137,8 +161,67 @@ def test_default_key_is_task_id(redis: FakeRedis) -> None:
         return "ran"
 
     redis.set(f"{task_lock.LOCK_KEY_PREFIX}t.task:same", "other", nx=True, ex=60)
-    assert body(_self("same")) == {"status": "duplicate_skipped"}
+    with pytest.raises(_Retried):
+        body(_self("same"))
     assert body(_self("different")) == "ran"
+
+
+def test_killed_first_run_copy_retries_then_runs(redis: FakeRedis) -> None:
+    runs: list[str] = []
+
+    @single_flight(lambda scan: scan, ttl=1)
+    def body(self: Any, scan: str) -> str:
+        runs.append(scan)
+        return "ran"
+
+    # The first run was killed: lock left behind, no done marker.
+    redis.set(f"{task_lock.LOCK_KEY_PREFIX}t.task:s", "dead", nx=True, ex=1)
+    with pytest.raises(_Retried):
+        body(_self("m"), "s")
+    assert runs == []
+    time.sleep(1.2)  # the dead run's lock lapses
+    assert body(_self("m"), "s") == "ran"
+    assert runs == ["s"]
+
+
+def test_finished_first_run_copy_skipped_via_done_marker(redis: FakeRedis) -> None:
+    runs: list[str] = []
+
+    @single_flight(lambda scan: scan)
+    def body(self: Any, scan: str) -> str:
+        runs.append(scan)
+        return "ran"
+
+    assert body(_self("m"), "s") == "ran"
+    assert body(_self("m"), "s") == {"status": "duplicate_skipped"}
+    assert runs == ["s"]
+    # A later message for the same natural key (next sweep) is a new id: runs.
+    assert body(_self("m2"), "s") == "ran"
+
+
+def test_failed_run_leaves_no_done_marker(redis: FakeRedis) -> None:
+    @single_flight(lambda scan: scan)
+    def body(self: Any, scan: str) -> str:
+        raise RuntimeError("x")
+
+    with pytest.raises(RuntimeError):
+        body(_self("m"), "s")
+    assert not any(k.startswith(task_lock.DONE_KEY_PREFIX) for k in redis.store)
+
+
+def test_gives_up_waiting_by_running(redis: FakeRedis) -> None:
+    @single_flight(lambda scan: scan)
+    def body(self: Any, scan: str) -> str:
+        return "ran"
+
+    me = _self("m")
+
+    def exhausted(**kw: Any) -> Exception:
+        return _Exhausted()
+
+    me.retry = exhausted
+    redis.set(f"{task_lock.LOCK_KEY_PREFIX}t.task:s", "live", nx=True, ex=60)
+    assert body(me, "s") == "ran"  # never drop
 
 
 def test_nmap_task_is_guarded(redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,9 +234,9 @@ def test_nmap_task_is_guarded(redis: FakeRedis, monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(nmap, "run_scan", fake_run)
     sid = str(uuid.uuid4())
-    redis.set(f"{task_lock.LOCK_KEY_PREFIX}app.tasks.nmap.run_scan:{sid}", "live", nx=True, ex=60)
-    nmap.run_scan_task.apply(args=(sid,)).get()
+    name = "app.tasks.nmap.run_scan"
+    redis.set(f"{task_lock.DONE_KEY_PREFIX}{name}:msg-1", "1", nx=True, ex=60)
+    nmap.run_scan_task.apply(args=(sid,), task_id="msg-1").get()
     assert calls == []
-    other = str(uuid.uuid4())
-    nmap.run_scan_task.apply(args=(other,)).get()
-    assert calls == [uuid.UUID(other)]
+    nmap.run_scan_task.apply(args=(sid,), task_id="msg-2").get()
+    assert calls == [uuid.UUID(sid)]

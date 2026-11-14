@@ -9,15 +9,14 @@ instead; this guards the *second* delivery.
 
 ``single_flight`` takes a Redis lock keyed on the task name plus a natural
 key (the scan id, defaulting to the Celery task id), holds it with a short TTL
-that a heartbeat thread keeps extending for as long as the task runs, and
-releases it on the way out. A delivery that finds the lock held by a live run
-returns a no-op result, which acks the duplicate message.
+that a heartbeat thread keeps extending while the task runs, and releases it
+on the way out. A successful run also leaves a done marker for its message id.
 
-Because the TTL is short and refreshed, a run that is *killed* stops
-refreshing and the lock lapses within ``LOCK_TTL_SECONDS``; a redelivery after
-that runs normally. A redelivery inside that window is dropped, which is the
-price of not double-running; the work's own row (scan, capture, order) records
-state, and an operator re-dispatches.
+A delivery is never dropped unless its message is known to have finished:
+  * done marker present: a true duplicate, acked as a no-op;
+  * lock held, no marker: a live run, or one killed without releasing (its
+    lock lapses within ``LOCK_TTL_SECONDS``). The copy ``retry``s after the TTL
+    and then either skips (the first run finished) or runs (it died).
 
 Advisory by design, like :mod:`app.core.task_attempts`: with Redis unreachable
 the task runs unguarded rather than blocking work on a broker blip.
@@ -39,6 +38,12 @@ from app.core.redis_client import make_sync_redis
 logger = structlog.get_logger(__name__)
 
 LOCK_KEY_PREFIX = "spatium:task-lock:"
+# Keyed on the message (Celery task id), not the natural key: a redelivery keeps
+# its id, while the next scheduled run of the same subnet is a new message.
+DONE_KEY_PREFIX = "spatium:task-done:"
+DONE_TTL_SECONDS = 24 * 3600
+# Deferrals while another delivery holds the lock: ~70 s each, ~2.3 h in all.
+MAX_DEFER_RETRIES = 120
 # Short on purpose: it only has to outlast a missed heartbeat. A dead run's
 # lock lapses this soon after its last extension.
 LOCK_TTL_SECONDS = 60
@@ -99,25 +104,45 @@ def single_flight(
             if not natural:
                 return fn(self, *args, **kwargs)
             lock_key = f"{LOCK_KEY_PREFIX}{name}:{natural}"
+            task_id = getattr(getattr(self, "request", None), "id", None)
+            done_key = f"{DONE_KEY_PREFIX}{name}:{task_id}" if task_id else None
             lock_ttl = ttl if ttl is not None else LOCK_TTL_SECONDS
             token = uuid.uuid4().hex
             client: Any = None
             beat: _Heartbeat | None = None
             try:
                 client = make_sync_redis(settings.redis_url, socket_connect_timeout=2.0)
-                got = client.set(lock_key, token, nx=True, ex=lock_ttl)
+                if done_key is not None and client.exists(done_key):
+                    got, finished = False, True
+                else:
+                    got = client.set(lock_key, token, nx=True, ex=lock_ttl)
+                    finished = False
             except Exception as exc:  # noqa: BLE001 — fail open: run unguarded
                 logger.warning("task_lock_unavailable", task=name, error=str(exc))
-                got, client = True, None
+                got, finished, client = True, False, None
             if not got:
-                logger.warning(
-                    "task_duplicate_delivery_skipped",
-                    task=name,
-                    key=str(natural),
-                    task_id=getattr(getattr(self, "request", None), "id", None),
-                )
                 _close(client)
-                return skipped(*args, **kwargs) if skipped else {"status": "duplicate_skipped"}
+                if finished:
+                    # This very message already ran to completion: a true
+                    # duplicate. Ack it.
+                    logger.warning(
+                        "task_duplicate_delivery_skipped",
+                        task=name,
+                        key=str(natural),
+                        task_id=task_id,
+                    )
+                    return skipped(*args, **kwargs) if skipped else {"status": "duplicate_skipped"}
+                # Lock held, message not finished: a live run, or one that died
+                # without releasing. Never drop the message; wait out the lock
+                # and look again (a dead run's lock lapses on its own).
+                logger.warning(
+                    "task_duplicate_delivery_deferred", task=name, key=str(natural), task_id=task_id
+                )
+                try:
+                    raise self.retry(countdown=lock_ttl + 10, max_retries=MAX_DEFER_RETRIES)
+                except self.MaxRetriesExceededError:
+                    logger.error("task_duplicate_delivery_gave_up", task=name, key=str(natural))
+                    return fn(self, *args, **kwargs)
             if client is not None:
                 beat = _Heartbeat(
                     client,
@@ -128,7 +153,13 @@ def single_flight(
                 )
                 beat.start()
             try:
-                return fn(self, *args, **kwargs)
+                result = fn(self, *args, **kwargs)
+                if client is not None and done_key is not None:
+                    try:
+                        client.set(done_key, "1", ex=DONE_TTL_SECONDS)
+                    except Exception as exc:  # noqa: BLE001 — advisory
+                        logger.warning("task_done_mark_failed", task=name, error=str(exc))
+                return result
             finally:
                 if beat is not None:
                     beat.stop()
@@ -154,4 +185,4 @@ def _close(client: Any) -> None:
         pass
 
 
-__all__ = ["LOCK_KEY_PREFIX", "LOCK_TTL_SECONDS", "single_flight"]
+__all__ = ["DONE_KEY_PREFIX", "LOCK_KEY_PREFIX", "LOCK_TTL_SECONDS", "single_flight"]
