@@ -11,6 +11,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -69,9 +70,9 @@ function PromptEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div>

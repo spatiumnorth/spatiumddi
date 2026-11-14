@@ -35,6 +35,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know what to run on their
@@ -779,7 +780,9 @@ function ClusterModal({
           </div>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

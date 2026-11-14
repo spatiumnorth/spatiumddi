@@ -5,6 +5,7 @@ import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPServerGroup } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 type CreateServerGroupModalProps = {
   group?: DHCPServerGroup;
@@ -435,7 +436,9 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>

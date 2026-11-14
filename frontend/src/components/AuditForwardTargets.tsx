@@ -30,6 +30,7 @@ import {
   type AuditForwardTargetWrite,
   formatApiError,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50";
@@ -532,9 +533,9 @@ function TargetModal({
     >
       <div className="space-y-3">
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+          <FormError className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="grid grid-cols-2 gap-3">

@@ -31,6 +31,7 @@ import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { exportErrorMessage, isRefused } from "@/lib/refusal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Conformity admin page (issue #106).
@@ -958,7 +959,9 @@ function PolicyEditorModal({
           />
           Policy enabled
         </label>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"

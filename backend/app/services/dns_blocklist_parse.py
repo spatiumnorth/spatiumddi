@@ -42,11 +42,16 @@ class FeedSkipCounts:
 
       * ``star_in_name`` — ``||reachableads-av.*.amazonaws.com^``; RPZ
         has no mid-name wildcard.
-      * ``no_anchor`` — ``-tracker.example.net^``; no ``||`` (and no ``*``),
-        so adblock reads it as a substring match, which a name cannot say.
+      * ``no_anchor`` — ``-tracker.example.net^``, ``.n.2.1.js^``; no ``||``
+        (and no ``*``), so adblock reads it as a substring match, which a
+        name cannot say. (A dot-led rule that IS a plain name,
+        ``.bbelements.com^``, is NOT skipped: it blocks that name's
+        subdomains, see :class:`ParsedFeed`.)
       * ``trailing_dot`` — ``||adserver1.``; a prefix match on a label.
-      * ``start_anchor`` — ``|piwik.``, ``|a.example.com^``; a single ``|``
-        anchors the start of the URL, not a domain.
+      * ``start_anchor`` — ``|piwik.``, ``|load.gtm.``; a single ``|``
+        anchors the start of the URL, not a domain. (``|a.example.com^``,
+        a full name between the anchor and the ``^``, is NOT skipped: it is
+        an exact-name block, see :class:`ParsedFeed`.)
       * ``bare_star`` — ``*ad.example.net^``, ``-adx-*.example.com^``; a
         ``*`` anywhere in a rule with no ``||``.
       * ``dotless`` — ``||countly-``; a single label, not a hostname.
@@ -131,6 +136,13 @@ class ParsedFeed:
     wildcard_count: int
     exceptions: list[str] = field(default_factory=list)
     skipped: FeedSkipCounts | None = None
+    #: Adblock entries whose reach is NOT the list's subdomain setting (#4037),
+    #: stored verbatim and always with ``is_wildcard=False``: ``name`` for an
+    #: exact-name rule (``|name^``, the name and nothing under it) and
+    #: ``*.name`` for a dot-led rule (``.name^``, the subdomains and NOT the
+    #: apex; the RPZ renderers emit ``*.name`` as written). Disjoint from
+    #: ``domains`` and from the exceptions.
+    literal_domains: list[str] = field(default_factory=list)
     #: Set when the content looks like a different format than the one asked
     #: for (#3531), e.g. ``"adblock"`` for an adblock file read as hosts. The
     #: caller should refuse the refresh rather than store the result.
@@ -248,6 +260,51 @@ _ADBLOCK_COSMETIC_MARKERS = ("##", "#@#", "#?#", "#$#", "#%#", "#@$#", "#@%#", "
 _RuleKey = tuple[bool, str, frozenset[str]]
 
 
+#: Last labels that are file extensions, not top-level domains. AdGuard lists
+#: carry dot-led filename fragments (``.n.2.1.js^``) that look like a name.
+_NOT_A_TLD = frozenset(
+    "js css png jpg jpeg gif svg ico webp html htm php asp aspx swf json xml txt "
+    "woff woff2 ttf mp4 webm map".split()
+)
+
+
+def _plain_name_rule(pattern: str) -> tuple[str, str] | None:
+    """``(kind, name)`` for a non-``||`` rule that is a complete DNS name (#4037).
+
+    ``kind`` is ``"subdomains"`` for a dot-led ``.name^`` and ``"exact"`` for
+    ``|name^``. Both must end in ``^`` (an optional end ``|`` after it is
+    allowed): without the separator adblock reads the text as a substring
+    (``.stape.net`` also matches ``stape.net.evil.example``), which a name
+    cannot say.
+
+    The name must satisfy :func:`_is_feed_name` plus a sanity rule, because
+    a dot-led pattern is just as often a filename fragment as a domain
+    (``.n.2.1.js^``, ``.1.1.1.l80.js^``): no label may be all digits, and
+    the last label must be letters (or ``xn--`` punycode) and not a file
+    extension. A legitimate name with a numeric label (``1.example.com``) is
+    skipped by that rule, the safe direction.
+    """
+    body = pattern[:-1] if pattern.endswith("^|") else pattern
+    if not body.endswith("^"):
+        return None
+    body = body[:-1]
+    if body.startswith("."):
+        kind, name = "subdomains", body[1:]
+    elif body.startswith("|") and not body.startswith("||"):
+        kind, name = "exact", body[1:]
+    else:
+        return None
+    if not _is_feed_name(name):
+        return None
+    labels = name.split(".")
+    if len(labels) < 2 or any(label.isdigit() for label in labels):
+        return None
+    tld = labels[-1]
+    if tld in _NOT_A_TLD or not (tld.isalpha() or tld.startswith("xn--")):
+        return None
+    return kind, name
+
+
 def _malformed_reason(pattern: str, host: str | None) -> str:
     """Why a rule that is not a plain ``||name^`` was skipped (#3519).
 
@@ -287,6 +344,7 @@ def _parse_adblock(content: str) -> ParsedFeed:
     counted rather than silently dropped.
     """
     blocks: list[tuple[_RuleKey, str]] = []
+    literal_blocks: list[tuple[_RuleKey, str]] = []
     allows: list[tuple[_RuleKey, str]] = []
     cancelled: set[_RuleKey] = set()
     regex = modifier = badfilter = 0
@@ -322,6 +380,21 @@ def _parse_adblock(content: str) -> ParsedFeed:
             continue
 
         if not pattern.startswith("||"):
+            plain = _plain_name_rule(pattern)
+            if plain is not None:
+                kind, name = plain
+                plain_key: _RuleKey = (is_exception, pattern, mods)
+                if not is_exception:
+                    literal_blocks.append((plain_key, name if kind == "exact" else f"*.{name}"))
+                    continue
+                if kind == "exact":
+                    # Every renderer's exception means "this name and what is
+                    # under it", so ``@@|name^`` over-allows the subtree; the
+                    # rule's whole point is a carve-out, so it is kept.
+                    allows.append((plain_key, name))
+                    continue
+                # ``@@.name^`` (subdomains only, apex stays blocked) has no
+                # exception to map to: skipped and counted, as before.
             reason = _malformed_reason(pattern, None)
             malformed[reason] = malformed.get(reason, 0) + 1
             continue
@@ -346,7 +419,9 @@ def _parse_adblock(content: str) -> ParsedFeed:
     # stored: a stored exception would unblock the name for every list on
     # the group, inverting the feed's intent.
     important_blocks = {
-        host for key, host in blocks if key not in cancelled and "important" in key[2]
+        host
+        for key, host in (*blocks, *literal_blocks)
+        if key not in cancelled and "important" in key[2]
     }
     exceptions: list[str] = []
     excepted: set[str] = set()
@@ -373,11 +448,28 @@ def _parse_adblock(content: str) -> ParsedFeed:
         seen.add(host)
         domains.append(host)
 
+    literals: list[str] = []
+    literal_seen: set[str] = set()
+    for key, host in literal_blocks:
+        if key in cancelled:
+            continue
+        # A ``*.name`` entry beside an exception for ``name`` would put two
+        # CNAMEs on one RPZ owner (the exception emits ``*.name`` too), which
+        # BIND rejects for the whole zone.
+        apex = host[2:] if host.startswith("*.") else host
+        # An exact ``name`` already covered by a ``||name^`` entry adds nothing
+        # (and the table is unique on the name).
+        if apex in excepted or host in literal_seen or host in seen:
+            continue
+        literal_seen.add(host)
+        literals.append(host)
+
     return ParsedFeed(
         domains=domains,
         wildcard_count=wildcard_count,
         exceptions=exceptions,
         skipped=FeedSkipCounts(regex=regex, modifier=modifier, badfilter=badfilter, **malformed),
+        literal_domains=literals,
     )
 
 

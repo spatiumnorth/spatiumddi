@@ -30,6 +30,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -198,9 +199,9 @@ function ProviderEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <ModalTabs
@@ -564,10 +565,10 @@ function ModelPickerModal({
           </div>
         )}
         {modelsQ.error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             Failed to fetch models —{" "}
             {(modelsQ.error as Error)?.message ?? "unknown error"}
-          </div>
+          </FormError>
         )}
         {modelsQ.data && modelsQ.data.length === 0 && (
           <div className="text-sm text-muted-foreground">

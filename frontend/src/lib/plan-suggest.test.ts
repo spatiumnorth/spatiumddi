@@ -89,3 +89,27 @@ describe("planner pre-fill (#3711)", () => {
     );
   });
 });
+
+describe("+ Subnet under an IPv6 node starts on /64 (#3850)", () => {
+  it.each(["fd5e:1110:d::/56", "fd5e:1110:e::/60", "fd5e:1110:f::/48"])(
+    "%s",
+    (p) => {
+      const c = suggestChildCidr(node(p), [], "subnet");
+      expect(c.endsWith("/64")).toBe(true);
+      expect(cidrContains(p, c)).toBe(true);
+    },
+  );
+  it("skips a /64 a sibling holds", () => {
+    const c = suggestChildCidr(
+      node("fd5e:1110:d::/56"),
+      [node("fd5e:1110:d::/64")],
+      "subnet",
+    );
+    expect(c).toBe("fd5e:1110:d:1::/64");
+  });
+  it("+ Block keeps its size", () => {
+    expect(suggestChildCidr(node("fd5e:1110:d::/56"), [], "block")).toBe(
+      "fd5e:1110:d::/72",
+    );
+  });
+});

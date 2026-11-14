@@ -253,7 +253,7 @@ async def list_targets(
             )
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(TLSCertTarget.host.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(TLSCertTarget.host.asc(), TLSCertTarget.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return TLSCertTargetListResponse(
         items=[TLSCertTargetRead.model_validate(r) for r in rows],
@@ -376,7 +376,13 @@ async def list_probes(
     base = select(TLSCertProbe).where(TLSCertProbe.target_id == target_id)
     total = await db.scalar(select(func.count()).select_from(base.subquery())) or 0
     rows = (
-        (await db.execute(base.order_by(TLSCertProbe.probed_at.desc()).limit(limit).offset(offset)))
+        (
+            await db.execute(
+                base.order_by(TLSCertProbe.probed_at.desc(), TLSCertProbe.id)
+                .limit(limit)
+                .offset(offset)
+            )
+        )
         .scalars()
         .all()
     )

@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -14,6 +15,7 @@ import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { cn } from "@/lib/utils";
 
 import { Field, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -53,6 +55,7 @@ function AsnForm({
   asn: ASNRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const isEdit = Boolean(asn);
   const qc = useQueryClient();
   const [number, setNumber] = useState<string>(asn ? String(asn.number) : "");
@@ -202,23 +205,27 @@ function AsnForm({
           />
         </Field>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <Field label="Customer" hint="Operator owning this AS, if any.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
-          <Field
-            label="Provider"
-            hint="Upstream we lease / peer through, if any."
-          >
-            <ProviderPicker
-              className={inputCls}
-              value={providerId}
-              onChange={setProviderId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Operator owning this AS, if any.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
+          {own.provider && (
+            <Field
+              label="Provider"
+              hint="Upstream we lease / peer through, if any."
+            >
+              <ProviderPicker
+                className={inputCls}
+                value={providerId}
+                onChange={setProviderId}
+              />
+            </Field>
+          )}
         </div>
         <Field
           label="Tags (JSON)"
@@ -230,7 +237,9 @@ function AsnForm({
             onChange={(e) => setTagsRaw(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"

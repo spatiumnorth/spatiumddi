@@ -257,61 +257,79 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     )
     purged = 0
     skipped = 0
-    for zone in res.scalars().all():
+    zones = list(res.scalars().all())
+    # #3751 — every zone's address rows in ONE ascending pass, before any zone
+    # row: an auto-sync batch locks its rows in one ascending pass across zones
+    # (#3726), and a pass per zone interleaves with it into a 40P01. The sweep
+    # commits once at its end (never per zone), so these locks are held for all
+    # the purges below, whose own per-zone lock then re-takes rows already held.
+    # No sync gate here: #3726 found it deadlocks.
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [z.id for z in zones])
+    for zone in zones:
+        # Read before the savepoint: rolling it back may expire the row.
+        zone_name, zone_id = zone.name, zone.id
         try:
-            # #3190 — a shared auto reverse zone holding the PTRs of a trashed
-            # subnet that has NOT expired is handed to that subnet's batch, not
-            # purged out from under it.
-            heir = await hand_over_zone_to_trashed_sharer(db, zone)
-            if heir is not None:
-                db.add(
-                    AuditLog(
-                        user_id=None,
-                        user_display_name="system",
-                        auth_source="system",
-                        action="update",
-                        resource_type="dns_zone",
-                        resource_id=str(zone.id),
-                        resource_display=zone.name,
-                        new_value={
-                            "handed_over_to_subnet": str(heir.id),
-                            "deletion_batch_id": str(heir.deletion_batch_id),
-                            "reason": "another trashed subnet's records still sit in the zone",
-                        },
-                        result="success",
+            # #3751 — a savepoint per zone: a database error here (a 40P01, a
+            # lock or statement timeout) aborts the transaction, and the
+            # sweep's closing COMMIT would then roll everything back without
+            # an error. Rolled back to the savepoint, only this zone is undone;
+            # the address locks above were taken outside it and stay held.
+            async with db.begin_nested():
+                # #3190 — a shared auto reverse zone holding the PTRs of a trashed
+                # subnet that has NOT expired is handed to that subnet's batch, not
+                # purged out from under it.
+                heir = await hand_over_zone_to_trashed_sharer(db, zone)
+                if heir is not None:
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="update",
+                            resource_type="dns_zone",
+                            resource_id=str(zone.id),
+                            resource_display=zone.name,
+                            new_value={
+                                "handed_over_to_subnet": str(heir.id),
+                                "deletion_batch_id": str(heir.deletion_batch_id),
+                                "reason": "another trashed subnet's records still sit in the zone",
+                            },
+                            result="success",
+                        )
                     )
-                )
-                continue
-            # #3889 — an expired zone the operator made (not handed over above)
-            # still holding another trashed subnet's records is kept until that
-            # subnet is purged or restored: its FK cascade would take them.
-            held_by = [] if zone.is_auto_generated else await trashed_sharers(db, zone)
-            if held_by:
-                logger.info(
-                    "trash_purge.zone_held_for_trashed_subnet",
-                    zone=zone.name,
-                    zone_id=str(zone.id),
-                    subnets=[str(s.network) for s in held_by],
-                    hint="kept until those subnets leave the Trash",
-                )
-                continue
-            kept = await purge_trashed_zone(db, zone)
-            if kept:
-                # #3812: the copy another zone of the same name may use stays at
-                # the provider; say so where an operator will look for it.
-                db.add(
-                    AuditLog(
-                        user_id=None,
-                        user_display_name="system",
-                        auth_source="system",
-                        action="permanent_delete",
-                        resource_type="dns_zone",
-                        resource_id=str(zone.id),
-                        resource_display=zone.name,
-                        new_value={"provider_copies_kept": kept},
-                        result="success",
+                    continue
+                # #3889 — an expired zone the operator made (not handed over above)
+                # still holding another trashed subnet's records is kept until that
+                # subnet is purged or restored: its FK cascade would take them.
+                held_by = [] if zone.is_auto_generated else await trashed_sharers(db, zone)
+                if held_by:
+                    logger.info(
+                        "trash_purge.zone_held_for_trashed_subnet",
+                        zone=zone_name,
+                        zone_id=str(zone_id),
+                        subnets=[str(s.network) for s in held_by],
+                        hint="kept until those subnets leave the Trash",
                     )
-                )
+                    continue
+                kept = await purge_trashed_zone(db, zone)
+                if kept:
+                    # #3812: the copy another zone of the same name may use stays at
+                    # the provider; say so where an operator will look for it.
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="permanent_delete",
+                            resource_type="dns_zone",
+                            resource_id=str(zone_id),
+                            resource_display=zone_name,
+                            new_value={"provider_copies_kept": kept},
+                            result="success",
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
@@ -319,8 +337,8 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
             skipped += 1
             logger.warning(
                 "trash_purge.zone_retract_failed",
-                zone=zone.name,
-                zone_id=str(zone.id),
+                zone=zone_name,
+                zone_id=str(zone_id),
                 error=str(exc),
                 hint="left soft-deleted; next daily sweep retries the provider push",
             )

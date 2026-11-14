@@ -6,7 +6,11 @@
 
        * **Pod listing + logs** (formerly /appliance/containers).
          Reads ``pods`` + ``pods/log`` in the chart's target
-         namespace (default ``spatium``).
+         namespace (default ``spatium``). Also what Platform Insights >
+         Containers uses on a plain Helm install (#3761); it lists only
+         pods labelled as ours and resolves a log request's pod name
+         against that fresh listing, so these two rules need no
+         separate toggle beyond ``api.serviceAccount.enabled``.
 
        * **TLS Secret patch** (formerly cert deploy to a docker
          volume + SIGHUP). Reads + patches the

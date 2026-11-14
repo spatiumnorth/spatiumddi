@@ -32,6 +32,7 @@ import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // OT / industrial device registry + Purdue zoning (issue #542, part of
 // #543). Read-only identification: nothing here probes, scans, reads a
@@ -848,7 +849,9 @@ function DeviceModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1012,7 +1015,9 @@ function ZoneModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

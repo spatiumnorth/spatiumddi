@@ -150,7 +150,9 @@ _END = object()
 _closing_sources: set[asyncio.Task[None]] = set()
 
 
-def _sse_log_response(gen: AsyncIterator[str], request: Request) -> StreamingResponse:
+def _sse_log_response(
+    gen: AsyncIterator[str], request: Request, *, superadmin_only: bool = False
+) -> StreamingResponse:
     """Wrap a log-chunk generator as an SSE response.
 
     Chunks are JSON-encoded ``{"line": "..."}`` so embedded newlines /
@@ -159,14 +161,15 @@ def _sse_log_response(gen: AsyncIterator[str], request: Request) -> StreamingRes
     line reaches the browser ASAP (same pattern as the AI-chat stream).
 
     The caller is re-validated (``StreamAuthGuard``, against
-    ``_LOG_PERMISSION``) before each chunk is sent AND whenever the source
+    ``_LOG_PERMISSION``, or the superadmin flag when ``superadmin_only`` --
+    the Platform Insights pod stream, #3761) before each chunk is sent AND whenever the source
     has been quiet for a re-check interval, so a stream that prints nothing
     still ends once the caller loses access. Lines pass through a
     ``LogStreamRedactor``, which keeps state between chunks: a private key
     arrives one line per chunk, and redacting each chunk on its own would
     let every line but the BEGIN through.
     """
-    guard = StreamAuthGuard(request, permission=_LOG_PERMISSION)
+    guard = StreamAuthGuard(request, permission=_LOG_PERMISSION, superadmin_only=superadmin_only)
 
     async def event_source() -> AsyncIterator[str]:
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)

@@ -20,6 +20,7 @@ import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // BACnet/IP device registry (issue #541, part of #543). Documentation
 // only — nothing on this page reads or writes a device object; rows come
@@ -845,7 +846,9 @@ function DeviceModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

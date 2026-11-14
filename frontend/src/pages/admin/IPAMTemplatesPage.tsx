@@ -19,6 +19,7 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -264,9 +265,9 @@ function TemplateEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex flex-wrap gap-1 border-b">

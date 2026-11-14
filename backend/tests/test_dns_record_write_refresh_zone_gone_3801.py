@@ -9,6 +9,7 @@ handler's re-read runs.
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,3 +75,23 @@ async def test_update_record_zone_deleted_after_commit_is_404(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_refresh_helper_row_gone_is_404_not_missing_greenlet_4043(
+    db_session: AsyncSession,
+) -> None:
+    """#4043: the fallback must not read ``record.id`` off the expired instance
+    (a lazy load on the sync path raises MissingGreenlet -> 500)."""
+    from app.api.v1.dns.router import _refresh_record_or_404
+
+    _, rec = await _zone_with_record(db_session)
+    rec_id = rec.id
+    db_session.expire(rec)  # as after the handler's commit: attributes unloaded
+    await db_session.execute(
+        delete(DNSRecord).where(DNSRecord.id == rec_id).execution_options(synchronize_session=False)
+    )
+    with pytest.raises(HTTPException) as ei:
+        await _refresh_record_or_404(db_session, rec)
+    assert ei.value.status_code == 404
+    assert ei.value.detail == "Zone not found"

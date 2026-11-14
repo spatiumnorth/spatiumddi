@@ -81,6 +81,13 @@ from app.services.ipam.subnet_carry import (
     merge_conflicts_and_warnings,
     merged_carried,
 )
+from app.services.ipam.subnet_dependents import (
+    carry_for_merge,
+    load_dependents,
+    merge_conflicts,
+    merge_warnings,
+)
+from app.services.ipam.subnet_placeholders import registry_referenced_ip_ids
 
 logger = structlog.get_logger(__name__)
 
@@ -460,7 +467,8 @@ async def preview_subnet_merge(
                 )
             else:
                 kept = (
-                    f"The default Gateway row(s) at {', '.join(sorted(retired_gw))} " "are retired."
+                    f"The default Gateway row(s) at {', '.join(sorted(retired_gw))} are retired "
+                    "(one an E911 binding or a device record names is kept)."
                     if retired_gw
                     else "The other sources' gateway rows were edited and are kept."
                 )
@@ -521,6 +529,11 @@ async def preview_subnet_merge(
             f"{len(domain_rows)} DNS zone binding(s) on source subnets will be "
             "deduplicated and re-attached to the merged subnet."
         )
+
+    dep = await load_dependents(db, [s.id for s in sources])
+    for ctype, detail in merge_conflicts(dep):
+        conflicts.append(MergeConflict(type=ctype, detail=detail))
+    warnings.extend(merge_warnings(dep))
 
     return SubnetMergePreview(
         merged_cidr=str(merged) if merged is not None else None,
@@ -655,12 +668,31 @@ async def commit_subnet_merge(
         rows = (
             (await db.execute(select(IPAddress).where(IPAddress.subnet_id == s.id))).scalars().all()
         )
+        # A boundary or Gateway row a registry record (E911 binding, device) is
+        # keyed to is the operator's: it moves into the merged subnet instead of
+        # being deleted with the record (#3899, #3958).
+        registry_kept = await registry_referenced_ip_ids(
+            db,
+            [
+                r.id
+                for r in rows
+                if str(r.address) in source_boundary_ips or str(r.address) in retired_gateways
+            ],
+        )
         for row in rows:
-            if str(row.address) in source_boundary_ips and _is_default_placeholder(row):
+            if (
+                str(row.address) in source_boundary_ips
+                and row.id not in registry_kept
+                and _is_default_placeholder(row)
+            ):
                 await db.delete(row)
                 deleted_default += 1
                 continue
-            if str(row.address) in retired_gateways and _is_default_gateway_row(row):
+            if (
+                str(row.address) in retired_gateways
+                and row.id not in registry_kept
+                and _is_default_gateway_row(row)
+            ):
                 await db.delete(row)
                 retired_gateway_rows += 1
                 continue
@@ -757,7 +789,12 @@ async def commit_subnet_merge(
             dhcp_servers_notified += 1
     await db.flush()
 
-    # Delete sources last — RESTRICT FKs catch anything we missed.
+    # Address sets, the OT zone and the SET NULL links follow the merged
+    # subnet (#3957): nothing keyed to a source is RESTRICT, so whatever is
+    # not carried here goes with the delete below.
+    await carry_for_merge(db, [s.id for s in sources], target.id, merged_subnet.id)
+
+    # Delete sources last.
     deleted_ids: list[uuid.UUID] = []
     for s in sources:
         deleted_ids.append(s.id)

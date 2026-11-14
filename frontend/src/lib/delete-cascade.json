@@ -1,0 +1,77 @@
+{
+  "tables": {
+    "address_set": "address sets",
+    "av_flow_profile": "AV flow",
+    "av_reserved_range": "AV reserved ranges",
+    "bacnet_device": "BACnet/IP devices",
+    "dhcp_pool": "DHCP pools",
+    "dhcp_scope": "DHCP scopes",
+    "dhcp_static_assignment": "DHCP static assignments",
+    "ip_address": "addresses",
+    "ip_block": "blocks",
+    "multicast_group_port": "ports",
+    "multicast_membership": "multicast memberships",
+    "ot_device": "OT devices",
+    "ot_zone": "OT zones",
+    "subnet_plan": "subnet plans",
+    "vlan_mapping": "VLAN mappings"
+  },
+  "exempt": {
+    "dhcp_phone_profile_scope": "link row: the phone profile keeps existing, only its scope binding goes",
+    "erl_binding": "the delete is refused while an E911 location binding names the row, so it never cascades",
+    "ip_mac_history": "the address's own MAC history; it is the address, not a separate object",
+    "subnet_domain": "link row between a subnet and a DNS zone; the zone keeps existing",
+    "subnet_utilization_history": "derived daily utilization snapshots, not operator-entered"
+  },
+  "dialogs": {
+    "ip_address": {
+      "root": "ip_address",
+      "includes": [],
+      "tables": [
+        "ot_device",
+        "bacnet_device",
+        "multicast_membership",
+        "dhcp_static_assignment"
+      ],
+      "extra": ["DNS records"]
+    },
+    "subnet": {
+      "root": "subnet",
+      "includes": [],
+      "tables": [
+        "dhcp_scope",
+        "dhcp_pool",
+        "dhcp_static_assignment",
+        "ip_address",
+        "ot_device",
+        "bacnet_device",
+        "multicast_membership",
+        "address_set",
+        "ot_zone"
+      ],
+      "extra": ["the DNS records published for its addresses"]
+    },
+    "ip_block": {
+      "root": "ip_block",
+      "includes": ["subnet"],
+      "tables": ["ip_block"],
+      "extra": []
+    },
+    "ip_space": {
+      "root": "ip_space",
+      "includes": ["ip_block"],
+      "tables": ["subnet_plan", "vlan_mapping", "av_reserved_range"],
+      "extra": []
+    },
+    "multicast_group": {
+      "root": "multicast_group",
+      "includes": [],
+      "tables": [
+        "multicast_group_port",
+        "multicast_membership",
+        "av_flow_profile"
+      ],
+      "extra": []
+    }
+  }
+}

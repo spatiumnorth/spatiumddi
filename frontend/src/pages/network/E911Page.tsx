@@ -1,3 +1,4 @@
+import { bindingTargetText } from "./bindingTarget";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -889,6 +890,9 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
   const items = query.data?.items ?? [];
 
   function targetOf(b: ERLBinding): string {
+    return bindingTargetText(b);
+  }
+  function rawTargetOf(b: ERLBinding): string {
     return (
       b.mac_address ??
       b.bssid ??
@@ -986,7 +990,10 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
                     </Chip>
                   )}
                 </td>
-                <td className="break-all px-3 py-2 font-mono text-xs text-muted-foreground">
+                <td
+                  className="break-all px-3 py-2 font-mono text-xs text-muted-foreground"
+                  title={rawTargetOf(b)}
+                >
                   {targetOf(b)}
                 </td>
                 <td className="px-3 py-2">{b.erl_name}</td>

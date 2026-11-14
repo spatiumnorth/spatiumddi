@@ -317,9 +317,9 @@ function DeleteModal({
           cannot be undone.
         </p>
         {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(mutation.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

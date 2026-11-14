@@ -142,7 +142,7 @@ See [AUTH.md](features/AUTH.md) for the full provider matrix.
 
 Zones live under server groups, so this has to come before zones.
 
-1. **Check which group your servers will land in.** A built-in agent creates a group named `default` the first time it registers, so you normally do not create that group by hand (creating a second one named `default` is refused with a 409). If you want a different name, open **DNS**, click **Create Group** in the groups panel, give it a name (`internal`, `corp`, whatever) and pick the [recursion](#recursion) / DNSSEC defaults, then move the server into it after it registers: **Edit Server** and change **Server group**. Servers that don't register themselves (Windows DNS, cloud and API-managed providers) are added to a group by hand instead.
+1. **Check which group your servers will land in.** The built-in BIND9 agent (and the appliance) creates a group named `default` the first time it registers, so you normally do not create that group by hand (creating a second one named `default` is refused with a 409). The PowerDNS and Technitium profiles register into `default-powerdns` and `default-technitium` instead, so a group named `default` is still free to create there. If you want a different name, open **DNS**, click the **+** button (**New server group**) at the top of the groups panel, give it a name (`internal`, `corp`, whatever) and pick the [recursion](#recursion) / DNSSEC defaults, then move the server into it after it registers: **Edit Server** and change **Server group**. Servers that don't register themselves (Windows DNS, cloud and API-managed providers) are added to a group by hand instead.
 2. **Start the server** (or add it, for an agentless backend). Agent-based servers appear in their group by themselves.
 
    **Choosing a backend — two questions.** If you'd rather read the full matrix, it follows below unchanged.
@@ -207,7 +207,7 @@ Reverse DNS stores IP-to-name mappings in ordinary zones under the special domai
 
 Same pattern as DNS. Do this before you start pinning subnets to DHCP servers.
 
-1. **Use the auto-created group, or make your own.** The Kea agent creates a group named `default` when it registers, so don't create that name by hand (409). For another name, open **DHCP**, click **Create Group** in the groups panel, and move the server into it afterwards from the server's edit form (**Server Group**).
+1. **Use the auto-created group, or make your own.** The Kea agent creates a group named `default` when it registers, so don't create that name by hand (409). For another name, open **DHCP**, click the **+** button (**New group**) at the top of the groups panel, and move the server into it afterwards from the server's edit form (**Server Group**).
 2. **Start the server** (or add it, for Windows DHCP). Agent-based servers appear in their group by themselves.
 
    **Choosing a backend — two questions.** The matrix follows below unchanged.
@@ -311,7 +311,7 @@ Now the fun part. In the subnet view:
 - To reserve a block of infrastructure addresses in one go, use **Bulk allocate…** from the subnet's menu: set the range, a hostname template such as `infra-{n}`, **Status** to `reserved`, and turn **Create DNS records** off.
 - Or click any row in the IP grid and fill in hostname, status, tags.
 
-> **Worked example — Ridgeline College.** Before allocating anything else, Ridgeline bulk-allocates `10.20.21.1–10.20.21.9` as `reserved` with the template `infra-{n}` and DNS records off, matching the excluded DHCP pool from step 9. **Next available** then starts at `10.20.21.10`.
+> **Worked example — Ridgeline College.** Before allocating anything else, Ridgeline bulk-allocates `10.20.21.2–10.20.21.9` as `reserved` (`.1` is already the subnet's `gateway` row, so the preview shows it as in use and skips it) with the template `infra-{n}` and DNS records off, matching the excluded DHCP pool from step 9. **Next available** then starts at `10.20.21.10`.
 
 When you save an IP with a hostname + DNS zone:
 

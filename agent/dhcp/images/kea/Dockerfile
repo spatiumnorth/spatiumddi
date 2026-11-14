@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-dhcp6 + kea-ctrl-agent + spatium-dhcp-agent
+# SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-dhcp6 + spatium-dhcp-agent
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.14
 

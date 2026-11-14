@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import structlog
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -45,6 +45,65 @@ def _batched(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
         yield items[start : start + size]
 
 
+# Postgres advisory-lock namespace for feed refreshes (#4059). The two-int form
+# keeps it from colliding with any other advisory key in the tree.
+_REFRESH_LOCK_CLASS = 0x424C4631  # "BLF1"
+
+
+async def _try_lock_list(db: AsyncSession, list_id: str) -> bool:
+    """Take the per-list refresh lock, or say another worker holds it.
+
+    A SESSION-level advisory lock: it follows the connection, not the
+    transaction (the refresh commits several times), and Postgres drops it
+    when the connection dies, so a worker OOM-killed mid-refresh cannot wedge
+    the list.
+    """
+    got = await db.scalar(
+        text("SELECT pg_try_advisory_lock(:cls, hashtext(:id))"),
+        {"cls": _REFRESH_LOCK_CLASS, "id": list_id},
+    )
+    return bool(got)
+
+
+async def _unlock_list(db: AsyncSession, list_id: str) -> None:
+    try:
+        await db.rollback()  # a failed statement leaves the txn unusable
+        await db.execute(
+            text("SELECT pg_advisory_unlock(:cls, hashtext(:id))"),
+            {"cls": _REFRESH_LOCK_CLASS, "id": list_id},
+        )
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        # The engine is disposed right after, which closes the connection and
+        # with it the lock; log, never mask the refresh's own outcome.
+        logger.warning("blocklist_feed_unlock_failed", list_id=list_id, error=str(exc))
+
+
+_ADD_FEED_ENTRIES_SQL = text(
+    "INSERT INTO dns_blocklist_entry "
+    "(id, list_id, domain, entry_type, source, is_wildcard, reason) "
+    "SELECT gen_random_uuid(), :lid, s.domain, 'block', 'feed', (NOT s.literal AND :wild), '' "
+    "FROM _blocklist_feed_stage s "
+    "WHERE NOT EXISTS (SELECT 1 FROM dns_blocklist_entry e "
+    "WHERE e.list_id = :lid AND e.domain = s.domain) "
+    "ON CONFLICT (list_id, domain) DO NOTHING"
+)
+
+
+async def _plan_set_apply(db: AsyncSession) -> None:
+    """Keep the apply's anti joins hash joins (#4062).
+
+    Against an entry table that is empty and freshly vacuumed (reltuples 0)
+    and an unanalysed staging table, Postgres plans ``NOT EXISTS`` as a nested
+    loop over a seq scan of the table being filled: quadratic in the feed,
+    cancelled at the command timeout with the list left empty. Real
+    statistics on the staging table, and no nested loops for the rest of this
+    transaction, make it a hash anti join whatever the entry table's stats say.
+    """
+    await db.execute(text("ANALYZE _blocklist_feed_stage"))
+    await db.execute(text("SET LOCAL enable_nestloop = off"))
+
+
 async def _refuse_feed_refresh(
     db: AsyncSession, bl: DNSBlockList, error: str, event: str
 ) -> dict[str, int | str]:
@@ -60,359 +119,408 @@ async def _refuse_feed_refresh(
 async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
     """Core async logic for refresh_blocklist_feed, reusable from tests."""
     engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
+        settings.database_url,
+        future=True,
+        # The apply is a handful of set statements over the whole feed, not
+        # row-at-a-time writes (#4062).
+        connect_args=task_connect_args(settings.task_db_long_command_timeout),
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
         async with session_factory() as db:
-            # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
-            # do no work (and open no driver connections) when it is.
-            if not await is_module_enabled(db, "core.dns"):
-                return {"status": "disabled"}
-            bl = (
-                await db.execute(
-                    select(DNSBlockList)
-                    .where(DNSBlockList.id == list_id)
-                    .options(
-                        selectinload(DNSBlockList.server_groups),
-                        selectinload(DNSBlockList.views),
-                    )
-                )
-            ).scalar_one_or_none()
-            if bl is None:
-                return {"status": "not_found", "added": 0, "removed": 0}
-
-            if not bl.feed_url:
-                bl.last_sync_status = "error"
-                bl.last_sync_error = "No feed_url configured"
-                bl.last_synced_at = datetime.now(UTC)
-                await db.commit()
-                return {"status": "error", "added": 0, "removed": 0}
-
-            # The feed URL is operator-typed and fetched by the control
-            # plane, so it goes through the guarded fetch: http/https only,
-            # loopback / link-local / metadata refused before the request
-            # AND at connect time, every redirect hop re-checked.
-            #
-            # What lands in ``last_sync_error`` is readable by every
-            # dns_blocklist reader, so it is a fixed description of the
-            # failure — never the exception text, which can carry the
-            # resolved address, a response body, or the URL itself with its
-            # credentials. The detail goes to the server log, with the URL
-            # reduced to scheme + host. The transient error re-raised below
-            # for Celery's retry is safe_fetch's FetchFailedError, whose
-            # message carries no URL: Celery writes it into its own retry /
-            # failure log lines and the result backend.
-            shown_url = url_display(bl.feed_url)
+            # One refresh per list at a time (#4059): a second one, queued by
+            # a subscribe followed by Refresh, would hold a second copy of the
+            # feed beside the first and could OOM the worker.
+            if not await _try_lock_list(db, list_id):
+                logger.info("blocklist_feed_refresh_coalesced", list_id=list_id)
+                return {"status": "already_refreshing", "added": 0, "removed": 0}
             try:
-                with secret_url_in_flight(bl.feed_url):
-                    text = await safe_get_text(
-                        bl.feed_url, label="dns_blocklist_feed", timeout=60, refuse_html=True
+                return await _refresh_locked(db, list_id)
+            except (httpx.HTTPError, socket.gaierror):
+                raise  # already recorded on the row; Celery retries these
+            except Exception as exc:
+                # The apply is one transaction, so the rollback leaves the
+                # previous entries exactly as they were (#4059); what is
+                # added is the failure the operator can see.
+                await db.rollback()
+                await db.execute(
+                    update(DNSBlockList)
+                    .where(DNSBlockList.id == list_id)
+                    .values(
+                        last_sync_status="error",
+                        last_sync_error="Refresh failed: unexpected error (see server log)",
                     )
-            except FetchRefusedError as e:
-                # Permanent — the same URL gets the same answer; no retry.
-                bl.last_sync_status = "error"
-                bl.last_sync_error = f"Fetch refused: {e}"
-                bl.last_synced_at = datetime.now(UTC)
-                await db.commit()
-                logger.warning(
-                    "blocklist_feed_fetch_refused",
-                    list_id=list_id,
-                    feed=shown_url,
-                    reason=str(e),
                 )
-                return {"status": "error", "added": 0, "removed": 0}
-            except (httpx.HTTPError, socket.gaierror) as e:
-                # Transient — write the per-row error state then re-raise
-                # so Celery's ``autoretry_for`` (configured on the task
-                # below) backs off + retries. Issue #219 — pre-fix the
-                # broad ``except`` swallowed every exception and the
-                # task's ``max_retries=3`` was decorative.
-                bl.last_sync_status = "error"
-                bl.last_sync_error = f"Fetch failed: {describe_fetch_error(e)}"
-                bl.last_synced_at = datetime.now(UTC)
                 await db.commit()
-                logger.warning(
-                    "blocklist_feed_fetch_failed",
+                logger.error(
+                    "blocklist_feed_refresh_failed",
                     list_id=list_id,
-                    feed=shown_url,
-                    error_type=type(e).__name__,
-                    error=redact(str(e), bl.feed_url),
+                    error_type=type(exc).__name__,
                 )
                 raise
-            except Exception as e:  # noqa: BLE001
-                # Permanent (parse error, unexpected shape) — same DB
-                # shape but don't bubble; retrying won't help.
-                bl.last_sync_status = "error"
-                bl.last_sync_error = "Fetch failed: unexpected error (see server log)"
-                bl.last_synced_at = datetime.now(UTC)
-                await db.commit()
-                logger.warning(
-                    "blocklist_feed_fetch_failed",
-                    list_id=list_id,
-                    feed=shown_url,
-                    error_type=type(e).__name__,
-                    error=redact(str(e), bl.feed_url),
-                )
-                return {"status": "error", "added": 0, "removed": 0}
-
-            if looks_like_html(text):
-                # #3607: a web page is not a feed. Parsed, it yields zero
-                # rules and the refresh would empty the list and report
-                # success. Refuse; the existing entries stay.
-                return await _refuse_feed_refresh(
-                    db,
-                    bl,
-                    "Feed refused: the URL answered with a web page (HTML), not a data feed "
-                    "(a login or captive-portal page, a 404 served as 200, or a moved "
-                    "repository?); the list's entries left as they were.",
-                    "blocklist_feed_html_refused",
-                )
-            parsed = parse_feed_detailed(text, bl.feed_format)
-            if parsed.format_mismatch:
-                # The feed is a different format than the list is set to
-                # read (#3531). Storing the parse would swap a good list for
-                # junk, so refuse: nothing is written and the existing
-                # entries stay.
-                bl.last_sync_status = "error"
-                bl.last_sync_error = (
-                    f"Feed appears to be {parsed.format_mismatch} format but the list is "
-                    f"set to {bl.feed_format}; refresh refused, the list's entries left as they were. "
-                    f"Change the list's feed format to {parsed.format_mismatch}."
-                )
-                bl.last_synced_at = datetime.now(UTC)
-                await db.commit()
-                logger.warning(
-                    "blocklist_feed_format_mismatch",
-                    list_id=list_id,
-                    list_name=bl.name,
-                    configured=bl.feed_format,
-                    detected=parsed.format_mismatch,
-                )
-                return {"status": "error", "added": 0, "removed": 0}
-            domains = set(parsed.domains)
-            wildcard = bool(bl.feed_entries_are_wildcard)
-
-            # #3607: a feed that parses to nothing is how an empty file, a
-            # blank answer or an unrecognisable body looks. Replacing a
-            # populated list with it would drop every feed entry, so refuse
-            # when the list has feed entries; a first refresh of a genuinely
-            # empty feed is allowed and reported below.
-            feed_empty = not domains and not parsed.exceptions
-            if feed_empty:
-                had_feed_entries = await db.scalar(
-                    select(func.count())
-                    .select_from(DNSBlockListEntry)
-                    .where(DNSBlockListEntry.list_id == bl.id, DNSBlockListEntry.source == "feed")
-                )
-                if had_feed_entries:
-                    return await _refuse_feed_refresh(
-                        db,
-                        bl,
-                        "Feed refused: it contained no rules (empty, or only comments) but the "
-                        f"list has {had_feed_entries} feed entries; the list's entries left as "
-                        "they were.",
-                        "blocklist_feed_empty_refused",
-                    )
-
-            # A `*.`-prefixed feed is DECLARING it means "and every
-            # subdomain" — as is every adblock `||name^` rule, which is
-            # counted the same way (#2123). Honouring an apex-only list setting against such
-            # a feed is the operator's call, but doing it silently would
-            # leave them wondering why subdomains still resolve.
-            if not wildcard and parsed.wildcard_count:
-                logger.warning(
-                    "blocklist_feed_wildcard_intent_overridden",
-                    list_id=list_id,
-                    list_name=bl.name,
-                    wildcard_lines=parsed.wildcard_count,
-                    detail=(
-                        "This feed publishes wildcard syntax, but the list is "
-                        "set to apex-only, so subdomains of its entries are "
-                        "NOT blocked. Enable 'Block subdomains' on the list if "
-                        "that is not intended."
-                    ),
-                )
-
-            # Diff on domain COLUMNS, write with Core statements in batches —
-            # never one ORM entity per entry (#1466). The catalog's Hagezi
-            # Gambling feed is ~580k domains; loading the existing rows as
-            # entities and adding one tracked instance per new domain OOM-
-            # killed a 1.4 GiB worker on every attempt. The #948 lesson, on
-            # the worker side.
-            #
-            # Every existing domain is read, not only feed rows: the list is
-            # unique on (list_id, domain), so a feed domain the operator
-            # already added by hand must be skipped, not inserted — that
-            # insert failed the whole refresh on the constraint.
-            feed_existing: set[str] = set()
-            other_existing: set[str] = set()
-            existing_rows = await db.execute(
-                select(DNSBlockListEntry.domain, DNSBlockListEntry.source).where(
-                    DNSBlockListEntry.list_id == bl.id
-                )
-            )
-            for domain, source in existing_rows.tuples():
-                (feed_existing if source == "feed" else other_existing).add(domain)
-
-            to_add = domains - feed_existing - other_existing
-            to_remove = feed_existing - domains
-
-            for batch in _batched(sorted(to_add), _FEED_WRITE_BATCH):
-                await db.execute(
-                    pg_insert(DNSBlockListEntry).on_conflict_do_nothing(
-                        index_elements=["list_id", "domain"]
-                    ),
-                    [
-                        {
-                            "list_id": bl.id,
-                            "domain": d,
-                            "entry_type": "block",
-                            "source": "feed",
-                            # Per-list, defaulting on (#878 made it universal,
-                            # #894 made it a choice): a list naming
-                            # `tracker.example` normally means
-                            # `cdn.tracker.example` too, which is what every
-                            # consumer of these feeds does — but a
-                            # host-specific feed wants apex-only.
-                            "is_wildcard": wildcard,
-                        }
-                        for d in batch
-                    ],
-                )
-
-            for batch in _batched(sorted(to_remove), _FEED_WRITE_BATCH):
-                await db.execute(
-                    delete(DNSBlockListEntry)
-                    .where(
-                        DNSBlockListEntry.list_id == bl.id,
-                        DNSBlockListEntry.source == "feed",
-                        DNSBlockListEntry.domain.in_(batch),
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-
-            # The feed's own exceptions (adblock ``@@||name^``, #2123). Same
-            # diff as the entries, on ``source``: an exception the operator
-            # added by hand is never removed by a refresh, and one the feed
-            # also lists is left as the operator's row. Before #2123 they
-            # were dropped, so a name the feed said not to block stayed
-            # blocked by any broader rule or other list that covered it.
-            feed_exceptions = set(parsed.exceptions)
-            exc_feed_existing: set[str] = set()
-            exc_other_existing: set[str] = set()
-            exc_rows = await db.execute(
-                select(DNSBlockListException.domain, DNSBlockListException.source).where(
-                    DNSBlockListException.list_id == bl.id
-                )
-            )
-            for domain, source in exc_rows.tuples():
-                (exc_feed_existing if source == "feed" else exc_other_existing).add(domain)
-            exc_to_add = feed_exceptions - exc_feed_existing - exc_other_existing
-            exc_to_remove = exc_feed_existing - feed_exceptions
-            for batch in _batched(sorted(exc_to_add), _FEED_WRITE_BATCH):
-                await db.execute(
-                    pg_insert(DNSBlockListException).on_conflict_do_nothing(
-                        index_elements=["list_id", "domain"]
-                    ),
-                    [
-                        {
-                            "list_id": bl.id,
-                            "domain": d,
-                            "reason": "Exception rule in the feed",
-                            "source": "feed",
-                        }
-                        for d in batch
-                    ],
-                )
-            for batch in _batched(sorted(exc_to_remove), _FEED_WRITE_BATCH):
-                await db.execute(
-                    delete(DNSBlockListException)
-                    .where(
-                        DNSBlockListException.list_id == bl.id,
-                        DNSBlockListException.source == "feed",
-                        DNSBlockListException.domain.in_(batch),
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-            # What the feed carried that the list does not enforce (#2123, #3531).
-            skipped = parsed.skipped.as_dict() if parsed.skipped else None
-            bl.feed_parse_skipped = skipped
-            if skipped and sum(skipped.values()):
-                logger.info(
-                    "blocklist_feed_rules_skipped",
-                    list_id=list_id,
-                    list_name=bl.name,
-                    **skipped,
-                )
-
-            # Recompute count — plain COUNT, no arithmetic on top: the
-            # inserts and deletes above already ran in this transaction, so
-            # the result ALREADY reflects them. Adding ``len(to_add)`` on top
-            # double-counted every row on a first sync — a 16k-domain feed
-            # reported 33k (#878).
-            bl.entry_count = int(
-                await db.scalar(
-                    select(func.count())
-                    .select_from(DNSBlockListEntry)
-                    .where(DNSBlockListEntry.list_id == bl.id)
-                )
-                or 0
-            )
-            bl.last_synced_at = datetime.now(UTC)
-            bl.last_success_at = bl.last_synced_at
-            bl.last_sync_status = "success"
-            bl.last_sync_error = None
-            if feed_empty:
-                # Allowed (nothing to lose), but said out loud (#3607).
-                bl.last_sync_error = "Feed contained no rules; the list is empty."
-                logger.warning("blocklist_feed_empty", list_id=list_id, list_name=bl.name)
-
-            # Groups whose rendered config folds in this blocklist: groups it's
-            # assigned to directly, plus the owning groups of any views it's
-            # assigned to. Resolved before commit off the eager-loaded
-            # relationships (no lazy access in async); published after.
-            wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
-            wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
-            feed_changed = bool(to_add or to_remove or exc_to_add or exc_to_remove)
-
-            # The entries went in and out through Core INSERT / DELETE, which
-            # the bundle_dirty listener never sees (it watches the ORM unit of
-            # work), so without this the agents kept serving the old list
-            # until some unrelated edit marked them. Blocklists are a global
-            # bundle input there too, hence everyone; nothing to mark when the
-            # set did not change.
-            if feed_changed:
-                from app.services.dns.bundle_dirty import mark_bundles_dirty
-
-                await mark_bundles_dirty(db, everyone=True)
-
-            await db.commit()
-
-            # Worker process — no request collector, so publish directly AFTER
-            # commit, and only when the entry set actually changed (otherwise
-            # the effective blocklist is identical and the bundle ETag is
-            # unchanged, making a wake a wasted no-op rebuild).
-            if feed_changed:
-                for gid in wake_group_ids:
-                    await publish_wake(dns_group_channel(gid))
-
-            logger.info(
-                "blocklist_feed_refreshed",
-                list_id=list_id,
-                added=len(to_add),
-                removed=len(to_remove),
-                exceptions_added=len(exc_to_add),
-                exceptions_removed=len(exc_to_remove),
-            )
-            return {
-                "status": "success",
-                "added": len(to_add),
-                "removed": len(to_remove),
-            }
+            finally:
+                await _unlock_list(db, list_id)
     finally:
         await engine.dispose()
+
+
+async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str]:
+    """The refresh proper; the caller holds the per-list lock."""
+    # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
+    # do no work (and open no driver connections) when it is.
+    if not await is_module_enabled(db, "core.dns"):
+        return {"status": "disabled"}
+    bl = (
+        await db.execute(
+            select(DNSBlockList)
+            .where(DNSBlockList.id == list_id)
+            .options(
+                selectinload(DNSBlockList.server_groups),
+                selectinload(DNSBlockList.views),
+            )
+        )
+    ).scalar_one_or_none()
+    if bl is None:
+        return {"status": "not_found", "added": 0, "removed": 0}
+
+    if not bl.feed_url:
+        bl.last_sync_status = "error"
+        bl.last_sync_error = "No feed_url configured"
+        bl.last_synced_at = datetime.now(UTC)
+        await db.commit()
+        return {"status": "error", "added": 0, "removed": 0}
+
+    # The feed URL is operator-typed and fetched by the control
+    # plane, so it goes through the guarded fetch: http/https only,
+    # loopback / link-local / metadata refused before the request
+    # AND at connect time, every redirect hop re-checked.
+    #
+    # What lands in ``last_sync_error`` is readable by every
+    # dns_blocklist reader, so it is a fixed description of the
+    # failure — never the exception text, which can carry the
+    # resolved address, a response body, or the URL itself with its
+    # credentials. The detail goes to the server log, with the URL
+    # reduced to scheme + host. The transient error re-raised below
+    # for Celery's retry is safe_fetch's FetchFailedError, whose
+    # message carries no URL: Celery writes it into its own retry /
+    # failure log lines and the result backend.
+    shown_url = url_display(bl.feed_url)
+    try:
+        with secret_url_in_flight(bl.feed_url):
+            feed_text = await safe_get_text(
+                bl.feed_url, label="dns_blocklist_feed", timeout=60, refuse_html=True
+            )
+    except FetchRefusedError as e:
+        # Permanent — the same URL gets the same answer; no retry.
+        bl.last_sync_status = "error"
+        bl.last_sync_error = f"Fetch refused: {e}"
+        bl.last_synced_at = datetime.now(UTC)
+        await db.commit()
+        logger.warning(
+            "blocklist_feed_fetch_refused",
+            list_id=list_id,
+            feed=shown_url,
+            reason=str(e),
+        )
+        return {"status": "error", "added": 0, "removed": 0}
+    except (httpx.HTTPError, socket.gaierror) as e:
+        # Transient — write the per-row error state then re-raise
+        # so Celery's ``autoretry_for`` (configured on the task
+        # below) backs off + retries. Issue #219 — pre-fix the
+        # broad ``except`` swallowed every exception and the
+        # task's ``max_retries=3`` was decorative.
+        bl.last_sync_status = "error"
+        bl.last_sync_error = f"Fetch failed: {describe_fetch_error(e)}"
+        bl.last_synced_at = datetime.now(UTC)
+        await db.commit()
+        logger.warning(
+            "blocklist_feed_fetch_failed",
+            list_id=list_id,
+            feed=shown_url,
+            error_type=type(e).__name__,
+            error=redact(str(e), bl.feed_url),
+        )
+        raise
+    except Exception as e:  # noqa: BLE001
+        # Permanent (parse error, unexpected shape) — same DB
+        # shape but don't bubble; retrying won't help.
+        bl.last_sync_status = "error"
+        bl.last_sync_error = "Fetch failed: unexpected error (see server log)"
+        bl.last_synced_at = datetime.now(UTC)
+        await db.commit()
+        logger.warning(
+            "blocklist_feed_fetch_failed",
+            list_id=list_id,
+            feed=shown_url,
+            error_type=type(e).__name__,
+            error=redact(str(e), bl.feed_url),
+        )
+        return {"status": "error", "added": 0, "removed": 0}
+
+    if looks_like_html(feed_text):
+        # #3607: a web page is not a feed. Parsed, it yields zero
+        # rules and the refresh would empty the list and report
+        # success. Refuse; the existing entries stay.
+        return await _refuse_feed_refresh(
+            db,
+            bl,
+            "Feed refused: the URL answered with a web page (HTML), not a data feed "
+            "(a login or captive-portal page, a 404 served as 200, or a moved "
+            "repository?); the list's entries left as they were.",
+            "blocklist_feed_html_refused",
+        )
+    parsed = parse_feed_detailed(feed_text, bl.feed_format)
+    del feed_text  # the raw body is not needed once parsed
+    if parsed.format_mismatch:
+        # The feed is a different format than the list is set to
+        # read (#3531). Storing the parse would swap a good list for
+        # junk, so refuse: nothing is written and the existing
+        # entries stay.
+        bl.last_sync_status = "error"
+        bl.last_sync_error = (
+            f"Feed appears to be {parsed.format_mismatch} format but the list is "
+            f"set to {bl.feed_format}; refresh refused, the list's entries left as they were. "
+            f"Change the list's feed format to {parsed.format_mismatch}."
+        )
+        bl.last_synced_at = datetime.now(UTC)
+        await db.commit()
+        logger.warning(
+            "blocklist_feed_format_mismatch",
+            list_id=list_id,
+            list_name=bl.name,
+            configured=bl.feed_format,
+            detected=parsed.format_mismatch,
+        )
+        return {"status": "error", "added": 0, "removed": 0}
+    domains = parsed.domains  # deduped by the parser
+    # Entries whose reach the rule itself fixes (#4037): never follow the
+    # list's subdomain setting.
+    literals = parsed.literal_domains
+    wildcard = bool(bl.feed_entries_are_wildcard)
+
+    # #3607: a feed that parses to nothing is how an empty file, a
+    # blank answer or an unrecognisable body looks. Replacing a
+    # populated list with it would drop every feed entry, so refuse
+    # when the list has feed entries; a first refresh of a genuinely
+    # empty feed is allowed and reported below.
+    feed_empty = not domains and not literals and not parsed.exceptions
+    if feed_empty:
+        had_feed_entries = await db.scalar(
+            select(func.count())
+            .select_from(DNSBlockListEntry)
+            .where(DNSBlockListEntry.list_id == bl.id, DNSBlockListEntry.source == "feed")
+        )
+        if had_feed_entries:
+            return await _refuse_feed_refresh(
+                db,
+                bl,
+                "Feed refused: it contained no rules (empty, or only comments) but the "
+                f"list has {had_feed_entries} feed entries; the list's entries left as "
+                "they were.",
+                "blocklist_feed_empty_refused",
+            )
+
+    # A `*.`-prefixed feed is DECLARING it means "and every
+    # subdomain" — as is every adblock `||name^` rule, which is
+    # counted the same way (#2123). Honouring an apex-only list setting against such
+    # a feed is the operator's call, but doing it silently would
+    # leave them wondering why subdomains still resolve.
+    if not wildcard and parsed.wildcard_count:
+        logger.warning(
+            "blocklist_feed_wildcard_intent_overridden",
+            list_id=list_id,
+            list_name=bl.name,
+            wildcard_lines=parsed.wildcard_count,
+            detail=(
+                "This feed publishes wildcard syntax, but the list is "
+                "set to apex-only, so subdomains of its entries are "
+                "NOT blocked. Enable 'Block subdomains' on the list if "
+                "that is not intended."
+            ),
+        )
+
+    # The diff runs in Postgres, not in worker memory (#1466, #4059). The
+    # parsed domains are staged into a transaction-local temp table in
+    # batches and the add / remove are set statements against it, so the
+    # existing entries are never read into Python at all (the previous
+    # sets-of-everything held the feed 4-5 times over: parsed list, set,
+    # existing set, to_add, sorted(to_add)). #1466 removed the one-ORM-
+    # entity-per-entry cost; this removes the rest.
+    #
+    # Every existing domain counts, not only feed rows: the list is unique on
+    # (list_id, domain), so a feed domain the operator already added by hand
+    # is skipped (NOT EXISTS), not inserted — that insert failed the whole
+    # refresh on the constraint.
+    #
+    # All of it, and the bookkeeping below, is ONE transaction committed at
+    # the end: a refresh killed or failing part-way rolls back to the
+    # previous entries instead of leaving the list half-written or empty.
+    await db.execute(text("DROP TABLE IF EXISTS _blocklist_feed_stage"))
+    await db.execute(
+        text(
+            "CREATE TEMP TABLE _blocklist_feed_stage "
+            "(domain text NOT NULL, literal boolean NOT NULL) ON COMMIT DROP"
+        )
+    )
+    stage_insert = text("INSERT INTO _blocklist_feed_stage (domain, literal) VALUES (:d, :l)")
+    literal_set = set(literals)
+    for batch in _batched([d for d in domains if d not in literal_set], _FEED_WRITE_BATCH):
+        await db.execute(stage_insert, [{"d": d, "l": False} for d in batch])
+    for batch in _batched(literals, _FEED_WRITE_BATCH):
+        await db.execute(stage_insert, [{"d": d, "l": True} for d in batch])
+    domains.clear()  # staged; the parsed copies are no longer needed
+    literals.clear()
+    literal_set.clear()
+    # A statement planned against an unanalysed temp table, or against an
+    # entry table that is empty and freshly vacuumed (reltuples 0), picks a
+    # nested-loop anti join that is quadratic in the feed and ran past the
+    # command timeout (#4062). Real statistics on the staging table plus no
+    # nested loops inside this transaction keep it a hash anti join.
+    await _plan_set_apply(db)
+
+    add_result = await db.execute(_ADD_FEED_ENTRIES_SQL, {"lid": bl.id, "wild": wildcard})
+    n_added = int(getattr(add_result, "rowcount", 0) or 0)
+    remove_result = await db.execute(
+        text(
+            "DELETE FROM dns_blocklist_entry e "
+            "WHERE e.list_id = :lid AND e.source = 'feed' "
+            "AND NOT EXISTS (SELECT 1 FROM _blocklist_feed_stage s WHERE s.domain = e.domain)"
+        ),
+        {"lid": bl.id},
+    )
+    n_removed = int(getattr(remove_result, "rowcount", 0) or 0)
+    # Feed rows that now come from a ``|name^`` / ``.name^`` rule keep their
+    # row, so a stale wildcard flag on it is cleared (#4037).
+    restamp_result = await db.execute(
+        text(
+            "UPDATE dns_blocklist_entry e SET is_wildcard = false "
+            "FROM _blocklist_feed_stage s "
+            "WHERE e.list_id = :lid AND e.source = 'feed' AND e.domain = s.domain "
+            "AND s.literal AND e.is_wildcard"
+        ),
+        {"lid": bl.id},
+    )
+    n_restamped = int(getattr(restamp_result, "rowcount", 0) or 0)
+
+    # The feed's own exceptions (adblock ``@@||name^``, #2123). Same
+    # diff as the entries, on ``source``: an exception the operator
+    # added by hand is never removed by a refresh, and one the feed
+    # also lists is left as the operator's row. Before #2123 they
+    # were dropped, so a name the feed said not to block stayed
+    # blocked by any broader rule or other list that covered it.
+    feed_exceptions = set(parsed.exceptions)
+    exc_feed_existing: set[str] = set()
+    exc_other_existing: set[str] = set()
+    exc_rows = await db.execute(
+        select(DNSBlockListException.domain, DNSBlockListException.source).where(
+            DNSBlockListException.list_id == bl.id
+        )
+    )
+    for domain, source in exc_rows.tuples():
+        (exc_feed_existing if source == "feed" else exc_other_existing).add(domain)
+    exc_to_add = feed_exceptions - exc_feed_existing - exc_other_existing
+    exc_to_remove = exc_feed_existing - feed_exceptions
+    for batch in _batched(sorted(exc_to_add), _FEED_WRITE_BATCH):
+        await db.execute(
+            pg_insert(DNSBlockListException).on_conflict_do_nothing(
+                index_elements=["list_id", "domain"]
+            ),
+            [
+                {
+                    "list_id": bl.id,
+                    "domain": d,
+                    "reason": "Exception rule in the feed",
+                    "source": "feed",
+                }
+                for d in batch
+            ],
+        )
+    for batch in _batched(sorted(exc_to_remove), _FEED_WRITE_BATCH):
+        await db.execute(
+            delete(DNSBlockListException)
+            .where(
+                DNSBlockListException.list_id == bl.id,
+                DNSBlockListException.source == "feed",
+                DNSBlockListException.domain.in_(batch),
+            )
+            .execution_options(synchronize_session=False)
+        )
+    # What the feed carried that the list does not enforce (#2123, #3531).
+    skipped = parsed.skipped.as_dict() if parsed.skipped else None
+    bl.feed_parse_skipped = skipped
+    if skipped and sum(skipped.values()):
+        logger.info(
+            "blocklist_feed_rules_skipped",
+            list_id=list_id,
+            list_name=bl.name,
+            **skipped,
+        )
+
+    # Recompute count — plain COUNT, no arithmetic on top: the
+    # inserts and deletes above already ran in this transaction, so
+    # the result ALREADY reflects them. Adding the insert count on top
+    # double-counted every row on a first sync — a 16k-domain feed
+    # reported 33k (#878).
+    bl.entry_count = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(DNSBlockListEntry)
+            .where(DNSBlockListEntry.list_id == bl.id)
+        )
+        or 0
+    )
+    bl.last_synced_at = datetime.now(UTC)
+    bl.last_success_at = bl.last_synced_at
+    bl.last_sync_status = "success"
+    bl.last_sync_error = None
+    if feed_empty:
+        # Allowed (nothing to lose), but said out loud (#3607).
+        bl.last_sync_error = "Feed contained no rules; the list is empty."
+        logger.warning("blocklist_feed_empty", list_id=list_id, list_name=bl.name)
+
+    # Groups whose rendered config folds in this blocklist: groups it's
+    # assigned to directly, plus the owning groups of any views it's
+    # assigned to. Resolved before commit off the eager-loaded
+    # relationships (no lazy access in async); published after.
+    wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
+    wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
+    feed_changed = bool(n_added or n_removed or n_restamped or exc_to_add or exc_to_remove)
+
+    # The entries went in and out through Core INSERT / DELETE, which
+    # the bundle_dirty listener never sees (it watches the ORM unit of
+    # work), so without this the agents kept serving the old list
+    # until some unrelated edit marked them. Blocklists are a global
+    # bundle input there too, hence everyone; nothing to mark when the
+    # set did not change.
+    if feed_changed:
+        from app.services.dns.bundle_dirty import mark_bundles_dirty
+
+        await mark_bundles_dirty(db, everyone=True)
+
+    await db.commit()
+
+    # Worker process — no request collector, so publish directly AFTER
+    # commit, and only when the entry set actually changed (otherwise
+    # the effective blocklist is identical and the bundle ETag is
+    # unchanged, making a wake a wasted no-op rebuild).
+    if feed_changed:
+        for gid in wake_group_ids:
+            await publish_wake(dns_group_channel(gid))
+
+    logger.info(
+        "blocklist_feed_refreshed",
+        list_id=list_id,
+        added=n_added,
+        removed=n_removed,
+        exceptions_added=len(exc_to_add),
+        exceptions_removed=len(exc_to_remove),
+    )
+    return {
+        "status": "success",
+        "added": n_added,
+        "removed": n_removed,
+    }
 
 
 @celery_app.task(
@@ -462,8 +570,6 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
     'active' but whose last_seen_at is beyond the threshold.
     """
     from datetime import timedelta
-
-    from sqlalchemy import update
 
     from app.models.dns import DNSServer
 

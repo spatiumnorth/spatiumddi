@@ -43,6 +43,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ..blocklist_entries import entry_count, iter_entries
 from ..ingest import read_seen_keys as _read_seen_keys
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
 from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
@@ -144,6 +145,15 @@ logging {{
     category query-errors {{ queries_channel; }};
 """
 
+
+#: ``response-policy`` options, shared by the global and per-view forms.
+#: ``servfail-until-ready yes`` (#4064): a policy zone of hundreds of
+#: thousands of names loads in the background while named is already
+#: answering, so a blocked name resolved for the first 5-11 s after every
+#: start. Until the zones have loaded named SERVFAILs instead of leaking.
+_RPZ_POLICY_OPTIONS = (
+    "break-dnssec yes qname-wait-recurse no servfail-until-ready yes"
+)
 
 # RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
 # category, never to ``queries`` — so without these two lines a blocked
@@ -1883,14 +1893,89 @@ def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
     for entry in entries:
         if entry.is_dir():
             for zf in sorted(entry.glob("*.db")):
-                out.append((zf.name[: -len(".db")], entry.name))
+                out.append((_zone_from_fname(zf.name[: -len(".db")]), entry.name))
         elif entry.name.endswith(".db"):
-            out.append((entry.name[: -len(".db")], None))
+            out.append((_zone_from_fname(entry.name[: -len(".db")]), None))
     return out
 
 
+_ZONE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
+
+
+def _zone_name_renderable(zname: str) -> bool:
+    """True when *zname* is safe to write into ``named.conf`` and a file path.
+
+    Mirrors the control plane's zone-name floor: no quote, whitespace, ``;``,
+    brace, backslash or control character, no ``..`` segment; ``/`` is kept
+    for RFC 2317 classless reverse zones. The root zone ``.`` is allowed.
+    """
+    if zname == ".":
+        return True
+    return bool(
+        _ZONE_NAME_RE.match(zname)
+        and ".." not in zname
+        and "/." not in zname
+        and "./" not in zname
+    )
+
+
+def _zone_fname(zname: str) -> str:
+    """A zone's file stem: ``/`` of an RFC 2317 classless reverse zone as
+    ``%2F`` (#4165), the encoding BIND itself uses in key file names. ``%`` is
+    not a legal zone-name character (``_ZONE_NAME_RE``), so it is unambiguous.
+    Left as ``/`` the file nests (``zones/<view>/64/26.2.0.192...db``), and
+    ``_zone_views_under`` never lists a nested file: the zone was loaded once
+    and never reloaded."""
+    return zname.replace("/", "%2F")
+
+
+def _zone_from_fname(stem: str) -> str:
+    return stem.replace("%2F", "/")
+
+
 def _zone_rel(zname: str, view: str | None) -> str:
-    return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
+    fname = _zone_fname(zname)
+    return f"zones/{view}/{fname}.db" if view else f"zones/{fname}.db"
+
+
+def _migrate_nested_zone_files(live: Path, zone_names: list[str]) -> None:
+    """Move a classless zone's file (and its sidecars, journal included) from
+    the nested layout older renders wrote into the flat one (#4165), so an
+    upgrade keeps the zone's dynamic data instead of treating it as new.
+
+    Driven by the bundle's own zone names rather than by guessing from the
+    tree, because ``zones/64/26.2.0.192.in-addr.arpa.db`` is ambiguous on its
+    own: a classless prefix directory, or a view named ``64``.
+    """
+    zones = live / "zones"
+    try:
+        dirs = [zones] + [d for d in zones.iterdir() if d.is_dir()]
+    except OSError:
+        return
+    for zname in zone_names:
+        stem = zname.rstrip(".")
+        if "/" not in stem:
+            continue
+        head, tail = stem.rsplit("/", 1)
+        for base in dirs:
+            old_dir = base / head
+            if not old_dir.is_dir():
+                continue
+            for f in sorted(old_dir.iterdir()):
+                if not f.is_file() or not (
+                    f.name == tail + ".db" or f.name.startswith(tail + ".db.")
+                ):
+                    continue
+                new = base / (_zone_fname(stem) + f.name[len(tail) :])
+                try:
+                    if not new.exists():
+                        f.rename(new)
+                except OSError as exc:
+                    log.warning("bind9_nested_zone_file_move_failed", path=str(f), error=str(exc))
+            try:
+                old_dir.rmdir()
+            except OSError:
+                pass  # not empty: a view of that name, or a sibling zone's files
 
 
 _VIEW_OPEN_LINE = re.compile(r'^view "([^"]+)" \{$')
@@ -2098,8 +2183,21 @@ def _rpz_sidecar(path: Path) -> Path:
     return path.with_name(path.name + _RPZ_HASH_SUFFIX)
 
 
-def _write_rpz_sidecar(path: Path, key: str) -> None:
+def _hash_file(path: Path) -> str:
+    """sha256 of ``path``'s bytes, streamed so a 20 MB zone costs 1 MiB."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_rpz_sidecar(path: Path, key: str, digest: str | None = None) -> None:
     """Record ``key`` beside the RPZ file at ``path``, if the name can exist.
+
+    The sidecar holds ``<key> <size> <sha256 of the file>`` (#4080). ``digest``
+    is passed by a caller that has just hashed the file; otherwise it is hashed
+    here.
 
     The sidecar is an optimisation: a zone without one is rendered every
     time, as for a bundle with no hash. A zone name within ~14 bytes of the
@@ -2107,8 +2205,10 @@ def _write_rpz_sidecar(path: Path, key: str) -> None:
     served, just never reused.
     """
     try:
+        if digest is None:
+            digest = _hash_file(path)
         _write_new_inode(
-            _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
+            _rpz_sidecar(path), f"{key} {path.stat().st_size} {digest}\n".encode()
         )
     except OSError as exc:
         if not _name_too_long(exc):
@@ -2146,26 +2246,27 @@ def _rpz_serial(bl: dict[str, Any]) -> int:
     )
 
 
-def _rpz_reusable(src: Path, key: str) -> bool:
-    """``src`` is a regular file whose sidecar records ``key`` and whose size
-    is the size it had when it was written.
+def _rpz_reusable(src: Path, key: str) -> str | None:
+    """The file's sha256 when ``src`` is a regular file whose sidecar records
+    ``key`` and whose bytes still hash to what the sidecar recorded, else None.
 
-    The size is the cheap half of the check: these files are never rewritten
-    once they are reused, so a file truncated by a crash (written, renamed,
-    not yet flushed) would otherwise be linked forward from tree to tree
-    rather than replaced by the next render.
+    The content is the check, not the size (#4080): damage that keeps the size
+    (a flipped byte, a partial restore) used to be linked forward, and named
+    then failed to load the zone while the server reported ok. A file truncated
+    by a crash fails it too. The stream-hash costs far less than a render.
     """
     try:
         recorded = _rpz_sidecar(src).read_text(encoding="utf-8").split()
-        size = src.stat().st_size if src.is_file() and not src.is_symlink() else None
+        if not src.is_file() or src.is_symlink():
+            return None
+        if len(recorded) != 3 or recorded[0] != key:
+            return None
+        if recorded[1] != str(src.stat().st_size):
+            return None
+        digest = _hash_file(src)
     except (OSError, UnicodeDecodeError):
-        return False
-    return (
-        size is not None
-        and len(recorded) == 2
-        and recorded[0] == key
-        and recorded[1] == str(size)
-    )
+        return None
+    return digest if digest == recorded[2] else None
 
 
 def _fsync_path(path: Path) -> None:
@@ -2242,6 +2343,37 @@ def _named_files_fit(path: Path, signed: bool) -> bool:
     apply."""
     suffix = _NAMED_SIGNED_JOURNAL_SUFFIX if signed else _NAMED_JOURNAL_SUFFIX
     return len(path.name.encode()) + len(suffix) <= _NAME_MAX
+
+
+#: A signed zone's key files are ``K<zone>.+AAA+IIIII.private`` (also ``.key``
+#: and ``.state``): the algorithm and key id are fixed width, so the name is the
+#: zone name plus this many characters whatever the policy (#3750).
+_KEY_FILE_EXTRA_CHARS = 20
+#: The longest key file name BIND 9.20.30 managed to write. BIND creates a key
+#: file through a longer temporary name, so it fails well below ``NAME_MAX``:
+#: measured, a 214-character zone (``.private`` name 234) signs and a
+#: 215-character one (235) gets a ``.key`` and ``.state`` but no ``.private``,
+#: and from 216 no key file at all. The zone is then served unsigned, with
+#: DNSSEC reading as on and no key.
+_KEY_FILE_NAME_MAX = 234
+
+
+def _key_files_fit(zname: str) -> bool:
+    """Whether BIND can write the key files of a signed zone named ``zname``
+    (#3750)."""
+    return len(zname.rstrip(".")) + _KEY_FILE_EXTRA_CHARS <= _KEY_FILE_NAME_MAX
+
+
+def _key_file_refusal(zname: str) -> str:
+    """The held-back reason for a signed zone whose key files cannot be written
+    (#3750)."""
+    limit = _KEY_FILE_NAME_MAX - _KEY_FILE_EXTRA_CHARS
+    return (
+        f"the zone name is {len(zname)} characters, too long to sign with "
+        f"DNSSEC: the DNS server cannot write the key files it names after the "
+        f"zone, and would serve the zone unsigned. A signed zone's name can be "
+        f"at most {limit} characters. Shorten the zone name or turn DNSSEC off"
+    )
 
 
 def _file_name_refusal(zname: str) -> str:
@@ -3036,6 +3168,12 @@ class Bind9Driver(DriverBase):
     #: ingest mirrors (``learned`` in the bundle, #2850): for these named's
     #: copy wins at the carry (``_carry_zone``).
     _learned_rrsets: dict[str, set[str]] | None = None
+    #: Rendered paths (``zones/<view>/<zone>.db``) of the zones the last verify
+    #: found named had not loaded (#4080). Kept across applies: the retry after
+    #: a failed verify has to check them again though their bytes did not
+    #: change, and must render an RPZ one afresh rather than reuse the file
+    #: named could not load.
+    _unloaded_zones: set[str] = set()
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -3054,6 +3192,17 @@ class Bind9Driver(DriverBase):
         # (#2835, D5): lines collected here, kept as ONE bytes object below.
         self._apex_lines: list[str] = []
         self._apex_overlay: dict[str, dict[str, Any]] = {}
+        # #4065 — the secondary / stub zones named holds transferred copies of:
+        # what ``periodic_served_serials`` re-reads, since a transfer moves
+        # their serial with no render and no change to the bundle.
+        self._rendered_secondaries: list[str] = sorted(
+            {
+                str(z.get("name") or "").rstrip(".").lower()
+                for z in (bundle.get("zones") or [])
+                if z.get("type", "primary") in {"secondary", "slave", "stub"}
+                and str(z.get("name") or "").rstrip(".")
+            }
+        )
         try:
             self._render(bundle)
             # #2223 — state that outlives the poll must not be a web of small
@@ -3071,6 +3220,10 @@ class Bind9Driver(DriverBase):
         if new_dir.exists():
             shutil.rmtree(new_dir)
         (new_dir / "zones").mkdir(parents=True)
+        _migrate_nested_zone_files(
+            self.state_dir / self.rendered_dir_name,
+            [str(z.get("name") or "") for z in (bundle.get("zones") or [])],
+        )
         # The zone files this render wrote for primary zones (#2864): the
         # ones whose serial an agent start must keep from going backwards.
         self._primary_rels: set[str] = set()
@@ -3198,9 +3351,15 @@ class Bind9Driver(DriverBase):
             # qname first and does not rewrite a failed lookup, so a blocked
             # name whose upstream is dead answered SERVFAIL after ~10 s instead
             # of the policy answer. A blocklist wants the opposite.
+            # servfail-until-ready (#4064): named answers while a large policy
+            # zone is still loading in the background, so for the first
+            # seconds after every start a blocked name resolved normally.
+            # With it, named SERVFAILs until the zones have loaded; a zone
+            # that fails to load counts as settled, so a broken one cannot
+            # keep named from serving.
             response_policy_block = (
                 f"    response-policy {{ {zones_list}; }} "
-                "break-dnssec yes qname-wait-recurse no;\n"
+                f"{_RPZ_POLICY_OPTIONS};\n"
             )
 
         logging_block = _render_logging_block(opts)
@@ -3268,6 +3427,12 @@ class Bind9Driver(DriverBase):
             zname = zone.get("name") or ""
             if not zname:
                 return ""
+            if not _zone_name_renderable(zname):
+                # Never interpolated into named.conf or a file path: a name
+                # with quotes, braces, ``;``, whitespace or a ``..`` segment
+                # would otherwise rewrite the config or escape ``zones/``.
+                log.warning("bind9_zone_skipped_invalid_name", zone=repr(zname))
+                return ""
             zone_type = zone.get("type", "primary")
             # Forward zones: just a forwarders block, no file / allow-update.
             # The transport is the ZONE's own (#2121), not the group's: the
@@ -3302,7 +3467,7 @@ class Bind9Driver(DriverBase):
                 if not masters:
                     log.warning("bind9_secondary_zone_no_masters_skipped", zone=zname)
                     return ""
-                rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+                rel_zfile = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
                 abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
                 bind_type = "stub" if zone_type == "stub" else "slave"
                 masters_clause = "; ".join(_format_master(m) for m in masters)
@@ -3314,7 +3479,7 @@ class Bind9Driver(DriverBase):
             # Relative path inside the rendered tree; absolute path written
             # into named.conf so BIND9 doesn't resolve against its
             # `directory` (/var/cache/bind, not our rendered tree).
-            rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+            rel_zfile = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
             # Coarse allow-update (IP + TSIG) unless the ACL needs the
             # fine-grained update-policy path (name-scope / per-type / deny).
@@ -3351,9 +3516,13 @@ class Bind9Driver(DriverBase):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
             self._primary_rels.add(rel_zfile)
-            if not _named_files_fit(
-                new_dir / rel_zfile, bool(zone.get("dnssec_enabled"))
-            ):
+            signed = bool(zone.get("dnssec_enabled"))
+            if signed and not _key_files_fit(zname):
+                # Checked first: it bites at a shorter name than the journal.
+                self._hold_unwritable(
+                    new_dir / rel_zfile, zname, file_prefix, _key_file_refusal(zname)
+                )
+            elif not _named_files_fit(new_dir / rel_zfile, signed):
                 self._hold_unwritable(new_dir / rel_zfile, zname, file_prefix)
             else:
                 try:
@@ -3379,7 +3548,7 @@ class Bind9Driver(DriverBase):
             <target>. or A/AAAA, exceptions → CNAME rpz-passthru.
             """
             zname = bl["rpz_zone_name"]
-            rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+            rel = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
             try:
                 if _named_files_fit(new_dir / rel, False):
@@ -3452,7 +3621,7 @@ class Bind9Driver(DriverBase):
                     )
                     body += (
                         f"response-policy {{ {zlist}; }} "
-                        "break-dnssec yes qname-wait-recurse no;\n"
+                        f"{_RPZ_POLICY_OPTIONS};\n"
                     )
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
@@ -3551,7 +3720,7 @@ class Bind9Driver(DriverBase):
             catalog = bundle.get("catalog") or None
             if catalog and catalog.get("mode") == "producer":
                 cname = catalog["zone_name"]
-                rel = f"zones/{cname.rstrip('.')}.db"
+                rel = f"zones/{_zone_fname(cname.rstrip('.'))}.db"
                 abs_zfile = self.state_dir / self.rendered_dir_name / rel
                 conf += (
                     f'zone "{cname}" {{ type master; file "{abs_zfile}"; '
@@ -3733,7 +3902,9 @@ class Bind9Driver(DriverBase):
             lines.append(f"{digest}.zones IN PTR {text_with_dot}")
         path.write_text("\n".join(lines) + "\n")
 
-    def _hold_unwritable(self, path: Path, zname: str, file_prefix: str) -> None:
+    def _hold_unwritable(
+        self, path: Path, zname: str, file_prefix: str, reason: str | None = None
+    ) -> None:
         """Hold back a zone whose file, or a sidecar of it, cannot be named (#3672).
 
         Only a name too long comes here (an ``ENAMETOOLONG`` from the write,
@@ -3752,11 +3923,11 @@ class Bind9Driver(DriverBase):
         # would be read as a render it is not.
         for staged in (path, _rpz_sidecar(path), _owned_sidecar(path)):
             _discard(staged, label)
-        reason = _file_name_refusal(zone)
+        reason = reason or _file_name_refusal(zone)
         log.warning("bind9_zone_file_name_too_long", zone=label, reason=reason)
         self._unwritable_zones = (
             *self._unwritable_zones,
-            HeldZone(zone, view, reason, False),
+            HeldZone(zone, view, reason, False, True),
         )
 
     def _write_zone_file(
@@ -3890,10 +4061,13 @@ class Bind9Driver(DriverBase):
         out of ``named-checkzone`` and out of every ``rndc reload``.
         """
         key = _rpz_render_key(bl)
-        if key is not None:
+        # A file named could not load is not reused again (#4080): its sidecar
+        # vouches for the bytes, not for named being able to read them.
+        if key is not None and rel not in self._unloaded_zones:
             for tree in (self.rendered_dir_name, "rendered.prev"):
                 src = self.state_dir / tree / rel
-                if not _rpz_reusable(src, key):
+                digest = _rpz_reusable(src, key)
+                if digest is None:
                     continue
                 path.parent.mkdir(parents=True, exist_ok=True)
                 how = _link_or_copy(src, path)
@@ -3907,13 +4081,13 @@ class Bind9Driver(DriverBase):
                     # that; it changes no byte, and the backup sharing the
                     # inode loses nothing.
                     os.utime(path)
-                _write_rpz_sidecar(path, key)
+                _write_rpz_sidecar(path, key, digest)
                 log.info(
                     "bind9_rpz_reused",
                     zone=bl["rpz_zone_name"],
                     source=tree,
                     via=how,
-                    entries=len(bl.get("entries") or []),
+                    entries=entry_count(bl),
                 )
                 return
         self._write_rpz_zone_file(path, bl)
@@ -4027,7 +4201,7 @@ class Bind9Driver(DriverBase):
         log.info(
             "bind9_rpz_written",
             zone=zname,
-            entries=len(bl.get("entries") or []),
+            entries=entry_count(bl),
             owners=len(seen),
         )
 
@@ -4054,10 +4228,13 @@ class Bind9Driver(DriverBase):
         # the zone must load, since the alternative is enforcing nothing
         # at all. Collisions are logged so the operator can reconcile the
         # lists rather than wonder which one is in effect.
-        for e in bl.get("entries") or []:
+        for e in iter_entries(bl):
             domain = e["domain"].rstrip(".")
             key = domain.lower()
-            if key in excluded:
+            # An exception emits ``N`` and ``*.N`` as passthru, so a
+            # subdomains-only entry ``*.N`` (adblock ``.N^``, #4037) would
+            # put a second CNAME on that owner.
+            if key in excluded or key.removeprefix("*.") in excluded:
                 continue
             action = e.get("action") or "block"
             block_mode = e.get("block_mode") or "nxdomain"
@@ -4505,6 +4682,13 @@ class Bind9Driver(DriverBase):
         sources = _view_carry_sources(new_dir, prev_tree)
         if changed is not None:
             changed |= carry
+            # Zones named failed to load last time are checked again, bytes
+            # changed or not (#4080).
+            changed |= {
+                zv
+                for zv in _zone_views_under(new_dir)
+                if _zone_rel(*zv) in self._unloaded_zones
+            }
         frozen: dict[tuple[str, str | None], int | None] = {}
         running = bool(rndc and current.exists() and self.daemon_running())
         if running:
@@ -5043,9 +5227,9 @@ class Bind9Driver(DriverBase):
         """The live ``.owned`` of zone ``zname`` (no views), matched without
         regard to case: the file is named as the bundle spells the zone."""
         zones = self.state_dir / self.rendered_dir_name / "zones"
-        zone_file = zones / f"{zname}.db"
+        zone_file = zones / f"{_zone_fname(zname)}.db"
         if not zone_file.is_file():
-            want = f"{zname.lower()}.db"
+            want = f"{_zone_fname(zname).lower()}.db"
             try:
                 zone_file = next(
                     p for p in zones.iterdir() if p.name.lower() == want and p.is_file()
@@ -5478,6 +5662,7 @@ class Bind9Driver(DriverBase):
             if only is None or zv in only
         }
         total = len(pending)
+        checked = {_zone_rel(*zv) for zv in pending}
         why: dict[tuple[str, str | None], str] = {}
         deadline = time.monotonic() + _ZONE_LOAD_TIMEOUT_S
 
@@ -5513,6 +5698,11 @@ class Bind9Driver(DriverBase):
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(_ZONE_LOAD_POLL_S)
+        # Remember what named did not load, for the retry (#4080); a zone that
+        # loaded is forgotten.
+        self._unloaded_zones = (self._unloaded_zones - checked) | {
+            _zone_rel(*zv) for zv in pending
+        }
         if pending:
             listed = [
                 f"{_zone_label(*zv)}: {why.get(zv, 'no answer')}" for zv in pending
@@ -5951,21 +6141,26 @@ class Bind9Driver(DriverBase):
     def periodic_served_serials(self) -> dict[str, int]:
         """Zone name (lowercase, no trailing dot) → the serial named serves,
         for every primary zone the last render wrote in a group without
-        views (#2835); the sync loop posts the ones that changed.
+        views (#2835) and every secondary / stub zone in any group (#4065);
+        the sync loop posts the ones that changed.
 
         Named moves a zone's serial through updates the agent never sent: a
-        third-party RFC 2136 client's, a DNSSEC key event on a signed zone.
-        A zone that cannot be read is left out. A group with views reports as
-        it always did, from its renders, and is not read here.
+        third-party RFC 2136 client's, a DNSSEC key event on a signed zone, a
+        transfer from the primary into a secondary. A zone that cannot be
+        read (a secondary not transferred yet) is left out. A primary zone of
+        a group with views reports as it always did, from its renders, and is
+        not read here. The reads run on the bounded apply pool.
         """
-        if getattr(self, "_rendered_has_views", True):
-            return {}
-        blob: bytes = getattr(self, "_apex_blob", b"")
-        keys = [
-            line.split(b"\t", 1)[0].decode()
-            for line in blob.split(b"\n")
-            if b"\t" in line
-        ]
+        keys: list[str] = []
+        if not getattr(self, "_rendered_has_views", True):
+            blob: bytes = getattr(self, "_apex_blob", b"")
+            keys = [
+                line.split(b"\t", 1)[0].decode()
+                for line in blob.split(b"\n")
+                if b"\t" in line
+            ]
+        have = set(keys)
+        keys += [k for k in getattr(self, "_rendered_secondaries", []) if k not in have]
         served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
         return {k: v for k, v in zip(keys, served) if v is not None}
 
@@ -6080,10 +6275,12 @@ class Bind9Driver(DriverBase):
         that very serial with other data is served one past it
         (``_freeze_and_wait``), and reporting the bundle's would read in sync
         at a serial named does not serve. A zone that cannot be read is left
-        out, so it is not reported. Every other zone — any zone of a group
-        with views, which re-renders on each change and is reported as it
-        always was, and secondary / stub / forward zones — reports the
-        bundle's serial, unchanged.
+        out, so it is not reported. A secondary / stub zone is read back the
+        same way in every group, views or not (#3940): the bundle's serial for
+        it is 0, which says nothing about whether named holds a copy. Every
+        other zone — any primary zone of a group with views, which re-renders
+        on each change and is reported as it always was, and forward zones —
+        reports the bundle's serial, unchanged.
         """
         out: dict[str, int] = {}
         has_views = any(v.get("name") for v in (bundle.get("views") or []))
@@ -6093,7 +6290,13 @@ class Bind9Driver(DriverBase):
             serial = z.get("serial")
             if not name or serial is None:
                 continue
-            if has_views or z.get("type", "primary") not in {"primary", "master"}:
+            ztype = z.get("type", "primary")
+            if ztype in {"secondary", "slave", "stub"}:
+                # What the server holds, not the bundle's serial (0 for a
+                # secondary): a zone it never transferred must not read in
+                # sync (#3940). Unreadable = left out = not reported.
+                reads.append(name)
+            elif has_views or ztype not in {"primary", "master"}:
                 out[name.lower()] = int(serial)
             else:
                 reads.append(name)

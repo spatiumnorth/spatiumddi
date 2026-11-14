@@ -27,10 +27,6 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPLease
-
-# The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
-# longer imports *up* from a task — servers.py:delete_lease used to); the sweep
-# imports them back here.
 from app.services.dhcp.lease_cleanup import (
     _load_subnet_cache,
     _resolve_lease_subnet_id,
@@ -41,6 +37,11 @@ from app.services.dhcp.lease_cleanup import (
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dhcp.normalize import norm_ip
 from app.services.dns.record_ops import purge_trashed_address_records
+
+# The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
+# longer imports *up* from a task — servers.py:delete_lease used to); the sweep
+# imports them back here.
+from app.services.e911.address_bindings import keep_row_if_bound
 from app.services.feature_modules import is_module_enabled
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.lock_order import (
@@ -212,7 +213,9 @@ async def _sweep() -> tuple[int, int]:
                         error=str(exc),
                     )
             await purge_trashed_address_records(db, [row.id])  # #3186
-            await db.delete(row)
+            # An address an E911 binding names stays (#3899), as a free row.
+            if not await keep_row_if_bound(db, row):
+                await db.delete(row)
             touched_subnets.add(row.subnet_id)
             cleaned += 1
 

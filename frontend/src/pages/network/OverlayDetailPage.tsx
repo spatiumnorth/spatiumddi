@@ -40,6 +40,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -287,6 +288,7 @@ function Card({
 // polish pass.
 
 function TopologyTab({ overlayId }: { overlayId: string }) {
+  const { writeGate } = useOverlayGates();
   const topoQ = useQuery({
     queryKey: ["overlay-topology", overlayId],
     queryFn: () => overlaysApi.topology(overlayId),
@@ -312,8 +314,9 @@ function TopologyTab({ overlayId }: { overlayId: string }) {
   if (nodes.length === 0) {
     return (
       <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-        No sites attached yet. Use the Sites tab to add hub / spoke / transit /
-        gateway sites with their preferred underlay circuits.
+        No sites attached yet.
+        {!writeGate.disabled &&
+          " Use the Sites tab to add hub / spoke / transit / gateway sites with their preferred underlay circuits."}
       </div>
     );
   }
@@ -930,7 +933,9 @@ function SiteEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -1434,7 +1439,9 @@ function PolicyEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -1460,6 +1467,9 @@ function PolicyEditorModal({
 // ── Simulate tab ───────────────────────────────────────────────────
 
 function SimulateTab({ overlayId }: { overlayId: string }) {
+  // #4118 — the route is write-scoped on 'overlay_network' even though it
+  // never writes, so the run button asks what the route asks.
+  const { writeGate } = useOverlayGates();
   const [downCircuits, setDownCircuits] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<SimulateResponse | null>(null);
 
@@ -1526,8 +1536,10 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
         </div>
         {candidates.length === 0 ? (
           <p className="px-3 py-6 text-center text-sm text-muted-foreground">
-            No circuits referenced by this overlay's sites yet — attach sites
-            with preferred circuits first.
+            No circuits referenced by this overlay's sites yet
+            {writeGate.disabled
+              ? "."
+              : " — attach sites with preferred circuits first."}
           </p>
         ) : (
           <ul className="divide-y">
@@ -1558,6 +1570,7 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
           type="button"
           disabled={sim.isPending}
           onClick={() => sim.mutate()}
+          {...writeGate}
           className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
           {sim.isPending ? "Simulating…" : "Run simulation"}
@@ -1575,7 +1588,9 @@ function SimulateTab({ overlayId }: { overlayId: string }) {
           </button>
         )}
         {sim.isError && (
-          <p className="text-xs text-destructive">Simulation failed</p>
+          <FormError className="text-xs text-destructive">
+            {formatApiError(sim.error, "Simulation failed")}
+          </FormError>
         )}
       </div>
 
