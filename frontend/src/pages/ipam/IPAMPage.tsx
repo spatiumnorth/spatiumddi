@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
@@ -1020,6 +1021,7 @@ function ZoneOptions({
 // ─── Create Space Modal ───────────────────────────────────────────────────────
 
 export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const canReadVrfs = usePermissions().can("read", "vrf");
   const [name, setName] = useState("");
@@ -1176,13 +1178,15 @@ export function CreateSpaceModal({ onClose }: { onClose: () => void }) {
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
-          <Field label="Customer" hint="Logical owner of this space.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Logical owner of this space.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
         </div>
       )}
 
@@ -2775,6 +2779,7 @@ export function CreateSubnetModal({
   defaultNetwork?: string;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [subnetMode, setSubnetMode] = useState<"manual" | "size">("manual");
   const [network, setNetwork] = useState(defaultNetwork ?? "");
@@ -2910,9 +2915,12 @@ export function CreateSubnetModal({
   const blockIsV6 = selectedBlock ? isIPv6Cidr(selectedBlock.network) : false;
   const blockPrefixOptions = (() => {
     if (!selectedBlock) return PREFIX_OPTIONS_V4;
-    const own = parseInt(selectedBlock.network.split("/")[1] ?? "0", 10);
+    const blockPrefix = parseInt(
+      selectedBlock.network.split("/")[1] ?? "0",
+      10,
+    );
     const pool = blockIsV6 ? PREFIX_OPTIONS_V6 : PREFIX_OPTIONS_V4;
-    return pool.filter((p) => p > own);
+    return pool.filter((p) => p > blockPrefix);
   })();
   useEffect(() => {
     if (blockPrefixOptions.length === 0) return;
@@ -3280,20 +3288,24 @@ export function CreateSubnetModal({
             />
             Skip network / broadcast / gateway records (loopback, P2P)
           </label>
-          <Field label="Customer" hint="Logical owner of this subnet.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
-          <Field label="Site" hint="Physical location of this subnet.">
-            <SitePicker
-              className={inputCls}
-              value={siteId}
-              onChange={setSiteId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Logical owner of this subnet.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
+          {own.site && (
+            <Field label="Site" hint="Physical location of this subnet.">
+              <SitePicker
+                className={inputCls}
+                value={siteId}
+                onChange={setSiteId}
+              />
+            </Field>
+          )}
           <CustomFieldsSection
             definitions={cfDefs}
             values={shownCustomFields}
@@ -8561,6 +8573,7 @@ function EditSubnetModalForm({
   onClose,
   onDeleted,
 }: EditSubnetModalProps) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
   const canDeleteSubnet = usePermissions().can("delete", "subnet");
@@ -9154,20 +9167,24 @@ function EditSubnetModalForm({
               </p>
             </div>
           </label>
-          <Field label="Customer" hint="Logical owner of this subnet.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
-          <Field label="Site" hint="Physical location of this subnet.">
-            <SitePicker
-              className={inputCls}
-              value={siteId}
-              onChange={setSiteId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Logical owner of this subnet.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
+          {own.site && (
+            <Field label="Site" hint="Physical location of this subnet.">
+              <SitePicker
+                className={inputCls}
+                value={siteId}
+                onChange={setSiteId}
+              />
+            </Field>
+          )}
           <CustomFieldsSection
             definitions={cfDefs}
             values={customFields}
@@ -11129,6 +11146,7 @@ function AddressSetModalForm({
   onClose,
   onSaved,
 }: AddressSetModalProps) {
+  const own = useOwnershipModules();
   const isEdit = !!existing;
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -11291,12 +11309,16 @@ function AddressSetModalForm({
           </Field>
         )}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Customer">
-            <CustomerPicker value={customerId} onChange={setCustomerId} />
-          </Field>
-          <Field label="Site">
-            <SitePicker value={siteId} onChange={setSiteId} />
-          </Field>
+          {own.customer && (
+            <Field label="Customer">
+              <CustomerPicker value={customerId} onChange={setCustomerId} />
+            </Field>
+          )}
+          {own.site && (
+            <Field label="Site">
+              <SitePicker value={siteId} onChange={setSiteId} />
+            </Field>
+          )}
         </div>
         {error && (
           <FormError className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
@@ -12737,6 +12759,7 @@ function EditSpaceModalForm({
 }: EditSpaceModalProps) {
   // The dialog opens for a holder of write on this one space, but the server
   // asks delete over every IP space (no id), so a grant on one space is not enough.
+  const own = useOwnershipModules();
   const { can } = usePermissions();
   const canDeleteSpace = can("delete", "ip_space");
   const canReadVrfs = can("read", "vrf");
@@ -13081,13 +13104,15 @@ function EditSpaceModalForm({
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
-          <Field label="Customer" hint="Logical owner of this space.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Logical owner of this space.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
           <div className="border-t pt-4">
             <DoNotProbeSection
               enabled={doNotProbe}
@@ -13232,6 +13257,7 @@ export function CreateBlockModal({
   defaultParentBlockId?: string;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [network, setNetwork] = useState("");
   const [name, setName] = useState("");
@@ -13516,20 +13542,24 @@ export function CreateBlockModal({
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
-          <Field label="Customer" hint="Logical owner of this block.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
-          <Field label="Site" hint="Physical location of this block.">
-            <SitePicker
-              className={inputCls}
-              value={siteId}
-              onChange={setSiteId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Logical owner of this block.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
+          {own.site && (
+            <Field label="Site" hint="Physical location of this block.">
+              <SitePicker
+                className={inputCls}
+                value={siteId}
+                onChange={setSiteId}
+              />
+            </Field>
+          )}
         </div>
       )}
 
@@ -13600,6 +13630,7 @@ function EditBlockModalForm({
 }: EditBlockModalProps) {
   // The dialog opens for a holder of write on this one block, but the server
   // asks delete over every IP block (no id), so a grant on one block is not enough.
+  const own = useOwnershipModules();
   const canDeleteBlock = usePermissions().can("delete", "ip_block");
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
@@ -14003,20 +14034,24 @@ function EditBlockModalForm({
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
-          <Field label="Customer" hint="Logical owner of this block.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
-          <Field label="Site" hint="Physical location of this block.">
-            <SitePicker
-              className={inputCls}
-              value={siteId}
-              onChange={setSiteId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Logical owner of this block.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
+          {own.site && (
+            <Field label="Site" hint="Physical location of this block.">
+              <SitePicker
+                className={inputCls}
+                value={siteId}
+                onChange={setSiteId}
+              />
+            </Field>
+          )}
           <div className="border-t pt-4">
             <DoNotProbeSection
               enabled={doNotProbe}
