@@ -34,6 +34,7 @@ import ipaddress
 import os
 import re
 import shlex
+import socket
 import tempfile
 import time
 import uuid
@@ -133,6 +134,37 @@ _HOSTNAME_RE: Final = re.compile(
 )
 
 
+_BLOCKED_TARGET_MESSAGE = (
+    "target is in a blocked range (loopback / link-local / cloud-metadata) " "and cannot be scanned"
+)
+
+
+def _blocked_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    from app.services.nettools.schemas import _BLOCKED_NETWORKS
+
+    return _BLOCKED_NETWORKS
+
+
+def _refuse_blocked(value: str) -> None:
+    from app.services.nettools.schemas import is_blocked_target
+
+    if is_blocked_target(value):
+        raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
+
+
+def _refuse_resolved_blocked(host: str) -> None:
+    """Refuse a hostname any of whose addresses is in a blocked range. A name
+    that does not resolve is left for nmap to report."""
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return
+    for info in infos:
+        addr = info[4][0]
+        if isinstance(addr, str):
+            _refuse_blocked(addr.split("%", 1)[0])
+
+
 def _validate_target(target: str) -> str:
     """Accept a literal IPv4/IPv6 address, a CIDR range, or a hostname / FQDN.
 
@@ -156,9 +188,11 @@ def _validate_target(target: str) -> str:
         raise NmapArgError("target is required")
     try:
         addr = ipaddress.ip_address(target)
-        return str(addr)
     except ValueError:
         pass
+    else:
+        _refuse_blocked(target)
+        return str(addr)
     if "/" in target:
         try:
             net = ipaddress.ip_network(target, strict=False)
@@ -169,8 +203,14 @@ def _validate_target(target: str) -> str:
                 f"CIDR is too large ({net.num_addresses} hosts) — limit is "
                 f"{MAX_CIDR_HOST_COUNT} (≤ /{net.max_prefixlen - MAX_CIDR_HOST_BITS} for IPv4)"
             )
+        _refuse_blocked(str(net.network_address))
+        _refuse_blocked(str(net.broadcast_address))
+        if any(blocked.overlaps(net) for blocked in _blocked_networks()):
+            raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
         return str(net)
     if _HOSTNAME_RE.match(target):
+        _refuse_blocked(target)
+        _refuse_resolved_blocked(target)
         return target
     raise NmapArgError(
         f"target must be a valid IPv4/IPv6 address, CIDR, or hostname (got {target!r})"

@@ -131,7 +131,7 @@ class ListAlertsArgs(BaseModel):
 
 @register_tool(
     name="list_alerts",
-    permission="authenticated",
+    permission=("read", "alert"),
     description=(
         "List alert events. Defaults to open (unresolved) alerts; "
         "set ``open_only=False`` for historical alerts. Each event "
@@ -177,7 +177,7 @@ class ListAlertRulesArgs(BaseModel):
 
 @register_tool(
     name="list_alert_rules",
-    permission="authenticated",
+    permission=("read", "alert"),
     description=(
         "List configured alert rules. Each summary includes name, "
         "rule type, enabled flag, and key thresholds."

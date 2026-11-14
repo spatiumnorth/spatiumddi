@@ -587,7 +587,7 @@ async def list_erls(
         (
             await db.execute(
                 _apply_erl_filters(select(EmergencyResponseLocation), **filters)
-                .order_by(EmergencyResponseLocation.name.asc())
+                .order_by(EmergencyResponseLocation.name.asc(), EmergencyResponseLocation.id)
                 .limit(limit)
                 .offset(offset)
             )
@@ -799,7 +799,9 @@ async def list_bindings(
     )
     rows = (
         await db.execute(
-            stmt.order_by(ordering.asc(), EmergencyResponseLocation.name.asc())
+            stmt.order_by(
+                ordering.asc(), EmergencyResponseLocation.name.asc(), EmergencyResponseLocation.id
+            )
             .limit(limit)
             .offset(offset)
         )

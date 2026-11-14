@@ -3296,6 +3296,16 @@ class CreateDNSZoneArgs(BaseModel):
             "defaults to ``forward``."
         ),
     )
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_fqdn(cls, v: str) -> str:
+        # Same rule as the REST zone create (#597): validated, IDNA-normalised,
+        # lower-cased, with the trailing root dot the storage convention uses.
+        if not v.strip():
+            return v  # the preview reports a missing name in its own words
+        return validate_fqdn(v, field="zone name") + "."
+
     primary_ns: str = Field(
         default="",
         description="Primary nameserver FQDN (e.g. ``ns1.example.com.``). Recommended.",
@@ -5812,6 +5822,14 @@ class AllowlistMacArgs(BaseModel):
     )
     note: str = Field(default="", description="Why this MAC/vendor is trusted")
 
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str | None) -> str | None:
+        # Same canonical form (and refusal of a malformed one) as the REST route.
+        from app.api.v1.dhcp._mac import canonicalize_mac  # noqa: PLC0415
+
+        return None if v is None else canonicalize_mac(v)
+
 
 async def _preview_allowlist_mac(
     db: AsyncSession, user: User, args: AllowlistMacArgs
@@ -5892,6 +5910,13 @@ class BlockMacArgs(BaseModel):
     )
     reason: str = Field(default="other", description="Block reason code")
     description: str = Field(default="", description="Free-form note")
+
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str) -> str:
+        from app.api.v1.dhcp._mac import canonicalize_mac  # noqa: PLC0415
+
+        return canonicalize_mac(v)
 
 
 async def _block_target_groups(db: AsyncSession, args: BlockMacArgs) -> list[UUID]:
