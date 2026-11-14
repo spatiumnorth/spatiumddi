@@ -13,13 +13,14 @@ No outbound connection of any kind is made here or anywhere in the feature.
 from __future__ import annotations
 
 import ipaddress
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1.appliance.firewall import WebUIAccessResponse
 from app.config import settings
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin, user_has_permission
@@ -36,7 +37,7 @@ from app.services.web_exposure.classify import (
     parse_networks,
 )
 from app.services.web_exposure.config import WebExposureConfig, config_from_row
-from app.services.web_exposure.verdict import build_verdict, deployment_shape
+from app.services.web_exposure.verdict import Verdict, build_verdict, deployment_shape
 
 router = APIRouter()
 
@@ -76,10 +77,72 @@ def _audit(
     )
 
 
+class BucketRowOut(BaseModel):
+    bucket: str
+    requests: int
+    signals: dict[str, int]
+    first_seen: str | None
+    last_seen: str | None
+    endpoints: list[str]
+    addresses: list[str] | None
+    login_page: int
+    other_api: int
+    login_failures: int
+
+
+class VerdictOut(BaseModel):
+    verdict: Verdict
+    severity: Literal["info", "warning", "critical"] | None
+    window_hours: int
+    threshold: int
+    distinct_external_buckets: int
+    since: str | None
+    totals: dict[str, int]
+    distinct_usernames: int
+    attack_evidence: bool
+    intentional: bool
+    attribution_warning: bool
+    deployment_shape: str
+    fix_hint: str
+    summary: str
+    buckets: list[BucketRowOut]
+
+
+class WebExposureContext(BaseModel):
+    caller_ip: str | None
+    caller_class: str
+    caller_bucket: str | None
+    deployment_shape: str
+    appliance: bool
+    break_glass_active: bool
+    superadmins_without_totp: list[str]
+    #: Active bans; None when Redis is unreachable.
+    bans: list[dict[str, Any]] | None
+    bans_available: bool
+    private_ranges: list[str]
+
+
+class WebExposureConfigResponse(WebExposureContext):
+    config: WebExposureConfig
+
+
+class WebExposureConfigSaved(WebExposureConfigResponse):
+    warnings: list[str]
+
+
+class BansResponse(BaseModel):
+    available: bool
+    bans: list[dict[str, Any]]
+
+
+class BansClearedResponse(BaseModel):
+    cleared: int
+
+
 # ── Verdict ─────────────────────────────────────────────────────────
 
 
-@router.get("/verdict")
+@router.get("/verdict", response_model=VerdictOut)
 async def get_verdict(db: DB, current_user: CurrentUser) -> dict[str, Any]:
     """The verdict with its evidence. Counts for everyone signed in; the
     per-network rows for callers who may read the audit log or users; exact
@@ -140,14 +203,14 @@ async def _context(request: Request, db: DB, cfg: WebExposureConfig) -> dict[str
     }
 
 
-@router.get("/config")
+@router.get("/config", response_model=WebExposureConfigResponse)
 async def get_config(request: Request, db: DB, current_user: SuperAdmin) -> dict[str, Any]:
     row = await db.get(PlatformSettings, 1)
     cfg = config_from_row(row.web_exposure if row else None)
     return {"config": cfg.model_dump(), **await _context(request, db, cfg)}
 
 
-@router.put("/config")
+@router.put("/config", response_model=WebExposureConfigSaved)
 async def put_config(
     body: WebExposureConfig, request: Request, db: DB, current_user: SuperAdmin
 ) -> dict[str, Any]:
@@ -203,7 +266,7 @@ async def put_config(
     return {"config": body.model_dump(), "warnings": warnings, **await _context(request, db, body)}
 
 
-@router.post("/trusted-networks")
+@router.post("/trusted-networks", response_model=WebExposureConfigResponse)
 async def add_trusted_network(
     body: TrustedNetworkRequest, request: Request, db: DB, current_user: SuperAdmin
 ) -> dict[str, Any]:
@@ -240,13 +303,13 @@ async def add_trusted_network(
 # ── Bans (tier 1b) ──────────────────────────────────────────────────
 
 
-@router.get("/bans")
+@router.get("/bans", response_model=BansResponse)
 async def list_bans(db: DB, current_user: SuperAdmin) -> dict[str, Any]:
     bans = await mitigations.list_bans()
     return {"available": bans is not None, "bans": bans or []}
 
 
-@router.delete("/bans")
+@router.delete("/bans", response_model=BansClearedResponse)
 async def clear_bans(db: DB, current_user: SuperAdmin, bucket: str | None = None) -> dict[str, Any]:
     """Clear one ban (``?bucket=203.0.113.0/24``) or all of them."""
     if bucket is not None:
@@ -279,10 +342,10 @@ class ApplyAllowListRequest(BaseModel):
     acknowledge_console_only: bool = False
 
 
-@router.post("/apply-web-ui-allow-list")
+@router.post("/apply-web-ui-allow-list", response_model=WebUIAccessResponse)
 async def apply_web_ui_allow_list(
     body: ApplyAllowListRequest, request: Request, db: DB, current_user: SuperAdmin
-) -> dict[str, Any]:
+) -> WebUIAccessResponse:
     """Tier 3a, appliance only: write the trusted networks plus private space
     (CGNAT and ULA included) into ``web_ui_allowed_cidrs`` via the existing
     Web UI access endpoint, so its lock-out guards (your own address must be
@@ -324,4 +387,4 @@ async def apply_web_ui_allow_list(
         )
     )
     await db.commit()
-    return res.model_dump()
+    return res
