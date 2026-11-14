@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.task_lock import single_flight
 from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
@@ -172,6 +173,7 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
     retry_backoff=True,
     retry_kwargs={"max_retries": 3},
 )
+@single_flight(lambda subnet_id_str: subnet_id_str)
 def run_subnet_discovery(self: Any, subnet_id_str: str) -> dict[str, Any]:  # noqa: ARG001
     """Sweep one subnet + reconcile. Invoked on-demand and by the beat
     dispatcher."""
