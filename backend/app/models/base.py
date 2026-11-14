@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -65,3 +65,26 @@ class SoftDeleteMixin:
         nullable=True,
         index=True,
     )
+
+
+class LockMixin:
+    """Resource lock state (#3361): freeze a row against edit and/or delete.
+
+    One set of columns on every lockable model rather than a polymorphic lock
+    table: the enforcement point already holds the row it is about to write,
+    so reading the lock costs nothing and needs no join; every read model gets
+    the state from the ORM object it is built from; and a backup / restore
+    carries it with the table. ``lock_level`` is NULL for an unlocked row.
+    ``lock_expires_at`` is the hook for #63's change-window lock: the same
+    columns hold a lock that lapses by itself, and
+    :func:`app.services.locks.active_lock` treats an expired lock as absent.
+
+    ``locked_by`` is a username snapshot, not a foreign key: the lock has to
+    keep naming who set it after that account is deleted.
+    """
+
+    lock_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

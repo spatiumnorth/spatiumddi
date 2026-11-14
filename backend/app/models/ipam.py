@@ -20,7 +20,13 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.base import (
+    Base,
+    LockMixin,
+    SoftDeleteMixin,
+    TimestampMixin,
+    UUIDPrimaryKeyMixin,
+)
 
 # Valid IPAddress.status values. Operator-settable values cover the
 # manual lifecycle (free → allocated → reserved → deprecated, plus the
@@ -123,7 +129,7 @@ TLS_SERVING_ROLES: frozenset[str] = frozenset({"web", "api", "lb"})
 SUBNET_ROLES: frozenset[str] = frozenset({"data", "voice", "management", "guest"})
 
 
-class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """VRF / isolated routing domain. IPs in different spaces may overlap."""
 
     __tablename__ = "ip_space"
@@ -264,7 +270,7 @@ class RouterZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subnets: Mapped[list["Subnet"]] = relationship("Subnet", back_populates="router_zone")
 
 
-class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """
     Aggregate/supernet range for organizational grouping.
     IPs are not directly assigned to blocks — only to subnets.
@@ -513,7 +519,7 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     subnets: Mapped[list["Subnet"]] = relationship("Subnet", back_populates="block")
 
 
-class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """Primary managed unit. Routable network; IPs are allocated here."""
 
     __tablename__ = "subnet"
@@ -997,7 +1003,7 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
 
 
-class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, LockMixin, Base):
     """Individual IP address within a subnet."""
 
     __tablename__ = "ip_address"

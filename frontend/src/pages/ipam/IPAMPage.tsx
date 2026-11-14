@@ -163,6 +163,7 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { LockBadge, LockControl } from "@/components/LockControl";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
 import { FilterModePicker } from "@/components/ui/filter-mode-picker";
@@ -5993,6 +5994,17 @@ export function SubnetDetail({
               resourceId={subnet.id}
               label={subnet.network}
             />
+            <LockControl
+              type="subnet"
+              resource={subnet}
+              label={subnet.network}
+              showBadge={false}
+              integrationOwned={!!subnet.integration_owner}
+              onChanged={() => {
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+                qc.invalidateQueries({ queryKey: ["subnet", subnet.id] });
+              }}
+            />
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSubnet(true)}
@@ -6017,6 +6029,7 @@ export function SubnetDetail({
             {subnet.network}
           </span>
           <StatusBadge status={subnet.status} />
+          <LockBadge resource={subnet} />
           {subnet.kind === "multicast" && (
             <span
               className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider bg-violet-100 text-violet-700 dark:bg-violet-950/30 dark:text-violet-400"

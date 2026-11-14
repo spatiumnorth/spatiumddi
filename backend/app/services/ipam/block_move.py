@@ -471,6 +471,11 @@ async def commit_move(
     only ``flush`` so the audit-log row written by the router lands
     in the same transaction.
     """
+    from app.services import locks as lock_svc  # noqa: PLC0415
+
+    # #3361 — a moved block takes its subtree with it: refused when the block
+    # or anything under it is edit-locked.
+    await lock_svc.assert_tree_editable(db, "ip_block", moved_block)
     if confirmation_cidr.strip() != str(moved_block.network):
         raise BlockMoveError(
             f"Confirmation CIDR '{confirmation_cidr}' does not match block "

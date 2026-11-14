@@ -32,6 +32,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `delete` | DELETE                                                     |
 | `admin`  | All of `read`, `write`, `delete` for the given resource    |
 | `approve` | The second-person decision on a queued change request — only meaningful on `change_request`. Does not imply `read`, and `admin` does not imply it |
+| `lock` | Set or clear an edit / delete lock on an IPAM, DNS or DHCP object (#3361) — meaningful on `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group` (also covers views), `dns_zone`, `dns_record`, `dhcp_scope`, `dhcp_static`. Separate from `write`: neither `write` nor `admin` implies it, so the people who edit an object are not automatically the people who can lift its freeze. A `*` grant (superadmin) always can; a reason is required to lock and to unlock, and both are audited |
 | `*`      | Wildcard — match any action                                |
 
 ### Resource types

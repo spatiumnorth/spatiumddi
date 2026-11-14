@@ -1175,6 +1175,33 @@ Implementation: `SubnetDomain` junction table; `IPAddress.domain_id` (FK → DNS
 
 ---
 
+### Locks (#3361)
+
+Any IP space, block, subnet or address can be **locked**, which is how a change freeze or an audit hold is
+written down on the object instead of in a wiki page. A lock has a level, a
+required reason, who set it and when, and optionally an expiry (the hook the
+change-window lock of #63 builds on; an expired lock is no lock).
+
+| Level | Effect |
+| --- | --- |
+| `delete` | The object can still be edited, but not deleted, and no parent delete that would remove it goes through. |
+| `edit` | Implies `delete`. Freezes the **operative** fields; annotations (description, tags, custom fields, owner, colour) stay editable. A locked object cannot be renamed, moved or have its type changed. |
+
+Refusals are `423 Locked` with `code: "resource_locked"`; the body names the
+object, the level, who locked it and why. A parent delete (or split, merge,
+move) that would take a locked object with it is refused with the first five
+locked descendants named. Bulk edits and deletes skip the locked rows and list
+each one in the response (`skipped_locked` / `locked`); importers leave a locked
+row as it is and report it under `skipped`. An IPAM change that the IPAM→DNS sync would carry into a locked DNS record (a hostname or zone change, a delete) is refused, naming the record; the scheduled auto-sync and DDNS skip such an address and log it instead of failing a batch.
+
+Lock and unlock with `PUT /api/v1/locks/{resource_type}/{id}` and
+`POST /api/v1/locks/{resource_type}/{id}/unlock` (a reason in both bodies);
+`GET /api/v1/locks` lists what is locked. Both need `lock` on the type
+([PERMISSIONS.md](../PERMISSIONS.md)). Integration-owned rows (an integration
+mirror, a dynamic-lease mirror) cannot be locked: the integration would
+overwrite them. The Copilot has `find_locked_resources`, and its delete
+proposals are refused on a locked target; it has no way to unlock.
+
 ## 12. MAC Address / OUI Vendor Lookup
 
 **Opt-in feature** — configured in Settings → IPAM → OUI Vendor Lookup. Off by default. When enabled, SpatiumDDI maintains a local copy of the IEEE OUI database to display vendor names next to MAC addresses in all IP and DHCP lease tables.

@@ -39,7 +39,13 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.base import (
+    Base,
+    LockMixin,
+    SoftDeleteMixin,
+    TimestampMixin,
+    UUIDPrimaryKeyMixin,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.models.dhcp_device_policy import DHCPDevicePolicy
@@ -610,7 +616,7 @@ class DHCPServerScopeState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 # ── Scope / Pool / Static / Client Class ─────────────────────────────────────
 
 
-class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """A DHCP scope — one subnet served by one group.
 
     Under the group-centric model, a scope belongs to a DHCPServerGroup,
@@ -914,7 +920,7 @@ class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="pools")
 
 
-class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, LockMixin, Base):
     """A DHCP reservation (MAC → IP) within a scope.
 
     The scope is part of the reservation's identity — uniqueness is keyed on

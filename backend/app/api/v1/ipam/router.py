@@ -67,6 +67,7 @@ from app.models.ipam import (
 )
 from app.models.settings import PlatformSettings
 from app.models.vlans import VLAN
+from app.services import locks as lock_svc
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import (
     DeleteBlockArgs,
@@ -3066,6 +3067,29 @@ async def _sync_dns_record(
     from app.services.lock_order import lock_zones_for_sync  # noqa: PLC0415
 
     await lock_zones_for_sync(db, ip, subnet, zone_id=zone_id, action=action)
+    # #3361 — never rewrite or remove an edit-locked DNS record. A request path
+    # (``strict``) is refused naming the record; a background path (DDNS, the
+    # scheduled sync, importers, discovery) skips this address and logs, so one
+    # locked record fails no lease and no batch.
+    locked_records = await lock_svc.sync_blocked_by_locked_records(db, ip, action)
+    if locked_records:
+        if strict:
+            raise lock_svc.cascade_refusal(
+                "ip_address",
+                ip,
+                locked_records,
+                "deleted" if action == "delete" else "changed",
+                "the DNS sync would "
+                + ("remove" if action == "delete" else "rewrite")
+                + " the locked DNS record(s)",
+            )
+        ip._dns_skip_reason = "a DNS record it publishes is locked"  # type: ignore[attr-defined]
+        logger.warning(
+            "ipam_dns_sync_skipped_locked_record",
+            address=str(ip.address),
+            records=[c.display for c in locked_records],
+        )
+        return False
     if action == "delete":
         result = await db.execute(
             select(DNSRecord)
@@ -4088,7 +4112,7 @@ class IPSpaceUpdate(BaseModel):
         return check_group_uuid_list(v)
 
 
-class IPSpaceResponse(BaseModel):
+class IPSpaceResponse(lock_svc.LockState):
     id: uuid.UUID
     name: str
     description: str
@@ -4239,7 +4263,7 @@ class IPBlockUpdate(BaseModel):
         return check_group_uuid_list(v)
 
 
-class IPBlockResponse(BaseModel):
+class IPBlockResponse(lock_svc.LockState):
     id: uuid.UUID
     space_id: uuid.UUID
     parent_block_id: uuid.UUID | None
@@ -4636,7 +4660,7 @@ class SubnetVLANRef(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class SubnetResponse(BaseModel):
+class SubnetResponse(lock_svc.LockState):
     id: uuid.UUID
     space_id: uuid.UUID
     # Nullable because the DB column is ``NULL``-able even though the ORM
@@ -5036,7 +5060,7 @@ class IPAddressUpdate(BaseModel):
         return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
-class IPAddressResponse(BaseModel):
+class IPAddressResponse(lock_svc.LockState):
     id: uuid.UUID
     subnet_id: uuid.UUID
     address: str
@@ -5330,6 +5354,9 @@ async def update_space(
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+    lock_svc.assert_editable(  # #3361
+        "ip_space", space, body.model_dump(exclude_unset=True), _SPACE_NULL_IS_NOOP
+    )
     _assert_scoped_item_bindings(
         current_user, "ip_space", body, space, _SPACE_BINDING_FIELDS, _SPACE_NULL_IS_NOOP
     )
@@ -5817,6 +5844,9 @@ async def update_block(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    lock_svc.assert_editable(  # #3361
+        "ip_block", block, body.model_dump(exclude_unset=True), _BLOCK_NULL_IS_NOOP
+    )
     _assert_scoped_item_bindings(
         current_user, "ip_block", body, block, _BLOCK_BINDING_FIELDS, _BLOCK_NULL_IS_NOOP
     )
@@ -7538,6 +7568,9 @@ class StaleIPDeprecateResponse(BaseModel):
     batch_id: uuid.UUID
     deprecated_count: int
     skipped: list[uuid.UUID] = []
+    # Rows skipped because an edit lock freezes their status (#3361); each also
+    # appears in ``skipped``.
+    locked: list[dict[str, Any]] = []
     # True when ``all_matching`` hit the server-side cap — the operator
     # should re-run to sweep the remainder.
     capped: bool = False
@@ -7622,9 +7655,16 @@ async def deprecate_stale_ips(
     )
     deprecated = 0
     skipped: list[uuid.UUID] = []
+    deprecate_locked: list[dict[str, Any]] = []
     for ip in rows:
         if ip.status != "allocated" or ip.auto_from_lease:
             skipped.append(ip.id)
+            continue
+        # #3361 — a stale address under an edit lock keeps its status.
+        locked_hit = lock_svc.skip_edit("ip_address", ip, {"status": "deprecated"})
+        if locked_hit is not None:
+            skipped.append(ip.id)
+            deprecate_locked.append(locked_hit.as_dict())
             continue
         if scoped_subnets is not None and ip.subnet_id not in scoped_subnets:
             skipped.append(ip.id)
@@ -7678,6 +7718,7 @@ async def deprecate_stale_ips(
         batch_id=batch_id,
         deprecated_count=deprecated,
         skipped=skipped,
+        locked=deprecate_locked,
         capped=capped,
     )
 
@@ -7839,6 +7880,13 @@ async def update_subnet(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # #3361 — an edit lock freezes the operative fields (CIDR, block, gateway,
+    # zone / DHCP bindings, ...); a null block_id leaves the parent alone.
+    lock_svc.assert_editable(
+        "subnet",
+        subnet,
+        {k: v for k, v in body.model_dump(exclude_unset=True).items() if k != "block_id" or v},
+    )
     # GHSA-875w — rebinding the subnet's zones would make every later address
     # write publish there: a zone it names must be one the token may write
     # (its current effective zones pass, so a re-save is not refused).
@@ -9563,7 +9611,7 @@ async def _apply_dns_sync(
                     else:
                         updated += 1
                 except HTTPException as exc:
-                    errors.append(f"{ip.address}: {exc.detail}")
+                    errors.append(f"{ip.address}: {lock_svc.refusal_message(exc)}")
                 except Exception as exc:
                     errors.append(f"{ip.address}: {exc}")
         # #1536 — a batched agentless op that came back ``failed`` was
@@ -9616,6 +9664,18 @@ async def _apply_dns_sync(
         )
 
         stale_records = [r for r in stale_records if not dns_record_owned_elsewhere(r)]
+
+        # #3361 — a locked record is never removed by a sync: it stays, and the
+        # skip is reported with the sync's other per-row errors.
+        for r in stale_records:
+            if lock_svc.active_lock(r) is not None:
+                skip = lock_svc.skip_delete("dns_record", r)
+                if skip is not None:
+                    errors.append(
+                        f"{r.record_type} {r.name}: left in place, locked ({skip.level})"
+                        f" by {skip.locked_by}: {skip.reason}"
+                    )
+        stale_records = [r for r in stale_records if lock_svc.active_lock(r) is None]
 
         # Group by zone so each zone's primary server gets a single
         # batched driver call (critical for agentless Windows DNS — one
@@ -10864,6 +10924,16 @@ async def update_address(
             detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
 
+    # #3361 — an edit lock freezes the address's operative fields, and a change
+    # the DNS sync would carry into a locked DNS record is refused naming it.
+    lock_changes = {
+        ("forward_zone_id" if k == "dns_zone_id" else k): v
+        for k, v in body.model_dump(exclude_unset=True).items()
+    }
+    lock_svc.assert_editable("ip_address", ip, lock_changes)
+    await lock_svc.assert_dns_sync_unlocked(db, ip, lock_changes)
+    await lock_svc.assert_static_sync_unlocked(db, ip, lock_changes)
+
     # MAC required if transitioning to static_dhcp. An explicit
     # ``mac_address: null`` is a *clear*, not "unchanged" (#1629 walk):
     # the Edit dialog sends null for a blanked MAC, and treating it as
@@ -11524,6 +11594,8 @@ async def delete_address(
     # Removing the row takes a delete grant that covers THIS address: delete
     # on its subnet, or on an address set containing it.
     await _require_ip_deletable(db, current_user, ip)
+    # #3361 — a locked address, or one whose DNS records are locked, stays.
+    await lock_svc.assert_tree_deletable(db, "ip_address", ip)
 
     subnet = await db.get(Subnet, ip.subnet_id)
 
@@ -11608,8 +11680,11 @@ async def purge_orphans(
     body: PurgeOrphansRequest,
     current_user: CurrentUser,
     db: DB,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Permanently delete the given orphan IPs in this subnet.
+
+    A locked orphan (or one whose DNS record is locked) is skipped and reported
+    under ``skipped_locked``, present only when something was skipped (#3361).
 
     The router gate requires ``delete`` here, as for a permanent single-row
     ``DELETE /addresses/{id}`` (``MULTI_ROW_DELETE_SUFFIXES``); the ``write`` on
@@ -11634,6 +11709,15 @@ async def purge_orphans(
         )
     )
     rows = list(res.scalars().all())
+    purge_skipped_locked: list[dict[str, Any]] = []
+    unlocked_rows: list[IPAddress] = []
+    for ip in rows:
+        locked_hit = await lock_svc.skip_delete_tree(db, "ip_address", ip)
+        if locked_hit is None:
+            unlocked_rows.append(ip)
+        else:
+            purge_skipped_locked.append(locked_hit.as_dict())
+    rows = unlocked_rows
     await refuse_if_e911_bound(db, "these orphan addresses", ip_ids=[ip.id for ip in rows])  # #3891
     # Gather any lingering DHCP reservations across all orphan IPs in one
     # query, then push-delete them in one batched WinRM round trip per
@@ -11674,7 +11758,10 @@ async def purge_orphans(
     await _update_utilization(db, subnet_id)
     await _update_block_utilization(db, subnet.block_id)
     await db.commit()
-    return {"purged": len(rows)}
+    out: dict[str, Any] = {"purged": len(rows)}
+    if purge_skipped_locked:
+        out["skipped_locked"] = purge_skipped_locked
+    return out
 
 
 # ── Bulk allocate (subnet-level) ─────────────────────────────────────────────
@@ -12812,6 +12899,9 @@ class SubnetBulkEditResponse(BaseModel):
     batch_id: uuid.UUID
     updated_count: int
     not_found: list[uuid.UUID] = []
+    # Subnets left unchanged because an edit lock freezes a field the batch
+    # changes (#3361): one entry per subnet, naming the lock.
+    skipped_locked: list[dict[str, Any]] = []
 
 
 @router.post("/subnets/bulk-edit", response_model=SubnetBulkEditResponse)
@@ -12847,11 +12937,16 @@ async def bulk_edit_subnets(
     batch_id = uuid.uuid4()
     updated = 0
     not_found: list[uuid.UUID] = []
+    skipped_locked: list[dict[str, Any]] = []
 
     for sid in body.subnet_ids:
         subnet = await db.get(Subnet, sid)
         if subnet is None:
             not_found.append(sid)
+            continue
+        locked_hit = lock_svc.skip_edit("subnet", subnet, changes)  # #3361
+        if locked_hit is not None:
+            skipped_locked.append(locked_hit.as_dict())
             continue
 
         old = {k: getattr(subnet, k, None) for k in changes.keys()}
@@ -12880,7 +12975,12 @@ async def bulk_edit_subnets(
         updated=updated,
         not_found=len(not_found),
     )
-    return SubnetBulkEditResponse(batch_id=batch_id, updated_count=updated, not_found=not_found)
+    return SubnetBulkEditResponse(
+        batch_id=batch_id,
+        updated_count=updated,
+        not_found=not_found,
+        skipped_locked=skipped_locked,
+    )
 
 
 # ── Effective fields (tags + custom_fields inheritance, §11) ──────────────────
@@ -13101,6 +13201,9 @@ class IPAddressBulkDeleteResponse(BaseModel):
     # reservation refusal and a missing delete grant (#3636) are itemised;
     # other skips keep the generic meaning documented above.
     skipped_reasons: dict[str, str] = {}
+    # Rows skipped because they (or a DNS record the delete would remove) are
+    # locked (#3361); each also appears in ``skipped`` / ``skipped_reasons``.
+    locked: list[dict[str, Any]] = []
 
 
 @router.post("/addresses/bulk-delete", response_model=IPAddressBulkDeleteResponse)
@@ -13135,6 +13238,7 @@ async def bulk_delete_addresses(
     deleted = 0
     skipped: list[uuid.UUID] = []
     skipped_reasons: dict[str, str] = {}
+    locked: list[dict[str, Any]] = []
     subnets_touched: set[uuid.UUID] = set()
     # Address-set write delegation (#103): resolve writable ranges once per
     # distinct subnet so a per-IP check is cheap.
@@ -13192,6 +13296,16 @@ async def bulk_delete_addresses(
             continue
         if not body.permanent and ip.status == "orphan":
             skipped.append(ip.id)
+            continue
+        # #3361 — a locked address, or one whose generated DNS record is
+        # locked, is skipped and reported.
+        locked_hit = await lock_svc.skip_delete_tree(db, "ip_address", ip)
+        if locked_hit is not None:
+            skipped.append(ip.id)
+            skipped_reasons[str(ip.id)] = (
+                f"Locked ({locked_hit.level}) by {locked_hit.locked_by}: {locked_hit.reason}"
+            )
+            locked.append(locked_hit.as_dict())
             continue
         # Resource-scoped token (#374): skip IPs outside the token's bound
         # subnet so a subnet-scoped token can't bulk-delete across subnets.
@@ -13306,6 +13420,7 @@ async def bulk_delete_addresses(
         not_found=not_found,
         skipped=skipped,
         skipped_reasons=skipped_reasons,
+        locked=locked,
     )
 
 
@@ -13362,6 +13477,9 @@ class IPAddressBulkEditResponse(BaseModel):
     updated_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
+    # Rows skipped because an edit lock freezes a field the batch changes, or
+    # the DNS sync would rewrite a locked record (#3361); also in ``skipped``.
+    locked: list[dict[str, Any]] = []
     # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
     # removed. An updated address absent from it had none to remove (#2172).
     dns_cleared: list[uuid.UUID] = []
@@ -13410,6 +13528,7 @@ async def bulk_edit_addresses(
     not_found = [i for i in body.ip_ids if i not in found_ids]
     updated = 0
     skipped: list[uuid.UUID] = []
+    locked: list[dict[str, Any]] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
     # Addresses whose DNS records a zone clear removed (#2172).
@@ -13471,6 +13590,28 @@ async def bulk_edit_addresses(
             # blocks these from being selected; this is defence-in-depth.
             if ip.auto_from_lease:
                 skipped.append(ip.id)
+                continue
+            # #3361 — skip (and report) a row an edit lock freezes against this
+            # change set, or whose generated DNS record the sync would rewrite.
+            lock_change = dict(scalar_changes)
+            if apply_zone:
+                lock_change["forward_zone_id"] = new_zone_id
+            locked_hit = lock_svc.skip_edit("ip_address", ip, lock_change)
+            if locked_hit is None:
+                try:
+                    await lock_svc.assert_dns_sync_unlocked(db, ip, lock_change)
+                except HTTPException as exc:
+                    locked_hit = lock_svc.SkippedLocked(
+                        "ip_address",
+                        ip.id,
+                        str(ip.address),
+                        "edit",
+                        None,
+                        lock_svc.refusal_message(exc),
+                    )
+            if locked_hit is not None:
+                skipped.append(ip.id)
+                locked.append(locked_hit.as_dict())
                 continue
             # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
             # IPs outside its bound subnet.
@@ -13628,6 +13769,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        locked=locked,
         dns_cleared=dns_cleared,
     )
 

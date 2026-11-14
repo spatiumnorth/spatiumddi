@@ -124,6 +124,7 @@ from app.models.dns import (
     dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
+from app.services import locks as lock_svc
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
@@ -675,7 +676,7 @@ class DNSMemoryEstimateResponse(BaseModel):
         )
 
 
-class ServerGroupResponse(BaseModel):
+class ServerGroupResponse(lock_svc.LockState):
     id: uuid.UUID
     name: str
     description: str
@@ -739,6 +740,11 @@ class ServerGroupResponse(BaseModel):
             scope_warnings=list(warnings or []),
             created_at=g.created_at,
             modified_at=g.modified_at,
+            lock_level=g.lock_level,
+            locked_by=g.locked_by,
+            locked_at=g.locked_at,
+            lock_reason=g.lock_reason,
+            lock_expires_at=g.lock_expires_at,
         )
 
 
@@ -1422,7 +1428,7 @@ class ViewUpdate(BaseModel):
     allow_query_cache: list[str] | None = None
 
 
-class ViewResponse(BaseModel):
+class ViewResponse(lock_svc.LockState):
     id: uuid.UUID
     group_id: uuid.UUID
     name: str
@@ -1783,7 +1789,7 @@ class ZoneNameScopeDetail(BaseModel):
     mdns_conflict: bool = False
 
 
-class ZoneResponse(BaseModel):
+class ZoneResponse(lock_svc.LockState):
     id: uuid.UUID
     group_id: uuid.UUID
     view_id: uuid.UUID | None
@@ -1949,7 +1955,7 @@ class RecordUpdate(BaseModel):
         return validate_record_owner(v, field="record name")
 
 
-class RecordResponse(BaseModel):
+class RecordResponse(lock_svc.LockState):
     id: uuid.UUID
     zone_id: uuid.UUID
     view_id: uuid.UUID | None
@@ -2352,6 +2358,7 @@ async def update_group(
             "auto_reverse_zones_at_provider",
         },
     )
+    lock_svc.assert_editable("dns_group", group, changes)  # #3361
     # #1784 — only turning catalog zones ON is refused: turning an
     # unapplied setting OFF is the way out of it, and a re-save of the
     # stored value must keep working.
@@ -2454,6 +2461,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
+    await lock_svc.assert_tree_deletable(db, "dns_group", group)  # #3361
 
     # The ORM-level ``cascade="all, delete-orphan"`` on zones/servers/views will
     # happily wipe a populated group, which is an easy foot-gun — the user can
@@ -2509,6 +2517,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             .all()
         }
     for z in trashed_zones:
+        lock_svc.assert_deletable("dns_zone", z)  # #3361 — a locked zone in Trash stays
         record_count = (
             await db.execute(
                 select(func.count())
@@ -5786,6 +5795,7 @@ async def update_view(
         },
     )
     changes.update(await _validated_view_fields(group_id, body, db))
+    lock_svc.assert_editable("dns_view", view, changes)  # #3361
     before = {k: getattr(view, k, None) for k in changes}
     for k, v in changes.items():
         setattr(view, k, v)
@@ -5843,6 +5853,7 @@ async def delete_view(
     ``acknowledge_blocklist_detach=true`` rather than doing it silently.
     """
     view = await _require_view(group_id, view_id, db)
+    lock_svc.assert_deletable("dns_view", view)  # #3361
     await _assert_view_is_unowned(view, db)
 
     bl_rows = (
@@ -6889,6 +6900,7 @@ async def update_zone(
             "tags",
         },
     )
+    lock_svc.assert_editable("dns_zone", zone, changes)  # #3361
     # Secondary / stub zones need at least one master to render loadable
     # BIND9 config (issue #336). Validate against the *effective* state —
     # the new zone_type/masters from this payload OR what's already on the
@@ -7537,6 +7549,7 @@ async def replace_zone_update_acl(
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — ACL is zone config
     await _lock_acl_and_check_version(db, zone, body.expected_version)
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
@@ -8016,6 +8029,7 @@ async def sign_zone_dnssec(
     immediately.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — DNSSEC state is zone config
     _reject_if_synthesised_zone(zone, "DNSSEC-sign")
     await _check_driver_gated_operation("dnssec_sign", group_id, db)
     zone.dnssec_enabled = True
@@ -8067,6 +8081,7 @@ async def unsign_zone_dnssec(
     resolvers — this endpoint does NOT walk the parent zone for them.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — DNSSEC state is zone config
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
     await _flip_dnssec_off(db, zone)
     db.add(
@@ -8106,6 +8121,7 @@ async def rollover_zone_dnssec_key(
     key set back on its next sync. The zone must already be signed.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    lock_svc.assert_editable("dns_zone", zone, None)  # #3361 — DNSSEC state is zone config
     _reject_if_synthesised_zone(zone, "DNSSEC-rollover")
     if not zone.dnssec_enabled:
         raise HTTPException(status_code=409, detail="Zone is not DNSSEC-signed")
@@ -8308,6 +8324,9 @@ async def move_zone_commit(
     # A reconciler-owned zone is not the operator's to re-home — the next
     # sync would recreate it in the group the integration is bound to.
     _reject_if_synthesised_zone(zone, "move")
+    await lock_svc.assert_tree_editable(
+        db, "dns_zone", zone
+    )  # #3361 — a locked zone cannot be moved
     target_group = await _require_group(body.target_group_id, db)
     # The same serviceability guard every create / update runs, applied to
     # the group the zone is landing in: a forwarders-less forward zone on a
@@ -9923,6 +9942,7 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
+    lock_svc.assert_editable("dns_record", record, changes)  # #3361
     if "value" in changes:
         await _require_superadmin_for_lua(
             db, current_user, [record.record_type], what="change a LUA record's value"
@@ -10120,6 +10140,7 @@ async def delete_record(
         record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
+    lock_svc.assert_deletable("dns_record", record)  # #3361
 
     # Zone + field snapshot captured before the soft-delete stamp so both paths
     # push the provider retraction with the record's pre-delete values.
@@ -10315,6 +10336,20 @@ async def bulk_delete_records(
             _reject_if_synthesised_record(rec, "delete")
         except HTTPException as exc:
             skipped.append({"record_id": str(rid), "reason": str(exc.detail)})
+            continue
+        # #3361 — a locked record is skipped and named, not a failed batch.
+        locked_hit = lock_svc.skip_delete("dns_record", rec)
+        if locked_hit is not None:
+            skipped.append(
+                {
+                    "record_id": str(rid),
+                    "reason": (
+                        f"locked ({locked_hit.level}) by {locked_hit.locked_by}: "
+                        f"{locked_hit.reason}"
+                    ),
+                    "code": "resource_locked",
+                }
+            )
             continue
         targets.append(rec)
 
@@ -10823,7 +10858,9 @@ async def _diff_zone_file(
     # spreadsheet import runs), or it is left out with the reason.
     await _apply_record_rules_to_import(db, zone, diff)
     apply_cname_rule(diff, existing, replace=replace)
-    diff.skipped = unservable + diff.skipped
+    # #3361 — a locked record is left as it is, and named, not a failed import.
+    locked_notes = lock_svc.withhold_locked_from_diff(diff, existing)
+    diff.skipped = unservable + locked_notes + diff.skipped
     return diff
 
 
@@ -11656,6 +11693,8 @@ async def _plan_sheet_import(
         mode=mode,
         validate=_sheet_row_validator(zone, gated, needs_absolute),
     )
+    # #3361 — a locked record is left as it is and reported under ``skipped``.
+    lock_svc.withhold_locked_from_sheet_plan(plan, sheet_io.RowIssue)
     return fmt, plan, {v.id: v.name for v in views}
 
 

@@ -20,6 +20,7 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
+from app.services import locks as lock_svc
 from app.services.dhcp.normalize import norm_duid, norm_ip, norm_mac
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.static_conflicts import check_static_conflicts as _conflict_check
@@ -138,7 +139,7 @@ class StaticUpdate(BaseModel):
         return canonicalize_mac(v) if v is not None else None
 
 
-class StaticResponse(BaseModel):
+class StaticResponse(lock_svc.LockState):
     id: uuid.UUID
     scope_id: uuid.UUID
     ip_address: str
@@ -306,6 +307,7 @@ async def update_static(
     # them through would revert whatever another surface (an IPAM inline
     # edit) stored since.
     changes = {k: v for k, v in changes.items() if not _same_value(k, getattr(st, k), v)}
+    lock_svc.assert_editable("dhcp_static", st, changes)  # #3361
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
@@ -342,6 +344,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Static assignment not found")
+    lock_svc.assert_deletable("dhcp_static", st)  # #3361
     scope = await db.get(DHCPScope, st.scope_id)
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))

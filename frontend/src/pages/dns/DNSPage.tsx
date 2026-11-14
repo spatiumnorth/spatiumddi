@@ -101,6 +101,8 @@ import {
 } from "@/lib/shortcuts";
 import { Pager } from "@/components/ui/pager";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import { LockBadge, LockControl, LockDialog } from "@/components/LockControl";
+import { isDeleteBlockedByLock, lockTitle } from "@/lib/locks";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
@@ -4254,6 +4256,8 @@ export function ZoneDetailView({
   const navigate = useNavigate();
   const [showAddRecord, setShowAddRecord] = useState(false);
   const [editRecord, setEditRecord] = useState<DNSRecord | null>(null);
+  // #3361 — the record whose lock / unlock dialog is open.
+  const [lockRecord, setLockRecord] = useState<DNSRecord | null>(null);
   const [propagationRecord, setPropagationRecord] = useState<DNSRecord | null>(
     null,
   );
@@ -4653,6 +4657,7 @@ export function ZoneDetailView({
               scope={zone.name_scope}
               detail={zone.name_scope_detail}
             />
+            <LockBadge resource={zone} />
             <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
               {zone.zone_type}
             </span>
@@ -4754,6 +4759,14 @@ export function ZoneDetailView({
             kind="dns_zone"
             resourceId={zone.id}
             label={zone.name}
+          />
+          <LockControl
+            type="dns_zone"
+            resource={zone}
+            label={zone.name}
+            showBadge={false}
+            integrationOwned={!!zone.tailscale_tenant_id}
+            onChanged={() => qc.invalidateQueries({ queryKey: ["dns-zones"] })}
           />
           {/* Data ▾ — everything that moves records in or out. A forward
               zone stores no records at all, so this collapses to nothing
@@ -5459,6 +5472,10 @@ export function ZoneDetailView({
                                 {r.name}
                               </button>
                             )}
+                            <LockBadge
+                              resource={r}
+                              className="ml-2 inline-flex items-center gap-1 rounded bg-amber-100 px-1 py-0.5 align-middle text-[10px] font-medium uppercase text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                            />
                           </td>
                           <td className="py-1.5">
                             <span className="inline-flex items-center gap-1.5">
@@ -5621,12 +5638,24 @@ export function ZoneDetailView({
                             <ContextMenuItem
                               destructive
                               onSelect={() => setConfirmDeleteRecord(r)}
-                              {...permissionGate(
-                                canDeleteRecords,
-                                NEEDS_DNS_DELETE,
-                              )}
+                              disabled={isDeleteBlockedByLock(r)}
+                              title={lockTitle(r) ?? undefined}
+                              {...(isDeleteBlockedByLock(r)
+                                ? {}
+                                : permissionGate(
+                                    canDeleteRecords,
+                                    NEEDS_DNS_DELETE,
+                                  ))}
                             >
                               Delete…
+                            </ContextMenuItem>
+                          </>
+                        )}
+                        {can("lock", "dns_record", r.id) && (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem onSelect={() => setLockRecord(r)}>
+                              {r.lock_level ? "Unlock…" : "Lock…"}
                             </ContextMenuItem>
                           </>
                         )}
@@ -5663,6 +5692,19 @@ export function ZoneDetailView({
           zoneName={zone.name}
           record={editRecord}
           onClose={() => setEditRecord(null)}
+        />
+      )}
+      {lockRecord && (
+        <LockDialog
+          type="dns_record"
+          id={lockRecord.id}
+          label={`${lockRecord.name} ${lockRecord.record_type}`}
+          locked={!!lockRecord.lock_level}
+          onClose={() => setLockRecord(null)}
+          onDone={() => {
+            qc.invalidateQueries({ queryKey: ["dns-records"] });
+            qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
+          }}
         />
       )}
       {propagationRecord && (
