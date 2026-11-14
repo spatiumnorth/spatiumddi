@@ -388,6 +388,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # a container with no limit at all. Only overwritten when a heartbeat
     # carries the field. Read by ``services/dns/memory_estimate``.
     memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # #4193 — the agent's actual memory use as last reported on the heartbeat
+    # (``services/agents/memory_status``): container used / peak / limit and the
+    # daemon's and the agent's own RSS, plus ``reported_at``. NULL = never
+    # reported (an older agent, an agentless driver): UNKNOWN, never 0.
+    memory_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # ── #1067 daemon state ──
     #

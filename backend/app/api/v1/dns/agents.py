@@ -72,6 +72,7 @@ from app.services.agents.ingest_receipt import (
     claim_batch,
     duplicate_response,
 )
+from app.services.agents.memory_status import apply_reported_memory
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.ownership import (
@@ -288,6 +289,12 @@ class AgentHeartbeatRequest(BaseModel):
     # the container has none. Absent on an older agent, which leaves the
     # stored value untouched (an explicit null clears it).
     memory_limit_bytes: int | None = Field(default=None, ge=0)
+    # #4193 — the agent's actual memory use: container used / peak / limit and
+    # the daemon's and the agent's RSS. Loose dict at the edge like ``spool``:
+    # ``apply_reported_memory`` validates it and ignores a malformed report
+    # rather than 422-ing the heartbeat. Absent on an older agent, which
+    # leaves the stored report untouched.
+    memory: dict[str, Any] | None = None
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     # Cumulative failed APPLY ATTEMPTS since the agent started, retries
@@ -1365,6 +1372,14 @@ async def agent_heartbeat(
         # #3551 — the container's memory limit, for the group memory estimate.
         if "memory_limit_bytes" in body.model_fields_set:
             server.memory_limit_bytes = body.memory_limit_bytes or None
+        # #4193 — actual memory use, plus a sample for the history.
+        await apply_reported_memory(
+            db,
+            server,
+            body.memory,
+            sample_model=DNSMetricSample,
+            agent_kind="dns",
+        )
         # #1067 — the daemon state. ``body.daemon`` has been declared on this model
         # since it was written and read by nothing: an agent whose ``named`` never
         # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was

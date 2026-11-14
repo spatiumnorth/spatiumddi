@@ -593,6 +593,27 @@ agents run under. It warns; it never refuses a change.
   The fix is one of two things: fewer views drawing on the same lists, or a
   larger memory limit for the DNS pod (§8.0 says where to raise it).
 
+**Actual memory (#4193).** The estimate is a model; the agents also report
+what they really use. Each heartbeat carries an optional `memory` block:
+the container's cgroup usage, peak and limit (`memory.current` /
+`memory.peak` on cgroup v2, `memory.usage_in_bytes` /
+`memory.max_usage_in_bytes` on v1) and the resident set (`VmRSS`) of the
+daemon (`named`, `pdns_server`, Technitium) and of the agent itself. Usage is
+the cgroup's own counter, page cache included, so it can read higher than
+`kubectl top`'s working set. Every field is best effort: an unreadable one is
+left out, and an older agent sends no block at all, which reads as "not
+reported" (`null` / "—"), never 0. The latest report is
+`dns_server.memory_status` (exposed as `memory_status` on the server read
+endpoints and in the Copilot's `find_dns_servers`), and a per-minute sample
+goes into `dns_metric_sample` (`mem_*` columns, same retention as the
+counters; `GET /dns/servers/{id}/memory-history`). The DNS server list shows
+used / limit (amber above 80 %), the server modal shows the breakdown and a
+sparkline, and the Blocking Lists tab sets each server's real `named` RSS
+beside the estimate (`servers` on `GET /dns/groups/{id}/memory-estimate`).
+The DHCP side is the same: `dhcp_server.memory_status`,
+`GET /dhcp/servers/{id}/memory-history`, Kea's RSS summed over `kea-dhcp4`
+and `kea-dhcp6`.
+
 ---
 
 ## 3. DNS Server Options & ACLs

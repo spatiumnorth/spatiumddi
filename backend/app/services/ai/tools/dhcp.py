@@ -52,7 +52,9 @@ class ListDHCPServersArgs(BaseModel):
         "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
         "and DHCPv6 scopes on an HA group are served by each member "
-        "independently, with no lease coordination."
+        "independently, with no lease coordination. ``memory`` is the agent's "
+        "reported container used / peak / limit and Kea / agent RSS in bytes "
+        "(null when the agent has not reported it)."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
@@ -87,6 +89,10 @@ async def list_dhcp_servers(
             # being refused (the one the row's alert and chip read).
             "duplicate_agent": duplicate_agent_active(s),
             "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
+            # #4193 — what the agent actually reports using (container used /
+            # peak / limit, Kea and agent RSS, reported_at); NULL = never
+            # reported, which is unknown, not zero.
+            "memory": s.memory_status,
         }
         for s in rows
     ]

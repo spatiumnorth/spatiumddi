@@ -155,6 +155,7 @@ backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop
 backend/alembic/versions/a3f7c1e84d59_appliance_lldpd_running.py:drop_column:35
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:38
 backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
+backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:52
 backend/alembic/versions/a4040c7e91d3_dns_server_packed_blocklists.py:drop_column:53
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:31
@@ -721,6 +722,8 @@ backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:110
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:111
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_table:113
 backend/alembic/versions/e5a72f14c890_proxmox_infer_vnet_subnets.py:drop_column:38
+backend/alembic/versions/e5b1c7a94d20_agent_memory_status.py:drop_column:39
+backend/alembic/versions/e5b1c7a94d20_agent_memory_status.py:drop_column:41
 backend/alembic/versions/e5b1d47a9c62_ssh_lockdown.py:drop_column:41
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:56
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:57

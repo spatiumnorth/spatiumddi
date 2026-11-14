@@ -65,6 +65,7 @@ import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryCell } from "@/components/AgentMemoryCell";
 import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -6589,6 +6590,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
               </div>
             </div>
             <div className="flex items-center gap-1">
+              <AgentMemoryCell server={s} className="mr-2" />
               {isCloudDriver(s.driver) && (
                 <button
                   type="button"

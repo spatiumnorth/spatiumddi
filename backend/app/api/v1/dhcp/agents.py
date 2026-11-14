@@ -73,6 +73,7 @@ from app.services.agents.instance_ownership import (
     parse_agent_instance,
     refuse_registration,
 )
+from app.services.agents.memory_status import apply_reported_memory
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
@@ -220,6 +221,10 @@ class AgentHeartbeatRequest(BaseModel):
     # than 422-ing the heartbeat. Absent (None) on a pre-#1077 agent, which
     # leaves the stored value untouched.
     spool: dict[str, Any] | None = None
+    # #4193 — the agent's actual memory use (container used / peak / limit, Kea's
+    # and the agent's RSS). Loose dict, validated by ``apply_reported_memory``;
+    # see the DNS heartbeat model. Absent on an older agent.
+    memory: dict[str, Any] | None = None
     # Bound the ACK list so a malformed / hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     failed_ops_count: int = 0
@@ -1280,6 +1285,10 @@ async def _apply_heartbeat_reports(
     apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
     # #1077 — spool state. Only written when the heartbeat carries it.
     apply_reported_spool(server, body.spool, agent_kind="dhcp", server_id=str(server.id))
+    # #4193 — actual memory use, plus a sample for the history.
+    await apply_reported_memory(
+        db, server, body.memory, sample_model=DHCPMetricSample, agent_kind="dhcp"
+    )
     # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
     # the same dict, the top-level ``status``; ``daemon`` is the source). Same
     # gap as the DNS side: declared, accepted, never read.
