@@ -179,9 +179,11 @@ def test_ldap_unknown_name_does_the_same_binds_as_a_known_one(
             pass
 
     binds: list[str] = []
+    passwords: list[str] = []
 
     def fake_open(cfg, user, password):  # type: ignore[no-untyped-def]
         binds.append(user)
+        passwords.append(password)
         if user != "cn=svc":
             raise LDAPInvalidCredentialsResult()
         return Conn()
@@ -212,7 +214,10 @@ def test_ldap_unknown_name_does_the_same_binds_as_a_known_one(
     known_binds = len(binds)
 
     binds.clear()
+    passwords.clear()
     monkeypatch.setattr(ldap_mod, "_search_user", lambda conn, c, u: None)
     assert ldap_mod.authenticate_ldap(object(), "zz", "wrong-pass") is None  # type: ignore[arg-type]
     assert len(binds) == known_binds == 2
     assert binds[1].endswith(",ou=u,dc=x")
+    # The bind against the empty DN never carries the password that was typed.
+    assert passwords[1] not in ("wrong-pass", "")

@@ -7,6 +7,7 @@ underlying ``ldap3`` library is blocking. See
 
 from __future__ import annotations
 
+import secrets
 import ssl
 import uuid
 from dataclasses import dataclass
@@ -267,10 +268,14 @@ def _result_from_entry(cfg: LDAPConfig, dn: str, attrs: dict) -> ExternalAuthRes
     )
 
 
-def _decoy_user_bind(cfg: LDAPConfig, password: str) -> None:
-    """Best-effort bind that always fails; only its cost matters."""
+def _decoy_user_bind(cfg: LDAPConfig) -> None:
+    """Best-effort bind that always fails; only its cost matters.
+
+    It uses a random password, never the one the user typed: the typed
+    password is only ever sent for an entry the directory itself returned.
+    """
     try:
-        _open(cfg, f"cn={uuid.uuid4().hex},{cfg.user_base_dn}", password).unbind()
+        _open(cfg, f"cn={uuid.uuid4().hex},{cfg.user_base_dn}", secrets.token_urlsafe(24)).unbind()
     except LDAPException:
         # Rejected (the expected outcome) or the server went away.
         pass
@@ -311,7 +316,7 @@ def authenticate_ldap(
         # No such entry. Do the user bind a known entry gets, against a DN that
         # holds nothing, so a name the directory has never heard of costs it
         # the same two binds as one it has.
-        _decoy_user_bind(cfg, password)
+        _decoy_user_bind(cfg)
         return None
 
     dn = found["dn"]
