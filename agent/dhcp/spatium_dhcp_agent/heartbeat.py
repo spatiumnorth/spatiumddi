@@ -6,6 +6,7 @@ import os
 import random
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -61,6 +62,12 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
+        # #3782 — what the spool cannot count: events read from Kea but not
+        # yet delivered or spooled. Set by the supervisor to the lease
+        # watcher's ``pending_status``; merged into the ``lease_events``
+        # stream and the rollup below. Extra keys are ignored by a control
+        # plane that predates them.
+        self.pending_provider: Callable[[], dict[str, Any]] | None = None
         # Same skew handling for ``capabilities``, with one difference: it is
         # what opens the HA peer-credential gate, so the field is offered
         # again every CAPABILITIES_RETRY_SECONDS rather than dropped for the
@@ -126,6 +133,21 @@ class HeartbeatClient:
         except Exception as exc:  # noqa: BLE001 — never costs the boot
             log.warning("dhcp_agent_announce_failed", error=str(exc))
 
+    def _spool_with_pending(self, spool: dict[str, Any]) -> dict[str, Any]:
+        """Fold the in-memory lease backlog (#3782) into the spool report."""
+        if self.pending_provider is None:
+            return spool
+        try:
+            pending = self.pending_provider()
+        except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
+            log.warning("heartbeat_pending_status_failed", error=str(exc))
+            return spool
+        streams = spool.get("streams")
+        if isinstance(streams, dict) and isinstance(streams.get("lease_events"), dict):
+            streams["lease_events"].update(pending)
+        spool.update(pending)
+        return spool
+
     def send_once(self, *, announce: bool = False) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
@@ -155,7 +177,7 @@ class HeartbeatClient:
             body["capabilities"] = list(AGENT_CAPABILITIES)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
-                body["spool"] = self.spool_manager.status()
+                body["spool"] = self._spool_with_pending(self.spool_manager.status())
             except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
                 log.warning("heartbeat_spool_status_failed", error=str(exc))
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry

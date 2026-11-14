@@ -37,6 +37,7 @@ import {
   type AIPrompt,
   type NmapScanRead,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /** Render assistant content as Markdown with a curated set of element
  *  overrides tuned for the chat-bubble aesthetic. Used by both the
@@ -1496,9 +1497,9 @@ export function ProposalCard({
             />
           )}
         {proposal?.error && (
-          <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+          <FormError className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-2">
             {proposal.error}
-          </div>
+          </FormError>
         )}
         {pending && (
           <div className="mt-3 flex items-center gap-2">
@@ -1862,9 +1863,9 @@ function StreamingBubble({
           </div>
         )}
         {error && (
-          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
             {error}
-          </div>
+          </FormError>
         )}
       </div>
     </div>

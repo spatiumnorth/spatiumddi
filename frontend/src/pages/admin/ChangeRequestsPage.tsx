@@ -58,6 +58,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
 import { BreakGlassModal } from "./BreakGlassModal";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -253,7 +254,7 @@ function DecisionModal({
           </label>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
@@ -607,7 +608,7 @@ function PolicyEditor({
           </span>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
