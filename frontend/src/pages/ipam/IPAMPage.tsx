@@ -10937,12 +10937,11 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
     queryKey: ["address-sets", subnet.id],
     queryFn: () => addressSetsApi.list({ subnet_id: subnet.id }),
   });
-  // Resolve customer / site names for the Owner chips.
-  const subnetWritable = perms.can("write", "subnet", subnet.id);
   // ``admin`` on the ``address_set`` type lets you create new sets.
   const canCreate = perms.can("admin", "address_set");
-  const canManageSet = (id: string) =>
-    subnetWritable || perms.can("admin", "address_set", id);
+  // The edit and delete handlers need ``admin`` on the set itself (a subnet
+  // grant is refused, #4184), so the row controls follow that and only that.
+  const canManageSet = (id: string) => perms.can("admin", "address_set", id);
 
   const [showCreate, setShowCreate] = useState(false);
   const [editingSet, setEditingSet] = useState<AddressSet | null>(null);
