@@ -1908,6 +1908,90 @@ except Exception:
     return 0
 }
 
+# #3919 — bring the role release (the supervisor's ``spatiumddi-appliance``
+# HelmChart) onto THIS slot's image tag and chart as soon as k3s answers.
+#
+# That HelmChart lives in the datastore, written by the supervisor, so a slot
+# upgrade's reboot leaves the PREVIOUS release's ``global.imageTag`` and chart
+# in it. k3s starts the role DaemonSets (dhcp-kea, dns-*) from it at once, and
+# they came back on the old images; the new supervisor's first lifecycle apply
+# (~2-3 min later, once its own pod is up) then moved the tag and rolled every
+# role pod a second time. Writing the tag here leaves the supervisor's apply
+# with nothing to change, so the roles move once.
+#
+# Properties that keep this from becoming its own source of churn:
+#   * the tag follows the slot that BOOTED (SPATIUMDDI_VERSION is stamped from
+#     the running slot), so a rollback writes the old tag back;
+#   * single-node clusters only. On a cluster the role chart is shared and the
+#     supervisor gates its write on the other nodes' versions and a Rolling
+#     Upgrade's hold (#1710, #1750); this script knows neither, so it leaves
+#     it to them. A node count it cannot read is "not single";
+#   * a HelmChart that does not exist yet (first install) is left to the
+#     supervisor, and one already on this tag is not written (a write is a
+#     helm revision);
+#   * only ``global.imageTag`` changes, and the document is re-dumped the way
+#     the supervisor dumps it (``safe_dump(sort_keys=False)``) with the chart
+#     encoded the way it encodes it, so the supervisor's own apply afterwards
+#     is a no-op on the object;
+#   * never fatal. No ``python3 -`` (#1001): the program is a ``-c`` argument
+#     and its data arrives as argv.
+reconcile_role_chart_tag() {
+    local k3s=/usr/local/bin/k3s nodes cur patch rc
+    [ -f "$CHART_TGZ" ] || return 0
+    # The supervisor's rolling-upgrade hold file (#1710/#3136): while one is
+    # recorded, the supervisor itself refuses to write this chart from a node
+    # already on the target, so firstboot must not either.
+    [ -e "${SUPERVISOR_STATE_DIR:-/var/persist/spatium-supervisor}/shared-chart-hold" ] && return 0
+    if ! nodes=$($k3s kubectl --request-timeout=10s get nodes -o name 2>/dev/null); then
+        echo "WARN: could not list nodes; role chart tag not reconciled this boot (#3919)." >&2
+        return 0
+    fi
+    [ "$(printf '%s\n' "$nodes" | grep -c .)" = 1 ] || return 0
+    if ! cur=$($k3s kubectl --request-timeout=10s -n kube-system get helmchart \
+            spatiumddi-appliance --ignore-not-found \
+            -o 'jsonpath={.spec.valuesContent}' 2>/dev/null); then
+        echo "WARN: could not read HelmChart kube-system/spatiumddi-appliance; role chart tag not reconciled this boot (#3919)." >&2
+        return 0
+    fi
+    [ -n "$cur" ] || return 0
+    patch=$(mktemp) || return 0
+    rc=0
+    python3 -c '
+import base64, json, sys
+import yaml
+
+tag, chart, cur, out = sys.argv[1:5]
+try:
+    doc = yaml.safe_load(cur)
+    if not isinstance(doc, dict) or not isinstance(doc.get("global"), dict):
+        sys.exit(1)
+    if str(doc["global"].get("imageTag")) == tag:
+        sys.exit(0)
+    doc["global"]["imageTag"] = tag
+    with open(chart, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    values = yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump({"spec": {"chartContent": b64, "valuesContent": values}}, fh)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(1)
+' "$SPATIUMDDI_VERSION" "$CHART_TGZ" "$cur" "$patch" 2>/dev/null || rc=$?
+    if [ "$rc" != 0 ]; then
+        echo "WARN: could not render the role chart tag patch; not reconciled this boot (#3919)." >&2
+    elif [ -s "$patch" ]; then
+        if $k3s kubectl --request-timeout=30s -n kube-system patch helmchart \
+                spatiumddi-appliance --type merge --patch-file "$patch" >/dev/null 2>&1; then
+            echo "Moved the role chart (spatiumddi-appliance) to ${SPATIUMDDI_VERSION} ahead of the supervisor (#3919)."
+        else
+            echo "WARN: could not patch HelmChart kube-system/spatiumddi-appliance; the supervisor moves it on its first apply (#3919)." >&2
+        fi
+    fi
+    rm -f "$patch"
+    return 0
+}
+
 # #1299 — pin 'failurePolicy: retry' on the control release's HelmChartConfig.
 #
 # This is the policy helm-controller applies: a HelmChartConfig's failurePolicy
@@ -2727,6 +2811,9 @@ if [ "$ready" = 1 ]; then
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
     # #3022 — the bootstrap chart this boot staged goes live, or stays held,
     # before the control chart's own release below.
+    # #3919 — first: the role pods k3s already started are on the previous
+    # release until the role chart carries this slot's tag.
+    reconcile_role_chart_tag || true
     release_bootstrap_manifest || true
     trap - EXIT TERM
     # #1299 — first, while this boot's control chart is still held back.
