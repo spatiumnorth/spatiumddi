@@ -46,6 +46,7 @@ from __future__ import annotations
 import csv
 import io
 import math
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -92,6 +93,10 @@ _STATE_MAP = {"0": "active", "1": "declined", "2": "expired", "3": "released"}
 
 # kea-leases6.csv ``lease_type``: 0 = IA_NA. 1 (IA_TA) and 2 (IA_PD) are skipped.
 _LEASE6_IA_NA = "0"
+
+
+def _rows(data: str) -> list[list[str]]:
+    return list(csv.reader(io.StringIO(data))) if data else []
 
 
 def _times(expire_epoch: int, valid_lifetime: int) -> tuple[str | None, str | None]:
@@ -235,6 +240,8 @@ class LeaseWatcher:
         self._last_drain = 0.0
         # Read offset per tailed file (v4 and v6 CSVs rotate independently).
         self._offsets: dict[Path, int] = {}
+        # Open handle per tailed file — see _read_new_rows (#4147).
+        self._handles: dict[Path, Any] = {}
         self._poster = CPPoster(cfg, token_ref, LEASE_EVENTS_PATH, late_bound(self, "_client"))
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("lease_events"),
@@ -454,32 +461,67 @@ class LeaseWatcher:
 
     # ── tailing ──────────────────────────────────────────────────────
 
+    def _drain_handle(self, path: Path, fh: Any) -> str:
+        """Read whatever is left in an open lease file, from the saved offset."""
+        data: str = fh.read()
+        self._offsets[path] = fh.tell()
+        return data
+
     def _read_new_rows(self, path: Path) -> list[list[str]]:
-        if not path.exists():
-            return []
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return []
-        offset = self._offsets.get(path, 0)
-        if size < offset:
-            # File rotated / truncated by Kea LFC
-            offset = 0
-        if size == offset:
-            self._offsets[path] = offset
-            self._read_at[path] = time.time()
-            return []
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(offset)
-            data = f.read()
-            self._offsets[path] = f.tell()
+        data = self._read_new_text(path)
         self._read_at[path] = time.time()
         if not data:
             return []
-        rows = list(csv.reader(io.StringIO(data)))
+        rows = _rows(data)
         self._row_bytes += len(data.encode("utf-8", errors="replace"))
         self._rows_read += len(rows)
         return rows
+
+    def _read_new_text(self, path: Path) -> str:
+        """Text appended to ``path`` since the last call, exactly once each.
+
+        The file is held OPEN between calls (#4147). Kea's lease-file cleanup
+        renames the live file to ``.1`` and starts a new one, and its output
+        lands in ``.2`` within about a tenth of a second, compacted — so by
+        the next read the old file's rows are in no path a byte offset could
+        name. The open descriptor keeps the old file readable after the
+        rename or delete: the rows Kea appended between our last read and the
+        rotation are read from it to the end before the new file is opened
+        at offset 0. Rotation is told by inode, so a new file that has
+        already outgrown the old offset is not read from the middle; an
+        in-place truncation (same inode, shorter file) still restarts at 0.
+        """
+        fh = self._handles.get(path)
+        data = ""
+        if fh is not None:
+            try:
+                data = self._drain_handle(path, fh)
+                st = path.stat()
+                rotated = st.st_ino != os.fstat(fh.fileno()).st_ino
+                truncated = not rotated and st.st_size < fh.tell()
+            except FileNotFoundError:
+                # Mid-rotation: Kea has renamed the file and not yet created
+                # the new one. Keep the handle; the new file is picked up on
+                # a later call.
+                return data
+            except OSError:
+                return data
+            if rotated:
+                fh.close()
+                del self._handles[path]
+                self._offsets[path] = 0
+                fh = None
+            elif truncated:
+                fh.seek(0)
+                self._offsets[path] = 0
+        if fh is None:
+            try:
+                fh = path.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                return data
+            self._handles[path] = fh
+        data += self._drain_handle(path, fh)
+        return data
 
     def _tail(self, path: Path, parse: Any, attr: str) -> None:
         prev_read = self._read_at.get(path)
@@ -537,6 +579,9 @@ class LeaseWatcher:
         while not self._stop.is_set():
             self.tick()
             self._stop.wait(1.0)
+        for fh in self._handles.values():
+            fh.close()
+        self._handles.clear()
         # Final flush on shutdown — with the spool, a failure here is queued
         # on disk for the next start rather than lost.
         self._flush()
