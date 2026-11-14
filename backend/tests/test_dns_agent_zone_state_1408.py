@@ -323,3 +323,46 @@ async def test_a_zone_state_report_marks_no_bundle_dirty(
         await db_session.execute(select(DNSServer.bundle_dirty_seq).where(DNSServer.id == srv_id))
     ).scalar_one()
     assert after == before
+
+
+@pytest.mark.asyncio
+async def test_a_row_written_before_the_name_became_ambiguous_is_dropped_4133(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4133: a zone created in one view lands a row while its name is held
+    once; the same name is then created in a second view. The report cannot
+    say whose serial is whose any more, so the first copy's row (its creation
+    serial) must not stay behind to read ``behind`` after the copy's next
+    change. Both copies end with no stored serial; an unrelated zone's row is
+    untouched."""
+    grp = await _group(db_session)
+    srv = await _server(db_session, grp)
+    inside = DNSView(group_id=grp.id, name="inside")
+    outside = DNSView(group_id=grp.id, name="outside")
+    db_session.add_all([inside, outside])
+    await db_session.flush()
+    first = await _zone(db_session, grp, "split.example.test.", view=inside, serial=2026111300)
+    solo = await _zone(db_session, grp, "solo.example.test.", view=inside, serial=2026111300)
+    srv_id, first_id, solo_id = srv.id, first.id, solo.id
+    outside_id = outside.id
+    await db_session.commit()
+
+    await _report(
+        client, db_session, srv, [("split.example.test.", 2026111300), ("solo.example.test.", 1)]
+    )
+    assert (await _state(db_session, srv_id, first_id)) is not None
+
+    second = await _zone(db_session, grp, "split.example.test.", view=None)
+    second.view_id = outside_id
+    second_id = second.id
+    await db_session.commit()
+
+    body = await _report(
+        client, db_session, srv, [("split.example.test.", 2026111301), ("solo.example.test.", 2)]
+    )
+
+    assert body == {"updated": 1, "skipped": 1}
+    assert await _state(db_session, srv_id, first_id) is None
+    assert await _state(db_session, srv_id, second_id) is None
+    kept = await _state(db_session, srv_id, solo_id)
+    assert kept is not None and kept.current_serial == 2

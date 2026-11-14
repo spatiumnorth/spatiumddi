@@ -352,7 +352,22 @@ def test_the_agents_key_may_write_the_soa_under_update_policy() -> None:
 # ── reporting what named serves after a structural apply ─────────────────────
 
 
-def test_served_zone_serials_reads_primaries_and_keeps_the_rest(
+def test_a_secondary_named_holds_nothing_of_is_not_reported_as_the_bundle_serial_3940(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refused(*_a: Any, **_kw: Any) -> Any:
+        raise OSError("SERVFAIL")
+
+    monkeypatch.setattr(dns.query, "tcp", refused)
+    monkeypatch.setattr(bind9.shutil, "which", lambda n: None)
+    bundle = {
+        "views": [{"name": "v"}],
+        "zones": [{"name": "sec.test.", "type": "secondary", "serial": 0}],
+    }
+    assert driver.served_zone_serials(bundle) == {}
+
+
+def test_served_zone_serials_reads_primaries_and_secondaries_and_keeps_the_rest(
     driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     named = _FakeNamed(2026102603)
@@ -366,7 +381,6 @@ def test_served_zone_serials_reads_primaries_and_keeps_the_rest(
     }
     assert driver.served_zone_serials(bundle) == {
         ORIGIN.rstrip("."): 2026102603,
-        "sec.test": 9,
         "fwd.test": 0,
     }
 
@@ -802,6 +816,21 @@ def test_the_driver_reads_the_served_serial_of_every_rendered_zone(
     assert driver.periodic_served_serials() == {}
 
 
+def test_secondaries_are_read_periodically_in_any_group_4065(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transferred serial moves with no render, so the periodic read covers
+    secondary / stub zones, with views or without, and leaves an unread one out."""
+    named = _FakeNamed(2026111312)
+    monkeypatch.setattr(dns.query, "tcp", named)
+    driver._rendered_secondaries = [ORIGIN.rstrip(".")]
+    for views in (False, True):
+        driver._rendered_has_views = views
+        assert driver.periodic_served_serials() == {ORIGIN.rstrip("."): 2026111312}
+    named.authoritative = False  # not transferred yet: not reported
+    assert driver.periodic_served_serials() == {}
+
+
 def test_an_outside_update_is_reported_on_change_only(tmp_path: Path) -> None:
     """The walk's case 3: a third party's nsupdate moved named to 04 while the
     row said 03 and read in sync for minutes. The periodic read posts the
@@ -858,3 +887,33 @@ def test_the_run_loop_reads_the_served_serials_on_its_interval(tmp_path: Path) -
     assert calls == [1]
     assert loop._served_report_at > 0.0
     assert sync_mod.SERVED_REPORT_SECONDS <= 300
+
+
+def test_a_transferred_serial_is_reported_without_a_config_change_4065(
+    tmp_path: Path,
+) -> None:
+    from tests import test_zone_state_after_ops as zs
+
+    served: dict[str, int] = {}
+
+    class _Reads(zs._Driver):
+        def periodic_served_serials(self) -> dict[str, int]:
+            return dict(served)
+
+    zs.ensure_layout(tmp_path)
+    loop = zs.SyncLoop(zs._Cfg(tmp_path), ["tok"], _Reads(tmp_path), zs._Heartbeat())
+    cp = zs._ControlPlane()
+    loop._client = lambda: cp  # type: ignore[method-assign]
+    loop._reported_serials = {"sec.test": 2026111302}
+
+    served["sec.test"] = 2026111302
+    loop._report_served_serials()
+    assert cp.zone_state == [], "unchanged: no report"
+
+    served["sec.test"] = 2026111312  # named took an IXFR
+    loop._report_served_serials()
+    assert cp.zone_state == [[{"zone_name": "sec.test", "serial": 2026111312}]]
+
+    served["late.test"] = 2026111305  # first transfer, long after the apply
+    loop._report_served_serials()
+    assert cp.zone_state[-1] == [{"zone_name": "late.test", "serial": 2026111305}]

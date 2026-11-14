@@ -32,6 +32,7 @@ import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { PERMISSIONS_UNREADABLE, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -1656,12 +1657,12 @@ export function SettingsPage() {
           )}
 
           {mutation.isError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm">
               {formatApiError(
                 mutation.error,
                 "Failed to save settings. Please try again.",
               )}
-            </div>
+            </FormError>
           )}
 
           <div className="rounded-lg border bg-card divide-y px-5">
@@ -1734,9 +1735,7 @@ export function SettingsPage() {
                   </div>
                 </Field>
                 {logoError && (
-                  <div className="py-2 text-xs text-destructive">
-                    {logoError}
-                  </div>
+                  <FormError className="py-2">{logoError}</FormError>
                 )}
 
                 {/* ── Login banner (#885) ──────────────────────────── */}

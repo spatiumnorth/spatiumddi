@@ -14,6 +14,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { newNodeId } from "@/lib/uuid";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Index of saved subnet plans. New plans bootstrap with a root node and a
@@ -96,8 +97,13 @@ export function SubnetPlannerListPage() {
           <div className="rounded-lg border border-dashed p-12 text-center">
             <Workflow className="mx-auto h-8 w-8 text-muted-foreground/40" />
             <p className="mt-3 text-sm text-muted-foreground">
-              <ListEmpty error={error} what="plans">
-                No plans yet. Create one to design a CIDR hierarchy.
+              <ListEmpty
+                error={error}
+                what="plans"
+                gate={writeGate}
+                hint="Create one to design a CIDR hierarchy."
+              >
+                No plans yet.
               </ListEmpty>
             </p>
           </div>
@@ -358,9 +364,7 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
         {createMut.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(createMut.error)}
-          </p>
+          <FormError>{formatApiError(createMut.error)}</FormError>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <button

@@ -622,6 +622,45 @@ async def test_malformed_spool_report_does_not_fail_the_heartbeat(
     assert row is None
 
 
+async def test_dhcp_heartbeat_persists_in_memory_lease_backlog_3782(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An agent behind on lease events has an EMPTY on-disk spool; what it has
+    read but not delivered must be stored, and an agent that does not report it
+    must read as unknown (None), never as 0."""
+    srv = await _dhcp_server(db_session)
+    oldest = "2026-11-08T10:00:00+00:00"
+    spool = _spool(bytes_=0, stream="lease_events")
+    spool["pending_events"] = 2400
+    spool["pending_oldest_at"] = oldest
+    spool["unread_bytes"] = 4096
+    spool["unread_events_estimated"] = 2000
+    spool["streams"]["lease_events"].update(
+        pending_events=2400, pending_oldest_at=oldest, unread_bytes=4096
+    )
+    r = await _post(client, "dhcp", srv, "heartbeat", {"spool": spool})
+    assert r.status_code == 200, r.text
+    row = (
+        await db_session.execute(select(DHCPServer.spool_status).where(DHCPServer.id == srv.id))
+    ).scalar_one()
+    assert row is not None and row["entries"] == 0
+    assert row["pending_events"] == 2400
+    assert row["unread_bytes"] == 4096
+    assert row["unread_events_estimated"] == 2000
+    assert row["streams"]["lease_events"]["pending_events"] == 2400
+    assert row["streams"]["lease_events"]["pending_oldest_at"].startswith("2026-11-08T10:00:00")
+
+    # A pre-#3782 agent: the fields are absent -> stored as null (unknown).
+    srv2 = await _dhcp_server(db_session)
+    r = await _post(client, "dhcp", srv2, "heartbeat", {"spool": _spool(bytes_=0)})
+    assert r.status_code == 200, r.text
+    row2 = (
+        await db_session.execute(select(DHCPServer.spool_status).where(DHCPServer.id == srv2.id))
+    ).scalar_one()
+    assert row2 is not None and row2["pending_events"] is None
+    assert row2["unread_bytes"] is None
+
+
 def test_apply_reported_spool_none_is_a_no_op() -> None:
     row = SimpleNamespace(spool_status={"bytes": 5})
     apply_reported_spool(row, None, agent_kind="dns", server_id="s")

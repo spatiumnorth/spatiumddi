@@ -1324,6 +1324,26 @@ def _queue_release_check_at_start(**_: object) -> None:
         )
 
 
+@beat_init.connect
+def _queue_orphan_sweep_at_start(**_: object) -> None:
+    """Run the upgrade orphan sweep once when beat starts (#3851).
+
+    A rolling upgrade's shared-tag flip recreates the beat Deployment
+    mid hand-off, and a restarted beat waits a full interval (plus its own
+    start-up) before its first scheduled sweep: measured, 190-230 s with no
+    sweep at all, in the one window where a lost hop needs one. The sweep's
+    first sighting lives in Redis (``orphan-seen``, 600 s), so one sweep at
+    start can be the second sighting and re-drive at once. Idempotent as the
+    scheduled task is (two sightings, SET NX cooldown, Lease acquire); a
+    broker that is not up yet never blocks beat from starting."""
+    try:
+        celery_app.send_task("app.tasks.upgrade_orchestrator.resume_orphaned_runs")
+    except Exception:  # noqa: BLE001 - the 60 s schedule still covers it
+        structlog.get_logger(__name__).warning(
+            "orphan_sweep_at_beat_start_not_queued", exc_info=True
+        )
+
+
 @task_failure.connect
 def _capture_task_failure(
     sender: object | None = None,

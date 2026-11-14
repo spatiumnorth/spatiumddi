@@ -27,6 +27,7 @@ import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const PAGE_SIZE = 100;
 
@@ -366,9 +367,9 @@ export function NewDevicesPage() {
       </div>
 
       {actionError && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {actionError}
-        </div>
+        </FormError>
       )}
       {actionNotice && (
         <div className="flex items-start justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400">
@@ -740,9 +741,9 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
         </div>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="max-h-72 overflow-auto rounded-md border">

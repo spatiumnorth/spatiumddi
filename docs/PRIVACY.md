@@ -250,8 +250,9 @@ SpatiumDDI is built to be delegated without handing over everything:
   before the response returns (non-negotiable #4), so administrative
   access is recorded rather than assumed;
 * credentials at rest (provider secrets, agent keys, cloud tokens) are
-  Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (or a key
-  derived from `SECRET_KEY` when you have not set one) and never
+  Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (the chart
+  and appliance generate one; on Compose you set it, otherwise a key is
+  derived from `SECRET_KEY`) and never
   returned by the API — endpoints report `*_set: true`, not the value.
 
 ## 8. Keeping this page true
