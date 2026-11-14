@@ -1893,9 +1893,9 @@ def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
     for entry in entries:
         if entry.is_dir():
             for zf in sorted(entry.glob("*.db")):
-                out.append((zf.name[: -len(".db")], entry.name))
+                out.append((_zone_from_fname(zf.name[: -len(".db")]), entry.name))
         elif entry.name.endswith(".db"):
-            out.append((entry.name[: -len(".db")], None))
+            out.append((_zone_from_fname(entry.name[: -len(".db")]), None))
     return out
 
 
@@ -1919,8 +1919,63 @@ def _zone_name_renderable(zname: str) -> bool:
     )
 
 
+def _zone_fname(zname: str) -> str:
+    """A zone's file stem: ``/`` of an RFC 2317 classless reverse zone as
+    ``%2F`` (#4165), the encoding BIND itself uses in key file names. ``%`` is
+    not a legal zone-name character (``_ZONE_NAME_RE``), so it is unambiguous.
+    Left as ``/`` the file nests (``zones/<view>/64/26.2.0.192...db``), and
+    ``_zone_views_under`` never lists a nested file: the zone was loaded once
+    and never reloaded."""
+    return zname.replace("/", "%2F")
+
+
+def _zone_from_fname(stem: str) -> str:
+    return stem.replace("%2F", "/")
+
+
 def _zone_rel(zname: str, view: str | None) -> str:
-    return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
+    fname = _zone_fname(zname)
+    return f"zones/{view}/{fname}.db" if view else f"zones/{fname}.db"
+
+
+def _migrate_nested_zone_files(live: Path, zone_names: list[str]) -> None:
+    """Move a classless zone's file (and its sidecars, journal included) from
+    the nested layout older renders wrote into the flat one (#4165), so an
+    upgrade keeps the zone's dynamic data instead of treating it as new.
+
+    Driven by the bundle's own zone names rather than by guessing from the
+    tree, because ``zones/64/26.2.0.192.in-addr.arpa.db`` is ambiguous on its
+    own: a classless prefix directory, or a view named ``64``.
+    """
+    zones = live / "zones"
+    try:
+        dirs = [zones] + [d for d in zones.iterdir() if d.is_dir()]
+    except OSError:
+        return
+    for zname in zone_names:
+        stem = zname.rstrip(".")
+        if "/" not in stem:
+            continue
+        head, tail = stem.rsplit("/", 1)
+        for base in dirs:
+            old_dir = base / head
+            if not old_dir.is_dir():
+                continue
+            for f in sorted(old_dir.iterdir()):
+                if not f.is_file() or not (
+                    f.name == tail + ".db" or f.name.startswith(tail + ".db.")
+                ):
+                    continue
+                new = base / (_zone_fname(stem) + f.name[len(tail) :])
+                try:
+                    if not new.exists():
+                        f.rename(new)
+                except OSError as exc:
+                    log.warning("bind9_nested_zone_file_move_failed", path=str(f), error=str(exc))
+            try:
+                old_dir.rmdir()
+            except OSError:
+                pass  # not empty: a view of that name, or a sibling zone's files
 
 
 _VIEW_OPEN_LINE = re.compile(r'^view "([^"]+)" \{$')
@@ -3165,6 +3220,10 @@ class Bind9Driver(DriverBase):
         if new_dir.exists():
             shutil.rmtree(new_dir)
         (new_dir / "zones").mkdir(parents=True)
+        _migrate_nested_zone_files(
+            self.state_dir / self.rendered_dir_name,
+            [str(z.get("name") or "") for z in (bundle.get("zones") or [])],
+        )
         # The zone files this render wrote for primary zones (#2864): the
         # ones whose serial an agent start must keep from going backwards.
         self._primary_rels: set[str] = set()
@@ -3408,7 +3467,7 @@ class Bind9Driver(DriverBase):
                 if not masters:
                     log.warning("bind9_secondary_zone_no_masters_skipped", zone=zname)
                     return ""
-                rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+                rel_zfile = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
                 abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
                 bind_type = "stub" if zone_type == "stub" else "slave"
                 masters_clause = "; ".join(_format_master(m) for m in masters)
@@ -3420,7 +3479,7 @@ class Bind9Driver(DriverBase):
             # Relative path inside the rendered tree; absolute path written
             # into named.conf so BIND9 doesn't resolve against its
             # `directory` (/var/cache/bind, not our rendered tree).
-            rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+            rel_zfile = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
             # Coarse allow-update (IP + TSIG) unless the ACL needs the
             # fine-grained update-policy path (name-scope / per-type / deny).
@@ -3489,7 +3548,7 @@ class Bind9Driver(DriverBase):
             <target>. or A/AAAA, exceptions → CNAME rpz-passthru.
             """
             zname = bl["rpz_zone_name"]
-            rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+            rel = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
             try:
                 if _named_files_fit(new_dir / rel, False):
@@ -3661,7 +3720,7 @@ class Bind9Driver(DriverBase):
             catalog = bundle.get("catalog") or None
             if catalog and catalog.get("mode") == "producer":
                 cname = catalog["zone_name"]
-                rel = f"zones/{cname.rstrip('.')}.db"
+                rel = f"zones/{_zone_fname(cname.rstrip('.'))}.db"
                 abs_zfile = self.state_dir / self.rendered_dir_name / rel
                 conf += (
                     f'zone "{cname}" {{ type master; file "{abs_zfile}"; '
@@ -5168,9 +5227,9 @@ class Bind9Driver(DriverBase):
         """The live ``.owned`` of zone ``zname`` (no views), matched without
         regard to case: the file is named as the bundle spells the zone."""
         zones = self.state_dir / self.rendered_dir_name / "zones"
-        zone_file = zones / f"{zname}.db"
+        zone_file = zones / f"{_zone_fname(zname)}.db"
         if not zone_file.is_file():
-            want = f"{zname.lower()}.db"
+            want = f"{_zone_fname(zname).lower()}.db"
             try:
                 zone_file = next(
                     p for p in zones.iterdir() if p.name.lower() == want and p.is_file()
