@@ -114,25 +114,60 @@ PROXY_USERINFO_MASK = "***"
 
 
 def _split_proxy_userinfo(url: str) -> tuple[str, str | None, str]:
-    """``(scheme://, userinfo or None, host-and-rest)`` for a proxy URL.
+    """``(scheme://, userinfo or None, host-and-rest)`` for a source or proxy URL.
 
-    The authority ends at the first ``/``, ``?`` or ``#``; userinfo is
-    everything before its LAST ``@`` (how urllib, curl and apt read it).
-    A value with no ``://`` is returned whole as host-and-rest.
+    Read the way apt reads it: the host part ends at the first ``/`` only,
+    and userinfo is everything before the LAST ``@`` ahead of it. Every
+    caller (mask, restore, destination check) shares this one reading, so
+    they cannot disagree with apt about where the host is. A value with no
+    ``://`` is returned whole as host-and-rest.
     """
     scheme, sep, rest = url.partition("://")
     if not sep:
         return "", None, url
-    end = len(rest)
-    for ch in "/?#":
-        idx = rest.find(ch)
-        if idx != -1:
-            end = min(end, idx)
+    end = rest.find("/")
+    if end == -1:
+        end = len(rest)
     authority = rest[:end]
     if "@" not in authority:
         return f"{scheme}://", None, rest
     userinfo, _, host = authority.rpartition("@")
     return f"{scheme}://", userinfo, host + rest[end:]
+
+
+def validate_apt_authority(url: str) -> None:
+    """Refuse a URL whose authority is ambiguous between parsers.
+
+    The authority is the text up to the first ``/`` (the whole remainder
+    for a proxy URL, which has no path). It may not hold ``?``, ``#``,
+    ``\\``, whitespace or control characters, more than one ``@``, or a
+    non-numeric port: a mirror or proxy needs none of them there, and each
+    is read differently by some URL parser. A value with no ``://`` (such
+    as ``file:/x``) has no authority and passes.
+    """
+    _, sep, rest = url.partition("://")
+    if not sep:
+        return
+    authority = rest.split("/", 1)[0]
+    if any(c in "?#\\" or c.isspace() or ord(c) < 0x20 for c in authority):
+        raise ValueError(
+            "the host part of the URL may not contain '?', '#', '\\', whitespace "
+            "or control characters"
+        )
+    if authority.count("@") > 1:
+        raise ValueError("the host part of the URL may contain only one '@'")
+    hostport = authority.rpartition("@")[2]
+    if hostport.startswith("["):
+        _, _, tail = hostport.partition("]")
+        port = tail[1:] if tail.startswith(":") else ""
+        bad = bool(tail) and not tail.startswith(":")
+    else:
+        _, colon, port = hostport.rpartition(":")
+        bad = False
+        if not colon:
+            port = ""
+    if bad or (port and not (port.isascii() and port.isdigit())):
+        raise ValueError("the port in the URL must be numeric")
 
 
 def mask_proxy_url(url: str | None) -> str:
@@ -152,14 +187,10 @@ def mask_proxy_url(url: str | None) -> str:
     return f"{prefix}{PROXY_USERINFO_MASK}@{rest}"
 
 
-def _destination(prefix: str, rest: str) -> tuple[str, str]:
-    """Scheme and ``host[:port]`` of a URL split by ``_split_proxy_userinfo``."""
-    end = len(rest)
-    for ch in "/?#":
-        idx = rest.find(ch)
-        if idx != -1:
-            end = min(end, idx)
-    return prefix.lower(), rest[:end].lower()
+def _destination(url: str) -> tuple[str, str]:
+    """Scheme and ``host[:port]`` of a URL, as apt reads it."""
+    prefix, _, rest = _split_proxy_userinfo(url)
+    return prefix.lower(), rest.split("/", 1)[0].lower()
 
 
 def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
@@ -177,19 +208,27 @@ def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
     prefix, userinfo, rest = _split_proxy_userinfo(incoming)
     if userinfo != PROXY_USERINFO_MASK:
         return incoming
-    stored_prefix, stored_userinfo, stored_rest = _split_proxy_userinfo(stored or "")
+    validate_apt_authority(incoming)
+    _, stored_userinfo, _ = _split_proxy_userinfo(stored or "")
     if not stored_userinfo:
         raise ValueError(
             "proxy URL carries the '***' credential placeholder, but no "
             "credential is stored to keep; enter the user:password or remove "
             "the '***@'"
         )
-    if _destination(prefix, rest) != _destination(stored_prefix, stored_rest):
+    if _destination(incoming) != _destination(stored or ""):
         raise ValueError(
             "the host, port or scheme changed: re-enter the user:password in the "
             "same request (stored credentials are not re-sent to a different destination)"
         )
-    return f"{prefix}{stored_userinfo}@{rest}"
+    restored = f"{prefix}{stored_userinfo}@{rest}"
+    # Last line of defence: the result must point where the stored value did.
+    if _destination(restored) != _destination(stored or ""):
+        raise ValueError(
+            "the host, port or scheme changed: re-enter the user:password in the "
+            "same request (stored credentials are not re-sent to a different destination)"
+        )
+    return restored
 
 
 def mask_source_uris(sources: Any) -> list[Any]:

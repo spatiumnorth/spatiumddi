@@ -542,6 +542,34 @@ async def test_put_of_the_masked_value_keeps_the_stored_credential(client: Async
     assert settings.apt_proxy_http == ""
 
 
+async def test_put_of_a_masked_proxy_with_an_ambiguous_host_part_is_refused(
+    client: AsyncClient, db_session
+):
+    await _store_proxy(
+        db_session, "http://bob:hunter2@proxy.lan:3128", "https://tok3n@proxy.lan:3129"
+    )
+    _, token = await _superadmin(db_session)
+    h = _hdr(token)
+    for field, base in (
+        ("apt_proxy_http", "http://***@proxy.lan:3128"),
+        ("apt_proxy_https", "https://***@proxy.lan:3129"),
+    ):
+        for sep in ("?", "#", "\\"):
+            r = await client.put(
+                "/api/v1/settings", headers=h, json={field: f"{base}{sep}@other.lan:3128"}
+            )
+            assert r.status_code == 422, (field, sep, r.text)
+            assert "hunter2" not in r.text and "tok3n" not in r.text
+    settings = await db_session.get(PlatformSettings, 1)
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128"
+    assert settings.apt_proxy_https == "https://tok3n@proxy.lan:3129"
+    r = await client.put(
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy.lan:3128"}
+    )
+    assert r.status_code == 200, r.text
+
+
 async def test_put_of_a_mask_with_no_stored_credential_is_refused(client: AsyncClient, db_session):
     await _store_proxy(db_session, "http://proxy.lan:3128/")
     _, token = await _superadmin(db_session)
