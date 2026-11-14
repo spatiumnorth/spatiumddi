@@ -199,7 +199,9 @@ def validate_dns_label(label: str, *, field: str = "name", allow_wildcard: bool 
     return ascii_label.lower()
 
 
-def validate_record_owner(name: str, *, field: str = "record name") -> str:
+def validate_record_owner(
+    name: str, *, field: str = "record name", allow_classless: bool = False
+) -> str:
     """Validate a DNS record owner name (RFC 2181, keeps ``_`` and ``*``).
 
     This is the rule for ``DNSRecord.name``. It deliberately permits the
@@ -214,6 +216,12 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
     is a relative owner that the handlers concatenate as ``f"{name}.{zone}"``,
     so returning ``www.`` would yield the double-dotted ``www..zone``.
     Returns the normalized, lower-cased owner.
+
+    With *allow_classless*, a lone ``<octet>/<prefix>`` owner (``64/26``) is
+    accepted for the RFC 2317 delegation NS in the parent reverse zone (#4166).
+    That is shape only, as the owner is judged without its zone;
+    :func:`classless_owner_error` then holds it to NS / DS in the parent of a
+    classless child.
     """
     raw = name.strip()
     if raw in ("", "@"):
@@ -221,6 +229,8 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
     body, _ = _strip_root(raw)
     if not body:
         return "@"
+    if allow_classless and _CLASSLESS_LABEL_RE.match(body):
+        return body
     parts = body.split(".")
     out: list[str] = []
     for i, part in enumerate(parts):
@@ -230,6 +240,88 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
     if len(normalized) > MAX_NAME_LEN:
         raise ValueError(f"{field} '{normalized}' exceeds {MAX_NAME_LEN} characters")
     return normalized
+
+
+# RFC 2317 classless reverse delegation: the first label of a zone under
+# ``in-addr.arpa`` may be ``<octet>/<prefix>`` (``0/26.2.0.192.in-addr.arpa``),
+# the one place a ``/`` is legal in a zone name (#4156). BIND serves it and a
+# DNS configuration import creates it; the zone form, REST create and copilot
+# must agree. ``<octet>`` is the first address of the delegated block and
+# ``<prefix>`` its length, which must reach past the octets already named by the
+# parent labels (3 parent octets -> /25../32). The ``a-b`` range form needs no
+# special case: it is an ordinary LDH label.
+_CLASSLESS_LABEL_RE = re.compile(r"^(\d{1,3})/(\d{1,2})\Z")
+_IN_ADDR_SUFFIX = ("in-addr", "arpa")
+
+
+def _is_classless_reverse(labels: list[str]) -> bool:
+    """True when *labels* is an RFC 2317 ``<octet>/<prefix>.<1-3 octets>.in-addr.arpa`` name."""
+    lowered = [lbl.lower() for lbl in labels]
+    if len(lowered) < 4 or len(lowered) > 6 or tuple(lowered[-2:]) != _IN_ADDR_SUFFIX:
+        return False
+    m = _CLASSLESS_LABEL_RE.match(lowered[0])
+    if not m:
+        return False
+    parents = lowered[1:-2]
+    if not all(p.isascii() and p.isdigit() and len(p) <= 3 and int(p) <= 255 for p in parents):
+        return False
+    octet, prefix = int(m.group(1)), int(m.group(2))
+    return octet <= 255 and 8 * len(parents) < prefix <= 32
+
+
+def _classless_labels(name: str) -> list[str]:
+    return name.strip().rstrip(".").split(".")
+
+
+def is_classless_cname_target(target: str) -> bool:
+    """True for ``<octet>.<classless child>`` (``65.64/26.2.0.192.in-addr.arpa``).
+
+    The target of an RFC 2317 CNAME in the parent zone (#4166): one numeric
+    host label in front of a classless reverse name.
+    """
+    labels = _classless_labels(target)
+    host = labels[0]
+    return (
+        len(labels) >= 5
+        and host.isascii()
+        and host.isdigit()
+        and len(host) <= 3
+        and int(host) <= 255
+        and _is_classless_reverse(labels[1:])
+    )
+
+
+def classless_owner_error(record_type: str, owner: str, origin: str) -> str | None:
+    """Why a record owner holding a ``/`` is refused in zone *origin*, or None.
+
+    *owner* is the full owner name. A ``/`` is legal in an owner only as the
+    delegation of an RFC 2317 classless child (#4166): an NS (or DS) whose one
+    classless label, with the zone's own name, makes a classless reverse name.
+    Owners without a ``/`` return None.
+    """
+    rtype = record_type.strip().upper()
+    zone = _classless_labels(origin)
+    labels = _classless_labels(owner)
+    lowered = [x.lower() for x in labels]
+    zone_lowered = [x.lower() for x in zone]
+    # Only the part in front of the zone's own name counts: a classless zone
+    # carries a ``/`` in its name, and the records inside it do not.
+    own = len(lowered) - len(zone_lowered)
+    relative = labels[:own] if own > 0 and lowered[own:] == zone_lowered else labels
+    if not any("/" in x for x in relative):
+        return None
+    if (
+        rtype in ("NS", "DS")
+        and len(labels) == len(zone) + 1
+        and lowered[1:] == zone_lowered
+        and _is_classless_reverse(labels)
+    ):
+        return None
+    return (
+        f"{rtype} record name '{owner.rstrip('.')}' holds a '/', which is only valid "
+        "as the NS (or DS) delegating an RFC 2317 classless reverse zone, "
+        "such as '64/26' in 2.0.192.in-addr.arpa."
+    )
 
 
 _ZONE_STORAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
@@ -266,7 +358,8 @@ def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = 
     (``allow_underscore=True``, the default — some zones legitimately carry
     underscore labels, e.g. ``_msdcs.example.com``) or the strict host rule
     when *allow_underscore* is False. Wildcards are not permitted in an
-    FQDN. A single trailing root dot is tolerated and stripped.
+    FQDN. The one ``/`` allowed is the first label of an RFC 2317 classless
+    reverse zone (``0/26.2.0.192.in-addr.arpa``, #4156). A single trailing root dot is tolerated and stripped.
     """
     raw = name.strip()
     if not raw:
@@ -274,11 +367,16 @@ def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = 
     body, _ = _strip_root(raw)
     if not body:
         raise ValueError(f"{field} must not be the root domain")
-    if allow_underscore:
-        labels = [validate_dns_label(lbl, field=field) for lbl in body.split(".")]
+    parts = body.split(".")
+    if _is_classless_reverse(parts):
+        # RFC 2317 (#4156): the ``/`` first label is already shape-checked.
+        normalized = body.lower()
     else:
-        labels = [validate_host_label(lbl, field=field) for lbl in body.split(".")]
-    normalized = ".".join(labels)
+        if allow_underscore:
+            labels = [validate_dns_label(lbl, field=field) for lbl in parts]
+        else:
+            labels = [validate_host_label(lbl, field=field) for lbl in parts]
+        normalized = ".".join(labels)
     if len(normalized) > MAX_NAME_LEN:
         raise ValueError(f"{field} '{normalized}' exceeds {MAX_NAME_LEN} characters")
     return normalized
@@ -570,6 +668,9 @@ def bind_check_names_error(
     """
     rtype = record_type.strip().upper()
     if check_owner:
+        slash = classless_owner_error(rtype, _owner_absolute(owner, origin), origin)
+        if slash is not None:
+            return slash
         # #2072 — the whole owner name, zone included, must fit a DNS name.
         # *owner* already carries the zone; a zone stored without its root
         # dot (synthesised and imported zones) would make _zone_absolute
@@ -867,6 +968,9 @@ def record_value_error(
             "which is not allowed in DNS record data."
         )
     if rtype in HOSTNAME_TARGET_RECORD_TYPES:
+        if rtype in ("CNAME", "DNAME") and is_classless_cname_target(value):
+            # RFC 2317 (#4166): the parent's CNAME into a classless child.
+            return None
         try:
             validate_fqdn(value, field=f"{rtype} record target")
         except ValueError as exc:

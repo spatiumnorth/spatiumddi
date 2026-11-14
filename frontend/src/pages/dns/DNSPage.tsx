@@ -3494,7 +3494,7 @@ function RecordModalForm({
     ? RECORD_TYPES
     : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
-  const nameErr = recordOwnerError(name);
+  const nameErr = recordOwnerError(name, type, zoneName);
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", groupId],

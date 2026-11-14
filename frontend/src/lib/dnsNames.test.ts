@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  fqdnError,
+  isClasslessCnameTarget,
   nameInZoneError,
   parseTtlInput,
+  recordOwnerError,
   reversePointerName,
   summarizeZoneNames,
   zoneKindForName,
@@ -108,5 +111,79 @@ describe("reversePointerName (#3210)", () => {
     expect(reversePointerName("not-an-ip")).toBeNull();
     expect(reversePointerName("300.1.1.1")).toBeNull();
     expect(reversePointerName("::ffff:1.2.3.4")).toBeNull();
+  });
+});
+
+describe("fqdnError classless reverse zones (#4156)", () => {
+  it.each([
+    "0/26.2.0.192.in-addr.arpa",
+    "64/26.2.0.192.in-addr.arpa.",
+    "0/17.1.10.in-addr.arpa",
+    "0/26.2.0.192.IN-ADDR.ARPA",
+  ])("accepts %s", (name) => {
+    expect(fqdnError(name)).toBeNull();
+  });
+
+  it.each([
+    "0/26.example.com",
+    "0/26.2.0.192.ip6.arpa",
+    "a/26.2.0.192.in-addr.arpa",
+    "256/26.2.0.192.in-addr.arpa",
+    "0/33.2.0.192.in-addr.arpa",
+    "0/24.2.0.192.in-addr.arpa",
+    "0/26.in-addr.arpa",
+    "2.0/26.192.in-addr.arpa",
+    "0/26",
+  ])("still refuses %s", (name) => {
+    expect(fqdnError(name)).not.toBeNull();
+  });
+});
+
+describe("RFC 2317 records in the parent zone (#4166)", () => {
+  const parent = "2.0.192.in-addr.arpa.";
+
+  it.each([
+    ["64/26", "NS"],
+    ["64/26", "ns"],
+    ["128/25.", "DS"],
+  ])("accepts owner %s for %s in the parent", (owner, type) => {
+    expect(recordOwnerError(owner, type, parent)).toBeNull();
+  });
+
+  it.each([
+    ["64/26", "A", parent],
+    ["64/26", "CNAME", parent],
+    ["64/26", "NS", "example.com."],
+    ["64/24", "NS", parent],
+    ["64/26", "NS", "0/26.2.0.192.in-addr.arpa."],
+    ["64/26", undefined, undefined],
+    ["a/26", "NS", parent],
+    ["x.64/26", "NS", parent],
+  ])("still refuses owner %s for %s in %s", (owner, type, zone) => {
+    expect(recordOwnerError(owner, type, zone)).not.toBeNull();
+  });
+
+  it("leaves ordinary owners alone", () => {
+    expect(recordOwnerError("65", "PTR", parent)).toBeNull();
+    expect(recordOwnerError("_acme-challenge")).toBeNull();
+  });
+
+  it.each([
+    "65.64/26.2.0.192.in-addr.arpa.",
+    "65.64/26.2.0.192.in-addr.arpa",
+    "1.0/17.1.10.in-addr.arpa.",
+  ])("accepts CNAME target %s", (t) => {
+    expect(isClasslessCnameTarget(t)).toBe(true);
+  });
+
+  it.each([
+    "64/26.2.0.192.in-addr.arpa.",
+    "x.64/26.2.0.192.in-addr.arpa.",
+    "65.64/24.2.0.192.in-addr.arpa.",
+    "65.64/26.example.com.",
+    "65.66.64/26.2.0.192.in-addr.arpa.",
+    "256.64/26.2.0.192.in-addr.arpa.",
+  ])("refuses CNAME target %s", (t) => {
+    expect(isClasslessCnameTarget(t)).toBe(false);
   });
 });
