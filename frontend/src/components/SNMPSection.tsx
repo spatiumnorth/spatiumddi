@@ -73,7 +73,7 @@ function CommunityField({
   return (
     <Field
       label="Community string (v2c)"
-      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ``public`` is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
+      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ‘public’ is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
     >
       <div className="flex flex-col items-end gap-2">
         {clearPending ? (

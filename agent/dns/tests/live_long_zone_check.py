@@ -25,10 +25,13 @@ What this proves, against the named we ship:
   ``.db`` cannot be named at all, and a 250-character dynamic zone whose
   ownership sidecar cannot be named. A record change in another zone still
   goes live, and named is not restarted;
+* a signed zone of 215 characters or more never gets its keys (#3750:
+  BIND writes each key file through a longer temporary name), so it is
+  held back too, rather than served unsigned;
 * a held zone's stanza stays in ``named.conf`` with no file behind it:
   named starts and reloads with it, and answers SERVFAIL for the zone
   rather than handing its names to recursion;
-* the longest zones named can load (248, and 241 inline-signed) are
+* the longest zones named can load (248, and 214 inline-signed) are
   served, and a refused edit of one keeps its live copy;
 * removing the long zones clears the hold: the next apply holds nothing.
 
@@ -74,6 +77,8 @@ _L249 = _long(249, "jnl.example")
 _L253 = _long(253, "nofile.example")
 _L250_DYN = _long(250, "dyn.example")
 _L248 = _long(248, "fine.example")
+_L214_SIG = _long(214, "sig.example")
+_L215_SIG = _long(215, "sig.example")
 _L241_SIG = _long(241, "sig.example")
 _L242_SIG = _long(242, "sig.example")
 
@@ -193,6 +198,13 @@ def _apex(name: str, serial: int = 1, **extra) -> dict:
     )
 
 
+def _signed(name: str) -> dict:
+    """An inline-signed zone with real apex names, under the default policy."""
+    z = _apex(name + ".", dnssec_enabled=True)
+    z["dnssec_policy_name"] = "default"
+    return z
+
+
 def run(state: Path) -> None:
     from spatium_dns_agent.drivers.bind9 import Bind9Driver
 
@@ -202,11 +214,9 @@ def run(state: Path) -> None:
     def good(serial: int, www: str) -> dict:
         return _zone(_GOOD, [*ns, ("www", "A", www)], serial=serial)
 
-    # The longest zones named can journal: 248 (``.db.jnl`` is 255) and,
-    # inline-signed, 241 (``.db.signed.jnl`` is 255).
-    served = [_apex(_L248 + "."), _apex(_L241_SIG + ".", dnssec_enabled=True)]
-    for z in served[1:]:
-        z["dnssec_policy_name"] = "default"
+    # The longest zones named can load: 248 (``.db.jnl`` is 255) and,
+    # inline-signed, 214 (its key files' names, #3750).
+    served = [_apex(_L248 + "."), _signed(_L214_SIG)]
 
     print("\n=== a good zone, and the longest zones named can load ===")
     err = _apply(driver, _bundle([good(1, "192.0.2.10"), *served]))
@@ -214,7 +224,7 @@ def run(state: Path) -> None:
     check("named started", driver.daemon_running(), f"pid {driver.daemon_pid}")
     check("nothing held", not driver.held_back, str(_held(driver)))
     check("good zone answers", _q(f"www.{_GOOD}") == "192.0.2.10", _q(f"www.{_GOOD}"))
-    for zname in (_L248, _L241_SIG):
+    for zname in (_L248, _L214_SIG):
         got = _q(zname + ".", "NS")
         check(
             f"the {len(zname)}-character zone is served", got == "ns.good.example.", got
@@ -222,8 +232,6 @@ def run(state: Path) -> None:
     pid = driver.daemon_pid
 
     print("\n=== add the long zones the issue and its siblings name ===")
-    signed_242 = _apex(_L242_SIG + ".", dnssec_enabled=True)
-    signed_242["dnssec_policy_name"] = "default"
     zones = [
         good(2, "192.0.2.11"),
         *served,
@@ -236,9 +244,12 @@ def run(state: Path) -> None:
         # ``.db`` fits, ``.db.owned`` does not.
         _apex(_L250_DYN + ".", dynamic_update_enabled=True),
         # Inline-signed: ``.db.signed.jnl`` is 256.
-        signed_242,
+        _signed(_L242_SIG),
+        # Inline-signed: BIND cannot write the key files (#3750).
+        _signed(_L215_SIG),
+        _signed(_L241_SIG),
     ]
-    long_held = (_L250, _L249, _L253, _L250_DYN, _L242_SIG)
+    long_held = (_L250, _L249, _L253, _L250_DYN, _L242_SIG, _L215_SIG, _L241_SIG)
     err = _apply(driver, _bundle(zones))
     check("apply does not raise", err is None, err or "")
     held = _held(driver)
@@ -271,7 +282,7 @@ def run(state: Path) -> None:
             got == "SERVFAIL",
             got,
         )
-    for zname in (_L248, _L241_SIG):
+    for zname in (_L248, _L214_SIG):
         got = _q(zname + ".", "NS")
         check(
             f"the {len(zname)}-character zone is still served",

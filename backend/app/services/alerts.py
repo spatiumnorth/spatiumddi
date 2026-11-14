@@ -8891,6 +8891,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     # stable severity, so the rank compare never trips and
                     # they're left untouched.
                     new_severity = severity_override or rule.severity
+                    # #3930 — the subject was renamed since the event opened.
+                    # Follow it: the display, and the old name inside the
+                    # stored message and peak (the peak is compared with the
+                    # current message below, and a name is no reading).
+                    old_display = existing.subject_display
+                    if old_display and display and old_display != display:
+                        lov0 = existing.last_observed_value or {}
+                        existing.subject_display = display
+                        existing.message = existing.message.replace(old_display, display)
+                        if isinstance(lov0.get("peak_message"), str):
+                            existing.last_observed_value = {
+                                **lov0,
+                                "peak_message": lov0["peak_message"].replace(old_display, display),
+                            }
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         # The peak stays clean; the stored (and delivered)

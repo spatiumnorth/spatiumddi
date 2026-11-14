@@ -1,5 +1,6 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef } from "react";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
@@ -92,6 +93,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
+import { DeleteChoiceModal } from "@/components/ui/delete-choice-modal";
 import { Field } from "@/pages/dhcp/_shared";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -763,53 +765,6 @@ export function DeleteDNSGroupModal({
   );
 }
 
-/** Single-step destructive confirm (no checkbox). Used for low-stakes deletes
- * like individual DNS records — the two-step modal above stays for group /
- * blocklist deletes where the blast radius is much larger. */
-function ConfirmSingleModal({
-  title,
-  description,
-  onConfirm,
-  onClose,
-  isPending,
-  confirmLabel = "Delete",
-  error,
-}: {
-  title: string;
-  description: React.ReactNode;
-  onConfirm: () => void;
-  onClose: () => void;
-  isPending?: boolean;
-  confirmLabel?: string;
-  /** The server's reason when the action was refused, so a refused
-   *  delete says why instead of leaving the dialog as it was. */
-  error?: string | null;
-}) {
-  return (
-    <Modal title={title} onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">{description}</p>
-        {error && <p className="text-sm text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={isPending}
-            className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-          >
-            {isPending ? "Deleting…" : confirmLabel}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
 // ── Download helper ──────────────────────────────────────────────────────────
 
 function downloadBlob(
@@ -993,9 +948,9 @@ function ImportZoneModal({
         </p>
 
         {error && (
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
 
         {preview && (
@@ -1441,7 +1396,7 @@ function GroupModalForm({
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -2451,7 +2406,7 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
             <code>DNS_AGENT_KEY</code> in deployment docs.
           </p>
         )}
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -2689,9 +2644,9 @@ function DnssecCard({
       </div>
 
       {error && (
-        <div className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <FormError className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5">
           {error}
-        </div>
+        </FormError>
       )}
 
       {enabled && keys.length > 0 && (
@@ -3237,9 +3192,7 @@ function ZoneModalForm({
                 />
               </Field>
             )}
-            {transportErr && (
-              <p className="text-xs text-destructive">{transportErr}</p>
-            )}
+            {transportErr && <FormError>{transportErr}</FormError>}
           </div>
         )}
         {(zoneType === "secondary" || zoneType === "stub") && (
@@ -3415,7 +3368,7 @@ function ZoneModalForm({
             />
           </Field>
         )}
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -3641,7 +3594,7 @@ function RecordModalForm({
               required
               autoFocus
             />
-            {nameErr && <p className="text-xs text-destructive">{nameErr}</p>}
+            {nameErr && <FormError>{nameErr}</FormError>}
           </Field>
           <Field label="Type">
             <select
@@ -3887,7 +3840,7 @@ function RecordModalForm({
             </p>
           )}
         </Field>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -3912,6 +3865,24 @@ function RecordModalForm({
  * Hover tooltip lists every server with its own serial for quick drift
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
+/** A secondary / stub zone's serial is its primary's, so the target (our
+ * own `last_serial`, 0 for it) means nothing there. */
+function isTransferredZone(state: ZoneServerState): boolean {
+  return state.zone_type === "secondary" || state.zone_type === "stub";
+}
+
+/** The serial to show for a zone: ours for a primary; for a secondary, the
+ * one its servers serve, or null when none has reported or they differ. */
+function shownSerial(state: ZoneServerState): number | null {
+  if (!isTransferredZone(state)) return state.target_serial;
+  const served = new Set(
+    state.servers
+      .filter((s) => s.counted && s.current_serial)
+      .map((s) => s.current_serial),
+  );
+  return served.size === 1 ? [...served][0]! : null;
+}
+
 export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   if (state.servers.length === 0) return null;
   // #2316 — a paused (maintenance) server is shown separately and left out
@@ -3934,10 +3905,14 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
   // even when the serial it reported matches.
+  // The API's per-server verdict decides (#3940): a secondary's serial is its
+  // primary's and never equals the target. Without one, compare serials.
+  const serverInSync = (s: ZoneServerState["servers"][number]) =>
+    s.in_sync ?? s.current_serial === state.target_serial;
   const inSync = counted.filter(
-    (s) =>
-      s.counted && s.current_serial === state.target_serial && !s.pending_ops,
+    (s) => s.counted && serverInSync(s) && !s.pending_ops,
   );
+  const serial = shownSerial(state);
   const tooltip = state.servers
     .map((s) =>
       s.freshness === "disabled"
@@ -3949,7 +3924,7 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
             : s.current_serial === null
               ? `${s.server_name}: not reported`
               : `${s.server_name}: serial ${s.current_serial}` +
-                (s.current_serial !== state.target_serial ? " (drift)" : "") +
+                (!serverInSync(s) ? " (drift)" : "") +
                 (s.pending_ops
                   ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
                   : ""),
@@ -3965,11 +3940,13 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   } else if (state.in_sync) {
     cls =
       "bg-emerald-500/15 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400";
-    label = `${inSync.length}/${total} synced · serial ${state.target_serial}`;
+    label = `${inSync.length}/${total} synced`;
+    if (serial !== null) label += ` · serial ${serial}`;
   } else {
     cls =
       "bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400";
-    label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
+    label = `${total - inSync.length}/${total} drift`;
+    if (!isTransferredZone(state)) label += ` · target ${state.target_serial}`;
     if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
   if (total > 0 && notActive > 0) label += ` · ${notActiveText}`;
@@ -4316,6 +4293,8 @@ export function ZoneDetailView({
   // name / fqdn / value / type on the server; the per-column recFilter below
   // stays a client-side refinement over the current page.
   const [recordSearch, setRecordSearch] = useState("");
+  // The box edits `recordSearch` at once; the query follows 300 ms later (#4077).
+  const debouncedRecordSearch = useDebouncedValue(recordSearch);
   const [recordPage, setRecordPage] = useState(1);
   const recordPageSize = 100;
   // Search-landing highlight — ``highlightRecordId`` is passed down
@@ -4410,9 +4389,9 @@ export function ZoneDetailView({
       page: recordPage,
       page_size: recordPageSize,
     };
-    if (recordSearch.trim()) p.search = recordSearch.trim();
+    if (debouncedRecordSearch.trim()) p.search = debouncedRecordSearch.trim();
     return p;
-  }, [recordPage, recordSearch]);
+  }, [recordPage, debouncedRecordSearch]);
   const {
     data: recordsPage,
     isFetching,
@@ -4420,6 +4399,9 @@ export function ZoneDetailView({
   } = useQuery({
     queryKey: ["dns-records", zone.id, recordParams],
     queryFn: () => dnsApi.listRecords(group.id, zone.id, recordParams),
+    // Keep this zone's previous page on screen while the next search loads.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === zone.id ? prev : undefined,
   });
   const records = recordsPage?.items ?? [];
   const recordsTotal = recordsPage?.total ?? 0;
@@ -4476,7 +4458,8 @@ export function ZoneDetailView({
   });
 
   const deleteRecord = useMutation({
-    mutationFn: (r: DNSRecord) => dnsApi.deleteRecord(group.id, zone.id, r.id),
+    mutationFn: ({ rec, permanent }: { rec: DNSRecord; permanent: boolean }) =>
+      dnsApi.deleteRecord(group.id, zone.id, rec.id, { permanent }),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] }),
   });
@@ -4492,7 +4475,6 @@ export function ZoneDetailView({
   // may use it.
   const { isSuperadmin, can, canWriteRecords, canDeleteRecords } =
     useDnsGrants();
-  const [bulkPermanent, setBulkPermanent] = useState(false);
   // Outcome of the last bulk delete when some rows were skipped — the
   // selection persists across pages, so the count in the modal can differ
   // from what the server did (pool-managed or synthesised rows, wire
@@ -4505,7 +4487,13 @@ export function ZoneDetailView({
     // BULK_DELETE_CHUNK ids and the selection can exceed that across
     // pages, so chunk — and each chunk is its own trash batch, which the
     // confirm copy says rather than promising one restore.
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      permanent,
+    }: {
+      ids: string[];
+      permanent: boolean;
+    }) => {
       let deleted = 0;
       const skipped: { record_id: string; reason: string }[] = [];
       const batches: string[] = [];
@@ -4515,7 +4503,7 @@ export function ZoneDetailView({
           group.id,
           zone.id,
           ids.slice(i, i + BULK_DELETE_CHUNK),
-          { permanent: bulkPermanent },
+          { permanent },
         );
         deleted += res.deleted;
         skipped.push(...res.skipped);
@@ -4524,7 +4512,10 @@ export function ZoneDetailView({
       }
       return { deleted, skipped, batches, providerWarnings };
     },
-    onSuccess: ({ deleted, skipped, batches, providerWarnings }) => {
+    onSuccess: (
+      { deleted, skipped, batches, providerWarnings },
+      { permanent: bulkPermanent },
+    ) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
@@ -4551,7 +4542,6 @@ export function ZoneDetailView({
       } else {
         setBulkDeleteNotice(null);
       }
-      setBulkPermanent(false);
     },
   });
 
@@ -4762,7 +4752,10 @@ export function ZoneDetailView({
             )}
           </div>
           <p className="text-xs text-muted-foreground mt-0.5">
-            TTL {zone.ttl}s · serial {zone.last_serial || "—"}
+            TTL {zone.ttl}s · serial{" "}
+            {(serverState && isTransferredZone(serverState)
+              ? shownSerial(serverState)
+              : zone.last_serial) || "—"}
             {zone.primary_ns && ` · ${zone.primary_ns}`}
             {serverState && <ZoneSyncPill state={serverState} />}
           </p>
@@ -5284,7 +5277,8 @@ export function ZoneDetailView({
                 {recordsTotal.toLocaleString()}{" "}
                 {recordsTotal === 1 ? "record" : "records"}
                 {hasRecFilter && " · page filtered"}
-                {isFetching && " · loading…"}
+                {(isFetching || recordSearch !== debouncedRecordSearch) &&
+                  " · searching…"}
               </span>
             )}
             <div className="ml-auto">
@@ -5747,28 +5741,44 @@ export function ZoneDetailView({
         />
       )}
       {confirmDeleteRecord && (
-        <ConfirmSingleModal
+        <DeleteChoiceModal
           title="Delete Record"
-          description={
+          intro={
             <>
               Delete{" "}
               <span className="font-mono">
                 {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
               </span>
-              ? This will remove the record from the zone and fire an RFC 2136
-              update.
+              ?
             </>
           }
-          isPending={deleteRecord.isPending}
+          softHeading="Move to Trash (reversible)"
+          softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
+          softButtonLabel="Move to Trash"
+          permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
+          allowPermanent={isSuperadmin}
+          isSoftPending={
+            deleteRecord.isPending && !deleteRecord.variables?.permanent
+          }
+          isPermanentPending={
+            deleteRecord.isPending && !!deleteRecord.variables?.permanent
+          }
           error={
             deleteRecord.isError
               ? formatApiError(deleteRecord.error, "Delete failed")
               : null
           }
-          onConfirm={() =>
-            deleteRecord.mutate(confirmDeleteRecord, {
-              onSuccess: () => setConfirmDeleteRecord(null),
-            })
+          onSoft={() =>
+            deleteRecord.mutate(
+              { rec: confirmDeleteRecord, permanent: false },
+              { onSuccess: () => setConfirmDeleteRecord(null) },
+            )
+          }
+          onPermanent={() =>
+            deleteRecord.mutate(
+              { rec: confirmDeleteRecord, permanent: true },
+              { onSuccess: () => setConfirmDeleteRecord(null) },
+            )
           }
           onClose={() => {
             deleteRecord.reset();
@@ -5777,46 +5787,47 @@ export function ZoneDetailView({
         />
       )}
       {confirmBulkDelete && (
-        <ConfirmSingleModal
-          title={
-            bulkPermanent
-              ? `Permanently delete ${selectedRecords.size} records`
-              : `Move ${selectedRecords.size} records to the trash`
+        <DeleteChoiceModal
+          title={`Delete ${selectedRecords.size} records`}
+          intro={
+            <>
+              Delete the{" "}
+              <span className="font-medium">{selectedRecords.size}</span>{" "}
+              selected records? Moved to Trash, a superadmin can restore them
+              from Administration → Trash. IPAM-managed records are excluded
+              automatically.
+            </>
           }
-          description={
-            <div className="space-y-2">
-              <p>
-                {bulkPermanent ? "Permanently delete the " : "Move the "}
-                <span className="font-medium">{selectedRecords.size}</span>{" "}
-                selected records
-                {bulkPermanent
-                  ? "? This cannot be undone."
-                  : selectedRecords.size > BULK_DELETE_CHUNK
-                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
-                    : " to the trash? A superadmin can restore them together from Administration → Trash."}{" "}
-                IPAM-managed records are excluded automatically.
-              </p>
-              {isSuperadmin && (
-                <label className="flex items-center gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={bulkPermanent}
-                    onChange={(e) => setBulkPermanent(e.target.checked)}
-                  />
-                  Delete permanently (skip the trash)
-                </label>
-              )}
-            </div>
+          softHeading="Move to Trash (reversible)"
+          softBody={
+            selectedRecords.size > BULK_DELETE_CHUNK
+              ? `The records are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
+              : "A superadmin can restore them together from Administration → Trash."
           }
-          confirmLabel={bulkPermanent ? "Delete permanently" : "Move to trash"}
-          isPending={bulkDeleteRecords.isPending}
-          onConfirm={() =>
-            bulkDeleteRecords.mutate(Array.from(selectedRecords))
+          softButtonLabel="Move to Trash"
+          permanentBody="The records are removed immediately and retracted from the DNS server. There's no undo."
+          allowPermanent={isSuperadmin}
+          isSoftPending={
+            bulkDeleteRecords.isPending &&
+            !bulkDeleteRecords.variables?.permanent
           }
-          onClose={() => {
-            setConfirmBulkDelete(false);
-            setBulkPermanent(false);
-          }}
+          isPermanentPending={
+            bulkDeleteRecords.isPending &&
+            !!bulkDeleteRecords.variables?.permanent
+          }
+          onSoft={() =>
+            bulkDeleteRecords.mutate({
+              ids: Array.from(selectedRecords),
+              permanent: false,
+            })
+          }
+          onPermanent={() =>
+            bulkDeleteRecords.mutate({
+              ids: Array.from(selectedRecords),
+              permanent: true,
+            })
+          }
+          onClose={() => setConfirmBulkDelete(false)}
         />
       )}
       {showMoveZone && (
@@ -6955,7 +6966,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </div>
       )}
 
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {error && <FormError className="mt-2">{error}</FormError>}
 
       {(creating || editing) && (
         <ViewModal
@@ -7240,7 +7251,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </div>
         </details>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
@@ -7484,7 +7495,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
               placeholder={"10.0.0.0/8\n192.168.0.0/16\n!198.51.100.0/24"}
             />
           </Field>
-          {error && <p className="text-xs text-destructive">{error}</p>}
+          {error && <FormError>{error}</FormError>}
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -8044,9 +8055,7 @@ function TSIGKeyModalForm({
           />
         </div>
         {saveMut.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(saveMut.error, "Save failed")}
-          </p>
+          <FormError>{formatApiError(saveMut.error, "Save failed")}</FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -8597,9 +8606,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           button just flips back to "Save Changes" and the operator has no
           idea why nothing happened. */}
       {saveMut.isError && (
-        <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {formatApiError(saveMut.error, "Save failed")}
-        </p>
+        </FormError>
       )}
 
       {/* Stored values a Technitium server here will not apply (#1763):
@@ -9602,7 +9611,7 @@ function applyTextFilter(
   return v.includes(f);
 }
 
-function RecordsTab({
+export function RecordsTab({
   group,
   onSelectZone,
 }: {
@@ -9615,6 +9624,9 @@ function RecordsTab({
   // name / fqdn / value / type / zone on the server; the per-column filters
   // below stay client-side refinements over the current page.
   const [groupRecordSearch, setGroupRecordSearch] = useState("");
+  // The box edits `groupRecordSearch` at once; the query follows 300 ms later
+  // (#4077).
+  const debouncedGroupRecordSearch = useDebouncedValue(groupRecordSearch);
   const [groupRecordPage, setGroupRecordPage] = useState(1);
   const groupRecordPageSize = 100;
   const groupRecordParams = useMemo(() => {
@@ -9622,16 +9634,22 @@ function RecordsTab({
       page: groupRecordPage,
       page_size: groupRecordPageSize,
     };
-    if (groupRecordSearch.trim()) p.search = groupRecordSearch.trim();
+    if (debouncedGroupRecordSearch.trim())
+      p.search = debouncedGroupRecordSearch.trim();
     return p;
-  }, [groupRecordPage, groupRecordSearch]);
+  }, [groupRecordPage, debouncedGroupRecordSearch]);
   const {
     data: groupRecordsPage,
     isLoading,
+    isFetching: groupRecordsFetching,
     error: groupRecordsError,
   } = useQuery({
     queryKey: ["dns-group-records", group.id, groupRecordParams],
     queryFn: () => dnsApi.listGroupRecords(group.id, groupRecordParams),
+    // A new search keeps the previous rows (of this group) until it answers,
+    // so the page below — and the search box in it — is never unmounted (#4077).
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === group.id ? prev : undefined,
   });
   const records = groupRecordsPage?.items ?? [];
   const recordsTotal = groupRecordsPage?.total ?? 0;
@@ -9849,6 +9867,9 @@ function RecordsTab({
               {filtered.length.toLocaleString()} of{" "}
               {recordsTotal.toLocaleString()}{" "}
               {recordsTotal === 1 ? "record" : "records"}
+              {(groupRecordsFetching ||
+                groupRecordSearch !== debouncedGroupRecordSearch) &&
+                " · searching…"}
             </p>
           )}
         </div>
@@ -10091,9 +10112,9 @@ function RecordsTab({
               Administration → Trash.
             </p>
             {deleteMut.isError && (
-              <p className="text-sm text-destructive">
+              <FormError className="text-sm">
                 {formatApiError(deleteMut.error, "Delete failed")}
-              </p>
+              </FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -10829,7 +10850,7 @@ export function BlocklistScopeModal({
           )}
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex items-center justify-between border-t pt-3">
           <span className="text-xs text-muted-foreground">
@@ -11756,7 +11777,7 @@ function BlocklistModalForm({
           />
           Enabled
         </label>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>
@@ -12769,9 +12790,9 @@ export function SyncWithServersResultModal({
           </div>
         )}
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
         {result && (
           <>
@@ -12869,9 +12890,9 @@ export function SyncWithServersResultModal({
                 </summary>
                 <div className="px-3 py-2 space-y-2">
                   {srv.error && (
-                    <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                    <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                       {srv.error}
-                    </div>
+                    </FormError>
                   )}
                   {srv.result && (
                     <>
