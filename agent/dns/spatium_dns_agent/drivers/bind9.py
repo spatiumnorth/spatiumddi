@@ -1899,6 +1899,26 @@ def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
     return out
 
 
+_ZONE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./*-]*\.?$")
+
+
+def _zone_name_renderable(zname: str) -> bool:
+    """True when *zname* is safe to write into ``named.conf`` and a file path.
+
+    Mirrors the control plane's zone-name floor: no quote, whitespace, ``;``,
+    brace, backslash or control character, no ``..`` segment; ``/`` is kept
+    for RFC 2317 classless reverse zones. The root zone ``.`` is allowed.
+    """
+    if zname == ".":
+        return True
+    return bool(
+        _ZONE_NAME_RE.match(zname)
+        and ".." not in zname
+        and "/." not in zname
+        and "./" not in zname
+    )
+
+
 def _zone_rel(zname: str, view: str | None) -> str:
     return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
 
@@ -2108,8 +2128,21 @@ def _rpz_sidecar(path: Path) -> Path:
     return path.with_name(path.name + _RPZ_HASH_SUFFIX)
 
 
-def _write_rpz_sidecar(path: Path, key: str) -> None:
+def _hash_file(path: Path) -> str:
+    """sha256 of ``path``'s bytes, streamed so a 20 MB zone costs 1 MiB."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_rpz_sidecar(path: Path, key: str, digest: str | None = None) -> None:
     """Record ``key`` beside the RPZ file at ``path``, if the name can exist.
+
+    The sidecar holds ``<key> <size> <sha256 of the file>`` (#4080). ``digest``
+    is passed by a caller that has just hashed the file; otherwise it is hashed
+    here.
 
     The sidecar is an optimisation: a zone without one is rendered every
     time, as for a bundle with no hash. A zone name within ~14 bytes of the
@@ -2117,8 +2150,10 @@ def _write_rpz_sidecar(path: Path, key: str) -> None:
     served, just never reused.
     """
     try:
+        if digest is None:
+            digest = _hash_file(path)
         _write_new_inode(
-            _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
+            _rpz_sidecar(path), f"{key} {path.stat().st_size} {digest}\n".encode()
         )
     except OSError as exc:
         if not _name_too_long(exc):
@@ -2156,26 +2191,27 @@ def _rpz_serial(bl: dict[str, Any]) -> int:
     )
 
 
-def _rpz_reusable(src: Path, key: str) -> bool:
-    """``src`` is a regular file whose sidecar records ``key`` and whose size
-    is the size it had when it was written.
+def _rpz_reusable(src: Path, key: str) -> str | None:
+    """The file's sha256 when ``src`` is a regular file whose sidecar records
+    ``key`` and whose bytes still hash to what the sidecar recorded, else None.
 
-    The size is the cheap half of the check: these files are never rewritten
-    once they are reused, so a file truncated by a crash (written, renamed,
-    not yet flushed) would otherwise be linked forward from tree to tree
-    rather than replaced by the next render.
+    The content is the check, not the size (#4080): damage that keeps the size
+    (a flipped byte, a partial restore) used to be linked forward, and named
+    then failed to load the zone while the server reported ok. A file truncated
+    by a crash fails it too. The stream-hash costs far less than a render.
     """
     try:
         recorded = _rpz_sidecar(src).read_text(encoding="utf-8").split()
-        size = src.stat().st_size if src.is_file() and not src.is_symlink() else None
+        if not src.is_file() or src.is_symlink():
+            return None
+        if len(recorded) != 3 or recorded[0] != key:
+            return None
+        if recorded[1] != str(src.stat().st_size):
+            return None
+        digest = _hash_file(src)
     except (OSError, UnicodeDecodeError):
-        return False
-    return (
-        size is not None
-        and len(recorded) == 2
-        and recorded[0] == key
-        and recorded[1] == str(size)
-    )
+        return None
+    return digest if digest == recorded[2] else None
 
 
 def _fsync_path(path: Path) -> None:
@@ -3077,6 +3113,12 @@ class Bind9Driver(DriverBase):
     #: ingest mirrors (``learned`` in the bundle, #2850): for these named's
     #: copy wins at the carry (``_carry_zone``).
     _learned_rrsets: dict[str, set[str]] | None = None
+    #: Rendered paths (``zones/<view>/<zone>.db``) of the zones the last verify
+    #: found named had not loaded (#4080). Kept across applies: the retry after
+    #: a failed verify has to check them again though their bytes did not
+    #: change, and must render an RPZ one afresh rather than reuse the file
+    #: named could not load.
+    _unloaded_zones: set[str] = set()
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -3325,6 +3367,12 @@ class Bind9Driver(DriverBase):
             """
             zname = zone.get("name") or ""
             if not zname:
+                return ""
+            if not _zone_name_renderable(zname):
+                # Never interpolated into named.conf or a file path: a name
+                # with quotes, braces, ``;``, whitespace or a ``..`` segment
+                # would otherwise rewrite the config or escape ``zones/``.
+                log.warning("bind9_zone_skipped_invalid_name", zone=repr(zname))
                 return ""
             zone_type = zone.get("type", "primary")
             # Forward zones: just a forwarders block, no file / allow-update.
@@ -3954,10 +4002,13 @@ class Bind9Driver(DriverBase):
         out of ``named-checkzone`` and out of every ``rndc reload``.
         """
         key = _rpz_render_key(bl)
-        if key is not None:
+        # A file named could not load is not reused again (#4080): its sidecar
+        # vouches for the bytes, not for named being able to read them.
+        if key is not None and rel not in self._unloaded_zones:
             for tree in (self.rendered_dir_name, "rendered.prev"):
                 src = self.state_dir / tree / rel
-                if not _rpz_reusable(src, key):
+                digest = _rpz_reusable(src, key)
+                if digest is None:
                     continue
                 path.parent.mkdir(parents=True, exist_ok=True)
                 how = _link_or_copy(src, path)
@@ -3971,7 +4022,7 @@ class Bind9Driver(DriverBase):
                     # that; it changes no byte, and the backup sharing the
                     # inode loses nothing.
                     os.utime(path)
-                _write_rpz_sidecar(path, key)
+                _write_rpz_sidecar(path, key, digest)
                 log.info(
                     "bind9_rpz_reused",
                     zone=bl["rpz_zone_name"],
@@ -4572,6 +4623,13 @@ class Bind9Driver(DriverBase):
         sources = _view_carry_sources(new_dir, prev_tree)
         if changed is not None:
             changed |= carry
+            # Zones named failed to load last time are checked again, bytes
+            # changed or not (#4080).
+            changed |= {
+                zv
+                for zv in _zone_views_under(new_dir)
+                if _zone_rel(*zv) in self._unloaded_zones
+            }
         frozen: dict[tuple[str, str | None], int | None] = {}
         running = bool(rndc and current.exists() and self.daemon_running())
         if running:
@@ -5545,6 +5603,7 @@ class Bind9Driver(DriverBase):
             if only is None or zv in only
         }
         total = len(pending)
+        checked = {_zone_rel(*zv) for zv in pending}
         why: dict[tuple[str, str | None], str] = {}
         deadline = time.monotonic() + _ZONE_LOAD_TIMEOUT_S
 
@@ -5580,6 +5639,11 @@ class Bind9Driver(DriverBase):
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(_ZONE_LOAD_POLL_S)
+        # Remember what named did not load, for the retry (#4080); a zone that
+        # loaded is forgotten.
+        self._unloaded_zones = (self._unloaded_zones - checked) | {
+            _zone_rel(*zv) for zv in pending
+        }
         if pending:
             listed = [
                 f"{_zone_label(*zv)}: {why.get(zv, 'no answer')}" for zv in pending
