@@ -98,8 +98,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # (``periodic_served_serials``) is asked between changes. Named also moves a
 # zone's serial through updates this agent never sent (a third party's RFC
 # 2136 client, a DNSSEC key event on a signed zone); nothing else reports
-# those, and the zone would read in sync at a serial no longer served.
-SERVED_REPORT_SECONDS = 120.0
+# those, and the zone would read in sync at a serial no longer served. A
+# secondary's transfer is the same (#4065): named takes a newer serial, or a
+# first one, with no apply here.
+SERVED_REPORT_SECONDS = 60.0
 
 # #2309 — how often the key directory is re-checked between structural
 # applies, so a zone's key files go when its grace period ends.
@@ -145,6 +147,11 @@ def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[st
 def _serial_later(new: int, old: int) -> bool:
     """RFC 1982 serial arithmetic: ``new`` is later than ``old``."""
     return 0 < (new - old) % 2**32 < 2**31
+
+
+def _view_names(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """The bundle's views reduced to their names (#4053)."""
+    return [{"name": v.get("name")} for v in bundle.get("views") or [] if v.get("name")]
 
 
 def _zone_key(name: Any) -> str:
@@ -859,15 +866,19 @@ class SyncLoop:
     def _dnssec_bundle(self, bundle: dict[str, Any] | None) -> None:
         if bundle is None:
             self._dnssec_frozen: bytes | None = None
+            self._applied_views: list[dict[str, Any]] = []
             return
         self._dnssec_frozen = _freeze(
             {
                 "zones": [
                     {k: v for k, v in zone.items() if k != "records"}
                     for zone in bundle.get("zones") or []
-                ]
+                ],
             }
         )
+        # #4053 — the view names alone (a few short strings), for the startup
+        # report's read-back after a re-registration.
+        self._applied_views = _view_names(bundle)
 
     # #1373 / #2223 — the serial last reported per zone. One entry per zone,
     # created while the bundle that carried it is still alive, so it pins the
@@ -897,10 +908,20 @@ class SyncLoop:
             return
         self._boot_report_frozen = _freeze(
             {
+                # #4053 — ``served_zone_serials`` picks what to read back from
+                # named by each zone's ``type`` and by the bundle's views; with
+                # neither kept, a secondary was read as a primary and a group
+                # with views as one without.
                 "zones": [
-                    {"name": zone.get("name"), "serial": zone.get("serial")}
+                    {
+                        "name": zone.get("name"),
+                        "serial": zone.get("serial"),
+                        # Absent stays absent: it reads as "primary".
+                        **({"type": zone["type"]} if "type" in zone else {}),
+                    }
                     for zone in bundle.get("zones") or []
-                ]
+                ],
+                "views": _view_names(bundle),
             }
         )
 
@@ -975,7 +996,7 @@ class SyncLoop:
                     # Record ops moved it past the structural apply's serial.
                     zone = {**zone, "serial": served}
                 zones.append(zone)
-            self._boot_report_bundle = {"zones": zones}
+            self._boot_report_bundle = {"zones": zones, "views": self._applied_views}
             self._boot_report_attempts = 0
         self._reported_serials = {}
         self._dnssec_reported = None

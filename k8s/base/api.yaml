@@ -20,6 +20,7 @@ spec:
     metadata:
       labels:
         app: spatiumddi-api
+        app.kubernetes.io/name: spatiumddi
         app.kubernetes.io/component: api
     spec:
       # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is

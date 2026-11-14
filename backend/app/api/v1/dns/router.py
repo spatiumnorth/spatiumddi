@@ -6280,11 +6280,16 @@ class ServerZoneStateEntry(BaseModel):
     # for ``ok``.
     freshness: Literal["ok", "unreachable", "paused", "disabled"] = "ok"
     counted: bool = True
+    # The verdict on this server's report: a primary zone serves our serial, a
+    # secondary / stub zone holds a copy (its serial is its primary's, not
+    # ours) and no op is pending. False when it has not reported.
+    in_sync: bool = False
 
 
 class ServerZoneStateResponse(BaseModel):
     zone_id: uuid.UUID
     zone_name: str
+    zone_type: str = "primary"
     target_serial: int
     servers: list[ServerZoneStateEntry]
     in_sync: bool
@@ -6346,6 +6351,11 @@ async def get_zone_server_state(
             freshness = "unreachable"
         else:
             freshness = "ok"
+        entry_in_sync = (
+            current is not None
+            and not pending
+            and zone_state_in_sync(zone, current, target, srv.driver)
+        )
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -6356,6 +6366,7 @@ async def get_zone_server_state(
                 pending_ops=pending,
                 freshness=freshness,
                 counted=freshness == "ok",
+                in_sync=entry_in_sync,
             )
         )
         if freshness in ("paused", "disabled"):
@@ -6367,12 +6378,13 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if pending or not zone_state_in_sync(zone, current, target, srv.driver):
+            if not entry_in_sync:
                 all_in_sync = False
 
     return ServerZoneStateResponse(
         zone_id=zone.id,
         zone_name=zone.name,
+        zone_type=zone.zone_type or "primary",
         target_serial=target,
         servers=entries,
         in_sync=all_in_sync and any_reported,
@@ -8446,6 +8458,12 @@ async def move_zone_commit(
     # and deleting through the source would remove it. Decided AFTER the
     # create, because a target that already held the zone is the evidence
     # that does not depend on the credentials naming the provider correctly.
+    # #3888: the name gate, before the source-copy check below reads other
+    # groups' zones (the target push takes it too; this covers a target with no
+    # agentless server, whose source delete still shares a provider).
+    from app.services.lock_order import lock_provider_zone_name  # noqa: PLC0415
+
+    await lock_provider_zone_name(db, zone.name)
     try:
         adopted_on = await _push_zone_to_agentless_servers(
             db,
@@ -9077,6 +9095,13 @@ async def _push_zone_to_agentless_servers(
     # ``skip_server_ids``: servers the caller has decided not to drive (the
     # move keeps a source copy that shares a provider with the target, #3805).
     skip = set(skip_server_ids or set())
+    group_servers = list(servers_res.scalars().all())
+    if any(is_agentless(s.driver) for s in group_servers):
+        # #3888: one zone name at a time per provider, before the shared-copy
+        # check reads other groups' rows and until this transaction commits.
+        from app.services.lock_order import lock_provider_zone_name  # noqa: PLC0415
+
+        await lock_provider_zone_name(db, zone.name)
     if op == "delete" and group_id is None:
         # #3812: the zone's own group is being deleted from; the move passes
         # ``group_id`` and decides its keeps itself (#3805).
@@ -9086,9 +9111,7 @@ async def _push_zone_to_agentless_servers(
             kept_notes.extend(shared.notes)
         for note in shared.notes:
             logger.warning("dns.zone.delete_kept_shared_provider_copy", zone=zone.name, note=note)
-    targets = [
-        s for s in servers_res.scalars().all() if is_agentless(s.driver) and s.id not in skip
-    ]
+    targets = [s for s in group_servers if is_agentless(s.driver) and s.id not in skip]
     if not targets:
         return []
 
