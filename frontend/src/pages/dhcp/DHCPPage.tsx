@@ -1148,7 +1148,9 @@ function GroupServersList({
 
       {servers.length === 0 ? (
         <p className="text-sm text-muted-foreground italic">
-          No servers. Add one manually or start a Kea agent container.
+          No servers.
+          {!superadminGate.disabled &&
+            " Add one manually or start a Kea agent container."}
         </p>
       ) : (
         <div className="space-y-2">

@@ -171,8 +171,13 @@ export function VLANsPage() {
           )}
           {!isLoading && routers.length === 0 && (
             <p className="text-xs text-muted-foreground italic px-2 py-4">
-              <ListEmpty error={routersError} what="routers">
-                No routers yet. Click + to add one.
+              <ListEmpty
+                error={routersError}
+                what="routers"
+                gate={writeGate}
+                hint="Click + to add one."
+              >
+                No routers yet.
               </ListEmpty>
             </p>
           )}

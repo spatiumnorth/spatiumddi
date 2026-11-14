@@ -17,6 +17,7 @@ import {
   type ZoneDriftServer,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { usePermissions } from "@/hooks/usePermissions";
 import {
   RECORD_TYPE_BADGE,
   RECORD_TYPE_BADGE_FALLBACK,
@@ -280,6 +281,8 @@ export function DriftView({
   group: DNSServerGroup;
   zone: DNSZone;
 }) {
+  // Sync with server (zone Data menu) asks write on dns_record (#4116).
+  const canSync = usePermissions().can("write", "dns_record");
   // Deliberately NOT auto-refetched: one call fans out an AXFR to every
   // server in the group, so it runs when the operator opens this tab and
   // then only when they ask for it again. `retry: false` for the same
@@ -313,8 +316,9 @@ export function DriftView({
             zone.
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Read-only — nothing here is applied. Use Sync to push the database
-            state to a server that has drifted.
+            Read-only — nothing here is applied.
+            {canSync &&
+              " Use Sync to push the database state to a server that has drifted."}
           </p>
         </div>
         <button
