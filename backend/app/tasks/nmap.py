@@ -18,12 +18,14 @@ from typing import Any
 import structlog
 
 from app.celery_app import celery_app
+from app.core.task_lock import single_flight
 from app.services.nmap.runner import NmapScanRowMissing, run_scan
 
 logger = structlog.get_logger(__name__)
 
 
 @celery_app.task(name="app.tasks.nmap.run_scan", bind=True, max_retries=8)
+@single_flight(lambda scan_id_str: scan_id_str)
 def run_scan_task(self: Any, scan_id_str: str) -> dict[str, str]:
     """Drive one nmap scan from start to finish.
 
