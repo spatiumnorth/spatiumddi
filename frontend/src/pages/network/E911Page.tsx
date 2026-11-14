@@ -186,6 +186,8 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
   const [verdictFor, setVerdictFor] = useState<ERL | null>(null);
   const [del, setDel] = useState<ERL | null>(null);
   const [error, setError] = useState("");
+  // A refused delete is read inside the confirm that stays open (#4218).
+  const [delError, setDelError] = useState("");
 
   const query = useQuery({
     queryKey: ["e911-erls", page, search, validation, dispatchable],
@@ -202,6 +204,7 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => e911Api.removeErl(id),
+    onMutate: () => setDelError(""),
     onSuccess: () => {
       setDel(null);
       setError("");
@@ -211,7 +214,7 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
       // tab showing rules that no longer exist.
       void qc.invalidateQueries({ queryKey: ["e911-bindings"] });
     },
-    onError: (e) => setError(formatApiError(e)),
+    onError: (e) => setDelError(formatApiError(e)),
   });
 
   // The exports need the same read on `e911_location` the list does, so a
@@ -475,11 +478,15 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
               "no location at all."
             : ""
         }
+        error={delError}
         confirmLabel="Delete"
         tone="destructive"
         loading={remove.isPending}
         onConfirm={() => del && remove.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          setDelError("");
+        }}
       />
     </div>
   );
@@ -863,7 +870,8 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
   const [kind, setKind] = useState<"" | E911RuleKind>("");
   const [creating, setCreating] = useState(false);
   const [del, setDel] = useState<ERLBinding | null>(null);
-  const [error, setError] = useState("");
+  // A refused delete is read inside the confirm that stays open (#4218).
+  const [delError, setDelError] = useState("");
 
   const query = useQuery({
     queryKey: ["e911-bindings", page, kind],
@@ -878,13 +886,14 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => e911Api.removeBinding(id),
+    onMutate: () => setDelError(""),
     onSuccess: () => {
       setDel(null);
       void qc.invalidateQueries({ queryKey: ["e911-bindings"] });
       // binding_count on the Locations tab moves with this.
       void qc.invalidateQueries({ queryKey: ["e911-erls"] });
     },
-    onError: (e) => setError(formatApiError(e)),
+    onError: (e) => setDelError(formatApiError(e)),
   });
 
   const items = query.data?.items ?? [];
@@ -941,8 +950,6 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
           </HeaderButton>
         )}
       </div>
-
-      {error && <p className="mb-2 text-sm text-rose-600">{error}</p>}
 
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[48rem] text-sm">
@@ -1043,11 +1050,15 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
               "back to a coarser rule, or to no location at all."
             : ""
         }
+        error={delError}
         confirmLabel="Delete"
         tone="destructive"
         loading={remove.isPending}
         onConfirm={() => del && remove.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          setDelError("");
+        }}
       />
     </div>
   );

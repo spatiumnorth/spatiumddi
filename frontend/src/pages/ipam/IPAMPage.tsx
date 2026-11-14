@@ -6006,9 +6006,14 @@ export function SubnetDetail({
   // #516 — surface delete/purge/restore failures (403/409/etc.) instead of
   // silently swallowing them.
   const [actionError, setActionError] = useState<string | null>(null);
+  // A refused delete / purge is read inside the confirm that stays open, as an
+  // announced line: the banner above sits behind the aria-modal dialog, which
+  // a screen reader treats as inert (#4218).
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const deleteAddr = useMutation({
     mutationFn: (id: string) => ipamApi.deleteAddress(id), // soft-delete → orphan
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setConfirmDeleteAddr(null);
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
@@ -6019,11 +6024,12 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
-      setActionError(formatApiError(e, "Failed to delete address.")),
+      setDeleteError(formatApiError(e, "Failed to delete address.")),
   });
 
   const purgeAddr = useMutation({
     mutationFn: (id: string) => ipamApi.deleteAddress(id, true), // permanent
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       // Purge can be triggered from either modal: the orphan-row trash
       // icon (``confirmPurgeAddr``) or the allocated-row delete-modal's
@@ -6039,7 +6045,7 @@ export function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["blocks"] });
     },
     onError: (e) =>
-      setActionError(formatApiError(e, "Failed to purge address.")),
+      setDeleteError(formatApiError(e, "Failed to purge address.")),
   });
 
   const restoreAddr = useMutation({
@@ -7772,9 +7778,13 @@ export function SubnetDetail({
           address={confirmDeleteAddr}
           onOrphan={() => deleteAddr.mutate(confirmDeleteAddr.id)}
           onPurge={() => purgeAddr.mutate(confirmDeleteAddr.id)}
-          onClose={() => setConfirmDeleteAddr(null)}
+          onClose={() => {
+            setConfirmDeleteAddr(null);
+            setDeleteError(null);
+          }}
           isOrphanPending={deleteAddr.isPending}
           isPurgePending={purgeAddr.isPending}
+          error={deleteError}
         />
       )}
       {confirmPurgeAddr && (
@@ -7783,8 +7793,12 @@ export function SubnetDetail({
           message={`Permanently delete ${addressWithHost(confirmPurgeAddr)}? This cannot be undone.`}
           confirmLabel="Delete Forever"
           onConfirm={() => purgeAddr.mutate(confirmPurgeAddr.id)}
-          onClose={() => setConfirmPurgeAddr(null)}
+          onClose={() => {
+            setConfirmPurgeAddr(null);
+            setDeleteError(null);
+          }}
           isPending={purgeAddr.isPending}
+          error={deleteError ?? undefined}
         />
       )}
       {showBulkEdit && (
@@ -12375,6 +12389,7 @@ export function DeleteOrOrphanModal({
   onClose,
   isOrphanPending,
   isPurgePending,
+  error,
 }: {
   address: IPAddress;
   onOrphan: () => void;
@@ -12382,6 +12397,7 @@ export function DeleteOrOrphanModal({
   onClose: () => void;
   isOrphanPending?: boolean;
   isPurgePending?: boolean;
+  error?: string | null;
 }) {
   // #3210 — name the host and the records the consequence touches. The
   // primary record is known from the row; aliases need a read, which may
@@ -12452,6 +12468,7 @@ export function DeleteOrOrphanModal({
       onClose={onClose}
       isSoftPending={isOrphanPending}
       isPermanentPending={isPurgePending}
+      error={error}
     />
   );
 }
