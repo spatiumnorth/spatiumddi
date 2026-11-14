@@ -193,6 +193,23 @@ def _local_api_usable() -> bool:
     return time.monotonic() - _local_api["last_failure"] >= _LOCAL_API_RETRY_S
 
 
+def _fallback_client(cfg: SupervisorConfig, url: str) -> httpx.Client | None:
+    """The client for the same-call fallback attempt to ``url``.
+
+    Built from the pin file as it is now, exactly as the ordinary heartbeat
+    client for that URL is. A TLS target with nothing pinned yet gets no
+    client at all (the caller skips the attempt) rather than one that
+    verifies against the system trust store.
+    """
+    if (
+        not cp_tls.skip_verify()
+        and cp_tls.tls_url(url) is not None
+        and cp_tls.load_pins(cfg.state_dir) is None
+    ):
+        return None
+    return cp_tls.client(cfg.state_dir, url, first_contact=False)
+
+
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     """Resolve the heartbeat target.
 
@@ -1534,12 +1551,14 @@ def heartbeat_once(
     # Two attempts at most: the node-local Service, then (when that had no
     # answer) the fallback target, in the same call so a node whose api pod is
     # away loses one connect timeout, not a whole heartbeat interval.
+    send = client
+    retry_client: httpx.Client | None = None
     for _attempt in range(2):
         timeout = httpx.Timeout(read_timeout)
         if url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
             timeout = httpx.Timeout(read_timeout, connect=_LOCAL_API_CONNECT_TIMEOUT_S)
         try:
-            resp = client.post(url, content=body_bytes, headers=headers, timeout=timeout)
+            resp = send.post(url, content=body_bytes, headers=headers, timeout=timeout)
         except httpx.HTTPError as exc:
             # A read timeout means an api pod took the request; anything else
             # (refused, connect timeout, no endpoint, DNS) means the node-local
@@ -1554,14 +1573,29 @@ def heartbeat_once(
             # refuse if not (an interception). The next heartbeat uses the result.
             if cp_tls.is_verification_failure(exc):
                 cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+                if retry_client is not None:
+                    retry_client.close()
                 return None
             retry = _effective_control_plane_url(cfg).rstrip("/") + url_path
             if retry == url:
+                if retry_client is not None:
+                    retry_client.close()
                 return None
             url = retry
+            # ``client`` was built for the node-local URL (plain http, no
+            # certificate), so it carries no pin. The fallback gets a client
+            # built the way an ordinary heartbeat to that URL is: from the
+            # CURRENT pin file, so a re-pin since this process started is
+            # honoured, and never from the default trust store.
+            retry_client = _fallback_client(cfg, retry)
+            if retry_client is None:
+                return None
+            send = retry_client
             continue
         note_local_api_result(url, True)
         break
+    if retry_client is not None:
+        retry_client.close()
     if resp is None:
         return None
     revocation = revocation_reason(resp)

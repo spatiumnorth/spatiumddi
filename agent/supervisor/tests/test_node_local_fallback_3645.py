@@ -53,7 +53,11 @@ def _run(
         control_plane_url=control_plane_url,
         hostname="n",
     )
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(handler)
+    ) as client, pytest.MonkeyPatch.context() as mp:
+        # the fallback gets its own client in production; here it is the mock
+        mp.setattr(heartbeat, "_fallback_client", lambda cfg, url: client)
         held = heartbeat.heartbeat_once(
             cfg, uuid.uuid4(), "tok", None, client, structlog.get_logger()  # type: ignore[arg-type]
         )
