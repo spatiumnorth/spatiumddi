@@ -6364,6 +6364,19 @@ class DriftRecordEntry(BaseModel):
     port: int | None = None
 
 
+class LockedDriftEntry(BaseModel):
+    """A locked record the server does not serve as saved (#3361)."""
+
+    name: str
+    record_type: str
+    value: str
+    lock_level: str
+    locked_by: str | None = None
+    lock_reason: str | None = None
+    # What the server holds under the same name and type; empty = nothing.
+    live_values: list[str] = []
+
+
 class ServerDriftEntry(BaseModel):
     server_id: str
     server_name: str
@@ -6380,6 +6393,7 @@ class ServerDriftEntry(BaseModel):
     drift_count: int
     extra_on_server: list[DriftRecordEntry]
     missing_on_server: list[DriftRecordEntry]
+    locked_differs: list[LockedDriftEntry] = []
 
 
 class ZoneDriftResponse(BaseModel):
@@ -6453,6 +6467,18 @@ async def get_zone_drift(
                         port=r.port,
                     )
                     for r in s.missing_on_server
+                ],
+                locked_differs=[
+                    LockedDriftEntry(
+                        name=r.name,
+                        record_type=r.record_type,
+                        value=r.value,
+                        lock_level=r.lock_level,
+                        locked_by=r.locked_by,
+                        lock_reason=r.lock_reason,
+                        live_values=r.live_values,
+                    )
+                    for r in s.locked_differs
                 ],
             )
             for s in report.servers

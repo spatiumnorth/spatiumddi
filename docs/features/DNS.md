@@ -2311,7 +2311,7 @@ object, the level, who locked it and why. A parent delete (or split, merge,
 move) that would take a locked object with it is refused with the first five
 locked descendants named. Bulk edits and deletes skip the locked rows and list
 each one in the response (`skipped_locked` / `locked`); importers leave a locked
-row as it is and report it under `skipped`. A locked record is never rewritten or removed by the IPAM sync, the zone-file / spreadsheet importers, bulk delete or a zone delete. An edit-locked group neither gives up nor takes in a server; an edit-locked zone cannot be moved to another group.
+row as it is and report it under `skipped`. A locked record is never rewritten or removed by the IPAM sync, the zone-file / spreadsheet importers, bulk delete or a zone delete. An edit-locked group neither gives up nor takes in a server; an edit-locked zone cannot be moved to another group. The config-drift report (Drift tab, #61) lists, per server, each locked record whose live value differs from the saved one (`locked_differs`: the saved value, the lock, and the value or values the server holds under that name and type), so a locked record changed on the host is not one line among many.
 
 Lock and unlock with `PUT /api/v1/locks/{resource_type}/{id}` and
 `POST /api/v1/locks/{resource_type}/{id}/unlock` (a reason in both bodies);
@@ -2320,6 +2320,8 @@ Lock and unlock with `PUT /api/v1/locks/{resource_type}/{id}` and
 mirror, a dynamic-lease mirror) cannot be locked: the integration would
 overwrite them. The Copilot has `find_locked_resources`, and its delete
 proposals are refused on a locked target; it has no way to unlock.
+
+The optional **Resource lock removed** alert rule (Alerts → Rules; seeded disabled) opens one event per unlock, naming who removed the lock, what it protected and the reason they gave. Each event resolves by itself after `threshold_days` (default 1). A lock that merely expires does not fire it.
 
 ## 17. GSLB pools (health-checked) + geo / topology-aware steering (issue #530)
 

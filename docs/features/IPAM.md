@@ -1202,6 +1202,8 @@ mirror, a dynamic-lease mirror) cannot be locked: the integration would
 overwrite them. The Copilot has `find_locked_resources`, and its delete
 proposals are refused on a locked target; it has no way to unlock.
 
+The optional **Resource lock removed** alert rule (Alerts → Rules; seeded disabled) opens one event per unlock, naming who removed the lock, what it protected and the reason they gave.
+
 ## 12. MAC Address / OUI Vendor Lookup
 
 **Opt-in feature** — configured in Settings → IPAM → OUI Vendor Lookup. Off by default. When enabled, SpatiumDDI maintains a local copy of the IEEE OUI database to display vendor names next to MAC addresses in all IP and DHCP lease tables.

@@ -785,6 +785,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_wol_wake_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("wol_wake_failed_alert_rule_seed_skipped", reason=str(exc))
+    # Resource-lock-removed alert rule — singleton, DISABLED by default (#3361).
+    try:
+        from app.services.alerts import seed_resource_lock_removed_alert_rule  # noqa: PLC0415
+
+        await seed_resource_lock_removed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("resource_lock_removed_alert_rule_seed_skipped", reason=str(exc))
     # New-device (arpwatch) alert rule — singleton, DISABLED by default (issue
     # #459). Fires on never-before-seen MACs once new-device watch is on.
     try:
