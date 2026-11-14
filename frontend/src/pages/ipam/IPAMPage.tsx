@@ -102,6 +102,7 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
+  disabledBecause,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -4413,8 +4414,13 @@ export function AddAddressModal({
                     { name: "", record_type: "CNAME" },
                   ])
                 }
-                disabled={!hostname || !publishZoneId}
                 className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                {...disabledBecause(
+                  !hostname || !publishZoneId,
+                  !hostname
+                    ? "Enter a hostname first."
+                    : "Pick a DNS zone first; aliases are published there.",
+                )}
               >
                 <Plus className="h-3 w-3" /> Add alias
               </button>
@@ -17959,9 +17965,12 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
             </button>
             <button
               type="button"
-              disabled={selected.size === 0}
               onClick={() => setShowBulkDelete(true)}
               className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:opacity-40"
+              {...disabledBecause(
+                selected.size === 0,
+                "Select at least one address first.",
+              )}
               {...permissionGate(canDeleteIpam, NEEDS_ADDRESS_DELETE)}
             >
               <Trash2 className="h-3.5 w-3.5" />
@@ -17969,9 +17978,12 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
             </button>
             <button
               type="button"
-              disabled={selected.size === 0}
               onClick={() => setShowBulkEdit(true)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              {...disabledBecause(
+                selected.size === 0,
+                "Select at least one address first.",
+              )}
               {...permissionGate(canBulkEdit, NEEDS_ADDRESS_WRITE)}
             >
               <Pencil className="h-3.5 w-3.5" />
@@ -18354,10 +18366,13 @@ export function IPAMPage() {
             </button>
             <button
               onClick={() => setShowImport(true)}
-              disabled={!spaces || spaces.length === 0}
               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
               title="Import subnets"
               aria-label="Import subnets"
+              {...disabledBecause(
+                !spaces || spaces.length === 0,
+                "Create an IP space first; imported subnets need a space to land in.",
+              )}
               {...permissionGate(canImportSubnets, NEEDS_SUBNET_WRITE)}
             >
               <Upload className="h-3.5 w-3.5" />
