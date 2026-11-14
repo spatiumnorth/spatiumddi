@@ -7910,6 +7910,24 @@ async def update_subnet(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=scoped_grant_refusal(field, "subnet"),
                 )
+        # The switches are judged on the value the update will STORE, not only
+        # on the body: ``ddns_enabled: true`` and a primary ``dns_zone_id``
+        # clear DDNS / DNS inheritance further down, whatever the body says
+        # about the switch itself.
+        for field, flips in (
+            ("dns_inherit_settings", bool(body.dns_zone_id)),
+            ("ddns_inherit_settings", body.ddns_enabled is True),
+        ):
+            stored = getattr(subnet, field)
+            if field in body.model_fields_set and getattr(body, field) is not None:
+                stored = getattr(body, field)
+            if flips:
+                stored = False
+            if stored != getattr(subnet, field):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=scoped_grant_refusal(field, "subnet"),
+                )
         await _assert_scoped_zones(
             db,
             current_user,
