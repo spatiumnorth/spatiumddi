@@ -134,6 +134,10 @@ export function RuleEditorModal({
   );
   const [notifySmtp, setNotifySmtp] = useState(existing?.notify_smtp ?? false);
   const [error, setError] = useState<string | null>(null);
+  // #3929 — a number input holding text the browser cannot read as a number
+  // (`85-`) reports value "", which would save as "use the default". Track
+  // those fields (from the input's validity) so Save refuses them in words.
+  const [unreadable, setUnreadable] = useState<Record<string, boolean>>({});
 
   const stored = existing as unknown as Record<string, unknown> | null;
   const current = (p: AlertParamSpec): number | string | null => {
@@ -307,7 +311,13 @@ export function RuleEditorModal({
                 max={p.max ?? undefined}
                 className={inputCls}
                 value={numVal(current(p) as number | null)}
-                onChange={(e) => setParam(p.name, parseNum(e.target.value))}
+                onChange={(e) => {
+                  setUnreadable((u) => ({
+                    ...u,
+                    [p.name]: e.target.validity.badInput,
+                  }));
+                  setParam(p.name, parseNum(e.target.value));
+                }}
               />
             )}
           </Field>
@@ -399,7 +409,19 @@ export function RuleEditorModal({
               catalogueBlocks ||
               (!!existing && catalogue.isLoading)
             }
-            onClick={() => mut.mutate()}
+            onClick={() => {
+              const bad = (spec?.params ?? []).filter(
+                (p) => p.kind !== "select" && unreadable[p.name],
+              );
+              if (bad.length > 0) {
+                setError(
+                  `${bad.map((p) => p.label).join(", ")}: not a number. Enter digits only, or clear the field to use the default.`,
+                );
+                return;
+              }
+              setError(null);
+              mut.mutate();
+            }}
             className={cn(
               "rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
               "hover:bg-primary/90 disabled:opacity-50",

@@ -3861,6 +3861,24 @@ function RecordModalForm({
  * Hover tooltip lists every server with its own serial for quick drift
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
+/** A secondary / stub zone's serial is its primary's, so the target (our
+ * own `last_serial`, 0 for it) means nothing there. */
+function isTransferredZone(state: ZoneServerState): boolean {
+  return state.zone_type === "secondary" || state.zone_type === "stub";
+}
+
+/** The serial to show for a zone: ours for a primary; for a secondary, the
+ * one its servers serve, or null when none has reported or they differ. */
+function shownSerial(state: ZoneServerState): number | null {
+  if (!isTransferredZone(state)) return state.target_serial;
+  const served = new Set(
+    state.servers
+      .filter((s) => s.counted && s.current_serial)
+      .map((s) => s.current_serial),
+  );
+  return served.size === 1 ? [...served][0]! : null;
+}
+
 export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   if (state.servers.length === 0) return null;
   // #2316 — a paused (maintenance) server is shown separately and left out
@@ -3883,10 +3901,14 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
   // even when the serial it reported matches.
+  // The API's per-server verdict decides (#3940): a secondary's serial is its
+  // primary's and never equals the target. Without one, compare serials.
+  const serverInSync = (s: ZoneServerState["servers"][number]) =>
+    s.in_sync ?? s.current_serial === state.target_serial;
   const inSync = counted.filter(
-    (s) =>
-      s.counted && s.current_serial === state.target_serial && !s.pending_ops,
+    (s) => s.counted && serverInSync(s) && !s.pending_ops,
   );
+  const serial = shownSerial(state);
   const tooltip = state.servers
     .map((s) =>
       s.freshness === "disabled"
@@ -3898,7 +3920,7 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
             : s.current_serial === null
               ? `${s.server_name}: not reported`
               : `${s.server_name}: serial ${s.current_serial}` +
-                (s.current_serial !== state.target_serial ? " (drift)" : "") +
+                (!serverInSync(s) ? " (drift)" : "") +
                 (s.pending_ops
                   ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
                   : ""),
@@ -3914,11 +3936,13 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   } else if (state.in_sync) {
     cls =
       "bg-emerald-500/15 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400";
-    label = `${inSync.length}/${total} synced · serial ${state.target_serial}`;
+    label = `${inSync.length}/${total} synced`;
+    if (serial !== null) label += ` · serial ${serial}`;
   } else {
     cls =
       "bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400";
-    label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
+    label = `${total - inSync.length}/${total} drift`;
+    if (!isTransferredZone(state)) label += ` · target ${state.target_serial}`;
     if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
   if (total > 0 && notActive > 0) label += ` · ${notActiveText}`;
@@ -4724,7 +4748,10 @@ export function ZoneDetailView({
             )}
           </div>
           <p className="text-xs text-muted-foreground mt-0.5">
-            TTL {zone.ttl}s · serial {zone.last_serial || "—"}
+            TTL {zone.ttl}s · serial{" "}
+            {(serverState && isTransferredZone(serverState)
+              ? shownSerial(serverState)
+              : zone.last_serial) || "—"}
             {zone.primary_ns && ` · ${zone.primary_ns}`}
             {serverState && <ZoneSyncPill state={serverState} />}
           </p>
