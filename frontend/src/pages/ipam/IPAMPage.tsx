@@ -10947,7 +10947,11 @@ function addressSetRangeLabel(s: AddressSet): string {
 export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   const qc = useQueryClient();
   const perms = usePermissions();
-  const { data: sets = [], isLoading } = useQuery({
+  const {
+    data: sets = [],
+    isLoading,
+    error: setsError,
+  } = useQuery({
     queryKey: ["address-sets", subnet.id],
     queryFn: () => addressSetsApi.list({ subnet_id: subnet.id }),
   });
@@ -10998,12 +11002,25 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
       {sets.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-center">
           <Boxes className="mb-3 h-10 w-10 text-muted-foreground/30" />
-          <p className="text-sm text-muted-foreground">
-            No address sets in this subnet.
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground/70">
-            Create one to delegate edit rights over a range of addresses.
-          </p>
+          {setsError ? (
+            <p className="text-sm">
+              <ListReadError
+                error={setsError}
+                what="this subnet's address sets"
+              />
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                No address sets in this subnet.
+              </p>
+              {canCreate && (
+                <p className="mt-1 text-xs text-muted-foreground/70">
+                  Create one to delegate edit rights over a range of addresses.
+                </p>
+              )}
+            </>
+          )}
         </div>
       ) : (
         <div className="overflow-x-auto">
