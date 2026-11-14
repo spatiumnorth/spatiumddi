@@ -45,9 +45,15 @@ function utcSuffix(): string {
     .replace("T", "-");
 }
 
-function csvEscape(v: unknown): string {
+// Same rule as the backend exports (sanitize_cell): a cell starting with a
+// spreadsheet formula character gets a leading apostrophe so it opens as text.
+const FORMULA_TRIGGERS = ["=", "+", "-", "@", "\t", "\r"];
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function csvEscape(v: unknown): string {
   if (v === null || v === undefined) return "";
-  const s = String(v);
+  let s = String(v);
+  if (FORMULA_TRIGGERS.some((t) => s.startsWith(t))) s = `'${s}`;
   if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
@@ -145,7 +151,14 @@ function buildRow(
 ): ParsedRow {
   const r: Record<string, string> = {};
   for (let i = 0; i < headers.length; i++) {
-    r[headers[i]] = (values[i] ?? "").trim();
+    // Undo the export's formula escape (an apostrophe before a trigger).
+    const cell = (values[i] ?? "").trim();
+    r[headers[i]] =
+      cell.length > 1 &&
+      cell[0] === "'" &&
+      FORMULA_TRIGGERS.some((t) => cell.slice(1).startsWith(t))
+        ? cell.slice(1)
+        : cell;
   }
   const name = r.name;
   const ip = r.ip_address || r.ip;

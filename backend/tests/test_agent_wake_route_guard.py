@@ -30,7 +30,8 @@ from app.main import app
 from tests.test_builtin_roles_match_routes import _dependency_calls, _iter_routes
 
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
-_WAKES = ("collect_wake(", "publish_wake(")
+# ``_wake_blocklist_groups`` is the blocklist router's own collect_wake wrapper.
+_WAKES = ("collect_wake(", "publish_wake(", "_wake_blocklist_groups(")
 
 # The DHCP config bundle's REST surface. ``/dhcp/agents`` is the agent's own
 # surface: the long-poll must never publish (it would wake itself).
@@ -109,6 +110,20 @@ NO_WAKE: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/e911/erls"): "an ERL no binding points at is in no bundle",
     ("POST", "/api/v1/e911/erls/{erl_id}/validation"): (
         "the provider's verdict; options 99 / 123 do not read it"
+    ),
+}
+
+
+# The DNS blocklist surface (#4140). A blocklist is a global bundle input the
+# agents render into RPZ zones, so every mutation must wake the groups it is
+# (or was) assigned to.
+_BLOCKLIST_PREFIX = "/api/v1/dns/blocklists"
+
+# Blocklist mutations that change no group's bundle, each with the reason.
+BLOCKLIST_NO_WAKE: dict[tuple[str, str], str] = {
+    ("POST", "/api/v1/dns/blocklists/apply-profile"): (
+        "creates unassigned lists (group_ids=None); no group renders them until an "
+        "assignment, which wakes"
     ),
 }
 
@@ -216,6 +231,37 @@ def test_no_wake_entries_really_do_not_wake() -> None:
 
 def test_every_listed_route_has_a_reason() -> None:
     assert all(reason.strip() for reason in NO_WAKE.values())
+
+
+# ── 2b. the DNS blocklist surface (#4140) ────────────────────────────────────
+
+
+def _blocklist_surface() -> dict[tuple[str, str], Any]:
+    out: dict[tuple[str, str], Any] = {}
+    for r in _routes():
+        if not r.path.startswith(_BLOCKLIST_PREFIX):
+            continue
+        for method in r.methods & _MUTATING:
+            out[(method, r.path)] = r
+    return out
+
+
+def test_every_blocklist_mutation_wakes_or_says_why_not() -> None:
+    surface = _blocklist_surface()
+    assert len(surface) >= 15, "the blocklist walker found no routes"
+    missing = sorted(
+        f"{m} {p}"
+        for (m, p), r in surface.items()
+        if (m, p) not in BLOCKLIST_NO_WAKE and not _wakes(_source(r.endpoint))
+    )
+    assert not missing, (
+        "These blocklist routes change what agents render into RPZ and publish no "
+        "wake, so a parked agent long-poll sees the change only on its safety tick. "
+        "Call _wake_blocklist_groups (or collect_wake the affected dns_group) or list "
+        f"the route in BLOCKLIST_NO_WAKE with the reason: {missing}"
+    )
+    assert not sorted(k for k in BLOCKLIST_NO_WAKE if k not in surface)
+    assert all(_has_collector(r) for r in surface.values())
 
 
 # ── 3. operation dispatch outside a router collector ─────────────────────────

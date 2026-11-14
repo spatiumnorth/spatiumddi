@@ -39,6 +39,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -230,7 +231,7 @@ function SiteEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -360,7 +361,7 @@ function MoveSiteModal({
             </button>
           ))}
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
       </div>
     </Modal>
   );
@@ -572,11 +573,14 @@ function SiteTreeRow({
 
 function SiteTreeView({
   sites,
+  listError,
   onEdit,
   onMove,
   onDelete,
 }: {
   sites: SiteRead[];
+  /** The list query's error, so a refused read isn't drawn as an empty tree. */
+  listError?: unknown;
   onEdit: (s: SiteRead) => void;
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
@@ -671,9 +675,9 @@ function SiteTreeView({
   return (
     <div className="space-y-2">
       {error && (
-        <p className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
           {error}
-        </p>
+        </FormError>
       )}
       {!writeGate.disabled && (
         <p className="text-xs text-muted-foreground">
@@ -693,8 +697,10 @@ function SiteTreeView({
         <div className="divide-y rounded-lg border text-sm">
           {roots.length === 0 ? (
             <p className="px-3 py-6 text-center text-muted-foreground">
-              No sites yet.
-              {!writeGate.disabled && " Click “New site” to add one."}
+              <ListEmpty error={listError} what="sites">
+                No sites yet.
+                {!writeGate.disabled && " Click “New site” to add one."}
+              </ListEmpty>
             </p>
           ) : (
             roots.map((s) => (
@@ -976,6 +982,7 @@ export function SitesPage() {
           ) : (
             <SiteTreeView
               sites={allSites}
+              listError={allSitesQuery.error}
               onEdit={(s) => setEditing(s)}
               onMove={(s) => setMoving(s)}
               onDelete={askDelete}

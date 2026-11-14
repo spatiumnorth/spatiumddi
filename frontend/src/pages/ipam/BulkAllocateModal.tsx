@@ -54,6 +54,7 @@ import {
   templateFormatError,
   templateStartError,
 } from "@/lib/bulk-allocate-template";
+import { FormError } from "@/components/ui/form-error";
 
 function ipToBigInt(ip: string): bigint | null {
   if (ip.includes(":")) {
@@ -244,7 +245,10 @@ export function BulkAllocateModal({
     queries: zoneGroupIds.map((gId) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
-      staleTime: 60_000,
+      // Re-read on open too: the primary may be a zone created since the
+      // cached list was taken (#4028, as #3078).
+      staleTime: 0,
+      refetchOnMount: "always" as const,
       enabled: dnsOn,
     })),
   });
@@ -266,7 +270,7 @@ export function BulkAllocateModal({
   // back to the first zone once every group has answered) and re-pick when it
   // lands, until the operator has chosen.
   const primaryZoneId = effectiveDns?.dns_zone_id;
-  const zonesSettled = zoneQueries.every((q) => !q.isLoading);
+  const zonesSettled = zoneQueries.every((q) => !q.isLoading && !q.isFetching);
   // Zones still on their way, or the subnet's DNS being re-read over a cached
   // copy: the pick is not final yet, so Preview waits (#3080).
   const zonesPending =
@@ -652,10 +656,10 @@ export function BulkAllocateModal({
           )}
 
           {serverError && (
-            <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-3 text-xs text-red-900 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+            <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
               <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
               <span>{serverError}</span>
-            </div>
+            </FormError>
           )}
         </>
       )}

@@ -649,7 +649,9 @@ async def list_groups(
     stmt = apply_tag_filter(stmt, MulticastGroup.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(MulticastGroup.address.asc()).limit(limit).offset(offset)
+    stmt = (
+        stmt.order_by(MulticastGroup.address.asc(), MulticastGroup.id).limit(limit).offset(offset)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return MulticastGroupListResponse(
         items=[MulticastGroupRead.model_validate(r) for r in rows],

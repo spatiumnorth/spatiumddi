@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -329,6 +329,21 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # timers only while every BIND9 agent in it does
     # (``services.dns.soa_timers``).
     agent_renders_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # #3940 — this server's agent reports a secondary / stub zone's SERVED
+    # serial (``served-serials`` in ``X-Spatium-Agent-Features``) and nothing
+    # for a zone named holds no copy of. An older agent reports the bundle's
+    # serial, 0, whatever named holds, so a serving-0 secondary is "not
+    # synced" only for an agent that says so (``zone_state_in_sync``).
+    agent_reports_served_serials: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # #4040 — this server's agent reads blocklist entries packed as gzip +
+    # base64 runs of domains: it sent ``packed-blocklists`` in
+    # ``X-Spatium-Agent-Features`` on its last register or heartbeat. False for
+    # an agent of an older release, which is sent one JSON object per entry.
+    agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
 
@@ -773,6 +788,12 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     # ``RENDERER_REVISION`` of the code that rendered it (#1185); NULL on
     # bundles rendered before the column existed, which read as stale.
     renderer_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # #4040 — the blocklist entries are packed runs (the server's agent read
+    # them at render time). The long-poll serves a bundle only in the shape
+    # THIS request's agent can read.
+    packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -1142,7 +1163,15 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     __tablename__ = "dns_zone"
     __table_args__ = (
-        UniqueConstraint("group_id", "view_id", "name", name="uq_dns_zone_group_view_name"),
+        # Partial: a trashed zone must not hold its name in a view (#3824).
+        Index(
+            "uq_dns_zone_group_view_name",
+            "group_id",
+            "view_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dns_zone_name", "name"),
     )
 
@@ -1160,6 +1189,19 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     # name: FQDN with trailing dot, e.g. "example.com."
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    @validates("name")
+    def _check_name(self, _key: str, value: str) -> str:
+        # Every path that creates a zone (REST, Copilot, importers,
+        # reconcilers) lands here, so a name the DNS server cannot take
+        # as a config statement / file name is refused at the row.
+        from app.core.dns_names import zone_name_storage_error  # noqa: PLC0415
+
+        err = zone_name_storage_error(value)
+        if err is not None:
+            raise ValueError(err)
+        return value
+
     # zone_type values: primary | secondary | stub | forward
     zone_type: Mapped[str] = mapped_column(String(20), nullable=False, default="primary")
     # kind: forward | reverse
@@ -1357,6 +1399,8 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "dns_record"
     __table_args__ = (
         Index("ix_dns_record_zone_name", "zone_id", "name"),
+        # The DDNS name-holder check (#3807) matches ``lower(name)``.
+        Index("ix_dns_record_zone_lower_name", "zone_id", sa_text("lower(name)")),
         Index("ix_dns_record_fqdn", "fqdn"),
     )
 

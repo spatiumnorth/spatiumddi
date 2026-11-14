@@ -428,7 +428,7 @@ async def list_overlays(
         stmt = stmt.where(OverlayNetwork.name.ilike(needle))
     stmt = apply_tag_filter(stmt, OverlayNetwork.tags, tag)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(OverlayNetwork.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(OverlayNetwork.name.asc(), OverlayNetwork.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     items = [await _read_overlay(db, r) for r in rows]
     return OverlayListResponse(items=items, total=total, limit=limit, offset=offset)

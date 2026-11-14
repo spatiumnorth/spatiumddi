@@ -2169,6 +2169,7 @@ export const ipamApi = {
       mac_address?: string;
       description?: string;
       custom_fields?: Record<string, unknown>;
+      tags?: Record<string, unknown>;
       dns_zone_id?: string | null;
       /** Issue #25 — additional zones to publish A/AAAA records into. */
       extra_zone_ids?: string[];
@@ -5393,6 +5394,8 @@ export interface DNSZoneSyncItem {
   pushed: number;
   server_records: number;
   push_errors: string[];
+  /** The pushed records are queued for background delivery (#3817). */
+  queued_for_agent?: boolean;
   error: string | null;
 }
 
@@ -5402,6 +5405,8 @@ export interface DNSServerSyncResult {
   zones_failed: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   /** Zones listed on the server via WinRM — windows_dns Path B only.
    * Empty for BIND9 and windows_dns without credentials. */
@@ -5435,6 +5440,8 @@ export interface DNSGroupSyncResult {
   servers_succeeded: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   total_zones_imported: number;
   total_zones_pushed_to_server: number;
@@ -5658,6 +5665,15 @@ export interface AgentSpoolStreamStatus {
   expired_entries_total: number;
   rejected_entries_total: number;
   write_failures_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
 }
 
 /**
@@ -5679,6 +5695,15 @@ export interface AgentSpoolStatus {
   trimmed_bytes_total: number;
   last_trim_at: string | null;
   expired_entries_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
   streams: Record<string, AgentSpoolStreamStatus>;
 }
 
@@ -6051,11 +6076,16 @@ export interface ZoneServerStateEntry {
   // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
+  // The API's verdict on this server's report (#3940): a primary zone serves
+  // our serial, a secondary / stub zone holds a copy of its primary's zone
+  // (its serial is not ours to compare) and no op is pending.
+  in_sync?: boolean;
 }
 
 export interface ZoneServerState {
   zone_id: string;
   zone_name: string;
+  zone_type?: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
   // `false` while any server hasn't reported, is on a different serial, or
@@ -6926,8 +6956,16 @@ export const dnsApi = {
         data,
       )
       .then((r) => r.data),
-  deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
-    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
+  // ``permanent`` is superadmin-only server-side (#4078).
+  deleteRecord: (
+    groupId: string,
+    zoneId: string,
+    recordId: string,
+    opts?: { permanent?: boolean },
+  ) =>
+    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, {
+      params: opts?.permanent ? { permanent: true } : undefined,
+    }),
 
   // Soft-deletes by default (#963) — the whole selection shares one
   // deletion_batch_id, so it restores from Admin → Trash in one action.
@@ -16619,12 +16657,66 @@ export interface ContainerStatsResponse {
   rows: ContainerStat[];
 }
 
+/** #3761 — which runtimes the Containers tab can see. */
+export interface ContainerBackendStatus {
+  available: boolean;
+  reason: string | null;
+  detail: string | null;
+}
+export interface ContainerBackends {
+  docker: ContainerBackendStatus;
+  kubernetes: ContainerBackendStatus;
+  appliance: boolean;
+}
+export interface PodRow {
+  name: string;
+  component: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string | null;
+  started_at: string | null;
+  containers: string[];
+}
+export interface PodListResponse {
+  available: boolean;
+  reason: string | null;
+  rows: PodRow[];
+}
+
 export const containersApi = {
   stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
     api
       .get<ContainerStatsResponse>("/admin/containers/stats", { params })
       .then((r) => r.data),
+  backends: () =>
+    api
+      .get<ContainerBackends>("/admin/containers/backends")
+      .then((r) => r.data),
+  pods: () =>
+    api.get<PodListResponse>("/admin/containers/pods").then((r) => r.data),
+  podLogs: (name: string, tail = 200) =>
+    api
+      .get<{
+        name: string;
+        tail: string;
+      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, {
+        params: { tail },
+      })
+      .then((r) => r.data),
 };
+
+/** Follow one release pod's logs (redacted server-side) — #3761. */
+export function streamPodLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/admin/containers/pods/${encodeURIComponent(name)}/logs/stream?tail=${tail}`,
+    signal,
+  );
+}
 
 // ── Service lifecycle control (issue #890) ────────────────────────────────────
 
@@ -21548,6 +21640,8 @@ export interface ERLBinding {
   mac_address: string | null;
   ip_address_id: string | null;
   site_id: string | null;
+  target_label?: string | null;
+  target_missing?: boolean;
   is_active: boolean;
   notes: string;
   created_at: string;

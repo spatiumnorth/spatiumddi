@@ -1406,8 +1406,10 @@ async def _enforce_zone_token_scope(
 # Subnet fields that point the subnet at ANOTHER resource. A caller who writes
 # the subnet only through a grant scoped to it (#2438) may not change them:
 # the grant names this subnet, not the customer, site, VLAN, DHCP server group
-# or DNS servers it would be attached to. (DNS zones are checked separately by
-# ``_assert_scoped_zones``, which also lets the subnet's own zones through.)
+# or DNS servers it would be attached to. The inherit switches count too:
+# flipping one re-points the subnet at the parent's servers and zones.
+# (DNS zones are checked separately by ``_assert_scoped_zones``, which also
+# lets the subnet's own zones through.)
 _SUBNET_BINDING_FIELDS = (
     "block_id",
     "customer_id",
@@ -1416,6 +1418,9 @@ _SUBNET_BINDING_FIELDS = (
     "dhcp_server_group_id",
     "dns_group_ids",
     "ddns_domain_override",
+    "dns_inherit_settings",
+    "dhcp_inherit_settings",
+    "ddns_inherit_settings",
 )
 
 
@@ -10709,7 +10714,7 @@ async def search_addresses(
 
     data_stmt = (
         _scoped(select(IPAddress, Subnet.network, Subnet.name, Subnet.space_id, IPSpace.name))
-        .order_by(*_address_order_by(sort, order))
+        .order_by(*_address_order_by(sort, order), IPAddress.id)
         .offset(offset)
         .limit(limit)
     )

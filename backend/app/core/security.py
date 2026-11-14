@@ -32,6 +32,16 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode()[:BCRYPT_MAX_BYTES], bcrypt.gensalt()).decode()
 
 
+# A real bcrypt hash of a random value nobody holds, verified against when a
+# login names no local account so every wrong login costs one bcrypt compare.
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"spatium-no-such-account", bcrypt.gensalt()).decode()
+
+
+def burn_password_check(plain: str) -> None:
+    """One bcrypt verification whose result is discarded (uniform login timing)."""
+    verify_password(plain, _DUMMY_PASSWORD_HASH)
+
+
 def verify_password(plain: str, hashed: str) -> bool:
     # Total by contract: a candidate password can only ever be WRONG, never an
     # exception. bcrypt.checkpw raises ValueError on >72-byte input and on NUL

@@ -86,6 +86,7 @@ import { UpgradeImagesTable } from "./UpgradeImagesTable";
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { ReleasesTab } from "./ReleasesTab";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -3119,10 +3120,11 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         Service health
       </h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Supervisor watchdog snapshot — refreshed every 5 min. ``missing`` /
-        ``unhealthy`` for more than one cadence means the auto-heal kicker
-        didn&apos;t bring the container back; SSH in and check{" "}
-        <code>docker logs &lt;service&gt;</code>.
+        Supervisor watchdog snapshot — refreshed every 5 min.{" "}
+        <code className="font-mono">missing</code> /
+        <code className="font-mono">unhealthy</code> for more than one cadence
+        means the auto-heal kicker didn&apos;t bring the container back; SSH in
+        and check <code>docker logs &lt;service&gt;</code>.
       </p>
       {stale && (
         <div
@@ -3519,7 +3521,7 @@ function MountDiskModal({
             This appliance already has a mount named “{name}”.
           </p>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-1">
           <HeaderButton variant="secondary" onClick={onClose}>
             Cancel

@@ -100,6 +100,7 @@ from app.services.dhcp.ipam_mirror import (
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.e911.address_bindings import keep_row_if_bound
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.lock_order import (
     claim_mirror_inserts,
@@ -2139,7 +2140,9 @@ async def agent_lease_events(
                         error=str(exc),
                     )
                 await purge_trashed_address_records(db, [ipam_row.id])  # #3186
-                await db.delete(ipam_row)
+                # An address an E911 binding names stays (#3899), as a free row.
+                if not await keep_row_if_bound(db, ipam_row):
+                    await db.delete(ipam_row)
                 recount_ids.add(subnet.id)
                 ipam_by_key.pop((subnet.id, norm_ip(ev.ip_address)), None)
 

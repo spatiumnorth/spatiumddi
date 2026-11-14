@@ -21,6 +21,7 @@ import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
+import { FormError } from "@/components/ui/form-error";
 
 // A refusal raised by the dialog's own checks before anything is sent; its
 // message is the reason shown to the operator (#3082).
@@ -1212,7 +1213,7 @@ function ScopeModalForm({
           onChange={setPxeProfileId}
         />
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         {adoptConflict && (
           <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
             <span>{adoptConflict}</span>
@@ -1389,11 +1390,16 @@ export function ApplyTemplateControl({
   currentOptions: DHCPOption[];
   onApply: (next: DHCPOption[]) => void;
 }) {
-  const { data: allTemplates = [] } = useQuery({
+  // Re-read on open and hold the picker meanwhile: applying merges the
+  // template's options into the form, and a cached copy may predate another
+  // client's change (#4029, as #3868).
+  const { data: allTemplates = [], isFetching } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
     queryFn: () =>
       groupId ? dhcpApi.listOptionTemplates(groupId) : Promise.resolve([]),
     enabled: !!groupId,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const templates = addressFamily
     ? allTemplates.filter((t) => (t.address_family ?? "ipv4") === addressFamily)
@@ -1447,6 +1453,7 @@ export function ApplyTemplateControl({
         aria-label="Apply template"
         key={pickerKey}
         defaultValue=""
+        disabled={isFetching}
         onChange={(e) => handleSelect(e.target.value)}
         className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
       >

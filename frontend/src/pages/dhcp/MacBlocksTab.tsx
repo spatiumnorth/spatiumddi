@@ -192,7 +192,7 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
         {filtered.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
             {blocks.length === 0
-              ? "No blocked MACs. Click 'Block MAC' to add one."
+              ? `No blocked MACs.${writeGate.disabled ? "" : " Click 'Block MAC' to add one."}`
               : "No blocks match the filter."}
           </p>
         ) : (
