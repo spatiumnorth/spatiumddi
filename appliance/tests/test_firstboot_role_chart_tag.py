@@ -40,8 +40,18 @@ case "$args" in
   "--request-timeout=10s -n kube-system get helmchart spatiumddi-appliance "*)
     [ -f "$S/apierr" ] && exit 1
     [ -f "$S/values" ] && cat "$S/values"; exit 0 ;;
+  "--request-timeout=10s -n spatium get daemonset "*)
+    ds=$(echo "$args" | awk '{print $6}')
+    [ -f "$S/ds_$ds.json" ] && cat "$S/ds_$ds.json"; exit 0 ;;
+  "--request-timeout=30s -n spatium patch daemonset "*)
+    ds=$(echo "$args" | awk '{print $6}')
+    cp "${args##* }" "$S/patched_ds_$ds.json"
+    echo "ds $ds" >> "$S/order.log"
+    [ -f "$S/ds_patch_fails" ] && exit 1
+    exit 0 ;;
   "--request-timeout=30s -n kube-system patch helmchart spatiumddi-appliance --type merge --patch-file "*)
     cp "${args##* }" "$S/patched.json"
+    echo chart >> "$S/order.log"
     [ -f "$S/patch_fails" ] && exit 1
     exit 0 ;;
 esac
@@ -68,7 +78,7 @@ def _extract_function(name: str) -> str:
     raise AssertionError("no closing brace")
 
 
-def _run(tmp_path, *, hold=False, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag="NEW"):
+def _run(tmp_path, *, daemonsets=None, ds_patch_fails=False, hold=False, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag="NEW"):
     stub = tmp_path / "stub"
     stub.mkdir()
     k3s = tmp_path / "k3s"
@@ -77,7 +87,13 @@ def _run(tmp_path, *, hold=False, nodes=1, values=LIVE, apierr=False, patch_fail
     (stub / "nodes").write_text("".join(f"node/n{i}\n" for i in range(nodes)))
     if values is not None:
         (stub / "values").write_text(yaml.safe_dump(values, default_flow_style=False, sort_keys=False))
-    for flag, on in (("apierr", apierr), ("patch_fails", patch_fails)):
+    for name, ds in (daemonsets or {}).items():
+        (stub / f"ds_{name}.json").write_text(json.dumps(ds))
+    for flag, on in (
+        ("apierr", apierr),
+        ("patch_fails", patch_fails),
+        ("ds_patch_fails", ds_patch_fails),
+    ):
         if on:
             (stub / flag).touch()
     chart = tmp_path / "chart.tgz"
@@ -86,7 +102,9 @@ def _run(tmp_path, *, hold=False, nodes=1, values=LIVE, apierr=False, patch_fail
     state.mkdir()
     if hold:
         (state / "shared-chart-hold").write_text("{}")
-    body = _extract_function(FUNC).replace("/usr/local/bin/k3s", str(k3s))
+    body = "\n".join(
+        _extract_function(f) for f in ("preroll_role_daemonsets", FUNC)
+    ).replace("/usr/local/bin/k3s", str(k3s))
     script = (
         f'. "{SCRIPT}"\nset -eu\n'
         f'CHART_TGZ="{chart}"\nSPATIUMDDI_VERSION="{tag}"\n'
@@ -163,3 +181,62 @@ def test_wired_in_ahead_of_the_bootstrap_release():
     text = SCRIPT.read_text(encoding="utf-8")
     call = text.index("    reconcile_role_chart_tag || true\n")
     assert call < text.index("    release_bootstrap_manifest || true\n    trap - EXIT TERM")
+
+
+def _ds(*images, init=()):
+    spec = {"containers": [{"name": f"c{i}", "image": im} for i, im in enumerate(images)]}
+    if init:
+        spec["initContainers"] = [{"name": f"i{i}", "image": im} for i, im in enumerate(init)]
+    return {"spec": {"template": {"spec": spec}}}
+
+
+def _order(tmp_path):
+    return (tmp_path / "stub" / "order.log").read_text().split()
+
+
+def test_role_daemonsets_move_to_the_new_tag_before_the_chart(tmp_path):
+    ds = {
+        "dhcp-kea": _ds("reg/kea:OLD"),
+        "dns-bind9": _ds("reg/bind:OLD", "reg/sidecar:pinned", init=["reg/init:OLD"]),
+    }
+    proc, patched, _ = _run(tmp_path, daemonsets=ds)
+    assert "rc=0" in proc.stdout, proc.stderr
+    stub = tmp_path / "stub"
+    kea = json.loads((stub / "patched_ds_dhcp-kea.json").read_text())
+    assert kea == {"spec": {"template": {"spec": {"containers": [{"name": "c0", "image": "reg/kea:NEW"}]}}}}
+    bind = json.loads((stub / "patched_ds_dns-bind9.json").read_text())["spec"]["template"]["spec"]
+    assert bind["containers"] == [{"name": "c0", "image": "reg/bind:NEW"}]  # pinned one untouched
+    assert bind["initContainers"] == [{"name": "i0", "image": "reg/init:NEW"}]
+    assert not (stub / "patched_ds_dns-powerdns.json").exists()
+    # the template moves first, then the chart write that follows
+    assert _order(tmp_path)[-1] == "chart" and "ds" in _order(tmp_path)[:-1]
+    assert patched is not None
+
+
+def test_daemonset_already_on_the_tag_is_not_patched(tmp_path):
+    _, _, _ = _run(tmp_path, daemonsets={"dhcp-kea": _ds("reg/kea:NEW")})
+    assert not (tmp_path / "stub" / "patched_ds_dhcp-kea.json").exists()
+
+
+def test_no_daemonset_patch_when_the_chart_is_left_alone(tmp_path):
+    # cluster / hold / first install: the DaemonSets stay with the supervisor
+    ds = {"dhcp-kea": _ds("reg/kea:OLD")}
+    for kw in ({"nodes": 3}, {"hold": True}):
+        sub = tmp_path / ("c" if "nodes" in kw else "h")
+        sub.mkdir()
+        _run(sub, daemonsets=ds, **kw)
+        assert not (sub / "stub" / "patched_ds_dhcp-kea.json").exists()
+
+
+def test_daemonset_patch_failure_still_writes_the_chart(tmp_path):
+    proc, patched, _ = _run(
+        tmp_path, daemonsets={"dhcp-kea": _ds("reg/kea:OLD")}, ds_patch_fails=True
+    )
+    assert "rc=0" in proc.stdout and "WARN" in proc.stderr and patched is not None
+
+
+def test_early_call_before_the_readyz_wait():
+    text = SCRIPT.read_text(encoding="utf-8")
+    early = text.index("get --raw=/livez")
+    assert text.index('echo "Waiting for k3s /readyz') < early < text.index("\nready=0\n")
+    assert "reconcile_role_chart_tag || true" in text[early : early + 200]

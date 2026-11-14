@@ -1913,6 +1913,64 @@ except Exception:
     return 0
 }
 
+# #3919 — move the role DaemonSets' pod template onto this slot's tag, ahead
+# of the chart write that follows. Rewriting the HelmChart alone cannot give
+# one roll: helm-controller applies it from a job POD, which needs the kubelet,
+# and by the time that pod has run the kubelet has restarted the role pods on
+# the previous release's image, so the chart's own template change rolled them
+# a second time (26 s on images new to the node). A DaemonSet's template is
+# plain API state, so it can be changed the moment the apiserver answers,
+# before the kubelet starts anything: the old pods (not Ready, their node not
+# yet back) are replaced by pods on the new image, and the helm upgrade that
+# follows finds the live template already equal to its own.
+#
+# Only the four role DaemonSets, and only images on the OLD global tag, so a
+# per-image tag override is left alone. Never fatal: without this the chart
+# write still moves the roles, with the extra roll.
+preroll_role_daemonsets() {
+    local k3s=/usr/local/bin/k3s old=$1 new=$2 ns=spatium ds patch
+    [ -n "$old" ] && [ "$old" != "$new" ] || return 0
+    patch=$(mktemp) || return 0
+    for ds in dhcp-kea dns-bind9 dns-powerdns dns-technitium; do
+        $k3s kubectl --request-timeout=10s -n "$ns" get daemonset "$ds" \
+            --ignore-not-found -o json 2>/dev/null | python3 -c '
+import json, sys
+
+old, new, out = sys.argv[1:4]
+try:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        sys.exit(0)
+    spec = json.loads(raw)["spec"]["template"]["spec"]
+    patch = {}
+    for key in ("containers", "initContainers"):
+        items = []
+        for c in spec.get(key) or []:
+            img = c.get("image", "")
+            repo, sep, tag = img.rpartition(":")
+            if sep and tag == old and "/" not in tag:
+                items.append({"name": c["name"], "image": repo + ":" + new})
+        if items:
+            patch[key] = items
+    if patch:
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump({"spec": {"template": {"spec": patch}}}, fh)
+except Exception:
+    sys.exit(1)
+' "$old" "$new" "$patch" 2>/dev/null || { echo "WARN: could not read DaemonSet $ds; left to the chart write (#3919)." >&2; continue; }
+        [ -s "$patch" ] || continue
+        if $k3s kubectl --request-timeout=30s -n "$ns" patch daemonset "$ds" \
+                --type strategic --patch-file "$patch" >/dev/null 2>&1; then
+            echo "Moved DaemonSet ${ds} to ${new} before the kubelet restarts it (#3919)."
+        else
+            echo "WARN: could not patch DaemonSet ${ds}; left to the chart write (#3919)." >&2
+        fi
+        : > "$patch"
+    done
+    rm -f "$patch"
+    return 0
+}
+
 # #3919 — bring the role release (the supervisor's ``spatiumddi-appliance``
 # HelmChart) onto THIS slot's image tag and chart as soon as k3s answers.
 #
@@ -1941,7 +1999,7 @@ except Exception:
 #   * never fatal. No ``python3 -`` (#1001): the program is a ``-c`` argument
 #     and its data arrives as argv.
 reconcile_role_chart_tag() {
-    local k3s=/usr/local/bin/k3s nodes cur patch rc
+    local k3s=/usr/local/bin/k3s nodes cur patch rc old
     [ -f "$CHART_TGZ" ] || return 0
     # The supervisor's rolling-upgrade hold file (#1710/#3136): while one is
     # recorded, the supervisor itself refuses to write this chart from a node
@@ -1961,7 +2019,7 @@ reconcile_role_chart_tag() {
     [ -n "$cur" ] || return 0
     patch=$(mktemp) || return 0
     rc=0
-    python3 -c '
+    old=$(python3 -c '
 import base64, json, sys
 import yaml
 
@@ -1972,20 +2030,24 @@ try:
         sys.exit(1)
     if str(doc["global"].get("imageTag")) == tag:
         sys.exit(0)
+    old = str(doc["global"].get("imageTag"))
     doc["global"]["imageTag"] = tag
     with open(chart, "rb") as fh:
         b64 = base64.b64encode(fh.read()).decode("ascii")
     values = yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump({"spec": {"chartContent": b64, "valuesContent": values}}, fh)
+    print(old)
 except SystemExit:
     raise
 except Exception:
     sys.exit(1)
-' "$SPATIUMDDI_VERSION" "$CHART_TGZ" "$cur" "$patch" 2>/dev/null || rc=$?
+' "$SPATIUMDDI_VERSION" "$CHART_TGZ" "$cur" "$patch" 2>/dev/null) || rc=$?
     if [ "$rc" != 0 ]; then
         echo "WARN: could not render the role chart tag patch; not reconciled this boot (#3919)." >&2
     elif [ -s "$patch" ]; then
+        # The DaemonSets first, see preroll_role_daemonsets.
+        preroll_role_daemonsets "$old" "$SPATIUMDDI_VERSION"
         if $k3s kubectl --request-timeout=30s -n kube-system patch helmchart \
                 spatiumddi-appliance --type merge --patch-file "$patch" >/dev/null 2>&1; then
             echo "Moved the role chart (spatiumddi-appliance) to ${SPATIUMDDI_VERSION} ahead of the supervisor (#3919)."
@@ -2801,6 +2863,19 @@ place_deferred_control_manifest() {
 # controller + the supervisor pod still need to settle.
 echo "Waiting for k3s /readyz …"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# #3919 — the role pods must not start on the previous release's image and be
+# rolled again. On a slot upgrade the datastore already holds the role
+# DaemonSets and chart, so as soon as the apiserver answers (well before the
+# readyz poll below succeeds, and before the kubelet restarts the old pods)
+# move them to this slot's tag. A first install has nothing to move; the
+# reconcile returns at once. The call after readyz stays as the retry.
+for _ in $(seq 1 120); do
+    if /usr/local/bin/k3s kubectl --request-timeout=3s get --raw=/livez >/dev/null 2>&1; then
+        reconcile_role_chart_tag || true
+        break
+    fi
+    sleep 1
+done
 ready=0
 for _ in $(seq 1 60); do
     if /usr/local/bin/k3s kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
