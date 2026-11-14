@@ -459,6 +459,33 @@ def test_a_truncated_file_is_rendered_again(tmp_path: Path, monkeypatch) -> None
     assert _two_renders(tmp_path, truncate, monkeypatch) == [RPZ]
 
 
+def test_a_same_size_corrupted_file_is_rendered_again_4080(tmp_path: Path, monkeypatch) -> None:
+    """A flipped byte keeps the size; only the content hash can tell (#4080)."""
+
+    def flip(p: Path) -> None:
+        data = bytearray(p.read_bytes())
+        i = data.index(b"CNAME")
+        data[i + 4] = ord("X")
+        with open(p, "r+b") as fh:  # in place: same inode, same size
+            fh.write(bytes(data))
+
+    assert _two_renders(tmp_path, flip, monkeypatch) == [RPZ]
+
+
+def test_an_intact_file_is_reused_4080(tmp_path: Path, monkeypatch) -> None:
+    assert _two_renders(tmp_path, lambda p: None, monkeypatch) == []
+
+
+def test_a_sidecar_without_a_content_hash_is_rendered_again_4080(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def old_format(p: Path) -> None:
+        side = bind9._rpz_sidecar(p)
+        side.write_text(" ".join(side.read_text().split()[:2]) + "\n")
+
+    assert _two_renders(tmp_path, old_format, monkeypatch) == [RPZ]
+
+
 def test_another_renderer_revisions_file_is_rendered_again(tmp_path: Path, monkeypatch) -> None:
     def older(p: Path) -> None:
         side = bind9._rpz_sidecar(p)
@@ -569,3 +596,47 @@ def test_the_real_checker_loads_a_rendered_rpz_zone_with_its_derived_serial(
     )
     assert res.returncode == 0, res.stdout + res.stderr
     assert f"loaded serial {bind9._rpz_serial(_bl())}" in res.stdout
+
+
+# ── A policy file named cannot load is not trusted again (#4080) ──────────────
+
+
+def _named_refusing(monkeypatch: pytest.MonkeyPatch, refused: set[str]) -> None:
+    """A named that answers ``zone not loaded`` for the zones in ``refused``."""
+    inner = subprocess.run
+
+    def fake_run(cmd: list[str], *a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+        if "zonestatus" in cmd and cmd[cmd.index("zonestatus") + 1] in refused:
+            return subprocess.CompletedProcess(cmd, 1, "", "rndc: 'zonestatus' failed: not loaded")
+        return inner(cmd, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def test_the_retry_after_a_failed_verify_checks_the_zone_named_could_not_load_4080(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rndc: list[list[str]]
+) -> None:
+    """QA's case 2: the start's verify fails on a policy file with a valid
+    sidecar; the retry (bytes unchanged, so no zone ``changed``) used to verify
+    zero zones, clear the quarantine and report applied with the zone unloaded.
+
+    Negative control: without the fix the retry reuses the file, verifies
+    nothing and does not raise."""
+    drv = _driver(tmp_path, monkeypatch)
+    refused = {RPZ.rstrip(".")}
+    _named_refusing(monkeypatch, refused)
+    bundle = _flat([_bl()])
+
+    with pytest.raises(RuntimeError, match="did not load"):
+        _apply(drv, bundle)
+
+    written = _rpz_writes(monkeypatch)
+    with pytest.raises(RuntimeError, match="did not load"):  # still not loaded
+        _apply(drv, bundle)
+    assert written == [RPZ], "the file named refused was reused, not rendered again"
+
+    refused.clear()  # named can load the fresh render
+    _apply(drv, bundle)
+    written.clear()
+    _apply(drv, bundle)  # now an intact, loaded file is reused as before
+    assert written == []

@@ -93,7 +93,7 @@ async def list_audit_log(
     count_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(count_q)).scalar_one()
 
-    q = q.order_by(AuditLog.timestamp.desc()).offset(offset).limit(limit)
+    q = q.order_by(AuditLog.timestamp.desc(), AuditLog.id.desc()).offset(offset).limit(limit)
     rows = (await db.execute(q)).scalars().all()
 
     return AuditLogPage(

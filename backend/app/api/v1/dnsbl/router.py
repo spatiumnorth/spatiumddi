@@ -368,7 +368,9 @@ async def list_listings(
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total = await db.scalar(count_stmt) or 0
     stmt = (
-        stmt.order_by(DNSBLListing.first_listed_at.desc().nullslast()).limit(limit).offset(offset)
+        stmt.order_by(DNSBLListing.first_listed_at.desc().nullslast(), DNSBLListing.id)
+        .limit(limit)
+        .offset(offset)
     )
     rows = (await db.execute(stmt)).all()
     return DNSBLListingListResponse(

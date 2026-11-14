@@ -282,7 +282,11 @@ async def list_scans(
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())
 
-    stmt = base.order_by(NmapScan.created_at.desc()).limit(page_size).offset((page - 1) * page_size)
+    stmt = (
+        base.order_by(NmapScan.created_at.desc(), NmapScan.id)
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
     rows = list((await db.execute(stmt)).scalars().all())
     spaces = await _scan_ip_row_spaces(db, rows)
     items = []
