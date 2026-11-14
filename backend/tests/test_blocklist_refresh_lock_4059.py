@@ -169,12 +169,13 @@ async def test_apply_anti_join_is_a_hash_join_on_an_empty_vacuumed_table(
 
     await db_session.execute(
         text(
-            "CREATE TEMP TABLE _blocklist_feed_stage (domain text NOT NULL, literal boolean NOT NULL)"
+            "CREATE TEMP TABLE _blocklist_feed_stage "
+            "(domain text NOT NULL, literal boolean NOT NULL, wild boolean NOT NULL)"
         )
     )
     await db_session.execute(
         text(
-            "INSERT INTO _blocklist_feed_stage SELECT 'h' || g || '.example.com', false "
+            "INSERT INTO _blocklist_feed_stage SELECT 'h' || g || '.example.com', false, false "
             "FROM generate_series(1, 50000) g"
         )
     )
