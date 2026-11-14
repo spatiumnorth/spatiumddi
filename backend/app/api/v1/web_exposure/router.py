@@ -28,6 +28,7 @@ from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.settings import PlatformSettings
+from app.services.api_token_scopes import token_write
 from app.services.web_exposure import config as cfg_mod
 from app.services.web_exposure import mitigations, store
 from app.services.web_exposure.classify import (
@@ -267,6 +268,7 @@ async def put_config(
 
 
 @router.post("/trusted-networks", response_model=WebExposureConfigResponse)
+@token_write("Adds a trusted network to the web-exposure settings (SuperAdmin-only)")
 async def add_trusted_network(
     body: TrustedNetworkRequest, request: Request, db: DB, current_user: SuperAdmin
 ) -> dict[str, Any]:
@@ -343,6 +345,7 @@ class ApplyAllowListRequest(BaseModel):
 
 
 @router.post("/apply-web-ui-allow-list", response_model=WebUIAccessResponse)
+@token_write("Rewrites the Web UI firewall allow-list (SuperAdmin-only)")
 async def apply_web_ui_allow_list(
     body: ApplyAllowListRequest, request: Request, db: DB, current_user: SuperAdmin
 ) -> WebUIAccessResponse:
