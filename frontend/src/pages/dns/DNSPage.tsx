@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
@@ -947,9 +948,9 @@ function ImportZoneModal({
         </p>
 
         {error && (
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
 
         {preview && (
@@ -1395,7 +1396,7 @@ function GroupModalForm({
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -2405,7 +2406,7 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
             <code>DNS_AGENT_KEY</code> in deployment docs.
           </p>
         )}
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -2643,9 +2644,9 @@ function DnssecCard({
       </div>
 
       {error && (
-        <div className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <FormError className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5">
           {error}
-        </div>
+        </FormError>
       )}
 
       {enabled && keys.length > 0 && (
@@ -2782,6 +2783,7 @@ function ZoneModalForm({
   initialName,
   onClose,
 }: ZoneModalProps) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
@@ -3190,9 +3192,7 @@ function ZoneModalForm({
                 />
               </Field>
             )}
-            {transportErr && (
-              <p className="text-xs text-destructive">{transportErr}</p>
-            )}
+            {transportErr && <FormError>{transportErr}</FormError>}
           </div>
         )}
         {(zoneType === "secondary" || zoneType === "stub") && (
@@ -3359,14 +3359,16 @@ function ZoneModalForm({
                     : ""}
           </p>
         </Field>
-        <Field label="Customer (optional)">
-          <CustomerPicker
-            className={inputCls}
-            value={customerId}
-            onChange={setCustomerId}
-          />
-        </Field>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {own.customer && (
+          <Field label="Customer (optional)">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+        )}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -3591,8 +3593,11 @@ function RecordModalForm({
               placeholder='@ for apex, "www", "mail"'
               required
               autoFocus
+              // A LUA record's name and view place a snippet this user may
+              // not write, so they stay as stored (as the snippet does).
+              readOnly={!!record && type === "LUA" && !canWriteLua}
             />
-            {nameErr && <p className="text-xs text-destructive">{nameErr}</p>}
+            {nameErr && <FormError>{nameErr}</FormError>}
           </Field>
           <Field label="Type">
             <select
@@ -3813,6 +3818,7 @@ function RecordModalForm({
             className={inputCls}
             value={viewId}
             onChange={(e) => setViewId(e.target.value)}
+            disabled={!!record && type === "LUA" && !canWriteLua}
           >
             <option value="">No view (unscoped, default)</option>
             {viewChoices.map((v) => (
@@ -3838,7 +3844,7 @@ function RecordModalForm({
             </p>
           )}
         </Field>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
           onClose={onClose}
           pending={mut.isPending}
@@ -3863,6 +3869,24 @@ function RecordModalForm({
  * Hover tooltip lists every server with its own serial for quick drift
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
+/** A secondary / stub zone's serial is its primary's, so the target (our
+ * own `last_serial`, 0 for it) means nothing there. */
+function isTransferredZone(state: ZoneServerState): boolean {
+  return state.zone_type === "secondary" || state.zone_type === "stub";
+}
+
+/** The serial to show for a zone: ours for a primary; for a secondary, the
+ * one its servers serve, or null when none has reported or they differ. */
+function shownSerial(state: ZoneServerState): number | null {
+  if (!isTransferredZone(state)) return state.target_serial;
+  const served = new Set(
+    state.servers
+      .filter((s) => s.counted && s.current_serial)
+      .map((s) => s.current_serial),
+  );
+  return served.size === 1 ? [...served][0]! : null;
+}
+
 export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   if (state.servers.length === 0) return null;
   // #2316 — a paused (maintenance) server is shown separately and left out
@@ -3885,10 +3909,14 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
   // even when the serial it reported matches.
+  // The API's per-server verdict decides (#3940): a secondary's serial is its
+  // primary's and never equals the target. Without one, compare serials.
+  const serverInSync = (s: ZoneServerState["servers"][number]) =>
+    s.in_sync ?? s.current_serial === state.target_serial;
   const inSync = counted.filter(
-    (s) =>
-      s.counted && s.current_serial === state.target_serial && !s.pending_ops,
+    (s) => s.counted && serverInSync(s) && !s.pending_ops,
   );
+  const serial = shownSerial(state);
   const tooltip = state.servers
     .map((s) =>
       s.freshness === "disabled"
@@ -3900,7 +3928,7 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
             : s.current_serial === null
               ? `${s.server_name}: not reported`
               : `${s.server_name}: serial ${s.current_serial}` +
-                (s.current_serial !== state.target_serial ? " (drift)" : "") +
+                (!serverInSync(s) ? " (drift)" : "") +
                 (s.pending_ops
                   ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
                   : ""),
@@ -3916,11 +3944,13 @@ export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   } else if (state.in_sync) {
     cls =
       "bg-emerald-500/15 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400";
-    label = `${inSync.length}/${total} synced · serial ${state.target_serial}`;
+    label = `${inSync.length}/${total} synced`;
+    if (serial !== null) label += ` · serial ${serial}`;
   } else {
     cls =
       "bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400";
-    label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
+    label = `${total - inSync.length}/${total} drift`;
+    if (!isTransferredZone(state)) label += ` · target ${state.target_serial}`;
     if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
   if (total > 0 && notActive > 0) label += ` · ${notActiveText}`;
@@ -4726,7 +4756,10 @@ export function ZoneDetailView({
             )}
           </div>
           <p className="text-xs text-muted-foreground mt-0.5">
-            TTL {zone.ttl}s · serial {zone.last_serial || "—"}
+            TTL {zone.ttl}s · serial{" "}
+            {(serverState && isTransferredZone(serverState)
+              ? shownSerial(serverState)
+              : zone.last_serial) || "—"}
             {zone.primary_ns && ` · ${zone.primary_ns}`}
             {serverState && <ZoneSyncPill state={serverState} />}
           </p>
@@ -6937,7 +6970,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         </div>
       )}
 
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {error && <FormError className="mt-2">{error}</FormError>}
 
       {(creating || editing) && (
         <ViewModal
@@ -7222,7 +7255,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </div>
         </details>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
@@ -7466,7 +7499,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
               placeholder={"10.0.0.0/8\n192.168.0.0/16\n!198.51.100.0/24"}
             />
           </Field>
-          {error && <p className="text-xs text-destructive">{error}</p>}
+          {error && <FormError>{error}</FormError>}
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -8026,9 +8059,7 @@ function TSIGKeyModalForm({
           />
         </div>
         {saveMut.isError && (
-          <p className="text-xs text-destructive">
-            {formatApiError(saveMut.error, "Save failed")}
-          </p>
+          <FormError>{formatApiError(saveMut.error, "Save failed")}</FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -8579,9 +8610,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           button just flips back to "Save Changes" and the operator has no
           idea why nothing happened. */}
       {saveMut.isError && (
-        <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
           {formatApiError(saveMut.error, "Save failed")}
-        </p>
+        </FormError>
       )}
 
       {/* Stored values a Technitium server here will not apply (#1763):
@@ -10085,9 +10116,9 @@ export function RecordsTab({
               Administration → Trash.
             </p>
             {deleteMut.isError && (
-              <p className="text-sm text-destructive">
+              <FormError className="text-sm">
                 {formatApiError(deleteMut.error, "Delete failed")}
-              </p>
+              </FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -10823,7 +10854,7 @@ export function BlocklistScopeModal({
           )}
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex items-center justify-between border-t pt-3">
           <span className="text-xs text-muted-foreground">
@@ -11750,7 +11781,7 @@ function BlocklistModalForm({
           />
           Enabled
         </label>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>
@@ -12763,9 +12794,9 @@ export function SyncWithServersResultModal({
           </div>
         )}
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
             {error}
-          </div>
+          </FormError>
         )}
         {result && (
           <>
@@ -12863,9 +12894,9 @@ export function SyncWithServersResultModal({
                 </summary>
                 <div className="px-3 py-2 space-y-2">
                   {srv.error && (
-                    <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                    <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                       {srv.error}
-                    </div>
+                    </FormError>
                   )}
                   {srv.result && (
                     <>
