@@ -7,13 +7,19 @@
 # ISC's EL9 RPMs (Cloudsmith isc/kea-3-0) need log4cplus, which lives in EPEL and
 # not in the UBI repositories, so they do not install. Everything that is not a
 # Red Hat package is therefore built here from a pinned, checksummed source
-# tarball: Kea, log4cplus, Boost (headers only), tini. The builder
+# tarball: Kea, log4cplus, Boost (headers only), radvd, tini. The builder
 # stage never reaches the final image; only the installed files are copied.
-# Versions + checksums are ARGs: the sha256 fails the build on a mismatch.
+# Versions + checksums are ARGs: the sha256 fails the build on a mismatch, and
+# where upstream signs a tarball and UBI's gpg can read the key (Kea, radvd, and the flex / bison the
+# radvd build needs) verify-sig.sh also checks the OpenPGP signature against a
+# pinned key fingerprint. No upstream signature exists for the Boost and tini
+# source tarballs (tini signs its binary release assets, not the source archive;
+# Boost publishes none), so those keep the sha256 alone.
 #
-# NOT IN THIS VARIANT: radvd (opt-in RADVD_MANAGED=1, #524). It is not in UBI and
-# its build needs libbsd, also not in UBI; the entrypoint's radvd loop then just
-# logs and retries without affecting DHCP. Use the default image for radvd.
+# radvd (RADVD_MANAGED=1, #524) is included. UBI has no radvd, no libbsd (radvd
+# wants strlcpy, which glibc 2.34 lacks: a one-function shim header stands in) and
+# no flex / bison (the release tarball ships no generated scanner / parser), so
+# flex and bison are built first, in the builder only.
 #
 # Build context is the REPO ROOT, as for the Alpine Dockerfile.
 ARG PYTHON_VERSION=3.12
@@ -24,12 +30,13 @@ FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff1
 RUN dnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
       --enablerepo=ubi-9-codeready-builder-rpms \
       gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config \
-      openssl-devel libcap-devel xz bzip2 tar gzip \
+      openssl-devel libcap-devel xz bzip2 tar gzip gnupg2 m4 perl-interpreter diffutils \
       python3.12 python3.12-pip \
  && dnf clean all
 ARG MESON_VERSION=1.9.1
 RUN python3.12 -m pip install --no-cache-dir "meson==${MESON_VERSION}"
 
+COPY agent/dhcp/images/kea/verify-sig.sh /usr/local/bin/verify-sig
 WORKDIR /src
 
 ARG BOOST_VERSION=1.89.0
@@ -51,6 +58,12 @@ RUN set -eu; v="$(echo "${BOOST_VERSION}" | tr . _)"; \
 
 ARG LOG4CPLUS_VERSION=2.2.1
 ARG LOG4CPLUS_SHA256=97c932e0eddbf6fef81656d44d632eac0c105d2ae795ef065cdb8f7b50f8fbda
+# sha256 ONLY, although upstream signs this tarball (REL_2_2_1 ships a .sig by a
+# signing subkey FB84C99776AEC6271F96A14F30709A8D5C8D850D of Vaclav Haisman,
+# primary E406292F7D08BBB00846131404B89D51DFE5A215): the only published copy of
+# that key also carries a Brainpool subkey, which UBI 9's GnuPG 2.3.3 cannot
+# parse ("Unknown elliptic curve"), so the whole import fails and nothing can
+# be checked. The signature was verified once with a current gpg when pinning.
 RUN set -eu; \
     curl -fsSL -o l4c.tar.bz2 "https://github.com/log4cplus/log4cplus/releases/download/REL_$(echo "${LOG4CPLUS_VERSION}" | tr . _)/log4cplus-${LOG4CPLUS_VERSION}.tar.bz2"; \
     echo "${LOG4CPLUS_SHA256}  l4c.tar.bz2" | sha256sum -c -; \
@@ -61,6 +74,9 @@ RUN set -eu; \
 
 ARG KEA_VERSION=3.0.5
 ARG KEA_SHA256=03ac2443f75b56c8c58144e2929230ce430cf7a2f85f0e2c056fb14933feb5eb
+# ISC's release signing key, from the key block ISC publishes at
+# https://www.isc.org/pgpkey/ (https://www.isc.org/docs/isc-keyblock.asc).
+ARG KEA_PGP_FPR=DA6A3508E672A49DD382AFD95B8F4D91B88ED909
 # Kea 3.0 refuses hook libraries / sockets / leases / logs outside its COMPILED-IN
 # directories (see the path note in the Alpine Dockerfile and render_kea.py), and
 # the config hardcodes /usr/lib/kea/hooks, /run/kea, /var/lib/kea, /var/log/kea.
@@ -68,7 +84,9 @@ ARG KEA_SHA256=03ac2443f75b56c8c58144e2929230ce430cf7a2f85f0e2c056fb14933feb5eb
 # the end of this RUN fail the build if any of them ever drifts.
 RUN set -eu; \
     curl -fsSL -o kea.tar.xz "https://downloads.isc.org/isc/kea/${KEA_VERSION}/kea-${KEA_VERSION}.tar.xz"; \
+    curl -fsSL -o kea.tar.xz.asc "https://downloads.isc.org/isc/kea/${KEA_VERSION}/kea-${KEA_VERSION}.tar.xz.asc"; \
     echo "${KEA_SHA256}  kea.tar.xz" | sha256sum -c -; \
+    verify-sig kea.tar.xz kea.tar.xz.asc https://www.isc.org/docs/isc-keyblock.asc "${KEA_PGP_FPR}"; \
     tar -xJf kea.tar.xz; cd "kea-${KEA_VERSION}"; \
     PKG_CONFIG_PATH=/usr/lib64/pkgconfig \
     BOOST_INCLUDEDIR=/usr/local/include BOOST_LIBRARYDIR=/usr/local/lib64 \
@@ -93,6 +111,51 @@ RUN set -eu; \
     cmake . && make tini; \
     install -D -m 0755 tini /stage/usr/local/bin/tini; \
     cp LICENSE /licenses-src/tini-LICENSE
+
+# radvd. Build tools first (builder only, into /opt/tools, never copied): flex and
+# bison, because the radvd release tarball carries gram.y / scanner.l and no
+# generated C. Both are signed: flex by Will Estes (key on keyserver.ubuntu.com
+# only, over HTTPS, pinned by fingerprint), bison from the GNU keyring.
+ARG FLEX_VERSION=2.6.4
+ARG FLEX_SHA256=e87aae032bf07c26f85ac0ed3250998c37621d95f8bd748b31f15b33c45ee995
+ARG FLEX_PGP_FPR=56C67868E93390AA1039AD1CE4B29C8D64885307
+ARG BISON_VERSION=3.8.2
+ARG BISON_SHA256=9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2
+ARG BISON_PGP_FPR=7DF84374B1EE1F9764BBE25D0DDCAA3278D5264E
+RUN set -eu; \
+    u="https://ftp.gnu.org/gnu/bison/bison-${BISON_VERSION}.tar.xz"; \
+    curl -fsSL -o bison.tar.xz "$u"; curl -fsSL -o bison.tar.xz.sig "$u.sig"; \
+    echo "${BISON_SHA256}  bison.tar.xz" | sha256sum -c -; \
+    verify-sig bison.tar.xz bison.tar.xz.sig https://ftp.gnu.org/gnu/gnu-keyring.gpg "${BISON_PGP_FPR}"; \
+    tar -xJf bison.tar.xz; (cd "bison-${BISON_VERSION}" && ./configure --prefix=/opt/tools >/dev/null && make -j"$(nproc)" MAKEINFO=true HELP2MAN=true >/dev/null && make install MAKEINFO=true HELP2MAN=true >/dev/null); \
+    u="https://github.com/westes/flex/releases/download/v${FLEX_VERSION}/flex-${FLEX_VERSION}.tar.gz"; \
+    curl -fsSL -o flex.tar.gz "$u"; curl -fsSL -o flex.tar.gz.sig "$u.sig"; \
+    echo "${FLEX_SHA256}  flex.tar.gz" | sha256sum -c -; \
+    verify-sig flex.tar.gz flex.tar.gz.sig "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FLEX_PGP_FPR}" "${FLEX_PGP_FPR}"; \
+    tar -xzf flex.tar.gz; (cd "flex-${FLEX_VERSION}" && PATH=/opt/tools/bin:$PATH ./configure --prefix=/opt/tools >/dev/null && make -j"$(nproc)" >/dev/null && make install >/dev/null)
+
+ARG RADVD_VERSION=2.21
+ARG RADVD_SHA256=09e5cf7712397463fd35ebca71f3c05f7d31cff9246513f12d03a359c40b089c
+# Signed by a key of Robin H. Johnson (radvd release manager); published on
+# keys.openpgp.org (the project ships none).
+ARG RADVD_PGP_FPR=BDEBB6A52F156FDF3168D91119395F23C58826C4
+# strlcpy is the only libbsd function radvd uses (configure otherwise demands
+# libbsd, absent from UBI). Declared via a shim header, ``ac_cv_func_strlcpy=yes``
+# skips the libbsd probe.
+RUN set -eu; \
+    u="https://github.com/radvd-project/radvd/releases/download/v${RADVD_VERSION}/radvd-${RADVD_VERSION}.tar.gz"; \
+    curl -fsSL -o radvd.tar.gz "$u"; curl -fsSL -o radvd.tar.gz.asc "$u.asc"; \
+    echo "${RADVD_SHA256}  radvd.tar.gz" | sha256sum -c -; \
+    verify-sig radvd.tar.gz radvd.tar.gz.asc "https://keys.openpgp.org/vks/v1/by-fingerprint/${RADVD_PGP_FPR}" "${RADVD_PGP_FPR}"; \
+    tar -xzf radvd.tar.gz; cd "radvd-${RADVD_VERSION}"; \
+    printf '#include <stddef.h>\n#include <string.h>\nstatic inline size_t strlcpy(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) { size_t c = l >= n ? n - 1 : l; memcpy(d, s, c); d[c] = 0; } return l; }\n' > /tmp/strlcpy.h; \
+    PATH=/opt/tools/bin:$PATH ac_cv_func_strlcpy=yes CFLAGS="-O2 -D_GNU_SOURCE -include /tmp/strlcpy.h" \
+      ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var >/dev/null; \
+    PATH=/opt/tools/bin:$PATH make -j"$(nproc)" >/dev/null; \
+    make install DESTDIR=/stage >/dev/null; \
+    strip /stage/usr/sbin/radvd /stage/usr/sbin/radvdump; \
+    cp COPYRIGHT /licenses-src/radvd-COPYRIGHT; \
+    /stage/usr/sbin/radvd --version 2>&1 | grep -q "^Version: ${RADVD_VERSION}"
 
 # Kea's meson sets install_umask=0027, which leaves the binaries and libraries
 # unreadable to a random OpenShift uid (group 0 is not the owning group): open
@@ -150,6 +213,9 @@ RUN echo "spatium:x:1001:" >> /etc/group \
  && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp4 \
  && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp6 \
  && getcap /usr/sbin/kea-dhcp4 /usr/sbin/kea-dhcp6 | grep -c cap_net_raw | grep -qx 2 \
+ # radvd (#524): CAP_NET_RAW for the ICMPv6 socket, CAP_NET_ADMIN to send RAs; file caps survive the privilege drop.
+ && setcap cap_net_raw,cap_net_admin=+ep /usr/sbin/radvd \
+ && getcap /usr/sbin/radvd | grep -q 'cap_net_admin,cap_net_raw' \
  && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
       /etc/radvd /run/radvd \
  && chown -R 1001:1001 /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
@@ -208,7 +274,7 @@ ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
 
 # #3913: image metadata Red Hat's preflight expects, plus /licenses: the project
 # texts and every source-built component's licence (Kea MPL-2.0, log4cplus
-# Apache-2.0, Boost BSL-1.0, tini MIT).
+# Apache-2.0, Boost BSL-1.0, radvd BSD-style, tini MIT).
 ARG IMAGE_RELEASE=1
 COPY LICENSE NOTICE /licenses/
 RUN cp /licenses-src/* /licenses/ && rm -rf /licenses-src

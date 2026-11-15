@@ -93,6 +93,8 @@ Where the two disagree about a license, THIS file is authoritative.
 - libuv — MIT — https://libuv.org
 - Userspace RCU (liburcu, dynamically linked) — LGPL 2.1 — https://liburcu.org
 - log4cplus — BSD-2-Clause / Apache 2.0 — https://github.com/log4cplus/log4cplus
+- jemalloc (built from source, linked into named) — BSD-2-Clause — https://jemalloc.net
+- radvd (built from source) — BSD-style — https://radvd.litech.org
 - tini (built from source) — MIT — https://github.com/krallin/tini
 
 ── Operator tooling shipped in the API image ───────────────────────────────

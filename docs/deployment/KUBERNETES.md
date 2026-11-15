@@ -150,7 +150,9 @@ chown and drop privileges at start). `frontend.tls.enabled` (the appliance's
 `:80` / `:443` nginx) and `frontend.hostNetwork` are refused: let the Route
 terminate TLS. Kea's opt-in
 rogue-DHCP probe and fingerprint sniffer need `NET_RAW` in a process that is not
-Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
+Kea, and are unavailable; so is radvd (`RADVD_MANAGED`), which also needs
+`NET_ADMIN`, in the default and the `-ubi` Kea image alike (the `-ubi` image does
+ship radvd, for platforms where you grant it). `restricted-v3` (4.22+) also requires `hostUsers:
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
@@ -174,9 +176,8 @@ numeric non-root `USER` and keep the random-uid behaviour above. BIND 9.20 and
 Kea are built from checksummed source, since Red Hat ships neither at these
 versions (see `docs/THIRD_PARTY.md`). Compared with the default images the UBI
 ones lack `whois` and `traceroute` (the Tools page reports the missing binary),
-the NFS backup destination (`libnfs`), radvd in the Kea image (the opt-in
-`RADVD_MANAGED` router advertisements), BIND's jemalloc and JSON statistics
-channel, and the frontend's nginx is Red Hat's 1.26.
+the NFS backup destination (`libnfs`), `kea-admin` and the SQL lease backends in
+the Kea image, and the frontend's nginx is Red Hat's 1.26.
 
 `charts/spatiumddi/values-openshift-certified.yaml` selects them:
 

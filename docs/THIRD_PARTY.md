@@ -348,18 +348,22 @@ from checksummed upstream source tarballs in a builder stage (each
 | [Userspace RCU](https://liburcu.org/) | 0.15.6 (built from source, UBI image) | LGPL v2.1 (dynamically linked) | `dns-bind9` UBI image |
 | [ISC Kea DHCP](https://www.isc.org/kea/) | 3.0.5 (built from source, UBI image) | MPL 2.0 | `dhcp-kea` UBI image |
 | [log4cplus](https://github.com/log4cplus/log4cplus) | 2.2.1 (built from source, UBI image) | BSD-2-Clause / Apache 2.0 | `dhcp-kea` UBI image |
+| [jemalloc](https://jemalloc.net/) | 5.3.0 (built from source, UBI image) | BSD-2-Clause | Allocator `named` is linked to in the `dns-bind9` UBI image (#4192) |
+| [radvd](https://radvd.litech.org/) | 2.21 (built from source, UBI image) | BSD-style | `dhcp-kea` UBI image (opt-in `RADVD_MANAGED=1`) |
 | [tini](https://github.com/krallin/tini) | 0.19.0 (built from source) | MIT | PID 1 in the `dns-bind9` and `dhcp-kea` UBI images |
 | [PostgreSQL client 16](https://www.postgresql.org/) (PGDG el9 repository) | 16 | PostgreSQL License | api UBI image (`pg_dump` / `pg_restore`) |
 | Red Hat PostgreSQL 16 / Redis 7 images | `registry.redhat.io/rhel9/postgresql-16`, `rhel9/redis-7` | PostgreSQL License / BSD-3-Clause, under Red Hat's terms | Pulled by the certified profile only (`values-openshift-certified.yaml`); not redistributed by this project |
 
 Build-time only, nothing shipped: Boost 1.89.0 headers and meson 1.9.1 (Kea
-build). Dropped from the UBI api image because UBI does not carry them:
+build), flex 2.6.4 and bison 3.8.2 (radvd build). BIND, Kea, libuv, userspace-rcu,
+radvd, flex and bison are fetched with an OpenPGP signature checked against a
+fingerprint pinned in the Dockerfile and `versions.json`, besides the sha256;
+log4cplus (its key cannot be imported by UBI's GnuPG), tini (only release
+binaries are signed), Boost and jemalloc (none published) are sha256-only.
+
+Dropped from the UBI api image because UBI does not carry them:
 `whois`, `traceroute` and `libnfs` (the NFS backup destination and the Tools
-page's whois / traceroute report the missing binary). Dropped from the UBI
-`dhcp-kea` image: radvd (opt-in `RADVD_MANAGED=1`; UBI has no radvd or libbsd to
-build it), `kea-admin` and the MySQL / PostgreSQL lease backends. Dropped from the UBI
-`dns-bind9` image: jemalloc (a glibc image has no need of it, #4192) and the
-JSON statistics channel (the agent reads XML).
+page's whois / traceroute report the missing binary). Dropped from the UBI `dhcp-kea` image: `kea-admin` and the MySQL / PostgreSQL lease backends.
 
 ## Container bases and init
 
