@@ -78,6 +78,9 @@ spec:
           # plain byte count — redis rejects a "16mb"-style suffix here.
           {{- if $rhel }}
           args:
+            {{- /* #3913 — the args replace sclorg's default command, so name
+                   it first; run-redis passes the rest on to redis-server. */}}
+            - run-redis
             - --maxmemory
             - {{ .Values.redis.maxmemory | quote }}
             - --maxmemory-policy

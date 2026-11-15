@@ -391,6 +391,15 @@ if grep -Eq '^ +- .*aof-load-corrupt-tail-max-size' "$CERT"; then
     echo "   FAIL #3913: Redis 7 (rhel flavor) does not know aof-load-corrupt-tail-max-size" >&2
     failures=$((failures + 1))
 fi
+# The rhel images start through their own command (run-postgresql / run-redis);
+# args replace it, so it must come first or the entrypoint execs the first
+# argument and the pod crash-loops (found on OpenShift Local, 15 Nov 2026).
+for cmd in run-postgresql run-redis; do
+    if ! grep -Eq "^ +- $cmd\$" "$CERT"; then
+        echo "   FAIL #3913: the rhel flavor's args do not start with $cmd" >&2
+        failures=$((failures + 1))
+    fi
+done
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
     || failures=$((failures + 1))

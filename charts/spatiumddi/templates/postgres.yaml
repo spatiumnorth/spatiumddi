@@ -68,6 +68,13 @@ spec:
           # (helper ``spatiumddi.postgresMaxConnections``); an explicit
           # ``postgresql.maxConnections`` wins. Changing it restarts Postgres.
           args:
+            {{- if $rhel }}
+            {{- /* #3913 — sclorg's image runs its default command only when
+                   no args are given; the args replace it, so name it first
+                   (run-postgresql passes the rest on to postgres). Found on
+                   OpenShift Local: without it the entrypoint execs "-c". */}}
+            - run-postgresql
+            {{- end }}
             - -c
             - max_connections={{ .Values.postgresql.maxConnections | default (include "spatiumddi.postgresMaxConnections" .) }}
             {{- /* #3932 — end a session whose client has gone (see

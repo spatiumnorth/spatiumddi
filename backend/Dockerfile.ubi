@@ -86,6 +86,7 @@ RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && microdnf -y --setopt=install_weak_deps=0 --nodocs install postgresql16 \
     && rm -f /etc/yum.repos.d/pgdg16.repo \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     && setcap cap_net_raw+eip /usr/sbin/tcpdump \
     && getcap /usr/sbin/tcpdump | grep -q cap_net_raw \
