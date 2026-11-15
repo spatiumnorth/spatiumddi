@@ -57,6 +57,7 @@ from app.services.logs.agent_logs import (
     search_dhcp_activity,
     search_dns_queries,
 )
+from app.services.logs.client_names import ClientNameError, name_fields, resolve_client_names
 
 # The agent fleet-health tools span three resource families; each kind is
 # shown only to a caller who can read that family on its own REST surface.
@@ -74,6 +75,13 @@ def _since_default(hours: float | None) -> datetime | None:
 
 
 # ── query_dns_query_log ───────────────────────────────────────────────
+
+
+def _client_name_fields(mode: str, names: dict[str, Any], r: Any) -> dict[str, Any]:
+    """``client_name`` keys (#4249) — only when names were resolved at all."""
+    if mode == "none":
+        return {}
+    return name_fields(names, str(r.client_ip) if r.client_ip else None)
 
 
 class QueryDNSQueryLogArgs(BaseModel):
@@ -98,6 +106,14 @@ class QueryDNSQueryLogArgs(BaseModel):
         description="Only include rows newer than N hours ago. None = no lower bound.",
         ge=0.0,
     )
+    resolve_clients: Literal["none", "ptr", "ipam"] = Field(
+        default="none",
+        description=(
+            "Add a client_name per row: 'ptr' = reverse DNS, 'ipam' = host name "
+            "in the IP space ip_space_id (required; only addresses you may read)."
+        ),
+    )
+    ip_space_id: uuid.UUID | None = Field(default=None, description="IP space for 'ipam'.")
     limit: int = Field(default=200, ge=1, le=1000)
 
 
@@ -143,8 +159,19 @@ async def query_dns_query_log(
         )
     except InvalidLogFilter as exc:
         return [{"result": exc.detail}]
+    try:
+        client_names = await resolve_client_names(
+            db,
+            user,
+            [str(r.client_ip) if r.client_ip else None for r in rows],
+            args.resolve_clients,
+            args.ip_space_id,
+        )
+    except ClientNameError as exc:
+        return [{"result": exc.detail}]
     return [
         {
+            **_client_name_fields(args.resolve_clients, client_names, r),
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
             "server_name": names.get(r.server_id),

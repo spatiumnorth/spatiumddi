@@ -216,8 +216,13 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     from app.core import shutdown
 
     shutdown.reset()
+    # #4249 — the PTR client-name cache is per process on a monotonic clock.
+    from app.services.logs import client_names
+
+    client_names.invalidate_cache()
     yield
     shutdown.reset()
+    client_names.invalidate_cache()
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
     maintenance_mode.invalidate_cache()

@@ -10600,6 +10600,9 @@ export interface DNSQueryLogRow {
   rcode?: string | null;
   /** RRs in the answer section. NOERROR with 0 is a NODATA response. */
   answer_count?: number | null;
+  /** Resolved host name for `client_ip` (#4249); set only when requested. */
+  client_name?: string | null;
+  client_name_source?: "ptr" | "ipam" | null;
   raw: string;
 }
 
@@ -10613,6 +10616,9 @@ export interface DNSQueryLogRequest extends AgentLogScope {
   view?: string | null;
   /** Exact outcome (#914). `UNKNOWN` selects rows with no recorded rcode. */
   rcode?: string | null;
+  /** Resolve client names (#4249); `ipam` needs `ip_space_id`. */
+  resolve_clients?: "none" | "ptr" | "ipam";
+  ip_space_id?: string | null;
   max_events?: number;
 }
 

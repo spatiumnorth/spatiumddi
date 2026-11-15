@@ -4,6 +4,7 @@ import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useSessionState } from "@/lib/useSessionState";
 import {
   Activity,
   AlertTriangle,
@@ -22,11 +23,13 @@ import {
   XCircle,
 } from "lucide-react";
 import {
+  ipamApi,
   logsApi,
   type AgentLogSource,
   type DhcpAuditDay,
   type DhcpAuditRow,
   type DHCPActivityLogRow,
+  type DNSQueryLogRequest,
   type DNSQueryLogRow,
   type LogEventRow,
   type LogSource,
@@ -1129,7 +1132,7 @@ function ServerCell({ name }: { name: string }) {
   );
 }
 
-function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
+export function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
     defaultSelection(sources),
   );
@@ -1140,6 +1143,35 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [clientIp, setClientIp] = useState<string>("");
   const [view, setView] = useState<string>("");
   const [rcode, setRcode] = useState<string>("");
+  // Client name resolution (#4249): off by default, remembered per session.
+  const [resolveNames, setResolveNames] = useSessionState<boolean>(
+    "logs-dns-resolve-clients",
+    false,
+  );
+  // "ptr" (reverse DNS) or an IP space id.
+  const [nameSource, setNameSource] = useSessionState<string>(
+    "logs-dns-resolve-source",
+    "ptr",
+  );
+  const spacesQuery = useQuery({
+    queryKey: ["ipam-spaces-for-logs"],
+    queryFn: () => ipamApi.listSpaces(),
+    enabled: resolveNames,
+    staleTime: 60_000,
+  });
+  const spaces = spacesQuery.data ?? [];
+  const resolveParams: Pick<
+    DNSQueryLogRequest,
+    "resolve_clients" | "ip_space_id"
+  > = !resolveNames
+    ? {}
+    : nameSource === "ptr"
+      ? { resolve_clients: "ptr" }
+      : { resolve_clients: "ipam", ip_space_id: nameSource };
+  const ipSpaceName =
+    nameSource !== "ptr"
+      ? spaces.find((sp) => sp.id === nameSource)?.name
+      : undefined;
 
   useEffect(() => {
     if (sources.length === 0) {
@@ -1169,10 +1201,12 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
       debouncedClientIp,
       view,
       rcode,
+      resolveParams,
     ],
     queryFn: () =>
       logsApi.dnsQueries({
         ...scope,
+        ...resolveParams,
         max_events: maxEvents,
         since: sinceIso,
         q: q.trim() || null,
@@ -1241,6 +1275,32 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
             className="w-32 rounded-md border bg-background px-2 py-1 text-sm font-mono text-[11px]"
           />
         </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={resolveNames}
+            onChange={(e) => setResolveNames(e.target.checked)}
+          />
+          <span className="text-muted-foreground">Resolve client names</span>
+        </label>
+        {resolveNames && (
+          <label className="flex items-center gap-1.5 text-xs">
+            <span className="text-muted-foreground">Source</span>
+            <select
+              aria-label="Client name source"
+              value={nameSource}
+              onChange={(e) => setNameSource(e.target.value)}
+              className="rounded-md border bg-background px-2 py-1 text-sm"
+            >
+              <option value="ptr">Reverse DNS</option>
+              {spaces.map((sp) => (
+                <option key={sp.id} value={sp.id}>
+                  IP space: {sp.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {/* Outcome filter (#914). "Unrecorded" is a real question an
             operator asks — it is how you find out whether response
             logging is actually on — so it is a selectable value rather
@@ -1353,6 +1413,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
                 key={row.id}
                 row={row}
                 showServer={showServer}
+                ipSpaceName={ipSpaceName}
                 onFilterClient={(ip) => setClientIp(ip)}
                 onFilterQname={(name) => setQ(name)}
               />
@@ -1567,12 +1628,15 @@ function RcodeCell({
 export function DNSQueryRow({
   row,
   showServer = false,
+  ipSpaceName,
   onFilterClient,
   onFilterQname,
 }: {
   row: DNSQueryLogRow;
   /** Render the Server column (#2120) — the read merged several servers. */
   showServer?: boolean;
+  /** Name of the IP space a resolved name came from (#4249). */
+  ipSpaceName?: string;
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
 }) {
@@ -1588,6 +1652,7 @@ export function DNSQueryRow({
       {open && (
         <DNSQueryDetailModal
           row={row}
+          ipSpaceName={ipSpaceName}
           onClose={() => setOpen(false)}
           onFilterClient={onFilterClient}
           onFilterQname={onFilterQname}
@@ -1604,11 +1669,24 @@ export function DNSQueryRow({
         className="truncate font-mono text-[11px]"
         title={
           row.client_ip
-            ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+            ? `${row.client_name ? `${row.client_name} ` : ""}${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
             : ""
         }
       >
-        {row.client_ip ?? <span className="text-muted-foreground/40">—</span>}
+        {row.client_ip ? (
+          row.client_name ? (
+            <>
+              <span className="block truncate">{row.client_name}</span>
+              <span className="block truncate text-muted-foreground">
+                {row.client_ip}
+              </span>
+            </>
+          ) : (
+            row.client_ip
+          )
+        ) : (
+          <span className="text-muted-foreground/40">—</span>
+        )}
       </span>
       <span className="font-mono">
         {row.qtype ?? <span className="text-muted-foreground/40">—</span>}
@@ -1996,11 +2074,13 @@ function describeRcode(
 
 function DNSQueryDetailModal({
   row,
+  ipSpaceName,
   onClose,
   onFilterClient,
   onFilterQname,
 }: {
   row: DNSQueryLogRow;
+  ipSpaceName?: string;
   onClose: () => void;
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
@@ -2023,6 +2103,18 @@ function DNSQueryDetailModal({
         <DetailField label="Client" mono>
           {client ?? <Missing />}
         </DetailField>
+        {row.client_name && (
+          <DetailField label="Client name" mono>
+            {row.client_name}{" "}
+            <span className="text-muted-foreground">
+              (from{" "}
+              {row.client_name_source === "ipam"
+                ? `IP space${ipSpaceName ? ` ${ipSpaceName}` : ""}`
+                : "reverse DNS"}
+              )
+            </span>
+          </DetailField>
+        )}
         <DetailField label="View" mono>
           {row.view ?? <Missing />}
         </DetailField>
