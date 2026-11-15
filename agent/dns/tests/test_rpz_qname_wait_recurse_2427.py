@@ -83,3 +83,28 @@ def test_named_checkconf_accepts_it(tmp_path: Path, views: list[dict]) -> None:
         check=False,
     )
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("views", [[], [_VIEW]])
+def test_response_policy_servfails_until_zones_loaded_4064(
+    tmp_path: Path, views: list[dict]
+) -> None:
+    """A big policy zone loads while named already answers, so a blocked name
+    resolved for seconds after every start (#4064)."""
+    pols = _policies(_render(tmp_path, views))
+    assert len(pols) == 1
+    assert "servfail-until-ready yes" in pols[0]
+
+
+def test_no_blocklists_renders_no_response_policy_4064(tmp_path: Path) -> None:
+    bundle = {
+        "options": {"recursion_enabled": True, "allow_query": ["any"]},
+        "views": [],
+        "zones": [],
+        "tsig_keys": [],
+        "blocklists": [],
+    }
+    Bind9Driver(state_dir=tmp_path).render(bundle)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    assert "response-policy" not in conf
+    assert "servfail-until-ready" not in conf

@@ -190,7 +190,7 @@ async def list_all_lease_history(
     rows = (
         (
             await db.execute(
-                base.order_by(DHCPLeaseHistory.expired_at.desc())
+                base.order_by(DHCPLeaseHistory.expired_at.desc(), DHCPLeaseHistory.id)
                 .offset((page - 1) * per_page)
                 .limit(per_page)
             )
