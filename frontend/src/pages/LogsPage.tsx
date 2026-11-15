@@ -4,6 +4,7 @@ import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useSessionState } from "@/lib/useSessionState";
 import {
   Activity,
   AlertTriangle,
@@ -1117,6 +1118,20 @@ const DHCP_COLS_SERVER =
   "grid-cols-[20px_160px_130px_70px_180px_140px_120px_1fr]";
 
 /** Whether a response merged more than one server. */
+/**
+ * The server pick a tab acts on. The pick is kept in sessionStorage so it
+ * survives a switch to another Logs tab and back (only the active tab is
+ * mounted, #4234); a stored pick that no longer names a readable server falls
+ * back to the default, and nothing is read with no sources.
+ */
+function effectiveSelection(
+  picked: AgentLogSelection | null,
+  sources: AgentLogSource[],
+): AgentLogSelection | null {
+  if (sources.length === 0) return null;
+  return selectionIsValid(picked, sources) ? picked : defaultSelection(sources);
+}
+
 function coversManyServers(data: { server_ids?: string[] } | undefined) {
   return (data?.server_ids?.length ?? 0) > 1;
 }
@@ -1130,9 +1145,9 @@ function ServerCell({ name }: { name: string }) {
 }
 
 function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
-  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
-    defaultSelection(sources),
-  );
+  const [pickedSelection, setSelection] =
+    useSessionState<AgentLogSelection | null>("logs-dns-queries-server", null);
+  const selection = effectiveSelection(pickedSelection, sources);
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
   const [q, setQ] = useState("");
@@ -1141,15 +1156,6 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [view, setView] = useState<string>("");
   const [rcode, setRcode] = useState<string>("");
 
-  useEffect(() => {
-    if (sources.length === 0) {
-      setSelection(null);
-      return;
-    }
-    if (!selectionIsValid(selection, sources)) {
-      setSelection(defaultSelection(sources));
-    }
-  }, [sources, selection]);
   const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
@@ -1638,9 +1644,12 @@ export function DNSQueryRow({
 // ── DHCP Activity tab (Kea log) ───────────────────────────────────
 
 function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
-  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
-    defaultSelection(sources),
-  );
+  const [pickedSelection, setSelection] =
+    useSessionState<AgentLogSelection | null>(
+      "logs-dhcp-activity-server",
+      null,
+    );
+  const selection = effectiveSelection(pickedSelection, sources);
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
   const [q, setQ] = useState("");
@@ -1649,15 +1658,6 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   const [mac, setMac] = useState<string>("");
   const [ip, setIp] = useState<string>("");
 
-  useEffect(() => {
-    if (sources.length === 0) {
-      setSelection(null);
-      return;
-    }
-    if (!selectionIsValid(selection, sources)) {
-      setSelection(defaultSelection(sources));
-    }
-  }, [sources, selection]);
   const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
