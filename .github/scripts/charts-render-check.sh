@@ -357,10 +357,45 @@ render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
 # #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
 # here too (no pinned uid, its ServiceAccount exists).
 render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
+# #3913 — the certified profile: the -ubi image variants and Red Hat's own
+# PostgreSQL / Redis from registry.redhat.io. Rendered with the agents on (they
+# carry the other two -ubi tags) and Redis auth on (the rhel flavor passes the
+# password through REDIS_PASSWORD, not a command line).
+render umbrella-openshift-certified "$UMBRELLA" "${UMBRELLA_OPENSHIFT[@]}" \
+    -f "$UMBRELLA/values-openshift-certified.yaml" \
+    --set redis.auth.enabled=true
+echo "── OpenShift certified profile: -ubi tags, Red Hat PostgreSQL / Redis (#3913)"
+CERT="$OUT/umbrella-openshift-certified.yaml"
+for img in spatiumddi-api spatiumddi-frontend dns-bind9 dhcp-kea; do
+    if ! grep -qE "image: \"?ghcr\.io/[a-z]+/$img:[^\" ]+-ubi\"?$" "$CERT"; then
+        echo "   FAIL #3913: the certified profile renders no $img:<version>-ubi image" >&2
+        failures=$((failures + 1))
+    fi
+done
+if grep -E "image: \"?ghcr\.io/[a-z]+/(spatiumddi-api|spatiumddi-frontend|dns-bind9|dhcp-kea):" "$CERT" \
+        | grep -qv -- '-ubi'; then
+    echo "   FAIL #3913: the certified profile renders a non-UBI image of the four" >&2
+    failures=$((failures + 1))
+fi
+for ref in registry.redhat.io/rhel9/postgresql-16 registry.redhat.io/rhel9/redis-7; do
+    if ! grep -q "image: \"$ref:" "$CERT"; then
+        echo "   FAIL #3913: the certified profile does not run $ref" >&2
+        failures=$((failures + 1))
+    fi
+done
+if ! grep -q 'name: POSTGRESQL_PASSWORD' "$CERT" || grep -q 'name: PGDATA' "$CERT"; then
+    echo "   FAIL #3913: the rhel PostgreSQL flavor must set POSTGRESQL_* and not the official image's PGDATA" >&2
+    failures=$((failures + 1))
+fi
+if grep -Eq '^ +- .*aof-load-corrupt-tail-max-size' "$CERT"; then
+    echo "   FAIL #3913: Redis 7 (rhel flavor) does not know aof-load-corrupt-tail-max-size" >&2
+    failures=$((failures + 1))
+fi
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
     || failures=$((failures + 1))
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
+    "$OUT/umbrella-openshift-certified.yaml" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
     "$OUT/umbrella-openshift-forced.yaml" "$OUT/umbrella-openshift-upgrade.yaml" \
     || failures=$((failures + 1))

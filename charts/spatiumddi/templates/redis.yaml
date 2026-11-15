@@ -1,4 +1,14 @@
 {{- if and .Values.redis.enabled (eq (.Values.redis.kind | default "standalone") "standalone") }}
+{{- /* #3913 — ``redis.image.flavor: rhel`` runs Red Hat's rhel9/redis-7 (sclorg):
+       its run-redis script starts redis-server from /etc/redis.conf plus
+       whatever args follow, takes REDIS_PASSWORD from the environment and
+       keeps data in /var/lib/redis/data. Redis 7 has no
+       ``aof-load-corrupt-tail-max-size`` (a Redis 8 option, #590), so it is not
+       passed. The default (``docker``) is the official redis image, unchanged. */ -}}
+{{- $rhel := eq (.Values.redis.image.flavor | default "docker") "rhel" -}}
+{{- if not (has (.Values.redis.image.flavor | default "docker") (list "docker" "rhel")) }}
+{{- fail (printf "redis.image.flavor must be docker or rhel, got %q" .Values.redis.image.flavor) }}
+{{- end }}
 {{- $cmp := "redis" -}}
 {{- $secretName := printf "%s-redis" (include "spatiumddi.fullname" .) -}}
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,8 +53,13 @@ spec:
         {{- if not (include "spatiumddi.isOpenShift" .) }}
         # Redis Alpine image runs as 999:999 by default.
         {{- /* #3852: omitted on OpenShift — the SCC assigns the fsGroup. */}}
-        fsGroup: 999
+        fsGroup: {{ if $rhel }}1001{{ else }}999{{ end }}
         {{- end }}
+      {{- with .Values.image.pullSecrets }}
+      {{- /* #3913 — registry.redhat.io (the certified profile) needs a pull secret. */}}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: redis
           image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
@@ -61,7 +76,23 @@ spec:
           # of expendable cache into a permanent crashloop. Same rationale
           # as the sentinel path; see redis-sentinel.yaml. The value is a
           # plain byte count — redis rejects a "16mb"-style suffix here.
+          {{- if $rhel }}
+          args:
+            - --maxmemory
+            - {{ .Values.redis.maxmemory | quote }}
+            - --maxmemory-policy
+            - allkeys-lru
+            - --appendonly
+            - "yes"
           {{- if .Values.redis.auth.enabled }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "spatiumddi.redisSecretName" . }}
+                  key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
+          {{- end }}
+          {{- else if .Values.redis.auth.enabled }}
           command:
             - sh
             - -c
@@ -86,7 +117,7 @@ spec:
           {{- end }}
           volumeMounts:
             - name: data
-              mountPath: /data
+              mountPath: {{ if $rhel }}/var/lib/redis/data{{ else }}/data{{ end }}
           livenessProbe:
             tcpSocket:
               port: redis
