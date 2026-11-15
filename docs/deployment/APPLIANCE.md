@@ -4190,7 +4190,15 @@ the operator installing a CA anywhere:
    control plane serves signed by the appliance CA (whose certificate the
    supervisor received on approval), and re-pins only if the new certificate
    is on it. Otherwise it keeps the old pin and logs
-   `supervisor.tls.certificate_not_vouched`.
+   `supervisor.tls.certificate_not_vouched`. A member on the node-local http
+   path does not wait for that failure: every ~5 minutes it reads the same
+   list over the in-cluster path (trust is the CA signature, not the
+   transport), which also carries the vouched certificates' PEM, and replaces
+   its pin when the list names a certificate it does not hold
+   (`supervisor.tls.pin_refreshed`). A read that fails (its own api is
+   down) stays pending: it is retried with backoff and as soon as the
+   node-local path returns, and is dropped with
+   `supervisor.tls.pin_refresh_satisfied_by_repin` if a repin got there first.
 3. **Once approved, the first-contact pin is checked.** When the CA arrives,
    the supervisor checks that the certificate it pinned at first contact is on
    the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.
