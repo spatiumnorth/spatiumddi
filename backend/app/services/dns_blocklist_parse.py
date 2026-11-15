@@ -121,9 +121,15 @@ class ParsedFeed:
     ``wildcard_count`` is how many lines declared "this name and every
     subdomain": ``*.``-prefixed lines, and in an adblock feed every
     ``||name^`` rule, since that is what ``||`` means. The caller needs it
-    because a list configured apex-only (``feed_entries_are_wildcard=False``,
+    because a list configured apex-only (``feed_wildcard_mode="never"``,
     #894) against such a feed is overriding a stated intent, which is worth
     saying out loud rather than doing silently.
+
+    ``wildcard_domains`` is the subset of ``domains`` whose own syntax said
+    "and every subdomain" (#4190): every adblock ``||name^`` entry and every
+    ``*.name`` line of a domains feed. A hosts line (``0.0.0.0 name``) or a
+    bare domain says nothing about subdomains, so it is not in the set and
+    the ``by_syntax`` list mode stores it as an exact trigger.
 
     ``exceptions`` are the feed's own allow rules (adblock ``@@||name^``,
     #2123), stored as the list's exceptions. ``skipped`` counts the rules
@@ -134,6 +140,7 @@ class ParsedFeed:
 
     domains: list[str]
     wildcard_count: int
+    wildcard_domains: set[str] = field(default_factory=set)
     exceptions: list[str] = field(default_factory=list)
     skipped: FeedSkipCounts | None = None
     #: Adblock entries whose reach is NOT the list's subdomain setting (#4037),
@@ -467,6 +474,8 @@ def _parse_adblock(content: str) -> ParsedFeed:
     return ParsedFeed(
         domains=domains,
         wildcard_count=wildcard_count,
+        # ``||name^`` is "name and every subdomain" for every one of them.
+        wildcard_domains=set(domains),
         exceptions=exceptions,
         skipped=FeedSkipCounts(regex=regex, modifier=modifier, badfilter=badfilter, **malformed),
         literal_domains=literals,
@@ -483,7 +492,9 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
         `$important` / `$badfilter`; see :func:`_parse_adblock`
 
     Ignores blank lines and comments (`#`, `!`). A leading `*.` is
-    stripped rather than kept — see the comment at the strip site.
+    stripped rather than kept — see the comment at the strip site — and
+    recorded in ``wildcard_domains`` with every adblock ``||name^`` entry
+    (#4190); a hosts line or a bare domain is not.
     """
     if feed_format == "adblock":
         # The reverse of the check below (#3597): a hosts or domains file
@@ -508,6 +519,7 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
 
     out: list[str] = []
     seen: set[str] = set()
+    wildcard_domains: set[str] = set()
     wildcard_count = 0
     invalid = 0
 
@@ -540,7 +552,8 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
         # means here anyway, so it is stripped rather than stored: kept
         # literally it produces an RPZ rule matching subdomains ONLY,
         # leaving the apex resolving normally.
-        if domain.startswith("*."):
+        declared_wildcard = domain.startswith("*.")
+        if declared_wildcard:
             domain = domain[2:]
             wildcard_count += 1
         if not domain or "." not in domain:
@@ -553,6 +566,8 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
         if not _is_feed_name(domain):
             invalid += 1
             continue
+        if declared_wildcard:
+            wildcard_domains.add(domain)  # also when ``name`` came first
         if domain in seen:
             continue
         seen.add(domain)
@@ -561,6 +576,7 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
     return ParsedFeed(
         domains=out,
         wildcard_count=wildcard_count,
+        wildcard_domains=wildcard_domains,
         skipped=FeedSkipCounts(invalid_name=invalid) if invalid else None,
     )
 

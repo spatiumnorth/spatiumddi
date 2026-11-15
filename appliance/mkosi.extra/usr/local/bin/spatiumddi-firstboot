@@ -1334,6 +1334,11 @@ ${API_SIZING_YAML}
       # to add (#1005).
       service:
         trafficDistribution: PreferSameNode
+        # #3645 — the second api Service with internalTrafficPolicy: Local,
+        # which the member supervisors use so their plain-http hop stays on
+        # the node (the frontend stays on the cluster Service). Same value as the supervisor's
+        # HelmChartConfig (#1005).
+        nodeLocal: true
       autoscaling:
         enabled: false
       env:

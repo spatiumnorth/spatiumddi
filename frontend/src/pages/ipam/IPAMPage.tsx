@@ -102,6 +102,7 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
+  disabledBecause,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -151,6 +152,7 @@ import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused } from "@/lib/refusal";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
@@ -1266,7 +1268,7 @@ function DnsSettingsSection({
   });
 
   // Fetch effective inherited DNS from parent block (if provided)
-  const { data: blockDns } = useQuery({
+  const { data: blockDns, error: blockDnsError } = useQuery({
     queryKey: ["effective-dns-block", parentBlockId],
     queryFn: () => ipamApi.getEffectiveBlockDns(parentBlockId!),
     enabled: !!parentBlockId,
@@ -1274,7 +1276,7 @@ function DnsSettingsSection({
   });
 
   // Fallback: fetch space-level DNS when no parent block (top-level block creation)
-  const { data: spaceDns } = useQuery({
+  const { data: spaceDns, error: spaceDnsError } = useQuery({
     queryKey: ["effective-dns-space", fallbackSpaceId],
     queryFn: () => ipamApi.getEffectiveSpaceDns(fallbackSpaceId!),
     enabled: !parentBlockId && !!fallbackSpaceId,
@@ -1282,6 +1284,11 @@ function DnsSettingsSection({
   });
 
   const effectiveDns = blockDns ?? spaceDns ?? null;
+  // A scoped grant may not read the parent's effective settings (#4186): the
+  // refusal is not "nothing configured", so say the parent is not visible.
+  const parentUnreadable =
+    effectiveDns == null &&
+    isRefused(parentBlockId ? blockDnsError : spaceDnsError);
 
   // The group IDs to drive zone loading (own or inherited depending on mode)
   const activeGroupIds = inherit
@@ -1346,7 +1353,9 @@ function DnsSettingsSection({
           {effectiveDns &&
           (effectiveDns.dns_group_ids.length > 0 || effectiveDns.dns_zone_id)
             ? `Inheriting from ${inheritedFrom ?? "parent"}: ${effectiveDns.dns_group_ids.length} group(s), zone: ${effectiveDns.dns_zone_id ? (availableZones.find((z) => z.id === effectiveDns.dns_zone_id)?.name ?? (canReadZones ? effectiveDns.dns_zone_id : unanswered ? "linked, checking permissions" : "linked, not shown")) : "none"}`
-            : "No DNS settings configured in parent chain."}
+            : parentUnreadable
+              ? "The parent's DNS settings are not visible to your role."
+              : "No DNS settings configured in parent chain."}
         </p>
       )}
 
@@ -1540,19 +1549,23 @@ function DhcpSettingsSection({
     enabled: dhcpOn && canReadGroups,
   });
 
-  const { data: blockDhcp } = useQuery({
+  const { data: blockDhcp, error: blockDhcpError } = useQuery({
     queryKey: ["effective-dhcp-block", parentBlockId],
     queryFn: () => ipamApi.getEffectiveBlockDhcp(parentBlockId!),
     enabled: dhcpOn && !!parentBlockId,
     staleTime: 30_000,
   });
-  const { data: spaceDhcp } = useQuery({
+  const { data: spaceDhcp, error: spaceDhcpError } = useQuery({
     queryKey: ["effective-dhcp-space", fallbackSpaceId],
     queryFn: () => ipamApi.getEffectiveSpaceDhcp(fallbackSpaceId!),
     enabled: dhcpOn && !parentBlockId && !!fallbackSpaceId,
     staleTime: 30_000,
   });
   const effectiveDhcp = blockDhcp ?? spaceDhcp ?? null;
+  // See DnsSettingsSection (#4186): a refused parent read is not "none".
+  const parentUnreadable =
+    effectiveDhcp == null &&
+    isRefused(parentBlockId ? blockDhcpError : spaceDhcpError);
 
   const displayGroupId = inherit
     ? (effectiveDhcp?.dhcp_server_group_id ?? null)
@@ -1591,7 +1604,9 @@ function DhcpSettingsSection({
             ? canReadGroups
               ? `Inheriting from ${inheritedFrom ?? "parent"}: group "${displayGroup?.name ?? "unknown"}".`
               : `Inheriting from ${inheritedFrom ?? "parent"}: a group (${dhcpPerms.unanswered ?? "not visible to your role"}).`
-            : "No DHCP group configured in parent chain."}
+            : parentUnreadable
+              ? "The parent's DHCP settings are not visible to your role."
+              : "No DHCP group configured in parent chain."}
         </p>
       )}
 
@@ -4413,8 +4428,13 @@ export function AddAddressModal({
                     { name: "", record_type: "CNAME" },
                   ])
                 }
-                disabled={!hostname || !publishZoneId}
                 className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                {...disabledBecause(
+                  !hostname || !publishZoneId,
+                  !hostname
+                    ? "Enter a hostname first."
+                    : "Pick a DNS zone first; aliases are published there.",
+                )}
               >
                 <Plus className="h-3 w-3" /> Add alias
               </button>
@@ -10933,16 +10953,19 @@ function addressSetRangeLabel(s: AddressSet): string {
 export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   const qc = useQueryClient();
   const perms = usePermissions();
-  const { data: sets = [], isLoading } = useQuery({
+  const {
+    data: sets = [],
+    isLoading,
+    error: setsError,
+  } = useQuery({
     queryKey: ["address-sets", subnet.id],
     queryFn: () => addressSetsApi.list({ subnet_id: subnet.id }),
   });
-  // Resolve customer / site names for the Owner chips.
-  const subnetWritable = perms.can("write", "subnet", subnet.id);
   // ``admin`` on the ``address_set`` type lets you create new sets.
   const canCreate = perms.can("admin", "address_set");
-  const canManageSet = (id: string) =>
-    subnetWritable || perms.can("admin", "address_set", id);
+  // The edit and delete handlers need ``admin`` on the set itself (a subnet
+  // grant is refused, #4184), so the row controls follow that and only that.
+  const canManageSet = (id: string) => perms.can("admin", "address_set", id);
 
   const [showCreate, setShowCreate] = useState(false);
   const [editingSet, setEditingSet] = useState<AddressSet | null>(null);
@@ -10985,12 +11008,25 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
       {sets.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-center">
           <Boxes className="mb-3 h-10 w-10 text-muted-foreground/30" />
-          <p className="text-sm text-muted-foreground">
-            No address sets in this subnet.
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground/70">
-            Create one to delegate edit rights over a range of addresses.
-          </p>
+          {setsError ? (
+            <p className="text-sm">
+              <ListReadError
+                error={setsError}
+                what="this subnet's address sets"
+              />
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                No address sets in this subnet.
+              </p>
+              {canCreate && (
+                <p className="mt-1 text-xs text-muted-foreground/70">
+                  Create one to delegate edit rights over a range of addresses.
+                </p>
+              )}
+            </>
+          )}
         </div>
       ) : (
         <div className="overflow-x-auto">
@@ -17959,9 +17995,12 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
             </button>
             <button
               type="button"
-              disabled={selected.size === 0}
               onClick={() => setShowBulkDelete(true)}
               className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:opacity-40"
+              {...disabledBecause(
+                selected.size === 0,
+                "Select at least one address first.",
+              )}
               {...permissionGate(canDeleteIpam, NEEDS_ADDRESS_DELETE)}
             >
               <Trash2 className="h-3.5 w-3.5" />
@@ -17969,9 +18008,12 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
             </button>
             <button
               type="button"
-              disabled={selected.size === 0}
               onClick={() => setShowBulkEdit(true)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              {...disabledBecause(
+                selected.size === 0,
+                "Select at least one address first.",
+              )}
               {...permissionGate(canBulkEdit, NEEDS_ADDRESS_WRITE)}
             >
               <Pencil className="h-3.5 w-3.5" />
@@ -18354,10 +18396,13 @@ export function IPAMPage() {
             </button>
             <button
               onClick={() => setShowImport(true)}
-              disabled={!spaces || spaces.length === 0}
               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
               title="Import subnets"
               aria-label="Import subnets"
+              {...disabledBecause(
+                !spaces || spaces.length === 0,
+                "Create an IP space first; imported subnets need a space to land in.",
+              )}
               {...permissionGate(canImportSubnets, NEEDS_SUBNET_WRITE)}
             >
               <Upload className="h-3.5 w-3.5" />
