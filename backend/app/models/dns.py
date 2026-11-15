@@ -1725,6 +1725,9 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 # ── Blocking Lists / RPZ ────────────────────────────────────────────────────
 
+#: Values of ``DNSBlockList.feed_wildcard_mode`` (#4190).
+FEED_WILDCARD_MODES = ("by_syntax", "always", "never")
+
 # Association tables: a blocklist can be applied to many server groups and/or
 # many views. A view or group can reference many blocklists.
 dns_blocklist_group_assoc = Table(
@@ -1794,20 +1797,42 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # replaces :: (#2124).
     sinkhole_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     # Whether a feed-sourced entry blocks the named domain's SUBDOMAINS too
-    # (#894). Default on, because that is what every one of these feeds
-    # means — a list naming ``tracker.example`` intends
-    # ``cdn.tracker.example`` as well, and the manual add-entry form has
-    # always defaulted the same way. Off suits a host-specific feed (a
-    # threat-intel drop of individual C2 FQDNs), where blocking the parent
-    # domain would be over-blocking.
+    # (#894, tri-state since #4190):
+    #
+    # * ``by_syntax`` (default) — each entry follows what its own source
+    #   line says. An adblock ``||name^`` is "name and every subdomain"
+    #   (wildcard); a hosts line (``0.0.0.0 name``) or a bare domain names
+    #   exactly that host (exact trigger only), as AdGuard Home and every
+    #   hosts-file resolver read them. A ``*.name`` line of a domains feed is
+    #   wildcard. Halves the RPZ for a hosts-format list.
+    # * ``always`` — every feed entry blocks subdomains too, whatever the
+    #   syntax (the pre-#4190 behaviour). For a plain-domain feed whose
+    #   publisher means "this domain and everything under it" (HaGeZi's
+    #   ``wildcard/`` lists).
+    # * ``never`` — apex only; suits a host-specific feed (a threat-intel
+    #   drop of individual C2 FQDNs) where blocking the parent is over-blocking.
     #
     # Only feed entries consult it; a manual entry's ``is_wildcard`` is the
     # operator's own per-row choice and is never rewritten by this flag.
+    feed_wildcard_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="by_syntax", server_default="by_syntax"
+    )
+
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # DEPRECATED (#4190), removed in a later release: the pre-tri-state
+    # boolean, kept so an api pod still on the old release works during a
+    # rolling upgrade (expand/contract, #296). Derived from
+    # ``feed_wildcard_mode`` on every write (false only for ``never``); the
+    # API still returns it for old clients.
     feed_entries_are_wildcard: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    @validates("feed_wildcard_mode")
+    def _sync_legacy_wildcard(self, _key: str, value: str) -> str:
+        self.feed_entries_are_wildcard = value != "never"
+        return value
 
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
