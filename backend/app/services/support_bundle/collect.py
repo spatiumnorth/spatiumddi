@@ -35,7 +35,7 @@ from app.models.alerts import AlertEvent
 from app.models.audit import AuditLog
 from app.models.diagnostics import InternalError
 from app.models.settings import PlatformSettings
-from app.services.appliance.apt import mask_proxy_url
+from app.services.appliance.apt import mask_proxy_url, mask_source_uris
 from app.services.support_bundle.scrub import (
     Scrubber,
     env_value_is_shareable,
@@ -338,6 +338,8 @@ async def collect_platform_settings(db: AsyncSession, scrub: Scrubber) -> str:
             # ``user:pass`` shape for the text scrubber to catch
             # (GHSA-j77h-pqg7-h2g4).
             value = mask_proxy_url(value)
+        elif name == "apt_sources":
+            value = mask_source_uris(value)
         out[name] = scrub.value(name, value)
     out["_redacted_columns"] = sorted(redacted)
     return _json(out)
