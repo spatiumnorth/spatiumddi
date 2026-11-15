@@ -558,9 +558,26 @@ async def test_export_csv_writes_structured_custom_fields_as_json(
     else:
         assert rows[0]["tags"] == '["a","b"]'
         assert rows[0]["owner"] == '{"team":"net","oncall":true}'
-        # Round-trips: the importer reads the JSON text back to the same value.
-        parsed = parse_payload(data, "rt.csv", "text/csv")
-        cf = parsed.subnets[0]["custom_fields"]
-        assert cf["tags"] == ["a", "b"]
-        assert cf["owner"] == {"team": "net", "oncall": True}
-        assert cf["env"] == "prod"
+
+
+@pytest.mark.asyncio
+async def test_import_reads_json_text_back_only_for_multi_select(
+    db_session: AsyncSession,
+) -> None:
+    from app.models.ipam import CustomFieldDefinition
+
+    for name, ftype in (("tags", "multi_select"), ("note", "text")):
+        db_session.add(
+            CustomFieldDefinition(
+                resource_type="subnet", name=name, label=name, field_type=ftype, options=["a", "b"]
+            )
+        )
+    space = await _seed_space(db_session, "CfImport")
+    await db_session.flush()
+    csv_text = "network,name,tags,note,free\n" '10.41.1.0/24,s,"[""a"",""b""]","[1,2]","[3]"\n'
+    payload = parse_payload(csv_text.encode(), "x.csv", "text/csv")
+    await preview_import(db_session, payload, space_id=space.id, strategy="skip")
+    cf = payload.subnets[0]["custom_fields"]
+    assert cf["tags"] == ["a", "b"]  # multi_select: back to a list
+    assert cf["note"] == "[1,2]"  # text-typed: stays the string
+    assert cf["free"] == "[3]"  # no definition: stays text

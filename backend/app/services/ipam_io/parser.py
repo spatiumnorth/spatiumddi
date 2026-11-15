@@ -75,21 +75,6 @@ def _coerce_int(v: Any) -> int | None:
         return None
 
 
-def _cf_value(value: Any) -> Any:
-    """An unrecognised column's cell as a custom-field value. The exporter
-    writes a list / object custom field as compact JSON text (#4282); text that
-    starts with ``[`` or ``{`` and parses to one is read back as that list /
-    object, anything else stays the text it is."""
-    if isinstance(value, str) and value[:1] in ("[", "{"):
-        try:
-            parsed = json.loads(value)
-        except ValueError:
-            return value
-        if isinstance(parsed, (list, dict)):
-            return parsed
-    return value
-
-
 def _row_to_subnet(row: dict[str, Any]) -> dict[str, Any]:
     """Coerce a generic row dict into a subnet dict with custom_fields."""
     out: dict[str, Any] = {}
@@ -111,7 +96,7 @@ def _row_to_subnet(row: dict[str, Any]) -> dict[str, Any]:
             out["vxlan_id"] = value
         else:
             # Everything unrecognised becomes a custom field.
-            custom[key] = _cf_value(value)
+            custom[key] = value
     if custom:
         out["custom_fields"] = custom
     # Normalise vlan_id
@@ -177,7 +162,7 @@ def _row_to_address(row: dict[str, Any]) -> dict[str, Any]:
             if isinstance(value, dict):
                 custom.update(value)
         else:
-            custom[key] = _cf_value(value)
+            custom[key] = value
     if custom:
         out["custom_fields"] = custom
     return out
