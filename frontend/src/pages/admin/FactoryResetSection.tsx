@@ -20,6 +20,7 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Admin → Backup → Factory Reset tab (issue #116).
@@ -396,9 +397,9 @@ function ResetModal({
 
           {/* Error / success */}
           {executeMut.isError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {formatApiError(executeMut.error, "Reset failed")}
-            </div>
+            </FormError>
           )}
           {executeMut.isSuccess && executeMut.data && (
             <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">

@@ -9,7 +9,6 @@ import {
   RefreshCw,
   RotateCcw,
   ScrollText,
-  Square,
 } from "lucide-react";
 
 import {
@@ -21,10 +20,12 @@ import {
 } from "@/lib/api";
 import { listReadErrorMessage, pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   useApplianceAdminGate,
   useCanReadApplianceLogs,
 } from "@/hooks/useApplianceAdmin";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Phase 4d (rewritten as Phase 11 wave 4) — Pod management tab.
@@ -71,8 +72,8 @@ export function ContainersTab() {
           <p className="mt-1 text-xs text-muted-foreground">
             All pods in the spatium namespace, listed via the api pod's
             in-cluster ServiceAccount. SpatiumDDI-owned pods are pinned to the
-            top. Logs stream live (kubeapi ``follow=true``); Restart deletes the
-            pod so the owning Deployment / DaemonSet recreates it.
+            top. Logs stream live (kubeapi <code>follow=true</code>); Restart
+            deletes the pod so the owning Deployment / DaemonSet recreates it.
           </p>
         </div>
         <button
@@ -89,15 +90,15 @@ export function ContainersTab() {
       </div>
 
       {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {listReadErrorMessage(error, "the pods")}
-        </div>
+        </FormError>
       )}
-      {/* A refused Restart / Stop / Start used to say nothing (#1342). */}
+      {/* A refused Restart used to say nothing (#1342). */}
       {action.isError && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {formatApiError(action.error, "Pod action failed")}
-        </div>
+        </FormError>
       )}
 
       {isLoading ? (
@@ -109,7 +110,8 @@ export function ContainersTab() {
         error ? null : (
           <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
             No pods visible. The api's ServiceAccount may not be wired up —
-            check the chart's ``api.serviceAccount.enabled`` value.
+            check the chart's{" "}
+            <code className="font-mono">api.serviceAccount.enabled</code> value.
           </div>
         )
       ) : (
@@ -147,12 +149,13 @@ function ContainerCard({
   onLogs: () => void;
   busy: boolean;
 }) {
-  // #1342 — a pod's Restart / Stop / Start takes `admin` on `appliance`.
+  // #1342 — a pod's Restart takes `admin` on `appliance`.
   const applianceGate = useApplianceAdminGate();
   // Pod log text takes `admin` on `appliance`; the button is not drawn
   // for a role that would be refused.
   const canReadLogs = useCanReadApplianceLogs();
-  const isRunning = container.state === "running";
+  // #4212 — Restart acts on the first click otherwise.
+  const [confirmRestart, setConfirmRestart] = useState(false);
   const healthTone =
     container.health === "healthy"
       ? "text-emerald-600 dark:text-emerald-400"
@@ -205,36 +208,31 @@ function ContainerCard({
               Logs
             </button>
           )}
-          {container.is_spatium && isRunning && (
-            <>
-              <ActionButton
-                icon={RotateCcw}
-                label="Restart"
-                onClick={() => onAction("restart")}
-                disabled={busy}
-                {...applianceGate}
-              />
-              <ActionButton
-                icon={Square}
-                label="Stop"
-                onClick={() => onAction("stop")}
-                disabled={busy}
-                destructive
-                {...applianceGate}
-              />
-            </>
-          )}
-          {container.is_spatium && !isRunning && (
+          {/* A pod has no Stop / Start: stopping one means scaling its owning
+              workload, which this page does not do (#4232). Restart deletes
+              the pod and its controller recreates it. */}
+          {container.is_spatium && (
             <ActionButton
-              icon={Play}
-              label="Start"
-              onClick={() => onAction("start")}
+              icon={RotateCcw}
+              label="Restart"
+              onClick={() => setConfirmRestart(true)}
               disabled={busy}
               {...applianceGate}
             />
           )}
         </div>
       </div>
+      <ConfirmModal
+        open={confirmRestart}
+        title={`Restart ${container.name}?`}
+        message={`Restart ${container.name}? Its service is briefly unavailable on this node while it comes back up.`}
+        confirmLabel="Restart"
+        onClose={() => setConfirmRestart(false)}
+        onConfirm={() => {
+          onAction("restart");
+          setConfirmRestart(false);
+        }}
+      />
     </div>
   );
 }
@@ -368,10 +366,10 @@ function LogsStreamModal({
           )}
         </div>
         {error && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+          <FormError className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>{error}</span>
-          </div>
+          </FormError>
         )}
         <div
           ref={containerRef}

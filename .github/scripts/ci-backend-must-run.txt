@@ -186,6 +186,9 @@ charts/spatiumddi/templates/frontend-tls-config.yaml
 # tested against; editing them must run the backend half, or the two sides
 # could disagree with only the frontend job noticing.
 frontend/src/lib/bulk-allocate-template.vectors.json
+# test_delete_cascade_copy_4143.py (#4143) walks the FK cascade graph against
+# the delete dialogs' registry.
+frontend/src/lib/delete-cascade.json
 
 # test_grant_vocabulary_covers_routes_3119.py (#3119) checks that the grant
 # vocabulary the role editor offers holds every resource type the routes,

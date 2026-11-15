@@ -49,6 +49,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -420,6 +421,41 @@ async def _ddns_records_current(
     )
 
 
+async def _dual_stack_sibling_row_ids(
+    db: AsyncSession, ipam_row: IPAddress, rows: Sequence[Any]
+) -> set[Any]:
+    """Ids of lease-owned rows of the OTHER address family on the same MAC (#4066).
+
+    A dual-stack client asks for its one name over DHCPv4 and DHCPv6. The A
+    record its v4 lease published is not another host holding the name, and an
+    AAAA beside it is ordinary dual-stack DNS; treating it as a holder made the
+    second lease of every dual-stack client fall back to ``dhcp-<address>``.
+    Only an address-family record DDNS itself wrote for a lease row carrying the
+    same (known) MAC counts, so another host's A record at the name still holds.
+    """
+    if ipam_row.mac_address is None:
+        return set()
+    own_v6 = ":" in str(ipam_row.address)
+    other_type = "A" if own_v6 else "AAAA"
+    ids = {
+        rec.ip_address_id
+        for rec in rows
+        if rec.auto_generated
+        and rec.ip_address_id is not None
+        and (rec.record_type or "").upper() == other_type
+    }
+    if not ids:
+        return set()
+    found = await db.execute(
+        select(IPAddress.id).where(
+            IPAddress.id.in_(ids),
+            IPAddress.auto_from_lease.is_(True),
+            IPAddress.mac_address == ipam_row.mac_address,
+        )
+    )
+    return set(found.scalars().all())
+
+
 async def _name_holder(
     db: AsyncSession,
     ipam_row: IPAddress,
@@ -475,8 +511,11 @@ async def _name_holder(
         )
 
     twin_present = any(_is_twin(rec) for rec in rows)
+    sibling_ids = await _dual_stack_sibling_row_ids(db, ipam_row, rows)
     for rec in rows:
         if rec.auto_generated and rec.ip_address_id == ipam_row.id:
+            continue
+        if rec.auto_generated and rec.ip_address_id in sibling_ids:
             continue
         if _is_twin(rec):
             continue

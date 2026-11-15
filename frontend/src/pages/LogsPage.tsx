@@ -1372,7 +1372,9 @@ export function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
               showServer ? DNS_COLS_SERVER : DNS_COLS,
             )}
           >
-            <span className="sr-only">Details</span>
+            <span>
+              <span className="sr-only">Details</span>
+            </span>
             <span>Time</span>
             {showServer && <span>Server</span>}
             <span>Client</span>
@@ -1834,7 +1836,9 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
               showServer ? DHCP_COLS_SERVER : DHCP_COLS,
             )}
           >
-            <span className="sr-only">Details</span>
+            <span>
+              <span className="sr-only">Details</span>
+            </span>
             <span>Time</span>
             {showServer && <span>Server</span>}
             <span>Severity</span>

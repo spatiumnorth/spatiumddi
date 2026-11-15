@@ -77,8 +77,9 @@ describe("selection model", () => {
     expect(selectionIsValid(groupSelection("gone"), SOURCES)).toBe(false);
   });
 
-  it("opens on the first server, as before", () => {
-    expect(defaultSelection(SOURCES)).toBe(serverSelection("a2"));
+  it("opens on All servers with several sources, the server with one", () => {
+    expect(defaultSelection(SOURCES)).toBe(ALL_SERVERS);
+    expect(defaultSelection([SOURCES[1]])).toBe(serverSelection("a1"));
     expect(defaultSelection([])).toBeNull();
   });
 
