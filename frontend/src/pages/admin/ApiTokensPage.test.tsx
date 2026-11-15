@@ -3,7 +3,7 @@
  *
  * Re-enabling an inactive API token is superadmin-only and needs the
  * operator step-up. The page offers Re-enable only to a superadmin, asks for
- * the step-up before sending, and keeps Revoke a one-click action.
+ * the step-up before sending, and asks before Revoke (#4212).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -13,6 +13,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -128,6 +129,12 @@ describe("API token Re-enable", () => {
   it("revokes without a step-up", async () => {
     await show(false);
     fireEvent.click(screen.getByTitle("Revoke"));
+    // #4212 — Revoke asks first.
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Revoke",
+      }),
+    );
     await waitFor(() => expect(update).toHaveBeenCalled());
     expect(update).toHaveBeenCalledWith("t-live", { is_active: false });
   });

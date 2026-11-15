@@ -64,6 +64,11 @@ export function BgpMonitorTab({
   const [addOpen, setAddOpen] = useState(false);
   const [newPrefix, setNewPrefix] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  // #4212 — Stop tracking deletes the watch, and no further alerts fire.
+  const [stopTarget, setStopTarget] = useState<{
+    id: string;
+    prefix: string;
+  } | null>(null);
   const [ackTarget, setAckTarget] = useState<BGPHijackDetection | null>(null);
   const [allowTarget, setAllowTarget] = useState<BGPHijackDetection | null>(
     null,
@@ -106,8 +111,14 @@ export function BgpMonitorTab({
 
   const delM = useMutation({
     mutationFn: (id: string) => asnsApi.deleteTrackedPrefix(id),
-    onSuccess: invalidate,
-    onError: (e) => setErr(errMsg(e, "Delete failed")),
+    onSuccess: () => {
+      setStopTarget(null);
+      invalidate();
+    },
+    onError: (e) => {
+      setStopTarget(null);
+      setErr(errMsg(e, "Delete failed"));
+    },
   });
 
   const ackM = useMutation({
@@ -334,7 +345,9 @@ export function BgpMonitorTab({
                         className="rounded p-1 hover:bg-muted"
                         title="Stop tracking"
                         aria-label="Stop tracking"
-                        onClick={() => delM.mutate(p.id)}
+                        onClick={() =>
+                          setStopTarget({ id: p.id, prefix: p.prefix })
+                        }
                         {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -384,6 +397,21 @@ export function BgpMonitorTab({
         </Modal>
       )}
 
+      <ConfirmModal
+        open={stopTarget !== null}
+        title="Stop tracking prefix?"
+        message={
+          stopTarget
+            ? `Stop tracking ${stopTarget.prefix}? The watch is deleted and no further hijack alerts fire for it.`
+            : null
+        }
+        confirmLabel="Stop tracking"
+        tone="destructive"
+        autoFocusCancel
+        loading={delM.isPending}
+        onClose={() => setStopTarget(null)}
+        onConfirm={() => stopTarget && delM.mutate(stopTarget.id)}
+      />
       {ackTarget && (
         <ConfirmModal
           open

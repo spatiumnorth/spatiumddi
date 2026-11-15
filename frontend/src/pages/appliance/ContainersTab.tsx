@@ -21,6 +21,7 @@ import {
 } from "@/lib/api";
 import { listReadErrorMessage, pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   useApplianceAdminGate,
   useCanReadApplianceLogs,
@@ -155,6 +156,9 @@ function ContainerCard({
   // for a role that would be refused.
   const canReadLogs = useCanReadApplianceLogs();
   const isRunning = container.state === "running";
+  // #4212 — Stop / Restart / Start act on the first click otherwise, and a
+  // stopped DNS or DHCP pod stays down until someone presses Start.
+  const [pending, setPending] = useState<ContainerAction | null>(null);
   const healthTone =
     container.health === "healthy"
       ? "text-emerald-600 dark:text-emerald-400"
@@ -212,14 +216,14 @@ function ContainerCard({
               <ActionButton
                 icon={RotateCcw}
                 label="Restart"
-                onClick={() => onAction("restart")}
+                onClick={() => setPending("restart")}
                 disabled={busy}
                 {...applianceGate}
               />
               <ActionButton
                 icon={Square}
                 label="Stop"
-                onClick={() => onAction("stop")}
+                onClick={() => setPending("stop")}
                 disabled={busy}
                 destructive
                 {...applianceGate}
@@ -230,15 +234,46 @@ function ContainerCard({
             <ActionButton
               icon={Play}
               label="Start"
-              onClick={() => onAction("start")}
+              onClick={() => setPending("start")}
               disabled={busy}
               {...applianceGate}
             />
           )}
         </div>
       </div>
+      <ConfirmModal
+        open={pending !== null}
+        title={
+          pending
+            ? `${pending[0].toUpperCase()}${pending.slice(1)} ${container.name}?`
+            : ""
+        }
+        message={pending ? containerActionMessage(pending, container) : null}
+        confirmLabel={
+          pending ? `${pending[0].toUpperCase()}${pending.slice(1)}` : "Confirm"
+        }
+        tone={pending === "stop" ? "destructive" : "default"}
+        autoFocusCancel={pending === "stop"}
+        onClose={() => setPending(null)}
+        onConfirm={() => {
+          if (pending) onAction(pending);
+          setPending(null);
+        }}
+      />
     </div>
   );
+}
+
+function containerActionMessage(
+  action: ContainerAction,
+  container: ApplianceContainer,
+) {
+  const name = container.name;
+  if (action === "stop")
+    return `Stop ${name}? Its service (DNS, DHCP or a control-plane component) stops answering on this node until you start it again.`;
+  if (action === "restart")
+    return `Restart ${name}? Its service is briefly unavailable on this node while it comes back up.`;
+  return `Start ${name}? Its service resumes on this node.`;
 }
 
 function ActionButton({

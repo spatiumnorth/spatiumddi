@@ -30,6 +30,7 @@ import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { FormError } from "@/components/ui/form-error";
+import { disabledBecause } from "@/hooks/usePermissions";
 
 /**
  * Backup Targets section on the Backup admin page (issue #117
@@ -284,6 +285,11 @@ function TargetRow({
             }
             onClick={() => runMut.mutate()}
             disabled={!target.enabled || runMut.isPending}
+            disabledReason={
+              target.enabled
+                ? undefined
+                : "Target is disabled; enable it in Edit to run a backup."
+            }
           />
           <IconButton
             title="Test connection"
@@ -1352,11 +1358,14 @@ function IconButton({
   icon,
   onClick,
   disabled,
+  disabledReason,
 }: {
   title: string;
   icon: React.ReactNode;
   onClick: () => void;
   disabled?: boolean;
+  /** Why it is disabled when that is not obvious; replaces the title. */
+  disabledReason?: string;
 }) {
   return (
     <button
@@ -1365,6 +1374,7 @@ function IconButton({
       disabled={disabled}
       title={title}
       className="rounded p-1 hover:bg-accent disabled:opacity-50"
+      {...disabledBecause(!!disabledReason, disabledReason ?? "")}
     >
       {icon}
     </button>
