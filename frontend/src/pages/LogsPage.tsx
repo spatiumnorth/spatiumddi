@@ -1117,7 +1117,6 @@ const DHCP_COLS = "grid-cols-[20px_160px_70px_180px_140px_120px_1fr]";
 const DHCP_COLS_SERVER =
   "grid-cols-[20px_160px_130px_70px_180px_140px_120px_1fr]";
 
-/** Whether a response merged more than one server. */
 /**
  * The server pick a tab acts on. The pick is kept in sessionStorage so it
  * survives a switch to another Logs tab and back (only the active tab is
@@ -1132,6 +1131,7 @@ function effectiveSelection(
   return selectionIsValid(picked, sources) ? picked : defaultSelection(sources);
 }
 
+/** Whether a response merged more than one server. */
 function coversManyServers(data: { server_ids?: string[] } | undefined) {
   return (data?.server_ids?.length ?? 0) > 1;
 }
