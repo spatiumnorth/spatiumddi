@@ -724,8 +724,22 @@ async def _reconcile_subnet_records(db: Any, subnet_ids: list[Any]) -> tuple[int
                 .scalars()
                 .all()
             )
+            # A lease mirror's records belong to the DDNS re-apply, not to the
+            # drift create, which would publish an expired lease too (#4227).
+            freed |= await _auto_from_lease_ip_ids(db, subnet_id)
             for u in units:
                 u.create_ip_ids = [i for i in u.create_ip_ids if i not in freed]
+            units = [
+                u
+                for u in units
+                if u.create_ip_ids or u.update_record_ids or u.delete_record_ids or u.mirror_ip_ids
+            ]
+        # The DDNS re-apply a restore runs is the Trash-restore republish's own
+        # (#3787): active, unexpired lease mirrors only, as the lease path would.
+        if any(u.mirror_ip_ids for u in units):
+            active = set(await active_lease_mirror_ids(db, subnet_id))
+            for u in units:
+                u.mirror_ip_ids = [i for i in u.mirror_ip_ids if i in active]
             units = [
                 u
                 for u in units
