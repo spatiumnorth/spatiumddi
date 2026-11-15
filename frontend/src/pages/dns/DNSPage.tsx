@@ -13744,9 +13744,20 @@ export function DNSPage() {
             <div className="text-center">
               <Globe className="h-12 w-12 text-muted-foreground/20 mx-auto mb-3" />
               <p className="text-sm text-muted-foreground">
-                {groups.length === 0
-                  ? "Create a server group to start managing DNS."
-                  : "Select a server group or zone from the tree."}
+                {groupsError != null ? (
+                  <ListReadError
+                    error={groupsError}
+                    what="the DNS server groups"
+                  />
+                ) : groups.length === 0 ? (
+                  isSuperadmin ? (
+                    "Create a server group to start managing DNS."
+                  ) : (
+                    "No DNS server groups yet."
+                  )
+                ) : (
+                  "Select a server group or zone from the tree."
+                )}
               </p>
             </div>
           </div>
