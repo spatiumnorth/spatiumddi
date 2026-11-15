@@ -12129,6 +12129,11 @@ export interface ProvisioningRequest {
   // Name of the IPAM template args.template_id names, resolved server-side so
   // viewers without read on IPAM templates still get it (#3649).
   template_name?: string | null;
+  // Whether the caller may approve this row, from the approve endpoint's own
+  // check (#4241); false once the row is no longer pending.
+  can_approve: boolean;
+  // The server's refusal text for a pending row that is not approvable.
+  approve_blocked_reason: string | null;
 }
 
 export interface ProvisioningRequestListParams {
