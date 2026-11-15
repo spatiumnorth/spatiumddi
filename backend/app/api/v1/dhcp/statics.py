@@ -254,7 +254,7 @@ async def create_static(
     await db.flush()
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, st)
+    await upsert_ipam_for_static(db, scope, st, user=user)
     await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
@@ -320,7 +320,7 @@ async def update_static(
         return st
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, st, action="update")
+    await upsert_ipam_for_static(db, scope, st, action="update", user=user)
     await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
@@ -346,7 +346,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
-    handovers = await detach_ipam_for_static(db, st)
+    handovers = await detach_ipam_for_static(db, st, user=user)
     write_audit(
         db,
         user=user,

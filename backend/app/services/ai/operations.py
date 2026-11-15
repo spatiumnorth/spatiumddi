@@ -3883,7 +3883,7 @@ async def _apply_create_dhcp_static(
     # counts. All in this one transaction, committed below.
     await push_static_change(db, row, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, row)
+    await upsert_ipam_for_static(db, scope, row, user=user)
     await _recount_subnet(db, scope.subnet_id)
 
     write_audit(
