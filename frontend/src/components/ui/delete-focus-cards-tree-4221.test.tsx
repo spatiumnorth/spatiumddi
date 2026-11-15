@@ -68,13 +68,13 @@ function Confirm({
   );
 }
 
-function Cards() {
-  const [items, setItems] = useState(["a", "b", "c"]);
+function Cards({ initial = ["a", "b", "c"] }: { initial?: string[] }) {
+  const [items, setItems] = useState(initial);
   const [del, setDel] = useState<string | null>(null);
   return (
     <main>
       <h1>Views</h1>
-      <div>
+      <div data-testid="list">
         {items.map((id) => (
           <div key={id} className="card">
             <span>{id}</span>
@@ -153,6 +153,27 @@ describe("focus after a delete from a card or a tree (#4221)", () => {
     }
     expect(document.activeElement).not.toBe(document.body);
     expect(document.activeElement?.closest("main")).not.toBeNull();
+  });
+
+  it("deleting the only card focuses the list, not main (#4224)", async () => {
+    const user = userEvent.setup();
+    render(<Cards initial={["a"]} />);
+    await user.click(screen.getByRole("button", { name: "Delete a" }));
+    await user.click(screen.getByRole("button", { name: "Confirm" }));
+    await tick(100);
+    expect(screen.queryByRole("button", { name: "Delete a" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByTestId("list"));
+  });
+
+  it("deleting the bottom card of two focuses the previous card's Delete (#4224)", async () => {
+    const user = userEvent.setup();
+    render(<Cards initial={["a", "b"]} />);
+    await user.click(screen.getByRole("button", { name: "Delete b" }));
+    await user.click(screen.getByRole("button", { name: "Confirm" }));
+    await tick(100);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Delete a" }),
+    );
   });
 
   it("a tree item deleted from its menu hands focus to the next item", async () => {

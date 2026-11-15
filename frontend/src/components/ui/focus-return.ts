@@ -75,6 +75,18 @@ export function captureSuccessors(
       );
       const container = list ?? row.parentElement;
       if (container) out.push(() => (container.isConnected ? container : null));
+    } else {
+      // No unit: the only card has no sibling to match (#4224). Remember the
+      // control's ancestors; once the card is gone, the nearest one still in
+      // the page is the list that held it.
+      const chain: HTMLElement[] = [];
+      let a = from.parentElement;
+      for (let i = 0; a && i < 8; i++, a = a.parentElement) {
+        if (a.matches('main, body, [role="dialog"]')) break;
+        chain.push(a);
+      }
+      if (chain.length)
+        out.push(() => chain.find((c) => c.isConnected) ?? null);
     }
   }
   out.push(() =>
