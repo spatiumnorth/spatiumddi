@@ -20,7 +20,7 @@ asked. This migration prepares the other behaviour; the code does the rest.
 primary key, and it holds counters, not client history.
 
 Revision ID: c4e7a1d93b52
-Revises: a3c9e5d1b7f2
+Revises: b6d2e9f41a07
 Create Date: 2026-11-14 12:00:00.000000
 """
 
@@ -29,7 +29,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c4e7a1d93b52"
-down_revision = "a3c9e5d1b7f2"
+down_revision = "b6d2e9f41a07"
 branch_labels = None
 depends_on = None
 

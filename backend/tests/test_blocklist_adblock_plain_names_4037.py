@@ -152,9 +152,9 @@ async def _noop_publish(_channel: str) -> None:
     return None
 
 
-@pytest.mark.parametrize("list_wildcard", [True, False])
+@pytest.mark.parametrize("list_wildcard", ["by_syntax", "always", "never"])
 async def test_refresh_stores_literal_entries_with_their_own_flag(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, list_wildcard: bool
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, list_wildcard: str
 ) -> None:
     feed = "||plain.example.com^\n.sub.example.org^\n|exact.example.net^\n"
     monkeypatch.setattr(
@@ -176,7 +176,7 @@ async def test_refresh_stores_literal_entries_with_their_own_flag(
         source_type="url",
         feed_url="https://93.184.216.34/f.txt",
         feed_format="adblock",
-        feed_entries_are_wildcard=list_wildcard,
+        feed_wildcard_mode=list_wildcard,
     )
     db_session.add(bl)
     await db_session.flush()
@@ -203,7 +203,7 @@ async def test_refresh_stores_literal_entries_with_their_own_flag(
         )
     ).all()
     assert {d: w for d, w in rows} == {
-        "plain.example.com": list_wildcard,
+        "plain.example.com": list_wildcard != "never",
         "*.sub.example.org": False,
         "exact.example.net": False,
     }

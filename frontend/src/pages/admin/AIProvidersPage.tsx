@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -31,6 +32,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { FormError } from "@/components/ui/form-error";
+import { changedFields, refetchRow } from "@/hooks/useFreshRow";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -121,7 +123,7 @@ function toCreatePayload(form: ProviderForm): AIProviderCreate {
   };
 }
 
-function toUpdatePayload(form: ProviderForm): AIProviderUpdate {
+function fullUpdatePayload(form: ProviderForm): AIProviderUpdate {
   let options: Record<string, unknown> = {};
   try {
     options = JSON.parse(form.optionsJson || "{}");
@@ -153,6 +155,22 @@ function toUpdatePayload(form: ProviderForm): AIProviderUpdate {
   // allowlist (revert to "all enabled"). Pydantic's exclude_unset
   // distinguishes that from absent on the backend.
   update.enabled_tools = form.enabled_tools;
+  return update;
+}
+
+// Only what the operator changed against what the dialog read when it opened
+// (#4236), so a field another client set since is not put back. An empty
+// result means the Save has nothing to send.
+function toUpdatePayload(
+  form: ProviderForm,
+  initial: ProviderForm,
+): AIProviderUpdate {
+  const { api_key: apiKey, ...full } = fullUpdatePayload(form);
+  const { api_key: _unused, ...base } = fullUpdatePayload(initial);
+  void _unused;
+  const update: AIProviderUpdate = changedFields(base, full);
+  // null on api_key means "do not touch".
+  if (apiKey !== undefined) update.api_key = apiKey;
   return update;
 }
 
@@ -190,6 +208,15 @@ function ProviderEditor({
   function set<K extends keyof ProviderForm>(key: K, v: ProviderForm[K]) {
     setForm((p) => ({ ...p, [key]: v }));
   }
+
+  // #4135 — a moved base URL needs the stored key typed again (or removed).
+  const reask = useCredentialReask(
+    { base_url: form.base_url.trim() },
+    mode === "edit" ? { base_url: initial.base_url.trim() } : null,
+    () => set("api_key", null),
+  );
+  const mustEnterKey =
+    mode === "edit" && reask.asks(initial.has_api_key) && form.api_key === null;
 
   return (
     <Modal
@@ -285,7 +312,9 @@ function ProviderEditor({
                 <span className="text-muted-foreground/60">
                   {mode === "edit"
                     ? initial.has_api_key
-                      ? "(a key is stored — leave blank to keep it)"
+                      ? reask.reask
+                        ? `(required — ${reask.hint.toLowerCase()} Or remove it.)`
+                        : "(a key is stored — leave blank to keep it)"
                       : "(no key stored)"
                     : "(optional)"}
                 </span>
@@ -299,10 +328,13 @@ function ProviderEditor({
                   set("api_key", e.target.value === "" ? null : e.target.value)
                 }
                 disabled={form.api_key === ""}
+                required={mustEnterKey}
                 placeholder={
                   mode === "edit"
                     ? initial.has_api_key
-                      ? "Type to replace the stored key"
+                      ? reask.reask
+                        ? reask.placeholder
+                        : "Type to replace the stored key"
                       : "Type to set a key"
                     : "Optional — local providers (Ollama, LM Studio) don't need one"
                 }
@@ -529,7 +561,7 @@ function ProviderEditor({
               Cancel
             </button>
             <button
-              disabled={saving || !form.name.trim()}
+              disabled={saving || !form.name.trim() || mustEnterKey}
               onClick={() => onSave(form)}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
             >
@@ -717,10 +749,12 @@ export function AIProvidersPage() {
     setEditorErr("");
     if (editor?.mode === "edit") {
       try {
-        updateMut.mutate({
-          id: editor.provider.id,
-          body: toUpdatePayload(form),
-        });
+        const body = toUpdatePayload(form, editor.initial);
+        if (Object.keys(body).length === 0) {
+          setEditor(null);
+          return;
+        }
+        updateMut.mutate({ id: editor.provider.id, body });
       } catch (e) {
         setEditorErr(e instanceof Error ? e.message : String(e));
       }
@@ -871,14 +905,32 @@ export function AIProvidersPage() {
                     <button
                       aria-label="Edit provider"
                       title="Edit provider"
-                      onClick={() => {
+                      onClick={async () => {
                         setEditorErr("");
                         setTestResult(null);
-                        setEditor({
-                          mode: "edit",
-                          provider: p,
-                          initial: formFromProvider(p),
-                        });
+                        // Read the provider when Edit opens (#4236); a failed
+                        // read opens nothing rather than the stale row.
+                        try {
+                          const fresh = await refetchRow<AIProvider>(
+                            qc,
+                            [["ai-providers"]],
+                            p.id,
+                          );
+                          if (!fresh)
+                            throw new Error(
+                              "it was not found, and may have been deleted",
+                            );
+                          setEditor({
+                            mode: "edit",
+                            provider: fresh,
+                            initial: formFromProvider(fresh),
+                          });
+                        } catch (e) {
+                          setEditorErr(
+                            "Couldn't read the current values: " +
+                              formatApiError(e, "the request failed"),
+                          );
+                        }
                       }}
                       className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
                     >
@@ -901,6 +953,12 @@ export function AIProvidersPage() {
             </tbody>
           </table>
         </div>
+
+        {editorErr && !editor && (
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {editorErr}
+          </FormError>
+        )}
 
         {testResult && !editor && (
           <div

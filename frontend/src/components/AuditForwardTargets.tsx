@@ -13,8 +13,9 @@
  */
 
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
+import { Check, Pencil, Play, Plus, Send, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -147,7 +148,7 @@ export function AuditForwardTargets({
     null,
   );
   const [testState, setTestState] = useState<
-    Record<string, { status: "ok" | "error"; msg: string } | undefined>
+    Record<string, { status: "ok" | "sent" | "error"; msg: string } | undefined>
   >({});
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -170,9 +171,16 @@ export function AuditForwardTargets({
   async function doTest(id: string) {
     try {
       const r = await settingsApi.testAuditTarget(id);
+      // UDP syslog cannot confirm delivery (#4237): never say "delivered".
+      const sent = r.status === "sent";
       setTestState((s) => ({
         ...s,
-        [id]: { status: "ok", msg: `delivered to ${r.target}` },
+        [id]: sent
+          ? {
+              status: "sent",
+              msg: `sent to ${r.target} over UDP — delivery cannot be confirmed`,
+            }
+          : { status: "ok", msg: `delivered to ${r.target}` },
       }));
     } catch (e) {
       const msg = formatApiError(e, "delivery failed");
@@ -324,11 +332,15 @@ export function AuditForwardTargets({
                             "ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] " +
                             (ts.status === "ok"
                               ? "bg-emerald-500/15 text-emerald-600"
-                              : "bg-red-500/15 text-red-600")
+                              : ts.status === "sent"
+                                ? "bg-muted text-muted-foreground"
+                                : "bg-red-500/15 text-red-600")
                           }
                         >
                           {ts.status === "ok" ? (
                             <Check className="h-3 w-3" />
+                          ) : ts.status === "sent" ? (
+                            <Send className="h-3 w-3" />
                           ) : (
                             <X className="h-3 w-3" />
                           )}
@@ -479,6 +491,39 @@ function TargetModal({
   const [clearAuthHeader, setClearAuthHeader] = useState(false);
   const [clearSmtpPassword, setClearSmtpPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // #4135 — a new webhook URL (write-only, so any value typed is a move) or
+  // a moved SMTP host / port needs the stored credential entered again.
+  const reaskWebhook = form.kind === "webhook";
+  const reaskSmtp = form.kind === "smtp";
+  const reask = useCredentialReask(
+    reaskWebhook
+      ? { url: form.url ?? "" }
+      : { smtp_host: form.smtp_host, smtp_port: form.smtp_port },
+    !existingId
+      ? null
+      : reaskWebhook
+        ? { url: "" }
+        : reaskSmtp
+          ? { smtp_host: initial.smtp_host, smtp_port: initial.smtp_port }
+          : null,
+    () => {
+      setForm((f) => ({ ...f, auth_header: null, smtp_password: null }));
+      setClearAuthHeader(false);
+      setClearSmtpPassword(false);
+    },
+  );
+  const mustEnterAuthHeader =
+    reaskWebhook &&
+    form.webhook_flavor === "generic" &&
+    reask.asks(authHeaderSet) &&
+    !clearAuthHeader &&
+    !form.auth_header;
+  const mustEnterSmtpPassword =
+    reaskSmtp &&
+    reask.asks(smtpPasswordSet) &&
+    !clearSmtpPassword &&
+    !form.smtp_password;
 
   const saveMut = useMutation({
     mutationFn: async () => {
@@ -788,12 +833,20 @@ function TargetModal({
                     onChange={(e) =>
                       setForm({ ...form, auth_header: e.target.value })
                     }
+                    required={mustEnterAuthHeader}
                     placeholder={
-                      authHeaderSet
-                        ? "(stored — leave blank to keep unchanged)"
-                        : "Bearer …"
+                      reask.asks(authHeaderSet)
+                        ? reask.placeholder
+                        : authHeaderSet
+                          ? "(stored — leave blank to keep unchanged)"
+                          : "Bearer …"
                     }
                   />
+                  {reask.asks(authHeaderSet) && (
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {reask.hint} Or remove it below.
+                    </div>
+                  )}
                 </label>
                 {existingId && authHeaderSet && (
                   <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -890,12 +943,20 @@ function TargetModal({
                   onChange={(e) =>
                     setForm({ ...form, smtp_password: e.target.value })
                   }
+                  required={mustEnterSmtpPassword}
                   placeholder={
-                    smtpPasswordSet
-                      ? "(stored — leave blank to keep unchanged)"
-                      : ""
+                    reask.asks(smtpPasswordSet)
+                      ? reask.placeholder
+                      : smtpPasswordSet
+                        ? "(stored — leave blank to keep unchanged)"
+                        : ""
                   }
                 />
+                {reask.asks(smtpPasswordSet) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    {reask.hint} Or remove it below.
+                  </div>
+                )}
               </label>
               {existingId && smtpPasswordSet && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -1012,7 +1073,12 @@ function TargetModal({
           </button>
           <button
             onClick={() => saveMut.mutate()}
-            disabled={saveMut.isPending || !form.name}
+            disabled={
+              saveMut.isPending ||
+              !form.name ||
+              mustEnterAuthHeader ||
+              mustEnterSmtpPassword
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : existingId ? "Save" : "Create"}

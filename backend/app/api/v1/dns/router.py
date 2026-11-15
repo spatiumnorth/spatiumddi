@@ -85,6 +85,10 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
 from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -1933,7 +1937,9 @@ class RecordCreate(BaseModel):
         # (``_acme-challenge``, ``_443._tcp``) and a leftmost ``*`` wildcard,
         # normalizes ``""``/``@`` to the apex sentinel ``@`` the handlers use
         # (``fqdn = name.zone if name != "@" else zone``).
-        return validate_record_owner(v, field="record name")
+        # An RFC 2317 delegation owner (``64/26``) passes by shape here and is
+        # held to NS / DS in a classless child's parent by the handlers' check-names (#4166).
+        return validate_record_owner(v, field="record name", allow_classless=True)
 
 
 class RecordUpdate(BaseModel):
@@ -1953,7 +1959,7 @@ class RecordUpdate(BaseModel):
         # Optional on update; same RFC 2181 owner rule as RecordCreate.
         if v is None:
             return v
-        return validate_record_owner(v, field="record name")
+        return validate_record_owner(v, field="record name", allow_classless=True)
 
 
 class RecordResponse(BaseModel):
@@ -2889,6 +2895,19 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    require_secret_with_destination_change(
+        server,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+            "api_key": body.api_key,
+        },
+        destination=("host", "port"),
+        secrets={
+            "credentials": server.credentials_encrypted,
+            "api_key": server.api_key_encrypted,
+        },
+    )
     reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
@@ -5016,6 +5035,14 @@ async def _assert_acl_graph_is_acyclic(group_id: uuid.UUID, db: DB) -> None:
         ) from exc
 
 
+#: Way out of a delete / rename refused because a zone in the Trash cites the
+#: name (#4226).
+_TRASHED_ZONE_HINT = (
+    " A zone marked 'in the Trash' comes back with its citations on restore: purge it "
+    "from Administration > Trash, or restore it and clear the citation first."
+)
+
+
 async def _assert_acl_is_unreferenced(
     group_id: uuid.UUID, acl: DNSAcl, db: DB, *, action: str
 ) -> None:
@@ -5079,9 +5106,16 @@ async def _assert_acl_is_unreferenced(
         if opts is not None
         else []
     )
+    # A zone in the Trash counts (#4226): its Restore brings the citation back.
     citing_zones = sorted(
-        f"{z.name} {f}"
-        for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id)))
+        (f"{z.name} {f}", z.deleted_at is not None)
+        for z in (
+            await db.execute(
+                select(DNSZone)
+                .where(DNSZone.group_id == group_id)
+                .execution_options(include_deleted=True)
+            )
+        )
         .scalars()
         .all()
         for f in ("allow_query", "allow_transfer", "also_notify")
@@ -5094,9 +5128,10 @@ async def _assert_acl_is_unreferenced(
             *(f"ACL '{n}'" for n in sorted(citing_acls)),
             *(f"view '{n}'" for n in sorted(citing_views)),
             *(f"server option '{n}'" for n in citing_options),
-            *(f"zone '{n}'" for n in citing_zones),
+            *(f"zone '{n}'" + (" in the Trash" if t else "") for n, t in citing_zones),
         ]
     )
+    hint = _TRASHED_ZONE_HINT if any(t for _n, t in citing_zones) else ""
     raise HTTPException(
         status_code=409,
         detail={
@@ -5105,7 +5140,7 @@ async def _assert_acl_is_unreferenced(
             "message": (
                 f"Cannot {action} ACL '{acl.name}' — it is still referenced by "
                 f"{cited_by}. BIND would refuse the whole server group's config "
-                f"with that name undefined. Remove the references first."
+                f"with that name undefined. Remove the references first." + hint
             ),
         },
     )
@@ -5502,10 +5537,20 @@ async def _assert_tsig_key_is_unreferenced(
         for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
             if cites(getattr(opts, f, None)):
                 cited.append(f"server option '{f}'")
-    for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars():
+    # A zone in the Trash counts (#4226): its Restore brings the citation back.
+    trashed_zone = False
+    for z in (
+        await db.execute(
+            select(DNSZone)
+            .where(DNSZone.group_id == group_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalars():
         for f in ("allow_query", "allow_transfer", "also_notify"):
             if cites(getattr(z, f)):
-                cited.append(f"zone '{z.name}' {f}")
+                in_trash = z.deleted_at is not None
+                trashed_zone = trashed_zone or in_trash
+                cited.append(f"zone '{z.name}' {f}" + (" in the Trash" if in_trash else ""))
     if not cited:
         return
     raise HTTPException(
@@ -5518,6 +5563,7 @@ async def _assert_tsig_key_is_unreferenced(
                 f"Cannot {action} TSIG key '{name}' — it is still referenced by "
                 f"{', '.join(cited)}. BIND would refuse the whole server group's "
                 f"config with that key undefined. Remove the references first."
+                + (_TRASHED_ZONE_HINT if trashed_zone else "")
             ),
         },
     )

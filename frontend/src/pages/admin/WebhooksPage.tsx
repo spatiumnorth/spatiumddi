@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 /**
  * WebhooksPage — admin surface for typed-event subscriptions.
  *
@@ -44,6 +45,8 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -98,6 +101,18 @@ export function SubscriptionEditor({
   // replace them, and the checkbox below clears them.
   const [headers, setHeaders] = useState<string>("");
   const [clearHeaders, setClearHeaders] = useState(false);
+  // #4135 — a moved URL needs the stored custom headers (they carry the
+  // credentials) typed again, or removed.
+  const reask = useCredentialReask(
+    { url },
+    existing && { url: existing.url },
+    () => {
+      setHeaders("");
+      setClearHeaders(false);
+    },
+  );
+  const mustEnterHeaders =
+    reask.asks(existing?.headers_set) && !clearHeaders && !headers.trim();
   const [timeoutSeconds, setTimeoutSeconds] = useState(
     existing?.timeout_seconds ?? 10,
   );
@@ -140,44 +155,58 @@ export function SubscriptionEditor({
 
   const mut = useMutation({
     mutationFn: async () => {
+      if (existing) {
+        // Edit sends only what the operator changed against what the dialog
+        // read when it opened (#4236), so a field another client set since is
+        // not put back. A blank secret / headers field keeps the stored one.
+        const body: Partial<WebhookSubscriptionWrite> = changedFields(
+          {
+            name: existing.name,
+            description: existing.description,
+            enabled: existing.enabled,
+            url: existing.url,
+            event_types: existing.event_types,
+            timeout_seconds: existing.timeout_seconds,
+            max_attempts: existing.max_attempts,
+          },
+          {
+            name: name.trim(),
+            description: description.trim(),
+            enabled,
+            url: url.trim(),
+            event_types: eventTypes.length > 0 ? eventTypes : null,
+            timeout_seconds: timeoutSeconds,
+            max_attempts: maxAttempts,
+          },
+        );
+        // Write-only headers (#1579): an explicit ``{}`` clears, typed lines
+        // replace, and an absent key keeps the stored values.
+        const typedHeaders = clearHeaders ? {} : parseHeaders();
+        if (typedHeaders) body.headers = typedHeaders;
+        // ``""`` removes the secret; absent keeps it.
+        if (removeSecret) body.secret = "";
+        else if (secret.length > 0) body.secret = secret;
+        if (Object.keys(body).length === 0) return null;
+        return webhooksApi.update(existing.id, body);
+      }
       const body: WebhookSubscriptionWrite = {
         name: name.trim(),
         description: description.trim(),
         enabled,
         url: url.trim(),
         event_types: eventTypes.length > 0 ? eventTypes : null,
-        // Write-only headers (#1579): on edit, an explicit ``{}``
-        // clears, typed lines replace, and blank (``null``) keeps the
-        // stored values the server never shows us.
-        headers: existing
-          ? clearHeaders
-            ? {}
-            : parseHeaders()
-          : parseHeaders(),
+        headers: parseHeaders(),
         timeout_seconds: timeoutSeconds,
         max_attempts: maxAttempts,
-        // ``null`` on edit when the operator didn't retype it = keep
-        // existing; ``""`` = remove it. On create we let the server
-        // auto-generate.
-        secret: existing
-          ? removeSecret
-            ? ""
-            : secret.length > 0
-              ? secret
-              : null
-          : secret.length > 0
-            ? secret
-            : undefined,
+        // On create we let the server auto-generate a blank secret.
+        secret: secret.length > 0 ? secret : undefined,
       };
-      if (existing) {
-        return webhooksApi.update(existing.id, body);
-      }
       return webhooksApi.create(body);
     },
     onSuccess: (sub) => {
       qc.invalidateQueries({ queryKey: ["webhooks"] });
       // Show the cleartext secret one final time before closing.
-      if (sub.secret_plaintext) {
+      if (sub?.secret_plaintext) {
         setRevealedSecret(sub.secret_plaintext);
       } else {
         onClose();
@@ -379,11 +408,17 @@ export function SubscriptionEditor({
         </div>
 
         <Field
-          label="Custom headers (optional)"
+          label={
+            reask.asks(existing?.headers_set)
+              ? "Custom headers (required)"
+              : "Custom headers (optional)"
+          }
           hint={
-            existing && existing.headers_set
-              ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
-              : "One header per line, ‘Key: value’ format. Values are encrypted at rest and never shown again. ‘X-SpatiumDDI-*’ reserved for the platform."
+            reask.asks(existing?.headers_set)
+              ? `${reask.hint} Or tick the box to remove them.`
+              : existing && existing.headers_set
+                ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
+                : "One header per line, ‘Key: value’ format. Values are encrypted at rest and never shown again. ‘X-SpatiumDDI-*’ reserved for the platform."
           }
         >
           <textarea
@@ -392,10 +427,13 @@ export function SubscriptionEditor({
             disabled={clearHeaders}
             onChange={(e) => setHeaders(e.target.value)}
             placeholder={
-              existing && existing.headers_set
-                ? "(stored — leave blank to keep)"
-                : `Authorization: Bearer …\nX-Custom: value`
+              reask.asks(existing?.headers_set)
+                ? reask.placeholder
+                : existing && existing.headers_set
+                  ? "(stored — leave blank to keep)"
+                  : `Authorization: Bearer …\nX-Custom: value`
             }
+            required={mustEnterHeaders}
           />
           {existing && existing.headers_set && (
             <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
@@ -459,7 +497,9 @@ export function SubscriptionEditor({
           </button>
           <button
             type="button"
-            disabled={!name.trim() || !url.trim() || mut.isPending}
+            disabled={
+              !name.trim() || !url.trim() || mustEnterHeaders || mut.isPending
+            }
             onClick={() => mut.mutate()}
             className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
@@ -468,6 +508,41 @@ export function SubscriptionEditor({
         </div>
       </div>
     </Modal>
+  );
+}
+
+// Edit reads the subscription when it opens (#4236): the row the list holds
+// can be 30 s old and the form is seeded once. The Save then sends only what
+// the operator changed against what was read.
+function EditSubscription({
+  row,
+  eventTypeVocab,
+  onClose,
+}: {
+  row: WebhookSubscription;
+  eventTypeVocab: string[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<WebhookSubscription>(row, () =>
+    refetchRow<WebhookSubscription>(qc, [["webhooks"]], row.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit webhook subscription"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return (
+    <SubscriptionEditor
+      existing={fresh.row}
+      eventTypeVocab={eventTypeVocab}
+      onClose={onClose}
+    />
   );
 }
 
@@ -825,8 +900,8 @@ export function WebhooksPage() {
         />
       )}
       {editing && (
-        <SubscriptionEditor
-          existing={editing}
+        <EditSubscription
+          row={editing}
           eventTypeVocab={vocab}
           onClose={() => setEditing(null)}
         />
