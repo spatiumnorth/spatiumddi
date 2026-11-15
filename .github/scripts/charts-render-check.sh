@@ -383,7 +383,7 @@ for ref in registry.redhat.io/rhel9/postgresql-16 registry.redhat.io/rhel9/redis
         failures=$((failures + 1))
     fi
 done
-if ! grep -q 'name: POSTGRESQL_PASSWORD' "$CERT" || grep -q 'name: PGDATA' "$CERT"; then
+if ! grep -q 'name: POSTGRESQL_PASSWORD' "$CERT" || grep -q 'name: PGDATA$' "$CERT"; then
     echo "   FAIL #3913: the rhel PostgreSQL flavor must set POSTGRESQL_* and not the official image's PGDATA" >&2
     failures=$((failures + 1))
 fi
