@@ -23,6 +23,8 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused } from "@/lib/refusal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 /**
  * Restore Drills section on the Backup admin page (issue #702).
@@ -474,6 +476,10 @@ function DrillRow({
   );
 }
 
+const DEFAULT_DRILL_CRON = "0 5 * * 0";
+
+// Reads the destination when the dialog opens (#4271, #4236's class): the row
+// the list holds can be 30 s old and the form is seeded once.
 function ScheduleDrillModal({
   target,
   onClose,
@@ -482,15 +488,50 @@ function ScheduleDrillModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const fresh = useFreshRow<BackupTarget>(target, () =>
+    refetchRow<BackupTarget>(qc, [["backup-targets"]], target.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Drill schedule"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <ScheduleDrillForm target={fresh.row} onClose={onClose} />;
+}
+
+function ScheduleDrillForm({
+  target,
+  onClose,
+}: {
+  target: BackupTarget;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
   const [enabled, setEnabled] = useState(target.drill_enabled);
-  const [cron, setCron] = useState(target.drill_cron ?? "0 5 * * 0");
+  const [cron, setCron] = useState(target.drill_cron ?? DEFAULT_DRILL_CRON);
 
   const save = useMutation({
-    mutationFn: () =>
-      backupTargetsApi.update(target.id, {
-        drill_enabled: enabled,
-        drill_cron: cron || null,
-      }),
+    mutationFn: async () => {
+      // Only what changed against what the dialog read. The cron is compared
+      // with what it was seeded to, so an untouched default is not "a change".
+      const body = changedFields(
+        {
+          drill_enabled: target.drill_enabled,
+          drill_cron: target.drill_cron ?? DEFAULT_DRILL_CRON,
+        },
+        { drill_enabled: enabled, drill_cron: cron || null },
+      );
+      // Turning drills on needs a stored cron; send the shown one if none is.
+      if (body.drill_enabled && !target.drill_cron && !("drill_cron" in body))
+        body.drill_cron = cron || null;
+      if (Object.keys(body).length === 0) return null;
+      return backupTargetsApi.update(target.id, body);
+    },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["backup-targets"] });
       onClose();
