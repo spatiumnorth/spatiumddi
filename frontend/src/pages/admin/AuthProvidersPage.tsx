@@ -6,6 +6,7 @@ import {
   authApi,
   groupsApi,
   type AuthProvider,
+  type AuthProviderUpdate,
   type AuthProviderType,
   type AuthGroupMapping,
   type AuthGroupMappingCreate,
@@ -31,6 +32,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { FormError } from "@/components/ui/form-error";
+import { changedFields, refetchRow } from "@/hooks/useFreshRow";
 
 const TYPE_LABELS: Record<AuthProviderType, string> = {
   ldap: "LDAP / Active Directory",
@@ -2043,10 +2045,24 @@ export function AuthProvidersPage() {
     setModalMode("create");
   }
 
-  function openEdit(p: AuthProvider) {
+  // Edit reads the provider when it opens (#4236): the list's copy can be
+  // 30 s old and the form is seeded once. A failed read opens nothing, since
+  // seeding from the cached row would bring the stale values back.
+  async function openEdit(listed: AuthProvider) {
+    setMutateError("");
+    let p: AuthProvider | undefined;
+    try {
+      p = await refetchRow<AuthProvider>(qc, [["auth-providers"]], listed.id);
+    } catch (e) {
+      setMutateError(formatApiError(e, "Couldn't read the current values"));
+      return;
+    }
+    if (!p) {
+      setMutateError("That provider was not found; it may have been deleted.");
+      return;
+    }
     setEditing(p);
     setInitialForm(initialFormFromProvider(p));
-    setMutateError("");
     setModalMode("edit");
   }
 
@@ -2108,18 +2124,37 @@ export function AuthProvidersPage() {
         secrets: secrets === undefined ? null : secrets,
       });
     } else if (editing) {
-      updateMut.mutate({
-        id: editing.id,
-        body: {
+      // Send only what the operator changed against what the dialog read
+      // when it opened (#4236); a field another client set since is not put
+      // back. The config is replaced whole, so it goes only when edited.
+      const body: AuthProviderUpdate = changedFields(
+        {
+          name: editing.name,
+          is_enabled: editing.is_enabled,
+          priority: editing.priority,
+          auto_create_users: editing.auto_create_users,
+          auto_update_users: editing.auto_update_users,
+        },
+        {
           name: form.name.trim(),
           is_enabled: form.is_enabled,
           priority: form.priority,
           auto_create_users: form.auto_create_users,
           auto_update_users: form.auto_update_users,
-          config,
-          secrets,
         },
-      });
+      );
+      if (
+        JSON.stringify(config) !==
+        JSON.stringify(JSON.parse(initialForm.config_json || "{}"))
+      )
+        body.config = config;
+      if (secrets !== undefined) body.secrets = secrets;
+      if (Object.keys(body).length === 0) {
+        setModalMode(null);
+        setEditing(null);
+        return;
+      }
+      updateMut.mutate({ id: editing.id, body });
     }
   }
 
@@ -2255,6 +2290,11 @@ export function AuthProvidersPage() {
           saving={createMut.isPending || updateMut.isPending}
           error={mutateError}
         />
+      )}
+      {mutateError && !modalMode && (
+        <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {mutateError}
+        </FormError>
       )}
       <ConfirmModal
         open={confirmDelete !== null}
