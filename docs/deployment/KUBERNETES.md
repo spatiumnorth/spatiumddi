@@ -155,27 +155,63 @@ false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
 **Red Hat certification status.** The chart and images are **not** Red Hat
-certified. What ships today is the part that needs no Red Hat account: every
-image carries `name`, `vendor`, `version`, `release`, `summary`, `description`,
-`maintainer` and `url` labels (plus the `org.opencontainers.image.*` set) and the
-project `LICENSE` and `NOTICE` under `/licenses`; the chart has a
-`values.schema.json`, `charts.openshift.io/*` annotations in `Chart.yaml` and a
-`helm test` hook (`helm test <release>` checks the api and the frontend answer).
-Not done, and tracked in
-[#4020](https://github.com/spatiumnorth/spatiumddi/issues/4020) for 1.1.0: UBI-based
-image variants (the images keep their current Alpine / Debian bases) and the
-certification submission itself, which needs a Red Hat Partner Connect
-account. Two image checks are knowingly unmet: the frontend, `dns-bind9` and
-`dhcp-kea` images still start as root and drop privileges themselves (the
-chart already runs them under a random uid on OpenShift), so a `USER` line would
-break Docker Compose, which relies on the start-as-root volume chown.
+certified: the submission itself needs a Red Hat Partner Connect account and is
+not done. What exists is everything short of it. Every image carries `name`,
+`vendor`, `version`, `release`, `summary`, `description`, `maintainer` and `url`
+labels (plus the `org.opencontainers.image.*` set) and the project `LICENSE` and
+`NOTICE` under `/licenses`; the chart has a `values.schema.json`,
+`charts.openshift.io/*` annotations in `Chart.yaml` and a `helm test` hook
+(`helm test <release>` checks the api and the frontend answer); and four of the
+images have Red Hat UBI 9 variants, described next.
+
+**UBI image variants and the certified profile (#3913).** The api, frontend,
+`dns-bind9` and `dhcp-kea` images are also published on `ubi9` as
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (and `:latest-ubi`), GHCR only. They
+are an addition: the default images, the appliance and the default chart values
+are unchanged, and the nightly does not publish `-ubi` tags (the release does,
+after the same Trivy gate, per architecture on a native runner). They run as a
+numeric non-root `USER` and keep the random-uid behaviour above. BIND 9.20 and
+Kea are built from checksummed source, since Red Hat ships neither at these
+versions (see `docs/THIRD_PARTY.md`). Compared with the default images the UBI
+ones lack `whois` and `traceroute` (the Tools page reports the missing binary),
+the NFS backup destination (`libnfs`), BIND's jemalloc and JSON statistics
+channel, and the frontend's nginx is Red Hat's 1.26.
+
+`charts/spatiumddi/values-openshift-certified.yaml` selects them:
+
+```bash
+oc create secret docker-registry redhat-registry -n spatiumddi \
+  --docker-server=registry.redhat.io \
+  --docker-username=<registry service account> --docker-password=<token>
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+  --version <CHART_VERSION> --namespace spatiumddi --create-namespace \
+  -f values-openshift-certified.yaml
+```
+
+It sets `image.tagSuffix: -ubi` (appended to the tag of those four images; the
+agents' BIND9 and Kea included) and runs the bundled PostgreSQL and Redis from
+Red Hat's `registry.redhat.io/rhel9/postgresql-16` and `rhel9/redis-7`
+(`postgresql.image.flavor: rhel`, `redis.image.flavor: rhel`; standalone kind
+only, and the Redis 8-only `aof-load-corrupt-tail-max-size` is not passed to
+Redis 7). Those two need a Red Hat registry pull secret, an account at
+<https://access.redhat.com/terms-based-registry/>; the chart passes
+`image.pullSecrets` to them as to every other pod. The two Red Hat tags are
+immutable `<RHEL minor>-<build>` builds. The `rhel` flavors follow the sclorg
+image contract (`POSTGRESQL_*` variables, `/var/lib/pgsql/data`,
+`/var/lib/redis/data`) and have been rendered and schema-checked, not yet run
+against a `registry.redhat.io` pull. For anything beyond a single pod of each,
+bring your own PostgreSQL and Redis (`externalDatabase`, `externalRedis`).
+
+The release runs Red Hat's `preflight check container` against each `-ubi` image
+(amd64, check only, never submitting); `.github/workflows/build-ubi-images.yml`
+does the same on a PR and weekly.
 
 To run Red Hat's checks yourself, install
 [`openshift-preflight`](https://github.com/redhat-openshift-ecosystem/openshift-preflight)
-and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>`
+and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>-ubi`
 (add `--platform amd64`). Check-only mode needs no account; do not pass
-`--submit`. Expect `RunAsNonRoot` and `BasedOnUbi` failures on the images
-described above. For the chart, `chart-verifier verify` against the packaged
+`--submit`. The default (non-`-ubi`) images fail `RunAsNonRoot` and
+`BasedOnUbi` by design. For the chart, `chart-verifier verify` against the packaged
 `.tgz` runs the offline checks (`helm lint`, schema, annotations).
 
 ---

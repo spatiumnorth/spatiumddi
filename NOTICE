@@ -87,6 +87,15 @@ Where the two disagree about a license, THIS file is authoritative.
 - su-exec — MIT — https://github.com/ncopa/su-exec
 - gosu — Apache 2.0 — https://github.com/tianon/gosu
 
+── Red Hat UBI image variants (#3913) ───────────────────────────────────────
+- Red Hat Universal Base Image 9 — Red Hat UBI EULA — https://www.redhat.com/en/about/agreements
+- ISC BIND 9, ISC Kea DHCP (built from source) — MPL 2.0 — https://isc.org
+- libuv — MIT — https://libuv.org
+- Userspace RCU (liburcu, dynamically linked) — LGPL 2.1 — https://liburcu.org
+- log4cplus — BSD-2-Clause / Apache 2.0 — https://github.com/log4cplus/log4cplus
+- radvd (built from source) — BSD-style — https://radvd.litech.org
+- tini (built from source) — MIT — https://github.com/krallin/tini
+
 ── Operator tooling shipped in the API image ───────────────────────────────
 - nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org
 - tcpdump / libpcap (packet capture) — BSD 3-Clause — https://www.tcpdump.org
