@@ -305,6 +305,25 @@ lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
+# #4278 — ``helm lint`` parses each template's raw output as ONE YAML stream,
+# which ``helm template`` / ``helm install`` do not: a ``---`` glued to the next
+# object's ``apiVersion`` by ``{{-`` trimming installs fine and fails lint. It
+# only shows with a server listed (a loop body) and a generated agent-key Secret
+# (the first ``---``), which none of the lints above set, and Red Hat's
+# chart-verifier lints with whatever values it is given. So lint with DNS +
+# DHCP servers and both keys, plainly and with the OpenShift set.
+UMBRELLA_LINT_SERVERS=(
+    --set dnsAgents.enabled=true
+    --set dnsAgents.agentKey.value=lint-key
+    --set dnsAgents.servers[0].name=ns1
+    --set dnsAgents.servers[1].name=ns2
+    --set dhcpAgents.enabled=true
+    --set dhcpAgents.agentKey.value=lint-key
+    --set dhcpAgents.servers[0].name=dhcp1
+    --set dhcpAgents.servers[1].name=dhcp2
+)
+lint "$UMBRELLA" "${UMBRELLA_LINT_SERVERS[@]}"
+lint "$UMBRELLA" "${UMBRELLA_LINT_SERVERS[@]}" --set global.platform=openshift
 render umbrella-defaults "$UMBRELLA"
 render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
