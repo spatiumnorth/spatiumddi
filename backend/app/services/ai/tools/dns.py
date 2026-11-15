@@ -929,9 +929,12 @@ class ListDNSBlockListsArgs(BaseModel):
         "file_upload), feed_url + feed_format when remote, "
         "block_mode (nxdomain / sinkhole — sinkhole answers with "
         "sinkhole_ip, else 0.0.0.0 and ::), "
-        "feed_entries_are_wildcard (whether feed entries block "
-        "subdomains too — off means a list naming tracker.example "
-        "leaves cdn.tracker.example resolving), enabled, "
+        "feed_wildcard_mode (by_syntax = each feed entry follows its "
+        "source syntax: adblock ||name^ blocks subdomains too, a hosts "
+        "line or bare domain blocks only that name; always = every "
+        "entry blocks subdomains too; never = apex only, so a list "
+        "naming tracker.example leaves cdn.tracker.example resolving), "
+        "enabled, "
         "entry_count, feed_parse_skipped (how many "
         "rules the last refresh could not enforce, by category regex / "
         "modifier / badfilter / malformed, with malformed split by "
@@ -978,7 +981,7 @@ async def list_dns_blocklists(
             "feed_format": r.feed_format,
             "update_interval_hours": r.update_interval_hours,
             "block_mode": r.block_mode,
-            "feed_entries_are_wildcard": r.feed_entries_are_wildcard,
+            "feed_wildcard_mode": r.feed_wildcard_mode,
             "sinkhole_ip": r.sinkhole_ip,
             "enabled": r.enabled,
             "entry_count": r.entry_count,

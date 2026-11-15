@@ -646,6 +646,7 @@ async def _assert_no_block_overlap(
     network: str,
     parent_block_id: uuid.UUID | None,
     exclude_id: uuid.UUID | None = None,
+    for_restore: bool = False,
 ) -> list[uuid.UUID]:
     """Validate the new/updated block against its siblings.
 
@@ -659,7 +660,8 @@ async def _assert_no_block_overlap(
 
     Raises 409 on: exact duplicate, strict subset of a sibling
     (operator should set ``parent_block_id`` to that sibling
-    instead), or any partial overlap.
+    instead), or any partial overlap. ``for_restore`` words the strict-subset
+    refusal for the Trash's Restore, which takes no parent (#4228).
     """
     # deleted_at IS NULL: raw SQL bypasses the ORM soft-delete filter, so a
     # trashed block must free its CIDR for recreate/reparent (#490).
@@ -697,6 +699,16 @@ async def _assert_no_block_overlap(
             reparent.append(sibling_id)
             continue
         if new_net.subnet_of(sibling_net):  # type: ignore[arg-type]
+            if for_restore:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Block {network} cannot be restored at the top level: its range is "
+                        f"now inside live block {sibling_net}, and a restore does not "
+                        f"re-parent a block. Move, resize or delete block {sibling_net} "
+                        "first, then restore this one."
+                    ),
+                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(

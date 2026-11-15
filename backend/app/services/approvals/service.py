@@ -896,6 +896,59 @@ async def _stamp_apply_failed(
     return cr
 
 
+def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
+    """Why ``approver`` may not approve ``cr``, or ``None`` when they may.
+
+    The identity and permission checks of :func:`approve_change_request`
+    (steps 2-4b), in the order it makes them. Shared with the list API's
+    per-row ``can_approve`` (#4189) so the queue offers Approve to exactly the
+    approvers the server admits. Does not look at the row's state or expiry.
+    """
+    from app.services.ai import operations  # noqa: PLC0415
+    from app.services.ai.operations import OperationPermissionError  # noqa: PLC0415
+    from app.services.ai.operations_control import (  # noqa: PLC0415
+        CONTROL_OPERATION_NAMES,
+    )
+
+    # Fail CLOSED when the requester row is gone (#5). ON DELETE SET NULL
+    # nulls ``requested_by_user_id`` if the requester is deleted; the
+    # self-approval guard below would then fail OPEN (None != approver.id
+    # is always true), letting anyone rubber-stamp an orphaned request and
+    # defeating two-person. Refuse instead — the requester must recreate.
+    if cr.requested_by_user_id is None:
+        return DecisionConflict(
+            "Requester no longer exists; cancel and recreate this change request"
+        )
+    # Self-approval is forbidden — the whole point of two-person.
+    if approver.id == cr.requested_by_user_id:
+        return DecisionForbidden("You cannot approve your own change request")
+
+    op = operations.get_operation(cr.operation)
+    if op is None:
+        return DecisionError(f"Operation {cr.operation!r} is not registered")
+
+    # Approver holds the approve capability.
+    if not _can_approve(approver):
+        return DecisionForbidden("Permission denied: need 'approve' on 'change_request'")
+
+    # Approver holds the underlying operation's own permission.
+    try:
+        operations.enforce_operation_permission(approver, op)
+    except OperationPermissionError as exc:
+        return DecisionForbidden(str(exc))
+
+    # Self-governance control ops (#62) are SUPERADMIN-ONLY to approve — IN
+    # ADDITION to the checks above. A control op weakens the approval control
+    # plane itself, so only a *different* superadmin may sign off. Without
+    # this, a plain {approve, change_request} + {admin, approval_control}
+    # holder could rubber-stamp turning the whole workflow off.
+    if cr.operation in CONTROL_OPERATION_NAMES and not is_effective_superadmin(approver):
+        return DecisionForbidden(
+            "Approving a control-plane change to the approval workflow requires superadmin"
+        )
+    return None
+
+
 async def approve_change_request(
     db: AsyncSession,
     cr_id: UUID,
@@ -939,52 +992,14 @@ async def approve_change_request(
         await db.commit()
         raise DecisionConflict("Change request has expired")
 
-    # 2a. Fail CLOSED when the requester row is gone (#5). ON DELETE SET NULL
-    #     nulls ``requested_by_user_id`` if the requester is deleted; the
-    #     self-approval guard below would then fail OPEN (None != approver.id
-    #     is always true), letting anyone rubber-stamp an orphaned request and
-    #     defeating two-person. Refuse instead — the requester must recreate.
-    if cr.requested_by_user_id is None:
-        raise DecisionConflict(
-            "Requester no longer exists; cancel and recreate this change request"
-        )
-
-    # 2b. Self-approval is forbidden — the whole point of two-person.
-    if approver.id == cr.requested_by_user_id:
-        raise DecisionForbidden("You cannot approve your own change request")
-
+    # 2-4b. Who may approve this row (requester gone, self-approval, the approve
+    #     grant, the operation's own permission, control ops). One helper so the
+    #     queue's ``can_approve`` (#4189) asks exactly what this asks.
+    refusal = approval_refusal(approver, cr)
+    if refusal is not None:
+        raise refusal
     op = operations.get_operation(cr.operation)
-    if op is None:
-        raise DecisionError(f"Operation {cr.operation!r} is not registered")
-
-    # 3. Approver holds the approve capability.
-    if not _can_approve(approver):
-        raise DecisionForbidden(
-            "Permission denied: need 'approve' on 'change_request'",
-        )
-
-    # 4. Approver holds the underlying operation's own permission.
-    try:
-        operations.enforce_operation_permission(approver, op)
-    except OperationPermissionError as exc:
-        raise DecisionForbidden(str(exc)) from exc
-
-    # 4b. Self-governance control ops (#62) are SUPERADMIN-ONLY to approve —
-    #     IN ADDITION to the {approve, change_request} + required_permission
-    #     checks above. A control op weakens the approval control plane
-    #     itself, so only a *different* superadmin may sign off (the
-    #     "different" half is the step-2b self-approval block above; this
-    #     half is the superadmin requirement). Without this, a plain
-    #     {approve, change_request} + {admin, approval_control} holder could
-    #     rubber-stamp turning the whole workflow off.
-    from app.services.ai.operations_control import (  # noqa: PLC0415
-        CONTROL_OPERATION_NAMES,
-    )
-
-    if cr.operation in CONTROL_OPERATION_NAMES and not is_effective_superadmin(approver):
-        raise DecisionForbidden(
-            "Approving a control-plane change to the approval workflow requires superadmin"
-        )
+    assert op is not None  # approval_refusal refused an unregistered operation
 
     # Re-validate frozen args (guards the rare redeploy-mid-flight schema change).
     # #6: never echo the Pydantic ValidationError back to the client — it
@@ -1009,6 +1024,7 @@ async def approve_change_request(
     #     weakening change under approver authority whose rationale is gone. The
     #     flag is read FOR UPDATE so this can't race a concurrent flip.
     from app.services.ai.operations_control import (  # noqa: PLC0415
+        CONTROL_OPERATION_NAMES,
         ModifyApprovalControlArgs,
         control_gate_premise_lost,
     )
@@ -1324,6 +1340,7 @@ def _can_approve(user: User) -> bool:
 
 
 __all__ = [
+    "approval_refusal",
     "ChangeRequestStateError",
     "DecisionConflict",
     "DecisionError",

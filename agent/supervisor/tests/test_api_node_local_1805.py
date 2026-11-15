@@ -91,4 +91,22 @@ def test_an_operator_key_beside_it_survives(monkeypatch) -> None:
     assert kube.written_values["api"]["service"] == {
         "type": "NodePort",
         "trafficDistribution": WANT,
+        "nodeLocal": True,
     }
+
+
+def _api_node_local_service(values: dict) -> object:
+    return ((values.get("api") or {}).get("service") or {}).get("nodeLocal")
+
+
+@pytest.mark.parametrize("cp_size", [1, 3, 5])
+def test_the_supervisor_turns_on_the_node_local_service(cp_size: int) -> None:
+    """#3645: ``api.service.nodeLocal`` (the internalTrafficPolicy: Local api
+    Service the member supervisors use) is written at every size."""
+    assert _api_node_local_service(_owned(cp_size)) is True
+
+
+def test_firstboot_renders_the_node_local_service() -> None:
+    """Same value as the HelmChartConfig, or the first heartbeat adds a helm
+    revision (#1005)."""
+    assert _api_node_local_service(_render_firstboot_control_values()) is True

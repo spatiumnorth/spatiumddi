@@ -25,10 +25,14 @@ import {
   type BackupTargetKind,
   type BackupTargetUpdate,
 } from "@/lib/api";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { disabledBecause } from "@/hooks/usePermissions";
 
 /**
  * Backup Targets section on the Backup admin page (issue #117
@@ -53,6 +57,16 @@ const CRON_PRESETS: { label: string; value: string }[] = [
   { label: "Daily 04:00 UTC", value: "0 4 * * *" },
   { label: "Weekly Sunday 03:00 UTC", value: "0 3 * * 0" },
   { label: "Monthly 1st 03:00 UTC", value: "0 3 1 * *" },
+];
+
+// Config keys that decide where a stored credential is sent (#4135); the
+// same list the API compares before accepting an edit.
+const BACKUP_DESTINATION_KEYS = [
+  "host",
+  "port",
+  "server",
+  "url",
+  "endpoint_url",
 ];
 
 // Settings the API reads as numbers (#3946). The form holds every value as
@@ -139,9 +153,9 @@ export function BackupTargetsSection() {
       )}
 
       {editing && (
-        <TargetFormModal
+        <EditableTargetForm
           mode={editing.mode}
-          existing={editing.mode === "edit" ? editing.target : undefined}
+          row={editing.mode === "edit" ? editing.target : undefined}
           onClose={() => setEditing(null)}
           onSaved={() => {
             qc.invalidateQueries({ queryKey: ["backup-targets"] });
@@ -273,6 +287,11 @@ function TargetRow({
             }
             onClick={() => runMut.mutate()}
             disabled={!target.enabled || runMut.isPending}
+            disabledReason={
+              target.enabled
+                ? undefined
+                : "Target is disabled; enable it in Edit to run a backup."
+            }
           />
           <IconButton
             title="Test connection"
@@ -774,6 +793,43 @@ function RestoreFromArchiveModal({
   );
 }
 
+// Edit reads the target when it opens (#4236): the row the list holds can be
+// 30 s old and the form is seeded once. Save then sends only what changed.
+function EditableTargetForm({
+  mode,
+  row,
+  onClose,
+  onSaved,
+}: {
+  mode: "create" | "edit";
+  row?: BackupTarget;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<BackupTarget>(row, () =>
+    refetchRow<BackupTarget>(qc, [["backup-targets"]], row!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit backup target"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return (
+    <TargetFormModal
+      mode={mode}
+      existing={fresh.row}
+      onClose={onClose}
+      onSaved={onSaved}
+    />
+  );
+}
+
 // ── Target form modal ─────────────────────────────────────────────────
 
 function TargetFormModal({
@@ -863,6 +919,31 @@ function TargetFormModal({
     () => kindsQ.data?.find((k) => k.kind === kind),
     [kindsQ.data, kind],
   );
+  // #4135 — a moved host / port / server / URL needs every stored secret of
+  // this destination entered again (the same keys the API compares).
+  const secretFieldNames = (kindMeta?.config_fields ?? [])
+    .filter((f) => f.secret)
+    .map((f) => f.name);
+  const destKeys = Object.keys(config).filter((k) =>
+    BACKUP_DESTINATION_KEYS.includes(k),
+  );
+  const reask = useCredentialReask(
+    Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+    mode === "edit" && existing
+      ? Object.fromEntries(destKeys.map((k) => [k, existing.config?.[k] ?? ""]))
+      : null,
+    () =>
+      setConfig((prev) => {
+        const next = { ...prev };
+        for (const n of secretFieldNames) next[n] = "";
+        return next;
+      }),
+  );
+  const mustEnter = (name: string) =>
+    mode === "edit" &&
+    reask.asks(Boolean(existing?.config?.[name])) &&
+    !(config[name] ?? "").trim();
+  const missingSecret = secretFieldNames.some(mustEnter);
   // A kind with no listing and no delete is write-only whatever the
   // operator picks — the server forces it, so the form shows the real
   // resulting state rather than a choice that gets silently overridden.
@@ -904,7 +985,23 @@ function TargetFormModal({
         } as BackupTargetCreate;
         return backupTargetsApi.create(body);
       }
-      const body: BackupTargetUpdate = { ...sharedFields };
+      // The eight top-level fields go only when changed against what the
+      // dialog read (#4236), so one another client set since is not put back.
+      const { config: _cfg, ...topLevel } = sharedFields;
+      void _cfg;
+      const body: BackupTargetUpdate = changedFields(
+        {
+          name: existing!.name,
+          description: existing!.description,
+          enabled: existing!.enabled,
+          passphrase_hint: existing!.passphrase_hint,
+          schedule_cron: existing!.schedule_cron,
+          retention_keep_last_n: existing!.retention_keep_last_n,
+          retention_keep_days: existing!.retention_keep_days,
+          write_only: existing!.write_only,
+        },
+        topLevel,
+      );
       // Send only the settings the operator changed (#3947): the form holds
       // text, so echoing an untouched one would turn a stored null or number
       // into text and record a change nobody made. The API merges the rest
@@ -922,13 +1019,13 @@ function TargetFormModal({
         changed[k] = v;
       }
       if (Object.keys(changed).length > 0) body.config = typedConfig(changed);
-      else delete body.config;
       if (passphrase.length > 0) {
         if (passphrase.length < 8) {
           throw new Error("passphrase must be at least 8 characters");
         }
         body.passphrase = passphrase;
       }
+      if (Object.keys(body).length === 0) return null;
       return backupTargetsApi.update(existing!.id, body);
     },
     onSuccess: onSaved,
@@ -1029,12 +1126,13 @@ function TargetFormModal({
             // unset secret back as "" and a set one as a sentinel (#3289).
             const isSecretStored =
               isSecretInEdit && Boolean(existing?.config?.[f.name]);
+            const askAgain = f.secret && mustEnter(f.name);
             return (
               <Field
                 key={f.name}
                 label={f.label}
-                required={f.required && !isSecretInEdit}
-                help={f.description}
+                required={(f.required && !isSecretInEdit) || askAgain}
+                help={askAgain ? reask.hint : f.description}
               >
                 {f.multiline ? (
                   // A PEM key, a known_hosts file or one header per line:
@@ -1043,7 +1141,7 @@ function TargetFormModal({
                   <MultilineConfigField
                     name={f.name}
                     masked={f.type === "password" || f.secret}
-                    stored={isSecretStored}
+                    stored={isSecretStored && !askAgain}
                     value={config[f.name] ?? ""}
                     onChange={(v) => setConfig({ ...config, [f.name]: v })}
                   />
@@ -1056,10 +1154,13 @@ function TargetFormModal({
                     onChange={(e) =>
                       setConfig({ ...config, [f.name]: e.target.value })
                     }
+                    required={askAgain}
                     placeholder={
-                      isSecretStored
-                        ? "(set — leave empty to keep, type to replace)"
-                        : undefined
+                      askAgain
+                        ? reask.placeholder
+                        : isSecretStored
+                          ? "(set — leave empty to keep, type to replace)"
+                          : undefined
                     }
                     autoComplete={f.secret ? "new-password" : undefined}
                     className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -1258,7 +1359,7 @@ function TargetFormModal({
             </button>
             <button
               type="submit"
-              disabled={saveMut.isPending}
+              disabled={saveMut.isPending || missingSecret}
               className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {saveMut.isPending
@@ -1312,11 +1413,14 @@ function IconButton({
   icon,
   onClick,
   disabled,
+  disabledReason,
 }: {
   title: string;
   icon: React.ReactNode;
   onClick: () => void;
   disabled?: boolean;
+  /** Why it is disabled when that is not obvious; replaces the title. */
+  disabledReason?: string;
 }) {
   return (
     <button
@@ -1325,6 +1429,7 @@ function IconButton({
       disabled={disabled}
       title={title}
       className="rounded p-1 hover:bg-accent disabled:opacity-50"
+      {...disabledBecause(!!disabledReason, disabledReason ?? "")}
     >
       {icon}
     </button>

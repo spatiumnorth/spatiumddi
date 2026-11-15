@@ -7,7 +7,7 @@ memory limit split across recursive views), so existing groups render exactly
 as before.
 
 Revision ID: b7d2e4f81c59
-Revises: a3c9e5d1b7f2
+Revises: b6d2e9f41a07
 Create Date: 2026-11-14 10:00:00.000000
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "b7d2e4f81c59"
-down_revision = "a3c9e5d1b7f2"
+down_revision = "b6d2e9f41a07"
 branch_labels = None
 depends_on = None
 

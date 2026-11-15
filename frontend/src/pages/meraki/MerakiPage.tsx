@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -547,6 +548,13 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
     (org?.network_ids ?? []).join(", "),
   );
   const [apiKey, setApiKey] = useState("");
+  // #4135 — a moved address needs the stored key entered again.
+  const reask = useCredentialReask(
+    { baseUrl },
+    org && { baseUrl: org.base_url },
+    () => setApiKey(""),
+  );
+  const mustEnter = reask.asks(org?.api_key_present);
   const [spaceId, setSpaceId] = useState(org?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(org?.dns_group_id ?? "");
   const [mirrorPolicyObjects, setMirrorPolicyObjects] = useState(
@@ -739,7 +747,11 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
         <div className="space-y-2 border-t pt-3">
           <Field
             label="API key"
-            hint="The read-only Dashboard API key. On edit, leave blank to keep the stored key."
+            hint={
+              mustEnter
+                ? reask.hint
+                : "The read-only Dashboard API key. On edit, leave blank to keep the stored key."
+            }
           >
             <input
               className={`${inputCls} font-mono text-[11px]`}
@@ -748,11 +760,13 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={
-                editing && org?.api_key_present
-                  ? "••• stored — enter to replace"
-                  : "API key"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && org?.api_key_present
+                    ? "••• stored — enter to replace"
+                    : "API key"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -911,7 +925,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending || (!editing && !apiKey)}
+            disabled={saveMut.isPending || ((!editing || mustEnter) && !apiKey)}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

@@ -45,6 +45,15 @@ class DockerUnavailableError(RuntimeError):
     """
 
 
+class PodActionRefusedError(Exception):
+    """A pod action that cannot be done on this pod; the router answers 409.
+
+    ``start`` / ``stop`` have no meaning for a pod (the owning workload has to
+    be scaled), and a pod no controller owns is gone for good once deleted, so
+    ``restart`` refuses it too (#4232).
+    """
+
+
 @dataclass
 class ContainerSummary:
     """Pod summary in a docker-shape (name/image/state/status/
@@ -318,29 +327,41 @@ def resolve_workload_pod(component: str) -> tuple[str, str | None] | None:
 
 
 def container_action(name: str, action: str) -> None:
-    """Apply ``start`` / ``stop`` / ``restart`` to the named pod.
+    """Apply ``restart`` to the named pod; ``start`` / ``stop`` are refused.
 
     K8s vocabulary:
-      * ``restart`` → delete the pod; the owning Deployment /
-        DaemonSet recreates it on the next reconcile.
-      * ``start`` / ``stop`` → not directly supported on a single
-        pod (you'd scale the owning Deployment). For the appliance
-        Fleet UI's purposes ``restart`` is the only meaningful
-        action; ``start`` / ``stop`` raise ValueError (was a
-        wishlist UX in the docker era).
+      * ``restart`` -> delete the pod; the owning Deployment / StatefulSet /
+        DaemonSet recreates it on the next reconcile. Only a pod in the api's
+        own namespace that a controller owns is deleted: a bare pod would not
+        come back, so it is refused (``PodActionRefusedError``).
+      * ``start`` / ``stop`` -> a pod has neither; stopping it means scaling
+        its workload, which this page does not do. Raises
+        ``PodActionRefusedError`` (HTTP 409), not a 500 (#4232).
     """
-    if action == "restart":
-        ok, err = k8s.delete_pod(name)
-        if not ok:
-            raise DockerUnavailableError(err or f"failed to delete pod {name}")
-        logger.info("appliance_pod_restart", name=name)
-        return
     if action in ("start", "stop"):
-        raise ValueError(
-            f"pod action {action!r} requires scaling the owning Deployment; "
-            "use kubectl scale for now (UI exposure pending)"
+        raise PodActionRefusedError(
+            f"cannot {action} a pod: stopping a pod needs its owning workload "
+            "scaled, which is not supported from this page (use Restart)"
         )
-    raise ValueError(f"unknown pod action: {action!r}")
+    if action != "restart":
+        raise ValueError(f"unknown pod action: {action!r}")
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        raise DockerUnavailableError(str(exc)) from exc
+    pod = next((p for p in pods if (p.get("metadata") or {}).get("name") == name), None)
+    if pod is None:
+        raise LookupError(f"pod {name} not found")
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    if not any(o.get("controller") for o in owners):
+        raise PodActionRefusedError(
+            f"pod {name} has no owning controller, so deleting it would not bring it "
+            "back; refusing to restart it"
+        )
+    ok, err = k8s.delete_pod(name)
+    if not ok:
+        raise DockerUnavailableError(err or f"failed to delete pod {name}")
+    logger.info("appliance_pod_restart", name=name)
 
 
 def get_container_logs(
@@ -411,6 +432,7 @@ async def stream_container_logs(
 __all__ = [
     "ContainerSummary",
     "DockerUnavailableError",
+    "PodActionRefusedError",
     "container_action",
     "get_container_logs",
     "find_release_pod",

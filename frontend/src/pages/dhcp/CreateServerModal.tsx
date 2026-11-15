@@ -12,6 +12,7 @@ import {
   winrmFormFrom,
   winrmSettingsPayload,
 } from "@/lib/winrm";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
@@ -99,6 +100,27 @@ function ServerModalForm({
   } | null>(null);
 
   const hasExistingCreds = !!server?.has_credentials;
+
+  // #4135 — a moved host / port needs the stored credential entered again
+  // (or cleared).
+  const reask = useCredentialReask(
+    { host, port },
+    server && { host: server.host, port: server.port },
+    () => {
+      setFgToken("");
+      setWinPassword("");
+    },
+  );
+  const mustEnterFgToken =
+    driver === "fortigate" &&
+    reask.asks(hasExistingCreds) &&
+    !fgClearCreds &&
+    !fgToken;
+  const mustEnterWinPassword =
+    driver === "windows_dhcp" &&
+    reask.asks(hasExistingCreds) &&
+    !winClearCreds &&
+    !winPassword;
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -487,13 +509,25 @@ function ServerModalForm({
             <div
               className={`grid grid-cols-2 gap-3 ${fgClearCreds ? "opacity-40 pointer-events-none" : ""}`}
             >
-              <Field label="API Token" hint="FortiOS REST API admin token">
+              <Field
+                label="API Token"
+                hint={
+                  mustEnterFgToken ? reask.hint : "FortiOS REST API admin token"
+                }
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={fgToken}
                   onChange={(e) => setFgToken(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  required={mustEnterFgToken}
+                  placeholder={
+                    mustEnterFgToken
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "required"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -777,13 +811,23 @@ function ServerModalForm({
                   autoComplete="off"
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterWinPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={winPassword}
                   onChange={(e) => setWinPassword(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  required={mustEnterWinPassword}
+                  placeholder={
+                    mustEnterWinPassword
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "required"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -875,7 +919,11 @@ function ServerModalForm({
         {error && (
           <FormError className="text-xs text-destructive">{error}</FormError>
         )}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        <Btns
+          onClose={onClose}
+          pending={mut.isPending}
+          disabled={mustEnterFgToken || mustEnterWinPassword}
+        />
       </form>
     </Modal>
   );

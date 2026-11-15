@@ -27,6 +27,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.drivers.llm import get_driver
 from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
@@ -330,6 +331,12 @@ async def update_provider(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        row,
+        changes,
+        destination=("base_url",),
+        secrets={"api_key": row.api_key_encrypted},
+    )
     for k, v in changes.items():
         if k == "api_key":
             # None already excluded by exclude_unset; "" clears, anything else replaces.
