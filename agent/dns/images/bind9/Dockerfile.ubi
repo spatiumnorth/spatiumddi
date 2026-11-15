@@ -8,10 +8,17 @@
 # the Alpine image runs. ISC's RPMs (Copr isc/bind-esv) exist for x86_64 only,
 # so they cannot serve a multi-arch image. UBI also lacks libuv-devel and
 # userspace-rcu-devel (BIND 9.20 hard dependencies), tini and su-exec, so the
-# builder stage compiles libuv, liburcu and tini from pinned tarballs too.
-# Every tarball is checked against a pinned sha256 and the build fails on a
-# mismatch. glibc's malloc is used: Alpine's jemalloc preload (#4192) fixed a
-# musl-specific "freed memory never returns" problem that glibc does not have.
+# builder stage compiles libuv, liburcu, jemalloc and tini from pinned tarballs
+# too. Every tarball is checked against a pinned sha256 and the build fails on a
+# mismatch; BIND, libuv and liburcu, which their projects sign, are also verified
+# with gpg against a PINNED key fingerprint (the key itself is fetched over HTTPS
+# from the project: ISC's keyblock, libuv's key from the git tag libuv publishes it in,
+# liburcu's by fingerprint from keys.openpgp.org). jemalloc publishes no signature, and tini's .asc signs its
+# release binary, not the source archive, so those two have sha256 only.
+# jemalloc (#4192/#4196): named runs on it, linked in with BIND's own
+# --with-jemalloc (patchelf, which Alpine uses, is not in UBI), tuned through the
+# /etc/malloc.conf symlink because named carries a file capability and so ignores
+# MALLOC_CONF and LD_PRELOAD (AT_SECURE).
 ARG PYTHON_VERSION=3.12
 
 FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8 AS bind-build
@@ -23,8 +30,19 @@ ARG URCU_VERSION=0.15.6
 ARG URCU_SHA256=850b192096eb11ebf2c70e8f97bc7da7479ee41da1bebeb44e3986908bac414f
 ARG TINI_VERSION=0.19.0
 ARG TINI_SHA256=0fd35a7030052acd9f58948d1d900fe1e432ee37103c5561554408bdac6bbf0d
+ARG JEMALLOC_VERSION=5.3.0
+ARG JEMALLOC_SHA256=2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aecfeaa
+# Signing-key fingerprints (the signature must be GOOD and made by exactly this key).
+# BIND: Michal Nowak (ISC code-signing key), in ISC's keyblock https://www.isc.org/docs/isc-keyblock.asc
+ARG BIND_SIGNING_FPR=D99CCEAF879747014F038D63182E23579462EFAA
+# libuv: Santiago Gimeno, listed in libuv's README ("GPG key: 612F 0EAD ..."); the key is the
+# blob its git tag pubkey-santigimeno points at (fetched through the GitHub API; the key itself is
+# long expired, which gpg reports but still checks the signature, and the fingerprint is what is pinned)
+ARG LIBUV_SIGNING_FPR=612F0EAD9401622379DF4402F28C3C8DA33C03BE
+# liburcu: the key that signs https://lttng.org/files/urcu/*.asc (fingerprint read off the signature)
+ARG URCU_SIGNING_FPR=2A0B4ED915F2D3FA45F5B16217280A9781186ACF
 RUN dnf -y --enablerepo=ubi-9-codeready-builder-rpms install --setopt=install_weak_deps=0 \
-      gcc make cmake perl xz bzip2 tar gzip pkgconf-pkg-config \
+      gcc make cmake perl xz bzip2 tar gzip pkgconf-pkg-config gnupg2 diffutils \
       openssl-devel libcap-devel libnghttp2-devel libxml2-devel \
  && dnf clean all
 WORKDIR /src
@@ -32,11 +50,37 @@ ADD https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERSION}.tar.gz
 ADD https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2 urcu.tar.bz2
 ADD https://github.com/krallin/tini/archive/refs/tags/v${TINI_VERSION}.tar.gz tini.tar.gz
 ADD https://downloads.isc.org/isc/bind9/${BIND_VERSION}/bind-${BIND_VERSION}.tar.xz bind.tar.xz
+ADD https://downloads.isc.org/isc/bind9/${BIND_VERSION}/bind-${BIND_VERSION}.tar.xz.asc bind.tar.xz.asc
+ADD https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERSION}.tar.gz.sign libuv.tar.gz.sign
+ADD https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2.asc urcu.tar.bz2.asc
+ADD https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2 jemalloc.tar.bz2
+# gpg: a fresh GNUPGHOME per tarball, the project's key fetched over HTTPS, and the
+# signature accepted only as VALIDSIG from the pinned fingerprint.
+RUN verify() { \
+      home=$(mktemp -d); chmod 700 "$home"; \
+      curl -fsSL --retry 3 -H "Accept: application/vnd.github.raw" "$1" | GNUPGHOME="$home" gpg --batch --import 2>/dev/null; \
+      GNUPGHOME="$home" gpg --batch --status-fd 1 --verify "$3" "$4" 2>/dev/null \
+        | grep -q "^\[GNUPG:\] VALIDSIG .* $2\$" \
+        || { echo "signature of $4 is not a valid one from $2" >&2; exit 1; }; \
+    } \
+ && verify https://www.isc.org/docs/isc-keyblock.asc "$BIND_SIGNING_FPR" bind.tar.xz.asc bind.tar.xz \
+ && verify "https://api.github.com/repos/libuv/libuv/git/blobs/f1beee0c8b030aec9c2863ebf884f8eb88d9ed6c" "$LIBUV_SIGNING_FPR" libuv.tar.gz.sign libuv.tar.gz \
+ && verify "https://keys.openpgp.org/vks/v1/by-fingerprint/${URCU_SIGNING_FPR}" "$URCU_SIGNING_FPR" urcu.tar.bz2.asc urcu.tar.bz2
+RUN echo "${JEMALLOC_SHA256}  jemalloc.tar.bz2" | sha256sum -c - \
+ && mkdir -p jemalloc && tar -xf jemalloc.tar.bz2 -C jemalloc --strip-components=1
 RUN echo "${LIBUV_SHA256}  libuv.tar.gz" | sha256sum -c - \
  && echo "${URCU_SHA256}  urcu.tar.bz2" | sha256sum -c - \
  && echo "${TINI_SHA256}  tini.tar.gz" | sha256sum -c - \
  && echo "${BIND_SHA256}  bind.tar.xz" | sha256sum -c - \
  && for f in libuv.tar.gz urcu.tar.bz2 tini.tar.gz bind.tar.xz; do mkdir -p "${f%%.*}" && tar -xf "$f" -C "${f%%.*}" --strip-components=1; done
+# jemalloc, installed live (BIND links against it) and into /stage. aarch64 gets
+# 64 KiB pages: that build also runs on a 4 KiB-page kernel, the reverse does not.
+RUN cd jemalloc && lgpage=; [ "$(uname -m)" = aarch64 ] && lgpage=--with-lg-page=16; \
+    ./configure --prefix=/usr --libdir=/usr/lib64 --disable-static $lgpage >/dev/null \
+ && make -j"$(nproc)" build_lib_shared >/dev/null \
+ && make install_lib_shared install_lib_pc install_include >/dev/null \
+ && make install_lib_shared DESTDIR=/stage >/dev/null \
+ && ldconfig
 # Each library is installed twice: live (BIND links against it) and into
 # /stage (what the runtime stage copies).
 RUN cd libuv && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
@@ -50,13 +94,14 @@ RUN cd tini && cmake -DCMAKE_BUILD_TYPE=Release . >/dev/null && make -j"$(nproc)
 # DoT/DoH (#50) need libnghttp2; the statistics channel (XMLv3, all the agent reads) needs libxml2; json-c-devel is not in UBI.
 RUN cd bind && ./configure --prefix=/usr --libdir=/usr/lib64 --sysconfdir=/etc/bind \
       --localstatedir=/var --with-openssl --enable-linux-caps \
-      --with-libxml2 --with-libnghttp2 --without-jemalloc --disable-static \
+      --with-libxml2 --with-libnghttp2 --with-jemalloc --disable-static \
       --without-readline >/dev/null \
  && make -j"$(nproc)" >/dev/null && make install DESTDIR=/stage >/dev/null \
  && find /stage -name '*.la' -delete \
  && rm -rf /stage/usr/share/man /stage/usr/share/doc /stage/usr/include /stage/usr/lib64/pkgconfig \
- && find /stage/usr/bin /stage/usr/sbin /stage/usr/lib64 /stage/usr/local/bin -type f \
-      \( -perm -u+x -o -name '*.so*' \) -exec strip --strip-unneeded {} + 2>/dev/null || true
+ && { find /stage/usr/bin /stage/usr/sbin /stage/usr/lib64 /stage/usr/local/bin -type f \
+      \( -perm -u+x -o -name '*.so*' \) -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
+ && test -x /stage/usr/sbin/named
 RUN mkdir -p /stage/licenses \
  && cp bind/COPYRIGHT /stage/licenses/BIND-COPYRIGHT \
  && cp bind/LICENSE /stage/licenses/BIND-LICENSE-MPL-2.0 \
@@ -65,7 +110,8 @@ RUN mkdir -p /stage/licenses \
  && cp urcu/LICENSE.md /stage/licenses/userspace-rcu-LICENSE.md \
  && cp -r urcu/LICENSES /stage/licenses/userspace-rcu-LICENSES \
  && cp tini/LICENSE /stage/licenses/tini-LICENSE \
- && printf 'bind=%s\nlibuv=%s\nuserspace-rcu=%s\ntini=%s\n' "$BIND_VERSION" "$LIBUV_VERSION" "$URCU_VERSION" "$TINI_VERSION" > /stage/bind-versions
+ && cp jemalloc/COPYING /stage/licenses/jemalloc-COPYING \
+ && printf 'bind=%s\nlibuv=%s\nuserspace-rcu=%s\njemalloc=%s\ntini=%s\n' "$BIND_VERSION" "$LIBUV_VERSION" "$URCU_VERSION" "$JEMALLOC_VERSION" "$TINI_VERSION" > /stage/bind-versions
 
 FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8 AS agent-build
 RUN dnf -y install --setopt=install_weak_deps=0 python3.12 python3.12-pip && dnf clean all
@@ -93,8 +139,13 @@ COPY --from=bind-build /stage/usr/ /usr/
 COPY --from=bind-build /stage/licenses/ /licenses/
 COPY --from=bind-build /stage/bind-versions /tmp/bind-versions
 COPY agent/dns/images/bind9/su-exec-ubi.sh /usr/local/bin/su-exec
+# #4192/#4196 — named's allocator is jemalloc, tuned through the /etc/malloc.conf
+# symlink (see the header; the same string as the Alpine image). Asserted at build
+# time so a configure that quietly dropped it fails here.
 RUN ldconfig \
- && ldd /usr/sbin/named | grep -q 'not found' && { ldd /usr/sbin/named; exit 1; } || true
+ && ldd /usr/sbin/named | grep -q 'not found' && { ldd /usr/sbin/named; exit 1; } || true \
+ && ldd /usr/sbin/named | grep -q libjemalloc \
+ && ln -sfn "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0" /etc/malloc.conf
 RUN setcap cap_net_bind_service=+ep /usr/sbin/named \
  && getcap /usr/sbin/named | grep -q cap_net_bind_service \
  && groupadd -r spatium \
