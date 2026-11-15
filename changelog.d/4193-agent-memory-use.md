@@ -7,7 +7,10 @@
   server lists show used against limit (amber above 80%), the server
   modal shows the breakdown and a sparkline, and the DNS Blocking Lists
   tab shows each server's real `named` memory next to the estimate.
-  Servers whose agent predates this show "—". The figures are also on
+  Servers whose agent predates this show "—", and a server whose agent
+  stops sending the figures (replaced by an older one, or wedged for more
+  than three heartbeats) goes back to "not reported" rather than keeping
+  stale numbers. The figures are also on
   the server read endpoints, `GET .../servers/{id}/memory-history`, and
   the Copilot's server tools. An alert on memory use is not part of this.
 

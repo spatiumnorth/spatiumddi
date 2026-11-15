@@ -293,7 +293,7 @@ class AgentHeartbeatRequest(BaseModel):
     # the daemon's and the agent's RSS. Loose dict at the edge like ``spool``:
     # ``apply_reported_memory`` validates it and ignores a malformed report
     # rather than 422-ing the heartbeat. Absent on an older agent, which
-    # leaves the stored report untouched.
+    # clears the stored report.
     memory: dict[str, Any] | None = None
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)

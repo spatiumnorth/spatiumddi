@@ -31,6 +31,7 @@ from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.normalize import canonical_duid
@@ -92,7 +93,7 @@ async def list_dhcp_servers(
             # #4193 — what the agent actually reports using (container used /
             # peak / limit, Kea and agent RSS, reported_at); NULL = never
             # reported, which is unknown, not zero.
-            "memory": s.memory_status,
+            "memory": fresh_memory_status(s.memory_status),
         }
         for s in rows
     ]

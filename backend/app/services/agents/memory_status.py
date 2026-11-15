@@ -9,8 +9,11 @@ counters, ``tasks/prune_metrics``).
 
 Best effort end to end: every field is optional and NULL means UNKNOWN, never
 0. A heartbeat without the block (an older agent) leaves the stored report
-untouched, and an invalid block is logged and ignored rather than 422-ing a
-heartbeat that also carries liveness and op acks.
+clears it (the agent that sent figures was replaced by one that does not, so
+the old ones are no longer true), and an invalid block is logged and ignored
+rather than 422-ing a heartbeat that also carries liveness and op acks. Every
+reader goes through :func:`fresh_memory_status`, so a report that stopped being
+refreshed (a wedged agent) also reads as not reported.
 """
 
 from __future__ import annotations
@@ -56,6 +59,32 @@ class _HasMemoryStatus(Protocol):
     memory_status: dict[str, Any] | None
 
 
+#: Agents heartbeat every 30 s by default; a stored report older than three
+#: intervals is no longer "current" and reads as not reported.
+MEMORY_STALE_AFTER = timedelta(seconds=90)
+
+
+def fresh_memory_status(
+    status: dict[str, Any] | None, now: datetime | None = None
+) -> dict[str, Any] | None:
+    """The stored report, or None when absent, undated or older than
+    :data:`MEMORY_STALE_AFTER`. Use this for every read of ``memory_status``."""
+    if not isinstance(status, dict):
+        return None
+    raw = status.get("reported_at")
+    try:
+        at = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+    except ValueError:
+        at = None
+    if at is None:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    if (now or datetime.now(UTC)) - at > MEMORY_STALE_AFTER:
+        return None
+    return status
+
+
 def _bucket(now: datetime) -> datetime:
     return now.astimezone(UTC).replace(second=0, microsecond=0)
 
@@ -70,8 +99,10 @@ async def apply_reported_memory(
     now: datetime | None = None,
 ) -> None:
     """Store the report on the server row and fold it into this minute's
-    metric-sample bucket (peak is the max seen in the bucket)."""
+    metric-sample bucket (peak is the max seen in the bucket). A heartbeat
+    without the block clears the stored report; history samples stay."""
     if memory is None:
+        server.memory_status = None
         return
     try:
         report = MemoryReport.model_validate(memory)

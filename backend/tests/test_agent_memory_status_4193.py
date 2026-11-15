@@ -21,6 +21,7 @@ from app.models.auth import User
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer, DNSServerGroup
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.services.agents.memory_status import MEMORY_STALE_AFTER, fresh_memory_status
 from app.services.ai.tools.dhcp import ListDHCPServersArgs, list_dhcp_servers
 from app.services.dns.memory_estimate import group_memory_estimate
 
@@ -129,7 +130,7 @@ async def test_heartbeat_stores_the_report_and_a_sample(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["dns", "dhcp"])
-async def test_older_agent_and_bad_block_leave_the_report_alone(
+async def test_bad_block_leaves_the_report_alone_and_an_older_agent_clears_it(
     kind: str, client: AsyncClient, db_session: AsyncSession
 ) -> None:
     srv = await (_dns if kind == "dns" else _dhcp)(db_session)
@@ -139,12 +140,81 @@ async def test_older_agent_and_bad_block_leave_the_report_alone(
     assert row is not None and row.memory_status is None  # unknown, not zero
 
     assert (await _post(client, kind, srv, "heartbeat", {"memory": BLOCK})).status_code == 200
-    assert (await _post(client, kind, srv, "heartbeat", {})).status_code == 200
     # Malformed (negative) must not 422 the heartbeat or overwrite.
     r = await _post(client, kind, srv, "heartbeat", {"memory": {"used_bytes": -5}})
     assert r.status_code == 200, r.text
     row = await db_session.get(type(srv), sid, populate_existing=True)
     assert row is not None and row.memory_status["used_bytes"] == 700 * MIB
+
+    # An older agent (no block) replaces this build's agent: the stored figures
+    # are cleared, the history sample stays.
+    assert (await _post(client, kind, srv, "heartbeat", {})).status_code == 200
+    row = await db_session.get(type(srv), sid, populate_existing=True)
+    assert row is not None and row.memory_status is None
+    model = DNSMetricSample if kind == "dns" else DHCPMetricSample
+    assert len(await _samples(db_session, model, sid)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["dns", "dhcp"])
+async def test_a_cleared_or_stale_report_reads_as_not_reported_everywhere(
+    kind: str, client: AsyncClient, db_session: AsyncSession
+) -> None:
+    srv = await (_dns if kind == "dns" else _dhcp)(db_session)
+    sid = srv.id
+    gid = srv.group_id if kind == "dns" else None
+    headers = await _admin(db_session)
+
+    async def api_value() -> dict | None:
+        if kind == "dns":
+            r = await client.get(f"/api/v1/dns/groups/{gid}/servers", headers=headers)
+            return next(s for s in r.json() if s["id"] == str(sid))["memory_status"]
+        r = await client.get(f"/api/v1/dhcp/servers/{sid}", headers=headers)
+        return r.json()["memory_status"]
+
+    async def copilot_value() -> dict | None:
+        user = User(username="cp", email="cp@example.com", hashed_password="x", is_superadmin=True)
+        if kind == "dhcp":
+            rows = await list_dhcp_servers(db_session, user, ListDHCPServersArgs())
+            return next(r for r in rows if r["id"] == str(sid))["memory"]
+        from app.services.ai.tools.dns import FindDnsServersArgs, find_dns_servers
+
+        rows = await find_dns_servers(db_session, user, FindDnsServersArgs())
+        return next(r for r in rows if r["id"] == str(sid))["memory"]
+
+    # Reported, then an older agent heartbeats without the block.
+    assert (await _post(client, kind, srv, "heartbeat", {"memory": BLOCK})).status_code == 200
+    await db_session.refresh(srv)
+    assert await api_value() is not None
+    assert (await _post(client, kind, srv, "heartbeat", {})).status_code == 200
+    await db_session.refresh(srv)
+    assert await api_value() is None
+    assert await copilot_value() is None
+
+    # A report nothing has refreshed for longer than three heartbeats.
+    assert (await _post(client, kind, srv, "heartbeat", {"memory": BLOCK})).status_code == 200
+    row = await db_session.get(type(srv), sid, populate_existing=True)
+    assert row is not None
+    old = datetime.now(UTC) - MEMORY_STALE_AFTER - timedelta(seconds=5)
+    row.memory_status = {**row.memory_status, "reported_at": old.isoformat()}
+    await db_session.commit()
+    await db_session.refresh(srv)
+    assert await api_value() is None
+    assert await copilot_value() is None
+    if kind == "dns":
+        est = await group_memory_estimate(db_session, gid)
+        assert est is not None and est.servers[0].daemon_rss_bytes is None
+
+
+def test_fresh_memory_status_bounds() -> None:
+    now = datetime.now(UTC)
+    ok = {"used_bytes": 1, "reported_at": (now - timedelta(seconds=30)).isoformat()}
+    assert fresh_memory_status(ok, now) == ok
+    old = {"used_bytes": 1, "reported_at": (now - MEMORY_STALE_AFTER * 2).isoformat()}
+    assert fresh_memory_status(old, now) is None
+    assert fresh_memory_status({"used_bytes": 1}, now) is None  # undated
+    assert fresh_memory_status({"reported_at": "garbage"}, now) is None
+    assert fresh_memory_status(None, now) is None
 
 
 @pytest.mark.asyncio

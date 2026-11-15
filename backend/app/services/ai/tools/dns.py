@@ -30,6 +30,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
@@ -421,7 +422,7 @@ async def find_dns_servers(
             # #4193 — what the agent actually reports using (container used /
             # peak / limit, daemon and agent RSS, reported_at); NULL = never
             # reported, which is unknown, not zero.
-            "memory": s.memory_status,
+            "memory": fresh_memory_status(s.memory_status),
         }
         for s, group_name in rows
     ]

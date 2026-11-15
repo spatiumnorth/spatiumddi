@@ -114,9 +114,14 @@ export function AgentMemoryPanel({
           />
         </dl>
       )}
-      <div className="mt-2">
-        <MemorySparkline values={values} limit={status?.limit_bytes} />
-      </div>
+      {/* No current report means no sparkline: the history rows outlive the
+          report (a replaced or wedged agent), and a line drawn under "Not
+          reported" reads as live data. */}
+      {status && (
+        <div className="mt-2">
+          <MemorySparkline values={values} limit={status.limit_bytes} />
+        </div>
+      )}
     </div>
   );
 }

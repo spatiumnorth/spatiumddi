@@ -44,6 +44,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
@@ -397,7 +398,7 @@ async def _observed(db: AsyncSession, group_id: uuid.UUID) -> tuple[ServerObserv
     ).all()
     out: list[ServerObservedMemory] = []
     for name, status in rows:
-        s = status if isinstance(status, dict) else {}
+        s = fresh_memory_status(status) or {}
         out.append(
             ServerObservedMemory(
                 name=name,

@@ -140,6 +140,38 @@ describe("server modal memory panel", () => {
   });
 });
 
+describe("server modal memory panel after the report is cleared", () => {
+  it("draws no sparkline from old history when nothing is currently reported", async () => {
+    const fetchHistory = vi.fn().mockResolvedValue({
+      server_id: "s1",
+      hours: 6,
+      points: [1, 2, 3].map((n) => ({
+        ts: `2026-11-14T10:0${n}:00Z`,
+        used_bytes: n * 100 * MIB,
+        peak_bytes: null,
+        daemon_rss_bytes: null,
+        agent_rss_bytes: null,
+      })),
+    });
+    wrap(
+      <AgentMemoryPanel
+        serverId="s1"
+        status={null}
+        daemonLabel="named"
+        fetchHistory={fetchHistory}
+        queryKeyPrefix="t3"
+      />,
+    );
+    await waitFor(() => expect(fetchHistory).toHaveBeenCalled());
+    // let the query resolve so the history is in hand before asserting
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getByTestId("agent-memory-panel").textContent).toContain(
+      "Not reported",
+    );
+    expect(screen.queryByTestId("memory-sparkline")).toBeNull();
+  });
+});
+
 describe("blocklists page banner", () => {
   function est(servers: DNSMemoryEstimate["servers"]): DNSMemoryEstimate {
     return {

@@ -50,6 +50,7 @@ from app.services.agents.memory_status import (
     MAX_HISTORY_HOURS,
     MemoryHistory,
     MemoryStatus,
+    fresh_memory_status,
     memory_history,
 )
 from app.services.agents.spool_status import SpoolStatus
@@ -381,7 +382,7 @@ class ServerResponse(BaseModel):
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
             spool_status=s.spool_status,
-            memory_status=s.memory_status,
+            memory_status=fresh_memory_status(s.memory_status),
             daemon_status=s.daemon_status,
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
