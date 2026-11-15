@@ -50,6 +50,7 @@ from app.services.logs.agent_logs import (
     search_dns_queries,
 )
 from app.services.logs.client_names import ClientNameError, name_fields, resolve_client_names
+from app.services.logs.client_names_ptr import resolve_ptr_batch
 
 logger = structlog.get_logger(__name__)
 
@@ -636,6 +637,7 @@ async def query_dns_queries(
             [str(r.client_ip) if r.client_ip is not None else None for r in rows],
             body.resolve_clients,
             body.ip_space_id,
+            ptr_batch=resolve_ptr_batch,
         )
     except ClientNameError as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc

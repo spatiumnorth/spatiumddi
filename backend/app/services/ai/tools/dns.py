@@ -1532,10 +1532,10 @@ class FindDNSQueriesArgs(BaseModel):
     minutes: int = Field(
         default=60, ge=1, le=1440, description="Trailing window (the log is pruned at 24 h)."
     )
-    resolve_clients: Literal["none", "ptr", "ipam"] = Field(
+    resolve_clients: Literal["none", "ipam"] = Field(
         default="none",
         description=(
-            "Add a client_name per row: 'ptr' = reverse DNS, 'ipam' = host name "
+            "Add a client_name per row: 'ipam' = host name "
             "in the IP space ip_space_id (required; only addresses you may read)."
         ),
     )

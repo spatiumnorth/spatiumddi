@@ -106,10 +106,10 @@ class QueryDNSQueryLogArgs(BaseModel):
         description="Only include rows newer than N hours ago. None = no lower bound.",
         ge=0.0,
     )
-    resolve_clients: Literal["none", "ptr", "ipam"] = Field(
+    resolve_clients: Literal["none", "ipam"] = Field(
         default="none",
         description=(
-            "Add a client_name per row: 'ptr' = reverse DNS, 'ipam' = host name "
+            "Add a client_name per row: 'ipam' = host name "
             "in the IP space ip_space_id (required; only addresses you may read)."
         ),
     )

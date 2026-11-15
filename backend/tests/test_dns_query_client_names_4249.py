@@ -153,7 +153,7 @@ async def test_ipam_skips_addresses_the_caller_cannot_read(
 async def test_none_does_no_lookups(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from app.services.logs import client_names
+    from app.services.logs import client_names_ptr as client_names
 
     async def boom(*a: Any, **k: Any) -> None:
         raise AssertionError("resolver called")
@@ -170,7 +170,7 @@ async def test_none_does_no_lookups(
 async def test_ptr_uses_resolver_and_caches(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from app.services.logs import client_names
+    from app.services.logs import client_names_ptr as client_names
 
     calls: list[str] = []
 
@@ -199,7 +199,7 @@ async def test_ptr_uses_resolver_and_caches(
 async def test_ptr_skips_public_addresses(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from app.services.logs import client_names
+    from app.services.logs import client_names_ptr as client_names
 
     calls: list[str] = []
 
@@ -220,3 +220,15 @@ async def test_ptr_skips_public_addresses(
     assert by_ip["8.8.8.8"] is None
     assert by_ip["2001:4860:4860::8888"] is None
     assert by_ip["10.0.0.5"] == "h-10.0.0.5"
+
+
+async def test_copilot_tools_refuse_ptr(db_session: AsyncSession) -> None:
+    from pydantic import ValidationError
+
+    from app.services.ai.tools.dns import FindDNSQueriesArgs
+    from app.services.ai.tools.observability import QueryDNSQueryLogArgs
+
+    for model in (FindDNSQueriesArgs, QueryDNSQueryLogArgs):
+        with pytest.raises(ValidationError):
+            model(resolve_clients="ptr")
+        assert model(resolve_clients="ipam").resolve_clients == "ipam"

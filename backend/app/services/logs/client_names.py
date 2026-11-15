@@ -4,7 +4,7 @@ Opt-in per request (``resolve_clients`` on ``POST /logs/dns-queries`` and the
 Copilot's DNS query-log tools). The distinct client IPs of ONE page of rows
 are resolved in a single batch, from one of two sources:
 
-* ``ptr``  — (non-public client addresses only) a PTR lookup through the resolvers the platform already uses for
+* ``ptr``  — (REST route only, via ``client_names_ptr``; non-public client addresses only) a PTR lookup through the resolvers the platform already uses for
   reverse-DNS population (#41: ``PlatformSettings.reverse_dns_resolvers``, or
   the worker's system resolvers when none are set). No new outbound host.
   Results, including misses, are cached per address for a few minutes so a
@@ -17,11 +17,9 @@ are resolved in a single batch, from one of two sources:
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
-import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Literal
 
 from sqlalchemy import func, select
@@ -30,22 +28,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import user_has_permission
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPSpace, Subnet
-from app.models.settings import PlatformSettings
-from app.services.ipam.reverse_dns import _build_resolver, resolve_ptr
 
 ResolveMode = Literal["none", "ptr", "ipam"]
 NameSource = Literal["ptr", "ipam"]
 
-PTR_CACHE_TTL_SECONDS = 300.0
-PTR_CACHE_MAX = 4096
-PTR_CONCURRENCY = 16
-
-# ip -> (monotonic expiry, name or None). A miss is cached too.
-_ptr_cache: dict[str, tuple[float, str | None]] = {}
-
-
-def invalidate_cache() -> None:
-    _ptr_cache.clear()
+# Live reverse DNS is injected by the one caller allowed to send it (the REST
+# route, see ``client_names_ptr``). This module never imports a resolver, so
+# the Copilot tools that share it cannot reach the network.
+PtrBatch = Callable[[AsyncSession, list[str]], Awaitable[dict[str, str]]]
 
 
 class ClientNameError(Exception):
@@ -66,40 +56,6 @@ def _distinct_ips(ips: Iterable[str | None]) -> list[str]:
         except ValueError:
             continue
     return list(out)
-
-
-async def _resolve_ptr_batch(db: AsyncSession, ips: list[str]) -> dict[str, str]:
-    now = time.monotonic()
-    found: dict[str, str] = {}
-    todo: list[str] = []
-    for ip in ips:
-        hit = _ptr_cache.get(ip)
-        if hit is not None and hit[0] > now:
-            if hit[1]:
-                found[ip] = hit[1]
-        else:
-            todo.append(ip)
-    if not todo:
-        return found
-    ps = await db.get(PlatformSettings, 1)
-    resolver = _build_resolver((ps.reverse_dns_resolvers if ps else None) or None)
-    if resolver is None:
-        return found
-    sem = asyncio.Semaphore(PTR_CONCURRENCY)
-
-    async def _one(ip: str) -> tuple[str, str | None]:
-        async with sem:
-            return ip, await resolve_ptr(ip, resolver)
-
-    results = await asyncio.gather(*[_one(ip) for ip in todo])
-    if len(_ptr_cache) + len(results) > PTR_CACHE_MAX:
-        _ptr_cache.clear()
-    expiry = time.monotonic() + PTR_CACHE_TTL_SECONDS
-    for ip, name in results:
-        _ptr_cache[ip] = (expiry, name)
-        if name:
-            found[ip] = name
-    return found
 
 
 async def _resolve_ipam_batch(
@@ -132,6 +88,7 @@ async def resolve_client_names(
     client_ips: Iterable[str | None],
     mode: ResolveMode,
     ip_space_id: uuid.UUID | None,
+    ptr_batch: PtrBatch | None = None,
 ) -> dict[str, tuple[str, NameSource]]:
     """Map each resolvable client IP (normalised text) to ``(name, source)``."""
     if mode == "none":
@@ -143,6 +100,8 @@ async def resolve_client_names(
             raise ClientNameError("IP space not found")
     ips = _distinct_ips(client_ips)
     if mode == "ptr":
+        if ptr_batch is None:
+            raise ClientNameError("reverse DNS is not available here; use an IP space")
         # Live PTR only for non-public clients (RFC 1918, 6598, ULA, loopback,
         # link-local, ...): a log full of internet clients (an open resolver)
         # must not become outbound lookups of public addresses.
@@ -150,7 +109,9 @@ async def resolve_client_names(
     if not ips:
         return {}
     if mode == "ptr":
-        return {ip: (n, "ptr") for ip, n in (await _resolve_ptr_batch(db, ips)).items()}
+        assert ptr_batch is not None  # checked above
+        resolved = await ptr_batch(db, ips)
+        return {ip: (n, "ptr") for ip, n in resolved.items()}
     names = await _resolve_ipam_batch(db, user, ips, ip_space_id)  # type: ignore[arg-type]
     return {ip: (n, "ipam") for ip, n in names.items()}
 
