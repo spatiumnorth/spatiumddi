@@ -765,6 +765,51 @@ export function DeleteDNSGroupModal({
   );
 }
 
+/** Single-record delete (#4078, #4204): Move to Trash or Delete permanently.
+ *  Shared by the zone view and the group-wide Records view so both offer the
+ *  same choice and send the same call. `mutation` runs
+ *  `{ permanent }`-parameterised; the caller owns it and the dialog state. */
+function RecordDeleteModal({
+  label,
+  isSuperadmin,
+  mutation,
+  onDelete,
+  onClose,
+}: {
+  label: React.ReactNode;
+  isSuperadmin: boolean;
+  mutation: {
+    isPending: boolean;
+    isError: boolean;
+    error: unknown;
+    variables?: { permanent: boolean };
+  };
+  onDelete: (permanent: boolean) => void;
+  onClose: () => void;
+}) {
+  return (
+    <DeleteChoiceModal
+      title="Delete Record"
+      intro={<>Delete {label}?</>}
+      softHeading="Move to Trash (reversible)"
+      softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
+      softButtonLabel="Move to Trash"
+      permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
+      allowPermanent={isSuperadmin}
+      isSoftPending={mutation.isPending && !mutation.variables?.permanent}
+      isPermanentPending={mutation.isPending && !!mutation.variables?.permanent}
+      error={
+        mutation.isError
+          ? formatApiError(mutation.error, "Delete failed")
+          : null
+      }
+      onSoft={() => onDelete(false)}
+      onPermanent={() => onDelete(true)}
+      onClose={onClose}
+    />
+  );
+}
+
 // ── Download helper ──────────────────────────────────────────────────────────
 
 function downloadBlob(
@@ -5750,42 +5795,17 @@ export function ZoneDetailView({
         />
       )}
       {confirmDeleteRecord && (
-        <DeleteChoiceModal
-          title="Delete Record"
-          intro={
-            <>
-              Delete{" "}
-              <span className="font-mono">
-                {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
-              </span>
-              ?
-            </>
+        <RecordDeleteModal
+          label={
+            <span className="font-mono">
+              {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
+            </span>
           }
-          softHeading="Move to Trash (reversible)"
-          softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
-          softButtonLabel="Move to Trash"
-          permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
-          allowPermanent={isSuperadmin}
-          isSoftPending={
-            deleteRecord.isPending && !deleteRecord.variables?.permanent
-          }
-          isPermanentPending={
-            deleteRecord.isPending && !!deleteRecord.variables?.permanent
-          }
-          error={
-            deleteRecord.isError
-              ? formatApiError(deleteRecord.error, "Delete failed")
-              : null
-          }
-          onSoft={() =>
+          isSuperadmin={isSuperadmin}
+          mutation={deleteRecord}
+          onDelete={(permanent) =>
             deleteRecord.mutate(
-              { rec: confirmDeleteRecord, permanent: false },
-              { onSuccess: () => setConfirmDeleteRecord(null) },
-            )
-          }
-          onPermanent={() =>
-            deleteRecord.mutate(
-              { rec: confirmDeleteRecord, permanent: true },
+              { rec: confirmDeleteRecord, permanent },
               { onSuccess: () => setConfirmDeleteRecord(null) },
             )
           }
@@ -9777,7 +9797,7 @@ export function RecordsTab({
   onSelectZone: (z: DNSZone) => void;
 }) {
   const qc = useQueryClient();
-  const { canWriteRecords, canDeleteRecords } = useDnsGrants();
+  const { canWriteRecords, canDeleteRecords, isSuperadmin } = useDnsGrants();
   // Server-side pagination + search (#455). `groupRecordSearch` matches
   // name / fqdn / value / type / zone on the server; the per-column filters
   // below stay client-side refinements over the current page.
@@ -9903,8 +9923,13 @@ export function RecordsTab({
   );
 
   const deleteMut = useMutation({
-    mutationFn: (rec: DNSGroupRecord) =>
-      dnsApi.deleteRecord(group.id, rec.zone_id, rec.id),
+    mutationFn: ({
+      rec,
+      permanent,
+    }: {
+      rec: DNSGroupRecord;
+      permanent: boolean;
+    }) => dnsApi.deleteRecord(group.id, rec.zone_id, rec.id, { permanent }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-group-records", group.id] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -10256,44 +10281,27 @@ export function RecordsTab({
       )}
 
       {confirmDelete && (
-        <Modal title="Delete DNS record" onClose={() => setConfirmDelete(null)}>
-          <div className="space-y-3">
-            <p className="text-sm">
-              Delete{" "}
+        <RecordDeleteModal
+          label={
+            <>
               <span className="font-mono font-medium">
                 {confirmDelete.fqdn}
               </span>{" "}
               <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
                 {confirmDelete.record_type}
               </span>
-              ? The record moves to Trash. A superadmin can restore it from
-              Administration → Trash.
-            </p>
-            {deleteMut.isError && (
-              <FormError className="text-sm">
-                {formatApiError(deleteMut.error, "Delete failed")}
-              </FormError>
-            )}
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => {
-                  deleteMut.reset();
-                  setConfirmDelete(null);
-                }}
-                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => deleteMut.mutate(confirmDelete)}
-                disabled={deleteMut.isPending}
-                className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {deleteMut.isPending ? "Deleting…" : "Delete"}
-              </button>
-            </div>
-          </div>
-        </Modal>
+            </>
+          }
+          isSuperadmin={isSuperadmin}
+          mutation={deleteMut}
+          onDelete={(permanent) =>
+            deleteMut.mutate({ rec: confirmDelete, permanent })
+          }
+          onClose={() => {
+            deleteMut.reset();
+            setConfirmDelete(null);
+          }}
+        />
       )}
     </div>
   );
