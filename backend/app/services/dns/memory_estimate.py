@@ -11,13 +11,13 @@ nothing in the product saying why.
 This module estimates what named will hold and compares it with the memory
 limit the group's agents report (their container's cgroup ``memory.max``, on
 the heartbeat). It warns; it never refuses. The figures are measured on BIND
-9.20.29 (``docs/features/DNS.md`` §2, "What a view costs in memory"):
+9.20.29 and 9.20.30 (``docs/features/DNS.md`` §2, "What a view costs in memory"):
 
 * :data:`BASELINE_BYTES` — named and the agent at idle with one view, the
   ``DNS.md`` §8.0 rule of thumb;
 * :data:`BYTES_PER_RECORD` — about 0.45 kB per record of each zone copy
   named loads (a copy shared through ``in-view`` counts once);
-* :data:`BYTES_PER_RPZ_ENTRY` — about 1.4 kB per RPZ owner name, per view
+* :data:`BYTES_PER_RPZ_ENTRY` — about 1.1 kB per RPZ owner name, per view
   that loads the RPZ zone.
 
 :func:`estimate_bytes` and :func:`assess` are pure; :func:`group_memory_estimate`
@@ -59,9 +59,11 @@ BASELINE_BYTES = 400 * MIB
 #: Per record of each zone copy named loads. Measured: a 200,000-record zone
 #: costs about 86 MiB per copy.
 BYTES_PER_RECORD = 450
-#: Per RPZ owner name per view that loads the zone. Measured: a 100,000-entry
-#: RPZ costs about 135 MiB per view.
-BYTES_PER_RPZ_ENTRY = 1430
+#: Per RPZ owner name per view that loads the zone. Measured on BIND 9.20.30
+#: (jemalloc image, 416,344 owners): 0.97 - 1.04 kB per owner, QA saw about
+#: 0.93 kB (DNS.md §8.0, #4183). 1,100 keeps a margin, because the estimate
+#: ignores the reload peak. 9.20.29 measured 1,430.
+BYTES_PER_RPZ_ENTRY = 1100
 #: Warn when the estimate reaches this share of the limit.
 WARN_FRACTION = 0.8
 #: The DNS pod limit the shipped compose / chart / plain-k8s paths set (2Gi),
