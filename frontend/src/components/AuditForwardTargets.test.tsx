@@ -25,6 +25,7 @@ const api = {
   list: vi.fn(),
   update: vi.fn(),
   del: vi.fn(),
+  test: vi.fn(),
 };
 
 vi.mock("@/lib/api", async () => {
@@ -36,6 +37,7 @@ vi.mock("@/lib/api", async () => {
       listAuditTargets: () => api.list(),
       updateAuditTarget: (id: string, body: unknown) => api.update(id, body),
       deleteAuditTarget: (id: string) => api.del(id),
+      testAuditTarget: (id: string) => api.test(id),
     },
   };
 });
@@ -92,6 +94,7 @@ afterEach(() => {
   api.list.mockReset();
   api.update.mockReset();
   api.del.mockReset();
+  api.test.mockReset();
 });
 
 describe("webhook secrets in the target form", () => {
@@ -258,5 +261,41 @@ describe("a refused delete (#3822)", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Target not found");
     expect(api.list.mock.calls.length).toBeGreaterThan(before);
+  });
+});
+
+describe("Test result wording (#4237)", () => {
+  async function runTest(result: { status: string; target: string }) {
+    api.list.mockResolvedValue([TARGET]);
+    api.test.mockResolvedValue(result);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("collector");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByTitle("Send a synthetic event to this target"),
+      );
+    });
+  }
+
+  it("a UDP send is never called delivered", async () => {
+    await runTest({ status: "sent", target: "collector" });
+    expect(
+      screen.getByText(
+        "sent to collector over UDP — delivery cannot be confirmed",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/^delivered to/)).toBeNull();
+  });
+
+  it("a confirmed delivery still says delivered", async () => {
+    await runTest({ status: "ok", target: "collector" });
+    expect(screen.getByText("delivered to collector")).toBeTruthy();
   });
 });

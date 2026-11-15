@@ -4048,6 +4048,9 @@ async def test_audit_target(
 ) -> dict[str, Any]:
     """Send a synthetic event to one target and report success / error.
 
+    A UDP syslog target answers ``status: "sent"`` (``confirmed: false``), not
+    ``ok``: UDP cannot confirm delivery (#4237).
+
     The event is flagged ``action="test_forward"`` so the operator can
     filter it out in the collector if they want. Doesn't land in
     ``audit_log`` — this is explicit probe traffic, not an audit.
@@ -4129,6 +4132,16 @@ async def test_audit_target(
         raise HTTPException(
             status_code=502, detail=f"delivery failed: {reasons[0] if reasons else outcome}"
         )
+    if row.kind == "syslog" and row.protocol == "udp":
+        # #4237: UDP only hands a datagram to the network. Nothing connects
+        # first, so a wrong host, port or firewall looks exactly like success;
+        # never claim a delivery here. The real forwarder is unchanged.
+        return {
+            "status": "sent",
+            "target": row.name,
+            "confirmed": False,
+            "detail": "sent over UDP: delivery cannot be confirmed",
+        }
     return {"status": "ok", "target": row.name}
 
 
