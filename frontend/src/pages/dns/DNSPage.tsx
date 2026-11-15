@@ -6565,6 +6565,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
     mutationFn: (s: DNSServer) => dnsApi.deleteServer(group.id, s.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-servers", group.id] });
+      // Logs offers and validates a pick against this list (#4234).
+      qc.invalidateQueries({ queryKey: ["logs-agent-sources"] });
+      qc.invalidateQueries({ queryKey: ["logs-sources"] });
       setConfirmDeleteServer(null);
     },
   });

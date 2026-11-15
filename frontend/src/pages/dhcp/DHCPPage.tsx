@@ -3743,6 +3743,9 @@ export function DHCPPage() {
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      // Logs offers and validates a pick against this list (#4234).
+      qc.invalidateQueries({ queryKey: ["logs-agent-sources"] });
+      qc.invalidateQueries({ queryKey: ["logs-sources"] });
       if (selection?.type === "server" && selection.server.id === id)
         setSelection(null);
       setDelServer(null);
