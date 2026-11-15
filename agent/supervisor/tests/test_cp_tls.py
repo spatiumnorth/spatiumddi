@@ -616,3 +616,90 @@ def test_an_https_control_plane_is_left_to_the_failure_path(server, tmp_path: Pa
     state, ca, _stale, current = _stale_member(tmp_path)
     server.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
     assert cp_tls.refresh_pin(state, server.url) is False
+
+
+# ── a refresh that fails while the control plane is down is still owed (#4223) ──
+
+_DEAD_URL = "http://127.0.0.1:1"  # nothing listens: a connection-level failure
+
+
+def _events(logs) -> list[str]:
+    return [e["event"] for e in logs]
+
+
+def test_a_failed_refresh_is_retried_when_node_local_is_restored(plain, tmp_path: Path) -> None:
+    from spatium_supervisor import heartbeat
+
+    state, ca, _stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    with _capture() as logs:
+        cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)  # timed out / refused
+        assert cp_tls._state["pin_refresh_pending"] is not None
+        # Still inside the backoff: no attempt, even though the api is now up.
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)
+        assert plain.hits == 0
+        # The node-local path coming back makes it due at once.
+        heartbeat._local_api["failures"] = 1
+        try:
+            heartbeat.note_local_api_result(heartbeat._IN_CLUSTER_NODE_LOCAL_URL, True)
+        finally:
+            heartbeat._local_api["failures"] = 0
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1002.0)
+    assert cp_tls.cert_sha256(cp_tls.load_pins(state)) == current.sha256
+    assert _events(logs) == [
+        "supervisor.tls.pin_refresh_failed",
+        "supervisor.control_plane.node_local_restored",
+        "supervisor.tls.pin_refreshed",
+    ]
+    assert cp_tls._state["pin_refresh_pending"] is None
+
+
+def test_a_repin_that_already_matches_satisfies_the_pending_refresh(plain, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    with _capture() as logs:
+        cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)
+        cp_tls._save_pins(state, current.pem)  # the reactive repin got there first
+        cp_tls.request_pin_refresh()
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0 + cp_tls.PIN_REFRESH_INTERVAL_S + 1)
+    assert _events(logs) == [
+        "supervisor.tls.pin_refresh_failed",
+        "supervisor.tls.pin_refresh_satisfied_by_repin",
+    ]
+    assert cp_tls._state["pin_refresh_pending"] is None
+
+
+def test_a_pending_refresh_still_replaces_a_pin_a_repin_left_older(plain, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    middle = _leaf("middle.example")
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)
+    cp_tls._save_pins(state, middle.pem)  # a repin to a certificate since replaced again
+    cp_tls.request_pin_refresh()
+    with _capture() as logs:
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)
+    assert cp_tls.cert_sha256(cp_tls.load_pins(state)) == current.sha256
+    assert _events(logs) == ["supervisor.tls.pin_refreshed"]
+
+
+def test_the_refresh_backoff_is_bounded_and_does_not_spin(tmp_path: Path) -> None:
+    state, _ca, _stale, _current = _stale_member(tmp_path)
+    t, attempts = 1000.0, []
+    for _ in range(600):  # ten minutes of one-second ticks against a dead api
+        before = cp_tls._state.get("pin_refresh_failures", 0)
+        cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=t)
+        if cp_tls._state.get("pin_refresh_failures", 0) != before:
+            attempts.append(t)
+        t += 1.0
+    gaps = [b - a for a, b in zip(attempts, attempts[1:], strict=False)]
+    assert gaps == sorted(gaps)  # backs off, never speeds up
+    assert max(gaps) <= cp_tls.PIN_REFRESH_RETRY_MAX_S
+    assert len(attempts) <= 12  # not one per tick
+
+
+def test_off_the_node_local_path_a_pending_refresh_stays_owed(tmp_path: Path) -> None:
+    state, _ca, _stale, _current = _stale_member(tmp_path)
+    cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)
+    cp_tls.refresh_pin_if_due(state, "https://127.0.0.1:1", now=1000.0 + 200)  # fallback path
+    assert cp_tls._state["pin_refresh_pending"] is not None

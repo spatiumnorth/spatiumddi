@@ -85,11 +85,23 @@ _redirects: dict[str, str | None] = {}
 # Per-process flags, in a mutable holder rather than ``global`` rebinding:
 # whether the first-contact pin has been checked against the CA, and whether
 # the skip-verify warning has been logged.
-_state: dict[str, Any] = {"vouch_checked": False, "skip_warned": False, "pin_refresh_at": None}
+_state: dict[str, Any] = {
+    "vouch_checked": False,
+    "skip_warned": False,
+    "pin_refresh_at": None,
+    # Pinned fingerprints when a refresh last failed and has not succeeded
+    # since (None: nothing pending), and how many failures in a row.
+    "pin_refresh_pending": None,
+    "pin_refresh_failures": 0,
+}
 #: How often a member on the node-local http path re-reads the signed list
-#: (#4223), and how soon it asks again after the list could not be fetched.
+#: (#4223). After a failed fetch it asks again after PIN_REFRESH_RETRY_S,
+#: doubling per consecutive failure up to PIN_REFRESH_RETRY_MAX_S, so a
+#: control plane that stays down is not hammered. A restored node-local path
+#: asks at once (:func:`request_pin_refresh`).
 PIN_REFRESH_INTERVAL_S = 300.0
-PIN_REFRESH_RETRY_S = 30.0
+PIN_REFRESH_RETRY_S = 15.0
+PIN_REFRESH_RETRY_MAX_S = 120.0
 
 
 class PinSetError(Exception):
@@ -423,12 +435,19 @@ def refresh_pin(state_dir: Path, url: str) -> bool:
     an old-format list (no PEMs) or a list that fails verification change
     nothing and write nothing.
     """
+    return _refresh_pin(state_dir, url) == "changed"
+
+
+def _refresh_pin(state_dir: Path, url: str) -> str:
+    """:func:`refresh_pin`'s work. ``"changed"``, ``"current"`` (a list was
+    fetched and verified, the pin needs nothing) or ``"na"`` (nothing was
+    fetched: not on the node-local http path, or no pin / CA yet)."""
     if skip_verify() or tls_url(url) is not None or urlsplit(url).scheme.lower() != "http":
-        return False
+        return "na"
     ca_pem = _load_ca(state_dir)
     pins = load_pins(state_dir)
     if ca_pem is None or pins is None:
-        return False
+        return "na"
     with httpx.Client(timeout=_CONNECT_TIMEOUT_S) as c:
         resp = c.get(_origin(url) + PIN_SET_PATH)
     if resp.status_code >= 500:
@@ -441,33 +460,71 @@ def refresh_pin(state_dir: Path, url: str) -> bool:
         raise PinSetError("the signed list is not JSON") from exc
     _vouched, pems = _verify_signed(body, ca_pem)
     if not pems:
-        return False
+        return "current"
     with _lock:
         old = load_pins(state_dir)
         if old is None or set(pems) <= _pinned_fingerprints(old):
-            return False
+            return "current"
         _save_pins(state_dir, "".join(pems[fp] for fp in sorted(pems)))
     log.info(
         "supervisor.tls.pin_refreshed",
         old=[display_fingerprint(fp) for fp in sorted(_pinned_fingerprints(old))],
         new=[display_fingerprint(fp) for fp in sorted(pems)],
     )
-    return True
+    return "changed"
+
+
+def request_pin_refresh() -> None:
+    """Make a pending refresh due now: the node-local path is back, which is
+    the first moment a refresh that failed during its outage can work."""
+    if _state.get("pin_refresh_pending") is not None:
+        _state["pin_refresh_at"] = None
+
+
+def _current_fingerprints(state_dir: Path) -> frozenset[str]:
+    pins = load_pins(state_dir)
+    return frozenset(_pinned_fingerprints(pins)) if pins is not None else frozenset()
 
 
 def refresh_pin_if_due(state_dir: Path, url: str, *, now: float | None = None) -> None:
-    """:func:`refresh_pin` at most every ``PIN_REFRESH_INTERVAL_S`` (sooner
-    after a failed fetch), never raising: a diagnostic, not a gate."""
+    """:func:`refresh_pin` at most every ``PIN_REFRESH_INTERVAL_S``, never
+    raising: a diagnostic, not a gate.
+
+    A failed fetch stays pending and is retried with bounded backoff (and at
+    once when the node-local path returns). A pending refresh that finds the
+    pin already covering the signed list because a reactive repin got there
+    first is logged as satisfied, then dropped.
+    """
     t = time.monotonic() if now is None else now
     due = _state.get("pin_refresh_at")
     if due is not None and t < due:
         return
     _state["pin_refresh_at"] = t + PIN_REFRESH_INTERVAL_S
+    pending = _state.get("pin_refresh_pending")
     try:
-        refresh_pin(state_dir, url)
+        result = _refresh_pin(state_dir, url)
     except (httpx.HTTPError, PinSetError, ValueError) as exc:
-        _state["pin_refresh_at"] = t + PIN_REFRESH_RETRY_S
+        failures = int(_state.get("pin_refresh_failures", 0))
+        _state["pin_refresh_failures"] = failures + 1
+        _state["pin_refresh_at"] = t + min(
+            PIN_REFRESH_RETRY_S * (2**failures), PIN_REFRESH_RETRY_MAX_S
+        )
+        if pending is None:
+            _state["pin_refresh_pending"] = _current_fingerprints(state_dir)
         log.warning("supervisor.tls.pin_refresh_failed", error=str(exc))
+        return
+    if result == "na":
+        if pending is not None:
+            # Off the node-local path (its api is down): still owed.
+            _state["pin_refresh_at"] = t + PIN_REFRESH_RETRY_S
+        return
+    _state["pin_refresh_pending"] = None
+    _state["pin_refresh_failures"] = 0
+    if result == "current" and pending is not None and pending != _current_fingerprints(state_dir):
+        log.info(
+            "supervisor.tls.pin_refresh_satisfied_by_repin",
+            pinned=[display_fingerprint(fp) for fp in sorted(_current_fingerprints(state_dir))],
+        )
 
 
 def try_repin(state_dir: Path, url: str) -> bool:
