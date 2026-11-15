@@ -1,5 +1,6 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { useSharedSessionSet } from "./zoneTreeState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
@@ -28,6 +29,7 @@ import {
   Plus,
   Trash2,
   Pencil,
+  ChevronDown,
   ChevronRight,
   Settings2,
   Shield,
@@ -1118,6 +1120,67 @@ function buildDnsTree(zones: DNSZone[]): DnsTreeNode[] {
     .filter(Boolean);
   roots.forEach(sortNode);
   return roots;
+}
+
+// ── Reverse-zone folders for the sidebar tree (#4203) ────────────────────────
+
+// Reserved expand-state keys. A colon cannot appear in a zone name, so these
+// can never collide with a `DnsTreeNode.domain` in the same session set.
+const REVERSE_V4_KEY = "reverse:ipv4";
+const REVERSE_V6_KEY = "reverse:ipv6";
+
+interface ReverseFolder {
+  key: string;
+  label: string;
+  count: number;
+  children: DnsTreeNode[];
+}
+
+function isReverseV4(z: DNSZone): boolean {
+  return /(^|\.)in-addr\.arpa$/i.test(z.name.replace(/\.$/, ""));
+}
+function isReverseV6(z: DNSZone): boolean {
+  return /(^|\.)ip6\.arpa$/i.test(z.name.replace(/\.$/, ""));
+}
+
+/**
+ * Split `zones` into forward tree roots (as `buildDnsTree` builds them) and
+ * up to two reverse folders, IPv4 then IPv6. A folder is present only when
+ * the group has a zone of that family; its children are the family's zones
+ * nested as before, minus the empty `arpa` / `in-addr` / `ip6` scaffolding.
+ * `buildDnsTree` itself is unchanged for its other caller.
+ */
+function buildZoneTreeWithReverseFolders(zones: DNSZone[]): {
+  forward: DnsTreeNode[];
+  folders: ReverseFolder[];
+} {
+  const forwardZones = zones.filter((z) => !isReverseV4(z) && !isReverseV6(z));
+  const folders: ReverseFolder[] = [];
+  const mk = (
+    key: string,
+    label: string,
+    fam: DNSZone[],
+    suffix: string,
+  ): void => {
+    if (fam.length === 0) return;
+    const root = buildDnsTree(fam)[0]; // the "arpa" root
+    const apex = root?.children.find((c) => c.domain === suffix);
+    const children = !apex ? [] : apex.zone ? [apex] : apex.children;
+    folders.push({ key, label, count: fam.length, children });
+  };
+  mk(
+    REVERSE_V4_KEY,
+    "Reverse zones (IPv4)",
+    zones.filter(isReverseV4),
+    "in-addr.arpa",
+  );
+  mk(
+    REVERSE_V6_KEY,
+    "Reverse zones (IPv6)",
+    zones.filter(isReverseV6),
+    "ip6.arpa",
+  );
+  return { forward: buildDnsTree(forwardZones), folders };
 }
 
 // ── Cached-list write-back after an edit (#2830) ─────────────────────────────
@@ -10358,7 +10421,7 @@ export function RecordsTab({
 
 // ── Zones Tab ─────────────────────────────────────────────────────────────────
 
-function ZonesTab({
+export function ZonesTab({
   group,
   onSelectZone,
 }: {
@@ -10379,6 +10442,14 @@ function ZonesTab({
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  // Grouping-row collapse (#4203). The reverse folders share the sidebar's
+  // set (present = open); every other group is open unless toggled here.
+  const [sidebarOpen, setSidebarOpen] = useSharedSessionSet(
+    `spatium.dns.expandedZones.${group.id}`,
+  );
+  const [rowToggled, setRowToggled] = useSharedSessionSet(
+    `spatium.dns.zoneRowsToggled.${group.id}`,
+  );
 
   const {
     data: zonesData,
@@ -10413,6 +10484,47 @@ function ZonesTab({
       })
     : zones;
   const tree = buildDnsTree(filteredZones);
+  // A tag or column filter leaves only matches in the list, so every group is
+  // held open while one is active rather than hiding what was searched for.
+  const filterActive = hasZoneFilter || tagFilters.length > 0;
+
+  function groupFlag(domain: string): {
+    open: boolean;
+    toggle: () => void;
+  } {
+    const shared =
+      domain === "in-addr.arpa"
+        ? REVERSE_V4_KEY
+        : domain === "ip6.arpa"
+          ? REVERSE_V6_KEY
+          : null;
+    if (shared) {
+      return {
+        open: sidebarOpen.has(shared),
+        toggle: () =>
+          setSidebarOpen((prev) => {
+            const n = new Set(prev);
+            if (n.has(shared)) n.delete(shared);
+            else n.add(shared);
+            return n;
+          }),
+      };
+    }
+    const toggled = rowToggled.has(domain);
+    return {
+      open: (domain !== "arpa") !== toggled,
+      toggle: () =>
+        setRowToggled((prev) => {
+          const n = new Set(prev);
+          if (n.has(domain)) n.delete(domain);
+          else n.add(domain);
+          return n;
+        }),
+    };
+  }
+  function countZones(n: DnsTreeNode): number {
+    return (n.zone ? 1 : 0) + n.children.reduce((a, c) => a + countZones(c), 0);
+  }
 
   const typeBadge: Record<string, string> = {
     primary: "bg-blue-500/15 text-blue-600",
@@ -10617,6 +10729,8 @@ function ZonesTab({
         </ContextMenu>,
       );
     } else {
+      const flag = groupFlag(node.domain);
+      const open = filterActive || flag.open;
       rows.push(
         <tr
           key={`folder:${node.domain}`}
@@ -10624,15 +10738,35 @@ function ZonesTab({
         >
           <td />
           <td colSpan={7} className="py-0.5">
-            <span
-              className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70"
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70 hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground/70"
               style={{ paddingLeft: indent }}
+              aria-expanded={open}
+              disabled={filterActive}
+              title={
+                filterActive
+                  ? "Clear the filter to collapse"
+                  : open
+                    ? "Collapse"
+                    : "Expand"
+              }
+              onClick={flag.toggle}
             >
+              {open ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronRight className="h-3 w-3" />
+              )}
               <Folder className="h-3 w-3" />.{node.domain}
-            </span>
+              {!open && (
+                <span className="tabular-nums">({countZones(node)})</span>
+              )}
+            </button>
           </td>
         </tr>,
       );
+      if (!open) return rows;
     }
     for (const child of node.children) {
       rows.push(...renderZoneRows(child, depth + 1));
@@ -13287,7 +13421,7 @@ export function SyncWithServersResultModal({
 
 // ── Sidebar zone tree rows ────────────────────────────────────────────────────
 
-function ZoneTreeRows({
+export function ZoneTreeRows({
   groupId,
   selectedZoneId,
   onSelectZone,
@@ -13296,9 +13430,8 @@ function ZoneTreeRows({
   selectedZoneId: string | null;
   onSelectZone: (z: DNSZone) => void;
 }) {
-  const [expandedNodes, setExpandedNodes] = useSessionState<Set<string>>(
+  const [expandedNodes, setExpandedNodes] = useSharedSessionSet(
     `spatium.dns.expandedZones.${groupId}`,
-    new Set(),
   );
   const [createZoneName, setCreateZoneName] = useState<string | null>(null);
 
@@ -13312,9 +13445,36 @@ function ZoneTreeRows({
     staleTime: 30_000,
   });
 
-  const tree = buildDnsTree(zones);
+  const { forward: tree, folders } = buildZoneTreeWithReverseFolders(zones);
 
-  if (tree.length === 0)
+  // A zone selected from a link, search result or deep link opens the reverse
+  // folder it sits in AND every ancestor row on the path to it (#4203), so it
+  // is visible and not hidden under a closed parent (e.g. 7.168.192.in-addr.arpa
+  // under 192.in-addr.arpa > 168.192.in-addr.arpa). Only adds keys: whatever
+  // the operator already had open stays open. An effect, not a derived value,
+  // so the operator can still collapse a row afterwards.
+  const selectedZone = zones.find((z) => z.id === selectedZoneId) ?? null;
+  const selectedOpenKeys = (() => {
+    if (!selectedZone) return "";
+    const keys: string[] = [];
+    if (isReverseV4(selectedZone)) keys.push(REVERSE_V4_KEY);
+    else if (isReverseV6(selectedZone)) keys.push(REVERSE_V6_KEY);
+    else return ""; // forward trees are not folded; leave them as they were
+    const labels = selectedZone.name.replace(/\.$/, "").split(".");
+    for (let i = 1; i < labels.length; i++)
+      keys.push(labels.slice(i).join("."));
+    return keys.join("|");
+  })();
+  useEffect(() => {
+    if (!selectedOpenKeys) return;
+    const keys = selectedOpenKeys.split("|");
+    setExpandedNodes((prev: Set<string>) =>
+      keys.every((k) => prev.has(k)) ? prev : new Set([...prev, ...keys]),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedOpenKeys, selectedZoneId]);
+
+  if (tree.length === 0 && folders.length === 0)
     return (
       <p className="px-3 py-1.5 text-xs text-muted-foreground italic">
         {zonesError != null ? (
@@ -13454,9 +13614,39 @@ function ZoneTreeRows({
     );
   }
 
+  function renderFolder(f: ReverseFolder): React.ReactNode {
+    const open = expandedNodes.has(f.key);
+    return (
+      <div key={f.key}>
+        <button
+          type="button"
+          className="flex w-full items-center gap-1.5 rounded py-1 pr-2 text-left text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+          style={{ paddingLeft: 12 }}
+          onClick={() => toggleNode(f.key)}
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          {open ? (
+            <FolderOpen className="h-3 w-3 flex-shrink-0" />
+          ) : (
+            <Folder className="h-3 w-3 flex-shrink-0" />
+          )}
+          <span className="truncate">{f.label}</span>
+          <span className="ml-auto flex-shrink-0 text-[10px] tabular-nums">
+            {f.count}
+          </span>
+        </button>
+        {open && <div>{f.children.map((c) => renderNode(c, 1))}</div>}
+      </div>
+    );
+  }
+
   return (
     <>
-      <div>{tree.map((root) => renderNode(root, 0))}</div>
+      <div>
+        {tree.map((root) => renderNode(root, 0))}
+        {folders.map(renderFolder)}
+      </div>
       {createZoneName && (
         <ZoneModal
           groupId={groupId}
