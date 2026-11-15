@@ -192,4 +192,53 @@ describe("Logs server pick (#4234)", () => {
     );
     expect(screen.queryByText("Query failed")).toBeNull();
   });
+
+  it("does not query a server deleted while another tab was open", async () => {
+    renderPage();
+    fireEvent.change(await picker(), { target: { value: "server:a2" } });
+    await waitFor(() =>
+      expect(h.dnsQueries).toHaveBeenCalledWith(
+        expect.objectContaining({ server_id: "a2" }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Event Log/ }));
+    h.agentSources = ALL().filter((x) => x.server_id !== "a2");
+    h.dnsQueries.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: /DNS Queries/ }));
+    await waitFor(() =>
+      expect(h.dnsQueries).toHaveBeenCalledWith(
+        expect.objectContaining({ server_id: "a1" }),
+      ),
+    );
+    expect(h.dnsQueries.mock.calls.some((c) => c[0]?.server_id === "a2")).toBe(
+      false,
+    );
+    expect((await picker()).value).toBe("server:a1");
+  });
+
+  it("DHCP: does not query a server deleted while another tab was open", async () => {
+    renderPage();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /DHCP Activity/ }),
+    );
+    fireEvent.change(await picker(), { target: { value: "server:d2" } });
+    await waitFor(() =>
+      expect(h.dhcpActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ server_id: "d2" }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Event Log/ }));
+    h.agentSources = ALL().filter((x) => x.server_id !== "d2");
+    h.dhcpActivity.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: /DHCP Activity/ }));
+    await waitFor(() =>
+      expect(h.dhcpActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ server_id: "d1" }),
+      ),
+    );
+    expect(
+      h.dhcpActivity.mock.calls.some((c) => c[0]?.server_id === "d2"),
+    ).toBe(false);
+    expect((await picker()).value).toBe("server:d1");
+  });
 });

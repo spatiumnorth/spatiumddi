@@ -167,8 +167,6 @@ export function LogsPage() {
     isLoading: agentSourcesLoading,
     error: agentSourcesError,
     refetch: refetchAgentSources,
-    dataUpdatedAt: agentSourcesUpdatedAt,
-    errorUpdatedAt: agentSourcesErrorAt,
   } = useQuery({
     queryKey: ["logs-agent-sources"],
     queryFn: logsApi.listAgentSources,
@@ -177,12 +175,6 @@ export function LogsPage() {
     // offered, or picked, from the cache (#4234).
     refetchOnMount: "always",
   });
-  // The agent tabs read nothing until the list has been fetched for THIS
-  // mount: a cached list from before a delete would validate a stored pick
-  // that no longer exists and send one query for it.
-  const [mountedAt] = useState(() => Date.now());
-  const agentSourcesFresh =
-    agentSourcesUpdatedAt >= mountedAt || agentSourcesErrorAt >= mountedAt;
 
   // Filter by tab — audit tab is DHCP-only. The agent tabs filter
   // their own list on `server_kind` directly.
@@ -298,11 +290,11 @@ export function LogsPage() {
       </div>
 
       {tab === "dns-queries" && dnsOn && !awaitingModules && (
-        <DNSQueriesTab sources={dnsAgentSources} ready={agentSourcesFresh} />
+        <DNSQueriesTab sources={dnsAgentSources} />
       )}
       {tab === "dns-threat" && dnsOn && !awaitingModules && <DNSThreatTab />}
       {tab === "dhcp-activity" && dhcpOn && !awaitingModules && (
-        <DHCPActivityTab sources={dhcpAgentSources} ready={agentSourcesFresh} />
+        <DHCPActivityTab sources={dhcpAgentSources} />
       )}
       {tab === "events" && !awaitingModules && (
         <EventLogTab sources={tabSources} />
@@ -1145,6 +1137,27 @@ function effectiveSelection(
   return selectionIsValid(picked, sources) ? picked : defaultSelection(sources);
 }
 
+/**
+ * Refetch the agent sources each time an agent tab mounts, and report whether
+ * a fetch that STARTED after this mount has settled. The Logs page stays
+ * mounted across a tab switch, so its own read happened once; a server deleted
+ * since would still validate a stored pick from the cache and cost one query
+ * (#4234). The tab reads nothing until this is true.
+ */
+function useFreshAgentSources(): boolean {
+  const [mountedAt] = useState(() => Date.now());
+  const q = useQuery({
+    queryKey: ["logs-agent-sources"],
+    queryFn: logsApi.listAgentSources,
+    staleTime: 60_000,
+    refetchOnMount: "always",
+  });
+  return (
+    !q.isFetching &&
+    (q.dataUpdatedAt >= mountedAt || q.errorUpdatedAt >= mountedAt)
+  );
+}
+
 /** Whether a failed read answered 404: the picked server no longer exists. */
 function isNotFound(err: unknown): boolean {
   return isAxiosError(err) && err.response?.status === 404;
@@ -1185,13 +1198,8 @@ function ServerCell({ name }: { name: string }) {
   );
 }
 
-function DNSQueriesTab({
-  sources,
-  ready,
-}: {
-  sources: AgentLogSource[];
-  ready: boolean;
-}) {
+function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
+  const ready = useFreshAgentSources();
   const [pickedSelection, setSelection] =
     useSessionState<AgentLogSelection | null>("logs-dns-queries-server", null);
   const selection = effectiveSelection(pickedSelection, sources);
@@ -1695,13 +1703,8 @@ export function DNSQueryRow({
 
 // ── DHCP Activity tab (Kea log) ───────────────────────────────────
 
-function DHCPActivityTab({
-  sources,
-  ready,
-}: {
-  sources: AgentLogSource[];
-  ready: boolean;
-}) {
+function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
+  const ready = useFreshAgentSources();
   const [pickedSelection, setSelection] =
     useSessionState<AgentLogSelection | null>(
       "logs-dhcp-activity-server",
