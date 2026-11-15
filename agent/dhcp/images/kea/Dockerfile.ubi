@@ -1,0 +1,230 @@
+# syntax=docker/dockerfile:1.7
+# SpatiumDDI Kea DHCP container, Red Hat UBI 9 variant (#3913) --
+# kea-dhcp4 + kea-dhcp6 + spatium-dhcp-agent.
+# Published to GHCR as dhcp-kea:<version>-ubi. Multi-arch: linux/amd64, linux/arm64.
+#
+# WHY A SOURCE BUILD. UBI 9 carries no Kea (RHEL 9 ships ISC dhcp only), and
+# ISC's EL9 RPMs (Cloudsmith isc/kea-3-0) need log4cplus, which lives in EPEL and
+# not in the UBI repositories, so they do not install. Everything that is not a
+# Red Hat package is therefore built here from a pinned, checksummed source
+# tarball: Kea, log4cplus, Boost (headers only), tini. The builder
+# stage never reaches the final image; only the installed files are copied.
+# Versions + checksums are ARGs: the sha256 fails the build on a mismatch.
+#
+# NOT IN THIS VARIANT: radvd (opt-in RADVD_MANAGED=1, #524). It is not in UBI and
+# its build needs libbsd, also not in UBI; the entrypoint's radvd loop then just
+# logs and retries without affecting DHCP. Use the default image for radvd.
+#
+# Build context is the REPO ROOT, as for the Alpine Dockerfile.
+ARG PYTHON_VERSION=3.12
+
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS builder
+# CodeReady Builder is part of UBI. meson itself comes from PyPI below: Kea 3.0
+# needs meson >= 1.3 and UBI's CRB has 0.63.
+RUN dnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
+      --enablerepo=ubi-9-codeready-builder-rpms \
+      gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config \
+      openssl-devel libcap-devel xz bzip2 tar gzip \
+      python3.12 python3.12-pip \
+ && dnf clean all
+ARG MESON_VERSION=1.9.1
+RUN python3.12 -m pip install --no-cache-dir "meson==${MESON_VERSION}"
+
+WORKDIR /src
+
+ARG BOOST_VERSION=1.89.0
+ARG BOOST_SHA256=85a33fa22621b4f314f8e85e1a5e2a9363d22e4f4992925d4bb3bc631b5a0c7a
+# Headers only: Kea needs no compiled Boost library (>= 1.69). boost-devel is not
+# in the UBI repositories.
+RUN set -eu; v="$(echo "${BOOST_VERSION}" | tr . _)"; \
+    curl -fsSL -o boost.tar.bz2 "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${v}.tar.bz2"; \
+    echo "${BOOST_SHA256}  boost.tar.bz2" | sha256sum -c -; \
+    mkdir -p /usr/local/include /licenses-src; \
+    tar -xjf boost.tar.bz2 -C /usr/local/include --strip-components=1 "boost_${v}/boost"; \
+    tar -xjf boost.tar.bz2 -O "boost_${v}/LICENSE_1_0.txt" > /licenses-src/boost-LICENSE_1_0.txt; \
+    rm boost.tar.bz2; \
+    # meson's boost finder insists on finding SOME libboost_* file next to the
+    # headers even when no module is requested (Kea 3.0 links none); an empty
+    # stub in the builder satisfies it and is never copied to the runtime.
+    mkdir -p /usr/local/lib64; \
+    echo | gcc -shared -x c - -o /usr/local/lib64/libboost_system.so
+
+ARG LOG4CPLUS_VERSION=2.2.1
+ARG LOG4CPLUS_SHA256=97c932e0eddbf6fef81656d44d632eac0c105d2ae795ef065cdb8f7b50f8fbda
+RUN set -eu; \
+    curl -fsSL -o l4c.tar.bz2 "https://github.com/log4cplus/log4cplus/releases/download/REL_$(echo "${LOG4CPLUS_VERSION}" | tr . _)/log4cplus-${LOG4CPLUS_VERSION}.tar.bz2"; \
+    echo "${LOG4CPLUS_SHA256}  l4c.tar.bz2" | sha256sum -c -; \
+    tar -xjf l4c.tar.bz2; cd "log4cplus-${LOG4CPLUS_VERSION}"; \
+    ./configure --prefix=/usr --libdir=/usr/lib64 --disable-static --disable-unicode; \
+    make -j"$(nproc)"; make install; make install DESTDIR=/stage; \
+    cp LICENSE /licenses-src/log4cplus-LICENSE
+
+ARG KEA_VERSION=3.0.5
+ARG KEA_SHA256=03ac2443f75b56c8c58144e2929230ce430cf7a2f85f0e2c056fb14933feb5eb
+# Kea 3.0 refuses hook libraries / sockets / leases / logs outside its COMPILED-IN
+# directories (see the path note in the Alpine Dockerfile and render_kea.py), and
+# the config hardcodes /usr/lib/kea/hooks, /run/kea, /var/lib/kea, /var/log/kea.
+# RHEL-family glibc defaults libdir to lib64, hence -Dlibdir=lib. The asserts at
+# the end of this RUN fail the build if any of them ever drifts.
+RUN set -eu; \
+    curl -fsSL -o kea.tar.xz "https://downloads.isc.org/isc/kea/${KEA_VERSION}/kea-${KEA_VERSION}.tar.xz"; \
+    echo "${KEA_SHA256}  kea.tar.xz" | sha256sum -c -; \
+    tar -xJf kea.tar.xz; cd "kea-${KEA_VERSION}"; \
+    PKG_CONFIG_PATH=/usr/lib64/pkgconfig \
+    BOOST_INCLUDEDIR=/usr/local/include BOOST_LIBRARYDIR=/usr/local/lib64 \
+    meson setup build --buildtype=release --strip \
+      -Dprefix=/usr -Dlibdir=lib -Dsysconfdir=/etc -Dlocalstatedir=/var -Drunstatedir=/run \
+      -Dkrb5=disabled -Dmysql=disabled -Dpostgresql=disabled -Dnetconf=disabled \
+      -Dtests=disabled -Dfuzz=disabled; \
+    meson compile -C build -j"$(nproc)"; \
+    meson install -C build --destdir /stage; \
+    cp COPYING /licenses-src/kea-COPYING; \
+    ldconfig; \
+    LD_LIBRARY_PATH=/stage/usr/lib:/stage/usr/lib64 /stage/usr/sbin/kea-dhcp4 -W > /tmp/kea-W; \
+    grep -E 'Hooks directory:? */usr/lib/kea/hooks' /tmp/kea-W || { cat /tmp/kea-W; exit 1; }; \
+    ls /stage/usr/lib/kea/hooks/libdhcp_lease_cmds.so /stage/usr/lib/kea/hooks/libdhcp_ha.so
+
+ARG TINI_VERSION=0.19.0
+ARG TINI_SHA256=0fd35a7030052acd9f58948d1d900fe1e432ee37103c5561554408bdac6bbf0d
+RUN set -eu; \
+    curl -fsSL -o tini.tar.gz "https://github.com/krallin/tini/archive/refs/tags/v${TINI_VERSION}.tar.gz"; \
+    echo "${TINI_SHA256}  tini.tar.gz" | sha256sum -c -; \
+    tar -xzf tini.tar.gz; cd "tini-${TINI_VERSION}"; \
+    cmake . && make tini; \
+    install -D -m 0755 tini /stage/usr/local/bin/tini; \
+    cp LICENSE /licenses-src/tini-LICENSE
+
+# Kea's meson sets install_umask=0027, which leaves the binaries and libraries
+# unreadable to a random OpenShift uid (group 0 is not the owning group): open
+# the staged tree up to others.
+RUN chmod -R o+rX /stage
+
+# The agent, installed as in the Alpine image (pure Python, no compilation).
+ARG PYTHON_VERSION
+WORKDIR /agent
+COPY agent/dhcp/pyproject.toml /agent/pyproject.toml
+COPY agent/dhcp/spatium_dhcp_agent /agent/spatium_dhcp_agent
+COPY agent/dhcp/README.md /agent/README.md
+RUN python3.12 -m pip install --prefix=/install --no-cache-dir .
+
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9 AS runtime
+# ``RPM_SNAPSHOT`` busts a cached layer so ``microdnf upgrade`` actually runs in
+# CI (same reason as APK_SNAPSHOT in the Alpine image: the nightly passes a date).
+#
+# python3.12: the agent. libpcap: scapy's BPF socket (optional fingerprint
+# sniffer). libcap: setcap. util-linux: setpriv (the agent's ambient NET_RAW
+# launch, and the su-exec shim below). openssl-libs / libstdc++ come with Kea's
+# link set; ``shadow-utils`` is deliberately absent, the user is written by hand.
+ARG RPM_SNAPSHOT=dev
+RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
+ && microdnf upgrade -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
+ && microdnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
+      python3.12 libpcap libcap util-linux ca-certificates tzdata openssl-libs libstdc++ \
+ && microdnf clean all \
+ && rm -rf /var/cache/yum /var/cache/dnf /var/lib/dnf/history* \
+ && alternatives --set python3 /usr/bin/python3.12 2>/dev/null || ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+
+COPY --from=builder /stage/usr/lib /usr/lib
+COPY --from=builder /stage/usr/lib64 /usr/lib64
+COPY --from=builder /stage/usr/sbin /usr/sbin
+COPY --from=builder /stage/usr/bin /usr/bin
+COPY --from=builder /stage/usr/local/bin/tini /usr/local/bin/tini
+COPY --from=builder /stage/etc /etc
+COPY --from=builder /licenses-src /licenses-src
+
+# libkea lives in /usr/lib, which glibc does not search on RHEL-family x86_64.
+RUN echo /usr/lib > /etc/ld.so.conf.d/kea.conf && ldconfig \
+ && ldd /usr/sbin/kea-dhcp4 | grep -q "not found" && { ldd /usr/sbin/kea-dhcp4; exit 1; } || true \
+ && printf '#!/bin/sh\n# su-exec shim (not packaged in UBI): su-exec USER[:GROUP] CMD...\nu="${1%%%%:*}"; g="${1#*:}"; [ "$g" = "$1" ] && g="$u"; shift\nexec setpriv --reuid "$u" --regid "$g" --init-groups "$@"\n' > /usr/local/bin/su-exec \
+ && chmod 0755 /usr/local/bin/su-exec
+
+# #3852 parity: user ``spatium`` (uid 1001) for the root start; OpenShift's
+# restricted SCC starts a random uid in group 0, so every written path is group 0
+# and group-writable. NOT /run/kea (Kea refuses a control-socket dir looser than
+# 0750; the entrypoint recreates it owned by the running uid and /run is g+w).
+# Capabilities are FILE capabilities because a container-level cap_add is dropped
+# on the root -> spatium privilege drop.
+RUN echo "spatium:x:1001:" >> /etc/group \
+ && echo "spatium:x:1001:1001:spatium:/var/lib/spatium-dhcp-agent:/sbin/nologin" >> /etc/passwd \
+ && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp4 \
+ && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp6 \
+ && getcap /usr/sbin/kea-dhcp4 /usr/sbin/kea-dhcp6 | grep -c cap_net_raw | grep -qx 2 \
+ && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chown -R 1001:1001 /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chgrp -R 0 /var/lib/spatium-dhcp-agent /var/lib/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chmod -R g=u /var/lib/spatium-dhcp-agent /var/lib/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
+ && chmod g+w /run \
+ && { \
+      echo "rhel_release=$(. /etc/os-release && echo "$VERSION_ID")"; \
+      echo "kea=$(kea-dhcp4 -v)"; \
+      echo "kea-dhcp4=$(kea-dhcp4 -v)"; \
+      echo "kea-dhcp6=$(kea-dhcp6 -v)"; \
+    } > /etc/spatiumddi-versions
+
+COPY --from=builder /install /usr/local
+COPY agent/dhcp/images/kea/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
+COPY agent/dhcp/images/kea/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
+COPY agent/dhcp/images/kea/entrypoint.sh /usr/local/bin/spatium-dhcp-entrypoint
+RUN chmod +x /usr/local/bin/spatium-dhcp-entrypoint \
+ && chown 1001:1001 /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf \
+ && chgrp 0 /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf \
+ && chmod g=u /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
+
+ARG PYTHON_VERSION
+ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
+    KEA_CONFIG_PATH=/etc/kea/kea-dhcp4.conf \
+    KEA_CONTROL_SOCKET=/run/kea/kea4-ctrl-socket \
+    KEA_LEASE_FILE=/var/lib/kea/kea-leases4.csv \
+    KEA_CONFIG_PATH_V6=/etc/kea/kea-dhcp6.conf \
+    KEA_CONTROL_SOCKET_V6=/run/kea/kea6-ctrl-socket \
+    PYTHONPATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages \
+    LOG_LEVEL=INFO \
+    RADVD_MANAGED=0 \
+    RADVD_CONFIG_PATH=/etc/radvd/radvd.conf \
+    RADVD_PIDFILE=/run/radvd/radvd.pid \
+    RADVD_DEFAULT_IFACE=eth0
+
+# #1037: prove PYTHONPATH matches THIS image's interpreter at build time.
+RUN python3 -c "import sys; assert sys.version_info[:2] == tuple(map(int, '${PYTHON_VERSION}'.split('.'))), sys.version" \
+ && python3 -c "import spatium_dhcp_agent"
+
+VOLUME ["/var/lib/spatium-dhcp-agent", "/var/lib/kea"]
+EXPOSE 67/udp
+EXPOSE 547/udp
+EXPOSE 8000/tcp
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+  CMD test -S /run/kea/kea4-ctrl-socket || exit 1
+
+ENTRYPOINT ["/usr/local/bin/tini", "--", "/usr/local/bin/spatium-dhcp-entrypoint"]
+
+ARG APP_VERSION=dev
+ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
+
+# #3913: image metadata Red Hat's preflight expects, plus /licenses: the project
+# texts and every source-built component's licence (Kea MPL-2.0, log4cplus
+# Apache-2.0, Boost BSL-1.0, tini MIT).
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+RUN cp /licenses-src/* /licenses/ && rm -rf /licenses-src
+LABEL name="dhcp-kea" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI managed Kea DHCP server (UBI)" \
+      description="ISC Kea DHCPv4 and DHCPv6 server with the SpatiumDDI agent, configured by the SpatiumDDI control plane. Red Hat UBI 9 variant." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="dhcp-kea" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+USER 1001
