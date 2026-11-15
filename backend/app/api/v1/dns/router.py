@@ -117,6 +117,7 @@ from app.models.dns import (
     DNSAclEntry,
     DNSBlockList,
     DNSKey,
+    DNSPool,
     DNSRecord,
     DNSSECPolicy,
     DNSServer,
@@ -9911,6 +9912,31 @@ async def _refuse_cname_conflict(
         raise HTTPException(
             status.HTTP_409_CONFLICT, describe_cname_conflict(record_type, fqdn, other)
         )
+    # #4260 — a pool owns its name even while none of its members is healthy
+    # (no row yet), and would write its A / AAAA beside the CNAME later.
+    if record_type.upper() == "CNAME":
+        pool = (
+            (
+                await db.execute(
+                    select(DNSPool)
+                    .where(
+                        DNSPool.zone_id == zone_id,
+                        func.lower(DNSPool.record_name) == name.strip().lower(),
+                    )
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if pool is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{fqdn.rstrip('.')} is owned by the DNS pool {pool.name!r}, so it can "
+                "hold no CNAME. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both refuse "
+                "a zone that breaks this, and the server stops applying it.",
+            )
 
 
 async def _enforce_zone_view_in_group(
