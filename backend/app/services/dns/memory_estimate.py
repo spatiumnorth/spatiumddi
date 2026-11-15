@@ -44,6 +44,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
@@ -99,6 +100,19 @@ class MemoryAssessment:
 
 
 @dataclass(frozen=True)
+class ServerObservedMemory:
+    """What one BIND9 agent last reported using (#4193), set beside the
+    estimate. Every figure is None when unreported (an older agent)."""
+
+    name: str
+    daemon_rss_bytes: int | None = None
+    used_bytes: int | None = None
+    peak_bytes: int | None = None
+    limit_bytes: int | None = None
+    reported_at: str | None = None
+
+
+@dataclass(frozen=True)
 class GroupMemoryEstimate:
     group_id: uuid.UUID
     views: tuple[str, ...]
@@ -110,6 +124,8 @@ class GroupMemoryEstimate:
     assessment: MemoryAssessment
     limit_server: str | None = None
     unknown_limit_servers: tuple[str, ...] = field(default_factory=tuple)
+    # #4193 — what each BIND9 server actually reports using, beside the estimate.
+    servers: tuple[ServerObservedMemory, ...] = field(default_factory=tuple)
 
     @property
     def message(self) -> str | None:
@@ -371,6 +387,31 @@ async def _limit(db: AsyncSession, group_id: uuid.UUID) -> tuple[int | None, str
     return int(lim), name, unknown
 
 
+async def _observed(db: AsyncSession, group_id: uuid.UUID) -> tuple[ServerObservedMemory, ...]:
+    """The group's BIND9 servers' last reported memory (#4193), by name."""
+    rows = (
+        await db.execute(
+            select(DNSServer.name, DNSServer.memory_status)
+            .where(DNSServer.group_id == group_id, DNSServer.driver == "bind9")
+            .order_by(DNSServer.name)
+        )
+    ).all()
+    out: list[ServerObservedMemory] = []
+    for name, status in rows:
+        s = fresh_memory_status(status) or {}
+        out.append(
+            ServerObservedMemory(
+                name=name,
+                daemon_rss_bytes=s.get("daemon_rss_bytes"),
+                used_bytes=s.get("used_bytes"),
+                peak_bytes=s.get("peak_bytes"),
+                limit_bytes=s.get("limit_bytes"),
+                reported_at=s.get("reported_at"),
+            )
+        )
+    return tuple(out)
+
+
 async def group_memory_estimate(
     db: AsyncSession, group_id: uuid.UUID
 ) -> GroupMemoryEstimate | None:
@@ -413,6 +454,7 @@ async def group_memory_estimate(
         assessment=assess(estimated, limit),
         limit_server=limit_server,
         unknown_limit_servers=tuple(unknown),
+        servers=await _observed(db, group_id),
     )
 
 

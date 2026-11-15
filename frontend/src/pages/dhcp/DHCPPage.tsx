@@ -63,6 +63,7 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryCell } from "@/components/AgentMemoryCell";
 import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
@@ -1255,6 +1256,7 @@ function GroupServersList({
                   </div>
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  <AgentMemoryCell server={s} className="mr-2" />
                   {s.maintenance_mode ? (
                     <button
                       type="button"
