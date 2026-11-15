@@ -92,7 +92,9 @@ async def _note_render_skipped(
             resource_type="dns_pool",
             resource_id=str(pool.id),
             resource_display=f"{pool.record_name}.{zone.name}",
-            result="denied",
+            # A background task skipping a write, not a request refused: "skipped",
+            # as other tasks record it ("denied" belongs to the denial-audit path).
+            result="skipped",
             error_detail=f"Pool {pool.name!r} renders no record: {why}",
         )
     )
