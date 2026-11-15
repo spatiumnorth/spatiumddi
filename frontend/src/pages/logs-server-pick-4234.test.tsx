@@ -7,7 +7,13 @@
  * to the default.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
@@ -25,6 +31,12 @@ const src = (id: string, kind: "dns" | "dhcp") => ({
   group_name: null,
 });
 
+const h = vi.hoisted(() => ({
+  agentSources: [] as unknown[],
+  dnsQueries: vi.fn(),
+  dhcpActivity: vi.fn(),
+}));
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const never = () => new Promise(() => {});
@@ -34,13 +46,9 @@ vi.mock("@/lib/api", async () => {
       get(_t, prop) {
         if (prop === "listSources") return () => Promise.resolve([]);
         if (prop === "listAgentSources")
-          return () =>
-            Promise.resolve([
-              src("a1", "dns"),
-              src("a2", "dns"),
-              src("d1", "dhcp"),
-              src("d2", "dhcp"),
-            ]);
+          return () => Promise.resolve(h.agentSources);
+        if (prop === "dnsQueries") return h.dnsQueries;
+        if (prop === "dhcpActivity") return h.dhcpActivity;
         return never;
       },
     }),
@@ -49,8 +57,15 @@ vi.mock("@/lib/api", async () => {
 
 const { LogsPage } = await import("./LogsPage");
 
-function renderPage() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+const ALL = () => [
+  src("a1", "dns"),
+  src("a2", "dns"),
+  src("d1", "dhcp"),
+  src("d2", "dhcp"),
+];
+
+function renderPage(qc?: QueryClient) {
+  qc ??= new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/logs?tab=dns-queries"]}>
@@ -63,7 +78,12 @@ function renderPage() {
 const picker = async () =>
   (await screen.findByLabelText("Server")) as HTMLSelectElement;
 
-beforeEach(() => sessionStorage.clear());
+beforeEach(() => {
+  sessionStorage.clear();
+  h.agentSources = ALL();
+  h.dnsQueries.mockReset().mockReturnValue(new Promise(() => {}));
+  h.dhcpActivity.mockReset().mockReturnValue(new Promise(() => {}));
+});
 afterEach(cleanup);
 
 describe("Logs server pick (#4234)", () => {
@@ -97,5 +117,79 @@ describe("Logs server pick (#4234)", () => {
     );
     renderPage();
     expect((await picker()).value).toBe("all");
+  });
+
+  it("does not query a server absent from the freshly fetched list", async () => {
+    // A cached list from before the server was deleted still names it.
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    qc.setQueryData(["logs-agent-sources"], ALL());
+    sessionStorage.setItem(
+      "logs-dns-queries-server",
+      JSON.stringify("server:a2"),
+    );
+    h.agentSources = ALL().filter((x) => x.server_id !== "a2");
+    renderPage(qc);
+    await waitFor(() =>
+      expect(h.dnsQueries).toHaveBeenCalledWith(
+        expect.objectContaining({ server_id: "a1" }),
+      ),
+    );
+    expect(h.dnsQueries.mock.calls.some((c) => c[0]?.server_id === "a2")).toBe(
+      false,
+    );
+  });
+
+  it("clears a DNS pick the server answers 404 for", async () => {
+    sessionStorage.setItem(
+      "logs-dns-queries-server",
+      JSON.stringify("server:a2"),
+    );
+    h.dnsQueries.mockImplementation((p: { server_id?: string }) =>
+      p.server_id === "a2"
+        ? Promise.reject(
+            Object.assign(new Error("404"), {
+              isAxiosError: true,
+              response: { status: 404, data: { detail: "not found" } },
+            }),
+          )
+        : new Promise(() => {}),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect((screen.getByLabelText("Server") as HTMLSelectElement).value).toBe(
+        "all",
+      ),
+    );
+    expect(screen.queryByText("Query failed")).toBeNull();
+    expect(sessionStorage.getItem("logs-dns-queries-server")).toBe("null");
+  });
+
+  it("clears a DHCP pick the server answers 404 for", async () => {
+    sessionStorage.setItem(
+      "logs-dhcp-activity-server",
+      JSON.stringify("server:d2"),
+    );
+    h.dhcpActivity.mockImplementation((p: { server_id?: string }) =>
+      p.server_id === "d2"
+        ? Promise.reject(
+            Object.assign(new Error("404"), {
+              isAxiosError: true,
+              response: { status: 404, data: { detail: "not found" } },
+            }),
+          )
+        : new Promise(() => {}),
+    );
+    renderPage();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /DHCP Activity/ }),
+    );
+    await waitFor(() =>
+      expect((screen.getByLabelText("Server") as HTMLSelectElement).value).toBe(
+        "all",
+      ),
+    );
+    expect(screen.queryByText("Query failed")).toBeNull();
   });
 });

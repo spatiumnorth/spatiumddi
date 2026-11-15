@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -36,6 +37,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { AgentLogScopePicker } from "@/components/AgentLogScopePicker";
 import {
+  ALL_SERVERS,
   type AgentLogSelection,
   defaultSelection,
   selectionHost,
@@ -157,6 +159,7 @@ export function LogsPage() {
     queryKey: ["logs-sources"],
     queryFn: logsApi.listSources,
     staleTime: 60_000,
+    refetchOnMount: "always",
   });
 
   const {
@@ -164,11 +167,22 @@ export function LogsPage() {
     isLoading: agentSourcesLoading,
     error: agentSourcesError,
     refetch: refetchAgentSources,
+    dataUpdatedAt: agentSourcesUpdatedAt,
+    errorUpdatedAt: agentSourcesErrorAt,
   } = useQuery({
     queryKey: ["logs-agent-sources"],
     queryFn: logsApi.listAgentSources,
     staleTime: 60_000,
+    // A server deleted or lost since the last visit must not still be
+    // offered, or picked, from the cache (#4234).
+    refetchOnMount: "always",
   });
+  // The agent tabs read nothing until the list has been fetched for THIS
+  // mount: a cached list from before a delete would validate a stored pick
+  // that no longer exists and send one query for it.
+  const [mountedAt] = useState(() => Date.now());
+  const agentSourcesFresh =
+    agentSourcesUpdatedAt >= mountedAt || agentSourcesErrorAt >= mountedAt;
 
   // Filter by tab — audit tab is DHCP-only. The agent tabs filter
   // their own list on `server_kind` directly.
@@ -284,11 +298,11 @@ export function LogsPage() {
       </div>
 
       {tab === "dns-queries" && dnsOn && !awaitingModules && (
-        <DNSQueriesTab sources={dnsAgentSources} />
+        <DNSQueriesTab sources={dnsAgentSources} ready={agentSourcesFresh} />
       )}
       {tab === "dns-threat" && dnsOn && !awaitingModules && <DNSThreatTab />}
       {tab === "dhcp-activity" && dhcpOn && !awaitingModules && (
-        <DHCPActivityTab sources={dhcpAgentSources} />
+        <DHCPActivityTab sources={dhcpAgentSources} ready={agentSourcesFresh} />
       )}
       {tab === "events" && !awaitingModules && (
         <EventLogTab sources={tabSources} />
@@ -1131,6 +1145,33 @@ function effectiveSelection(
   return selectionIsValid(picked, sources) ? picked : defaultSelection(sources);
 }
 
+/** Whether a failed read answered 404: the picked server no longer exists. */
+function isNotFound(err: unknown): boolean {
+  return isAxiosError(err) && err.response?.status === 404;
+}
+
+/**
+ * A read that 404s for a picked server or group means the pick is gone (the
+ * server was deleted or lost its registration after the sources list was
+ * fetched). Clear the stored pick so the tab falls back to the default, and
+ * refresh the list, instead of showing a banner for it (#4234).
+ */
+function useDropGonePick(
+  error: unknown,
+  selection: AgentLogSelection | null,
+  clearPick: () => void,
+) {
+  const qc = useQueryClient();
+  const gone = isNotFound(error) && !!selection && selection !== ALL_SERVERS;
+  useEffect(() => {
+    if (!gone) return;
+    clearPick();
+    void qc.invalidateQueries({ queryKey: ["logs-agent-sources"] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- clearPick is a fresh closure each render; `gone` is the trigger
+  }, [gone, selection]);
+  return gone;
+}
+
 /** Whether a response merged more than one server. */
 function coversManyServers(data: { server_ids?: string[] } | undefined) {
   return (data?.server_ids?.length ?? 0) > 1;
@@ -1144,7 +1185,13 @@ function ServerCell({ name }: { name: string }) {
   );
 }
 
-function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
+function DNSQueriesTab({
+  sources,
+  ready,
+}: {
+  sources: AgentLogSource[];
+  ready: boolean;
+}) {
   const [pickedSelection, setSelection] =
     useSessionState<AgentLogSelection | null>("logs-dns-queries-server", null);
   const selection = effectiveSelection(pickedSelection, sources);
@@ -1159,7 +1206,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!selection;
+  const enabled = !!selection && ready;
   // A partial address filters as you type; wait for a pause so each
   // keystroke is not its own request (#3171).
   const debouncedClientIp = useDebouncedValue(clientIp);
@@ -1209,6 +1256,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
+  const pickGone = useDropGonePick(dnsQueriesQuery.error, selection, () =>
+    setSelection(null),
+  );
   const events = dnsQueriesQuery.data?.events ?? [];
   const showServer = coversManyServers(dnsQueriesQuery.data);
   const selectedHost = useMemo(
@@ -1326,7 +1376,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         onPickRcode={(r) => setRcode(r)}
       />
 
-      {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
+      {dnsQueriesQuery.isError && !pickGone && (
+        <QueryErrorBanner query={dnsQueriesQuery} />
+      )}
       {dnsQueriesQuery.isFetching && events.length === 0 && (
         <QueryingIndicator host={selectedHost} />
       )}
@@ -1643,7 +1695,13 @@ export function DNSQueryRow({
 
 // ── DHCP Activity tab (Kea log) ───────────────────────────────────
 
-function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
+function DHCPActivityTab({
+  sources,
+  ready,
+}: {
+  sources: AgentLogSource[];
+  ready: boolean;
+}) {
   const [pickedSelection, setSelection] =
     useSessionState<AgentLogSelection | null>(
       "logs-dhcp-activity-server",
@@ -1661,7 +1719,7 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!selection;
+  const enabled = !!selection && ready;
   const debouncedMac = useDebouncedValue(mac);
   const debouncedIp = useDebouncedValue(ip);
 
@@ -1694,6 +1752,9 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
+  const pickGone = useDropGonePick(activityQuery.error, selection, () =>
+    setSelection(null),
+  );
   const events = activityQuery.data?.events ?? [];
   const showServer = coversManyServers(activityQuery.data);
   const selectedHost = useMemo(
@@ -1784,7 +1845,9 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
         </div>
       </div>
 
-      {activityQuery.isError && <QueryErrorBanner query={activityQuery} />}
+      {activityQuery.isError && !pickGone && (
+        <QueryErrorBanner query={activityQuery} />
+      )}
       {activityQuery.isFetching && events.length === 0 && (
         <QueryingIndicator host={selectedHost} />
       )}
