@@ -2887,8 +2887,12 @@ covers how to get off 2026.10.02-1 on each deployment shape (#3915).
 The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
 works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
 images (#1181). It went through in under 10 minutes, with DNS down for
-about 4 minutes during the reboot. A second, shorter DNS and DHCP
-interruption of a few seconds can follow about 3 minutes after boot
+about 4 minutes during the reboot. Upgrading from a release that
+predates #3919's fix, a second, shorter DNS and DHCP interruption of a few
+seconds can follow about 3 minutes after boot; a release that carries it
+moves the role pods onto its own image during the boot, so they restart
+once, and the upgrade unpacks the new role images while the old slot is still
+running, so the first container start after the reboot is not slowed by it
 (#3919).
 
 ### Multi-node cluster, from 2026.10.02-1
