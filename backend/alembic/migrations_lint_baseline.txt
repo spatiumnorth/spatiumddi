@@ -132,6 +132,7 @@ backend/alembic/versions/a3c7e91f2d58_retention_settings.py:drop_column:38
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:83
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:84
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:85
+backend/alembic/versions/a3c9e5d1b7f2_dns_server_agent_reports_served_serials.py:drop_column:37
 backend/alembic/versions/a3d7f1c9e6b2_dns_pool_member_geo_steering.py:drop_column:71
 backend/alembic/versions/a3d7f1c9e6b2_dns_pool_member_geo_steering.py:drop_column:72
 backend/alembic/versions/a3d7f1c9e6b2_dns_pool_member_geo_steering.py:drop_constraint_fk:69

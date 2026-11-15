@@ -141,7 +141,10 @@ export function SessionsTab({
   if (sessions.length === 0) {
     return (
       <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-        No peers configured yet — click "Add Peer" above to peer with a router.
+        No peers configured yet
+        {writeGate.disabled
+          ? "."
+          : ' — click "Add Peer" above to peer with a router.'}
       </div>
     );
   }

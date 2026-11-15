@@ -66,6 +66,12 @@ const CIRCUIT = {
   notes: "",
 };
 
+// The ownership fields follow their feature modules (#4101); these tests are
+// about the customer field itself, so every module is on.
+vi.mock("@/hooks/useFeatureModules", () => ({
+  useFeatureModules: () => ({ ready: true, enabled: () => true }),
+}));
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});

@@ -177,6 +177,59 @@ async def test_apt_source_uri_userinfo_is_masked_and_kept_on_resave(
     assert r.status_code == 422, r.text
 
 
+async def test_apt_source_masked_uri_on_a_new_host_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    src: dict[str, Any] = {
+        "name": "lan",
+        "uri": "http://bob:hunter2@mirror.lan:8080/apt/",
+        "suites": "trixie",
+        "components": "main",
+        "enabled": True,
+    }
+    r = await client.put("/api/v1/settings", headers=h, json={"apt_sources": [src]})
+    assert r.status_code == 200, r.text
+    stored = "http://bob:hunter2@mirror.lan:8080/apt/"
+
+    async def _stored() -> str:
+        st = await db_session.get(PlatformSettings, 1)
+        assert st is not None
+        await db_session.refresh(st)
+        return str(st.apt_sources[0]["uri"])
+
+    # Host, port or scheme moved with the mask left in: refused, unchanged.
+    for moved in (
+        "http://***@other.lan:8080/apt/",
+        "http://***@mirror.lan:9090/apt/",
+        "https://***@mirror.lan:8080/apt/",
+    ):
+        r = await client.put(
+            "/api/v1/settings", headers=h, json={"apt_sources": [{**src, "uri": moved}]}
+        )
+        assert r.status_code == 422, r.text
+        assert "re-enter" in r.text and "hunter2" not in r.text
+        assert await _stored() == stored
+
+    # Same host and port, new path: the credential is kept.
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={"apt_sources": [{**src, "uri": "http://***@mirror.lan:8080/other/"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert await _stored() == "http://bob:hunter2@mirror.lan:8080/other/"
+
+    # A new host with a real credential supplied is stored as sent.
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={"apt_sources": [{**src, "uri": "http://amy:pw2@other.lan:8080/apt/"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert await _stored() == "http://amy:pw2@other.lan:8080/apt/"
+
+
 async def test_guard_rule_cases() -> None:
     from types import SimpleNamespace
 
@@ -209,3 +262,70 @@ async def test_guard_rule_cases() -> None:
     assert sent_server_credential({}, None) == ""
     assert sent_server_credential({"password": "p"}, None) == "p"
     assert sent_server_credential(None, {"vdom": "root"}) is None
+
+
+_SRC_BASE: dict[str, Any] = {
+    "name": "lan",
+    "suites": "trixie",
+    "components": "main",
+    "enabled": True,
+}
+
+
+@pytest.mark.parametrize("sep", ["?", "#", "\\"])
+async def test_apt_source_with_an_ambiguous_host_part_is_refused(
+    client: AsyncClient, db_session: AsyncSession, sep: str
+) -> None:
+    h = await _admin(db_session)
+    stored = "http://bob:hunter2@mirror.lan:80/debian/"
+    r = await client.put(
+        "/api/v1/settings", headers=h, json={"apt_sources": [{**_SRC_BASE, "uri": stored}]}
+    )
+    assert r.status_code == 200, r.text
+
+    for uri in (
+        f"http://***@mirror.lan:80{sep}@other.lan:80/debian/",
+        f"http://***@mirror.lan:80{sep}other.lan/debian/",
+        "http://***@mirror.lan:80@other.lan:80/debian/",
+        "http://***@mirror.lan:8x/debian/",
+    ):
+        r = await client.put(
+            "/api/v1/settings", headers=h, json={"apt_sources": [{**_SRC_BASE, "uri": uri}]}
+        )
+        assert r.status_code == 422, (uri, r.text)
+        assert "hunter2" not in r.text
+        st = await db_session.get(PlatformSettings, 1)
+        assert st is not None
+        await db_session.refresh(st)
+        assert st.apt_sources[0]["uri"] == stored
+
+    # A query string after the first '/', and a plain unchanged save, still work.
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={"apt_sources": [{**_SRC_BASE, "uri": "http://***@mirror.lan:80/debian/?a=b@c"}]},
+    )
+    assert r.status_code == 200, r.text
+    await db_session.refresh(st)
+    assert st.apt_sources[0]["uri"] == "http://bob:hunter2@mirror.lan:80/debian/?a=b@c"
+
+
+async def test_restore_helpers_read_the_host_the_way_apt_does() -> None:
+    from app.services.appliance.apt import (
+        restore_proxy_credentials,
+        restore_source_uri,
+        validate_apt_authority,
+    )
+
+    stored = "http://u:p@a:1/x/"
+    for bad in ("http://***@a:1?@b:2/x/", "http://***@a:1#@b:2/x/", "http://***@a:1\\@b:2/x/"):
+        # Read the apt way the userinfo is not the bare mask, so the stored
+        # credential is never spliced in; and the shape itself is refused.
+        assert "u:p" not in restore_proxy_credentials(bad, stored)
+        assert "u:p" not in restore_source_uri(bad, "n", [{"name": "n", "uri": stored}])
+        with pytest.raises(ValueError):
+            validate_apt_authority(bad)
+    with pytest.raises(ValueError):
+        validate_apt_authority("http://***@a:1?@b:2")
+    # No path (a proxy): the whole remainder is the host part.
+    assert restore_proxy_credentials("http://***@a:1/y?q=@z", stored) == "http://u:p@a:1/y?q=@z"

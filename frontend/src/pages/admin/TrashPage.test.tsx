@@ -604,11 +604,13 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
 
   it("names a subnet's scopes, addresses and records, and does not count the batch", async () => {
     const t = await openDelete("subnet", 4);
-    expect(t).toMatch(/DHCP scopes \(with their pools and static/);
-    expect(t).toMatch(/addresses, the DNS records published for them/);
+    expect(t).toMatch(/Its DHCP scopes, DHCP pools, DHCP static assignments/);
+    expect(t).toMatch(/the DNS records published for its addresses/);
     expect(t).toMatch(/E911 location binding names it/);
     // #3894 — the purge also cascades the subnet's address sets and OT zones.
-    expect(t).toMatch(/its address sets and its OT zones/);
+    expect(t).toMatch(/address sets, OT zones/);
+    // #4143 — and, through its addresses, their OT and BACnet/IP devices.
+    expect(t).toMatch(/OT devices, BACnet\/IP devices/);
     expect(t).not.toMatch(/other row/);
   });
 
@@ -632,6 +634,18 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
     cleanup();
     const block = await openDelete("ip_block", 1);
     expect(block).not.toMatch(/subnet plans/);
+  });
+
+  it("names what a block's and a space's subnets lose, not just their addresses (#4143)", async () => {
+    for (const type of ["ip_block", "ip_space"] as const) {
+      const t = (await openDelete(type, 1)) ?? "";
+      expect(t).toMatch(/address sets/);
+      expect(t).toMatch(/OT zones/);
+      expect(t).toMatch(/OT devices/);
+      expect(t).toMatch(/BACnet\/IP devices/);
+      expect(t).toMatch(/DHCP scopes/);
+      cleanup();
+    }
   });
 
   it("adds no count for a row deleted alone", async () => {

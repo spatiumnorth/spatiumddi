@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -54,6 +55,7 @@ function AsnForm({
   asn: ASNRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const isEdit = Boolean(asn);
   const qc = useQueryClient();
   const [number, setNumber] = useState<string>(asn ? String(asn.number) : "");
@@ -203,23 +205,27 @@ function AsnForm({
           />
         </Field>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <Field label="Customer" hint="Operator owning this AS, if any.">
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </Field>
-          <Field
-            label="Provider"
-            hint="Upstream we lease / peer through, if any."
-          >
-            <ProviderPicker
-              className={inputCls}
-              value={providerId}
-              onChange={setProviderId}
-            />
-          </Field>
+          {own.customer && (
+            <Field label="Customer" hint="Operator owning this AS, if any.">
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </Field>
+          )}
+          {own.provider && (
+            <Field
+              label="Provider"
+              hint="Upstream we lease / peer through, if any."
+            >
+              <ProviderPicker
+                className={inputCls}
+                value={providerId}
+                onChange={setProviderId}
+              />
+            </Field>
+          )}
         </div>
         <Field
           label="Tags (JSON)"

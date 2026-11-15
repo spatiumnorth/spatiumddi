@@ -69,6 +69,7 @@ from app.services.appliance.apt import (
     render_sources_list,
     restore_proxy_credentials,
     restore_source_uri,
+    validate_apt_authority,
 )
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
@@ -892,6 +893,7 @@ class AptSourceUpdate(BaseModel):
             )
         if any(c.isspace() for c in s):
             raise ValueError("uri may not contain whitespace")
+        validate_apt_authority(s)
         return s
 
     @field_validator("suites")
@@ -1360,6 +1362,8 @@ class SettingsUpdate(BaseModel):
         # or inject an extra directive.
         if any(c == '"' or ord(c) < 0x20 for c in s):
             raise ValueError("proxy URL must not contain quotes or control characters")
+        if s:
+            validate_apt_authority(s)
         return s
 
     @field_validator("apt_proxy_no_proxy")
