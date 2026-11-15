@@ -183,6 +183,15 @@ api:
     # reacting late. Rendered on Kubernetes 1.34+, where the PreferSameNode
     # feature is on by default; older API servers refuse the value.
     trafficDistribution: ""
+    # #3645 — false (the default) renders only the one api Service. true adds
+    # a second, ``<release>-api-local`` with ``internalTrafficPolicy: Local``,
+    # which only ever answers from an api pod on the caller's own node, for
+    # the member supervisors' heartbeat, so that plain-http hop never crosses
+    # the node LAN (with no local pod they fall back to their pinned https
+    # URL). The frontend keeps the cluster Service: a node whose api pod is
+    # down or being rolled must still serve the UI. The appliance sets it in firstboot's HelmChart and the supervisor's
+    # HelmChartConfig; leave it off elsewhere.
+    nodeLocal: false
   autoscaling:
     enabled: true
     minReplicas: 2

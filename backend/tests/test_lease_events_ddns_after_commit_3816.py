@@ -164,6 +164,8 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
     the batch's own and a first-acquisition batch took three times as long as
     before the change, then 7 to 10 when the chunk halved past a 2 s hold. The
     first chunk is 40 names and the next is sized from what those cost."""
+    import app.api.v1.dhcp.agents as agents
+
     subnet, _block = await _ddns_subnet(db_session)
     peer_a, _peer_b = await _two_agents(db_session, [subnet])
     zone_id = uuid.UUID(str(subnet.dns_zone_id))
@@ -177,6 +179,9 @@ async def test_a_hundred_new_names_publish_in_a_few_transactions(
         await real(self)
 
     monkeypatch.setattr(AsyncSession, "commit", _count)
+    # The next chunk's size is measured from the last one's speed; a slow
+    # runner must not shrink it, so the budget is out of play here.
+    monkeypatch.setattr(agents, "_DDNS_HOLD_S", 1e6)
     resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
     assert resp.status_code == 200, resp.text
     assert len(await _a_records(db_session, zone_id)) == len(ips)
@@ -371,6 +376,8 @@ async def test_a_chunk_bumps_each_zone_serial_once_not_once_per_name(
     zone_id = uuid.UUID(str(subnet.dns_zone_id))
     before, _ = await _chunk_serials(db_session, zone_id)
     monkeypatch.setattr(agents, "_DDNS_CHUNK_START", 30)
+    # Chunk 2 is sized from chunk 1's speed: a slow runner would split it again.
+    monkeypatch.setattr(agents, "_DDNS_HOLD_S", 1e6)
     ips = [f"10.31.1.{n}" for n in range(100, 200)]
     resp = await _post(concurrent_client, peer_a, [_ev(i) for i in ips])
     assert resp.status_code == 200, resp.text
