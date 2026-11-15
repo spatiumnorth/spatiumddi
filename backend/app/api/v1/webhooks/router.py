@@ -39,6 +39,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_dict, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_credential_problem, header_value_problem
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
@@ -355,6 +356,12 @@ async def update_subscription(
         raise HTTPException(status_code=404, detail="Subscription not found")
     old = _snapshot(sub)
     old_url = sub.url
+    require_secret_with_destination_change(
+        sub,
+        {"url": body.url, "headers": body.headers},
+        destination=("url",),
+        secrets={"headers": sub.headers_encrypted},
+    )
     plaintext = _apply_body(sub, body, creating=False)
     new = _snapshot(sub)
     # The displayed URL drops the path, so flag a repoint within one host.
