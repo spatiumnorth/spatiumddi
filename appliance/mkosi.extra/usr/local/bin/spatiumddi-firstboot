@@ -1929,12 +1929,17 @@ except Exception:
 release_preroll_ownership() {
     local k3s=/usr/local/bin/k3s ns=$1 ds=$2 fm=$3 ops
     ops=$($k3s kubectl --request-timeout=10s -n "$ns" get daemonset "$ds" \
-        -o json 2>/dev/null | python3 -c '
+        --show-managed-fields -o json 2>/dev/null | python3 -c '
 import json, sys
 
-fm = sys.argv[1]
+fm, ds = sys.argv[1:3]
 try:
-    mf = json.load(sys.stdin)["metadata"].get("managedFields") or []
+    mf = (json.load(sys.stdin).get("metadata") or {}).get("managedFields") or []
+    if not mf:
+        # kubectl leaves managedFields out unless --show-managed-fields is
+        # given; a read with none is a miss to report, never a quiet success.
+        print(f"WARN: DaemonSet {ds} was read with no managedFields; nothing released (#3919).", file=sys.stderr)
+        sys.exit(0)
     # Highest index first, so a removal does not shift the next.
     ops = []
     for i in range(len(mf) - 1, -1, -1):
@@ -1943,9 +1948,11 @@ try:
             ops.append({"op": "remove", "path": f"/metadata/managedFields/{i}"})
     if ops:
         print(json.dumps(ops))
+    else:
+        print(f"WARN: DaemonSet {ds} has no managedFields entry for {fm} after the preroll patch; nothing released (#3919).", file=sys.stderr)
 except Exception:
     sys.exit(1)
-' "$fm" 2>/dev/null) || ops=""
+' "$fm" "$ds") || ops=""
     [ -n "$ops" ] || return 0
     $k3s kubectl --request-timeout=10s -n "$ns" patch daemonset "$ds" \
         --type json -p "$ops" >/dev/null 2>&1 \

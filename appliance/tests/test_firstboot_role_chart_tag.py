@@ -42,7 +42,17 @@ case "$args" in
     [ -f "$S/values" ] && cat "$S/values"; exit 0 ;;
   "--request-timeout=10s -n spatium get daemonset "*)
     ds=$(echo "$args" | awk '{print $6}')
-    [ -f "$S/ds_$ds.json" ] && cat "$S/ds_$ds.json"; exit 0 ;;
+    # kubectl's default: managedFields are omitted unless asked for.
+    [ -f "$S/ds_$ds.json" ] || exit 0
+    case "$args" in
+      *--show-managed-fields*) cat "$S/ds_$ds.json" ;;
+      *) python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+d.get("metadata", {}).pop("managedFields", None)
+print(json.dumps(d))' < "$S/ds_$ds.json" ;;
+    esac
+    exit 0 ;;
   "--request-timeout=10s -n spatium patch daemonset "*" --type json -p "*)
     ds=$(echo "$args" | awk '{print $6}')
     printf '%s' "${args#* --type json -p }" > "$S/jsonpatch_$ds.json"
@@ -323,3 +333,14 @@ def test_no_release_patch_when_we_own_nothing_or_release_fails(tmp_path):
     ds["metadata"] = {"managedFields": _managed((FM, "Update"))}
     proc, patched, _ = _run(sub, daemonsets={"dhcp-kea": ds}, release_fails=True)
     assert "rc=0" in proc.stdout and "WARN" in proc.stderr and patched is not None
+
+
+def test_no_managed_fields_or_no_entry_of_ours_is_reported_not_silent(tmp_path):
+    ds = _ds("reg/kea:OLD")
+    proc, _, _ = _run(tmp_path, daemonsets={"dhcp-kea": ds})
+    assert "rc=0" in proc.stdout and "no managedFields" in proc.stderr
+    sub = tmp_path / "g"
+    sub.mkdir()
+    ds["metadata"] = {"managedFields": _managed(("helm", "Apply"))}
+    proc, _, _ = _run(sub, daemonsets={"dhcp-kea": ds})
+    assert "rc=0" in proc.stdout and f"no managedFields entry for {FM}" in proc.stderr

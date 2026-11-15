@@ -2063,6 +2063,14 @@ def cmd_set_default(args) -> int:
 
 
 def main() -> int:
+    # The log file is not a tty, so stdout is block-buffered there and the
+    # upgrader's own lines landed after the unpack child's (#3919): keep the
+    # log in the order things happened.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass  # not a TextIOWrapper (a test capture); order is then moot
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
