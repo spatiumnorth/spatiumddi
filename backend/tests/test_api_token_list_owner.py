@@ -66,3 +66,38 @@ async def test_superadmin_list_names_each_owner_and_user_sees_only_own(
     hb = {"Authorization": f"Bearer {create_access_token(str(bob.id))}"}
     mine = (await client.get("/api/v1/api-tokens", headers=hb)).json()
     assert [r["owner_username"] for r in mine] == [bob.username]
+
+
+@pytest.mark.asyncio
+async def test_token_list_reports_effective_status_3784(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    if await db_session.get(PlatformSettings, 1) is None:
+        db_session.add(PlatformSettings(id=1))
+    admin = await _user(db_session, "adm", admin=True)
+    must = await _user(db_session, "must", admin=False)
+    must.force_password_change = True
+    off = await _user(db_session, "off", admin=False)
+    off.is_active = False
+    await _token(db_session, admin, "ok")
+    await _token(db_session, must, "pw")
+    await _token(db_session, off, "dis")
+    revoked = await _token(db_session, admin, "rev")
+    revoked.is_active = False
+    expired = await _token(db_session, admin, "exp")
+    expired.expires_at = datetime(2020, 1, 1, tzinfo=UTC)
+    await db_session.commit()
+
+    h = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
+    rows = {r["name"]: r for r in (await client.get("/api/v1/api-tokens", headers=h)).json()}
+    assert {n: r["status"] for n, r in rows.items()} == {
+        "ok": "active",
+        "pw": "password_change_required",
+        "dis": "owner_disabled",
+        "rev": "revoked",
+        "exp": "expired",
+    }
+    assert rows["ok"]["blocked_reason"] is None
+    assert "change their password" in rows["pw"]["blocked_reason"]
+    one = await client.get(f"/api/v1/api-tokens/{rows['pw']['id']}", headers=h)
+    assert one.json()["status"] == "password_change_required"

@@ -15,6 +15,19 @@ import { humanTime } from "@/pages/network/_shared";
 
 type RightTab = "live" | "history" | "result";
 
+/**
+ * Whether Start scan is offered (#4116): the same pair NmapScanForm's
+ * writeGate asks. Words that tell the reader to start a scan are drawn only
+ * when it is.
+ */
+function useCanStartScan(): boolean {
+  const perms = usePermissions();
+  return (
+    perms.can("write", "manage_nmap_scans") &&
+    perms.can("read", "manage_nmap_scans")
+  );
+}
+
 export function NmapToolsPage() {
   const [activeScan, setActiveScan] = useState<NmapScanRead | null>(null);
   const [displayScan, setDisplayScan] = useState<NmapScanRead | null>(null);
@@ -148,11 +161,14 @@ function LiveTab({
   onComplete: (s: NmapScanRead) => void;
   onCancelClose: () => void;
 }) {
+  const canStart = useCanStartScan();
   if (!activeScan) {
     return (
       <p className="text-xs text-muted-foreground">
-        No scan running — kick one off on the left. Live output will stream
-        here.
+        No scan running
+        {canStart
+          ? " — kick one off on the left. Live output will stream here."
+          : "."}
       </p>
     );
   }
@@ -190,10 +206,12 @@ export function ResultTab({
     // rather than trusting it for the default `staleTime`.
     initialDataUpdatedAt: 0,
   });
+  const canStart = useCanStartScan();
   if (!data) {
     return (
       <p className="text-xs text-muted-foreground">
-        Nothing to show yet. Click a row in History or run a fresh scan.
+        Nothing to show yet. Click a row in History
+        {canStart ? " or run a fresh scan." : "."}
       </p>
     );
   }
@@ -234,6 +252,7 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   const qc = useQueryClient();
   // Cancel and delete (single and bulk) take delete on 'manage_nmap_scans'
   // (nmap/router.py).
+  const canStart = useCanStartScan();
   const deleteGate = permissionGate(
     usePermissions().can("delete", "manage_nmap_scans"),
     "Requires delete permission on nmap scans",
@@ -315,7 +334,7 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   if (items.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
-        No scans yet — kick one off on the left.
+        No scans yet{canStart ? " — kick one off on the left." : "."}
       </p>
     );
   }

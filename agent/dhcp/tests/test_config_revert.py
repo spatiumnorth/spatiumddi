@@ -245,3 +245,33 @@ def test_quarantine_clears_when_the_server_moves_on(loop: SyncLoop) -> None:
     loop._quarantine.record("bad", "boom")
     assert _apply(loop, "fixed") is True
     assert loop._quarantine.etag is None
+
+
+def test_cache_boot_reports_ok_so_a_restarted_row_returns_to_ok(
+    agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4139 — the DHCP agent's cache boot set no applied status, so its
+    heartbeats carried ``config: {}`` and, with every poll a 304 on an
+    unchanged bundle, a row a restart had cleared to unknown never read ok
+    again."""
+    monkeypatch.setattr(sync_mod, "config_check", lambda daemon, path: None)
+    monkeypatch.setattr(sync_mod, "config_reload", lambda s: {"result": 0})
+    ensure_layout(agent_cfg.state_dir)
+    save_config(agent_cfg.state_dir, _bundle("cached"), "cached")
+    hb = _FakeHeartbeat()
+    SyncLoop(agent_cfg, token_ref=[""], heartbeat=hb)
+    wire = hb.config_apply.as_dict()
+    assert wire["status"] == STATUS_OK
+    assert hb.config_apply.etag == "cached"
+
+
+def test_failing_cache_boot_reports_failed_not_ok(
+    agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ensure_layout(agent_cfg.state_dir)
+    save_config(agent_cfg.state_dir, _bundle("cached"), "cached")
+    _reject(monkeypatch, "dhcp4_config_rejected: boom")
+    monkeypatch.setattr(sync_mod, "config_reload", lambda s: {"result": 0})
+    hb = _FakeHeartbeat()
+    SyncLoop(agent_cfg, token_ref=[""], heartbeat=hb)
+    assert hb.config_apply.status == STATUS_NO_PREVIOUS

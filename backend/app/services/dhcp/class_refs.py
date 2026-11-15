@@ -85,19 +85,34 @@ async def pools_restricted_to(
     name: str,
     *,
     exclude_scope_id: uuid.UUID | None = None,
+    include_trashed: bool = False,
 ) -> list[tuple[str, str, str]]:
     """``(scope name, start_ip, end_ip)`` of every pool in the group bound to
-    ``name``, leaving out ``exclude_scope_id``'s own pools."""
+    ``name``, leaving out ``exclude_scope_id``'s own pools.
+
+    ``include_trashed`` also counts pools in the Trash (a trashed pool, or any
+    pool of a trashed scope), their scope name suffixed ``, in Trash`` (#3928).
+    A delete or rename must pass it: a restore brings the pool back with its
+    restriction, so a class removed meanwhile leaves it serving no client."""
     q = (
-        select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip)
+        select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip, DHCPScope.deleted_at)
         .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
         .where(DHCPScope.group_id == group_id, DHCPPool.class_restriction == name)
         .order_by(DHCPScope.name, DHCPPool.start_ip)
     )
     if exclude_scope_id is not None:
         q = q.where(DHCPScope.id != exclude_scope_id)
+    if include_trashed:
+        q = q.add_columns(DHCPPool.deleted_at).execution_options(include_deleted=True)
     rows = (await db.execute(q)).all()
-    return [(r[0] or "", str(r[1]), str(r[2])) for r in rows]
+    return [
+        (
+            (r[0] or "") + (", in Trash" if include_trashed and (r[3] or r[4]) else ""),
+            str(r[1]),
+            str(r[2]),
+        )
+        for r in rows
+    ]
 
 
 def calls_member(expr: str, name: str) -> bool:
@@ -136,6 +151,16 @@ def describe_pools(pools: list[tuple[str, str, str]]) -> str:
     shown = ", ".join(f"{s}-{e}" + (f" ({n})" if n else "") for n, s, e in pools[:5])
     more = f" and {len(pools) - 5} more" if len(pools) > 5 else ""
     return f"{shown}{more}"
+
+
+def trash_hint(pools: list[tuple[str, str, str]]) -> str:
+    """Way out of a refusal that counted pools in the Trash (#3928)."""
+    if not any(n.endswith(", in Trash") for n, _s, _e in pools):
+        return ""
+    return (
+        " Pools marked 'in Trash' come back with their restriction on restore: purge "
+        "their scope from Administration > Trash, or restore it and clear the pool's class."
+    )
 
 
 async def known_class_names(db: AsyncSession, group_id: uuid.UUID) -> set[str]:

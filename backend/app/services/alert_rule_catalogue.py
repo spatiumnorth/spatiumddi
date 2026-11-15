@@ -171,7 +171,8 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "Threshold (%)",
                 90,
                 "Fires when subnet utilization ≥ this; an open alert resolves "
-                f"{int(a._PCT_RESOLVE_MARGIN)} points below it. PTP / loopback subnets "
+                f"{int(a._PCT_RESOLVE_MARGIN)} points below it (half of it at a threshold of "
+                f"{int(a._PCT_RESOLVE_MARGIN)}% or less). PTP / loopback subnets "
                 "(prefix > utilization_max_prefix_*) are excluded.",
             )
         ],
@@ -274,7 +275,8 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "subnet looks empty. Empty uses 90% only while the free-address "
                 "floor below is also empty; with a floor set, empty means no "
                 f"percent check. An open alert resolves {int(a._PCT_RESOLVE_MARGIN)} "
-                "points below this.",
+                "points below this (half of it at a threshold of "
+                f"{int(a._PCT_RESOLVE_MARGIN)}% or less).",
                 initial=90,
             ),
             ParamSpec(

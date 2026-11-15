@@ -15,7 +15,7 @@ Adds the lock columns of ``app.models.base.LockMixin`` to every lockable table:
 All five columns are nullable with no default, so the ALTERs are metadata-only.
 
 Revision ID: a3361c0de1f7
-Revises: ede3bcd2aff4
+Revises: b6d2e9f41a07
 Create Date: 2026-11-14
 """
 
@@ -25,7 +25,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "a3361c0de1f7"
-down_revision = "ede3bcd2aff4"
+down_revision = "b6d2e9f41a07"
 branch_labels = None
 depends_on = None
 
