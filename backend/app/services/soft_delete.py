@@ -1047,7 +1047,12 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
         try:
             covered = await _assert_no_block_overlap(
-                db, obj.space_id, str(obj.network), obj.parent_block_id, exclude_id=obj.id
+                db,
+                obj.space_id,
+                str(obj.network),
+                obj.parent_block_id,
+                exclude_id=obj.id,
+                for_restore=True,
             )
         except HTTPException as exc:
             return str(exc.detail)
