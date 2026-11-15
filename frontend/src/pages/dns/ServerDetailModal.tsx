@@ -41,6 +41,7 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryPanel } from "@/components/AgentMemoryPanel";
 import { SpoolChip } from "@/components/SpoolChip";
 import { syncCard } from "@/lib/dhcp-sync-label";
 import {
@@ -310,9 +311,23 @@ function OverviewTab({
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />
       </div>
+      <AgentMemoryPanel
+        serverId={server.id}
+        status={server.memory_status}
+        daemonLabel={daemonRssLabel(server.driver)}
+        fetchHistory={(id) => dnsApi.getMemoryHistory(id)}
+        queryKeyPrefix="dns-server"
+      />
       {isBind9 && <RndcStatusPanel serverId={server.id} />}
     </div>
   );
+}
+
+/** What the daemon RSS row is called for each agent-managed driver. */
+function daemonRssLabel(driver: string): string {
+  if (driver === "powerdns") return "pdns_server";
+  if (driver === "technitium") return "Technitium";
+  return "named";
 }
 
 function OverviewInfo({ server }: { server: DNSServer }) {

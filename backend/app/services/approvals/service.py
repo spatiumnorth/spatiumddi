@@ -896,6 +896,12 @@ async def _stamp_apply_failed(
     return cr
 
 
+REQUESTER_GONE_MESSAGE = (
+    "The requester's account no longer exists, so this request cannot be "
+    "provisioned. Reject it; the requester can submit it again from a current account."
+)
+
+
 def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
     """Why ``approver`` may not approve ``cr``, or ``None`` when they may.
 
@@ -914,11 +920,11 @@ def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
     # nulls ``requested_by_user_id`` if the requester is deleted; the
     # self-approval guard below would then fail OPEN (None != approver.id
     # is always true), letting anyone rubber-stamp an orphaned request and
-    # defeating two-person. Refuse instead — the requester must recreate.
+    # defeating two-person. Refuse instead. The words name what the APPROVER
+    # can do (#4242): they cannot cancel (requester / superadmin only), they
+    # can reject, and the requester can submit it again.
     if cr.requested_by_user_id is None:
-        return DecisionConflict(
-            "Requester no longer exists; cancel and recreate this change request"
-        )
+        return DecisionConflict(REQUESTER_GONE_MESSAGE)
     # Self-approval is forbidden — the whole point of two-person.
     if approver.id == cr.requested_by_user_id:
         return DecisionForbidden("You cannot approve your own change request")
@@ -1340,6 +1346,7 @@ def _can_approve(user: User) -> bool:
 
 
 __all__ = [
+    "REQUESTER_GONE_MESSAGE",
     "approval_refusal",
     "ChangeRequestStateError",
     "DecisionConflict",

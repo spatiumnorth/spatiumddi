@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import uuid
+from dataclasses import asdict
 from typing import Any
 
 import dns.exception
@@ -29,6 +30,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.agents.memory_status import fresh_memory_status
 from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
@@ -357,7 +359,9 @@ class FindDnsServersArgs(BaseModel):
         "primary for that group?' and "
         "'which groups have no primary?' (one is re-elected automatically "
         "within a minute; until then writes go to the server it will "
-        "pick). Read-only: "
+        "pick). Each row's ``memory`` is the agent's reported container used / "
+        "peak / limit and daemon / agent RSS in bytes (null = not reported). "
+        "Read-only: "
         "moving a server between groups is done over the REST API or the "
         "DNS → Server Groups UI, not from here."
     ),
@@ -415,6 +419,10 @@ async def find_dns_servers(
             # #3551 — the agent container's memory limit; NULL = never
             # reported (an older agent, an agentless driver) or no limit.
             "memory_limit_bytes": s.memory_limit_bytes,
+            # #4193 — what the agent actually reports using (container used /
+            # peak / limit, daemon and agent RSS, reported_at); NULL = never
+            # reported, which is unknown, not zero.
+            "memory": fresh_memory_status(s.memory_status),
         }
         for s, group_name in rows
     ]
@@ -434,8 +442,9 @@ class GetDnsGroupMemoryEstimateArgs(BaseModel):
         "share a response-policy zone between views); identical zones load "
         "once. Returns the estimate, the limit and where it came from "
         "(``agent`` or the 2 GiB ``default``), the percentage, whether it "
-        "warns (80 % and over), and each blocklist zone with the views that "
-        "load it and its entry count. Answers 'will adding a view OOM this "
+        "warns (80 % and over), each blocklist zone with the views that "
+        "load it and its entry count, and each server's ACTUAL reported "
+        "memory (named's RSS, container used / peak / limit). Answers 'will adding a view OOM this "
         "group?' and 'why are the DNS agents being OOM-killed?'. Null for a "
         "group with no BIND9 server. Read-only."
     ),
@@ -471,6 +480,9 @@ async def get_dns_group_memory_estimate(
             {"zone": r.zone, "views": list(r.views), "entries": r.entries, "bytes": r.bytes}
             for r in est.rpz
         ],
+        # #4193 — what each BIND9 server actually reports using, to set beside
+        # the estimate. Null figures are unreported, not zero.
+        "servers": [asdict(s) for s in est.servers],
     }
 
 
