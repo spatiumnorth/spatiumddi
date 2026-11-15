@@ -1,4 +1,5 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -421,6 +422,13 @@ function RouterModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [apiKey, setApiKey] = useState(router?.api_key ?? "");
   const [apiSecret, setApiSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    router && { host: router.host, port: router.port },
+    () => setApiSecret(""),
+  );
+  const mustEnter = reask.asks(router?.api_secret_present);
   const [spaceId, setSpaceId] = useState(router?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(router?.dns_group_id ?? "");
   const [mirrorDhcpLeases, setMirrorDhcpLeases] = useState(
@@ -617,18 +625,23 @@ function RouterModal({
               required
             />
           </Field>
-          <Field label="API Secret" hint="The 'secret' line from apikey.txt.">
+          <Field
+            label="API Secret"
+            hint={mustEnter ? reask.hint : "The 'secret' line from apikey.txt."}
+          >
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiSecret}
               onChange={(e) => setApiSecret(e.target.value)}
               placeholder={
-                editing && router?.api_secret_present
-                  ? "••• stored — enter to replace"
-                  : "API secret"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && router?.api_secret_present
+                    ? "••• stored — enter to replace"
+                    : "API secret"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -784,7 +797,7 @@ function RouterModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !apiSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

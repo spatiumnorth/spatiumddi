@@ -342,6 +342,7 @@ Apache license covers it.
 | [nginx](https://nginx.org/) | 1.31.8-alpine | BSD 2-Clause | Frontend runtime |
 | [ASP.NET Core runtime](https://dotnet.microsoft.com/) | 10.0 | MIT | Technitium agent image |
 | [tini](https://github.com/krallin/tini) | Alpine/Debian pkg | MIT | PID 1 in every agent image |
+| [jemalloc](https://jemalloc.net/) | Alpine pkg | BSD-2-Clause | Allocator linked into `named` in the BIND9 agent image (#4192) |
 | [su-exec](https://github.com/ncopa/su-exec) / [gosu](https://github.com/tianon/gosu) | Alpine / Debian pkg | MIT / Apache 2.0 | Privilege drop at entrypoint |
 
 Alpine is pinned at **3.23, not 3.24**, and that pin is load-bearing: 3.24 ships

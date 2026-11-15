@@ -86,7 +86,7 @@ const KIND_LABELS: Record<SiteKind, string> = {
   customer_premise: "Customer premise",
 };
 
-function SiteEditorModal({
+export function SiteEditorModal({
   existing,
   sites,
   onClose,
@@ -210,6 +210,13 @@ function SiteEditorModal({
               onChange={(e) => setParentId(e.target.value)}
             >
               <option value="">— none —</option>
+              {/* A parent the role may not read is not in the list; keep
+                  it selected and say so rather than drawing "none" (#4188). */}
+              {parentId && !sites.some((s) => s.id === parentId) && (
+                <option value={parentId}>
+                  Linked (not visible to your role)
+                </option>
+              )}
               {sites
                 .filter((s) => !cycleBlockedIds.has(s.id))
                 .map((s) => (

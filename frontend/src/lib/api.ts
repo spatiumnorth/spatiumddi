@@ -11962,6 +11962,11 @@ export interface ChangeRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  /** Whether the caller may approve this row, from the server's own approve
+   * check (#4189). False once the row is no longer pending. */
+  can_approve: boolean;
+  /** The server's refusal text when a pending row is not approvable. */
+  approve_blocked_reason: string | null;
 }
 
 export interface ChangeRequestListParams {

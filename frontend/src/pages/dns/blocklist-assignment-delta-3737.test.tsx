@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * #3737: Apply / Detach / bulk Apply / Save scope change only THIS group's
+ * #3737: Apply / Detach / bulk Apply / the Edit dialog's scope section change only THIS group's
  * membership, sent as deltas — never the whole set built from the tab's copy.
  */
 import {
@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const updateAssignments = vi.fn();
 const list = vi.fn();
+const get = vi.fn();
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -29,6 +30,7 @@ vi.mock("@/lib/api", async () => {
     dnsBlocklistApi: {
       ...actual.dnsBlocklistApi,
       list: (...a: unknown[]) => list(...a),
+      get: (...a: unknown[]) => get(...a),
       updateAssignments: (...a: unknown[]) => updateAssignments(...a),
     },
     dnsApi: {
@@ -39,7 +41,7 @@ vi.mock("@/lib/api", async () => {
   };
 });
 
-import { BlocklistScopeModal, BlocklistsTab } from "./DNSPage";
+import { BlocklistModal, BlocklistsTab } from "./DNSPage";
 
 const group = { id: "g1", name: "Group1" } as never;
 const mkList = (id: string, name: string, groups: string[]) => ({
@@ -89,19 +91,21 @@ describe("blocklist assignment deltas (#3737)", () => {
     });
   });
 
-  it("an untouched Save scope sends nothing that replaces a set", async () => {
+  it("an untouched Edit Save sends nothing that replaces a set", async () => {
     updateAssignments.mockResolvedValue({});
+    const l = mkList("l1", "ads-list", ["g1", "g2"]);
+    get.mockResolvedValue(l);
+    const onClose = vi.fn();
     wrap(
-      <BlocklistScopeModal
-        list={mkList("l1", "ads-list", ["g1", "g2"]) as never}
-        group={group}
-        views={[]}
-        onClose={() => {}}
+      <BlocklistModal
+        list={l as never}
+        scope={{ group, views: [] }}
+        onClose={onClose}
       />,
     );
-    await userEvent.click(screen.getByRole("button", { name: /Save scope/ }));
-    await waitFor(() => expect(updateAssignments).toHaveBeenCalled());
-    expect(updateAssignments).toHaveBeenCalledWith("l1", {});
+    await userEvent.click(await screen.findByRole("button", { name: /^Save/ }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAssignments).not.toHaveBeenCalled();
   });
 
   it("row Detach sends a remove delta for this group only", async () => {
@@ -154,28 +158,29 @@ describe("blocklist assignment deltas (#3737)", () => {
     });
   });
 
-  it("Save scope sends only the view ticks that changed", async () => {
+  it("Edit's scope section sends only the view ticks that changed", async () => {
     updateAssignments.mockResolvedValue({});
     const views = [
       { id: "v1", name: "inside", group_id: "g1", match_clients: [] },
       { id: "v2", name: "outside", group_id: "g1", match_clients: [] },
     ];
+    const l = {
+      ...mkList("l1", "ads-list", ["g2"]),
+      applied_view_ids: ["v1", "v-other-group"],
+    };
+    get.mockResolvedValue(l);
     wrap(
-      <BlocklistScopeModal
-        list={
-          {
-            ...mkList("l1", "ads-list", ["g2"]),
-            applied_view_ids: ["v1", "v-other-group"],
-          } as never
-        }
-        group={group}
-        views={views as never}
+      <BlocklistModal
+        list={l as never}
+        scope={{ group, views: views as never }}
         onClose={() => {}}
       />,
     );
-    await userEvent.click(screen.getByRole("checkbox", { name: /inside/ }));
+    await userEvent.click(
+      await screen.findByRole("checkbox", { name: /inside/ }),
+    );
     await userEvent.click(screen.getByRole("checkbox", { name: /outside/ }));
-    await userEvent.click(screen.getByRole("button", { name: /Save scope/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Save/ }));
     await waitFor(() => expect(updateAssignments).toHaveBeenCalled());
     expect(updateAssignments).toHaveBeenCalledWith("l1", {
       add_view_ids: ["v2"],
