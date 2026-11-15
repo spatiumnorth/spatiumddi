@@ -341,6 +341,8 @@ async def test_feed_sync_counts_and_wildcards(
         source_type="url",
         feed_url="http://example.com/list.txt",
         feed_format="domains",
+        # "always": a bare domain is exact under the default by_syntax (#4190).
+        feed_wildcard_mode="always",
         # Deliberately wrong to start with, so a task that never writes
         # the field would fail rather than coincidentally match.
         entry_count=999,
@@ -486,27 +488,38 @@ async def test_feed_wildcard_flag_defaults_on_and_drives_new_rows(
         await dns_tasks._refresh_blocklist_feed_async(bl_id)
 
     wide = DNSBlockList(
-        name="wide", source_type="url", feed_url="http://x/1", feed_format="domains"
+        name="wide",
+        source_type="url",
+        feed_url="http://x/1",
+        feed_format="domains",
+        feed_wildcard_mode="always",
+    )
+    plain = DNSBlockList(
+        name="plain", source_type="url", feed_url="http://x/3", feed_format="domains"
     )
     narrow = DNSBlockList(
         name="narrow",
         source_type="url",
         feed_url="http://x/2",
         feed_format="domains",
-        feed_entries_are_wildcard=False,
+        feed_wildcard_mode="never",
     )
-    db_session.add_all([wide, narrow])
+    db_session.add_all([wide, narrow, plain])
     await db_session.commit()
-    # The column default applies without the caller passing anything.
-    assert wide.feed_entries_are_wildcard is True
+    # The column default applies without the caller passing anything (#4190).
+    assert plain.feed_wildcard_mode == "by_syntax"
 
     await _run(str(wide.id), "a.example.com\n")
     await _run(str(narrow.id), "b.example.com\n")
+    await _run(str(plain.id), "c.example.com\n*.d.example.com\n")
 
     rows = (await db_session.execute(select(DNSBlockListEntry))).scalars().all()
     by_domain = {r.domain: r for r in rows}
     assert by_domain["a.example.com"].is_wildcard is True
     assert by_domain["b.example.com"].is_wildcard is False
+    # by_syntax: a bare domain is exact, a ``*.`` line is wildcard.
+    assert by_domain["c.example.com"].is_wildcard is False
+    assert by_domain["d.example.com"].is_wildcard is True
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,6 @@ import {
   RefreshCw,
   RotateCcw,
   ScrollText,
-  Square,
 } from "lucide-react";
 
 import {
@@ -95,7 +94,7 @@ export function ContainersTab() {
           {listReadErrorMessage(error, "the pods")}
         </FormError>
       )}
-      {/* A refused Restart / Stop / Start used to say nothing (#1342). */}
+      {/* A refused Restart used to say nothing (#1342). */}
       {action.isError && (
         <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           {formatApiError(action.error, "Pod action failed")}
@@ -150,15 +149,13 @@ function ContainerCard({
   onLogs: () => void;
   busy: boolean;
 }) {
-  // #1342 — a pod's Restart / Stop / Start takes `admin` on `appliance`.
+  // #1342 — a pod's Restart takes `admin` on `appliance`.
   const applianceGate = useApplianceAdminGate();
   // Pod log text takes `admin` on `appliance`; the button is not drawn
   // for a role that would be refused.
   const canReadLogs = useCanReadApplianceLogs();
-  const isRunning = container.state === "running";
-  // #4212 — Stop / Restart / Start act on the first click otherwise, and a
-  // stopped DNS or DHCP pod stays down until someone presses Start.
-  const [pending, setPending] = useState<ContainerAction | null>(null);
+  // #4212 — Restart acts on the first click otherwise.
+  const [confirmRestart, setConfirmRestart] = useState(false);
   const healthTone =
     container.health === "healthy"
       ? "text-emerald-600 dark:text-emerald-400"
@@ -211,30 +208,14 @@ function ContainerCard({
               Logs
             </button>
           )}
-          {container.is_spatium && isRunning && (
-            <>
-              <ActionButton
-                icon={RotateCcw}
-                label="Restart"
-                onClick={() => setPending("restart")}
-                disabled={busy}
-                {...applianceGate}
-              />
-              <ActionButton
-                icon={Square}
-                label="Stop"
-                onClick={() => setPending("stop")}
-                disabled={busy}
-                destructive
-                {...applianceGate}
-              />
-            </>
-          )}
-          {container.is_spatium && !isRunning && (
+          {/* A pod has no Stop / Start: stopping one means scaling its owning
+              workload, which this page does not do (#4232). Restart deletes
+              the pod and its controller recreates it. */}
+          {container.is_spatium && (
             <ActionButton
-              icon={Play}
-              label="Start"
-              onClick={() => setPending("start")}
+              icon={RotateCcw}
+              label="Restart"
+              onClick={() => setConfirmRestart(true)}
               disabled={busy}
               {...applianceGate}
             />
@@ -242,38 +223,18 @@ function ContainerCard({
         </div>
       </div>
       <ConfirmModal
-        open={pending !== null}
-        title={
-          pending
-            ? `${pending[0].toUpperCase()}${pending.slice(1)} ${container.name}?`
-            : ""
-        }
-        message={pending ? containerActionMessage(pending, container) : null}
-        confirmLabel={
-          pending ? `${pending[0].toUpperCase()}${pending.slice(1)}` : "Confirm"
-        }
-        tone={pending === "stop" ? "destructive" : "default"}
-        autoFocusCancel={pending === "stop"}
-        onClose={() => setPending(null)}
+        open={confirmRestart}
+        title={`Restart ${container.name}?`}
+        message={`Restart ${container.name}? Its service is briefly unavailable on this node while it comes back up.`}
+        confirmLabel="Restart"
+        onClose={() => setConfirmRestart(false)}
         onConfirm={() => {
-          if (pending) onAction(pending);
-          setPending(null);
+          onAction("restart");
+          setConfirmRestart(false);
         }}
       />
     </div>
   );
-}
-
-function containerActionMessage(
-  action: ContainerAction,
-  container: ApplianceContainer,
-) {
-  const name = container.name;
-  if (action === "stop")
-    return `Stop ${name}? Its service (DNS, DHCP or a control-plane component) stops answering on this node until you start it again.`;
-  if (action === "restart")
-    return `Restart ${name}? Its service is briefly unavailable on this node while it comes back up.`;
-  return `Start ${name}? Its service resumes on this node.`;
 }
 
 function ActionButton({

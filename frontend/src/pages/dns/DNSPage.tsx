@@ -11799,7 +11799,7 @@ function BlocklistModalFormBody({
     list?.update_interval_hours ?? 24,
   );
   const [feedWildcard, setFeedWildcard] = useState(
-    list?.feed_entries_are_wildcard ?? true,
+    list?.feed_wildcard_mode ?? "by_syntax",
   );
   const [enabled, setEnabled] = useState(list?.enabled ?? true);
   const [error, setError] = useState("");
@@ -11863,7 +11863,7 @@ function BlocklistModalFormBody({
               block_mode: list.block_mode ?? "nxdomain",
               sinkhole_ip: list.sinkhole_ip ?? null,
               update_interval_hours: list.update_interval_hours ?? 24,
-              feed_entries_are_wildcard: list.feed_entries_are_wildcard ?? true,
+              feed_wildcard_mode: list.feed_wildcard_mode ?? "by_syntax",
               enabled: list.enabled ?? true,
             },
             body,
@@ -11971,27 +11971,40 @@ function BlocklistModalFormBody({
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
               />
             </Field>
-            <label className="flex items-start gap-2 text-sm">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={feedWildcard}
-                onChange={(e) => setFeedWildcard(e.target.checked)}
-              />
-              <span>
-                Block subdomains of feed entries
-                <span className="block text-xs text-muted-foreground">
-                  On (recommended): a feed naming <code>tracker.example</code>{" "}
-                  also blocks <code>cdn.tracker.example</code> — what these
-                  lists mean. Turn off only for a feed listing specific hosts,
-                  where blocking the parent domain would be too broad.
-                  {list &&
-                    list.feed_entries_are_wildcard !== feedWildcard &&
-                    " Saving restamps the entries already imported, which" +
-                      " takes a few seconds on a large list."}
-                </span>
+            <Field label="Block subdomains of feed entries">
+              <select
+                className={inputCls}
+                value={feedWildcard}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "by_syntax" || v === "always" || v === "never")
+                    setFeedWildcard(v);
+                }}
+              >
+                <option value="by_syntax">By syntax (recommended)</option>
+                <option value="always">Always block subdomains</option>
+                <option value="never">Never (exact names only)</option>
+              </select>
+              <span className="block text-xs text-muted-foreground mt-1">
+                By syntax: an adblock <code>||tracker.example^</code> rule (or a{" "}
+                <code>*.tracker.example</code> line) also blocks{" "}
+                <code>cdn.tracker.example</code>; a hosts line (
+                <code>0.0.0.0 tracker.example</code>) or a bare domain blocks
+                only that name, as AdGuard Home does. Always: every entry also
+                blocks its subdomains, for a plain-domain feed that means
+                &ldquo;this domain and everything under it&rdquo;. Never: exact
+                names only, for a feed of specific hosts.
+                {list &&
+                  list.feed_wildcard_mode !== feedWildcard &&
+                  feedWildcard !== "by_syntax" &&
+                  " Saving restamps the entries already imported, which" +
+                    " takes a few seconds on a large list."}
+                {list &&
+                  list.feed_wildcard_mode !== feedWildcard &&
+                  feedWildcard === "by_syntax" &&
+                  " Saving refreshes the feed to apply it."}
               </span>
-            </label>
+            </Field>
           </>
         )}
         <label className="flex items-center gap-2 text-sm">

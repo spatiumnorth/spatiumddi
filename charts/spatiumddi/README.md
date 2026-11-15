@@ -333,7 +333,7 @@ them:
 | `api.probes.liveness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `10` / `30` / `30` / `4` | #1051 — `/health/live` budgets, sized for a busy single-worker loop: four 30 s misses restart a process that has said nothing for two minutes |
 | `api.probes.readiness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `5` / `10` / `15` / `3` | #1051 — `/health/ready` budgets; the timeout exceeds the handler's own bounded worst case (4 s db + 4 s schema + 2 s redis) so the kubelet sees the 503 naming the failing check instead of a bare deadline |
 | `api.serviceControl.enabled` | `false` | Sets `SERVICE_CONTROL_ENABLED` on the api — what the Services screen's capability probe reports |
-| `api.serviceControlRBAC.enabled` | `false` | Grants the api ServiceAccount `list` + `patch` on Deployments / StatefulSets / DaemonSets. Needs `serviceAccount.enabled` |
+| `api.serviceControlRBAC.enabled` | `false` | Grants the api ServiceAccount `list` + `patch` on Deployments / StatefulSets / DaemonSets, and `delete` on pods (Cluster → Pods Restart, #4232). Needs `serviceAccount.enabled` |
 | `frontend.replicas` | `2` |  |
 | `frontend.service.type` / `.port` | `ClusterIP` / `80` |  |
 | `frontend.apiUpstream.host` | `""` (→ `{{ fullname }}-api`) | nginx-proxy target Service name |

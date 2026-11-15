@@ -23,11 +23,11 @@ import uuid
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
@@ -46,6 +46,7 @@ from app.core.safe_fetch import (
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.audit import AuditLog
 from app.models.dns import (
+    FEED_WILDCARD_MODES,
     DNSBlockList,
     DNSBlockListEntry,
     DNSBlockListException,
@@ -81,6 +82,18 @@ VALID_ENTRY_TYPES = {"block", "redirect", "nxdomain"}
 # update_interval_hours: 0 = manual refresh only; otherwise the hourly sweep
 # refreshes the feed once the interval has passed (#1467). Capped at a year.
 MAX_UPDATE_INTERVAL_HOURS = 8760
+
+
+def _check_wildcard_mode(v: str) -> str:
+    """``feed_wildcard_mode`` is ``by_syntax``, ``always`` or ``never`` (#4190)."""
+    if v not in FEED_WILDCARD_MODES:
+        raise ValueError(f"feed_wildcard_mode must be one of {list(FEED_WILDCARD_MODES)}")
+    return v
+
+
+def _legacy_wildcard_mode(flag: bool) -> str:
+    """The pre-#4190 boolean, read as the explicit choice it was."""
+    return "always" if flag else "never"
 
 
 def _check_block_mode(v: str | None) -> str | None:
@@ -181,9 +194,26 @@ class BlockListCreate(BaseModel):
     update_interval_hours: int = 24
     block_mode: str = "nxdomain"
     sinkhole_ip: str | None = None
-    # Feed rows block subdomains too. Default on — see the model.
-    feed_entries_are_wildcard: bool = True
+    # How feed entries treat subdomains — see the model. ``by_syntax`` by default.
+    feed_wildcard_mode: str = "by_syntax"
+    # Deprecated boolean spelling (#4190): True = "always", False = "never".
+    # Ignored when ``feed_wildcard_mode`` is sent.
+    feed_entries_are_wildcard: bool | None = None
     enabled: bool = True
+
+    @field_validator("feed_wildcard_mode")
+    @classmethod
+    def _v_wildcard_mode(cls, v: str) -> str:
+        return _check_wildcard_mode(v)
+
+    @model_validator(mode="after")
+    def _fold_legacy_wildcard(self) -> Self:
+        if "feed_wildcard_mode" not in self.model_fields_set:
+            legacy = self.feed_entries_are_wildcard
+            if legacy is not None:
+                self.feed_wildcard_mode = _legacy_wildcard_mode(legacy)
+        self.feed_entries_are_wildcard = None
+        return self
 
     @field_validator("source_type")
     @classmethod
@@ -232,8 +262,25 @@ class BlockListUpdate(BaseModel):
     update_interval_hours: int | None = None
     block_mode: str | None = None
     sinkhole_ip: str | None = None
+    feed_wildcard_mode: str | None = None
+    # Deprecated boolean spelling (#4190); ``feed_wildcard_mode`` wins.
     feed_entries_are_wildcard: bool | None = None
     enabled: bool | None = None
+
+    @field_validator("feed_wildcard_mode")
+    @classmethod
+    def _v_wildcard_mode(cls, v: str | None) -> str | None:
+        return None if v is None else _check_wildcard_mode(v)
+
+    @model_validator(mode="after")
+    def _fold_legacy_wildcard(self) -> Self:
+        legacy = self.feed_entries_are_wildcard
+        if legacy is not None and "feed_wildcard_mode" not in self.model_fields_set:
+            self.feed_wildcard_mode = _legacy_wildcard_mode(legacy)
+            self.model_fields_set.add("feed_wildcard_mode")
+        self.model_fields_set.discard("feed_entries_are_wildcard")
+        self.feed_entries_are_wildcard = None
+        return self
 
     @field_validator("source_type")
     @classmethod
@@ -300,6 +347,8 @@ class BlockListResponse(BaseModel):
     update_interval_hours: int
     block_mode: str
     sinkhole_ip: str | None
+    feed_wildcard_mode: str
+    # Legacy view of ``feed_wildcard_mode``: False only for "never".
     feed_entries_are_wildcard: bool
     enabled: bool
     last_synced_at: datetime | None
@@ -495,6 +544,7 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         update_interval_hours=bl.update_interval_hours,
         block_mode=bl.block_mode,
         sinkhole_ip=bl.sinkhole_ip,
+        feed_wildcard_mode=bl.feed_wildcard_mode,
         feed_entries_are_wildcard=bl.feed_entries_are_wildcard,
         enabled=bl.enabled,
         last_synced_at=bl.last_synced_at,
@@ -803,13 +853,12 @@ def _build_from_source(
         feed_format=src["feed_format"],
         update_interval_hours=update_interval_hours,
         block_mode=block_mode,
-        # Per-source, defaulting on (#894). Every catalog entry today is a
-        # "block this domain and everything under it" list, so none set it
-        # — the key exists for a host-specific feed (a threat-intel drop of
-        # individual C2 FQDNs), where blocking the parent domain would be
-        # over-blocking. Left absent rather than stamped `true` on every
-        # entry, which would be noise carrying no information.
-        feed_entries_are_wildcard=bool(src.get("entries_are_wildcard", True)),
+        # Per-source ``wildcard_mode`` (#4190), default ``by_syntax``: the
+        # entry follows its line's syntax. Set to ``always`` for a
+        # plain-domain feed whose publisher means "this domain and
+        # everything under it" (HaGeZi's ``wildcard/`` lists, OISD
+        # ``domainswild``), where a bare line would otherwise read as exact.
+        feed_wildcard_mode=str(src.get("wildcard_mode", "by_syntax")),
         enabled=enabled,
     )
 
@@ -1173,7 +1222,7 @@ async def create_blocklist(
     _reject_masked_feed_url(body.feed_url)
     await _guard_feed_target(body.feed_url)
 
-    bl = DNSBlockList(**body.model_dump())
+    bl = DNSBlockList(**body.model_dump(exclude={"feed_entries_are_wildcard"}))
     db.add(bl)
     await db.flush()
     db.add(
@@ -1216,7 +1265,7 @@ async def update_blocklist(
             "feed_format",
             "update_interval_hours",
             "block_mode",
-            "feed_entries_are_wildcard",
+            "feed_wildcard_mode",
             "enabled",
         },
     )
@@ -1234,14 +1283,16 @@ async def update_blocklist(
         _reject_masked_feed_url(changes["feed_url"])
         await _guard_feed_target(changes["feed_url"])
     wildcard_flipped = (
-        "feed_entries_are_wildcard" in changes
-        and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard
+        "feed_wildcard_mode" in changes and changes["feed_wildcard_mode"] != bl.feed_wildcard_mode
     )
     before = snapshot(bl, changes)
     for k, v in changes.items():
         setattr(bl, k, v)
 
-    if wildcard_flipped:
+    # ``by_syntax`` cannot be restamped from the stored rows (they do not
+    # remember which syntax they came from); the refresh below does it.
+    resync_for_syntax = wildcard_flipped and bl.feed_wildcard_mode == "by_syntax"
+    if wildcard_flipped and not resync_for_syntax:
         # Restamp the rows already stored (#894). The refresh task diffs by
         # domain and never revisits an unchanged one, so without this the
         # toggle would appear to do nothing until a feed's contents
@@ -1267,7 +1318,7 @@ async def update_blocklist(
                 DNSBlockListEntry.list_id == bl.id,
                 DNSBlockListEntry.source == "feed",
             )
-            .values(is_wildcard=bl.feed_entries_are_wildcard)
+            .values(is_wildcard=bl.feed_wildcard_mode == "always")
         )
 
     db.add(
@@ -1283,6 +1334,8 @@ async def update_blocklist(
     await db.commit()
     reloaded = await _require_list(list_id, db)
     _wake_blocklist_groups(reloaded)
+    if resync_for_syntax:
+        _enqueue_initial_refresh(reloaded)
     return await _respond(db, reloaded)
 
 

@@ -131,3 +131,34 @@ async def test_httpx_messages_quoting_the_url_do_not_leak(
         httpx.ReadTimeout(f"timed out for url '{_SECRET_URL}'"),
     ):
         _assert_clean(await _probe(client, db_session, exc))
+
+
+async def _syslog_test(client: AsyncClient, db: AsyncSession, protocol: str, send: AsyncMock):
+    h = await _admin(db)
+    body = {
+        "name": f"sl-{protocol}",
+        "enabled": False,
+        "kind": "syslog",
+        "host": "192.0.2.30",
+        "port": 514,
+        "protocol": protocol,
+    }
+    created = (await client.post(_TARGETS, headers=h, json=body)).json()
+    with patch.object(svc, "_send_syslog", new=send):
+        return await client.post(f"{_TARGETS}/{created['id']}/test", headers=h)
+
+
+async def test_udp_syslog_test_never_claims_delivery_4237(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    resp = await _syslog_test(client, db_session, "udp", AsyncMock())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "sent" and data["confirmed"] is False
+    assert data["target"] == "sl-udp" and "cannot be confirmed" in data["detail"]
+
+
+async def test_tcp_syslog_test_still_ok_4237(client: AsyncClient, db_session: AsyncSession) -> None:
+    resp = await _syslog_test(client, db_session, "tcp", AsyncMock())
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "ok", "target": "sl-tcp"}
