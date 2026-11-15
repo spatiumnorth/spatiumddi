@@ -26,6 +26,7 @@ ACL / forwarder configuration on the SpatiumDDI side post-import.
 from __future__ import annotations
 
 import io
+import ipaddress
 import re
 import tarfile
 import zipfile
@@ -44,6 +45,7 @@ from .canonical import (
     ImportedSOA,
     ImportedZone,
     ImportPreview,
+    settle_replica_zones,
 )
 
 
@@ -282,6 +284,109 @@ def _zone_list_directive(body: str, name: str) -> list[str]:
     ]
 
 
+# ── masters / primaries (#4259) ──────────────────────────────────────
+
+# ``masters`` and ``primaries`` are one statement (BIND's old and new
+# name). The lookbehind keeps ``default-primaries`` / ``also-notify``-style
+# hyphenated names out. A top-level definition carries a NAME
+# (``masters corp port 5353 { … };``); a zone's own list has none.
+_MASTERS_OPTS = r"((?:\s+(?:port|dscp)\s+\d+)*)"
+_MASTERS_LIST_DEF_RE = re.compile(
+    r"(?<![\w-])(?:masters|primaries)\s+(?!port\b|dscp\b)([A-Za-z_][\w.-]*)"
+    + _MASTERS_OPTS
+    + r"\s*\{"
+)
+_ZONE_MASTERS_RE = re.compile(r"(?<![\w-])(?:masters|primaries)" + _MASTERS_OPTS + r"\s*\{")
+_PORT_RE = re.compile(r"\bport\s+(\d+)\b")
+
+
+def _balanced_inner(text: str, open_pos: int) -> str | None:
+    try:
+        inner, _ = _balanced_block(text, open_pos)
+    except ImportSourceError:
+        return None
+    return inner
+
+
+def _collect_master_lists(conf_text: str) -> dict[str, tuple[str, int | None]]:
+    """Top-level named lists: ``{name: (body, default port)}``."""
+
+    lists: dict[str, tuple[str, int | None]] = {}
+    for m in _MASTERS_LIST_DEF_RE.finditer(conf_text):
+        inner = _balanced_inner(conf_text, m.end() - 1)
+        if inner is None:
+            continue
+        port = _PORT_RE.search(m.group(2))
+        lists.setdefault(m.group(1), (inner, int(port.group(1)) if port else None))
+    return lists
+
+
+def _master_entry(host: str, port: int | None) -> str | None:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if port is None or port == 53:
+        return host
+    return f"{host}@{port}" if 1 <= port <= 65535 else None
+
+
+def _resolve_masters(
+    inner: str,
+    default_port: int | None,
+    lists: dict[str, tuple[str, int | None]],
+    problems: list[str],
+    seen: tuple[str, ...] = (),
+) -> list[str]:
+    """Flatten one masters list (addresses, ``port N``, ``key`` / ``tls``
+    clauses, references to named lists) to ``ip`` / ``ip@port`` entries.
+    What cannot be read lands in ``problems``."""
+
+    out: list[str] = []
+    for token in inner.split(";"):
+        words = token.split()
+        if not words:
+            continue
+        head = words[0].strip('"')
+        pm = _PORT_RE.search(token)
+        port = int(pm.group(1)) if pm else default_port
+        clause = {w for w in words[1:] if w in {"key", "tls"}}
+        entry = _master_entry(head, port)
+        if entry is not None:
+            if clause:
+                problems.append(
+                    f"master {head} carries a {'/'.join(sorted(clause))} clause, "
+                    "which is not imported (set per-primary TSIG / TLS on the zone afterwards)"
+                )
+            out.append(entry)
+        elif head in lists and head not in seen:
+            body, list_port = lists[head]
+            out.extend(_resolve_masters(body, port or list_port, lists, problems, (*seen, head)))
+        elif head in lists:
+            problems.append(f"masters list {head!r} refers to itself")
+        else:
+            problems.append(
+                f"master {head!r} is neither an address nor a masters list defined in named.conf"
+            )
+    return out
+
+
+def _zone_masters(
+    body: str, lists: dict[str, tuple[str, int | None]], problems: list[str]
+) -> list[str]:
+    masters: list[str] = []
+    for m in _ZONE_MASTERS_RE.finditer(body):
+        inner = _balanced_inner(body, m.end() - 1)
+        if inner is None:
+            problems.append("a masters list is not closed")
+            continue
+        port = _PORT_RE.search(m.group(1))
+        for entry in _resolve_masters(inner, int(port.group(1)) if port else None, lists, problems):
+            if entry not in masters:
+                masters.append(entry)
+    return masters
+
+
 # ── Archive unpack ───────────────────────────────────────────────────
 
 
@@ -439,7 +544,11 @@ def _normalize_zone_name(name: str) -> str:
 
 
 def _parse_one_zone(
-    decl: _NamedConfZone, root: Path, conf_dir: Path, options_dir: str | None
+    decl: _NamedConfZone,
+    root: Path,
+    conf_dir: Path,
+    options_dir: str | None,
+    master_lists: dict[str, tuple[str, int | None]] | None = None,
 ) -> ImportedZone:
     """Turn one named.conf zone declaration into the canonical
     :class:`ImportedZone` shape. Per-zone parse errors land in
@@ -470,6 +579,12 @@ def _parse_one_zone(
     records: list[ImportedRecord] = []
     skipped: dict[str, int] = {}
     warnings: list[str] = []
+
+    masters: list[str] = []
+    if zone_type in {"secondary", "stub"}:
+        problems: list[str] = []
+        masters = _zone_masters(body, master_lists or {}, problems)
+        warnings.extend(f"Zone {fqdn!r}: {p}" for p in problems)
 
     file_value = _zone_directive(body, "file")
     if zone_type in {"primary", "secondary"} and file_value:
@@ -543,6 +658,7 @@ def _parse_one_zone(
         records=records,
         view_name=decl.view,
         forwarders=forwarders,
+        masters=masters,
         skipped_record_types=skipped,
         parse_warnings=warnings,
     )
@@ -607,6 +723,7 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                 + (" " + " ".join(warnings) if warnings else "")
             )
 
+        master_lists = _collect_master_lists(conf_text)
         zones: list[ImportedZone] = []
         seen_views: set[str] = set()
         for decl in decls:
@@ -626,7 +743,7 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                     "not zone data SpatiumDDI serves."
                 )
                 continue
-            zones.append(_parse_one_zone(decl, root, named_conf.parent, options_dir))
+            zones.append(_parse_one_zone(decl, root, named_conf.parent, options_dir, master_lists))
             if decl.view is not None:
                 seen_views.add(decl.view)
 
@@ -640,6 +757,10 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                 "Phase 1 collapses everything to the default view; enable issue #24 (DNS Views) "
                 "to separate them at apply time."
             )
+
+        # #4259 — a secondary / stub zone imports with its masters and none of
+        # its file's records; one with no readable master is left out, named.
+        zones = settle_replica_zones(zones, warnings)
 
         if not zones:
             raise ImportSourceError(
