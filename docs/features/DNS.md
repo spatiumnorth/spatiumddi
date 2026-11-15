@@ -554,9 +554,9 @@ BIND 9.20.29:
 | Data | Resident, per copy |
 |---|---|
 | Authoritative zone, 200,000 A records | about 86 MiB (about 0.45 kB per record) |
-| RPZ zone, 100,000 entries (200,000 policy records) | about 135 MiB (about 1.4 kB per entry) |
+| RPZ zone, 100,000 entries (200,000 policy records) | about 135 MiB (about 1.4 kB per entry) on 9.20.29; about 1.0 kB per owner on 9.20.30 with jemalloc (see §8.0) |
 
-So a view adds roughly **1.4 kB × entries** for each list it applies, and
+So a view adds roughly **1.1 kB × entries** (the estimate; measured 0.93 - 1.04 kB, see §8.0) for each list it applies, and
 nothing for the authoritative zones it shares. A 190,000-entry list costs
 about 260 MiB per view that applies it. If a view exists only to give some
 clients a different blocklist, size the DNS pod for one copy of every list
@@ -569,7 +569,7 @@ agents run under. It warns; it never refuses a change.
 
 - *The estimate*: 400 MiB for named and the agent at idle, plus about
   0.45 kB per record of each zone copy named loads (a copy shared through
-  `in-view` counts once), plus about 1.4 kB per RPZ owner name per view that
+  `in-view` counts once), plus about 1.1 kB per RPZ owner name per view that
   loads it. RPZ owners are counted as the bundle builds each view's zone:
   every domain once across the lists it draws on (the §8 first-writer dedup),
   plus exception domains, which render as passthru owners. Records of a
@@ -1323,7 +1323,7 @@ RPZ zones:
 
 | | Measured |
 |---|---|
-| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone) |
+| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone; about 1.0 kB on 9.20.30, see below) |
 | agent while it renders | about 1.0 - 1.2 GB, plus short-lived children |
 | the pod's peak | 2.8 GB on the first apply, 3.6 GB on the next |
 
@@ -1358,6 +1358,63 @@ list beside its own); BIND cannot share an RPZ zone between views, so that
 factor stays (see §2, "What a view costs in memory"). So 582k entries x 2 zones is about 3.9 GB and
 needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
+
+### Blocklist memory: measured on BIND 9.20.30 (#4183)
+
+These figures come from a before/after run on a dev host: BIND 9.20.30 on
+Alpine 3.24, one group, the AdGuard DNS filter, HaGeZi TIF mini and
+StevenBlack unified lists plus 300 manual entries (454,421 entries, 416,344
+distinct owners). "Before" is `release/1.0.1` as of the run; "after" adds the
+fixes listed below. Resident figures are `named` VmRSS read from the
+container's cgroup, in MiB. **Measured** means read off that run;
+**estimated** means derived or extrapolated.
+
+| Measured | Before | After |
+|---|---|---|
+| Steady, 1 view, whole RPZ loaded (cold restart) | 622 | 578 |
+| Steady, same record count (639,994 records) in both | 619 - 626 | 536 - 541 |
+| Full reload, peak / settled | 1,008 / 681 | 940 / 584 |
+| Small list edit (+2 / -3 domains), peak | 1,010 | 596 |
+| Second view applying the same lists, steady | 1,002 | 887 |
+| Second view removed again | 619 | 477 |
+
+- **Per-view cost** (measured): the second view added about 385 MiB before
+  and about 414 MiB after, for 416k owners, so roughly 1.0 kB per owner name
+  per view. That is the figure to plan with; the 1.4 kB this page gave before was
+  measured on an older build and a smaller list.
+- **Reload peak** (measured): a full reload of the RPZ peaks about 400 MiB
+  above steady state, because named holds the old and the new zone at once.
+  Size the limit for the peak, not the steady figure.
+- **What changed it** (measured, in this run): jemalloc in the BIND9 image
+  (#4192) lowers steady RSS by about 80 MiB at the same record count;
+  syntax-aware wildcards (#4190) stop wildcarding hosts-format entries,
+  which halved the records for a hosts-only list (135,293 to 67,652);
+  incremental RPZ updates (#4191) remove the reload for a small edit, so the
+  peak is steady state plus about 10 MiB instead of plus about 330 MiB, as
+  long as the change stays under the incremental budget (a larger change
+  falls back to a reload); the group `max-cache-size` setting (#4185) is
+  applied and honoured by named, but this run's query load never filled even
+  a 64 MiB cache, so its effect on RSS is **not measured**.
+- **After a reload** (measured): on the build with #4191, `rndc reload`
+  no longer re-reads the RPZ, because the zone is dynamic; use
+  `rndc freeze`, then `rndc thaw`.
+- **Not measured**: a cache-bound RSS difference, the server-list memory
+  column in the UI, arm64, and anything above about 640k records. Figures
+  for other list sizes are **estimated** by scaling the per-owner cost.
+
+The control plane's estimate and the measurement agree within about 30 %.
+The memory warning (§2) uses 1.1 kB per owner per view, taken from this run
+(measured 0.93 - 1.04 kB) with a margin for the reload peak the estimate
+leaves out. It does not account for
+the reload peak, which is why the warning threshold is 80 % of the limit.
+
+**DNSRPS is not supported (#4183).** `dnsrps-enable` hands RPZ lookups to
+`librpz`, a proprietary provider (Farsight / DomainTools) that cannot be
+redistributed. ISC deprecated DNSRPS in BIND 9.20 and removed it in 9.21
+([announcement](https://lists.isc.org/pipermail/bind-users/2024-August/108841.html),
+[9.21.3 notes](https://mirrorservice.org/sites/ftp.isc.org/isc/bind/9.21.3/doc/arm/html/notes.html)),
+and our image is built without it. The supported route is native RPZ with
+incremental updates (#4191).
 
 **That peak is paid only when a list changed (#2157).** The control plane
 ships a content hash with each RPZ zone, and the agent records it beside the
