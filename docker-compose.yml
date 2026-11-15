@@ -334,9 +334,8 @@ services:
   # Third DNS driver, alongside bind9/powerdns. Distinct profile + host
   # port (6053, avoiding 1053/5453) so all three can run side-by-side in
   # a dev/migration setup. Technitium's web console + API listen on
-  # 0.0.0.0 / [::]:5380 (plain HTTP, #1776), not loopback: every container
-  # on this network can reach it, and with host networking so can the LAN
-  # (firewall TCP 5380). The agent calls it over 127.0.0.1; the admin
+  # 127.0.0.1:5380 only (plain HTTP, #1776; the agent pins the bind), so no
+  # port is published and other containers cannot reach it. The admin
   # password is random per install.
   dns-technitium:
     profiles: ["dns-technitium"]

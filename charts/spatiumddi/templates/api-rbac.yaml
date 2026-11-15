@@ -6,7 +6,11 @@
 
        * **Pod listing + logs** (formerly /appliance/containers).
          Reads ``pods`` + ``pods/log`` in the chart's target
-         namespace (default ``spatium``).
+         namespace (default ``spatium``). Also what Platform Insights >
+         Containers uses on a plain Helm install (#3761); it lists only
+         pods labelled as ours and resolves a log request's pod name
+         against that fresh listing, so these two rules need no
+         separate toggle beyond ``api.serviceAccount.enabled``.
 
        * **TLS Secret patch** (formerly cert deploy to a docker
          volume + SIGHUP). Reads + patches the
@@ -23,8 +27,9 @@
                             after a Secret change)
 
        Scope is namespace-only — no cluster-scoped permissions,
-       no permission to write pods / deployments other than
-       annotation patches. */}}
+       pods can be deleted only with ``api.serviceControlRBAC.enabled``
+       (#4232). No other writes to pods / deployments beyond annotation
+       patches. */}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -73,6 +78,14 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets"]
     verbs: ["get", "list", "patch"]
+  # #4232 — Appliance -> Cluster -> Pods Restart deletes the pod and its
+  # controller recreates it. Namespace-scoped like everything here; the api
+  # refuses a pod no controller owns (``container_action``). Gated with the
+  # rest of service control rather than granted on the read-only SA a plain
+  # Helm install gets, and the appliance turns this block on.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
   {{- end }}
   {{- if .Values.api.upgradeOrchestratorRBAC.enabled }}
   # #296 Phase C/D/E — the rolling-upgrade orchestrator reads

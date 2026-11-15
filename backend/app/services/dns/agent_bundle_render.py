@@ -100,6 +100,7 @@ async def render_and_store(
         records=rendered.records,
         render_ms=render_ms,
         rendered_by=rendered_by,
+        packed_blocklists=rendered.packed_blocklists,
     )
     return RenderOutcome(
         bundle=row,

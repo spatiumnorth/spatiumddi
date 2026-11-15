@@ -13,10 +13,13 @@
  */
 
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
+import { Check, Pencil, Play, Plus, Send, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   settingsApi,
@@ -28,6 +31,7 @@ import {
   type AuditForwardTargetWrite,
   formatApiError,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50";
@@ -144,12 +148,21 @@ export function AuditForwardTargets({
     null,
   );
   const [testState, setTestState] = useState<
-    Record<string, { status: "ok" | "error"; msg: string } | undefined>
+    Record<string, { status: "ok" | "sent" | "error"; msg: string } | undefined>
   >({});
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: (id: string) => settingsApi.deleteAuditTarget(id),
     onSuccess: () => {
+      setDeleteError(null);
+      qc.invalidateQueries({ queryKey: ["audit-forward-targets"] });
+      setConfirmDelete(null);
+    },
+    // A refused delete (403 / 404 / 409) says why and re-reads the list, so
+    // a row already deleted elsewhere leaves it (#3822).
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({ queryKey: ["audit-forward-targets"] });
       setConfirmDelete(null);
     },
@@ -158,9 +171,16 @@ export function AuditForwardTargets({
   async function doTest(id: string) {
     try {
       const r = await settingsApi.testAuditTarget(id);
+      // UDP syslog cannot confirm delivery (#4237): never say "delivered".
+      const sent = r.status === "sent";
       setTestState((s) => ({
         ...s,
-        [id]: { status: "ok", msg: `delivered to ${r.target}` },
+        [id]: sent
+          ? {
+              status: "sent",
+              msg: `sent to ${r.target} over UDP — delivery cannot be confirmed`,
+            }
+          : { status: "ok", msg: `delivered to ${r.target}` },
       }));
     } catch (e) {
       const msg = formatApiError(e, "delivery failed");
@@ -193,6 +213,15 @@ export function AuditForwardTargets({
           </button>
         )}
       </div>
+
+      {deleteError && (
+        <div
+          role="alert"
+          className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400"
+        >
+          {deleteError}
+        </div>
+      )}
 
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[800px] text-xs">
@@ -303,11 +332,15 @@ export function AuditForwardTargets({
                             "ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] " +
                             (ts.status === "ok"
                               ? "bg-emerald-500/15 text-emerald-600"
-                              : "bg-red-500/15 text-red-600")
+                              : ts.status === "sent"
+                                ? "bg-muted text-muted-foreground"
+                                : "bg-red-500/15 text-red-600")
                           }
                         >
                           {ts.status === "ok" ? (
                             <Check className="h-3 w-3" />
+                          ) : ts.status === "sent" ? (
+                            <Send className="h-3 w-3" />
                           ) : (
                             <X className="h-3 w-3" />
                           )}
@@ -357,22 +390,18 @@ export function AuditForwardTargets({
         </table>
       </div>
 
-      {editing && (
+      {editing?.mode === "create" && (
         <TargetModal
-          initial={
-            editing.mode === "create" ? EMPTY : targetToBody(editing.row)
-          }
-          existingId={editing.mode === "edit" ? editing.row.id : undefined}
-          urlSet={editing.mode === "edit" ? editing.row.url_set : false}
-          urlDisplay={editing.mode === "edit" ? editing.row.url_display : ""}
-          authHeaderSet={
-            editing.mode === "edit" ? editing.row.auth_header_set : false
-          }
-          smtpPasswordSet={
-            editing.mode === "edit" ? editing.row.smtp_password_set : false
-          }
+          initial={EMPTY}
+          urlSet={false}
+          urlDisplay=""
+          authHeaderSet={false}
+          smtpPasswordSet={false}
           onClose={() => setEditing(null)}
         />
+      )}
+      {editing?.mode === "edit" && (
+        <EditAuditTarget row={editing.row} onClose={() => setEditing(null)} />
       )}
 
       {confirmDelete && (
@@ -404,6 +433,42 @@ export function AuditForwardTargets({
   );
 }
 
+// Edit reads the target when it opens (#3926) and the Save sends only what
+// the operator changed against what was read.
+function EditAuditTarget({
+  row,
+  onClose,
+}: {
+  row: AuditForwardTarget;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<AuditForwardTarget>(row, () =>
+    refetchRow<AuditForwardTarget>(qc, [["audit-forward-targets"]], row.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Audit Forward Target"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return (
+    <TargetModal
+      initial={targetToBody(fresh.row)}
+      existingId={fresh.row.id}
+      urlSet={fresh.row.url_set}
+      urlDisplay={fresh.row.url_display}
+      authHeaderSet={fresh.row.auth_header_set}
+      smtpPasswordSet={fresh.row.smtp_password_set}
+      onClose={onClose}
+    />
+  );
+}
+
 function TargetModal({
   initial,
   existingId,
@@ -424,34 +489,74 @@ function TargetModal({
   const qc = useQueryClient();
   const [form, setForm] = useState<AuditForwardTargetWrite>(initial);
   const [clearAuthHeader, setClearAuthHeader] = useState(false);
+  const [clearSmtpPassword, setClearSmtpPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // #4135 — a new webhook URL (write-only, so any value typed is a move) or
+  // a moved SMTP host / port needs the stored credential entered again.
+  const reaskWebhook = form.kind === "webhook";
+  const reaskSmtp = form.kind === "smtp";
+  const reask = useCredentialReask(
+    reaskWebhook
+      ? { url: form.url ?? "" }
+      : { smtp_host: form.smtp_host, smtp_port: form.smtp_port },
+    !existingId
+      ? null
+      : reaskWebhook
+        ? { url: "" }
+        : reaskSmtp
+          ? { smtp_host: initial.smtp_host, smtp_port: initial.smtp_port }
+          : null,
+    () => {
+      setForm((f) => ({ ...f, auth_header: null, smtp_password: null }));
+      setClearAuthHeader(false);
+      setClearSmtpPassword(false);
+    },
+  );
+  const mustEnterAuthHeader =
+    reaskWebhook &&
+    form.webhook_flavor === "generic" &&
+    reask.asks(authHeaderSet) &&
+    !clearAuthHeader &&
+    !form.auth_header;
+  const mustEnterSmtpPassword =
+    reaskSmtp &&
+    reask.asks(smtpPasswordSet) &&
+    !clearSmtpPassword &&
+    !form.smtp_password;
 
   const saveMut = useMutation({
     mutationFn: async () => {
-      const body: AuditForwardTargetWrite = { ...form };
-      // A blank URL or header on edit means "keep what's on file" — the
-      // server never sends either back, so the field always starts empty.
-      if (existingId && !body.url) {
-        delete body.url;
+      // The three write-only secrets are handled apart from the plain
+      // fields: blank (untouched, or typed then erased) keeps what is on
+      // file, and only an explicit checkbox (or, for the URL, a new value)
+      // changes one.
+      const { url, auth_header, smtp_password, ...plain } = form;
+      if (plain.resource_types && plain.resource_types.length === 0) {
+        plain.resource_types = null;
       }
+      // Edit sends only what the operator changed against what the dialog
+      // read when it opened (#3926), so a field another client set since is
+      // not put back. Create sends the whole form.
+      const body: Partial<AuditForwardTargetWrite> = existingId
+        ? changedFields(initial as unknown as Record<string, unknown>, plain)
+        : { ...plain };
+      if (url) body.url = url;
       if (clearAuthHeader) {
         body.auth_header = "";
-      } else if (existingId && !body.auth_header) {
-        delete body.auth_header;
+      } else if (auth_header) {
+        body.auth_header = auth_header;
       }
-      // Same dance for SMTP password — ``null`` (default on edit) means
-      // "keep". Empty string keeps as is; the operator opens a separate
-      // dialog to clear if they ever need to.
-      if (existingId && smtpPasswordSet && body.smtp_password === null) {
-        delete body.smtp_password;
-      }
-      if (body.resource_types && body.resource_types.length === 0) {
-        body.resource_types = null;
+      if (clearSmtpPassword) {
+        body.smtp_password = "";
+      } else if (smtp_password) {
+        body.smtp_password = smtp_password;
       }
       if (existingId) {
+        if (Object.keys(body).length === 0) return null;
         return settingsApi.updateAuditTarget(existingId, body);
       }
-      return settingsApi.createAuditTarget(body);
+      return settingsApi.createAuditTarget(body as AuditForwardTargetWrite);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["audit-forward-targets"] });
@@ -473,9 +578,9 @@ function TargetModal({
     >
       <div className="space-y-3">
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+          <FormError className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="grid grid-cols-2 gap-3">
@@ -728,12 +833,20 @@ function TargetModal({
                     onChange={(e) =>
                       setForm({ ...form, auth_header: e.target.value })
                     }
+                    required={mustEnterAuthHeader}
                     placeholder={
-                      authHeaderSet
-                        ? "(stored — leave blank to keep unchanged)"
-                        : "Bearer …"
+                      reask.asks(authHeaderSet)
+                        ? reask.placeholder
+                        : authHeaderSet
+                          ? "(stored — leave blank to keep unchanged)"
+                          : "Bearer …"
                     }
                   />
+                  {reask.asks(authHeaderSet) && (
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {reask.hint} Or remove it below.
+                    </div>
+                  )}
                 </label>
                 {existingId && authHeaderSet && (
                   <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -826,16 +939,35 @@ function TargetModal({
                   autoComplete="new-password"
                   className={inputCls}
                   value={form.smtp_password ?? ""}
+                  disabled={clearSmtpPassword}
                   onChange={(e) =>
                     setForm({ ...form, smtp_password: e.target.value })
                   }
+                  required={mustEnterSmtpPassword}
                   placeholder={
-                    smtpPasswordSet
-                      ? "(stored — leave blank to keep unchanged)"
-                      : ""
+                    reask.asks(smtpPasswordSet)
+                      ? reask.placeholder
+                      : smtpPasswordSet
+                        ? "(stored — leave blank to keep unchanged)"
+                        : ""
                   }
                 />
+                {reask.asks(smtpPasswordSet) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    {reask.hint} Or remove it below.
+                  </div>
+                )}
               </label>
+              {existingId && smtpPasswordSet && (
+                <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={clearSmtpPassword}
+                    onChange={(e) => setClearSmtpPassword(e.target.checked)}
+                  />
+                  Remove the stored password
+                </label>
+              )}
             </div>
             <label className="block">
               <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
@@ -941,7 +1073,12 @@ function TargetModal({
           </button>
           <button
             onClick={() => saveMut.mutate()}
-            disabled={saveMut.isPending || !form.name}
+            disabled={
+              saveMut.isPending ||
+              !form.name ||
+              mustEnterAuthHeader ||
+              mustEnterSmtpPassword
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : existingId ? "Save" : "Create"}

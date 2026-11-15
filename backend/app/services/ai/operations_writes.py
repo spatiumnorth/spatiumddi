@@ -1980,7 +1980,7 @@ def _dns_preview_text(preview: Any, apex_ns_policy: str = "keep") -> str:
         + apex
         + (
             f"; {unsafe} record(s) will NOT be imported (a CNAME beside other data, "
-            "or at the zone apex)"
+            "or at the zone apex, or a name BIND check-names refuses)"
             if unsafe
             else ""
         )

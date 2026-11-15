@@ -23,8 +23,10 @@ timing, and the captured stdout/stderr. The socket-based tools
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
+import socket
 import uuid
 from typing import Final, Literal
 
@@ -111,27 +113,80 @@ _BLOCKED_NETWORKS: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ..
 )
 
 
-def is_blocked_target(value: str) -> bool:
-    """Return True if ``value`` is an IP literal in a blocked range.
-
-    Only IP literals are classified here. A *hostname* returns False —
-    the caller is responsible for resolving it (see
-    :func:`assert_target_allowed`); we never silently treat an
-    unresolvable name as allowed-because-unclassified at the socket
-    layer, but a plain hostname that DNS later maps into a blocked range
-    is the documented follow-up caveat below.
-    """
-    value = value.strip()
+def _numeric_ipv4(value: str) -> ipaddress.IPv4Address | None:
+    """Parse the short / decimal / hex / octal IPv4 spellings the system
+    resolver accepts (``127.1``, ``2130706433``, ``0x7f000001``)."""
     try:
-        ip = ipaddress.ip_address(value)
+        return ipaddress.IPv4Address(socket.inet_ntoa(socket.inet_aton(value)))
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def is_blocked_target(value: str) -> bool:
+    """Return True if ``value`` is a blocked address, however it is spelled.
+
+    Covers IP literals, the non-canonical numeric IPv4 forms the system
+    resolver accepts (``127.1``, ``2130706433``, ``0x7f000001``) and the
+    ``localhost`` names. Any other hostname returns False here — a name that
+    DNS maps into a blocked range is caught where the name is resolved
+    (:func:`resolve_checked_target`).
+    """
+    value = value.strip().rstrip(".")
+    try:
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(value)
     except ValueError:
-        return False
+        lowered = value.lower()
+        if lowered == "localhost" or lowered.endswith(".localhost"):
+            return True
+        numeric = _numeric_ipv4(value)
+        if numeric is None:
+            return False
+        ip = numeric
     # ``ip.ipv4_mapped`` unwraps ::ffff:127.0.0.1 etc so a mapped
     # loopback / link-local can't sneak past the v4 networks.
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         ip = mapped
     return any(ip in net for net in _BLOCKED_NETWORKS)
+
+
+async def _getaddrinfo(host: str) -> list:
+    return await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+
+
+async def resolve_checked_target(host: str) -> tuple[str | None, str | None]:
+    """Resolve ``host`` once; return ``(address, None)`` or ``(None, error)``.
+
+    Every answer is checked and ONE blocked answer refuses the name. Callers
+    connect to the returned address, not the name, so the address that was
+    checked is the address dialled.
+    """
+    blocked = (
+        f"target {host!r} is in a blocked range (loopback / link-local / "
+        "cloud-metadata) and cannot be reached by this tool"
+    )
+    if is_blocked_target(host):
+        return None, blocked
+    canonical = host.strip()
+    numeric = _numeric_ipv4(canonical)
+    if numeric is not None:
+        canonical = str(numeric)
+    try:
+        infos = await _getaddrinfo(canonical)
+    except (OSError, UnicodeError) as exc:
+        return None, f"DNS resolution failed: {exc}"
+    chosen: str | None = None
+    for info in infos:
+        addr = info[4][0]
+        if not isinstance(addr, str):
+            continue
+        if is_blocked_target(addr.split("%", 1)[0]):
+            return None, blocked
+        if chosen is None:
+            chosen = addr
+    if chosen is None:
+        return None, f"{host!r} did not resolve to a usable address"
+    return chosen, None
 
 
 def assert_target_allowed(value: str) -> str:
@@ -146,14 +201,9 @@ def assert_target_allowed(value: str) -> str:
     Returns the normalised host on success; raises ``ValueError`` (→ 422
     for Pydantic callers) on a blocked literal.
 
-    Hostname caveat (follow-up): when ``value`` is a hostname we validate
-    its shape but do not pre-resolve it here, so a name whose A/AAAA
-    record points into a blocked range is not caught at this layer. The
-    socket tools could still reach loopback / metadata via a crafted DNS
-    name. Closing that requires resolving the name with the same address
-    the socket will connect to (getaddrinfo) and re-checking each result;
-    tracked as a follow-up. IP literals — the common SSRF vector — are
-    blocked here unconditionally.
+    Hostnames are checked for shape here and, for the socket tools, ping,
+    traceroute, mtr and dig ``@server``, resolved and checked again where the
+    tool runs (:func:`resolve_checked_target`), which then uses the address.
     """
     host = validate_host(value)
     if is_blocked_target(host):
@@ -532,6 +582,7 @@ __all__ = [
     "WhoisRequest",
     "assert_target_allowed",
     "is_blocked_target",
+    "resolve_checked_target",
     "validate_host",
     "validate_host_or_cidr",
 ]

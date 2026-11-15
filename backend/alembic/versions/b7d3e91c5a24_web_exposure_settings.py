@@ -10,7 +10,7 @@ mitigation is off.
 The module row is deliberately NOT seeded (CLAUDE.md non-negotiable #14).
 
 Revision ID: b7d3e91c5a24
-Revises: ede3bcd2aff4
+Revises: b6d2e9f41a07
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "b7d3e91c5a24"
-down_revision: str | None = "ede3bcd2aff4"
+down_revision: str | None = "b6d2e9f41a07"
 branch_labels: str | None = None
 depends_on: str | None = None
 

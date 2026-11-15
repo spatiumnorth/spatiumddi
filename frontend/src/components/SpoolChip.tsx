@@ -1,5 +1,11 @@
 import type { AgentSpoolStatus } from "@/lib/api";
-import { formatAge, formatBytes, spoolState } from "@/lib/spool-status";
+import {
+  formatAge,
+  formatBytes,
+  formatCount,
+  formatLag,
+  spoolState,
+} from "@/lib/spool-status";
 
 /**
  * Chip surfacing an agent's durable push spool (#1077).
@@ -59,6 +65,30 @@ export function SpoolChip({
         title={title}
       >
         Spool trimmed
+      </span>
+    );
+  }
+
+  if (state.kind === "pending") {
+    const age = formatLag(state.lagSeconds);
+    const title = [
+      "This agent is behind on delivering events to the control plane. They are held in the agent's memory or still unread in Kea's lease file, so nothing is queued on disk yet. Nothing is lost; the agent catches up once the control plane keeps pace.",
+      `\n\n${state.estimated > 0 ? "about " : ""}${formatCount(state.events)} events waiting`,
+      state.estimated > 0
+        ? ` (${formatCount(state.estimated)} estimated from the unread lease file)`
+        : "",
+      `, oldest ${age} ago as of its last report`,
+      state.unreadBytes > 0
+        ? `\n${formatBytes(state.unreadBytes)} of lease file not read yet`
+        : "",
+    ].join("");
+    return (
+      <span
+        className={`inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400 ${className}`}
+        title={title}
+      >
+        Behind {age}: {state.estimated > 0 ? "~" : ""}
+        {formatCount(state.events)} events
       </span>
     );
   }

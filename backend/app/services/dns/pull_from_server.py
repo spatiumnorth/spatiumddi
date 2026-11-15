@@ -804,14 +804,29 @@ async def pull_zone_from_server(
 _PUSHABLE_TYPES = frozenset({"A", "AAAA", "CNAME", "MX", "TXT", "PTR", "SRV", "NS", "TLSA"})
 
 
+#: #3817 — an agentless push of more than this many records is queued as
+#: record ops instead of being sent inside the request. Every agentless driver
+#: but Windows DNS makes one provider call per record, so a zone of thousands
+#: of records outruns the reverse proxy's timeout; the ``pending`` ops are
+#: drained, with retry and backoff, by ``apply_pending_agentless_ops``.
+INLINE_PUSH_MAX_RECORDS = 200
+
+
 async def _queue_for_agent(
     db: AsyncSession,
     server: Any,
     zone: DNSZone,
     rows: list[DNSRecord],
     payloads: list[dict[str, Any]],
+    *,
+    agentless: bool = False,
 ) -> PushResult:
-    """Agent-managed server: hand the missing rows to its record-op queue (#2667).
+    """Hand the missing rows to the server's record-op queue (#2667).
+
+    An agent-managed server applies them on its next poll. With
+    ``agentless`` (#3817, a zone too large to push inside the request) the
+    ``pending`` rows are drained by the agentless retry sweep instead, so
+    there is no agent to wake.
 
     The control plane has no RFC 2136 / driver path to an agent-managed
     server (the agent applies ops against loopback ``named``), so calling
@@ -880,7 +895,8 @@ async def _queue_for_agent(
             ]
         )
         await db.flush()
-        collect_wake(dns_server_channel(server.id))
+        if not agentless:
+            collect_wake(dns_server_channel(server.id))
     return PushResult(
         candidates=len(rows),
         pushed=len(pushed_records),
@@ -900,6 +916,7 @@ async def _additive_push(
     *,
     apply: bool,
     skip_apex_ns: bool = False,
+    inline_only: bool = False,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
     the driver. Errors are collected, not raised, so one bad record
@@ -998,8 +1015,16 @@ async def _additive_push(
     ]
     await stamp_rrsets_for_ops(db, zone, payloads)
 
-    if not is_agentless(primary.driver):
-        queued = await _queue_for_agent(db, primary, zone, candidate_rows, payloads)
+    # ``inline_only`` (a zone move, a rollback restore) never queues: those
+    # callers act on the zone elsewhere in the same request (a move deletes
+    # it from the source provider), so a merely QUEUED push would leave the
+    # target answering with an empty or partial zone until the sweep caught up.
+    if not is_agentless(primary.driver) or (
+        candidates > INLINE_PUSH_MAX_RECORDS and not inline_only
+    ):
+        queued = await _queue_for_agent(
+            db, primary, zone, candidate_rows, payloads, agentless=is_agentless(primary.driver)
+        )
         queued.already_matched = already_matched
         return queued
 
@@ -1078,7 +1103,7 @@ async def _additive_push(
 
 
 async def restore_zone_records_to_server(
-    db: AsyncSession, server: Any, driver: Any, zone: DNSZone
+    db: AsyncSession, server: Any, driver: Any, zone: DNSZone, *, inline_only: bool = True
 ) -> PushResult:
     """Push ``zone``'s records back to one agentless ``server`` (#1613).
 
@@ -1116,7 +1141,9 @@ async def restore_zone_records_to_server(
                 server=str(server.id),
                 error=str(exc) or type(exc).__name__,
             )
-    return await _additive_push(db, server, driver, zone, on_wire, rows, apply=True)
+    return await _additive_push(
+        db, server, driver, zone, on_wire, rows, apply=True, inline_only=inline_only
+    )
 
 
 async def sync_zone_with_server(

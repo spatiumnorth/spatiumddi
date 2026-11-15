@@ -734,3 +734,32 @@ async def test_sync_with_server_refuses_a_forward_zone(
     await db_session.commit()
     with pytest.raises(ValueError, match="conditional forwarder"):
         await sync_zone_with_server(db_session, zone, apply=False)
+
+
+async def test_secondary_zone_records_are_not_compared_4057(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """#4057 — a secondary's records come from its primary by transfer and
+    SpatiumDDI holds none, so the transferred records are not "extra"."""
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="sec.example.com."
+    )
+    zone.zone_type = "secondary"
+    await db_session.commit()
+
+    class _Driver:
+        async def pull_zone_records(
+            self, server: Any, zone_name: str, *, tsig: Any = None, **_k: Any
+        ) -> list[RecordData]:
+            return [
+                RecordData(name="www", record_type="A", value="192.0.2.1", ttl=300),
+                RecordData(name="ns1", record_type="A", value="192.0.2.2", ttl=300),
+            ]
+
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _Driver())
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    s = report.servers[0]
+    assert s.extra_on_server == []
+    assert s.missing_on_server == []
+    assert s.status != "drift"
+    assert any("secondary zone" in w and "SpatiumDDI does not hold" in w for w in report.warnings)

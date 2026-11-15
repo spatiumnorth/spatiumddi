@@ -196,6 +196,19 @@ def check(manifest: dict[str, Any], root: pathlib.Path) -> tuple[list[str], int]
                     f"(manifest says {name} is {version})"
                 )
 
+    # #3913 -- backend/ is its own build context, so the api image copies the
+    # licence texts from backend/legal/. They must stay byte-identical to the
+    # repo-root files, or /licenses in that image drifts from the project's.
+    if (root / "backend" / "Dockerfile").is_file():
+        for fname in ("LICENSE", "NOTICE"):
+            checked += 1
+            top, copy = root / fname, root / "backend" / "legal" / fname
+            if not copy.is_file() or top.read_bytes() != copy.read_bytes():
+                problems.append(
+                    f"backend/legal/{fname} must be a byte-identical copy of {fname} "
+                    f"(cp {fname} backend/legal/{fname})"
+                )
+
     return problems, checked
 
 

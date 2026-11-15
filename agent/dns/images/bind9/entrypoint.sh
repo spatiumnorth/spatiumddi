@@ -55,6 +55,11 @@ EOF
         /var/lib/spatium-dns-agent/rndc.conf || true
 fi
 
+# #4192 -- named's allocator is jemalloc, tuned through the /etc/malloc.conf
+# symlink baked into the image (see the Dockerfile for why not MALLOC_CONF).
+# SPATIUM_MALLOC_CONF replaces its value; only possible when started as root.
+/usr/local/bin/spatium-malloc-conf
+
 # Supervise: agent process manages named lifecycle
 if [ "$(id -u)" = "0" ]; then
     exec su-exec spatium:spatium /usr/local/bin/spatium-dns-agent
