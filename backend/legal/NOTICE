@@ -83,6 +83,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - node (frontend build stage) — MIT — https://nodejs.org
 - ASP.NET Core runtime (Technitium agent image) — MIT — https://dotnet.microsoft.com
 - tini — MIT — https://github.com/krallin/tini
+- jemalloc — BSD-2-Clause — https://jemalloc.net
 - su-exec — MIT — https://github.com/ncopa/su-exec
 - gosu — Apache 2.0 — https://github.com/tianon/gosu
 

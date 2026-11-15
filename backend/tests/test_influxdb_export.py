@@ -966,6 +966,7 @@ async def test_update_applies_only_the_keys_it_carries(
     # Another client changes several fields.
     other = {
         "url": "http://influx2:8086",
+        "token": "re-entered-with-the-new-url",
         "bucket": "other",
         "measurement_prefix": "xq_",
         "push_dhcp_metrics": False,
