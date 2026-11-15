@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 /**
  * WebhooksPage — admin surface for typed-event subscriptions.
  *
@@ -98,6 +99,18 @@ export function SubscriptionEditor({
   // replace them, and the checkbox below clears them.
   const [headers, setHeaders] = useState<string>("");
   const [clearHeaders, setClearHeaders] = useState(false);
+  // #4135 — a moved URL needs the stored custom headers (they carry the
+  // credentials) typed again, or removed.
+  const reask = useCredentialReask(
+    { url },
+    existing && { url: existing.url },
+    () => {
+      setHeaders("");
+      setClearHeaders(false);
+    },
+  );
+  const mustEnterHeaders =
+    reask.asks(existing?.headers_set) && !clearHeaders && !headers.trim();
   const [timeoutSeconds, setTimeoutSeconds] = useState(
     existing?.timeout_seconds ?? 10,
   );
@@ -379,11 +392,17 @@ export function SubscriptionEditor({
         </div>
 
         <Field
-          label="Custom headers (optional)"
+          label={
+            reask.asks(existing?.headers_set)
+              ? "Custom headers (required)"
+              : "Custom headers (optional)"
+          }
           hint={
-            existing && existing.headers_set
-              ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
-              : "One header per line, ‘Key: value’ format. Values are encrypted at rest and never shown again. ‘X-SpatiumDDI-*’ reserved for the platform."
+            reask.asks(existing?.headers_set)
+              ? `${reask.hint} Or tick the box to remove them.`
+              : existing && existing.headers_set
+                ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
+                : "One header per line, ‘Key: value’ format. Values are encrypted at rest and never shown again. ‘X-SpatiumDDI-*’ reserved for the platform."
           }
         >
           <textarea
@@ -392,10 +411,13 @@ export function SubscriptionEditor({
             disabled={clearHeaders}
             onChange={(e) => setHeaders(e.target.value)}
             placeholder={
-              existing && existing.headers_set
-                ? "(stored — leave blank to keep)"
-                : `Authorization: Bearer …\nX-Custom: value`
+              reask.asks(existing?.headers_set)
+                ? reask.placeholder
+                : existing && existing.headers_set
+                  ? "(stored — leave blank to keep)"
+                  : `Authorization: Bearer …\nX-Custom: value`
             }
+            required={mustEnterHeaders}
           />
           {existing && existing.headers_set && (
             <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
@@ -459,7 +481,9 @@ export function SubscriptionEditor({
           </button>
           <button
             type="button"
-            disabled={!name.trim() || !url.trim() || mut.isPending}
+            disabled={
+              !name.trim() || !url.trim() || mustEnterHeaders || mut.isPending
+            }
             onClick={() => mut.mutate()}
             className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
