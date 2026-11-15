@@ -1,0 +1,150 @@
+# SpatiumDDI API / worker / beat / migrate — Red Hat UBI 9 variant (#3913).
+# Published as ghcr.io/spatiumnorth/spatiumddi-api:<version>-ubi. Same app, same
+# CMD as backend/Dockerfile; the Debian base becomes ubi9/ubi-minimal with Python 3.12
+# from the UBI AppStream, and the apt package set becomes UBI RPMs + PGDG's
+# postgresql16 client. NOT in the UBI repos, so not in this image: ``whois`` and
+# ``traceroute`` (the Tools page returns its structured "binary missing" result for
+# those two) and libnfs (the NFS backup destination raises NfsUnavailableError).
+# Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11). The build context is
+# ./backend, as for the Debian image.
+
+# ── Stage 1: build dependencies ───────────────────────────────────────────────
+# Every dependency in requirements.txt ships a manylinux wheel for cp312 on both
+# x86_64 and aarch64 (checked with ``pip download --only-binary=:all:``), including
+# lxml and xmlsec (which bundle their native libraries), so no -devel packages are
+# needed: UBI carries neither xmlsec1-devel nor libxmlsec1-dev's equivalents.
+FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8 AS builder
+
+WORKDIR /build
+
+RUN dnf -y --setopt=install_weak_deps=False install python3.12 python3.12-pip \
+    && dnf clean all
+
+COPY pyproject.toml requirements.txt ./
+
+RUN mkdir -p app && touch app/__init__.py && \
+    python3.12 -m pip install --no-cache-dir --only-binary=:all: --prefix=/install -c requirements.txt .
+
+# #2895 — the machine-made Python third-party notice list, served by the About
+# page. Generated here, from the packages the runtime image actually receives
+# (the ``/install`` prefix above), and copied into the runtime stage as one
+# static text file. ``pip-licenses`` itself lives in a throwaway venv and never
+# reaches the runtime image. It blanks PYTHONPATH before it asks the interpreter
+# named by ``--python`` for its search path, so ``/opt/py-install`` is a
+# two-line wrapper that puts ``/install`` back; the builder's own pip /
+# setuptools / wheel are left out (the runtime removes pip, #1392).
+# ``--with-system`` is required, not cosmetic: without it pip-licenses drops
+# the names of its OWN dependencies (prettytable, wcwidth, …) from the report
+# even when they come from the inspected interpreter, so ``wcwidth`` — a real
+# runtime dependency — went missing from the list. A list that is short looks
+# exactly like a clean pass, so the build fails unless every distribution in
+# ``/install`` (bar the excluded four) is named in it.
+ARG PIP_LICENSES_VERSION=5.5.5
+RUN python3.12 -m venv /opt/pip-licenses \
+    && /opt/pip-licenses/bin/pip install --no-cache-dir "pip-licenses==${PIP_LICENSES_VERSION}" \
+    && printf '#!/bin/sh\nPYTHONPATH=/install/lib/python3.12/site-packages exec /usr/bin/python3.12 "$@"\n' > /opt/py-install \
+    && chmod +x /opt/py-install \
+    && mkdir -p /install/share/spatiumddi \
+    && /opt/pip-licenses/bin/pip-licenses --python=/opt/py-install \
+         --format=plain-vertical --with-system --with-urls --with-authors \
+         --with-license-file --no-license-path \
+         --ignore-packages pip setuptools wheel spatiumddi \
+         --output-file=/install/share/spatiumddi/third-party-python.txt \
+    && python3.12 -c "import importlib.metadata as m, re, sys; n = lambda s: re.sub(r'[-_.]+', '-', s).lower(); listed = {n(l.strip()) for l in open(sys.argv[1], encoding='utf-8')}; want = {n(d.metadata['Name']) for d in m.distributions(path=[sys.argv[2]])} - {'pip', 'setuptools', 'wheel', 'spatiumddi'}; miss = sorted(want - listed); assert len(want) > 50 and not miss, f'third-party-python.txt is missing {miss} ({len(want)} installed)'" \
+         /install/share/spatiumddi/third-party-python.txt /install/lib/python3.12/site-packages
+
+
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9@sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9 AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    NMAP_PRIVILEGED=1
+    # NMAP_PRIVILEGED=1 and the file capabilities below: see backend/Dockerfile.
+
+WORKDIR /app
+
+# PGDG's postgresql16 client: the client major must match the postgres 16 server we
+# ship (pg_dump 17 emits directives a 16 server rejects). The key is pinned by sha256
+# (fingerprint D4BF 08AE 67A0 B4C7 A1DB CCD2 40BC A2B4 08B4 0D20) and imported before
+# the repo is enabled; the repo is disabled again afterwards and ``microdnf upgrade``
+# only sees the UBI repos. ``RPM_SNAPSHOT`` busts the cached layer for the
+# nightly/weekly rebuild, like APT_SNAPSHOT in the Debian image.
+ARG RPM_SNAPSHOT=dev
+ARG PGDG_KEY_DIGEST=a70c9527426017d00fa4e6f9d2941d515357a27a7be82e155248ece53bbe5453
+RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
+    && microdnf -y upgrade \
+    && microdnf -y --setopt=install_weak_deps=0 --nodocs install \
+        python3.12 libxml2 xmlsec1-openssl nmap tcpdump iputils mtr bind-utils \
+        libcap shadow-utils ca-certificates tzdata \
+    && curl -fsSL -o /tmp/pgdg.key https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL \
+    && echo "${PGDG_KEY_DIGEST}  /tmp/pgdg.key" | sha256sum -c - \
+    && rpm --import /tmp/pgdg.key && rm -f /tmp/pgdg.key \
+    && printf '[pgdg16]\nname=PostgreSQL 16 for RHEL 9\nbaseurl=https://download.postgresql.org/pub/repos/yum/16/redhat/rhel-9-$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=0\n' > /etc/yum.repos.d/pgdg16.repo \
+    && microdnf -y --setopt=install_weak_deps=0 --nodocs install postgresql16 \
+    && rm -f /etc/yum.repos.d/pgdg16.repo \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
+    && setcap cap_net_raw+eip /usr/sbin/tcpdump \
+    && getcap /usr/sbin/tcpdump | grep -q cap_net_raw \
+    && getcap /usr/bin/nmap | grep -q cap_net_raw \
+    && /usr/pgsql-16/bin/pg_dump --version \
+    && microdnf -y clean all && rm -rf /var/cache/dnf /var/cache/yum
+ENV PATH=/usr/pgsql-16/bin:$PATH
+
+# Non-root user 1001 (preflight RunAsNonRoot wants a numeric USER). #3852: OpenShift
+# runs a random uid in group 0, so the writable paths are group 0 + g=u; ``app``
+# (1001) still owns them everywhere else.
+RUN useradd --uid 1001 --gid 0 --no-create-home --shell /bin/false app \
+    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images /var/lib/spatiumddi/pcaps \
+    && chmod 0700 /var/lib/spatiumddi/pcaps \
+    && chown 1001:0 /app \
+    && chown -R 1001:0 /var/lib/spatiumddi \
+    && chmod -R g=u /var/lib/spatiumddi
+
+COPY --from=builder /install /usr/local
+
+# No package installer at runtime (#1392): UBI's python3.12 does not install pip;
+# assert it stays that way.
+RUN ! python -c "import pip" 2>/dev/null
+
+COPY --chown=1001:0 . .
+
+ARG APP_VERSION=
+ENV APP_VERSION=${APP_VERSION}
+
+# #3913 — labels + /licenses (see backend/Dockerfile). The python and postgresql
+# licence texts come from the installed RPMs.
+ARG IMAGE_RELEASE=1
+COPY legal/LICENSE legal/NOTICE /licenses/
+RUN mkdir -p /licenses/python /licenses/postgresql \
+    && cp -a /usr/share/licenses/python3.12*/. /licenses/python/ 2>/dev/null || true; \
+    cp -a /usr/share/licenses/postgresql16*/. /licenses/postgresql/ 2>/dev/null || true; \
+    cp /usr/local/share/spatiumddi/third-party-python.txt /licenses/third-party-python.txt
+LABEL name="spatiumddi-api" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI API, worker, beat and migrate image" \
+      description="FastAPI control plane for the SpatiumDDI DDI (DNS, DHCP, IPAM) platform. The same image runs the API, Celery worker, Celery beat and the migration job." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="spatiumddi-api" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+USER 1001
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
+
+# Identical to backend/Dockerfile; see the comments there.
+CMD ["python", "-m", "spatium_uvicorn", "app.main:app", "--port", "8000", "--workers", "1", "--no-proxy-headers", "--timeout-graceful-shutdown", "20"]

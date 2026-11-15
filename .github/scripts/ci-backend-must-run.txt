@@ -158,6 +158,7 @@ docs/PRIVACY.md
 # covered the day it lands; add it here too so editing it runs that test.
 .github/workflows/build-dns-images.yml
 .github/workflows/build-dhcp-images.yml
+.github/workflows/build-ubi-images.yml
 .github/workflows/build-looking-glass-images.yml
 .github/workflows/build-supervisor-image.yml
 
