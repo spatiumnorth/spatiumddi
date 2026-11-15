@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { Link } from "react-router-dom";
@@ -34,6 +35,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // One-shot snippet operators can paste into Settings → Control
 // Plane → Integrations on UniFi OS to mint an API key with the
@@ -446,6 +448,24 @@ export function ControllerModal({
   const hasStoredPassword = !!controller?.password_present;
   const hasStoredCaBundle = !!controller?.ca_bundle_present;
 
+  // #4135 — a moved address needs the stored credential entered again.
+  const reask = useCredentialReask(
+    { mode, host, port, cloudHostId },
+    controller && {
+      mode: controller.mode,
+      host: controller.host,
+      port: controller.port,
+      cloudHostId: controller.cloud_host_id,
+    },
+    () => {
+      setApiKey("");
+      setPassword("");
+    },
+  );
+  const mustEnterKey = authKind === "api_key" && reask.asks(hasStoredApiKey);
+  const mustEnterPassword =
+    authKind === "user_password" && reask.asks(hasStoredPassword);
+
   // Cloud + user_password is illegal — flip to api_key when mode
   // switches to cloud so the form doesn't carry an invalid combo.
   function setModeAndFix(m: "local" | "cloud") {
@@ -728,18 +748,24 @@ export function ControllerModal({
             </select>
           </Field>
           {authKind === "api_key" ? (
-            <Field label="API key" className="col-span-2">
+            <Field
+              label="API key"
+              className="col-span-2"
+              hint={mustEnterKey ? reask.hint : undefined}
+            >
               <input
                 type="password"
                 className={`${inputCls} font-mono text-[11px]`}
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={
-                  editing && hasStoredApiKey
-                    ? "••• stored — enter to replace"
-                    : "<api key>"
+                  mustEnterKey
+                    ? reask.placeholder
+                    : editing && hasStoredApiKey
+                      ? "••• stored — enter to replace"
+                      : "<api key>"
                 }
-                required={!editing && !hasStoredApiKey}
+                required={(!editing && !hasStoredApiKey) || mustEnterKey}
               />
             </Field>
           ) : (
@@ -757,18 +783,25 @@ export function ControllerModal({
                   required={!editing && !hasStoredUsername}
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder={
-                    editing && hasStoredPassword
-                      ? "••• stored — enter to replace"
-                      : ""
+                    mustEnterPassword
+                      ? reask.placeholder
+                      : editing && hasStoredPassword
+                        ? "••• stored — enter to replace"
+                        : ""
                   }
-                  required={!editing && !hasStoredPassword}
+                  required={
+                    (!editing && !hasStoredPassword) || mustEnterPassword
+                  }
                 />
               </Field>
             </>
@@ -879,7 +912,9 @@ export function ControllerModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -891,7 +926,11 @@ export function ControllerModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={
+              saveMut.isPending ||
+              (mustEnterKey && !apiKey.trim()) ||
+              (mustEnterPassword && !password.trim())
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -939,9 +978,9 @@ function DeleteControllerModal({
           <span>I understand.</span>
         </label>
         {error && (
-          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

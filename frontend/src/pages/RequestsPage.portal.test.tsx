@@ -35,7 +35,10 @@ vi.mock("@/lib/api", async () => {
     },
     requestsApi: {
       ...actual.requestsApi,
-      list: () => rows(),
+      listPage: async () => {
+        const items = await rows();
+        return { items, total: items.length };
+      },
       catalog: () => catalog(),
       approve: (...a: unknown[]) => approve(...a),
       submit: (...a: unknown[]) => submit(...a),
