@@ -1,5 +1,5 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
 import { humanTime } from "../network/_shared";
@@ -3539,7 +3539,7 @@ function RecordModalForm({
     ? RECORD_TYPES
     : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
-  const nameErr = recordOwnerError(name);
+  const nameErr = recordOwnerError(name, type, zoneName);
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", groupId],
@@ -6782,12 +6782,14 @@ function SyncStat({
  * guest VLAN only" is a view whose match_clients is the guest CIDRs plus
  * a blocklist scoped to that view.
  */
-function ViewsTab({ group }: { group: DNSServerGroup }) {
+export function ViewsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { can } = useDnsGrants();
   const [editing, setEditing] = useState<DNSView | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
+  // #4180 — the read-only detail modal a row click / Enter opens.
+  const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const { data: viewsData, error: viewsError } = useQuery({
@@ -6803,6 +6805,11 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
     queryKey: ["dns-blocklists"],
     queryFn: () => dnsBlocklistApi.list(),
   });
+  const { data: groupZones = [] } = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+  const detailView = views.find((v) => v.id === detailId) ?? null;
 
   // Per-view RPZ is rendered by the BIND9 driver only — render_rpz_zone is
   // a no-op on Windows / PowerDNS / cloud, and Technitium blocks natively
@@ -6908,7 +6915,18 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
             return (
               <div
                 key={v.id}
-                className="rounded-md border bg-card px-3 py-2.5 group"
+                role="button"
+                tabIndex={0}
+                aria-label={`View details of ${v.name}`}
+                onClick={() => setDetailId(v.id)}
+                onKeyDown={(e) => {
+                  // Only the row itself: Enter on an inner button is its own.
+                  if (e.target === e.currentTarget && e.key === "Enter") {
+                    e.preventDefault();
+                    setDetailId(v.id);
+                  }
+                }}
+                className="cursor-pointer rounded-md border bg-card px-3 py-2.5 hover:bg-accent/30 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -6924,12 +6942,13 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                       </span>
                     )}
                   </div>
-                  <div className="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100">
+                  <div className="flex shrink-0 items-center gap-1">
                     <button
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                       title="Edit view"
                       aria-label="Edit view"
-                      onClick={() => {
+                      onClick={(e) => {
+                        e.stopPropagation();
                         setError("");
                         setEditing(v);
                       }}
@@ -6944,7 +6963,8 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                       className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                       title="Delete view"
                       aria-label="Delete view"
-                      onClick={() => {
+                      onClick={(e) => {
+                        e.stopPropagation();
                         setError("");
                         setConfirmDelete(v);
                       }}
@@ -6999,6 +7019,27 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
 
       {error && <FormError className="mt-2">{error}</FormError>}
 
+      {detailView && !editing && !confirmDelete && (
+        <ViewDetailModal
+          view={detailView}
+          zones={groupZones.filter((z) => z.view_id === detailView.id)}
+          blocklists={blocklists.filter((b) =>
+            b.applied_view_ids?.includes(detailView.id),
+          )}
+          canEdit={can("write", "dns_group")}
+          canDelete={can("delete", "dns_group")}
+          onClose={() => setDetailId(null)}
+          onEdit={() => {
+            setError("");
+            setEditing(detailView);
+          }}
+          onDelete={() => {
+            setError("");
+            setConfirmDelete(detailView);
+          }}
+        />
+      )}
+
       {(creating || editing) && (
         <ViewModal
           groupId={group.id}
@@ -7052,6 +7093,112 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
     </div>
+  );
+}
+
+/** Read-only detail of one view (#4180). Edit / Delete hand over to the
+ * existing edit form and delete confirm, under the row actions' gates. */
+function ViewDetailModal({
+  view,
+  zones,
+  blocklists,
+  canEdit,
+  canDelete,
+  onClose,
+  onEdit,
+  onDelete,
+}: {
+  view: DNSView;
+  zones: DNSZone[];
+  blocklists: { id: string; name: string }[];
+  canEdit: boolean;
+  canDelete: boolean;
+  onClose: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const chips = (items: string[] | null | undefined, empty: string) =>
+    items && items.length > 0 ? (
+      <div className="flex flex-wrap gap-1">
+        {items.map((c) => (
+          <span
+            key={c}
+            className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-xs font-mono"
+          >
+            {c}
+          </span>
+        ))}
+      </div>
+    ) : (
+      <span className="text-xs text-muted-foreground">{empty}</span>
+    );
+  const row = (label: string, body: ReactNode) => (
+    <div className="grid grid-cols-[9rem_1fr] gap-2 py-1.5 text-sm">
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div>{body}</div>
+    </div>
+  );
+  return (
+    <Modal title={`View ${view.name}`} onClose={onClose} wide>
+      <div className="divide-y">
+        {row("Name", <span className="font-mono">{view.name}</span>)}
+        {view.description && row("Description", view.description)}
+        {row("Order", view.order)}
+        {row("Match clients", chips(view.match_clients, "none"))}
+        {row("Match destinations", chips(view.match_destinations, "any"))}
+        {row("Recursion", view.recursion ? "Enabled" : "Disabled")}
+        {row(
+          "Allow query",
+          chips(view.allow_query, "inherited from the group"),
+        )}
+        {row(
+          "Allow query cache",
+          chips(view.allow_query_cache, "inherited from the group"),
+        )}
+        {blocklists.length > 0 &&
+          row(
+            "Blocking lists",
+            chips(
+              blocklists.map((b) => b.name),
+              "none",
+            ),
+          )}
+        {row(
+          `Zones (${zones.length})`,
+          zones.length === 0 ? (
+            <span className="text-xs text-muted-foreground">
+              No zone is scoped to this view.
+            </span>
+          ) : (
+            <ul className="space-y-0.5 font-mono text-xs">
+              {zones.map((z) => (
+                <li key={z.id}>{z.name}</li>
+              ))}
+            </ul>
+          ),
+        )}
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <button
+          type="button"
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={onDelete}
+          {...permissionGate(canDelete, NEEDS_GROUP_DELETE)}
+        >
+          Delete
+        </button>
+        <button
+          type="button"
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={onEdit}
+          {...permissionGate(canEdit, NEEDS_GROUP_WRITE)}
+        >
+          Edit
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -10700,7 +10847,8 @@ function ZonesTab({
 // ── Blocklists Tab ────────────────────────────────────────────────────────────
 
 /**
- * Choose where a blocking list applies (#876).
+ * Choose where a blocking list applies (#876), as a section of the Edit
+ * dialog (#4182) — it was a separate funnel button and dialog before.
  *
  * The backend has carried two independent relationships since #24 —
  * ``server_groups`` (every client of the group) and ``views`` (only
@@ -10712,24 +10860,16 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
-export function BlocklistScopeModal({
-  list,
-  group,
-  views,
-  onClose,
-}: {
-  list: DNSBlockList;
-  group: DNSServerGroup;
-  views: DNSView[];
-  onClose: () => void;
-}) {
-  const qc = useQueryClient();
+type BlocklistScopeCtx = { group: DNSServerGroup; views: DNSView[] };
+
+function useBlocklistScope(list: DNSBlockList, ctx: BlocklistScopeCtx) {
+  const { group, views } = ctx;
   // What the dialog opened with: save sends only the DIFFERENCE from this,
   // as add / remove deltas, so a group or view another client attached since
   // the tab loaded is never dropped by a replace-the-set write (#3737).
   const [initialWhole] = useState(list.applied_group_ids.includes(group.id));
   const [wholeGroup, setWholeGroup] = useState(initialWhole);
-  // Only THIS group's views — the checkbox list below renders no others, so
+  // Only THIS group's views — the checkbox list renders no others, so
   // seeding from the raw ``applied_view_ids`` would park an un-unpickable
   // id in the state that the footer then counts ("Applies to 1 view" about a
   // view of some other group) and that ships duplicated in the PUT alongside
@@ -10743,8 +10883,35 @@ export function BlocklistScopeModal({
   const [picked, setPicked] = useState<Set<string>>(
     () => new Set(initialPicked),
   );
-  const [error, setError] = useState("");
+  // Deltas only: this section speaks for THIS group and its views, and
+  // the server applies them to the stored sets, so assignments made
+  // elsewhere since the tab loaded survive.
+  const delta = () => {
+    const addViews = Array.from(picked).filter((v) => !initialPicked.has(v));
+    const removeViews = Array.from(initialPicked).filter((v) => !picked.has(v));
+    return {
+      ...(wholeGroup && !initialWhole
+        ? { add_server_group_ids: [group.id] }
+        : {}),
+      ...(!wholeGroup && initialWhole
+        ? { remove_server_group_ids: [group.id] }
+        : {}),
+      ...(addViews.length ? { add_view_ids: addViews } : {}),
+      ...(removeViews.length ? { remove_view_ids: removeViews } : {}),
+    };
+  };
+  return { wholeGroup, setWholeGroup, picked, setPicked, delta };
+}
 
+function BlocklistScopeFields({
+  ctx,
+  scope,
+}: {
+  ctx: BlocklistScopeCtx;
+  scope: ReturnType<typeof useBlocklistScope>;
+}) {
+  const { group, views } = ctx;
+  const { wholeGroup, setWholeGroup, picked, setPicked } = scope;
   const { data: servers = [] } = useQuery({
     queryKey: ["dns-servers", group.id],
     queryFn: () => dnsApi.listServers(group.id),
@@ -10752,153 +10919,104 @@ export function BlocklistScopeModal({
   const nonBind = Array.from(
     new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
   );
-
-  const saveMut = useMutation({
-    mutationFn: () => {
-      // Deltas only: this modal speaks for THIS group and its views, and
-      // the server applies them to the stored sets, so assignments made
-      // elsewhere since the tab loaded survive.
-      const addViews = Array.from(picked).filter((v) => !initialPicked.has(v));
-      const removeViews = Array.from(initialPicked).filter(
-        (v) => !picked.has(v),
-      );
-      return dnsBlocklistApi.updateAssignments(list.id, {
-        ...(wholeGroup && !initialWhole
-          ? { add_server_group_ids: [group.id] }
-          : {}),
-        ...(!wholeGroup && initialWhole
-          ? { remove_server_group_ids: [group.id] }
-          : {}),
-        ...(addViews.length ? { add_view_ids: addViews } : {}),
-        ...(removeViews.length ? { remove_view_ids: removeViews } : {}),
-      });
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      onClose();
-    },
-    onError: (e: ApiError) => setError(formatApiError(e, "Save failed")),
-  });
-
   const nothingSelected = !wholeGroup && picked.size === 0;
 
   return (
-    <Modal title={`Scope "${list.name}"`} onClose={onClose} wide>
-      <div className="space-y-3">
-        {nonBind.length > 0 && (
-          <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
-            This group also runs {nonBind.join(" / ")}, which
-            {nonBind.length === 1 ? " does" : " do"} not render RPZ blocking.
-            Scoping affects the BIND9 servers only.
+    <fieldset className="space-y-3 rounded-md border p-3">
+      <legend className="px-1 text-xs font-medium text-muted-foreground">
+        Applies to
+      </legend>
+      {nonBind.length > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
+          This group also runs {nonBind.join(" / ")}, which
+          {nonBind.length === 1 ? " does" : " do"} not render RPZ blocking.
+          Scoping affects the BIND9 servers only.
+        </div>
+      )}
+
+      <label className="flex cursor-pointer items-start gap-2 rounded-md border p-2.5 hover:bg-accent/30">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={wholeGroup}
+          onChange={(e) => setWholeGroup(e.target.checked)}
+        />
+        <span className="text-sm">
+          <span className="font-medium">Whole group</span>
+          <span className="block text-xs text-muted-foreground">
+            Every client {group.name} answers, including clients of every view.
+          </span>
+        </span>
+      </label>
+
+      <div>
+        <p className="mb-1 text-xs font-medium text-muted-foreground">
+          Specific views
+        </p>
+        {views.length === 0 ? (
+          <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
+            No views defined in this group. Create one on the Views tab to apply
+            a list to a subset of clients — that is how "adult lists on the
+            guest VLAN only" is expressed.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            {views.map((v) => (
+              <label
+                key={v.id}
+                className={cn(
+                  "flex cursor-pointer items-start gap-2 rounded-md border p-2 hover:bg-accent/30",
+                  wholeGroup && "opacity-50",
+                )}
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={picked.has(v.id)}
+                  onChange={() =>
+                    setPicked((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(v.id)) next.delete(v.id);
+                      else next.add(v.id);
+                      return next;
+                    })
+                  }
+                />
+                <span className="min-w-0 text-sm">
+                  <span className="font-mono">{v.name}</span>
+                  <span className="mt-0.5 flex flex-wrap gap-1">
+                    {v.match_clients.map((c) => (
+                      <span
+                        key={c}
+                        className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[11px] font-mono"
+                      >
+                        {c}
+                      </span>
+                    ))}
+                  </span>
+                </span>
+              </label>
+            ))}
           </div>
         )}
-
-        <label className="flex cursor-pointer items-start gap-2 rounded-md border p-2.5 hover:bg-accent/30">
-          <input
-            type="checkbox"
-            className="mt-0.5"
-            checked={wholeGroup}
-            onChange={(e) => setWholeGroup(e.target.checked)}
-          />
-          <span className="text-sm">
-            <span className="font-medium">Whole group</span>
-            <span className="block text-xs text-muted-foreground">
-              Every client {group.name} answers, including clients of every
-              view.
-            </span>
-          </span>
-        </label>
-
-        <div>
-          <p className="mb-1 text-xs font-medium text-muted-foreground">
-            Specific views
+        {wholeGroup && picked.size > 0 && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            The group-wide assignment already covers every view, so these
+            per-view selections add nothing while it is on. They are kept so
+            unchecking "Whole group" narrows the list rather than removing it
+            everywhere.
           </p>
-          {views.length === 0 ? (
-            <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
-              No views defined in this group. Create one on the Views tab to
-              apply a list to a subset of clients — that is how "adult lists on
-              the guest VLAN only" is expressed.
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {views.map((v) => (
-                <label
-                  key={v.id}
-                  className={cn(
-                    "flex cursor-pointer items-start gap-2 rounded-md border p-2 hover:bg-accent/30",
-                    wholeGroup && "opacity-50",
-                  )}
-                >
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={picked.has(v.id)}
-                    onChange={() =>
-                      setPicked((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(v.id)) next.delete(v.id);
-                        else next.add(v.id);
-                        return next;
-                      })
-                    }
-                  />
-                  <span className="min-w-0 text-sm">
-                    <span className="font-mono">{v.name}</span>
-                    <span className="mt-0.5 flex flex-wrap gap-1">
-                      {v.match_clients.map((c) => (
-                        <span
-                          key={c}
-                          className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[11px] font-mono"
-                        >
-                          {c}
-                        </span>
-                      ))}
-                    </span>
-                  </span>
-                </label>
-              ))}
-            </div>
-          )}
-          {wholeGroup && picked.size > 0 && (
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              The group-wide assignment already covers every view, so these
-              per-view selections add nothing while it is on. They are kept so
-              unchecking "Whole group" narrows the list rather than removing it
-              everywhere.
-            </p>
-          )}
-        </div>
-
-        {error && <FormError>{error}</FormError>}
-
-        <div className="flex items-center justify-between border-t pt-3">
-          <span className="text-xs text-muted-foreground">
-            {nothingSelected
-              ? "Not applied anywhere in this group."
-              : wholeGroup
-                ? "Applies to every client of this group."
-                : `Applies to ${picked.size} view${picked.size === 1 ? "" : "s"}.`}
-          </span>
-          <div className="flex gap-2">
-            <button
-              type="button"
-              className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-              onClick={onClose}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              disabled={saveMut.isPending}
-              className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
-              onClick={() => saveMut.mutate()}
-            >
-              {saveMut.isPending ? "Saving…" : "Save scope"}
-            </button>
-          </div>
-        </div>
+        )}
       </div>
-    </Modal>
+
+      <p className="text-xs text-muted-foreground">
+        {nothingSelected
+          ? "Not applied anywhere in this group."
+          : wholeGroup
+            ? "Applies to every client of this group."
+            : `Applies to ${picked.size} view${picked.size === 1 ? "" : "s"}.`}
+      </p>
+    </fieldset>
   );
 }
 
@@ -10913,7 +11031,6 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   // #876 — per-view scoping. Editing which views a list applies to is a
   // separate action from the group-wide Apply/Detach toggle, because they
   // write two different relationships.
-  const [scopeList, setScopeList] = useState<DNSBlockList | null>(null);
   // Bulk-select state. Keyed by blocklist id; spans both sections so the
   // operator can apply / detach / refresh / delete a mixed selection.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -11448,17 +11565,6 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                           Apply
                         </button>
                       )}
-                      {views.length > 0 && (
-                        <button
-                          title="Scope to specific views"
-                          aria-label="Scope to specific views"
-                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                          onClick={() => setScopeList(l)}
-                          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
-                        >
-                          <Filter className="h-3 w-3" />
-                        </button>
-                      )}
                       {l.source_type === "url" && l.feed_url && (
                         <button
                           title={
@@ -11507,18 +11613,13 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
         );
       })}
 
-      {scopeList && (
-        <BlocklistScopeModal
-          list={scopeList}
-          group={group}
-          views={views}
-          onClose={() => setScopeList(null)}
-        />
-      )}
-
       {showCreate && <BlocklistModal onClose={() => setShowCreate(false)} />}
       {editList && (
-        <BlocklistModal list={editList} onClose={() => setEditList(null)} />
+        <BlocklistModal
+          list={editList}
+          scope={{ group, views }}
+          onClose={() => setEditList(null)}
+        />
       )}
       {confirmDelete && (
         <ConfirmDestroyModal
@@ -11565,6 +11666,8 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
 // Edit reads the list fresh on open and Save sends only what changed (#3365).
 export function BlocklistModal(props: {
   list?: DNSBlockList;
+  /** Edit only: adds the "Applies to" section for this group (#4182). */
+  scope?: BlocklistScopeCtx;
   onClose: () => void;
 }) {
   const fresh = useFreshRow(props.list, () =>
@@ -11580,14 +11683,60 @@ export function BlocklistModal(props: {
       />
     );
   if (!fresh.ready) return null;
-  return <BlocklistModalForm list={fresh.row} onClose={props.onClose} />;
+  return (
+    <BlocklistModalForm
+      list={fresh.row}
+      scope={props.scope}
+      onClose={props.onClose}
+    />
+  );
 }
 
 function BlocklistModalForm({
   list,
+  scope: scopeCtx,
   onClose,
 }: {
   list?: DNSBlockList;
+  scope?: BlocklistScopeCtx;
+  onClose: () => void;
+}) {
+  if (list && scopeCtx)
+    return (
+      <BlocklistModalFormScoped
+        list={list}
+        scopeCtx={scopeCtx}
+        onClose={onClose}
+      />
+    );
+  return <BlocklistModalFormBody list={list} onClose={onClose} />;
+}
+
+function BlocklistModalFormScoped(props: {
+  list: DNSBlockList;
+  scopeCtx: BlocklistScopeCtx;
+  onClose: () => void;
+}) {
+  const scope = useBlocklistScope(props.list, props.scopeCtx);
+  return (
+    <BlocklistModalFormBody
+      list={props.list}
+      scope={{ ctx: props.scopeCtx, state: scope }}
+      onClose={props.onClose}
+    />
+  );
+}
+
+function BlocklistModalFormBody({
+  list,
+  scope,
+  onClose,
+}: {
+  list?: DNSBlockList;
+  scope?: {
+    ctx: BlocklistScopeCtx;
+    state: ReturnType<typeof useBlocklistScope>;
+  };
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -11609,8 +11758,15 @@ function BlocklistModalForm({
   const [error, setError] = useState("");
 
   const mut = useMutation({
-    mutationFn: (d: Partial<DNSBlockList>) =>
-      list ? dnsBlocklistApi.update(list.id, d) : dnsBlocklistApi.create(d),
+    mutationFn: async (d: Partial<DNSBlockList>) => {
+      if (!list) return dnsBlocklistApi.create(d);
+      // An unchanged list body is not re-sent; the scope section (#4182)
+      // goes through the existing assignments endpoint, as deltas.
+      if (Object.keys(d).length > 0) await dnsBlocklistApi.update(list.id, d);
+      const delta = scope?.state.delta() ?? {};
+      if (Object.keys(delta).length > 0)
+        await dnsBlocklistApi.updateAssignments(list.id, delta);
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
       onClose();
@@ -11665,7 +11821,10 @@ function BlocklistModalForm({
             },
             body,
           );
-          if (Object.keys(diff).length === 0) {
+          if (
+            Object.keys(diff).length === 0 &&
+            Object.keys(scope?.state.delta() ?? {}).length === 0
+          ) {
             onClose();
             return;
           }
@@ -11796,6 +11955,7 @@ function BlocklistModalForm({
           />
           Enabled
         </label>
+        {scope && <BlocklistScopeFields ctx={scope.ctx} scope={scope.state} />}
         {error && <FormError>{error}</FormError>}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
@@ -13592,9 +13752,20 @@ export function DNSPage() {
             <div className="text-center">
               <Globe className="h-12 w-12 text-muted-foreground/20 mx-auto mb-3" />
               <p className="text-sm text-muted-foreground">
-                {groups.length === 0
-                  ? "Create a server group to start managing DNS."
-                  : "Select a server group or zone from the tree."}
+                {groupsError != null ? (
+                  <ListReadError
+                    error={groupsError}
+                    what="the DNS server groups"
+                  />
+                ) : groups.length === 0 ? (
+                  isSuperadmin ? (
+                    "Create a server group to start managing DNS."
+                  ) : (
+                    "No DNS server groups yet."
+                  )
+                ) : (
+                  "Select a server group or zone from the tree."
+                )}
               </p>
             </div>
           </div>
