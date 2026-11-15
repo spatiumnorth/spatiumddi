@@ -22,8 +22,13 @@ async def _seed(db: AsyncSession, bucket: datetime, clients: int, per_client: in
     db.add(g)
     await db.flush()
     s = DNSServer(
-        name="s-4275", host="127.0.0.1", port=53, driver="bind9", group_id=g.id,
-        is_primary=True, is_enabled=True,
+        name="s-4275",
+        host="127.0.0.1",
+        port=53,
+        driver="bind9",
+        group_id=g.id,
+        is_primary=True,
+        is_enabled=True,
     )
     db.add(s)
     await db.flush()
