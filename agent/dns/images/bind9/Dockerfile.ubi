@@ -14,7 +14,7 @@
 # musl-specific "freed memory never returns" problem that glibc does not have.
 ARG PYTHON_VERSION=3.12
 
-FROM registry.access.redhat.com/ubi9/ubi:9.9 AS bind-build
+FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8 AS bind-build
 ARG BIND_VERSION=9.20.30
 ARG BIND_SHA256=9e1443a40a72a30272cbc3196d020a6b2e26937111c83e59e101e82e1e3b4fef
 ARG LIBUV_VERSION=1.52.1
@@ -67,14 +67,14 @@ RUN mkdir -p /stage/licenses \
  && cp tini/LICENSE /stage/licenses/tini-LICENSE \
  && printf 'bind=%s\nlibuv=%s\nuserspace-rcu=%s\ntini=%s\n' "$BIND_VERSION" "$LIBUV_VERSION" "$URCU_VERSION" "$TINI_VERSION" > /stage/bind-versions
 
-FROM registry.access.redhat.com/ubi9/ubi:9.9 AS agent-build
+FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8 AS agent-build
 RUN dnf -y install --setopt=install_weak_deps=0 python3.12 python3.12-pip && dnf clean all
 WORKDIR /src
 COPY agent/dns/pyproject.toml /src/pyproject.toml
 COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN python3.12 -m pip install --prefix=/install --no-cache-dir .
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9 AS runtime
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9@sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9 AS runtime
 # ``libcap`` brings setcap (named gets CAP_NET_BIND_SERVICE as a FILE
 # capability, so a random OpenShift uid can bind :53); setpriv (util-linux; util-linux-core lacks it) is
 # the su-exec shim's engine. RPM_SNAPSHOT busts the layer cache so the nightly

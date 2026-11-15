@@ -13,7 +13,7 @@
 # x86_64 and aarch64 (checked with ``pip download --only-binary=:all:``), including
 # lxml and xmlsec (which bundle their native libraries), so no -devel packages are
 # needed: UBI carries neither xmlsec1-devel nor libxmlsec1-dev's equivalents.
-FROM registry.access.redhat.com/ubi9/ubi:9.9 AS builder
+FROM registry.access.redhat.com/ubi9/ubi:9.9@sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8 AS builder
 
 WORKDIR /build
 
@@ -56,7 +56,7 @@ RUN python3.12 -m venv /opt/pip-licenses \
 
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9 AS runtime
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9@sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

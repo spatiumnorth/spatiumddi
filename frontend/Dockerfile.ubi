@@ -17,7 +17,7 @@ RUN npm run build
 
 
 # ── Stage 2: serve via nginx on UBI ───────────────────────────────────────────
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9 AS runtime
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9@sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9 AS runtime
 
 # RPM_SNAPSHOT busts BuildKit's layer cache so the nightly/weekly rebuild really
 # re-runs ``microdnf upgrade`` (same reasoning as APK_SNAPSHOT / APT_SNAPSHOT in the

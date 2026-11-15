@@ -595,17 +595,27 @@
 
     "ubi9": {
       "version": "9.9",
+      "digest": "sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8",
       "pinned_in": [
-        { "path": "backend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}", "count": 1 },
-        { "path": "backend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}", "count": 1 },
-        { "path": "frontend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}", "count": 1 },
-        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}", "count": 2 },
-        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}", "count": 1 },
-        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}", "count": 1 },
-        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}", "count": 1 }
+        { "path": "backend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}@", "count": 1 },
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}@", "count": 2 },
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}@", "count": 1 }
       ],
-      "upstream": {"kind": "none"},
-      "note": "Base of the Red Hat UBI variants (#3913), minor-release tag. Red Hat rebuilds the tag on its own schedule and the Dockerfiles `microdnf upgrade` on top of it (RPM_SNAPSHOT). registry.access.redhat.com is not Docker Hub, so there is no upstream resolver: check https://catalog.redhat.com/software/containers/ubi9/ubi-minimal by hand when RHEL 9 moves to a new minor."
+      "upstream": { "kind": "none" },
+      "note": "Builder base of the Red Hat UBI variants (#3913), pinned by tag AND index digest (amd64, arm64, s390x, ppc64le). Red Hat rebuilds the minor tag often; the digest keeps a build reproducible and the Dockerfiles `microdnf upgrade` on top (RPM_SNAPSHOT). registry.access.redhat.com is not Docker Hub, so no upstream resolver: read the digest with `docker buildx imagetools inspect registry.access.redhat.com/ubi9/ubi:<tag>` and bump it with the tag, in every file."
+    },
+
+    "ubi9-minimal": {
+      "version": "9.9",
+      "digest": "sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9",
+      "pinned_in": [
+        { "path": "backend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 },
+        { "path": "frontend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 },
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 },
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Runtime base of the Red Hat UBI variants (#3913); same pinning and bump procedure as ubi9."
     },
 
     "bind-ubi": {
