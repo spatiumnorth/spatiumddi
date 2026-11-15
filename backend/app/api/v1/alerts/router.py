@@ -18,9 +18,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_permission
@@ -491,6 +491,7 @@ async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> N
     dependencies=[Depends(require_permission("read", "alert"))],
 )
 async def list_events(
+    response: Response,
     db: DB,
     current_user: CurrentUser,
     open_only: bool = Query(False, description="Only return events with resolved_at IS NULL"),
@@ -511,8 +512,16 @@ async def list_events(
     ),
     severity: str | None = Query(None, max_length=32, description="Exact severity match."),
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0, description="Rows to skip, newest first (#3830)."),
 ) -> list[AlertEvent]:
-    q = select(AlertEvent).order_by(AlertEvent.fired_at.desc()).limit(limit)
+    """List events, newest first.
+
+    Still a bare list (existing clients), but ``offset`` pages past ``limit``
+    and ``X-Total-Count`` carries the number of events matching the filters
+    *before* the window, so a client can say "100 of 111" instead of
+    presenting a truncated page as the whole answer (#3830).
+    """
+    q = select(AlertEvent)
     if open_only:
         q = q.where(AlertEvent.resolved_at.is_(None))
     if rule_id:
@@ -523,6 +532,9 @@ async def list_events(
         q = q.where(AlertEvent.subject_id == subject_id)
     if severity:
         q = q.where(AlertEvent.severity == severity)
+    total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
+    response.headers["X-Total-Count"] = str(total)
+    q = q.order_by(AlertEvent.fired_at.desc(), AlertEvent.id).offset(offset).limit(limit)
     res = await db.execute(q)
     return list(res.scalars().all())
 

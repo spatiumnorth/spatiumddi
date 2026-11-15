@@ -27,6 +27,16 @@ keywords:
   - networking
 maintainers:
   - name: SpatiumDDI Contributors
+    url: https://github.com/spatiumnorth/spatiumddi
+# #3913 — metadata Red Hat's chart-verifier and the OpenShift Helm catalogue
+# read. Informational for every other consumer. The chart is NOT yet
+# certified: see docs/deployment/KUBERNETES.md (OpenShift).
+annotations:
+  charts.openshift.io/name: SpatiumDDI
+  charts.openshift.io/provider: Spatium North Inc.
+  charts.openshift.io/supportURL: https://github.com/spatiumnorth/spatiumddi/issues
+  charts.openshift.io/archs: x86_64
+  charts.openshift.io/providerType: partner
 # No subchart dependencies. Postgres + Redis ship as plain
 # StatefulSet + Service templates owned by this chart, using the
 # official ``postgres:16-alpine`` and ``redis:8.10.2-alpine`` images

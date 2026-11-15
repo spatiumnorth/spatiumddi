@@ -1050,3 +1050,61 @@ async def test_alert_deliver_stamps_flag_only_on_actual_delivery() -> None:
     # Transport raised — not delivered.
     with patch.object(svc, "_send_webhook", new=AsyncMock(side_effect=OSError("down"))):
         assert await alerts_svc._deliver(rule, event, [ok]) == (False, False, False)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_update_applies_only_the_keys_it_carries(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3926: a PUT of one field must not put back what another client stored,
+    and kind-dependent completeness is judged on the merged result."""
+    from app.core.security import create_access_token, hash_password
+    from app.models.auth import User
+
+    user = User(
+        username=f"fw-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="Forward Admin",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    h = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+    base = "/api/v1/settings/audit-forward-targets"
+
+    r = await client.post(
+        base,
+        headers=h,
+        json={"name": "siem", "kind": "syslog", "host": "10.0.0.1", "port": 514},
+    )
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+
+    # Another client moves the host and the port.
+    r = await client.put(f"{base}/{tid}", headers=h, json={"host": "10.0.0.2", "port": 6514})
+    assert r.status_code == 200, r.text
+
+    # The stale dialog saves only the facility: a syslog target needs no
+    # webhook fields, and the other client's host and port stay.
+    r = await client.put(f"{base}/{tid}", headers=h, json={"facility": 17})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert (got["host"], got["port"], got["facility"]) == ("10.0.0.2", 6514, 17)
+    assert got["name"] == "siem" and got["kind"] == "syslog"
+
+    # An explicit null clears a nullable field.
+    r = await client.put(f"{base}/{tid}", headers=h, json={"min_severity": "warn"})
+    assert r.json()["min_severity"] == "warn"
+    r = await client.put(f"{base}/{tid}", headers=h, json={"min_severity": None})
+    assert r.status_code == 200 and r.json()["min_severity"] is None
+
+    # The merged result is still validated: blanking the host is refused,
+    # a null name is refused, and switching to a kind the row cannot satisfy
+    # is refused.
+    for bad in ({"host": ""}, {"name": None}, {"kind": "smtp"}, {"kind": "webhook"}):
+        r = await client.put(f"{base}/{tid}", headers=h, json=bad)
+        assert r.status_code == 422, (bad, r.text)
+    r = await client.get(base, headers=h)
+    row = next(t for t in r.json() if t["id"] == tid)
+    assert row["host"] == "10.0.0.2" and row["kind"] == "syslog"

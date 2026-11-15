@@ -305,7 +305,7 @@ export function SyslogSection({
 
       <Field
         label="Filter (rsyslog selector)"
-        description="Which messages to forward, as an rsyslog selector (e.g. ``*.*`` for everything, ``authpriv.*`` for auth logs, ``*.warning`` for warnings and above). Empty defaults to ``*.*``."
+        description="Which messages to forward, as an rsyslog selector (e.g. ‘*.*’ for everything, ‘authpriv.*’ for auth logs, ‘*.warning’ for warnings and above). Empty defaults to ‘*.*’."
       >
         <input
           type="text"

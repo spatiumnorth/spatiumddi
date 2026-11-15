@@ -61,6 +61,7 @@ from app.services.approvals.policy import (
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
+    approval_refusal,
     approve_change_request,
     get_change_request,
     list_change_requests,
@@ -96,6 +97,12 @@ class ChangeRequestResponse(BaseModel):
     executed_at: datetime | None
     created_at: datetime
     modified_at: datetime
+    # Whether the CALLER may approve this row, asked of the same check the
+    # approve endpoint makes (#4189); the server stays authoritative. False on
+    # a row that is no longer pending. ``approve_blocked_reason`` is the
+    # server's own refusal text when a pending row is refused.
+    can_approve: bool = False
+    approve_blocked_reason: str | None = None
 
 
 class DecisionBody(BaseModel):
@@ -147,8 +154,11 @@ class ApprovalPolicyUpdate(BaseModel):
 # ── Serialisers ──────────────────────────────────────────────────────────────
 
 
-def _cr_to_response(cr: ChangeRequest) -> ChangeRequestResponse:
+def _cr_to_response(cr: ChangeRequest, viewer: User) -> ChangeRequestResponse:
+    refusal = approval_refusal(viewer, cr) if cr.state == "pending" else None
     return ChangeRequestResponse(
+        can_approve=cr.state == "pending" and refusal is None,
+        approve_blocked_reason=str(refusal) if refusal is not None else None,
         id=cr.id,
         operation=cr.operation,
         resource_type=cr.resource_type,
@@ -320,7 +330,7 @@ async def list_requests(
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
-    return [_cr_to_response(r) for r in rows]
+    return [_cr_to_response(r, current_user) for r in rows]
 
 
 # ── Approval policies (operator-tunable rules) ─────────────────────────────
@@ -520,7 +530,7 @@ async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Ch
         )
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 async def _assert_gate_row(db: DB, cr_id: uuid.UUID) -> None:
@@ -594,7 +604,7 @@ async def approve_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 @router.post("/{cr_id}/reject", response_model=ChangeRequestResponse)
@@ -616,7 +626,7 @@ async def reject_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 @router.post("/{cr_id}/cancel", response_model=ChangeRequestResponse)
@@ -652,7 +662,7 @@ async def cancel_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()
     await db.refresh(cr)
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 __all__ = ["router"]
