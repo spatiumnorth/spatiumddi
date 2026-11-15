@@ -522,14 +522,15 @@ celery_app.conf.update(
             "task": "app.tasks.oui_update.auto_update_oui_database",
             "schedule": schedule(run_every=3600.0),
         },
-        # Nightly prune of dns/dhcp metric_sample rows older than the
+        # Daily at 02:45 UTC (fixed time, #4174 — a 24 h interval restarts
+        # with beat, so beat restarts inside a day starved it), prune dns/dhcp metric_sample rows older than the
         # configured retention window (default 7 d). Keeps the two
         # tables a bounded size without coarsening resolution. Cadence
         # is deliberately slow — the tables are already small and
         # pruning more often just burns cycles.
         "metric-samples-prune": {
             "task": "app.tasks.prune_metrics.prune_metric_samples",
-            "schedule": schedule(run_every=24 * 3600.0),
+            "schedule": crontab(hour=2, minute=45),
         },
         # #889 — InfluxDB push export. Coarse 30 s tick; each target is
         # gated on its own ``push_interval_seconds`` inside the task, so
@@ -539,19 +540,21 @@ celery_app.conf.update(
             "task": "app.tasks.influxdb_push.push_influxdb_metrics",
             "schedule": schedule(run_every=30.0),
         },
-        # #44 — daily per-subnet utilization snapshot + 90-day prune,
+        # #44 — daily at 02:15 UTC (#4174: fixed time) per-subnet utilization snapshot + 90-day prune,
         # powering the "% used over time" chart on the subnet detail.
         "subnet-utilization-snapshot": {
             "task": "app.tasks.subnet_utilization_snapshot.snapshot_subnet_utilization",
-            "schedule": schedule(run_every=24 * 3600.0),
+            "schedule": crontab(hour=2, minute=15),
         },
-        # Nightly prune of agent-shipped query / activity log entries
-        # older than the retention window (default 24 h). Query logs
-        # are a firehose; the short window keeps the tables manageable
-        # without operator tuning.
+        # Hourly (:05 UTC) prune of agent-shipped query / activity log
+        # entries older than the retention window (default 24 h). Query
+        # logs are a firehose, so the table must hold ~retention rows,
+        # not retention + a day. A crontab, not a 24 h interval: beat
+        # keeps no state, so every restart reset that timer and the
+        # prune went days unrun (#4174). The DELETE is idempotent.
         "log-entries-prune": {
             "task": "app.tasks.prune_logs.prune_log_entries",
-            "schedule": schedule(run_every=24 * 3600.0),
+            "schedule": crontab(minute=5),
         },
         # Daily at 03:45 UTC (offset from the other prunes), delete
         # terminal packet-capture rows past the retention window
@@ -590,12 +593,12 @@ celery_app.conf.update(
             "task": "app.tasks.dhcp_lease_history_prune.prune_lease_history",
             "schedule": crontab(hour=3, minute=15),
         },
-        # Every 12 h, re-issue active Let's Encrypt Web-UI certs that are
+        # At 00:20 and 12:20 UTC, re-issue active Let's Encrypt Web-UI certs that are
         # within 30 d of expiry (issue #438 Phase 2). Idempotent +
         # advisory-locked; gated on acme_enabled + acme_auto_renew.
         "acme-renew-due": {
             "task": "app.tasks.acme.renew_due_certificates",
-            "schedule": schedule(run_every=12 * 3600.0),
+            "schedule": crontab(hour="0,12", minute=20),
         },
         # Hourly, sweep stale ACME TXT records older than 24 h — the
         # provider-path janitor plus the embedded client's stranded
@@ -614,14 +617,14 @@ celery_app.conf.update(
             "task": "app.tasks.dnsbl_sweep.sweep_dnsbl",
             "schedule": crontab(hour=4, minute=30),
         },
-        # Once a day, check GitHub for the latest release tag. Gated
+        # Daily at 05:00 UTC (also once at beat start), check GitHub for the latest release tag. Gated
         # on ``PlatformSettings.github_release_check_enabled`` — so
         # operators can turn this off in air-gapped deployments
         # without restarting beat. Unauthenticated call; the 60/hour
         # rate limit is plenty for a daily tick.
         "update-check": {
             "task": "app.tasks.update_check.check_github_release",
-            "schedule": schedule(run_every=24 * 3600.0),
+            "schedule": crontab(hour=5, minute=0),
         },
         # Every 30 s, sweep every enabled KubernetesCluster. The per-
         # cluster ``sync_interval_seconds`` (min 30) gates the actual
@@ -810,10 +813,10 @@ celery_app.conf.update(
         # grace (issue #169). High-cadence vs. the nightly prunes
         # because the operator-facing list endpoint should reflect
         # the rolling-window state of recent codes without a long lag.
-        # Daily, drop E911 lookup-trail rows past retention (#3514).
+        # Daily at 04:10 UTC, drop E911 lookup-trail rows past retention (#3514).
         "e911-resolution-log-prune": {
             "task": "app.tasks.prune_e911_resolution_log.prune_e911_resolution_log",
-            "schedule": schedule(run_every=86400.0),
+            "schedule": crontab(hour=4, minute=10),
         },
         "pairing-codes-prune": {
             "task": "app.tasks.prune_pairing_codes.prune_pairing_codes",

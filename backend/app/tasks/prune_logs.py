@@ -1,4 +1,4 @@
-"""Nightly retention sweep for agent-shipped log entries.
+"""Hourly retention sweep for agent-shipped log entries.
 
 Deletes ``dns_query_log_entry`` and ``dhcp_log_entry`` rows older
 than ``PlatformSettings.log_retention_hours`` (default 24 h, capped at
@@ -8,7 +8,7 @@ size on busy resolvers (10k+ qps means ~36M rows in an hour, so even at
 24 h we're already managing a substantial table — we deliberately avoid
 a longer default).
 
-Symmetric to ``prune_metrics``: tick once a day, delete everything
+Symmetric to ``prune_metrics``: tick on a crontab (hourly for these, daily at a fixed UTC time for the rest, #4174), delete everything
 past the cutoff. Runs under the default queue.
 
 Also retires agent ingest receipts (#1077) older than

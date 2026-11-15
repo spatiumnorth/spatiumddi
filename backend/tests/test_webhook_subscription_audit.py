@@ -85,6 +85,7 @@ async def test_create_update_delete_each_write_one_audit_row(
         json={
             "name": name,
             "url": "https://other.example.test/x",
+            "headers": {"Authorization": f"Bearer {_HDR}"},
             "secret": _SECRET2,
             "event_types": ["ip.allocated"],
         },
