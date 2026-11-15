@@ -174,7 +174,8 @@ numeric non-root `USER` and keep the random-uid behaviour above. BIND 9.20 and
 Kea are built from checksummed source, since Red Hat ships neither at these
 versions (see `docs/THIRD_PARTY.md`). Compared with the default images the UBI
 ones lack `whois` and `traceroute` (the Tools page reports the missing binary),
-the NFS backup destination (`libnfs`), BIND's jemalloc and JSON statistics
+the NFS backup destination (`libnfs`), radvd in the Kea image (the opt-in
+`RADVD_MANAGED` router advertisements), BIND's jemalloc and JSON statistics
 channel, and the frontend's nginx is Red Hat's 1.26.
 
 `charts/spatiumddi/values-openshift-certified.yaml` selects them:

@@ -677,16 +677,6 @@
       "note": "Built from source for Kea in the UBI dhcp-kea image (#3913): it is an EPEL package, not in UBI. ARG LOG4CPLUS_SHA256 pins the tarball; the upstream tags (REL_x_y_z) are not comparable by the github-release resolver."
     },
 
-    "radvd-ubi": {
-      "version": "2.21",
-      "pinned_in": [
-        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG RADVD_VERSION={version}", "count": 1 },
-        { "path": "docs/THIRD_PARTY.md", "match": "radvd](https://radvd.litech.org/) | {version} (built from source, UBI image)", "count": 1 }
-      ],
-      "upstream": {"kind": "none"},
-      "note": "radvd built from source in the UBI dhcp-kea image (#3913); UBI has no radvd. Opt-in (RADVD_MANAGED=1). ARG RADVD_SHA256 pins the tarball."
-    },
-
     "meson-ubi": {
       "version": "1.9.1",
       "pinned_in": [
