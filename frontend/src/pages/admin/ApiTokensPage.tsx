@@ -37,6 +37,7 @@ import { QrCode } from "@/components/QrCode";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
@@ -822,13 +823,18 @@ export function ApiTokensPage() {
   const [justCreated, setJustCreated] = useState<ApiTokenCreated | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
   const [reenable, setReenable] = useState<ApiToken | null>(null);
+  const [revokeTarget, setRevokeTarget] = useState<ApiToken | null>(null);
   // Only a superadmin can re-enable an inactive token; owners mint a new one.
   const { isSuperadmin } = usePermissions();
 
   const revokeMut = useMutation({
     mutationFn: (t: ApiToken) =>
       apiTokensApi.update(t.id, { is_active: false }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      setRevokeTarget(null);
+    },
+    onError: () => setRevokeTarget(null),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiTokensApi.delete(id),
@@ -957,7 +963,7 @@ export function ApiTokensPage() {
                       <div className="flex justify-end gap-1">
                         {t.is_active ? (
                           <button
-                            onClick={() => revokeMut.mutate(t)}
+                            onClick={() => setRevokeTarget(t)}
                             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                             title="Revoke"
                           >
@@ -1028,6 +1034,21 @@ export function ApiTokensPage() {
             onClose={() => setReenable(null)}
           />
         )}
+        <ConfirmModal
+          open={revokeTarget !== null}
+          title="Revoke API token?"
+          message={
+            revokeTarget
+              ? `Revoke ${revokeTarget.name}? Calls using this token fail at once; you can re-enable it later.`
+              : null
+          }
+          confirmLabel="Revoke"
+          tone="destructive"
+          autoFocusCancel
+          loading={revokeMut.isPending}
+          onClose={() => setRevokeTarget(null)}
+          onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
+        />
         {confirmDelete && (
           <Modal
             title="Delete API Token"

@@ -13,7 +13,9 @@
  *
  * Gating is server-side (every endpoint re-enforces the two-person spine);
  * this only drives affordance *visibility*: Approve/Reject need
- * ``approve,change_request``; Cancel needs requester-or-superadmin; the
+ * ``approve,change_request`` (Approve is disabled, with the server's reason,
+ * when the row's ``can_approve`` is false — e.g. the approver lacks the
+ * operation's own permission, #4189); Cancel needs requester-or-superadmin; the
  * Policies tab needs superadmin. The whole page is reached only when the
  * default-off ``governance.approvals`` module is on (the Sidebar nav entry
  * + backend ``require_module`` both gate it).
@@ -344,6 +346,12 @@ function RequestRow({
                 <HeaderButton
                   variant="primary"
                   icon={Check}
+                  disabled={!cr.can_approve}
+                  title={
+                    cr.can_approve
+                      ? undefined
+                      : (cr.approve_blocked_reason ?? "You cannot approve this")
+                  }
                   onClick={() => onDecide(cr, "approve")}
                 >
                   Approve

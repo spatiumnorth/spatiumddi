@@ -15,7 +15,11 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { parseTtlInput } from "@/lib/dnsNames";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  disabledBecause,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -939,10 +943,13 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-right">
                     <button
                       onClick={() => setReapplyTarget(t)}
-                      disabled={t.applied_count === 0}
                       className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
                       title="Reapply across all instances"
                       aria-label="Reapply across all instances"
+                      {...disabledBecause(
+                        t.applied_count === 0,
+                        "Not applied anywhere yet: nothing to reapply.",
+                      )}
                       {...writeGate}
                     >
                       <RefreshCw className="h-3 w-3" />

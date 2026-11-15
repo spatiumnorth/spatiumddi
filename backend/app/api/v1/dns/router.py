@@ -85,6 +85,10 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
 from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -1958,7 +1962,9 @@ class RecordCreate(BaseModel):
         # (``_acme-challenge``, ``_443._tcp``) and a leftmost ``*`` wildcard,
         # normalizes ``""``/``@`` to the apex sentinel ``@`` the handlers use
         # (``fqdn = name.zone if name != "@" else zone``).
-        return validate_record_owner(v, field="record name")
+        # An RFC 2317 delegation owner (``64/26``) passes by shape here and is
+        # held to NS / DS in a classless child's parent by the handlers' check-names (#4166).
+        return validate_record_owner(v, field="record name", allow_classless=True)
 
 
 class RecordUpdate(BaseModel):
@@ -1978,7 +1984,7 @@ class RecordUpdate(BaseModel):
         # Optional on update; same RFC 2181 owner rule as RecordCreate.
         if v is None:
             return v
-        return validate_record_owner(v, field="record name")
+        return validate_record_owner(v, field="record name", allow_classless=True)
 
 
 class RecordResponse(BaseModel):
@@ -2914,6 +2920,19 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    require_secret_with_destination_change(
+        server,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+            "api_key": body.api_key,
+        },
+        destination=("host", "port"),
+        secrets={
+            "credentials": server.credentials_encrypted,
+            "api_key": server.api_key_encrypted,
+        },
+    )
     reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():

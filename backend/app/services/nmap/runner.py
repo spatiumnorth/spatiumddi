@@ -134,6 +134,9 @@ _HOSTNAME_RE: Final = re.compile(
 )
 
 
+_NUMERIC_LABEL_RE: Final = re.compile(r"^[0-9-]+$")
+
+
 _BLOCKED_TARGET_MESSAGE = (
     "target is in a blocked range (loopback / link-local / cloud-metadata) " "and cannot be scanned"
 )
@@ -209,6 +212,15 @@ def _validate_target(target: str) -> str:
             raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
         return str(net)
     if _HOSTNAME_RE.match(target):
+        # nmap reads dotted digit / dash spellings (``10.0.0.1-20``,
+        # ``10.0-255.0-255.0-255``) as octet ranges, expanding to many hosts.
+        # A real name's final label is never made of digits and dashes only
+        # (RFC 3696 section 2), so refuse that shape instead of passing it on.
+        if _NUMERIC_LABEL_RE.match(target.rstrip(".").rsplit(".", 1)[-1]):
+            raise NmapArgError(
+                f"target looks like an address range, which is not supported (got {target!r}); "
+                "use a single address, a CIDR, or a hostname"
+            )
         _refuse_blocked(target)
         _refuse_resolved_blocked(target)
         return target

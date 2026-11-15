@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   authProvidersApi,
@@ -180,6 +181,31 @@ const TACACS_DEFAULTS = {
 };
 
 type ModalMode = "create" | "edit";
+
+// The config keys that decide where a provider's stored secret is sent (#4135).
+const SECRET_DESTINATION_KEYS = [
+  "host",
+  "backup_hosts",
+  "server",
+  "backup_servers",
+  "discovery_url",
+];
+
+function destinationOf(configJson: string): Record<string, unknown> | null {
+  let cfg: Record<string, unknown>;
+  try {
+    cfg = JSON.parse(configJson || "{}") ?? {};
+  } catch {
+    return null; // mid-edit invalid JSON
+  }
+  // The structured fields write the backup lists as newline-joined text where
+  // the stored config holds arrays; compare them the same way.
+  const text = (v: unknown) =>
+    Array.isArray(v) ? v.join("\n") : String(v ?? "").trim();
+  return Object.fromEntries(
+    SECRET_DESTINATION_KEYS.map((k) => [k, text(cfg[k])]),
+  );
+}
 
 interface ProviderForm {
   name: string;
@@ -1527,6 +1553,40 @@ function ProviderModal({
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
+  // #4135 — a moved host / server / discovery URL needs the stored secret
+  // entered again; the same config keys the API compares.
+  // Invalid JSON while typing keeps the last valid destination, so a stray
+  // brace does not read as "moved".
+  const lastDestination = useRef<Record<string, unknown>>({});
+  const parsedDestination = destinationOf(form.config_json);
+  if (parsedDestination) lastDestination.current = parsedDestination;
+  const reask = useCredentialReask(
+    lastDestination.current,
+    mode === "edit" ? destinationOf(initial.config_json) : null,
+    (moved) =>
+      setForm((prev) => ({
+        ...prev,
+        secrets_dirty: moved,
+        bind_password: "",
+        oidc_client_secret: "",
+        saml_sp_private_key: "",
+        radius_secret: "",
+        tacacs_secret: "",
+      })),
+  );
+  const askSecret = reask.asks(initialProvider?.has_secrets);
+  const enteredSecret =
+    form.type === "ldap"
+      ? form.bind_password
+      : form.type === "oidc"
+        ? form.oidc_client_secret
+        : form.type === "saml"
+          ? form.saml_sp_private_key
+          : form.type === "radius"
+            ? form.radius_secret
+            : form.tacacs_secret;
+  const mustEnterSecret = askSecret && !enteredSecret.trim();
+
   function handleTypeChange(newType: AuthProviderType) {
     // Swap the scaffolds for the new type if the user hasn't meaningfully
     // edited them. Structured-form defaults (LDAP_DEFAULTS, OIDC_DEFAULTS,
@@ -1575,6 +1635,10 @@ function ProviderModal({
   }
 
   function handleSubmit() {
+    if (mustEnterSecret) {
+      setJsonError(`Secrets: ${reask.hint}`);
+      return;
+    }
     try {
       JSON.parse(form.config_json || "{}");
     } catch {
@@ -1722,7 +1786,8 @@ function ProviderModal({
               </label>
               {mode === "edit" &&
                 initialProvider?.has_secrets &&
-                !form.secrets_dirty && (
+                !form.secrets_dirty &&
+                !askSecret && (
                   <button
                     onClick={() => set("secrets_dirty", true)}
                     className="text-xs text-primary hover:underline"
@@ -1732,9 +1797,13 @@ function ProviderModal({
                 )}
             </div>
 
+            {askSecret && (
+              <p className="mb-2 text-xs text-muted-foreground">{reask.hint}</p>
+            )}
             {mode === "edit" &&
             initialProvider?.has_secrets &&
-            !form.secrets_dirty ? (
+            !form.secrets_dirty &&
+            !askSecret ? (
               <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">
                 <ShieldCheck className="mr-1 inline h-3 w-3" /> Secrets are
                 stored. They will be left untouched unless you click
@@ -1748,6 +1817,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.bind_password}
+                  required={askSecret}
                   onChange={(e) => {
                     set("bind_password", e.target.value);
                     set("secrets_dirty", true);
@@ -1764,6 +1834,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.oidc_client_secret}
+                  required={askSecret}
                   onChange={(e) => {
                     set("oidc_client_secret", e.target.value);
                     set("secrets_dirty", true);
@@ -1780,6 +1851,7 @@ function ProviderModal({
                 </label>
                 <textarea
                   value={form.saml_sp_private_key}
+                  required={askSecret}
                   onChange={(e) => {
                     set("saml_sp_private_key", e.target.value);
                     set("secrets_dirty", true);
@@ -1797,6 +1869,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.radius_secret}
+                  required={askSecret}
                   onChange={(e) => {
                     set("radius_secret", e.target.value);
                     set("secrets_dirty", true);
@@ -1813,6 +1886,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.tacacs_secret}
+                  required={askSecret}
                   onChange={(e) => {
                     set("tacacs_secret", e.target.value);
                     set("secrets_dirty", true);
@@ -1862,7 +1936,7 @@ function ProviderModal({
           </button>
           <button
             onClick={handleSubmit}
-            disabled={saving || !form.name.trim()}
+            disabled={saving || !form.name.trim() || mustEnterSecret}
             className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saving ? "Saving…" : "Save"}
