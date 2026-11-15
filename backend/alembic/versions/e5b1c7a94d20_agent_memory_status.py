@@ -6,7 +6,7 @@ Adds ``memory_status`` (JSONB, the latest heartbeat ``memory`` block) to
 nullable, no backfill: NULL means the agent never reported, which is unknown.
 
 Revision ID: e5b1c7a94d20
-Revises: a3c9e5d1b7f2
+Revises: b6d2e9f41a07
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "e5b1c7a94d20"
-down_revision: str | None = "a3c9e5d1b7f2"
+down_revision: str | None = "b6d2e9f41a07"
 branch_labels: str | None = None
 depends_on: str | None = None
 

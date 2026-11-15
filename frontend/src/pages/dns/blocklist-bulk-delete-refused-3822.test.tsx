@@ -55,7 +55,7 @@ const mkList = (id: string, name: string) => ({
   entry_count: 0,
   applied_group_ids: [],
   applied_view_ids: [],
-  feed_entries_are_wildcard: true,
+  feed_wildcard_mode: "by_syntax",
   feed_parse_skipped: null,
   last_synced_at: null,
   last_sync_status: null,

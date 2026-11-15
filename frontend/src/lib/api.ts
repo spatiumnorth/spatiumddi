@@ -4528,6 +4528,8 @@ export const settingsApi = {
       .post<{
         status: string;
         target: string;
+        confirmed?: boolean;
+        detail?: string;
       }>(`/settings/audit-forward-targets/${id}/test`)
       .then((r) => r.data),
   /** Issue #889 — InfluxDB push-export targets. Superadmin-only server
@@ -7302,6 +7304,8 @@ export interface DNSImportCommit {
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
 
+export type BlocklistWildcardMode = "by_syntax" | "always" | "never";
+
 export interface DNSBlockList {
   id: string;
   name: string;
@@ -7313,8 +7317,12 @@ export interface DNSBlockList {
   update_interval_hours: number;
   block_mode: string;
   sinkhole_ip: string | null;
-  /** Whether feed-sourced entries block subdomains too (#894). */
-  feed_entries_are_wildcard: boolean;
+  /**
+   * How feed entries treat subdomains (#4190): `by_syntax` follows each
+   * line's own syntax, `always` blocks subdomains of every entry, `never`
+   * is apex-only.
+   */
+  feed_wildcard_mode: BlocklistWildcardMode;
   enabled: boolean;
   last_synced_at: string | null;
   last_sync_status: string | null;
@@ -11959,7 +11967,7 @@ export const webhooksApi = {
     api.get<WebhookSubscription>(`/webhooks/${id}`).then((r) => r.data),
   create: (body: WebhookSubscriptionWrite) =>
     api.post<WebhookSubscription>("/webhooks", body).then((r) => r.data),
-  update: (id: string, body: WebhookSubscriptionWrite) =>
+  update: (id: string, body: Partial<WebhookSubscriptionWrite>) =>
     api.put<WebhookSubscription>(`/webhooks/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/webhooks/${id}`),
   test: (id: string) =>

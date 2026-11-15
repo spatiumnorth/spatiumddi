@@ -1266,6 +1266,39 @@ if rc == 0:
     print("   hook renders with DHCP agents, not with the opt-out or without agents")
 sys.exit(rc)
 PYEOF
+# #4232 — Cluster -> Pods Restart deletes a pod, so the api Role grants
+# ``delete`` on pods: namespaced, and only under api.serviceControlRBAC.
+render umbrella-api-podrestart-on "$UMBRELLA" \
+    --set api.serviceAccount.enabled=true \
+    --set api.serviceControlRBAC.enabled=true
+render umbrella-api-podrestart-off "$UMBRELLA" \
+    --set api.serviceAccount.enabled=true
+echo "── api Role pod delete (umbrella, #4232)"
+python3 - "$OUT/umbrella-api-podrestart-on.yaml" "$OUT/umbrella-api-podrestart-off.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+def pod_verbs(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    roles = [d for d in docs if d["kind"] == "Role" and d["metadata"]["name"].endswith("-api")]
+    assert len(roles) == 1 and roles[0]["metadata"].get("namespace"), "api Role missing or not namespaced"
+    verbs = {v for r in roles[0]["rules"] if r["resources"] == ["pods"] for v in r["verbs"]}
+    cluster = [
+        r for d in docs if d["kind"] == "ClusterRole" for r in d["rules"]
+        if "pods" in r["resources"] and "delete" in r["verbs"]
+    ]
+    return verbs, cluster
+rc = 0
+on, cluster_on = pod_verbs(sys.argv[1])
+off, _ = pod_verbs(sys.argv[2])
+if "delete" not in on:
+    print(f"FAIL api Role lacks pods delete with serviceControlRBAC: {sorted(on)} (#4232)", file=sys.stderr); rc = 1
+if "delete" in off:
+    print("FAIL api Role grants pods delete without serviceControlRBAC (#4232)", file=sys.stderr); rc = 1
+if cluster_on:
+    print("FAIL a ClusterRole grants pods delete (#4232)", file=sys.stderr); rc = 1
+if rc == 0:
+    print("   pods delete is namespaced and gated on serviceControlRBAC")
+sys.exit(rc)
+PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))

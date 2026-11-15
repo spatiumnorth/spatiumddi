@@ -15,7 +15,7 @@
 import { useState } from "react";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
+import { Check, Pencil, Play, Plus, Send, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -148,7 +148,7 @@ export function AuditForwardTargets({
     null,
   );
   const [testState, setTestState] = useState<
-    Record<string, { status: "ok" | "error"; msg: string } | undefined>
+    Record<string, { status: "ok" | "sent" | "error"; msg: string } | undefined>
   >({});
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -171,9 +171,16 @@ export function AuditForwardTargets({
   async function doTest(id: string) {
     try {
       const r = await settingsApi.testAuditTarget(id);
+      // UDP syslog cannot confirm delivery (#4237): never say "delivered".
+      const sent = r.status === "sent";
       setTestState((s) => ({
         ...s,
-        [id]: { status: "ok", msg: `delivered to ${r.target}` },
+        [id]: sent
+          ? {
+              status: "sent",
+              msg: `sent to ${r.target} over UDP — delivery cannot be confirmed`,
+            }
+          : { status: "ok", msg: `delivered to ${r.target}` },
       }));
     } catch (e) {
       const msg = formatApiError(e, "delivery failed");
@@ -325,11 +332,15 @@ export function AuditForwardTargets({
                             "ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] " +
                             (ts.status === "ok"
                               ? "bg-emerald-500/15 text-emerald-600"
-                              : "bg-red-500/15 text-red-600")
+                              : ts.status === "sent"
+                                ? "bg-muted text-muted-foreground"
+                                : "bg-red-500/15 text-red-600")
                           }
                         >
                           {ts.status === "ok" ? (
                             <Check className="h-3 w-3" />
+                          ) : ts.status === "sent" ? (
+                            <Send className="h-3 w-3" />
                           ) : (
                             <X className="h-3 w-3" />
                           )}

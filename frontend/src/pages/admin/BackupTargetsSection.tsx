@@ -30,6 +30,8 @@ import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { disabledBecause } from "@/hooks/usePermissions";
 
 /**
@@ -151,9 +153,9 @@ export function BackupTargetsSection() {
       )}
 
       {editing && (
-        <TargetFormModal
+        <EditableTargetForm
           mode={editing.mode}
-          existing={editing.mode === "edit" ? editing.target : undefined}
+          row={editing.mode === "edit" ? editing.target : undefined}
           onClose={() => setEditing(null)}
           onSaved={() => {
             qc.invalidateQueries({ queryKey: ["backup-targets"] });
@@ -791,6 +793,43 @@ function RestoreFromArchiveModal({
   );
 }
 
+// Edit reads the target when it opens (#4236): the row the list holds can be
+// 30 s old and the form is seeded once. Save then sends only what changed.
+function EditableTargetForm({
+  mode,
+  row,
+  onClose,
+  onSaved,
+}: {
+  mode: "create" | "edit";
+  row?: BackupTarget;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<BackupTarget>(row, () =>
+    refetchRow<BackupTarget>(qc, [["backup-targets"]], row!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit backup target"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return (
+    <TargetFormModal
+      mode={mode}
+      existing={fresh.row}
+      onClose={onClose}
+      onSaved={onSaved}
+    />
+  );
+}
+
 // ── Target form modal ─────────────────────────────────────────────────
 
 function TargetFormModal({
@@ -946,7 +985,23 @@ function TargetFormModal({
         } as BackupTargetCreate;
         return backupTargetsApi.create(body);
       }
-      const body: BackupTargetUpdate = { ...sharedFields };
+      // The eight top-level fields go only when changed against what the
+      // dialog read (#4236), so one another client set since is not put back.
+      const { config: _cfg, ...topLevel } = sharedFields;
+      void _cfg;
+      const body: BackupTargetUpdate = changedFields(
+        {
+          name: existing!.name,
+          description: existing!.description,
+          enabled: existing!.enabled,
+          passphrase_hint: existing!.passphrase_hint,
+          schedule_cron: existing!.schedule_cron,
+          retention_keep_last_n: existing!.retention_keep_last_n,
+          retention_keep_days: existing!.retention_keep_days,
+          write_only: existing!.write_only,
+        },
+        topLevel,
+      );
       // Send only the settings the operator changed (#3947): the form holds
       // text, so echoing an untouched one would turn a stored null or number
       // into text and record a change nobody made. The API merges the rest
@@ -964,13 +1019,13 @@ function TargetFormModal({
         changed[k] = v;
       }
       if (Object.keys(changed).length > 0) body.config = typedConfig(changed);
-      else delete body.config;
       if (passphrase.length > 0) {
         if (passphrase.length < 8) {
           throw new Error("passphrase must be at least 8 characters");
         }
         body.passphrase = passphrase;
       }
+      if (Object.keys(body).length === 0) return null;
       return backupTargetsApi.update(existing!.id, body);
     },
     onSuccess: onSaved,

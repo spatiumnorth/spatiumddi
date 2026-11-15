@@ -182,13 +182,13 @@ async function openEdit() {
 }
 
 describe("backup destination Edit round-trips stored types (#3947)", () => {
-  it("shows a stored null as empty and an untouched Save sends no config", async () => {
+  it("shows a stored null as empty and an untouched Save sends nothing", async () => {
     const { container } = await openEdit();
     expect(input(container, "Prefix").value).toBe("");
     expect(input(container, "Port").value).toBe("21");
     fireEvent.submit(container.querySelector("form")!);
-    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
-    expect(update.mock.calls[0][1].config).toBeUndefined();
+    await waitFor(() => expect(container.querySelector("form")).toBeNull());
+    expect(update).not.toHaveBeenCalled();
   });
 
   it("sends only the setting that changed, as a number", async () => {
@@ -197,5 +197,56 @@ describe("backup destination Edit round-trips stored types (#3947)", () => {
     fireEvent.submit(container.querySelector("form")!);
     await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
     expect(update.mock.calls[0][1].config).toEqual({ port: 2121 });
+  });
+});
+
+describe("backup destination Edit saves only what changed (#4236)", () => {
+  const stored: BackupTarget = {
+    id: "t1",
+    name: "nightly",
+    description: "other client's text",
+    kind: "ftp",
+    enabled: false,
+    config: { host: "192.0.2.1", port: 21 },
+    passphrase_set: true,
+    passphrase_hint: "",
+    schedule_cron: "0 2 * * *",
+    retention_keep_last_n: 7,
+    retention_keep_days: null,
+    write_only: false,
+    last_run_status: "never",
+    last_run_at: null,
+    last_run_filename: null,
+    last_run_node: null,
+    last_run_bytes: null,
+    last_run_duration_ms: null,
+    last_run_error: null,
+  } as unknown as BackupTarget;
+
+  async function openEdit() {
+    list.mockResolvedValue([stored]);
+    listKinds.mockResolvedValue(KINDS);
+    update.mockResolvedValue(stored);
+    const r = renderSection();
+    fireEvent.click(await screen.findByTitle("Edit"));
+    await screen.findByText("Host");
+    return r;
+  }
+
+  it("sends only the changed top-level field", async () => {
+    const { container } = await openEdit();
+    fireEvent.change(container.querySelector('input[type="text"]')!, {
+      target: { value: "nightly-2" },
+    });
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update.mock.calls[0][1]).toEqual({ name: "nightly-2" });
+  });
+
+  it("a Save with nothing changed sends nothing", async () => {
+    const { container } = await openEdit();
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(container.querySelector("form")).toBeNull());
+    expect(update).not.toHaveBeenCalled();
   });
 });
