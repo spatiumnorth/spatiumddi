@@ -16,6 +16,7 @@ partial-success state cleanly.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -49,6 +50,7 @@ from app.services.ipam.zone_binding import prune_zone_ids
 from . import cname_check
 from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
 from .canonical import (
+    REPLICA_ZONE_TYPES,
     ConflictAction,
     ImportedZone,
     ImportPreview,
@@ -252,6 +254,16 @@ async def _build_records_for_zone(
     return rows, skipped
 
 
+def _is_master(entry: str) -> bool:
+    """``ip`` or ``ip@port``, the shapes the zone API stores."""
+    host, sep, port = entry.partition("@")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not sep or (port.isascii() and port.isdigit() and 1 <= int(port) <= 65535)
+
+
 def _timer(value: int | None, default: int) -> int:
     servable = servable_ttl(value)
     return default if servable is None else servable
@@ -302,6 +314,7 @@ def _zone_kwargs_from_parsed(
         admin_email=importable_admin_email(soa.admin_email if soa else None)[0],
         last_serial=soa.serial if soa else 0,
         forwarders=parsed.forwarders or [],
+        masters=list(parsed.masters) if parsed.zone_type in REPLICA_ZONE_TYPES else [],
         forward_only=parsed.zone_type == "forward",
         import_source=source,
         imported_at=now,
@@ -333,6 +346,18 @@ async def _create_zone_at(
     distinguishes the case via ``audit_extra``.
     """
 
+    # #4259 — the plan comes back from the client, so the rule the preview
+    # applied is applied again: a secondary / stub zone needs masters the zone
+    # API would accept, and stores no records (its masters serve them).
+    if parsed.zone_type in REPLICA_ZONE_TYPES:
+        bad = [m for m in parsed.masters if not _is_master(m)]
+        if bad or not parsed.masters:
+            raise ValueError(
+                f"a {parsed.zone_type} zone requires at least one master "
+                "(primary server IP) to transfer from"
+                + (f"; not an address: {', '.join(repr(m) for m in bad)}" if bad else "")
+            )
+        parsed = replace(parsed, records=[])
     zone_kwargs = _zone_kwargs_from_parsed(
         parsed,
         name=target_name,

@@ -600,6 +600,13 @@ def main() -> int:
                 cp_tls.check_pin_vouched_once(cfg.state_dir, effective_url)
             except Exception as exc:  # noqa: BLE001 — a diagnostic, never fatal
                 log.warning("supervisor.tls.vouch_check_crashed", error=str(exc))
+            # #4223 — a member on the node-local http path keeps its pin
+            # current from the CA-signed list, so an https fallback after an
+            # upgrade does not have to fail verification and repin first.
+            try:
+                cp_tls.refresh_pin_if_due(cfg.state_dir, effective_url)
+            except Exception as exc:  # noqa: BLE001 — never fatal
+                log.warning("supervisor.tls.pin_refresh_crashed", error=str(exc))
         else:
             log.info(
                 "supervisor.heartbeat.skipped",

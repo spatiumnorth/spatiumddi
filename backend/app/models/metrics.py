@@ -42,6 +42,15 @@ class DNSMetricSample(Base):
     rate_dropped: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     rate_slipped: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
+    # #4193 — the agent's own memory, sampled from the heartbeat into the
+    # same minute bucket as the counters. NULL = not measured (an older agent,
+    # or a bucket with no heartbeat in it), never 0; the counter columns above
+    # are 0 on a row a heartbeat created before the first counter push.
+    mem_used_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mem_peak_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mem_daemon_rss_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mem_agent_rss_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
 
 class DHCPMetricSample(Base):
     __tablename__ = "dhcp_metric_sample"
@@ -91,6 +100,15 @@ class DHCPMetricSample(Base):
     # it: an agent without ``CAP_NET_RAW``, a v6-only server, the bucket in
     # which its counting socket reopened, or an agent older than this change.
     queue_evicted: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # #4193 — the agent's own memory, sampled from the heartbeat into the
+    # same minute bucket as the counters. NULL = not measured (an older agent,
+    # or a bucket with no heartbeat in it), never 0; the counter columns above
+    # are 0 on a row a heartbeat created before the first counter push.
+    mem_used_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mem_peak_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mem_daemon_rss_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mem_agent_rss_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 __all__ = ["DNSMetricSample", "DHCPMetricSample"]

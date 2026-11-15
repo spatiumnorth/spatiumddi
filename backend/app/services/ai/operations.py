@@ -3883,7 +3883,7 @@ async def _apply_create_dhcp_static(
     # counts. All in this one transaction, committed below.
     await push_static_change(db, row, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
-    await upsert_ipam_for_static(db, scope, row)
+    await upsert_ipam_for_static(db, scope, row, user=user)
     await _recount_subnet(db, scope.subnet_id)
 
     write_audit(
@@ -5551,7 +5551,10 @@ async def _preview_approve_change_request(
         RESOURCE_TYPE_CHANGE_REQUEST,
         user_has_permission,
     )
-    from app.services.approvals.service import get_change_request  # noqa: PLC0415
+    from app.services.approvals.service import (  # noqa: PLC0415
+        REQUESTER_GONE_MESSAGE,
+        get_change_request,
+    )
 
     cr_id = _parse_cr_id(args.change_request_id)
     if cr_id is None:
@@ -5572,7 +5575,7 @@ async def _preview_approve_change_request(
     if cr.requested_by_user_id is None:
         return PreviewResult(
             ok=False,
-            detail="Requester no longer exists; cancel and recreate this change request.",
+            detail=REQUESTER_GONE_MESSAGE,
         )
     if user.id == cr.requested_by_user_id:
         return PreviewResult(ok=False, detail="You cannot approve your own change request.")

@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SpatiumDDI on OpenShift, certified-image profile (#3913)
+#
+#   helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+#     --version <chart version> -f values-openshift-certified.yaml \
+#     --set 'image.pullSecrets[0].name=redhat-registry'
+#
+# What it changes against the defaults, and nothing else:
+#
+#   * the four images that have a Red Hat UBI 9 build (api, frontend, BIND9,
+#     Kea) run as <version>-ubi, from ghcr.io (``image.tagSuffix``);
+#   * the bundled PostgreSQL and Redis run Red Hat's own images from
+#     registry.redhat.io (rhel9/postgresql-16, rhel9/redis-7) instead of the
+#     Docker Hub ones. Those two need a Red Hat registry pull secret:
+#
+#       oc create secret docker-registry redhat-registry \
+#         --docker-server=registry.redhat.io \
+#         --docker-username=<registry service account> \
+#         --docker-password=<token>
+#
+#     (a registry service account from https://access.redhat.com/terms-based-registry/).
+#     Referenced below through ``image.pullSecrets``, which every pod of the
+#     release uses; GHCR's pull is anonymous and ignores it.
+#
+# Not changed: the PostgreSQL and Redis here are still the chart's single-pod
+# StatefulSets. For HA bring your own (set ``postgresql.enabled=false`` and
+# fill ``externalDatabase``, same for Redis) — a certified PostgreSQL operator
+# is the supported path on OpenShift. The pins below follow Red Hat's own tag
+# scheme (<RHEL minor>-<build timestamp>), an immutable build; move them
+# together with a deliberate re-test, not with a floating ``latest``.
+# ─────────────────────────────────────────────────────────────────────────────
+
+global:
+  platform: openshift
+
+image:
+  tagSuffix: "-ubi"
+  pullSecrets:
+    - name: redhat-registry
+
+postgresql:
+  image:
+    repository: registry.redhat.io/rhel9/postgresql-16
+    tag: "9.8-1793252703"
+    flavor: rhel
+
+redis:
+  image:
+    repository: registry.redhat.io/rhel9/redis-7
+    tag: "9.8-1793253232"
+    flavor: rhel
+
+# BIND9 is the DNS flavor that runs under OpenShift's restricted SCC, and the
+# only one with a UBI build. Kea likewise. Both stay off until you turn them
+# on; the -ubi suffix applies when you do.

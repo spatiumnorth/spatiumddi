@@ -387,7 +387,12 @@ export function PortsTab({ groupId }: { groupId: string }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => multicastApi.deletePort(id),
+    onMutate: () => setError(null),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["multicast-ports", groupId] });
+    },
+    onError: (e: unknown) => {
+      setError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({ queryKey: ["multicast-ports", groupId] });
     },
   });
@@ -550,7 +555,14 @@ function MembershipsTab({ groupId }: { groupId: string }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => multicastApi.deleteMembership(id),
+    onMutate: () => setError(null),
     onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["multicast-memberships", groupId],
+      });
+    },
+    onError: (e: unknown) => {
+      setError(formatApiError(e, "Delete failed"));
       qc.invalidateQueries({
         queryKey: ["multicast-memberships", groupId],
       });
@@ -1044,15 +1056,29 @@ export function MulticastGroupsPage() {
 
   const items = query.data?.items ?? [];
 
+  // A refused delete says why in an announced line and re-reads the list, so
+  // a group that is already gone leaves it (#4220).
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
     mutationFn: (id: string) => multicastApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["multicast-groups"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete multicast group"));
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
   });
 
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => multicastApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete multicast groups"));
       qc.invalidateQueries({ queryKey: ["multicast-groups"] });
     },
   });
@@ -1171,6 +1197,7 @@ export function MulticastGroupsPage() {
             toggleOne={toggleOne}
             removeOne={removeOne}
             bulkDelete={bulkDelete}
+            deleteError={deleteError}
             setEditing={setEditing}
             setShowNew={setShowNew}
             setShowBulk={setShowBulk}
@@ -1252,6 +1279,7 @@ type GroupsTabBodyProps = {
   toggleOne: (id: string) => void;
   removeOne: { mutate: (id: string) => void };
   bulkDelete: { mutate: (ids: string[]) => void; isPending: boolean };
+  deleteError: string | null;
   setEditing: (g: MulticastGroupRead | null) => void;
   setShowNew: (v: boolean) => void;
   setShowBulk: (v: boolean) => void;
@@ -1277,6 +1305,7 @@ function GroupsTabBody({
   toggleOne,
   removeOne,
   bulkDelete,
+  deleteError,
   setEditing,
   setShowNew,
   setShowBulk,
@@ -1300,6 +1329,7 @@ function GroupsTabBody({
   } | null>(null);
   return (
     <>
+      <FormError className="text-sm text-destructive">{deleteError}</FormError>
       <div className="flex justify-end gap-2">
         <HeaderButton
           icon={RefreshCw}
