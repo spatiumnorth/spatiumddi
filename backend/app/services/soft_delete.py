@@ -1149,6 +1149,21 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active zone {obj.name!r} already exists in this group/view"
+        # #4226 — a zone cites ACLs and TSIG keys by name. The delete guards
+        # of those count a zone in the Trash now, but a row trashed before that,
+        # or a name removed by another path, leaves a citation the group no
+        # longer defines: BIND would refuse the config, and the bundle renders
+        # the emptied list as ``none``. The zone API refuses the same value
+        # with a 422, so a restore must not write it.
+        from app.services.dns.zone_citations import undefined_zone_citations  # noqa: PLC0415
+
+        missing = await undefined_zone_citations(db, obj)
+        if missing:
+            return (
+                f"Zone {obj.name!r} cites {', '.join(missing)}, which its server group no "
+                "longer defines. Create it again on the group's ACLs / TSIG keys tab, or "
+                "edit the zone's citation, then restore the zone."
+            )
         # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
         # not counted when a second server joins its group, so the restore must
         # hold it to the same rule the direct sign does, or the group ends up

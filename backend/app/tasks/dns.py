@@ -82,7 +82,7 @@ async def _unlock_list(db: AsyncSession, list_id: str) -> None:
 _ADD_FEED_ENTRIES_SQL = text(
     "INSERT INTO dns_blocklist_entry "
     "(id, list_id, domain, entry_type, source, is_wildcard, reason) "
-    "SELECT gen_random_uuid(), :lid, s.domain, 'block', 'feed', (NOT s.literal AND :wild), '' "
+    "SELECT gen_random_uuid(), :lid, s.domain, 'block', 'feed', s.wild, '' "
     "FROM _blocklist_feed_stage s "
     "WHERE NOT EXISTS (SELECT 1 FROM dns_blocklist_entry e "
     "WHERE e.list_id = :lid AND e.domain = s.domain) "
@@ -297,7 +297,7 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     # Entries whose reach the rule itself fixes (#4037): never follow the
     # list's subdomain setting.
     literals = parsed.literal_domains
-    wildcard = bool(bl.feed_entries_are_wildcard)
+    wildcard_mode = bl.feed_wildcard_mode
 
     # #3607: a feed that parses to nothing is how an empty file, a
     # blank answer or an unrecognisable body looks. Replacing a
@@ -326,7 +326,7 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     # counted the same way (#2123). Honouring an apex-only list setting against such
     # a feed is the operator's call, but doing it silently would
     # leave them wondering why subdomains still resolve.
-    if not wildcard and parsed.wildcard_count:
+    if wildcard_mode == "never" and parsed.wildcard_count:
         logger.warning(
             "blocklist_feed_wildcard_intent_overridden",
             list_id=list_id,
@@ -360,16 +360,30 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     await db.execute(
         text(
             "CREATE TEMP TABLE _blocklist_feed_stage "
-            "(domain text NOT NULL, literal boolean NOT NULL) ON COMMIT DROP"
+            "(domain text NOT NULL, literal boolean NOT NULL, wild boolean NOT NULL) "
+            "ON COMMIT DROP"
         )
     )
-    stage_insert = text("INSERT INTO _blocklist_feed_stage (domain, literal) VALUES (:d, :l)")
+    stage_insert = text(
+        "INSERT INTO _blocklist_feed_stage (domain, literal, wild) VALUES (:d, :l, :w)"
+    )
     literal_set = set(literals)
+    # Per entry (#4190): ``always`` / ``never`` are the list's override;
+    # ``by_syntax`` takes what each line's own syntax said. A literal entry
+    # (``|name^`` / ``.name^``) fixes its own reach and is never a wildcard.
+    wild_syntax = parsed.wildcard_domains
+
+    def _wild(d: str) -> bool:
+        if wildcard_mode == "always":
+            return True
+        return wildcard_mode != "never" and d in wild_syntax
+
     for batch in _batched([d for d in domains if d not in literal_set], _FEED_WRITE_BATCH):
-        await db.execute(stage_insert, [{"d": d, "l": False} for d in batch])
+        await db.execute(stage_insert, [{"d": d, "l": False, "w": _wild(d)} for d in batch])
     for batch in _batched(literals, _FEED_WRITE_BATCH):
-        await db.execute(stage_insert, [{"d": d, "l": True} for d in batch])
+        await db.execute(stage_insert, [{"d": d, "l": True, "w": False} for d in batch])
     domains.clear()  # staged; the parsed copies are no longer needed
+    wild_syntax.clear()
     literals.clear()
     literal_set.clear()
     # A statement planned against an unanalysed temp table, or against an
@@ -379,7 +393,7 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
     # nested loops inside this transaction keep it a hash anti join.
     await _plan_set_apply(db)
 
-    add_result = await db.execute(_ADD_FEED_ENTRIES_SQL, {"lid": bl.id, "wild": wildcard})
+    add_result = await db.execute(_ADD_FEED_ENTRIES_SQL, {"lid": bl.id})
     n_added = int(getattr(add_result, "rowcount", 0) or 0)
     remove_result = await db.execute(
         text(
@@ -390,14 +404,16 @@ async def _refresh_locked(db: AsyncSession, list_id: str) -> dict[str, int | str
         {"lid": bl.id},
     )
     n_removed = int(getattr(remove_result, "rowcount", 0) or 0)
-    # Feed rows that now come from a ``|name^`` / ``.name^`` rule keep their
-    # row, so a stale wildcard flag on it is cleared (#4037).
+    # Feed rows keep their row when the feed's reach for them changes (a
+    # ``|name^`` / ``.name^`` rule, #4037; a list moved to ``by_syntax`` or a
+    # feed that now says ``*.name``, #4190), so a stale wildcard flag is
+    # restamped to what this refresh decided.
     restamp_result = await db.execute(
         text(
-            "UPDATE dns_blocklist_entry e SET is_wildcard = false "
+            "UPDATE dns_blocklist_entry e SET is_wildcard = s.wild "
             "FROM _blocklist_feed_stage s "
             "WHERE e.list_id = :lid AND e.source = 'feed' AND e.domain = s.domain "
-            "AND s.literal AND e.is_wildcard"
+            "AND e.is_wildcard IS DISTINCT FROM s.wild"
         ),
         {"lid": bl.id},
     )
