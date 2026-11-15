@@ -114,26 +114,17 @@ describe("container actions confirm first", () => {
     show(<ContainersTab />);
   }
 
-  it("Stop: cancel calls nothing, confirm calls once", async () => {
+  it("Restart: cancel calls nothing, confirm calls once", async () => {
     open("running");
-    const stop = await screen.findByRole("button", { name: /^Stop$/ });
-    stop.focus();
-    fireEvent.click(stop);
+    const restart = await screen.findByRole("button", { name: /^Restart$/ });
+    restart.focus();
+    fireEvent.click(restart);
     const dialog = await screen.findByRole("dialog");
-    expect(dialog.textContent).toMatch(/stops answering on this node/);
+    expect(dialog.textContent).toMatch(/briefly unavailable on this node/);
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(action).not.toHaveBeenCalled();
-    expect(document.activeElement).toBe(stop);
-
-    fireEvent.click(stop);
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Stop",
-      }),
-    );
-    await waitFor(() => expect(action).toHaveBeenCalledTimes(1));
-    expect(action.mock.calls[0].slice(0, 2)).toEqual(["spatium-dns-0", "stop"]);
+    expect(document.activeElement).toBe(restart);
   });
 
   it("Restart asks first", async () => {
@@ -149,13 +140,12 @@ describe("container actions confirm first", () => {
     ]);
   });
 
-  it("Start asks first", async () => {
-    open("exited");
-    fireEvent.click(await screen.findByRole("button", { name: /^Start$/ }));
-    const dialog = await screen.findByRole("dialog");
-    expect(action).not.toHaveBeenCalled();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
-    await waitFor(() => expect(action).toHaveBeenCalledTimes(1));
+  // #4232 — a pod has no Stop / Start (it would need its workload scaled).
+  it("offers no Stop or Start on a running or exited pod", async () => {
+    open("running");
+    await screen.findByRole("button", { name: /^Restart$/ });
+    expect(screen.queryByRole("button", { name: /^Stop$/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Start$/ })).toBeNull();
   });
 });
 

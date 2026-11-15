@@ -940,7 +940,7 @@ const APPLIANCE_TABS: [string, string, string, (string | RegExp)[]][] = [
     "Cluster › Pods",
     "./appliance/ContainersTab.tsx",
     "ContainersTab",
-    ["Restart", "Stop"],
+    ["Restart"],
   ],
   [
     "Firewall",

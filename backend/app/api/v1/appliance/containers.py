@@ -3,7 +3,7 @@
 Mounted at ``/api/v1/appliance/containers``:
 
     GET    /                          list all containers + spatium-only first
-    POST   /{name}/{action}           start / stop / restart
+    POST   /{name}/{action}           restart (start / stop answer 409)
     GET    /{name}/logs               tail (non-streaming)
     GET    /{name}/logs/stream        SSE — follow=true tail (close to disconnect)
 """
@@ -28,6 +28,7 @@ from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.services.appliance.containers import (
     DockerUnavailableError,
+    PodActionRefusedError,
     container_action,
     get_container_logs,
     resolve_workload_pod,
@@ -90,7 +91,7 @@ async def list_containers() -> list[ContainerInfo]:
     "/{name}/{action}",
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Run start / stop / restart on a container",
+    summary="Restart a pod (start / stop answer 409: a pod has neither)",
 )
 async def post_container_action(
     name: str,
@@ -107,6 +108,10 @@ async def post_container_action(
         container_action(name, action)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    except PodActionRefusedError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     db.add(
         AuditLog(
             user_id=user.id,
