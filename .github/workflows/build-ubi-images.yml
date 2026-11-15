@@ -46,7 +46,7 @@ jobs:
             file: ./backend/Dockerfile.ubi
             target: runtime
             smoke: >-
-              docker run --rm --user 123456:0 -e SECRET_KEY=smoke "$IMG" python -c "import app.main"
+              docker run --rm --user 123456:0 -e SECRET_KEY="$(openssl rand -hex 32)" "$IMG" python -c "import app.main"
               && docker run --rm --user 123456:0 "$IMG" pg_dump --version
           - image: spatiumddi-frontend
             context: .
