@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   Activity,
   Award,
@@ -208,7 +209,20 @@ function buildTarget(selection: string): NetToolTarget | undefined {
 // ── page ──────────────────────────────────────────────────────────────
 
 export function NetworkToolsPage() {
-  const [active, setActive] = useState<ToolId>("ping");
+  // Deep link from the DNS query details (#4250): ``?tool=dig&name=…&type=…
+  // &server=…`` or ``?tool=whois&query=…`` opens that tool with its form
+  // filled in. Read once, and never run: the operator presses Run.
+  const [params] = useSearchParams();
+  const [prefill, setPrefill] = useState<Prefill>(() => ({
+    name: params.get("name") ?? "",
+    type: params.get("type") ?? "",
+    server: params.get("server") ?? "",
+    query: params.get("query") ?? "",
+  }));
+  const [active, setActive] = useState<ToolId>(() => {
+    const wanted = params.get("tool");
+    return TOOLS.some((t) => t.id === wanted) ? (wanted as ToolId) : "ping";
+  });
   // ``"server"`` or an appliance id. Default = server (back-compat).
   const [runFrom, setRunFrom] = useState("server");
   const tool = TOOLS.find((t) => t.id === active)!;
@@ -281,7 +295,11 @@ export function NetworkToolsPage() {
               return (
                 <button
                   key={t.id}
-                  onClick={() => setActive(t.id)}
+                  onClick={() => {
+                    // The link's values belong to the tool it named.
+                    setPrefill({ name: "", type: "", server: "", query: "" });
+                    setActive(t.id);
+                  }}
                   className={cn(
                     "flex w-full items-start gap-2 rounded-md px-2 py-2 text-left text-sm",
                     active === t.id
@@ -323,7 +341,12 @@ export function NetworkToolsPage() {
               if (denied && e.key === "Enter") e.stopPropagation();
             }}
           >
-            <ToolPanel key={active} tool={tool} target={target} />
+            <ToolPanel
+              key={active}
+              tool={tool}
+              target={target}
+              prefill={prefill}
+            />
           </div>
         </div>
       </div>
@@ -378,12 +401,16 @@ function RunFromSelector({
   );
 }
 
+type Prefill = { name: string; type: string; server: string; query: string };
+
 function ToolPanel({
   tool,
   target,
+  prefill,
 }: {
   tool: ToolDef;
   target?: NetToolTarget;
+  prefill: Prefill;
 }) {
   const Icon = tool.icon;
   return (
@@ -397,8 +424,8 @@ function ToolPanel({
         <CommandTool kind="traceroute" target={target} />
       )}
       {tool.id === "mtr" && <CommandTool kind="mtr" />}
-      {tool.id === "dig" && <DigTool target={target} />}
-      {tool.id === "whois" && <WhoisTool />}
+      {tool.id === "dig" && <DigTool target={target} prefill={prefill} />}
+      {tool.id === "whois" && <WhoisTool prefill={prefill.query} />}
       {tool.id === "port-test" && <PortTestTool target={target} />}
       {tool.id === "tls-cert" && <TlsCertTool target={target} />}
       {tool.id === "dns-propagation" && <PropagationTool />}
@@ -534,10 +561,20 @@ export function CommandTool({
 
 // ── dig ───────────────────────────────────────────────────────────────
 
-function DigTool({ target }: { target?: NetToolTarget }) {
-  const [name, setName] = useState("");
-  const [recordType, setRecordType] = useState("A");
-  const [server, setServer] = useState("");
+function DigTool({
+  target,
+  prefill,
+}: {
+  target?: NetToolTarget;
+  prefill?: { name: string; type: string; server: string };
+}) {
+  const [name, setName] = useState(prefill?.name ?? "");
+  const [recordType, setRecordType] = useState(
+    prefill?.type && RECORD_TYPES.includes(prefill.type.toUpperCase())
+      ? prefill.type.toUpperCase()
+      : "A",
+  );
+  const [server, setServer] = useState(prefill?.server ?? "");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolCommandResult | null>(null);
@@ -622,8 +659,8 @@ function DigTool({ target }: { target?: NetToolTarget }) {
 
 // ── whois ─────────────────────────────────────────────────────────────
 
-function WhoisTool() {
-  const [query, setQuery] = useState("");
+function WhoisTool({ prefill }: { prefill?: string }) {
+  const [query, setQuery] = useState(prefill ?? "");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolCommandResult | null>(null);

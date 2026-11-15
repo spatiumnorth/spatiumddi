@@ -7,12 +7,34 @@
  * one server, and the server's name in the row details modal always.
  */
 
+import { useState, type ReactElement, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render as rtlRender,
+  screen,
+} from "@testing-library/react";
 import type { DHCPActivityLogRow, DNSQueryLogRow } from "@/lib/api";
 import { DHCPActivityRow, DNSQueryRow } from "./LogsPage";
 
 afterEach(cleanup);
+
+// The details modal reads permissions and blocking-list state (#4250), so a
+// row needs a query client and a router around it, as it has on the page.
+function Wrapper({ children }: { children: ReactNode }) {
+  const [qc] = useState(
+    () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  );
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+const render = (ui: ReactElement) => rtlRender(ui, { wrapper: Wrapper });
 
 const dnsRow: DNSQueryLogRow = {
   id: 1,

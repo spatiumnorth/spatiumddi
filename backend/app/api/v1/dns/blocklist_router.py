@@ -69,6 +69,7 @@ from app.services.dns_blocklist import (
     build_effective_for_view,
     dedupe_domains,
 )
+from app.services.dns_blocklist_match import match_domain
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(require_resource_permission("dns_blocklist"))])
@@ -1144,6 +1145,69 @@ async def apply_profile(
 
 
 # ── Blocklist CRUD ──────────────────────────────────────────────────────────
+
+
+class MatchedEntryResponse(BaseModel):
+    list_id: uuid.UUID
+    list_name: str
+    source_type: str
+    block_mode: str
+    sinkhole_ip: str | None
+    enabled: bool
+    entry_id: uuid.UUID
+    entry_domain: str
+    is_wildcard: bool
+    entry_source: str
+    entry_type: str
+    target: str | None
+    reason: str
+    # The list is enabled and assigned to the queried group or view.
+    applies_here: bool
+    # An exception takes this entry out for the queried name.
+    excepted: bool
+
+
+class MatchedExceptionResponse(BaseModel):
+    list_id: uuid.UUID
+    list_name: str
+    exception_id: uuid.UUID
+    domain: str
+    source: str
+    applies_here: bool
+
+
+class BlocklistMatchResponse(BaseModel):
+    domain: str
+    # blocked | allowed | none, over the lists that apply to the group / view.
+    effective: str
+    matches: list[MatchedEntryResponse]
+    exceptions: list[MatchedExceptionResponse]
+
+
+@router.get("/blocklists/match", response_model=BlocklistMatchResponse)
+async def match_blocklists(
+    db: DB,
+    _: CurrentUser,
+    domain: str,
+    group_id: uuid.UUID | None = None,
+    view_id: uuid.UUID | None = None,
+) -> BlocklistMatchResponse:
+    """Which blocking lists hold an entry or exception covering ``domain``,
+    and whether the name is blocked for ``group_id`` / ``view_id`` (#4250).
+
+    Looks up the name and its parent suffixes only; it never reads a whole
+    list. Declared before ``/blocklists/{list_id}`` so ``match`` is not
+    parsed as a list id."""
+    try:
+        res = await match_domain(db, domain, group_id=group_id, view_id=view_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid domain") from None
+    return BlocklistMatchResponse(
+        domain=res.domain,
+        effective=res.effective,
+        matches=[MatchedEntryResponse(**vars(m)) for m in res.matches],
+        exceptions=[MatchedExceptionResponse(**vars(e)) for e in res.exceptions],
+    )
 
 
 @router.get("/blocklists", response_model=list[BlockListResponse])
