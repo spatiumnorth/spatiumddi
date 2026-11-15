@@ -43,6 +43,11 @@ case "$args" in
   "--request-timeout=10s -n spatium get daemonset "*)
     ds=$(echo "$args" | awk '{print $6}')
     [ -f "$S/ds_$ds.json" ] && cat "$S/ds_$ds.json"; exit 0 ;;
+  "--request-timeout=10s -n spatium patch daemonset "*" --type json -p "*)
+    ds=$(echo "$args" | awk '{print $6}')
+    printf '%s' "${args#* --type json -p }" > "$S/jsonpatch_$ds.json"
+    [ -f "$S/release_fails" ] && exit 1
+    exit 0 ;;
   "--request-timeout=30s -n spatium patch daemonset "*)
     ds=$(echo "$args" | awk '{print $6}')
     cp "${args##* }" "$S/patched_ds_$ds.json"
@@ -78,7 +83,7 @@ def _extract_function(name: str) -> str:
     raise AssertionError("no closing brace")
 
 
-def _run(tmp_path, *, daemonsets=None, ds_patch_fails=False, hold=False, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag="NEW"):
+def _run(tmp_path, *, release_fails=False, daemonsets=None, ds_patch_fails=False, hold=False, nodes=1, values=LIVE, apierr=False, patch_fails=False, tag="NEW"):
     stub = tmp_path / "stub"
     stub.mkdir()
     k3s = tmp_path / "k3s"
@@ -93,6 +98,7 @@ def _run(tmp_path, *, daemonsets=None, ds_patch_fails=False, hold=False, nodes=1
         ("apierr", apierr),
         ("patch_fails", patch_fails),
         ("ds_patch_fails", ds_patch_fails),
+        ("release_fails", release_fails),
     ):
         if on:
             (stub / flag).touch()
@@ -103,7 +109,8 @@ def _run(tmp_path, *, daemonsets=None, ds_patch_fails=False, hold=False, nodes=1
     if hold:
         (state / "shared-chart-hold").write_text("{}")
     body = "\n".join(
-        _extract_function(f) for f in ("preroll_role_daemonsets", FUNC)
+        _extract_function(f)
+        for f in ("release_preroll_ownership", "preroll_role_daemonsets", FUNC)
     ).replace("/usr/local/bin/k3s", str(k3s))
     script = (
         f'. "{SCRIPT}"\nset -eu\n'
@@ -240,3 +247,79 @@ def test_early_call_before_the_readyz_wait():
     early = text.index("get --raw=/livez")
     assert text.index('echo "Waiting for k3s /readyz') < early < text.index("\nready=0\n")
     assert "reconcile_role_chart_tag || true" in text[early : early + 200]
+
+
+FM = "spatium-firstboot-preroll"
+
+
+def _managed(*managers):
+    return [
+        {"manager": m, "operation": op, "apiVersion": "apps/v1", "fieldsType": "FieldsV1"}
+        for m, op in managers
+    ]
+
+
+def _apply_json_patch(doc, ops):
+    """The two RFC 6902 ops the release uses, as the apiserver applies them."""
+    for op in ops:
+        *parents, last = op["path"].strip("/").split("/")
+        node = doc
+        for part in parents:
+            node = node[int(part)] if isinstance(node, list) else node[part]
+        key = int(last) if isinstance(node, list) else last
+        if op["op"] == "test":
+            assert node[key] == op["value"]
+        else:
+            assert op["op"] == "remove"
+            del node[key]
+
+
+def test_preroll_patch_uses_its_own_field_manager(tmp_path):
+    _run(tmp_path, daemonsets={"dhcp-kea": _ds("reg/kea:OLD")})
+    calls = (tmp_path / "stub" / "calls.log").read_text().splitlines()
+    patch = [c for c in calls if "patch daemonset dhcp-kea --field-manager" in c]
+    assert patch and f"--field-manager={FM}" in patch[0] and "--type strategic" in patch[0]
+
+
+def test_preroll_ownership_is_released_so_helm_can_apply_other_images(tmp_path):
+    ds = _ds("reg/kea:OLD")
+    ds["metadata"] = {
+        "managedFields": _managed(
+            ("helm", "Apply"),
+            ("kube-controller-manager", "Update"),
+            (FM, "Update"),
+            ("kubectl-patch", "Update"),  # an operator's own, never ours to drop
+        )
+    }
+    proc, _, _ = _run(tmp_path, daemonsets={"dhcp-kea": ds})
+    assert "rc=0" in proc.stdout, proc.stderr
+    ops = json.loads((tmp_path / "stub" / "jsonpatch_dhcp-kea.json").read_text())
+    live = json.loads(json.dumps(ds))
+    _apply_json_patch(live, ops)
+    left = [e["manager"] for e in live["metadata"]["managedFields"]]
+    assert left == ["helm", "kube-controller-manager", "kubectl-patch"]
+
+
+def test_release_removes_every_entry_highest_index_first(tmp_path):
+    ds = _ds("reg/kea:OLD")
+    ds["metadata"] = {
+        "managedFields": _managed((FM, "Update"), ("helm", "Apply"), (FM, "Update"))
+    }
+    _run(tmp_path, daemonsets={"dhcp-kea": ds})
+    live = json.loads(json.dumps(ds))
+    _apply_json_patch(
+        live, json.loads((tmp_path / "stub" / "jsonpatch_dhcp-kea.json").read_text())
+    )
+    assert [e["manager"] for e in live["metadata"]["managedFields"]] == ["helm"]
+
+
+def test_no_release_patch_when_we_own_nothing_or_release_fails(tmp_path):
+    ds = _ds("reg/kea:OLD")
+    ds["metadata"] = {"managedFields": _managed(("helm", "Apply"))}
+    _run(tmp_path, daemonsets={"dhcp-kea": ds})
+    assert not (tmp_path / "stub" / "jsonpatch_dhcp-kea.json").exists()
+    sub = tmp_path / "f"
+    sub.mkdir()
+    ds["metadata"] = {"managedFields": _managed((FM, "Update"))}
+    proc, patched, _ = _run(sub, daemonsets={"dhcp-kea": ds}, release_fails=True)
+    assert "rc=0" in proc.stdout and "WARN" in proc.stderr and patched is not None

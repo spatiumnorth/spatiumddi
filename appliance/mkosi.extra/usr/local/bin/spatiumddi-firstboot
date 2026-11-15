@@ -1913,6 +1913,46 @@ except Exception:
     return 0
 }
 
+# #3919 — drop the field manager the preroll patch used from a DaemonSet's
+# managedFields. A patch is an Update and takes ownership of the fields it
+# changes (every role container's .image); helm applies server-side without
+# forcing conflicts (the role chart's upgrade runs --force-conflicts=false), so
+# a later helm apply of a DIFFERENT image (a rollback to a slot without this
+# change, a shared-chart hold, a node joining) was refused "conflict with
+# kubectl-patch". Naming the manager is not enough, since we cannot know that
+# helm's name matches across versions; removing our own entry is: the image
+# field is then unowned or helm's, and helm's next apply takes it without a
+# conflict, as it did before the preroll. The entry is matched by the manager
+# name this function was given (never an operator's own kubectl-patch), and the
+# JSON patch tests the name at its index so a concurrent write cannot make it
+# remove another manager. Never fatal.
+release_preroll_ownership() {
+    local k3s=/usr/local/bin/k3s ns=$1 ds=$2 fm=$3 ops
+    ops=$($k3s kubectl --request-timeout=10s -n "$ns" get daemonset "$ds" \
+        -o json 2>/dev/null | python3 -c '
+import json, sys
+
+fm = sys.argv[1]
+try:
+    mf = json.load(sys.stdin)["metadata"].get("managedFields") or []
+    # Highest index first, so a removal does not shift the next.
+    ops = []
+    for i in range(len(mf) - 1, -1, -1):
+        if mf[i].get("manager") == fm:
+            ops.append({"op": "test", "path": f"/metadata/managedFields/{i}/manager", "value": fm})
+            ops.append({"op": "remove", "path": f"/metadata/managedFields/{i}"})
+    if ops:
+        print(json.dumps(ops))
+except Exception:
+    sys.exit(1)
+' "$fm" 2>/dev/null) || ops=""
+    [ -n "$ops" ] || return 0
+    $k3s kubectl --request-timeout=10s -n "$ns" patch daemonset "$ds" \
+        --type json -p "$ops" >/dev/null 2>&1 \
+        || echo "WARN: could not release field manager ${fm} on DaemonSet ${ds}; a later helm apply of other images may report a conflict (#3919)." >&2
+    return 0
+}
+
 # #3919 — move the role DaemonSets' pod template onto this slot's tag, ahead
 # of the chart write that follows. Rewriting the HelmChart alone cannot give
 # one roll: helm-controller applies it from a job POD, which needs the kubelet,
@@ -1928,7 +1968,7 @@ except Exception:
 # per-image tag override is left alone. Never fatal: without this the chart
 # write still moves the roles, with the extra roll.
 preroll_role_daemonsets() {
-    local k3s=/usr/local/bin/k3s old=$1 new=$2 ns=spatium ds patch
+    local k3s=/usr/local/bin/k3s old=$1 new=$2 ns=spatium ds patch fm=spatium-firstboot-preroll
     [ -n "$old" ] && [ "$old" != "$new" ] || return 0
     patch=$(mktemp) || return 0
     for ds in dhcp-kea dns-bind9 dns-powerdns dns-technitium; do
@@ -1960,8 +2000,10 @@ except Exception:
 ' "$old" "$new" "$patch" 2>/dev/null || { echo "WARN: could not read DaemonSet $ds; left to the chart write (#3919)." >&2; continue; }
         [ -s "$patch" ] || continue
         if $k3s kubectl --request-timeout=30s -n "$ns" patch daemonset "$ds" \
+                --field-manager="$fm" \
                 --type strategic --patch-file "$patch" >/dev/null 2>&1; then
             echo "Moved DaemonSet ${ds} to ${new} before the kubelet restarts it (#3919)."
+            release_preroll_ownership "$ns" "$ds" "$fm"
         else
             echo "WARN: could not patch DaemonSet ${ds}; left to the chart write (#3919)." >&2
         fi

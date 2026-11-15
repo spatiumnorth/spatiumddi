@@ -2891,7 +2891,9 @@ about 4 minutes during the reboot. Upgrading from a release that
 predates #3919's fix, a second, shorter DNS and DHCP interruption of a few
 seconds can follow about 3 minutes after boot; a release that carries it
 moves the role pods onto its own image during the boot, so they restart
-once (#3919).
+once, and the upgrade unpacks the new role images while the old slot is still
+running, so the first container start after the reboot is not slowed by it
+(#3919).
 
 ### Multi-node cluster, from 2026.10.02-1
 
