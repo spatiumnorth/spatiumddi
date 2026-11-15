@@ -13446,24 +13446,31 @@ export function ZoneTreeRows({
   const { forward: tree, folders } = buildZoneTreeWithReverseFolders(zones);
 
   // A zone selected from a link, search result or deep link opens the reverse
-  // folder it sits in (#4203). An effect, not a derived value, so the operator
-  // can still collapse the folder afterwards.
-  const selectedFolderKey = (() => {
-    const sel = zones.find((z) => z.id === selectedZoneId);
-    if (!sel) return null;
-    return isReverseV4(sel)
-      ? REVERSE_V4_KEY
-      : isReverseV6(sel)
-        ? REVERSE_V6_KEY
-        : null;
+  // folder it sits in AND every ancestor row on the path to it (#4203), so it
+  // is visible and not hidden under a closed parent (e.g. 7.168.192.in-addr.arpa
+  // under 192.in-addr.arpa > 168.192.in-addr.arpa). Only adds keys: whatever
+  // the operator already had open stays open. An effect, not a derived value,
+  // so the operator can still collapse a row afterwards.
+  const selectedZone = zones.find((z) => z.id === selectedZoneId) ?? null;
+  const selectedOpenKeys = (() => {
+    if (!selectedZone) return "";
+    const keys: string[] = [];
+    if (isReverseV4(selectedZone)) keys.push(REVERSE_V4_KEY);
+    else if (isReverseV6(selectedZone)) keys.push(REVERSE_V6_KEY);
+    else return ""; // forward trees are not folded; leave them as they were
+    const labels = selectedZone.name.replace(/\.$/, "").split(".");
+    for (let i = 1; i < labels.length; i++)
+      keys.push(labels.slice(i).join("."));
+    return keys.join("|");
   })();
   useEffect(() => {
-    if (!selectedFolderKey) return;
+    if (!selectedOpenKeys) return;
+    const keys = selectedOpenKeys.split("|");
     setExpandedNodes((prev: Set<string>) =>
-      prev.has(selectedFolderKey) ? prev : new Set(prev).add(selectedFolderKey),
+      keys.every((k) => prev.has(k)) ? prev : new Set([...prev, ...keys]),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFolderKey, selectedZoneId]);
+  }, [selectedOpenKeys, selectedZoneId]);
 
   if (tree.length === 0 && folders.length === 0)
     return (
