@@ -488,3 +488,79 @@ async def test_export_csv_include_addresses_follows_the_box_not_the_data(
         db_session, block_id=block.id, format="json", include_addresses=True
     )
     assert json.loads(as_json)["subnets"][0]["name"] == "lab"
+
+
+# ── List / object custom fields (#4282) ───────────────────────────────────────
+
+
+async def _seed_structured_cf(db_session: AsyncSession, name: str) -> IPSpace:
+    space = await _seed_space(db_session, name)
+    block = IPBlock(space_id=space.id, network="10.40.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.40.1.0/24",
+        name="s",
+        total_ips=254,
+        custom_fields={"tags": ["a", "b"], "owner": {"team": "net", "oncall": True}, "env": "prod"},
+    )
+    db_session.add(subnet)
+    await db_session.flush()
+    db_session.add(
+        IPAddress(
+            subnet_id=subnet.id,
+            address="10.40.1.5",
+            status="allocated",
+            custom_fields={"ports": [80, 443], "meta": {"k": "v"}},
+        )
+    )
+    await db_session.flush()
+    return space
+
+
+@pytest.mark.asyncio
+async def test_export_xlsx_writes_structured_custom_fields_as_json(
+    db_session: AsyncSession,
+) -> None:
+    from openpyxl import load_workbook
+
+    space = await _seed_structured_cf(db_session, "CfXlsx")
+    data, _, _ = await export_subtree(
+        db_session, space_id=space.id, format="xlsx", include_addresses=True
+    )
+    wb = load_workbook(io.BytesIO(data))
+    hdr = [c.value for c in wb["subnets"][1]]
+    row = [c.value for c in wb["subnets"][2]]
+    assert row[hdr.index("tags")] == '["a","b"]'
+    assert row[hdr.index("owner")] == '{"team":"net","oncall":true}'
+    assert row[hdr.index("env")] == "prod"
+    ahdr = [c.value for c in wb["addresses"][1]]
+    arow = [c.value for c in wb["addresses"][2]]
+    assert arow[ahdr.index("ports")] == "[80,443]"
+    assert arow[ahdr.index("meta")] == '{"k":"v"}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_addresses", [False, True])
+async def test_export_csv_writes_structured_custom_fields_as_json(
+    db_session: AsyncSession, include_addresses: bool
+) -> None:
+    space = await _seed_structured_cf(db_session, f"CfCsv{include_addresses}")
+    data, _, _ = await export_subtree(
+        db_session, space_id=space.id, format="csv", include_addresses=include_addresses
+    )
+    rows = list(_csv.DictReader(io.StringIO(data.decode())))
+    if include_addresses:
+        assert rows[0]["ports"] == "[80,443]"
+        assert rows[0]["meta"] == '{"k":"v"}'
+    else:
+        assert rows[0]["tags"] == '["a","b"]'
+        assert rows[0]["owner"] == '{"team":"net","oncall":true}'
+        # Round-trips: the importer reads the JSON text back to the same value.
+        parsed = parse_payload(data, "rt.csv", "text/csv")
+        cf = parsed.subnets[0]["custom_fields"]
+        assert cf["tags"] == ["a", "b"]
+        assert cf["owner"] == {"team": "net", "oncall": True}
+        assert cf["env"] == "prod"
