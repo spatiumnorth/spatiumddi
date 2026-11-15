@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -30,6 +31,7 @@ from app.core.auth.saml import probe_metadata as saml_probe_metadata
 from app.core.auth.tacacs import test_connection as tacacs_test_connection
 from app.core.crypto import decrypt_dict, encrypt_dict
 from app.core.session_rotation import revoke_live_sessions
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.auth import Group, User, UserSession
 from app.models.auth_provider import (
@@ -240,11 +242,35 @@ async def get_provider(provider_id: uuid.UUID, db: DB, _: SuperAdmin) -> Provide
     return _to_response(p, await _mapping_count(db, provider_id))
 
 
+# Config keys that decide where a provider's stored secret is sent.
+_SECRET_DESTINATION_KEYS = (
+    "host",
+    "backup_hosts",
+    "server",
+    "backup_servers",
+    "discovery_url",
+)
+
+
 @router.put("/{provider_id}", response_model=ProviderResponse)
 async def update_provider(
     provider_id: uuid.UUID, body: ProviderUpdate, db: DB, user: SuperAdmin
 ) -> ProviderResponse:
     provider = await _get_provider_or_404(db, provider_id)
+
+    if body.config is not None:
+        # Config is replaced whole. The stored bind password / client secret /
+        # shared secret goes with the server it was entered for.
+        old_cfg = provider.config or {}
+        require_secret_with_destination_change(
+            SimpleNamespace(**{k: old_cfg.get(k) for k in _SECRET_DESTINATION_KEYS}),
+            {
+                **{k: body.config.get(k) for k in _SECRET_DESTINATION_KEYS},
+                "secrets": body.secrets,
+            },
+            destination=_SECRET_DESTINATION_KEYS,
+            secrets={"secrets": provider.secrets_encrypted},
+        )
 
     changes: dict[str, Any] = {}
     if body.name is not None and body.name != provider.name:

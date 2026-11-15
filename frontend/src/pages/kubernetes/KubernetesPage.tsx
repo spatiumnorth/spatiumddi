@@ -1,3 +1,4 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -430,6 +431,13 @@ function ClusterModal({
   );
   const [caBundlePem, setCaBundlePem] = useState("");
   const [token, setToken] = useState("");
+  // #4135 — a moved address needs the stored token entered again.
+  const reask = useCredentialReask(
+    { apiServerUrl },
+    cluster && { apiServerUrl: cluster.api_server_url },
+    () => setToken(""),
+  );
+  const mustEnter = reask.asks(cluster?.token_present);
   const [spaceId, setSpaceId] = useState(cluster?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(cluster?.dns_group_id ?? "");
   const [podCidr, setPodCidr] = useState(cluster?.pod_cidr ?? "");
@@ -642,9 +650,11 @@ function ClusterModal({
         <Field
           label="Bearer token"
           hint={
-            editing && cluster?.token_present
-              ? "Stored. Leave blank to keep the existing token."
-              : "Service account token (single line)."
+            mustEnter
+              ? reask.hint
+              : editing && cluster?.token_present
+                ? "Stored. Leave blank to keep the existing token."
+                : "Service account token (single line)."
           }
         >
           <textarea
@@ -653,8 +663,13 @@ function ClusterModal({
             value={token}
             onChange={(e) => setToken(e.target.value)}
             placeholder={
-              editing && cluster?.token_present ? "••• stored" : "eyJhbGciOi..."
+              mustEnter
+                ? reask.placeholder
+                : editing && cluster?.token_present
+                  ? "••• stored"
+                  : "eyJhbGciOi..."
             }
+            required={mustEnter}
           />
         </Field>
 
@@ -794,7 +809,7 @@ function ClusterModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !token.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

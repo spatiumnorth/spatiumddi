@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -191,6 +192,15 @@ function ProviderEditor({
     setForm((p) => ({ ...p, [key]: v }));
   }
 
+  // #4135 — a moved base URL needs the stored key typed again (or removed).
+  const reask = useCredentialReask(
+    { base_url: form.base_url.trim() },
+    mode === "edit" ? { base_url: initial.base_url.trim() } : null,
+    () => set("api_key", null),
+  );
+  const mustEnterKey =
+    mode === "edit" && reask.asks(initial.has_api_key) && form.api_key === null;
+
   return (
     <Modal
       title={mode === "create" ? "New AI Provider" : `Edit — ${initial.name}`}
@@ -285,7 +295,9 @@ function ProviderEditor({
                 <span className="text-muted-foreground/60">
                   {mode === "edit"
                     ? initial.has_api_key
-                      ? "(a key is stored — leave blank to keep it)"
+                      ? reask.reask
+                        ? `(required — ${reask.hint.toLowerCase()} Or remove it.)`
+                        : "(a key is stored — leave blank to keep it)"
                       : "(no key stored)"
                     : "(optional)"}
                 </span>
@@ -299,10 +311,13 @@ function ProviderEditor({
                   set("api_key", e.target.value === "" ? null : e.target.value)
                 }
                 disabled={form.api_key === ""}
+                required={mustEnterKey}
                 placeholder={
                   mode === "edit"
                     ? initial.has_api_key
-                      ? "Type to replace the stored key"
+                      ? reask.reask
+                        ? reask.placeholder
+                        : "Type to replace the stored key"
                       : "Type to set a key"
                     : "Optional — local providers (Ollama, LM Studio) don't need one"
                 }
@@ -529,7 +544,7 @@ function ProviderEditor({
               Cancel
             </button>
             <button
-              disabled={saving || !form.name.trim()}
+              disabled={saving || !form.name.trim() || mustEnterKey}
               onClick={() => onSave(form)}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
             >

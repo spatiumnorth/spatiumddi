@@ -86,6 +86,7 @@ import {
   CertsCompactTable,
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -763,6 +764,51 @@ export function DeleteDNSGroupModal({
       isPending={isPending}
       error={error}
       notice={notice}
+    />
+  );
+}
+
+/** Single-record delete (#4078, #4204): Move to Trash or Delete permanently.
+ *  Shared by the zone view and the group-wide Records view so both offer the
+ *  same choice and send the same call. `mutation` runs
+ *  `{ permanent }`-parameterised; the caller owns it and the dialog state. */
+function RecordDeleteModal({
+  label,
+  isSuperadmin,
+  mutation,
+  onDelete,
+  onClose,
+}: {
+  label: React.ReactNode;
+  isSuperadmin: boolean;
+  mutation: {
+    isPending: boolean;
+    isError: boolean;
+    error: unknown;
+    variables?: { permanent: boolean };
+  };
+  onDelete: (permanent: boolean) => void;
+  onClose: () => void;
+}) {
+  return (
+    <DeleteChoiceModal
+      title="Delete Record"
+      intro={<>Delete {label}?</>}
+      softHeading="Move to Trash (reversible)"
+      softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
+      softButtonLabel="Move to Trash"
+      permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
+      allowPermanent={isSuperadmin}
+      isSoftPending={mutation.isPending && !mutation.variables?.permanent}
+      isPermanentPending={mutation.isPending && !!mutation.variables?.permanent}
+      error={
+        mutation.isError
+          ? formatApiError(mutation.error, "Delete failed")
+          : null
+      }
+      onSoft={() => onDelete(false)}
+      onPermanent={() => onDelete(true)}
+      onClose={onClose}
     />
   );
 }
@@ -1585,12 +1631,36 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
 
   const hasExistingCreds = !!server?.has_credentials;
 
+  // #4135 — a moved host / port needs the stored WinRM password or API token
+  // entered again (or cleared).
+  const reask = useCredentialReask(
+    { host, port },
+    server && { host: server.host, port: server.port },
+    () => {
+      setWinPassword("");
+      setCloudCreds((c) => {
+        const { api_token: _drop, ...rest } = c;
+        return rest;
+      });
+    },
+  );
+  const mustEnterWinPassword =
+    driver === "windows_dns" &&
+    reask.asks(hasExistingCreds) &&
+    !winClearCreds &&
+    !winPassword;
+
   const cloudDriver = isCloudDriver(driver) ? driver : null;
   // Any driver that takes a credential dict — the cloud providers plus
   // self-hosted technitium_api (#810). ``cloudDriver`` stays the narrower
   // test for the bits that are genuinely cloud-only: the hosted-provider
   // setup guide, the "no host/port" layout, and the hosted-zone import link.
   const credFields = CRED_FIELDS_BY_DRIVER[driver] ?? null;
+  const mustEnterApiToken =
+    !!credFields?.some((f) => f.key === "api_token") &&
+    reask.asks(hasExistingCreds) &&
+    !cloudClearCreds &&
+    !(cloudCreds.api_token ?? "").trim();
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -2199,13 +2269,23 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                   autoComplete="off"
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterWinPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={winPassword}
                   onChange={(e) => setWinPassword(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "optional"}
+                  required={mustEnterWinPassword}
+                  placeholder={
+                    mustEnterWinPassword
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "optional"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -2371,7 +2451,15 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                     </span>
                   </label>
                 ) : (
-                  <Field key={f.key} label={f.label}>
+                  <Field
+                    key={f.key}
+                    label={f.label}
+                    hint={
+                      f.key === "api_token" && mustEnterApiToken
+                        ? reask.hint
+                        : undefined
+                    }
+                  >
                     {f.textarea ? (
                       <textarea
                         className={`${inputCls} font-mono text-xs`}
@@ -2401,10 +2489,13 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                             [f.key]: e.target.value,
                           }))
                         }
+                        required={f.key === "api_token" && mustEnterApiToken}
                         placeholder={
-                          editing && hasExistingCreds
-                            ? "(unchanged)"
-                            : (f.placeholder ?? "")
+                          f.key === "api_token" && mustEnterApiToken
+                            ? reask.placeholder
+                            : editing && hasExistingCreds
+                              ? "(unchanged)"
+                              : (f.placeholder ?? "")
                         }
                         autoComplete="off"
                       />
@@ -2474,6 +2565,7 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
           onClose={onClose}
           pending={mut.isPending}
           label={server ? "Save" : "Add Server"}
+          disabled={mustEnterWinPassword || mustEnterApiToken}
         />
       </form>
     </Modal>
@@ -3557,7 +3649,7 @@ function RecordModalForm({
     ? RECORD_TYPES
     : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
-  const nameErr = recordOwnerError(name);
+  const nameErr = recordOwnerError(name, type, zoneName);
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", groupId],
@@ -5813,42 +5905,17 @@ export function ZoneDetailView({
         />
       )}
       {confirmDeleteRecord && (
-        <DeleteChoiceModal
-          title="Delete Record"
-          intro={
-            <>
-              Delete{" "}
-              <span className="font-mono">
-                {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
-              </span>
-              ?
-            </>
+        <RecordDeleteModal
+          label={
+            <span className="font-mono">
+              {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
+            </span>
           }
-          softHeading="Move to Trash (reversible)"
-          softBody="The record leaves the zone and the DNS server retracts it (RFC 2136 update). A superadmin can restore it from Administration → Trash."
-          softButtonLabel="Move to Trash"
-          permanentBody="The record is removed immediately and retracted from the DNS server. There's no undo."
-          allowPermanent={isSuperadmin}
-          isSoftPending={
-            deleteRecord.isPending && !deleteRecord.variables?.permanent
-          }
-          isPermanentPending={
-            deleteRecord.isPending && !!deleteRecord.variables?.permanent
-          }
-          error={
-            deleteRecord.isError
-              ? formatApiError(deleteRecord.error, "Delete failed")
-              : null
-          }
-          onSoft={() =>
+          isSuperadmin={isSuperadmin}
+          mutation={deleteRecord}
+          onDelete={(permanent) =>
             deleteRecord.mutate(
-              { rec: confirmDeleteRecord, permanent: false },
-              { onSuccess: () => setConfirmDeleteRecord(null) },
-            )
-          }
-          onPermanent={() =>
-            deleteRecord.mutate(
-              { rec: confirmDeleteRecord, permanent: true },
+              { rec: confirmDeleteRecord, permanent },
               { onSuccess: () => setConfirmDeleteRecord(null) },
             )
           }
@@ -9840,7 +9907,7 @@ export function RecordsTab({
   onSelectZone: (z: DNSZone) => void;
 }) {
   const qc = useQueryClient();
-  const { canWriteRecords, canDeleteRecords } = useDnsGrants();
+  const { canWriteRecords, canDeleteRecords, isSuperadmin } = useDnsGrants();
   // Server-side pagination + search (#455). `groupRecordSearch` matches
   // name / fqdn / value / type / zone on the server; the per-column filters
   // below stay client-side refinements over the current page.
@@ -9966,8 +10033,13 @@ export function RecordsTab({
   );
 
   const deleteMut = useMutation({
-    mutationFn: (rec: DNSGroupRecord) =>
-      dnsApi.deleteRecord(group.id, rec.zone_id, rec.id),
+    mutationFn: ({
+      rec,
+      permanent,
+    }: {
+      rec: DNSGroupRecord;
+      permanent: boolean;
+    }) => dnsApi.deleteRecord(group.id, rec.zone_id, rec.id, { permanent }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-group-records", group.id] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -10319,44 +10391,27 @@ export function RecordsTab({
       )}
 
       {confirmDelete && (
-        <Modal title="Delete DNS record" onClose={() => setConfirmDelete(null)}>
-          <div className="space-y-3">
-            <p className="text-sm">
-              Delete{" "}
+        <RecordDeleteModal
+          label={
+            <>
               <span className="font-mono font-medium">
                 {confirmDelete.fqdn}
               </span>{" "}
               <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
                 {confirmDelete.record_type}
               </span>
-              ? The record moves to Trash. A superadmin can restore it from
-              Administration → Trash.
-            </p>
-            {deleteMut.isError && (
-              <FormError className="text-sm">
-                {formatApiError(deleteMut.error, "Delete failed")}
-              </FormError>
-            )}
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => {
-                  deleteMut.reset();
-                  setConfirmDelete(null);
-                }}
-                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => deleteMut.mutate(confirmDelete)}
-                disabled={deleteMut.isPending}
-                className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {deleteMut.isPending ? "Deleting…" : "Delete"}
-              </button>
-            </div>
-          </div>
-        </Modal>
+            </>
+          }
+          isSuperadmin={isSuperadmin}
+          mutation={deleteMut}
+          onDelete={(permanent) =>
+            deleteMut.mutate({ rec: confirmDelete, permanent })
+          }
+          onClose={() => {
+            deleteMut.reset();
+            setConfirmDelete(null);
+          }}
+        />
       )}
     </div>
   );
@@ -11878,7 +11933,7 @@ function BlocklistModalFormBody({
     list?.update_interval_hours ?? 24,
   );
   const [feedWildcard, setFeedWildcard] = useState(
-    list?.feed_entries_are_wildcard ?? true,
+    list?.feed_wildcard_mode ?? "by_syntax",
   );
   const [enabled, setEnabled] = useState(list?.enabled ?? true);
   const [error, setError] = useState("");
@@ -11942,7 +11997,7 @@ function BlocklistModalFormBody({
               block_mode: list.block_mode ?? "nxdomain",
               sinkhole_ip: list.sinkhole_ip ?? null,
               update_interval_hours: list.update_interval_hours ?? 24,
-              feed_entries_are_wildcard: list.feed_entries_are_wildcard ?? true,
+              feed_wildcard_mode: list.feed_wildcard_mode ?? "by_syntax",
               enabled: list.enabled ?? true,
             },
             body,
@@ -12050,27 +12105,40 @@ function BlocklistModalFormBody({
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
               />
             </Field>
-            <label className="flex items-start gap-2 text-sm">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={feedWildcard}
-                onChange={(e) => setFeedWildcard(e.target.checked)}
-              />
-              <span>
-                Block subdomains of feed entries
-                <span className="block text-xs text-muted-foreground">
-                  On (recommended): a feed naming <code>tracker.example</code>{" "}
-                  also blocks <code>cdn.tracker.example</code> — what these
-                  lists mean. Turn off only for a feed listing specific hosts,
-                  where blocking the parent domain would be too broad.
-                  {list &&
-                    list.feed_entries_are_wildcard !== feedWildcard &&
-                    " Saving restamps the entries already imported, which" +
-                      " takes a few seconds on a large list."}
-                </span>
+            <Field label="Block subdomains of feed entries">
+              <select
+                className={inputCls}
+                value={feedWildcard}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "by_syntax" || v === "always" || v === "never")
+                    setFeedWildcard(v);
+                }}
+              >
+                <option value="by_syntax">By syntax (recommended)</option>
+                <option value="always">Always block subdomains</option>
+                <option value="never">Never (exact names only)</option>
+              </select>
+              <span className="block text-xs text-muted-foreground mt-1">
+                By syntax: an adblock <code>||tracker.example^</code> rule (or a{" "}
+                <code>*.tracker.example</code> line) also blocks{" "}
+                <code>cdn.tracker.example</code>; a hosts line (
+                <code>0.0.0.0 tracker.example</code>) or a bare domain blocks
+                only that name, as AdGuard Home does. Always: every entry also
+                blocks its subdomains, for a plain-domain feed that means
+                &ldquo;this domain and everything under it&rdquo;. Never: exact
+                names only, for a feed of specific hosts.
+                {list &&
+                  list.feed_wildcard_mode !== feedWildcard &&
+                  feedWildcard !== "by_syntax" &&
+                  " Saving restamps the entries already imported, which" +
+                    " takes a few seconds on a large list."}
+                {list &&
+                  list.feed_wildcard_mode !== feedWildcard &&
+                  feedWildcard === "by_syntax" &&
+                  " Saving refreshes the feed to apply it."}
               </span>
-            </label>
+            </Field>
           </>
         )}
         <label className="flex items-center gap-2 text-sm">
@@ -13927,9 +13995,20 @@ export function DNSPage() {
             <div className="text-center">
               <Globe className="h-12 w-12 text-muted-foreground/20 mx-auto mb-3" />
               <p className="text-sm text-muted-foreground">
-                {groups.length === 0
-                  ? "Create a server group to start managing DNS."
-                  : "Select a server group or zone from the tree."}
+                {groupsError != null ? (
+                  <ListReadError
+                    error={groupsError}
+                    what="the DNS server groups"
+                  />
+                ) : groups.length === 0 ? (
+                  isSuperadmin ? (
+                    "Create a server group to start managing DNS."
+                  ) : (
+                    "No DNS server groups yet."
+                  )
+                ) : (
+                  "Select a server group or zone from the tree."
+                )}
               </p>
             </div>
           </div>
