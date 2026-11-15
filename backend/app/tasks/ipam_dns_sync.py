@@ -749,10 +749,13 @@ async def _reconcile_subnet_records(db: Any, subnet_ids: list[Any]) -> tuple[int
             batch = units[i : i + SYNC_BATCH_SIZE]
             errors: list[str] = []
             try:
-                created, updated, deleted, _re = await _sync_batch(
+                created, updated, deleted, reapplied = await _sync_batch(
                     db, subnet_id, batch, errors=errors
                 )
-                n = created + updated + deleted
+                # A restore that only republishes live lease mirrors (the DDNS
+                # re-apply) still queued record ops: count it and wake the group,
+                # or the agents see them only on their next safety tick (#4227).
+                n = created + updated + deleted + reapplied
                 if n:
                     subnet = await db.get(Subnet, subnet_id)
                     if subnet is not None:
