@@ -4059,7 +4059,7 @@ async def test_audit_target(
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "id": "test-" + str(row.id),
-        "timestamp": now.isoformat() + "Z",
+        "timestamp": now.isoformat().replace("+00:00", "Z"),
         "action": "test_forward",
         "resource_type": "audit_forward_target",
         "resource_id": str(row.id),
