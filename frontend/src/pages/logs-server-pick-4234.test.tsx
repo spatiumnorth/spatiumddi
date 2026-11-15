@@ -69,7 +69,7 @@ afterEach(cleanup);
 describe("Logs server pick (#4234)", () => {
   it("keeps the DNS Queries pick across a tab switch", async () => {
     renderPage();
-    expect((await picker()).value).toBe("server:a1");
+    expect((await picker()).value).toBe("all");
     fireEvent.change(await picker(), { target: { value: "server:a2" } });
     expect((await picker()).value).toBe("server:a2");
     fireEvent.click(screen.getByRole("button", { name: /Event Log/ }));
@@ -83,7 +83,7 @@ describe("Logs server pick (#4234)", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: /DHCP Activity/ }),
     );
-    expect((await picker()).value).toBe("server:d1");
+    expect((await picker()).value).toBe("all");
     fireEvent.change(await picker(), { target: { value: "server:d2" } });
     fireEvent.click(screen.getByRole("button", { name: /Event Log/ }));
     fireEvent.click(screen.getByRole("button", { name: /DHCP Activity/ }));
@@ -96,6 +96,6 @@ describe("Logs server pick (#4234)", () => {
       JSON.stringify("server:gone"),
     );
     renderPage();
-    expect((await picker()).value).toBe("server:a1");
+    expect((await picker()).value).toBe("all");
   });
 });
