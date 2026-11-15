@@ -191,7 +191,7 @@ async def test_a_cleared_or_stale_report_reads_as_not_reported_everywhere(
     assert await api_value() is None
     assert await copilot_value() is None
 
-    # A report nothing has refreshed for longer than three heartbeats.
+    # A report nothing has refreshed for longer than the stale threshold.
     assert (await _post(client, kind, srv, "heartbeat", {"memory": BLOCK})).status_code == 200
     row = await db_session.get(type(srv), sid, populate_existing=True)
     assert row is not None
@@ -210,6 +210,8 @@ def test_fresh_memory_status_bounds() -> None:
     now = datetime.now(UTC)
     ok = {"used_bytes": 1, "reported_at": (now - timedelta(seconds=30)).isoformat()}
     assert fresh_memory_status(ok, now) == ok
+    near = {"used_bytes": 1, "reported_at": (now - timedelta(seconds=100)).isoformat()}
+    assert fresh_memory_status(near, now) == near  # still inside 120 s
     old = {"used_bytes": 1, "reported_at": (now - MEMORY_STALE_AFTER * 2).isoformat()}
     assert fresh_memory_status(old, now) is None
     assert fresh_memory_status({"used_bytes": 1}, now) is None  # undated

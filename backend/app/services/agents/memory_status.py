@@ -59,9 +59,11 @@ class _HasMemoryStatus(Protocol):
     memory_status: dict[str, Any] | None
 
 
-#: Agents heartbeat every 30 s by default; a stored report older than three
-#: intervals is no longer "current" and reads as not reported.
-MEMORY_STALE_AFTER = timedelta(seconds=90)
+#: Matches ``AGENT_STALE_AFTER`` (120 s) in ``tasks/dns.py`` / ``tasks/dhcp_health.py``
+#: (not imported: tasks/ would be an import cycle risk), so the figure goes
+#: "not reported" exactly when the server itself reads stale, with no separate
+#: threshold that flickers for an agent on a slower HEARTBEAT_INTERVAL.
+MEMORY_STALE_AFTER = timedelta(seconds=120)
 
 
 def fresh_memory_status(
