@@ -16,6 +16,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { cascadeList } from "@/lib/delete-cascade";
+import { invalidateAfterTrashChange } from "@/lib/trash-invalidate";
 import { ListReadError } from "@/components/ui/list-read-error";
 
 const TYPE_LABELS: Record<TrashEntryType, string> = {
@@ -98,10 +99,7 @@ function ConfirmRestoreModal({
   const parentLeftRef = useRef<string[]>([]);
 
   const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ["trash"] });
-    qc.invalidateQueries({ queryKey: ["ipam"] });
-    qc.invalidateQueries({ queryKey: ["dns"] });
-    qc.invalidateQueries({ queryKey: ["dhcp"] });
+    invalidateAfterTrashChange(qc);
   };
 
   const showError = (err: unknown) => {
@@ -316,7 +314,7 @@ function ConfirmPermanentDeleteModal({
   const mut = useMutation({
     mutationFn: () => trashApi.permanentDelete(entry.type, entry.id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["trash"] });
+      invalidateAfterTrashChange(qc);
       onClose();
     },
     onError: (err: unknown) => {

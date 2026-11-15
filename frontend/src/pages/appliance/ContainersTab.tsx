@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import { listReadErrorMessage, pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   useApplianceAdminGate,
   useCanReadApplianceLogs,
@@ -153,6 +154,8 @@ function ContainerCard({
   // Pod log text takes `admin` on `appliance`; the button is not drawn
   // for a role that would be refused.
   const canReadLogs = useCanReadApplianceLogs();
+  // #4212 — Restart acts on the first click otherwise.
+  const [confirmRestart, setConfirmRestart] = useState(false);
   const healthTone =
     container.health === "healthy"
       ? "text-emerald-600 dark:text-emerald-400"
@@ -212,13 +215,24 @@ function ContainerCard({
             <ActionButton
               icon={RotateCcw}
               label="Restart"
-              onClick={() => onAction("restart")}
+              onClick={() => setConfirmRestart(true)}
               disabled={busy}
               {...applianceGate}
             />
           )}
         </div>
       </div>
+      <ConfirmModal
+        open={confirmRestart}
+        title={`Restart ${container.name}?`}
+        message={`Restart ${container.name}? Its service is briefly unavailable on this node while it comes back up.`}
+        confirmLabel="Restart"
+        onClose={() => setConfirmRestart(false)}
+        onConfirm={() => {
+          onAction("restart");
+          setConfirmRestart(false);
+        }}
+      />
     </div>
   );
 }
