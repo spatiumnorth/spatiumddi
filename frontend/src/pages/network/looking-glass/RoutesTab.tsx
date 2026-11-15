@@ -13,6 +13,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Field, errMsg, inputCls } from "../_shared";
 import { RouteDetailModal } from "./RouteDetailModal";
+import { FormError } from "@/components/ui/form-error";
 
 const SEARCH_PAGE_SIZE = 100;
 
@@ -333,9 +334,9 @@ export function RoutesTab({
       </div>
 
       {error && (
-        <p className="text-sm text-destructive">
+        <FormError className="text-sm text-destructive">
           {errMsg(error, "Failed to load routes.")}
-        </p>
+        </FormError>
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">

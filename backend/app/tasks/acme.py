@@ -29,6 +29,7 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
+from app.core.task_lock import single_flight
 from app.db import task_session
 from app.services.acme_client.orchestrator import run_order
 
@@ -58,6 +59,7 @@ _RENEW_LOCK_KEY = 0x53504D52454E  # "SPMREN"-ish
     retry_jitter=True,
     max_retries=3,
 )
+@single_flight(lambda order_id: order_id)
 def run_acme_order(self: Any, order_id: str) -> str:  # type: ignore[type-arg]
     # Once ``max_retries`` retries have run, Celery re-raises the error
     # instead of retrying, so this attempt is the last: tell the

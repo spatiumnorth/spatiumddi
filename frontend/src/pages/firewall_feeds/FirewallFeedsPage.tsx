@@ -30,6 +30,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Full poll URL for a feed — prefix the server-relative poll_path with
 // the current origin so operators can paste it straight into a
@@ -423,7 +424,11 @@ function RevealModal({
               placeholder="or 6-digit code"
               className={`${inputCls} font-mono`}
             />
-            {error && <p className="text-xs text-destructive">{error}</p>}
+            {error && (
+              <FormError className="text-xs text-destructive">
+                {error}
+              </FormError>
+            )}
             <div className="flex justify-end gap-2 pt-1">
               <button
                 type="button"
@@ -549,7 +554,9 @@ function CreateFeedModal({
           list. The poll URL + token are shown once after create.
         </p>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -630,7 +637,9 @@ function EditFeedModal({
           <span>Enabled</span>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

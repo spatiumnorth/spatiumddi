@@ -25,7 +25,7 @@ Two entry points are exported:
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Annotated, NoReturn
 from uuid import UUID
 
@@ -34,6 +34,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_db
+from app.core.denial_audit import note_denial_audited
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -621,6 +622,7 @@ async def _record_denial(
     resource_id: str | None,
 ) -> None:
     """Write a `denied` audit row. Best-effort — never raises."""
+    note_denial_audited()
     try:
         db.add(
             AuditLog(
@@ -663,6 +665,7 @@ async def refuse_and_audit(
     would be any pending change. Best-effort on the audit write, as
     :func:`_record_denial` is — the refusal never depends on it.
     """
+    note_denial_audited()
     try:
         db.add(
             AuditLog(
@@ -973,6 +976,7 @@ def require_resource_permission(
 
 def require_any_resource_permission(
     *resource_types: str,
+    admit_scoped: bool = False,
 ) -> Callable[..., Awaitable[User]]:
     """Like :func:`require_resource_permission` but accepts multiple resource types.
 
@@ -980,6 +984,12 @@ def require_any_resource_permission(
     resource types. Used by aggregate routers (e.g. IPAM has ip_space, ip_block,
     subnet, ip_address routes all under a single APIRouter, so we accept any of
     those four).
+
+    ``admit_scoped`` (#4007) additionally admits a caller holding ANY grant
+    (scoped or unscoped, :func:`has_any_grant_for`) for the method's action on
+    a listed type, for a router whose handlers enforce the per-row boundary
+    themselves — a grant scoped to one resource cannot satisfy the unscoped
+    check above, so without it that delegate never reaches its own row.
     """
 
     async def _dep(
@@ -992,6 +1002,12 @@ def require_any_resource_permission(
         for rt in resource_types:
             if any(user_has_permission(current_user, a, rt) for a in actions):
                 return current_user
+            if (
+                admit_scoped
+                and any(has_any_grant_for(current_user, a, rt) for a in actions)
+                and _token_covers_type(current_user, actions, rt)
+            ):
+                return current_user
         first = resource_types[0] if resource_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
         raise HTTPException(
@@ -1001,6 +1017,16 @@ def require_any_resource_permission(
 
     _dep.spatium_requires = ("method", list(resource_types))  # type: ignore[attr-defined]
     return _dep
+
+
+def _token_covers_type(user: User, actions: Iterable[str], resource_type: str) -> bool:
+    """A resource-scoped API token (#374) may only narrow its owner, so the
+    coarse ``admit_scoped`` gate must not admit one whose own grants cover none
+    of the actions on the type (``has_any_grant_for`` reads the owner alone)."""
+    grants = _token_grants_for(user)
+    if not grants:
+        return True
+    return any(_token_grants_allow(grants, a, resource_type, None) for a in actions)
 
 
 def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:

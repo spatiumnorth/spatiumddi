@@ -636,7 +636,7 @@ async def list_devices(
     stmt = apply_tag_filter(stmt, OTDevice.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(IPAddress.address.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(IPAddress.address.asc(), IPAddress.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).all()
     return OTDeviceListResponse(
         items=[_device_read(device, ip) for device, ip in rows],
