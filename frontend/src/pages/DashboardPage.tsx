@@ -3088,7 +3088,14 @@ export function IpamSpaceFilter({
             <div className="border-t px-3 py-2">
               <button
                 type="button"
-                onClick={() => onChange([])}
+                onClick={() => {
+                  onChange([]);
+                  // The button is drawn only while a filter is set, so it
+                  // removes itself: close the list and hand focus to the
+                  // trigger, as Esc does, rather than the page body (#4222).
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
                 className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3 w-3" />
