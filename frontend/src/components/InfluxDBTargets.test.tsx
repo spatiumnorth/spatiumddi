@@ -208,6 +208,13 @@ describe("a refused save", () => {
     fireEvent.change(screen.getByDisplayValue("http://192.0.2.10:8086"), {
       target: { value: "192.0.2.10:8086" },
     });
+    // The moved URL asks for the stored password again (#4135).
+    fireEvent.change(
+      screen.getByPlaceholderText(/re-enter for the new address/),
+      {
+        target: { value: "pw" },
+      },
+    );
     api.update.mockRejectedValue({
       response: {
         data: {

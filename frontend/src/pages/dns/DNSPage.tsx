@@ -84,6 +84,7 @@ import {
   CertsCompactTable,
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
@@ -1567,12 +1568,36 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
 
   const hasExistingCreds = !!server?.has_credentials;
 
+  // #4135 — a moved host / port needs the stored WinRM password or API token
+  // entered again (or cleared).
+  const reask = useCredentialReask(
+    { host, port },
+    server && { host: server.host, port: server.port },
+    () => {
+      setWinPassword("");
+      setCloudCreds((c) => {
+        const { api_token: _drop, ...rest } = c;
+        return rest;
+      });
+    },
+  );
+  const mustEnterWinPassword =
+    driver === "windows_dns" &&
+    reask.asks(hasExistingCreds) &&
+    !winClearCreds &&
+    !winPassword;
+
   const cloudDriver = isCloudDriver(driver) ? driver : null;
   // Any driver that takes a credential dict — the cloud providers plus
   // self-hosted technitium_api (#810). ``cloudDriver`` stays the narrower
   // test for the bits that are genuinely cloud-only: the hosted-provider
   // setup guide, the "no host/port" layout, and the hosted-zone import link.
   const credFields = CRED_FIELDS_BY_DRIVER[driver] ?? null;
+  const mustEnterApiToken =
+    !!credFields?.some((f) => f.key === "api_token") &&
+    reask.asks(hasExistingCreds) &&
+    !cloudClearCreds &&
+    !(cloudCreds.api_token ?? "").trim();
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -2181,13 +2206,23 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                   autoComplete="off"
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterWinPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={winPassword}
                   onChange={(e) => setWinPassword(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "optional"}
+                  required={mustEnterWinPassword}
+                  placeholder={
+                    mustEnterWinPassword
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "optional"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -2353,7 +2388,15 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                     </span>
                   </label>
                 ) : (
-                  <Field key={f.key} label={f.label}>
+                  <Field
+                    key={f.key}
+                    label={f.label}
+                    hint={
+                      f.key === "api_token" && mustEnterApiToken
+                        ? reask.hint
+                        : undefined
+                    }
+                  >
                     {f.textarea ? (
                       <textarea
                         className={`${inputCls} font-mono text-xs`}
@@ -2383,10 +2426,13 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
                             [f.key]: e.target.value,
                           }))
                         }
+                        required={f.key === "api_token" && mustEnterApiToken}
                         placeholder={
-                          editing && hasExistingCreds
-                            ? "(unchanged)"
-                            : (f.placeholder ?? "")
+                          f.key === "api_token" && mustEnterApiToken
+                            ? reask.placeholder
+                            : editing && hasExistingCreds
+                              ? "(unchanged)"
+                              : (f.placeholder ?? "")
                         }
                         autoComplete="off"
                       />
@@ -2456,6 +2502,7 @@ function ServerModalForm({ groupId, server, onClose }: ServerModalProps) {
           onClose={onClose}
           pending={mut.isPending}
           label={server ? "Save" : "Add Server"}
+          disabled={mustEnterWinPassword || mustEnterApiToken}
         />
       </form>
     </Modal>
@@ -11752,7 +11799,7 @@ function BlocklistModalFormBody({
     list?.update_interval_hours ?? 24,
   );
   const [feedWildcard, setFeedWildcard] = useState(
-    list?.feed_entries_are_wildcard ?? true,
+    list?.feed_wildcard_mode ?? "by_syntax",
   );
   const [enabled, setEnabled] = useState(list?.enabled ?? true);
   const [error, setError] = useState("");
@@ -11816,7 +11863,7 @@ function BlocklistModalFormBody({
               block_mode: list.block_mode ?? "nxdomain",
               sinkhole_ip: list.sinkhole_ip ?? null,
               update_interval_hours: list.update_interval_hours ?? 24,
-              feed_entries_are_wildcard: list.feed_entries_are_wildcard ?? true,
+              feed_wildcard_mode: list.feed_wildcard_mode ?? "by_syntax",
               enabled: list.enabled ?? true,
             },
             body,
@@ -11924,27 +11971,40 @@ function BlocklistModalFormBody({
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
               />
             </Field>
-            <label className="flex items-start gap-2 text-sm">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={feedWildcard}
-                onChange={(e) => setFeedWildcard(e.target.checked)}
-              />
-              <span>
-                Block subdomains of feed entries
-                <span className="block text-xs text-muted-foreground">
-                  On (recommended): a feed naming <code>tracker.example</code>{" "}
-                  also blocks <code>cdn.tracker.example</code> — what these
-                  lists mean. Turn off only for a feed listing specific hosts,
-                  where blocking the parent domain would be too broad.
-                  {list &&
-                    list.feed_entries_are_wildcard !== feedWildcard &&
-                    " Saving restamps the entries already imported, which" +
-                      " takes a few seconds on a large list."}
-                </span>
+            <Field label="Block subdomains of feed entries">
+              <select
+                className={inputCls}
+                value={feedWildcard}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "by_syntax" || v === "always" || v === "never")
+                    setFeedWildcard(v);
+                }}
+              >
+                <option value="by_syntax">By syntax (recommended)</option>
+                <option value="always">Always block subdomains</option>
+                <option value="never">Never (exact names only)</option>
+              </select>
+              <span className="block text-xs text-muted-foreground mt-1">
+                By syntax: an adblock <code>||tracker.example^</code> rule (or a{" "}
+                <code>*.tracker.example</code> line) also blocks{" "}
+                <code>cdn.tracker.example</code>; a hosts line (
+                <code>0.0.0.0 tracker.example</code>) or a bare domain blocks
+                only that name, as AdGuard Home does. Always: every entry also
+                blocks its subdomains, for a plain-domain feed that means
+                &ldquo;this domain and everything under it&rdquo;. Never: exact
+                names only, for a feed of specific hosts.
+                {list &&
+                  list.feed_wildcard_mode !== feedWildcard &&
+                  feedWildcard !== "by_syntax" &&
+                  " Saving restamps the entries already imported, which" +
+                    " takes a few seconds on a large list."}
+                {list &&
+                  list.feed_wildcard_mode !== feedWildcard &&
+                  feedWildcard === "by_syntax" &&
+                  " Saving refreshes the feed to apply it."}
               </span>
-            </label>
+            </Field>
           </>
         )}
         <label className="flex items-center gap-2 text-sm">
