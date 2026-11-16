@@ -45,9 +45,11 @@ bullet below.
   `DHCP_REQUIRE_AGENT_APPROVAL=true` on the control plane). The agent
   re-registers, but the new row comes back **pending approval** and
   the agent gets no config (its config poll answers
-  `pending_approval`) until an operator approves it: use **Approve** on
-  the server in the console, or `POST /api/v1/dns/groups/{group_id}/servers/{server_id}/approve`
-  (DHCP: `POST /api/v1/dhcp/servers/{id}/approve`).
+  `pending_approval`) until an operator approves it. For DHCP use
+  **Approve** on the server in the DHCP page (or
+  `POST /api/v1/dhcp/servers/{id}/approve`). The DNS console has no Approve
+  button, so approve a DNS server through the API:
+  `POST /api/v1/dns/groups/{group_id}/servers/{server_id}/approve`.
 
 - *The pre-shared key was rotated on the server.* The agent's bootstrap
   request will be rejected. The agent needs the new key in its
