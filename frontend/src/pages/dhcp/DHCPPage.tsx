@@ -1,4 +1,5 @@
 import { ListReadError } from "@/components/ui/list-read-error";
+import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -3875,7 +3876,12 @@ export function DHCPPage() {
       {delServer && (
         <DeleteConfirmModal
           title="Delete DHCP Server"
-          description={deleteServerDescription(delServer.name)}
+          description={
+            <>
+              {deleteServerDescription(delServer.name)}
+              <ServerDeleteAgentNote />
+            </>
+          }
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => {
             setDelServer(null);

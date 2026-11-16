@@ -74,6 +74,15 @@ WORKDIR /app
 # nightly/weekly rebuild, like APT_SNAPSHOT in the Debian image.
 ARG RPM_SNAPSHOT=dev
 ARG PGDG_KEY_DIGEST=a70c9527426017d00fa4e6f9d2941d515357a27a7be82e155248ece53bbe5453
+# #4340: PGDG's rhel-9 metadata lists only a 16.16 client built for RHEL 9.9, which
+# was never uploaded (404 on both architectures), so a repo install fails and no
+# repo pin can reach the 9.8 build that does exist. Fetch the RHEL 9.8 build of the
+# same release (client and libs: the client requires libs of its exact build) from
+# PGDG by URL, verify both against the pinned PGDG key with ``rpm --checksig``,
+# install what they require from the UBI repos (microdnf cannot install a local
+# file), then ``rpm -i`` them; rpm refuses if any requirement is still missing.
+# Go back to ``install postgresql16`` from the repo once PGDG publishes the 9.9 build.
+ARG PGDG_PG_BUILD=16.16-1PGDG.rhel9.8
 RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && microdnf -y upgrade \
     && microdnf -y --setopt=install_weak_deps=0 --nodocs install \
@@ -82,9 +91,20 @@ RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && curl -fsSL -o /tmp/pgdg.key https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL \
     && echo "${PGDG_KEY_DIGEST}  /tmp/pgdg.key" | sha256sum -c - \
     && rpm --import /tmp/pgdg.key && rm -f /tmp/pgdg.key \
-    && printf '[pgdg16]\nname=PostgreSQL 16 for RHEL 9\nbaseurl=https://download.postgresql.org/pub/repos/yum/16/redhat/rhel-9-$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=0\n' > /etc/yum.repos.d/pgdg16.repo \
-    && microdnf -y --setopt=install_weak_deps=0 --nodocs install postgresql16 \
-    && rm -f /etc/yum.repos.d/pgdg16.repo \
+    && arch="$(uname -m)" \
+    && pgdg="https://download.postgresql.org/pub/repos/yum/16/redhat/rhel-9-${arch}" \
+    && mkdir /tmp/pgdg \
+    && for p in postgresql16 postgresql16-libs; do \
+         curl -fsSL -o "/tmp/pgdg/${p}.rpm" "${pgdg}/${p}-${PGDG_PG_BUILD}.${arch}.rpm" \
+         && rpm --checksig "/tmp/pgdg/${p}.rpm" | grep -q 'digests signatures OK' \
+         || { echo "PGDG ${p}-${PGDG_PG_BUILD}.${arch}: download or signature check failed" >&2; exit 1; }; \
+       done \
+    && rpm -qp --provides /tmp/pgdg/*.rpm | awk '{print $1}' | sort -u > /tmp/pgdg/provides \
+    && rpm -qpR /tmp/pgdg/*.rpm | awk '{print $1}' | grep -v '^rpmlib(' | sort -u \
+       | comm -23 - /tmp/pgdg/provides > /tmp/pgdg/deps \
+    && xargs -a /tmp/pgdg/deps microdnf -y --setopt=install_weak_deps=0 --nodocs install \
+    && rpm -i /tmp/pgdg/postgresql16-libs.rpm /tmp/pgdg/postgresql16.rpm \
+    && rm -rf /tmp/pgdg \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \

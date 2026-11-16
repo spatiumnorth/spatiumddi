@@ -502,7 +502,7 @@ kubectl apply -f base/migrate-job.yaml -n spatiumddi
 kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --timeout=10m
 ```
 
-Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart renders a new migrate Job per Helm revision (`<release>-migrate-r<revision>`, a regular Job, not a hook), and the api / worker / beat pods wait for it in their `wait-for-migrate` init containers.
+Helm chart users: `helm upgrade <release> charts/spatiumddi -n <namespace> --set image.tag=$NEW_TAG`. The chart renders a new migrate Job per Helm revision (`<release>-migrate-r<revision>`, a regular Job, not a hook), and the api / worker / beat pods wait for it in their `wait-for-migrate` init containers.
 
 **GitOps over these manifests.** `base/migrate-job.yaml` has a fixed name, and a Job's pod template is immutable. The `kubectl delete` above is what makes a re-apply work. A controller that only applies (Argo CD, Flux's `Kustomization`) cannot do that step, so the first image bump fails with `spec.template: field is immutable`. Patch the Job into a sync hook in your overlay instead of editing the base, e.g. for Argo CD:
 

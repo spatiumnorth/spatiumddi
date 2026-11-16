@@ -404,11 +404,12 @@ function TabButton({
 // ─────────────────────────────────────────────────────────────────────
 function SchedulesTab() {
   // #1341 — a read-only user is offered no write it would be refused:
-  // the router asks write on 'use_network_tools'.
+  // the router asks write on the type named below or 'use_network_tools'.
   const perms = usePermissions();
   const writeGate = permissionGate(
-    perms.can("write", "use_network_tools"),
-    "Requires write permission on wake schedules",
+    perms.can("write", "wol_schedule") ||
+      perms.can("write", "use_network_tools"),
+    "Requires write permission on wol_schedule (or use_network_tools)",
   );
   const qc = useQueryClient();
   const schedulesQ = useQuery({
@@ -658,15 +659,17 @@ function ScheduleRow({
   onDelete: () => void;
 }) {
   // #1341 — a read-only user is offered no write it would be refused:
-  // the router asks write (delete) on 'use_network_tools'.
+  // the router asks write (delete) on the type named below or 'use_network_tools'.
   const perms = usePermissions();
   const writeGate = permissionGate(
-    perms.can("write", "use_network_tools"),
-    "Requires write permission on wake schedules",
+    perms.can("write", "wol_schedule") ||
+      perms.can("write", "use_network_tools"),
+    "Requires write permission on wol_schedule (or use_network_tools)",
   );
   const deleteGate = permissionGate(
-    perms.can("delete", "use_network_tools"),
-    "Requires delete permission on wake schedules",
+    perms.can("delete", "wol_schedule") ||
+      perms.can("delete", "use_network_tools"),
+    "Requires delete permission on wol_schedule (or use_network_tools)",
   );
   // Live per-schedule target preview → "N hosts · M no-MAC".
   const previewQ = useQuery({
@@ -855,15 +858,17 @@ function ScheduleDetailModal({
   onDelete: () => void;
 }) {
   // #1341 — a read-only user is offered no write it would be refused:
-  // the router asks write (delete) on 'use_network_tools'.
+  // the router asks write (delete) on the type named below or 'use_network_tools'.
   const perms = usePermissions();
   const writeGate = permissionGate(
-    perms.can("write", "use_network_tools"),
-    "Requires write permission on wake schedules",
+    perms.can("write", "wol_schedule") ||
+      perms.can("write", "use_network_tools"),
+    "Requires write permission on wol_schedule (or use_network_tools)",
   );
   const deleteGate = permissionGate(
-    perms.can("delete", "use_network_tools"),
-    "Requires delete permission on wake schedules",
+    perms.can("delete", "wol_schedule") ||
+      perms.can("delete", "use_network_tools"),
+    "Requires delete permission on wol_schedule (or use_network_tools)",
   );
   // Same query key the row uses, so it's already warm — no extra fetch.
   const previewQ = useQuery({
@@ -1311,11 +1316,12 @@ function CalendarKindChip({ kind }: { kind: WolCalendarKind }) {
 
 function CalendarsTab() {
   // #1341 — a read-only user is offered no write it would be refused:
-  // the router asks write on 'use_network_tools'.
+  // the router asks write on the type named below or 'use_network_tools'.
   const perms = usePermissions();
   const writeGate = permissionGate(
-    perms.can("write", "use_network_tools"),
-    "Requires write permission on calendars",
+    perms.can("write", "wol_calendar") ||
+      perms.can("write", "use_network_tools"),
+    "Requires write permission on wol_calendar (or use_network_tools)",
   );
   const qc = useQueryClient();
   const calendarsQ = useQuery({
@@ -1499,15 +1505,17 @@ function CalendarRow({
   onDelete: () => void;
 }) {
   // #1341 — a read-only user is offered no write it would be refused:
-  // the router asks write (delete) on 'use_network_tools'.
+  // the router asks write (delete) on the type named below or 'use_network_tools'.
   const perms = usePermissions();
   const writeGate = permissionGate(
-    perms.can("write", "use_network_tools"),
-    "Requires write permission on calendars",
+    perms.can("write", "wol_calendar") ||
+      perms.can("write", "use_network_tools"),
+    "Requires write permission on wol_calendar (or use_network_tools)",
   );
   const deleteGate = permissionGate(
-    perms.can("delete", "use_network_tools"),
-    "Requires delete permission on calendars",
+    perms.can("delete", "wol_calendar") ||
+      perms.can("delete", "use_network_tools"),
+    "Requires delete permission on wol_calendar (or use_network_tools)",
   );
   return (
     <tr className="border-b last:border-0 align-top">
