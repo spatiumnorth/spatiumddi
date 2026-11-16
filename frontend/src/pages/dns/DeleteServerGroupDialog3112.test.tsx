@@ -101,13 +101,15 @@ describe("DNS Delete Server Group", () => {
   it("names the zones' update grants, ACME accounts and DNSSEC keys (#4332)", async () => {
     open();
     const text = await said();
-    expect(text).toMatch(/dynamic-update grants/);
+    expect(text).toMatch(/DNS records, DNS pools, dynamic-update grants/);
     expect(text).toMatch(/ACME DNS-01 accounts/);
     expect(text).toMatch(/DNSSEC keys/);
     expect(text).toMatch(/register again/);
     fireEvent.click(screen.getByRole("button", { name: /^Continue$/ }));
     expect(
-      await screen.findByText(/ACME accounts and DNSSEC keys/),
+      await screen.findByText(
+        /DNSSEC keys and ACME DNS-01 accounts\) and its views/,
+      ),
     ).toBeTruthy();
   });
 });
