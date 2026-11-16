@@ -98,6 +98,8 @@ def _row_to_subnet(row: dict[str, Any], skipped: set[str] | None = None) -> dict
         norm = key.lower()
         if value == "":
             value = None
+        # Undo the export's formula escape (every value cell it writes).
+        value = unescape_cell(value)
         if _norm_header(key) in SUBNET_COMPUTED_COLUMNS:
             if skipped is not None:
                 skipped.add(_norm_header(key))
@@ -168,6 +170,8 @@ def _row_to_address(row: dict[str, Any], skipped: set[str] | None = None) -> dic
         norm = key.lower().replace(" ", "_")
         if value == "":
             value = None
+        # Undo the export's formula escape (every value cell it writes).
+        value = unescape_cell(value)
         if norm in ADDRESS_COMPUTED_COLUMNS:
             if skipped is not None:
                 skipped.add(norm)

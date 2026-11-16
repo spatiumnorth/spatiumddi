@@ -69,3 +69,44 @@ def test_apostrophe_key_unchanged() -> None:
     b.subnets[0]["custom_fields"] = {"'plain": "v"}
     assert "'plain" in _csv_header(_to_csv(b))
     assert set(parse_csv(_to_csv(b)).subnets[0]["custom_fields"]) == {"'plain"}
+
+
+VALUES = ["=1+1", "+y", "@z", "-w", "\tt", "\rr", "plain"]
+
+
+def _value_bundle() -> ExportBundle:
+    cf = {f"k{i}": v for i, v in enumerate(VALUES)}
+    return ExportBundle(
+        space=None,
+        blocks=[],
+        subnets=[{"network": "10.0.0.0/24", "name": "=n", "custom_fields": dict(cf)}],
+        addresses=[
+            {
+                "subnet": "10.0.0.0/24",
+                "address": "10.0.0.5",
+                "hostname": "@h",
+                "description": "-d",
+                "custom_fields": dict(cf),
+            }
+        ],
+        include_addresses=False,
+    )
+
+
+def test_csv_round_trip_keeps_values() -> None:
+    b = _value_bundle()
+    sub = parse_csv(_to_csv(b)).subnets[0]
+    assert sub["name"] == "=n"
+    assert list(sub["custom_fields"].values()) == VALUES
+    b.include_addresses = True
+    addr = parse_csv(_to_csv(b)).addresses[0]
+    assert addr["hostname"] == "@h" and addr["description"] == "-d"
+    assert list(addr["custom_fields"].values()) == VALUES
+
+
+def test_xlsx_round_trip_keeps_values() -> None:
+    parsed = parse_xlsx(_to_xlsx(_value_bundle()))
+    assert parsed.subnets[0]["name"] == "=n"
+    assert list(parsed.subnets[0]["custom_fields"].values()) == VALUES
+    assert parsed.addresses[0]["hostname"] == "@h"
+    assert list(parsed.addresses[0]["custom_fields"].values()) == VALUES
