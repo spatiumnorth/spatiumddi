@@ -581,6 +581,27 @@ _RESERVED_DNS_PORTS: dict[int, str] = {
 # ── Pydantic schemas ────────────────────────────────────────────────────────
 
 
+# #4185 — a BIND size for ``max-cache-size``: a positive integer with an
+# optional k / m / g suffix. ``unlimited`` and ``0`` are refused on purpose:
+# BIND 9.21.21+ ignores both and falls back to 90 % of physical memory, the
+# ceiling this setting exists to defeat (#3565). The agent applies the same rule.
+_MAX_CACHE_SIZE_RE = re.compile(r"[1-9]\d*[kKmMgG]?")
+
+
+def _validate_max_cache_size(v: str | None) -> str | None:
+    if v is None:
+        return None
+    v = v.strip().lower()
+    if not v:
+        return None
+    if not _MAX_CACHE_SIZE_RE.fullmatch(v) or len(v) > 16:
+        raise ValueError(
+            "max_cache_size must be a BIND size such as 64m, 512m or 1g "
+            "(unlimited and 0 are not accepted)"
+        )
+    return v
+
+
 class ServerGroupCreate(BaseModel):
     name: str
     description: str = ""
@@ -601,6 +622,13 @@ class ServerGroupCreate(BaseModel):
     # #1932 — auto-create subnet reverse zones in a cloud DNS group. Off by
     # default: the provider bills per hosted zone. Other drivers ignore it.
     auto_reverse_zones_at_provider: bool = False
+    # #4185 — BIND ``max-cache-size`` per recursive view; null = agent default.
+    max_cache_size: str | None = None
+
+    @field_validator("max_cache_size")
+    @classmethod
+    def validate_max_cache_size(cls, v: str | None) -> str | None:
+        return _validate_max_cache_size(v)
 
     @field_validator("group_type")
     @classmethod
@@ -620,6 +648,12 @@ class ServerGroupUpdate(BaseModel):
     catalog_zone_name: str | None = None
     is_public_facing: bool | None = None
     auto_reverse_zones_at_provider: bool | None = None
+    max_cache_size: str | None = None
+
+    @field_validator("max_cache_size")
+    @classmethod
+    def validate_max_cache_size(cls, v: str | None) -> str | None:
+        return _validate_max_cache_size(v)
 
     @field_validator("group_type")
     @classmethod
@@ -719,6 +753,7 @@ class ServerGroupResponse(BaseModel):
     catalog_zone_name: str
     is_public_facing: bool = False
     auto_reverse_zones_at_provider: bool = False
+    max_cache_size: str | None = None
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
@@ -763,6 +798,7 @@ class ServerGroupResponse(BaseModel):
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
             auto_reverse_zones_at_provider=g.auto_reverse_zones_at_provider,
+            max_cache_size=g.max_cache_size,
             server_drivers=sorted(drivers or []),
             catalog_unsupported_warning=(
                 catalog_unsupported_message(drivers or [])
@@ -2405,7 +2441,7 @@ async def update_group(
     # NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
-        clearable={"default_view"},
+        clearable={"default_view", "max_cache_size"},
         non_nullable={
             "name",
             "description",

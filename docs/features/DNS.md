@@ -1582,8 +1582,17 @@ writes an explicit `max-cache-size` into `options {}`: a quarter of the
 container's memory limit, split across the views that recurse (at least
 32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
 recursive views. With no limit it writes nothing and BIND keeps its default.
-Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
-BIND does) on the agent to override it. `unlimited` and `0` are not accepted:
+Set **Resolver cache size per view** on the server group (`max_cache_size` on
+the group's API, a BIND size such as `64m`, `512m` or `1g`; #4185) to choose it
+per group: it goes in the bundle, so every BIND9 agent of the group re-renders,
+and it applies to each recursive view's own cache. The precedence is the group
+setting, then the `NAMED_MAX_CACHE_SIZE` env on the agent, then the derived
+quarter of the limit. Total cache memory is the per-view figure times the
+number of recursive views. As a guide, a home or small office at about 10
+queries/s needs only 64-128m per view, against the roughly 320m the quarter
+rule gives on a 1.25 GiB limit; a view added for kids or guests costs another
+cache of that size. `NAMED_MAX_CACHE_SIZE` (applied per view, as BIND does)
+stays as the agent-wide override for groups that set nothing. `unlimited` and `0` are not accepted:
 BIND 9.21.21+ stops honouring them and falls back to 90 % of physical memory,
 so the agent ignores them (logging `bind9_max_cache_size_ignored`) and keeps
 the derived ceiling. Use an explicit size.
