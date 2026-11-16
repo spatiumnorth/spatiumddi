@@ -1,7 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowRight, CheckCircle2, Loader2 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
-import { dnsApi, formatApiError, type DelegationRecord } from "@/lib/api";
+import {
+  dnsApi,
+  formatApiError,
+  type DelegationPreviewResponse,
+  type DelegationRecord,
+} from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
 
 /**
@@ -25,13 +30,35 @@ export function DelegationModal({
 }) {
   const qc = useQueryClient();
 
-  const { data, isLoading, error, refetch } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ["dns-delegation-preview", groupId, zoneId],
     queryFn: () => dnsApi.getDelegationPreview(groupId, zoneId),
+    // Re-read on open: the zone page read this for its menu, and the child's
+    // apex NS may have changed since (#4310).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const applyMut = useMutation({
-    mutationFn: () => dnsApi.applyDelegation(groupId, zoneId),
+    // Apply makes the server recompute from the child's apex NS as stored
+    // then. Read the preview once more first: if what would be created is not
+    // what the dialog listed, show the new list and let the operator decide
+    // instead of writing records they were not shown (#4310).
+    mutationFn: async () => {
+      const shown = data;
+      const fresh = await dnsApi.getDelegationPreview(groupId, zoneId);
+      const toCreate = (d?: DelegationPreviewResponse) =>
+        d?.has_parent
+          ? JSON.stringify([d.ns_records_to_create, d.glue_records_to_create])
+          : "";
+      if (toCreate(fresh) !== toCreate(shown)) {
+        qc.setQueryData(["dns-delegation-preview", groupId, zoneId], fresh);
+        throw new Error(
+          "The zone's NS records changed since this list was shown. The list has been updated: review it and apply again.",
+        );
+      }
+      return dnsApi.applyDelegation(groupId, zoneId);
+    },
     onSuccess: () => {
       // The parent zone's record list changed — invalidate any cached view.
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -164,6 +191,7 @@ export function DelegationModal({
               onClick={() => applyMut.mutate()}
               disabled={
                 applyMut.isPending ||
+                isFetching ||
                 data.child_apex_ns_count === 0 ||
                 (data.ns_records_to_create.length === 0 &&
                   data.glue_records_to_create.length === 0)
