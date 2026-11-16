@@ -226,10 +226,10 @@ class DICOMAEUpdate(BaseModel):
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
 
-    @field_validator("ae_title")
-    @classmethod
-    def _v_title(cls, v: str | None) -> str | None:
-        return None if v is None else _validated_title(v)
+    # ``ae_title`` is deliberately NOT validated here: a row stored before
+    # #4294 may carry a title the PS3.5 rules now refuse, and a PATCH that
+    # re-sends that unchanged value must still work. A schema validator
+    # cannot see the row, so ``update_ae`` validates it, only when it changes.
 
 
 class DICOMAERead(BaseModel):
@@ -780,6 +780,17 @@ async def update_ae(
     ip = await _load_anchor(db, row, user)
 
     changes = body.model_dump(exclude_unset=True)
+    if "ae_title" in changes:
+        if changes["ae_title"] is None or changes["ae_title"] == row.ae_title:
+            # Unchanged (possibly a legacy invalid title): not a change.
+            changes.pop("ae_title")
+        else:
+            try:
+                changes["ae_title"] = validate_ae_title(changes["ae_title"])
+            except AETitleError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+                ) from exc
     if not changes:
         return _to_read(row, ip)
 

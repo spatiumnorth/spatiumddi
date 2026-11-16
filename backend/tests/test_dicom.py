@@ -745,3 +745,38 @@ async def test_module_gate_404s_the_surface_when_disabled(
         )
         await db_session.commit()
         invalidate_cache()
+
+
+# ── Legacy rows stored before #4294 ──────────────────────────────────
+
+
+async def test_legacy_invalid_title_row_stays_editable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A title stored before the stricter rules must not lock the row:
+    other fields save, re-sending the unchanged title is a no-op, and only
+    a *changed* title is validated."""
+    _, token = await _make_superadmin(db_session)
+    legacy = DICOMApplicationEntity(ae_title="CT LEGACY")
+    db_session.add(legacy)
+    await db_session.commit()
+    url = f"/api/v1/dicom/aes/{legacy.id}"
+
+    only_notes = await client.patch(url, headers=_auth(token), json={"notes": "n1"})
+    assert only_notes.status_code == 200, only_notes.text
+    assert only_notes.json()["notes"] == "n1"
+
+    same = await client.patch(
+        url, headers=_auth(token), json={"ae_title": "CT LEGACY", "notes": "n2"}
+    )
+    assert same.status_code == 200, same.text
+    assert same.json()["ae_title"] == "CT LEGACY"
+    assert same.json()["notes"] == "n2"
+
+    bad = await client.patch(url, headers=_auth(token), json={"ae_title": "CT OTHER"})
+    assert bad.status_code == 422, bad.text
+    assert "U+00A0" in bad.text
+
+    fixed = await client.patch(url, headers=_auth(token), json={"ae_title": "CT_LEGACY"})
+    assert fixed.status_code == 200, fixed.text
+    assert fixed.json()["ae_title"] == "CT_LEGACY"

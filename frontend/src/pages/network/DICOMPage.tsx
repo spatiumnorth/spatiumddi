@@ -1074,7 +1074,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
 
 // ── Create / edit ────────────────────────────────────────────────────
 
-function AEModal({
+export function AEModal({
   mode,
   ae,
   onClose,
@@ -1104,7 +1104,6 @@ function AEModal({
   const mut = useMutation({
     mutationFn: () => {
       const shared = {
-        ae_title: aeTitle.trim(),
         // Parse defensively: a non-numeric field would otherwise become
         // NaN, serialise to null, and hit the column's NOT NULL as an
         // opaque server error rather than a fixable form message.
@@ -1124,10 +1123,20 @@ function AEModal({
         // explicit null is how a retired host demotes its title to a
         // reservation, and omitting it would make "clear the anchor"
         // indistinguishable from "don't touch it".
-        const body: DICOMAEUpdate = { ...shared, ip_address_id: ipAddressId };
+        // An unchanged stored title is omitted: a legacy row may hold one
+        // the server now refuses, and re-sending it would block every edit.
+        const body: DICOMAEUpdate = {
+          ...shared,
+          ...(aeTitle === ae.ae_title ? {} : { ae_title: aeTitle.trim() }),
+          ip_address_id: ipAddressId,
+        };
         return dicomApi.updateAe(ae.id, body);
       }
-      const body: DICOMAECreate = { ...shared, ip_address_id: ipAddressId };
+      const body: DICOMAECreate = {
+        ...shared,
+        ae_title: aeTitle.trim(),
+        ip_address_id: ipAddressId,
+      };
       return dicomApi.createAe(body);
     },
     onSuccess: () => {
@@ -1144,10 +1153,12 @@ function AEModal({
   // app.services.dicom.titles.validate_ae_title, which is authoritative.
   const trimmedTitle = aeTitle.replace(/^ +| +$/g, "");
   const titleLength = trimmedTitle.length;
+  const titleUnchanged = mode === "edit" && !!ae && aeTitle === ae.ae_title;
   const titleValid =
-    titleLength >= 1 &&
-    titleLength <= 16 &&
-    /^[\x20-\x5b\x5d-\x7e]+$/.test(trimmedTitle);
+    titleUnchanged ||
+    (titleLength >= 1 &&
+      titleLength <= 16 &&
+      /^[\x20-\x5b\x5d-\x7e]+$/.test(trimmedTitle));
   const parsedPort = /^\d+$/.test(port.trim()) ? Number(port.trim()) : null;
   const portValid =
     port.trim() === "" ||
@@ -1179,6 +1190,13 @@ function AEModal({
             placeholder="e.g. CT1_RADIOLOGY"
             required
           />
+          {titleUnchanged &&
+            !/^[\x20-\x5b\x5d-\x7e]{1,16}$/.test(aeTitle.trim()) && (
+              <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                This title has characters DICOM does not allow; rename it when
+                you can.
+              </p>
+            )}
           <p className="text-[11px] text-muted-foreground">
             Unique across the whole institution. Up to 16 printable ASCII
             characters ({titleLength} used); spaces are legal padding,
