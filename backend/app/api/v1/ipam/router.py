@@ -118,6 +118,7 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
+    validate_custom_field_values,
 )
 from app.services.ipam.gateway_rules import gateway_problem
 from app.services.ipam.host_name import current_fqdn, fqdn_matches
@@ -5702,6 +5703,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 detail=f"{body.network} is not contained within parent block {parent.network}",
             )
 
+    await validate_custom_field_values(db, "ip_block", body.custom_fields)
     # A Required custom field needs a value (#2478), after any template
     # pre-fill above, counting what the parent chain already carries.
     await enforce_required_custom_fields(
@@ -5868,6 +5870,7 @@ async def update_block(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the block already holds.
     if body.custom_fields is not None:
+        await validate_custom_field_values(db, "ip_block", body.custom_fields)
         await enforce_required_custom_fields(
             db,
             "ip_block",
@@ -6840,6 +6843,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         # Override to enforce consistency
         body.vlan_id = vlan_obj.vlan_id
 
+    await validate_custom_field_values(db, "subnet", body.custom_fields)
     # A Required custom field needs a value (#2478), after any template
     # pre-fill above, counting what the block chain already carries.
     await enforce_required_custom_fields(
@@ -8032,6 +8036,7 @@ async def update_subnet(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the subnet already holds.
     if body.custom_fields is not None:
+        await validate_custom_field_values(db, "subnet", body.custom_fields)
         await enforce_required_custom_fields(
             db,
             "subnet",
@@ -10530,6 +10535,7 @@ async def create_address(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
 
     # Multicast subnets don't allocate per-IP endpoint rows. Use the
     # multicast group registry under ``/multicast/groups`` instead —
@@ -11072,6 +11078,7 @@ async def update_address(
     # ``reserved_until`` by sending an explicit null. ``dns_zone_id`` /
     # ``force`` are routing fields, not row attrs.
     changes = body.model_dump(exclude_unset=True, exclude={"dns_zone_id", "force"})
+    await validate_custom_field_values(db, "ip_address", changes.get("custom_fields"))
     changes_for_audit = body.model_dump(
         mode="json", exclude_unset=True, exclude={"dns_zone_id", "force"}
     )
@@ -12291,6 +12298,7 @@ async def bulk_allocate_commit(
             },
         )
 
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     created_addrs: list[str] = []
     # Every allocated IP lands in the same subnet → same zone(s); batch the
@@ -12480,6 +12488,7 @@ async def allocate_next_ip(
     subnet_id: uuid.UUID, body: NextIPRequest, current_user: CurrentUser, db: DB
 ) -> IPAddress:
     """Atomically allocate the next available IP in the subnet."""
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
     # Lock the subnet row to serialise concurrent allocations. `of=Subnet`
     # restricts the FOR UPDATE to the base table; Subnet has joined-eager
     # relationships (vlan, etc.) and Postgres rejects FOR UPDATE on the
@@ -12928,6 +12937,8 @@ async def bulk_edit_subnets(
     # the whole batch is refused before anything changes.
     for sid in body.subnet_ids:
         _enforce_subnet_token_scope(current_user, sid)
+
+    await validate_custom_field_values(db, "subnet", changes.get("custom_fields"))
 
     batch_id = uuid.uuid4()
     updated = 0
@@ -13511,6 +13522,7 @@ async def bulk_edit_addresses(
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
+    await validate_custom_field_values(db, "ip_address", cf_patch)
     # Per-field opt-in: the change set carries ONLY the fields the
     # client explicitly set. ``role`` and ``reserved_until`` flow
     # through as scalars; an empty string on ``role`` clears.
