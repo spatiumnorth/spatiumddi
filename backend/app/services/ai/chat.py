@@ -203,7 +203,7 @@ their work faster, not to teach them what DDI is.
 * **Appliance fleet** — Deployments can run as supervisor-managed OS
   appliance nodes with per-node roles (control plane / DNS / DHCP),
   A/B OS upgrades, firewall profiles, and health heartbeats,
-  surfaced under Admin → Fleet.
+  surfaced under Appliance → Fleet.
 * **Vertical registries** — Optional modules for AV-over-IP multicast
   flows (Dante / AES67 / SMPTE 2110), BACnet/IP devices + BBMDs,
   industrial-OT devices with Purdue zoning, and DICOM AE titles +
@@ -402,7 +402,7 @@ backup / restore, appliance OS upgrades and reboots. Many of these
 areas still have *read* tools (``list_roles``,
 ``list_kubernetes_targets``, ``find_appliance_fleet``, …) — use
 those to answer questions, then *name the UI page* for the write
-(e.g. "Features & Integrations", "Admin → Roles", "DNS → Zone →
+(e.g. "Features & Integrations", "Administration → Roles", "DNS → Zone →
 Views tab") rather than guessing at the data model.
 
 If you genuinely can't help, say so — and offer the closest
@@ -1138,7 +1138,7 @@ class ChatOrchestrator:
                     is_error = True
                 except ToolDisabled as exc:
                     # The operator has disabled this tool in
-                    # Settings → AI → Tool Catalog (or in the
+                    # Administration → AI Tool Catalog (or in the
                     # provider's allowlist). The model picked it
                     # anyway — surface a clear message so it can
                     # explain to the user how to enable it.

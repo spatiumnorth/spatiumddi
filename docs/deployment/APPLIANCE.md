@@ -863,7 +863,7 @@ under the cluster instead of relying on this alone.
 
 ### Guided etcd restore (Phase 9b)
 
-`/appliance → Fleet → Control plane` carries an **etcd snapshots**
+`/appliance → Cluster → etcd snapshots` carries an **etcd snapshots**
 disaster-recovery card. The seed reports its local
 `k3s etcd-snapshot list` on every heartbeat — read from the
 `ETCDSnapshotFile` CRs over the kubeapi (no host `k3s` binary needed),
@@ -1460,7 +1460,7 @@ of that floor *can* be source-scoped, but only by the separate `ssh_lockdown`
 setting ([#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009)) — a
 deliberate act with its own guards, never a consequence of a firewall rule.
 
-**Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
+**Appliance → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
 five sections: **Policies** (fleet/role/appliance list + rule editor, with the
 **Enforcement** + **Web-UI-access** cards nested compactly at the top rather
 than as full-width bars), **Aliases** (named CIDR/port sets), **Preview
@@ -3953,7 +3953,7 @@ from a snapshot taken before the upgrade** — and the order and the
 vantage both matter.
 
 **The Fleet UI path only works while the control plane still serves.**
-Fleet → Control plane → etcd snapshots drives the restore through the
+Appliance → Cluster → etcd snapshots drives the restore through the
 api pod → the seed's heartbeat → a host trigger file, so every hop
 needs the very cluster you are recovering to be up. Use it while things
 still work: on a partial rollout, or when you have decided to abandon

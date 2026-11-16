@@ -273,8 +273,8 @@ async def propose_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) ->
 #
 # All four ship default-disabled so an operator who hasn't reviewed
 # the implications doesn't accidentally hand the LLM keys to their
-# DNS / DHCP / alert / chat tables. Enable per-tool via Settings →
-# AI → Tool Catalog (the catalog page now confirm-modals before
+# DNS / DHCP / alert / chat tables. Enable per-tool via
+# Administration → AI Tool Catalog (the catalog page now confirm-modals before
 # turning on any propose_* tool — see frontend treatment of the
 # ``propose_`` name prefix).
 
@@ -536,7 +536,7 @@ async def propose_archive_session(
 #
 # Each tool below mirrors a sibling read tool's category + module so the
 # write proposal is gated identically. All ship default-disabled —
-# operators opt in via Settings → AI → Tool Catalog after reviewing the
+# operators opt in via Administration → AI Tool Catalog after reviewing the
 # blast radius. Backup writes are intentionally absent (restore needs an
 # uploaded archive + passphrase + a typed confirm phrase that an MCP
 # apply can't supply); the backup read tools remain the supported
