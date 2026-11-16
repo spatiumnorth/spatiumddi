@@ -1,0 +1,103 @@
+# Run Red Hat's `preflight check container` against a locally built image
+# (#3913). CHECK ONLY: this never submits. A submission needs a Partner
+# Connect project and a Pyxis API token, neither of which belongs in CI.
+#
+# preflight pulls the image from a registry (it does not read the Docker
+# daemon), and its HasUniqueTag check lists the repository's tags, so the image
+# is pushed to a throwaway registry:2 on localhost under the tag it will ship
+# with. The preflight binary is pinned in versions.json (component `preflight`)
+# and verified against the sha256 GitHub publishes for the release asset; the
+# step fails closed on a mismatch.
+name: Preflight check
+description: Run a pinned `preflight check container` on a local image, check only.
+inputs:
+  image:
+    description: Docker image reference present in the local daemon.
+    required: true
+  name:
+    description: Repository name to check it under (the image's published name).
+    required: true
+  tag:
+    description: The unique tag the image ships with (never just `latest`).
+    required: true
+  platform:
+    description: Architecture of the image (amd64 or arm64).
+    required: false
+    default: amd64
+  version:
+    description: preflight version.
+    required: false
+    default: '1.22.0'
+  sha256-amd64:
+    description: sha256 of the preflight-linux-amd64 release asset.
+    required: false
+    default: '1451ed8763f209f4d4a63848d9d62d1d40653a247db43d7606feb28eadbbd99b'
+runs:
+  using: composite
+  steps:
+    - name: Install preflight from the GitHub release
+      shell: bash
+      env:
+        PREFLIGHT_VERSION: ${{ inputs.version }}
+        PREFLIGHT_SHA256: ${{ inputs.sha256-amd64 }}
+      run: |
+        set -euo pipefail
+        if [ "${RUNNER_ARCH}" != "X64" ]; then
+          echo "::error::preflight-check: the pinned checksum is for the linux-amd64 binary; run it on an x86-64 runner"
+          exit 1
+        fi
+        bin="${RUNNER_TEMP}/preflight-bin"
+        mkdir -p "${bin}"
+        curl -fsSL --retry 3 --retry-all-errors -o "${bin}/preflight" \
+          "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/${PREFLIGHT_VERSION}/preflight-linux-amd64"
+        echo "${PREFLIGHT_SHA256}  ${bin}/preflight" | sha256sum -c -
+        chmod +x "${bin}/preflight"
+        echo "${bin}" >> "${GITHUB_PATH}"
+        "${bin}/preflight" --version
+
+    - name: Push to a local registry and check
+      shell: bash
+      env:
+        SRC: ${{ inputs.image }}
+        NAME: ${{ inputs.name }}
+        TAG: ${{ inputs.tag }}
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        out="${RUNNER_TEMP}/preflight-${NAME}"
+        mkdir -p "${out}"
+        reg="preflight-registry-${NAME}"
+        docker rm -f "${reg}" >/dev/null 2>&1 || true
+        docker run -d --name "${reg}" -p 127.0.0.1:5000:5000 registry:2 >/dev/null
+        for _ in $(seq 1 20); do
+          curl -fsS http://127.0.0.1:5000/v2/ >/dev/null 2>&1 && break
+          sleep 1
+        done
+        ref="localhost:5000/${NAME}:${TAG}"
+        docker tag "${SRC}" "${ref}"
+        docker push --quiet "${ref}"
+        rc=0
+        preflight check container "${ref}" --insecure --platform "${PLATFORM}" \
+          --artifacts "${out}/artifacts" --logfile "${out}/preflight.log" \
+          > "${out}/results.json" 2> "${out}/stderr.txt" || rc=$?
+        docker rm -f "${reg}" >/dev/null 2>&1 || true
+        echo "── preflight ${NAME}:${TAG} (${PLATFORM}), exit ${rc}"
+        python3 - "${out}/results.json" <<'PY'
+        import json, sys
+        try:
+            data = json.load(open(sys.argv[1]))
+        except (OSError, ValueError) as exc:
+            print(f"   no results.json ({exc})")
+            raise SystemExit(0)
+        for bucket in ("passed", "failed", "errors"):
+            for check in data.get("results", {}).get(bucket, []) or []:
+                line = f"   {bucket[:-2] if bucket == 'passed' else bucket:7} {check.get('name')}"
+                if bucket != "passed":
+                    line += f" -- {check.get('help') or check.get('suggestion') or ''}"
+                print(line)
+        PY
+        if [ "${rc}" -ne 0 ]; then
+          echo "::error::preflight check container failed for ${NAME}:${TAG} (see the log above)"
+          cat "${out}/stderr.txt" >&2 || true
+          exit 1
+        fi

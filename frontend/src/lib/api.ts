@@ -5318,6 +5318,9 @@ export interface DNSServerGroup {
    *  cloud DNS driver. Off by default: the provider bills per hosted zone.
    *  Groups on other drivers ignore it. */
   auto_reverse_zones_at_provider?: boolean;
+  /** #4185 — BIND `max-cache-size` for each recursive view's cache of a
+   *  BIND9 group (e.g. `64m`); null = the agent's default. */
+  max_cache_size?: string | null;
   /** Distinct drivers of the servers currently in this group (#934
    *  follow-up). Empty = an empty group, compatible with anything. A group
    *  is single-driver, so one entry is normal; two or more means the group
@@ -5337,6 +5340,44 @@ export interface DNSServerGroup {
   memory_estimate?: DNSMemoryEstimate | null;
   created_at: string;
   modified_at: string;
+}
+
+/** #4193 — an agent's actual memory use as last reported on its heartbeat:
+ *  the container's cgroup usage / peak / limit and the resident set of the
+ *  daemon and of the agent. Every figure is optional and `null` / absent means
+ *  not reported (an older agent, an unreadable file), never 0. */
+export interface AgentMemoryStatus {
+  used_bytes?: number | null;
+  peak_bytes?: number | null;
+  limit_bytes?: number | null;
+  daemon_rss_bytes?: number | null;
+  agent_rss_bytes?: number | null;
+  reported_at?: string | null;
+}
+
+/** #4193 — one minute of an agent's memory, for the sparkline. */
+export interface AgentMemoryPoint {
+  ts: string;
+  used_bytes: number | null;
+  peak_bytes: number | null;
+  daemon_rss_bytes: number | null;
+  agent_rss_bytes: number | null;
+}
+
+export interface AgentMemoryHistory {
+  server_id: string;
+  hours: number;
+  points: AgentMemoryPoint[];
+}
+
+/** #4193 — what one BIND9 server reports using, beside the group estimate. */
+export interface DNSMemoryServer {
+  name: string;
+  daemon_rss_bytes: number | null;
+  used_bytes: number | null;
+  peak_bytes: number | null;
+  limit_bytes: number | null;
+  reported_at: string | null;
 }
 
 /** #3551 — one blocklist (RPZ) zone as named loads it. */
@@ -5368,6 +5409,8 @@ export interface DNSMemoryEstimate {
   rpz_bytes: number;
   rpz: DNSMemoryRpzLoad[];
   views: string[];
+  /** #4193 — each BIND9 server's actual reported memory, beside the estimate. */
+  servers?: DNSMemoryServer[];
 }
 
 /** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
@@ -5790,6 +5833,8 @@ export interface DNSServer {
   config_apply_at: string | null;
   /** #1077 — push spool as last reported; `null` = never reported. */
   spool_status: AgentSpoolStatus | null;
+  /** #4193 — actual memory use as last reported; `null` = never reported. */
+  memory_status?: AgentMemoryStatus | null;
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
@@ -6470,6 +6515,13 @@ export const dnsApi = {
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
   getGroup: (id: string) =>
     api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
+  // #4193 — per-minute agent memory samples for the server modal's sparkline.
+  getMemoryHistory: (serverId: string, hours = 6) =>
+    api
+      .get<AgentMemoryHistory>(`/dns/servers/${serverId}/memory-history`, {
+        params: { hours },
+      })
+      .then((r) => r.data),
   // #3551 — estimated named memory against the agents' limit.
   getMemoryEstimate: (groupId: string) =>
     api
@@ -8875,6 +8927,8 @@ export interface DHCPServer {
   config_apply_at: string | null;
   /** #1077 — push spool as last reported; `null` = never reported. */
   spool_status: AgentSpoolStatus | null;
+  /** #4193 — actual memory use as last reported; `null` = never reported. */
+  memory_status?: AgentMemoryStatus | null;
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
@@ -9619,6 +9673,13 @@ export const dhcpApi = {
       .get<DHCPServerEventsResponse>(
         `/dhcp/servers/${serverId}/recent-events?limit=${limit}`,
       )
+      .then((r) => r.data),
+  // #4193 — per-minute agent memory samples for the sparkline.
+  getMemoryHistory: (serverId: string, hours = 6) =>
+    api
+      .get<AgentMemoryHistory>(`/dhcp/servers/${serverId}/memory-history`, {
+        params: { hours },
+      })
       .then((r) => r.data),
   getServerRenderedConfig: (serverId: string) =>
     api
@@ -12138,6 +12199,11 @@ export interface ProvisioningRequest {
   // Name of the IPAM template args.template_id names, resolved server-side so
   // viewers without read on IPAM templates still get it (#3649).
   template_name?: string | null;
+  // Whether the caller may approve this row, from the approve endpoint's own
+  // check (#4241); false once the row is no longer pending.
+  can_approve: boolean;
+  // The server's refusal text for a pending row that is not approvable.
+  approve_blocked_reason: string | null;
 }
 
 export interface ProvisioningRequestListParams {

@@ -61,6 +61,7 @@ from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
     _refusal_text,
+    approval_refusal,
     approve_change_request,
     count_change_requests,
     get_change_request,
@@ -139,6 +140,13 @@ class ProvisioningRequestResponse(BaseModel):
     # stamp. Only the name is exposed, never the template body. None when the
     # request names no template or it no longer exists.
     template_name: str | None = None
+    # Whether the CALLER may approve this row, from the same check the approve
+    # endpoint makes (#4241, #4242); the server re-checks on press. False once
+    # the row is no longer pending. ``approve_blocked_reason`` is the server's
+    # own refusal text for a pending row (no permission on the operation, the
+    # requester's account gone, ...).
+    can_approve: bool = False
+    approve_blocked_reason: str | None = None
 
 
 def _template_id(cr: ChangeRequest) -> uuid.UUID | None:
@@ -161,19 +169,26 @@ async def _template_names(db: DB, rows: list[ChangeRequest]) -> dict[uuid.UUID, 
     return {row[0]: row[1] for row in res.all()}
 
 
-async def _respond_all(db: DB, rows: list[ChangeRequest]) -> list[ProvisioningRequestResponse]:
+async def _respond_all(
+    db: DB, rows: list[ChangeRequest], viewer: User
+) -> list[ProvisioningRequestResponse]:
     names = await _template_names(db, rows)
-    return [_to_response(r, names.get(tid) if (tid := _template_id(r)) else None) for r in rows]
+    return [
+        _to_response(r, viewer, names.get(tid) if (tid := _template_id(r)) else None) for r in rows
+    ]
 
 
-async def _respond(db: DB, cr: ChangeRequest) -> ProvisioningRequestResponse:
-    return (await _respond_all(db, [cr]))[0]
+async def _respond(db: DB, cr: ChangeRequest, viewer: User) -> ProvisioningRequestResponse:
+    return (await _respond_all(db, [cr], viewer))[0]
 
 
 def _to_response(
-    cr: ChangeRequest, template_name: str | None = None
+    cr: ChangeRequest, viewer: User, template_name: str | None = None
 ) -> ProvisioningRequestResponse:
+    refusal = approval_refusal(viewer, cr) if cr.state == "pending" else None
     return ProvisioningRequestResponse(
+        can_approve=cr.state == "pending" and refusal is None,
+        approve_blocked_reason=str(refusal) if refusal is not None else None,
         id=cr.id,
         operation=cr.operation,
         resource_type=cr.resource_type,
@@ -523,7 +538,7 @@ async def list_requests(
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
-    return await _respond_all(db, list(rows))
+    return await _respond_all(db, list(rows), current_user)
 
 
 @router.post("", response_model=ProvisioningRequestResponse, status_code=status.HTTP_201_CREATED)
@@ -549,7 +564,7 @@ async def create_request(
     )
     await db.commit()
     await db.refresh(cr)
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 @router.get("/{req_id}", response_model=ProvisioningRequestResponse)
@@ -557,7 +572,7 @@ async def get_request(
     req_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> ProvisioningRequestResponse:
     _require_read(current_user)
-    return await _respond(db, await _load_visible(db, req_id, current_user))
+    return await _respond(db, await _load_visible(db, req_id, current_user), current_user)
 
 
 class CurrentPreviewResponse(BaseModel):
@@ -659,7 +674,7 @@ async def approve_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 @router.post("/{req_id}/reject", response_model=ProvisioningRequestResponse)
@@ -680,7 +695,7 @@ async def reject_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 @router.post("/{req_id}/cancel", response_model=ProvisioningRequestResponse)
@@ -710,7 +725,7 @@ async def cancel_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()
     await db.refresh(cr)
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 __all__ = ["router"]

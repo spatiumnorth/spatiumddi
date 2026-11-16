@@ -53,6 +53,11 @@ stringData:
 {{- end -}}
 {{- $repo := $flavorImg.repository | default $root.Values.dnsAgents.image.repository -}}
 {{- $imgTag := $flavorImg.tag | default $tag -}}
+{{- /* #3913 — image.tagSuffix ("-ubi") picks the UBI build, which exists for
+       the BIND9 image only. */ -}}
+{{- if eq $flavor "bind9" -}}
+  {{- $imgTag = printf "%s%s" $imgTag ($root.Values.image.tagSuffix | default "") -}}
+{{- end -}}
 {{- /* Volume mount path for the driver's zone-state volume. BIND9 caches
        zone files under /var/cache/bind; PowerDNS LMDB lives at
        /var/lib/powerdns; Technitium's own config + zone store lives at

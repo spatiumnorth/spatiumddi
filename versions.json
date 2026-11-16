@@ -591,6 +591,237 @@
       ],
       "upstream": { "kind": "none" },
       "note": "Build-time only (#2895): the backend image's builder stage installs it into a throwaway venv to generate the About page's Python third-party list; it never reaches the runtime image. Not a shipped component, so no NOTICE / THIRD_PARTY.md entry. Upstream tags it `v-5.5.5`, which the github-release resolver cannot compare, so check https://pypi.org/project/pip-licenses/ by hand."
+    },
+
+    "ubi9": {
+      "version": "9.9",
+      "digest": "sha256:1e9f0ed9fceafb40878bc1705ff124aa150e3fed873f18c42cdc2dded319e0a8",
+      "pinned_in": [
+        { "path": "backend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}@", "count": 1 },
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}@", "count": 2 },
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi:{version}@", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Builder base of the Red Hat UBI variants (#3913), pinned by tag AND index digest (amd64, arm64, s390x, ppc64le). Red Hat rebuilds the minor tag often; the digest keeps a build reproducible and the Dockerfiles `microdnf upgrade` on top (RPM_SNAPSHOT). registry.access.redhat.com is not Docker Hub, so no upstream resolver: read the digest with `docker buildx imagetools inspect registry.access.redhat.com/ubi9/ubi:<tag>` and bump it with the tag, in every file."
+    },
+
+    "ubi9-minimal": {
+      "version": "9.9",
+      "digest": "sha256:baafce2d34783a28b4a472779f304e97e00f9d35c99553bc53b068b14344d9a9",
+      "pinned_in": [
+        { "path": "backend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 },
+        { "path": "frontend/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 },
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 },
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "FROM registry.access.redhat.com/ubi9/ubi-minimal:{version}@", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Runtime base of the Red Hat UBI variants (#3913); same pinning and bump procedure as ubi9."
+    },
+
+    "bind-ubi": {
+      "version": "9.20.30",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG BIND_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "ISC BIND 9](https://www.isc.org/bind/) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "BIND 9.20 built from the ISC source tarball in the UBI dns-bind9 image (#3913): Red Hat ships 9.16 and ISC's RPMs are x86_64-only. ARG BIND_SHA256 pins the tarball (ISC publishes only a detached .asc); bump both together, and keep it at or above the `bind` floor. https://downloads.isc.org/isc/bind9/"
+    },
+
+    "libuv": {
+      "version": "1.52.1",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG LIBUV_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "libuv](https://libuv.org/) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "github-release", "repo": "libuv/libuv"},
+      "note": "Built from source for BIND in the UBI dns-bind9 image (#3913): UBI carries libuv but not libuv-devel. ARG LIBUV_SHA256 pins the tarball."
+    },
+
+    "userspace-rcu": {
+      "version": "0.15.6",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG URCU_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "Userspace RCU](https://liburcu.org/) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Built from source for BIND in the UBI dns-bind9 image (#3913): UBI carries liburcu but not its headers. LGPL-2.1, dynamically linked. ARG URCU_SHA256 pins the tarball; upstream is https://lttng.org/files/urcu/."
+    },
+
+    "tini-ubi": {
+      "version": "0.19.0",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG TINI_VERSION={version}", "count": 1 },
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG TINI_VERSION={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "github-release", "repo": "krallin/tini"},
+      "note": "tini built from source as PID 1 in the UBI dns-bind9 and dhcp-kea images (#3913); UBI has no tini or catatonit. ARG TINI_SHA256 pins the tarball. The release tag is v0.19.0."
+    },
+
+    "kea-ubi": {
+      "version": "3.0.5",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG KEA_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "ISC Kea DHCP](https://www.isc.org/kea/) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Kea built from the ISC source tarball in the UBI dhcp-kea image (#3913): RHEL 9 has no Kea, and ISC's RPMs need log4cplus from EPEL. Stay on the 3.0 LTS line at or above the `kea` floor. ARG KEA_SHA256 pins the tarball. https://downloads.isc.org/isc/kea/"
+    },
+
+    "boost-headers": {
+      "version": "1.89.0",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG BOOST_VERSION={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Header-only Boost for the Kea build in the UBI dhcp-kea image (#3913); boost-devel is not in UBI. Build-time only, nothing of it ships. ARG BOOST_SHA256 pins the tarball."
+    },
+
+    "log4cplus": {
+      "version": "2.2.1",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG LOG4CPLUS_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "log4cplus](https://github.com/log4cplus/log4cplus) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Built from source for Kea in the UBI dhcp-kea image (#3913): it is an EPEL package, not in UBI. ARG LOG4CPLUS_SHA256 pins the tarball; the upstream tags (REL_x_y_z) are not comparable by the github-release resolver."
+    },
+
+    "meson-ubi": {
+      "version": "1.9.1",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG MESON_VERSION={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Build-time only: the meson that builds Kea in the UBI dhcp-kea image (#3913). Nothing of it ships."
+    },
+
+    "preflight": {
+      "version": "1.22.0",
+      "pinned_in": [
+        { "path": ".github/actions/preflight-check/action.yml", "match": "default: '{version}'", "count": 1 }
+      ],
+      "upstream": {"kind": "github-release", "repo": "redhat-openshift-ecosystem/openshift-preflight"},
+      "note": "Red Hat's `preflight check container` (#3913), installed in CI by .github/actions/preflight-check from the GitHub release and verified against `sha256-amd64` in the same file -- a bump must move that digest with it (GitHub shows it on the release asset). Check only, never `--submit`."
+    },
+
+    "rhel9-postgresql-16": {
+      "version": "9.8-1793252703",
+      "pinned_in": [
+        { "path": "charts/spatiumddi/values-openshift-certified.yaml", "match": "tag: \"{version}\"", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Red Hat's PostgreSQL 16 image for the certified profile (#3913), registry.redhat.io/rhel9/postgresql-16. An immutable <RHEL minor>-<build timestamp> tag at least two weeks old when pinned; the catalog lists them at https://catalog.redhat.com/software/containers/rhel9/postgresql-16. The chart's `rhel` flavor was written against the sclorg image contract (POSTGRESQL_* env, /var/lib/pgsql/data) and not run against a registry.redhat.io pull."
+    },
+
+    "rhel9-redis-7": {
+      "version": "9.8-1793253232",
+      "pinned_in": [
+        { "path": "charts/spatiumddi/values-openshift-certified.yaml", "match": "tag: \"{version}\"", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Red Hat's Redis 7 image for the certified profile (#3913), registry.redhat.io/rhel9/redis-7; same tag scheme and caveats as rhel9-postgresql-16. Redis 7 is BSD-3-Clause, unlike the Redis 8 the default profile runs."
+    },
+
+    "jemalloc-ubi": {
+      "version": "5.3.0",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG JEMALLOC_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "jemalloc](https://jemalloc.net/) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Built from source for BIND in the UBI dns-bind9 image (#3913, #4192): named is linked to it (--with-jemalloc) and /etc/malloc.conf carries the decay settings, as in the Alpine image, which ships 5.3.0. ARG JEMALLOC_SHA256 pins the tarball; jemalloc publishes no signature."
+    },
+
+    "radvd-ubi": {
+      "version": "2.21",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG RADVD_VERSION={version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "radvd](https://radvd.litech.org/) | {version} (built from source, UBI image)", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "radvd built from source in the UBI dhcp-kea image (#3913, #524); UBI has no radvd. The release tarball has no generated scanner or parser, so flex and bison are built in the builder stage (never shipped) and strlcpy comes from a shim header, not libbsd. ARG RADVD_SHA256 and RADVD_PGP_FPR pin the tarball and its signing key."
+    },
+
+    "flex-ubi": {
+      "version": "2.6.4",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG FLEX_VERSION={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Build-time only: generates radvd's scanner in the UBI dhcp-kea image (#3913). UBI has no flex. Nothing ships."
+    },
+
+    "bison-ubi": {
+      "version": "3.8.2",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG BISON_VERSION={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Build-time only: generates radvd's parser in the UBI dhcp-kea image (#3913). UBI has no bison. Nothing ships."
+    },
+
+    "isc-signing-key-bind": {
+      "version": "D99CCEAF879747014F038D63182E23579462EFAA",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG BIND_SIGNING_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the OpenPGP key that signs ISC's BIND tarballs, pinned in the UBI dns-bind9 build, which fails unless gpg reports a good signature from exactly this key. Key block: https://www.isc.org/docs/isc-keyblock.asc. Moves when ISC changes release manager."
+    },
+
+    "isc-signing-key-kea": {
+      "version": "DA6A3508E672A49DD382AFD95B8F4D91B88ED909",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG KEA_PGP_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the OpenPGP key that signs ISC's Kea tarballs, pinned in the UBI dhcp-kea build (same check as BIND's). Key block: https://www.isc.org/docs/isc-keyblock.asc."
+    },
+
+    "libuv-signing-key": {
+      "version": "612F0EAD9401622379DF4402F28C3C8DA33C03BE",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG LIBUV_SIGNING_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the libuv release signing key (listed in libuv's README), pinned in the UBI dns-bind9 build. gpg reports the key expired but the signature still validates; the pin is the fingerprint."
+    },
+
+    "urcu-signing-key": {
+      "version": "2A0B4ED915F2D3FA45F5B16217280A9781186ACF",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile.ubi", "match": "ARG URCU_SIGNING_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the key that signs userspace-rcu tarballs, read off the .asc (the project publishes none) and pinned in the UBI dns-bind9 build."
+    },
+
+    "radvd-signing-key": {
+      "version": "BDEBB6A52F156FDF3168D91119395F23C58826C4",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG RADVD_PGP_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the key that signs radvd release tarballs, pinned in the UBI dhcp-kea build."
+    },
+
+    "flex-signing-key": {
+      "version": "56C67868E93390AA1039AD1CE4B29C8D64885307",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG FLEX_PGP_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the flex release signing key, pinned in the UBI dhcp-kea build (build-time tool)."
+    },
+
+    "bison-signing-key": {
+      "version": "7DF84374B1EE1F9764BBE25D0DDCAA3278D5264E",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile.ubi", "match": "ARG BISON_PGP_FPR={version}", "count": 1 }
+      ],
+      "upstream": {"kind": "none"},
+      "note": "Fingerprint of the GNU bison release signing key, pinned in the UBI dhcp-kea build (build-time tool). Tarballs with no signature check: log4cplus (upstream signs it, but its key carries a Brainpool subkey UBI's GnuPG cannot import), tini (only its release binaries are signed), Boost and jemalloc (none published): those are sha256-only."
     }
   },
 

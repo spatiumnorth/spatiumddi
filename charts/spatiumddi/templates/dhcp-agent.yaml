@@ -2,7 +2,8 @@
 {{- $root := . -}}
 {{- /* #3209 — fail on two servers rendering one object name. */ -}}
 {{- include "spatiumddi.agentNamesUnique" . -}}
-{{- $tag := .Values.dhcpAgents.image.tag | default .Chart.AppVersion -}}
+{{- /* #3913 — image.tagSuffix ("-ubi") picks the UBI build of the Kea image. */ -}}
+{{- $tag := printf "%s%s" (.Values.dhcpAgents.image.tag | default .Chart.AppVersion) (.Values.image.tagSuffix | default "") -}}
 {{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
 {{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}
 apiVersion: v1

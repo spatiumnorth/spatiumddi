@@ -11,6 +11,7 @@ import uuid
 import zipfile
 import zlib
 from collections.abc import Iterable, Sequence
+from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
 
@@ -117,6 +118,7 @@ from app.models.dns import (
     DNSAclEntry,
     DNSBlockList,
     DNSKey,
+    DNSPool,
     DNSRecord,
     DNSSECPolicy,
     DNSServer,
@@ -131,8 +133,16 @@ from app.models.dns import (
     dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
+from app.models.metrics import DNSMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.memory_status import (
+    MAX_HISTORY_HOURS,
+    MemoryHistory,
+    MemoryStatus,
+    fresh_memory_status,
+    memory_history,
+)
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
@@ -348,6 +358,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/servers/{server_id}/sync-from-server": _G,
     "POST /test-windows-credentials": _G,
     "GET /servers/{server_id}/recent-events": _G,
+    "GET /servers/{server_id}/memory-history": _G,
     "GET /servers/{server_id}/rendered-config": _G,
     "GET /servers/{server_id}/rndc-status": _G,
     # a server's view of every zone in its group, and its queued record ops
@@ -571,6 +582,27 @@ _RESERVED_DNS_PORTS: dict[int, str] = {
 # ── Pydantic schemas ────────────────────────────────────────────────────────
 
 
+# #4185 — a BIND size for ``max-cache-size``: a positive integer with an
+# optional k / m / g suffix. ``unlimited`` and ``0`` are refused on purpose:
+# BIND 9.21.21+ ignores both and falls back to 90 % of physical memory, the
+# ceiling this setting exists to defeat (#3565). The agent applies the same rule.
+_MAX_CACHE_SIZE_RE = re.compile(r"[1-9]\d*[kKmMgG]?")
+
+
+def _validate_max_cache_size(v: str | None) -> str | None:
+    if v is None:
+        return None
+    v = v.strip().lower()
+    if not v:
+        return None
+    if not _MAX_CACHE_SIZE_RE.fullmatch(v) or len(v) > 16:
+        raise ValueError(
+            "max_cache_size must be a BIND size such as 64m, 512m or 1g "
+            "(unlimited and 0 are not accepted)"
+        )
+    return v
+
+
 class ServerGroupCreate(BaseModel):
     name: str
     description: str = ""
@@ -591,6 +623,13 @@ class ServerGroupCreate(BaseModel):
     # #1932 — auto-create subnet reverse zones in a cloud DNS group. Off by
     # default: the provider bills per hosted zone. Other drivers ignore it.
     auto_reverse_zones_at_provider: bool = False
+    # #4185 — BIND ``max-cache-size`` per recursive view; null = agent default.
+    max_cache_size: str | None = None
+
+    @field_validator("max_cache_size")
+    @classmethod
+    def validate_max_cache_size(cls, v: str | None) -> str | None:
+        return _validate_max_cache_size(v)
 
     @field_validator("group_type")
     @classmethod
@@ -610,6 +649,12 @@ class ServerGroupUpdate(BaseModel):
     catalog_zone_name: str | None = None
     is_public_facing: bool | None = None
     auto_reverse_zones_at_provider: bool | None = None
+    max_cache_size: str | None = None
+
+    @field_validator("max_cache_size")
+    @classmethod
+    def validate_max_cache_size(cls, v: str | None) -> str | None:
+        return _validate_max_cache_size(v)
 
     @field_validator("group_type")
     @classmethod
@@ -626,6 +671,18 @@ class DNSMemoryRpzLoad(BaseModel):
     views: list[str]
     entries: int
     estimated_bytes: int
+
+
+class DNSMemoryServer(BaseModel):
+    """One BIND9 server's reported memory, next to the group estimate (#4193).
+    Null fields are unreported (an older agent), never 0."""
+
+    name: str
+    daemon_rss_bytes: int | None = None
+    used_bytes: int | None = None
+    peak_bytes: int | None = None
+    limit_bytes: int | None = None
+    reported_at: str | None = None
 
 
 class DNSMemoryEstimateResponse(BaseModel):
@@ -654,6 +711,9 @@ class DNSMemoryEstimateResponse(BaseModel):
     rpz_bytes: int
     rpz: list[DNSMemoryRpzLoad] = []
     views: list[str] = []
+    # #4193 — what each BIND9 server actually reports using (named's RSS and
+    # the container's usage), beside the estimate above.
+    servers: list[DNSMemoryServer] = []
 
     @classmethod
     def from_estimate(cls, est: GroupMemoryEstimate) -> DNSMemoryEstimateResponse:
@@ -679,6 +739,7 @@ class DNSMemoryEstimateResponse(BaseModel):
                 for r in est.rpz
             ],
             views=list(est.views),
+            servers=[DNSMemoryServer(**asdict(s)) for s in est.servers],
         )
 
 
@@ -693,6 +754,7 @@ class ServerGroupResponse(BaseModel):
     catalog_zone_name: str
     is_public_facing: bool = False
     auto_reverse_zones_at_provider: bool = False
+    max_cache_size: str | None = None
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
@@ -737,6 +799,7 @@ class ServerGroupResponse(BaseModel):
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
             auto_reverse_zones_at_provider=g.auto_reverse_zones_at_provider,
+            max_cache_size=g.max_cache_size,
             server_drivers=sorted(drivers or []),
             catalog_unsupported_warning=(
                 catalog_unsupported_message(drivers or [])
@@ -952,6 +1015,10 @@ class ServerResponse(BaseModel):
     # NULL when never reported (a pre-#1077 agent, or an agentless driver):
     # UNKNOWN, never "empty".
     spool_status: SpoolStatus | None = None
+    # #4193 — the agent's actual memory use as last reported on its heartbeat
+    # (container used / peak / limit, daemon and agent RSS). NULL when never
+    # reported (an older agent, an agentless driver): UNKNOWN, never 0.
+    memory_status: MemoryStatus | None = None
     # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
     # ``degraded`` (the agent's own word); NULL when the agent has never
     # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
@@ -1050,6 +1117,7 @@ class ServerResponse(BaseModel):
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
             spool_status=s.spool_status,
+            memory_status=fresh_memory_status(s.memory_status),
             daemon_status=s.daemon_status,
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
@@ -2378,7 +2446,7 @@ async def update_group(
     # NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
-        clearable={"default_view"},
+        clearable={"default_view", "max_cache_size"},
         non_nullable={
             "name",
             "description",
@@ -6871,6 +6939,22 @@ async def get_server_recent_events(
     return ServerEventsResponse(server_id=server.id, items=items)
 
 
+@router.get("/servers/{server_id}/memory-history", response_model=MemoryHistory)
+async def get_server_memory_history(
+    server_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(6, ge=1, le=MAX_HISTORY_HOURS),
+) -> MemoryHistory:
+    """#4193 — the agent's memory samples (container used / peak, daemon and
+    agent RSS), one per minute, for the Server modal's sparkline. Empty for an
+    agent that does not report memory. Refused for a resource-scoped token."""
+    _refuse_resource_scoped_token(current_user)
+    if await db.get(DNSServer, server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return await memory_history(db, DNSMetricSample, server_id, hours)
+
+
 # ── Server runtime-state read endpoints (rendered config + rndc) ─────
 
 
@@ -9898,6 +9982,31 @@ async def _refuse_cname_conflict(
         raise HTTPException(
             status.HTTP_409_CONFLICT, describe_cname_conflict(record_type, fqdn, other)
         )
+    # #4260 — a pool owns its name even while none of its members is healthy
+    # (no row yet), and would write its A / AAAA beside the CNAME later.
+    if record_type.upper() == "CNAME":
+        pool = (
+            (
+                await db.execute(
+                    select(DNSPool)
+                    .where(
+                        DNSPool.zone_id == zone_id,
+                        func.lower(DNSPool.record_name) == name.strip().lower(),
+                    )
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if pool is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{fqdn.rstrip('.')} is owned by the DNS pool {pool.name!r}, so it can "
+                "hold no CNAME. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both refuse "
+                "a zone that breaks this, and the server stops applying it.",
+            )
 
 
 async def _enforce_zone_view_in_group(
