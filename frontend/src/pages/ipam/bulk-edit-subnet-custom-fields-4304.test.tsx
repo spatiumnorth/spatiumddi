@@ -78,6 +78,10 @@ function mount() {
         def("owner", "Owner"),
         def("site", "Site", { field_type: "select", options: ["a", "b"] }),
         def("other", "Other"),
+        def("tags2", "Teams", {
+          field_type: "multi_select",
+          options: ["net", "sec"],
+        }),
       ]),
   };
   const bulk = vi.fn(() =>
@@ -144,5 +148,23 @@ describe("Subnet bulk edit custom fields (#4304)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     await waitFor(() => expect(bulk).toHaveBeenCalled());
     expect((bulk.mock.calls[0] as unknown[])[1]).toEqual({ name: "renamed" });
+  });
+
+  it("sends the chosen multi_select values, and null when none are chosen", async () => {
+    const bulk = mount();
+    await openSection();
+    fireEvent.click(await screen.findByLabelText("Teams"));
+    fireEvent.click(await screen.findByLabelText("net"));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(bulk).toHaveBeenCalledTimes(1));
+    expect((bulk.mock.calls[0] as unknown[])[1]).toEqual({
+      custom_fields: { tags2: ["net"] },
+    });
+    fireEvent.click(screen.getByLabelText("net"));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(bulk).toHaveBeenCalledTimes(2));
+    expect((bulk.mock.calls[1] as unknown[])[1]).toEqual({
+      custom_fields: { tags2: null },
+    });
   });
 });

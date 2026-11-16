@@ -57,7 +57,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dns.record_ops import purge_trashed_address_records
-from app.services.e911.address_bindings import carry_ip_bindings, keep_row_if_bound
+from app.services.e911.address_bindings import bound_ip_ids, carry_ip_bindings, keep_row_if_bound
 from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
@@ -693,6 +693,7 @@ async def remove_ipam_for_static(
     *,
     touched_subnets: set[uuid.UUID] | None = None,
     user: User | None = None,
+    keep_bound: bool = False,
 ) -> int:
     """DELETE the IPAM mirror row(s) for a reservation (not just free them).
 
@@ -710,11 +711,18 @@ async def remove_ipam_for_static(
     Does not recount: a caller freeing many mirrors passes ``touched_subnets``,
     collects every removed row's subnet, and recounts them once with
     ``recount_subnets_and_blocks`` (#3354). Returns the number of rows removed.
+
+    ``keep_bound`` leaves a row an E911 ``ip`` binding names exactly as it is, still
+    ``static_dhcp`` with its binding active (#4286): a scope going to the Trash is
+    not an end for the address, and the restore finds the row where it was. Without
+    it such a row is kept as a free address with the binding deactivated (#3964).
     """
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     removed = 0
     audits: list[AuditLog] = []
     for row in res.scalars().all():
+        if keep_bound and await bound_ip_ids(db, [row.id]):
+            continue
         if touched_subnets is not None:
             touched_subnets.add(row.subnet_id)
         await _delete_mirror_row(db, row, st, user=user, audits=audits)
@@ -862,6 +870,14 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
     for row, static_id in parsed:
         if static_id is not None and static_id in live:
             continue
+        # A scope in the Trash keeps its bound reservation's row (#4286); the
+        # reservation is in the Trash, not gone, and its restore re-adopts the row.
+        if (
+            static_id is not None
+            and await bound_ip_ids(db, [row.id])
+            and await _load_reservation_any(db, row.static_assignment_id) is not None
+        ):
+            continue
         touched.append(row.subnet_id)
         await _delete_mirror_row(
             db, row, await _load_reservation_any(db, row.static_assignment_id), audits=audits
@@ -909,6 +925,7 @@ async def remove_ipam_for_scope_statics(
     scope_id: uuid.UUID,
     *,
     touched_subnets: set[uuid.UUID] | None = None,
+    keep_bound: bool = False,
 ) -> int:
     """DELETE the IPAM mirror of every reservation under ``scope_id``.
 
@@ -922,7 +939,8 @@ async def remove_ipam_for_scope_statics(
     A caller looping over several scopes passes ``touched_subnets`` and recounts
     once itself with ``recount_subnets_and_blocks``, so the subnets and blocks
     are locked in one id-ordered pass rather than scope by scope; with none,
-    this recounts what it freed before returning.
+    this recounts what it freed before returning. ``keep_bound`` is passed through
+    (see ``remove_ipam_for_static``): the soft delete keeps a bound address row.
     """
     res = await db.execute(
         select(DHCPStaticAssignment)
@@ -932,7 +950,9 @@ async def remove_ipam_for_scope_statics(
     touched: set[uuid.UUID] = set() if touched_subnets is None else touched_subnets
     removed = 0
     for st in res.scalars().all():
-        removed += await remove_ipam_for_static(db, st, touched_subnets=touched)
+        removed += await remove_ipam_for_static(
+            db, st, touched_subnets=touched, keep_bound=keep_bound
+        )
     if touched_subnets is None:
         await recount_subnets_and_blocks(db, touched)
     return removed

@@ -347,7 +347,11 @@ async def _purge_leases_for_scope_batch(
 
     for row in batch.rows:
         if isinstance(row.obj, DHCPScope):
-            await remove_ipam_for_scope_statics(db, row.obj.id, touched_subnets=touched_subnets)
+            # A reservation's address an E911 binding names stays while its
+            # scope is in the Trash (#4286); the restore finds it where it was.
+            await remove_ipam_for_scope_statics(
+                db, row.obj.id, touched_subnets=touched_subnets, keep_bound=True
+            )
 
 
 async def _retract_lease_mirror_records(db: AsyncSession, root: Any, batch: Any) -> set[UUID]:
@@ -1455,6 +1459,17 @@ async def _apply_delete_scope(
     # #3388 — refused before any side effect: a phone class this scope keeps
     # rendering may be named by another scope's pool.
     await refuse_scope_removal_orphaning_classes(db, scope, "delete this scope")
+    if args.permanent:
+        # #4286 — the permanent delete takes the binding a reservation's address
+        # carries (#3891); refused before any side effect, as the Trash purge does.
+        from app.services.e911.address_bindings import bound_static_mirror_ids  # noqa: PLC0415
+        from app.services.e911.delete_guard import refuse_if_e911_bound  # noqa: PLC0415
+
+        await refuse_if_e911_bound(
+            db,
+            f"DHCP scope {scope.id}",
+            ip_ids=await bound_static_mirror_ids(db, [scope.id]),
+        )
     if not args.permanent:
         # #3733 — the scope row first, before anything this delete writes. A
         # lease-events batch holds it ``FOR KEY SHARE`` from the moment it
@@ -1501,7 +1516,11 @@ async def _apply_delete_scope(
         )
     else:
         leases_removed, lease_mirrors = await scope_lease_counts(db, scope.id)
-    statics_released = await remove_ipam_for_scope_statics(db, scope.id, touched_subnets=touched)
+    # A soft delete keeps a mirror an E911 binding names (#4286): the scope sits
+    # in the Trash and its restore brings the reservation back onto that row.
+    statics_released = await remove_ipam_for_scope_statics(
+        db, scope.id, touched_subnets=touched, keep_bound=not args.permanent
+    )
     cleanup_audit = {
         "leases_removed": leases_removed,
         "lease_mirrors_removed": lease_mirrors,

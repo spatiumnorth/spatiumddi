@@ -115,6 +115,7 @@ import { cascadeList } from "@/lib/delete-cascade";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   customFieldChecked,
+  customFieldDisplay,
   missingRequiredCustomFields,
   requiredFieldsMessage,
   withCustomFieldDefaults,
@@ -135,6 +136,7 @@ import {
   staleReasonText,
   type IpDnsState,
 } from "@/lib/gatewayDns";
+import { CustomFieldMultiSelect } from "@/components/CustomFieldMultiSelect";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
@@ -895,6 +897,13 @@ function CustomFieldsSection({
                     checked={customFieldChecked(val)}
                     onChange={(e) => onChange(def.name, e.target.checked)}
                   />
+                ) : def.field_type === "multi_select" && def.options ? (
+                  <CustomFieldMultiSelect
+                    label={def.label}
+                    options={def.options}
+                    value={val}
+                    onChange={(next) => onChange(def.name, next)}
+                  />
                 ) : def.field_type === "select" && def.options ? (
                   <select
                     className={inputCls}
@@ -930,11 +939,13 @@ function CustomFieldsSection({
                     type={
                       def.field_type === "number"
                         ? "number"
-                        : def.field_type === "email"
-                          ? "email"
-                          : def.field_type === "url"
-                            ? "url"
-                            : "text"
+                        : def.field_type === "date"
+                          ? "date"
+                          : def.field_type === "email"
+                            ? "email"
+                            : def.field_type === "url"
+                              ? "url"
+                              : "text"
                     }
                     value={String(val)}
                     onChange={(e) => onChange(def.name, e.target.value)}
@@ -6376,7 +6387,9 @@ export function SubnetDetail({
                 {Object.entries(keep).map(([k, v]) => (
                   <div key={k} className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">{k}</span>
-                    <span className="text-xs font-medium">{String(v)}</span>
+                    <span className="text-xs font-medium">
+                      {customFieldDisplay(v)}
+                    </span>
                   </div>
                 ))}
               </>
@@ -14802,7 +14815,9 @@ export function BlockDetailView({
                 {Object.entries(keep).map(([k, v]) => (
                   <div key={k} className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">{k}</span>
-                    <span className="text-xs font-medium">{String(v)}</span>
+                    <span className="text-xs font-medium">
+                      {customFieldDisplay(v)}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -15620,7 +15635,7 @@ export function BlockDetailView({
                               className="px-4 py-2 text-muted-foreground"
                             >
                               {s.custom_fields?.[def.name] != null ? (
-                                String(s.custom_fields[def.name])
+                                customFieldDisplay(s.custom_fields[def.name])
                               ) : (
                                 <span className="text-muted-foreground/40">
                                   —
@@ -16662,7 +16677,7 @@ export function SpaceTableView({
                             className="px-4 py-2 text-muted-foreground"
                           >
                             {s.custom_fields?.[def.name] != null ? (
-                              String(s.custom_fields[def.name])
+                              customFieldDisplay(s.custom_fields[def.name])
                             ) : (
                               <span className="text-muted-foreground/40">
                                 —

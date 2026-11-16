@@ -93,3 +93,42 @@ async def test_null_removes_key_keeps_the_others(
         .all()
     )
     assert audit and audit[-1].new_value[field] == {keys[0]: None}
+
+
+@pytest.mark.asyncio
+async def test_multi_select_set_and_clear_merge_with_the_validator(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4288 validates multi_select on bulk edit; the merge keeps other keys."""
+    from app.models.ipam import CustomFieldDefinition
+
+    headers = await _headers(db_session)
+    subs = await _two_subnets(db_session)
+    db_session.add(
+        CustomFieldDefinition(
+            resource_type="subnet",
+            name="teams",
+            label="Teams",
+            field_type="multi_select",
+            options=["net", "sec"],
+        )
+    )
+    await db_session.commit()
+    await _bulk(client, headers, subs, {"custom_fields": {"teams": ["net"]}})
+    for s in subs:
+        await db_session.refresh(s)
+        n = subs.index(s) + 1
+        assert s.custom_fields == {"a": f"a{n}", "b": f"b{n}", "teams": ["net"]}
+    await _bulk(client, headers, subs, {"custom_fields": {"teams": None}})
+    for s in subs:
+        await db_session.refresh(s)
+        assert "teams" not in s.custom_fields and "a" in s.custom_fields
+    r = await client.post(
+        "/api/v1/ipam/subnets/bulk-edit",
+        headers=headers,
+        json={
+            "subnet_ids": [str(subs[0].id)],
+            "changes": {"custom_fields": {"teams": ["bogus"]}},
+        },
+    )
+    assert r.status_code == 422

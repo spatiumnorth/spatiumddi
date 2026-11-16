@@ -10,7 +10,10 @@ export function bulkCustomFieldChanges(
     if (!on) continue;
     const v = values[key];
     // Explicitly empty is a removal (null); "" would store a set-looking value.
-    out[key] = v === "" || v === undefined ? null : v;
+    out[key] =
+      v === "" || v === undefined || (Array.isArray(v) && v.length === 0)
+        ? null
+        : v;
   }
   return out;
 }

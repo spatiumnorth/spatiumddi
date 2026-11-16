@@ -1,4 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
+import { CustomFieldMultiSelect } from "@/components/CustomFieldMultiSelect";
 import type { CustomField } from "@/lib/api";
 
 // Bulk-edit "Custom fields (merge)" section shared by the address and subnet
@@ -86,6 +87,18 @@ export function BulkCustomFieldsSection({
                             }))
                           }
                         />
+                      ) : def.field_type === "multi_select" && def.options ? (
+                        <CustomFieldMultiSelect
+                          label={def.label}
+                          options={def.options}
+                          value={val}
+                          onChange={(next) =>
+                            onValuesChange((prev) => ({
+                              ...prev,
+                              [def.name]: next,
+                            }))
+                          }
+                        />
                       ) : def.field_type === "select" && def.options ? (
                         <select
                           className={inputCls}
@@ -110,11 +123,13 @@ export function BulkCustomFieldsSection({
                           type={
                             def.field_type === "number"
                               ? "number"
-                              : def.field_type === "email"
-                                ? "email"
-                                : def.field_type === "url"
-                                  ? "url"
-                                  : "text"
+                              : def.field_type === "date"
+                                ? "date"
+                                : def.field_type === "email"
+                                  ? "email"
+                                  : def.field_type === "url"
+                                    ? "url"
+                                    : "text"
                           }
                           value={String(val)}
                           onChange={(e) =>
