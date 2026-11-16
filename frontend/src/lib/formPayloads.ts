@@ -54,7 +54,11 @@ export function blocklistPayload(
 /** DNS pool health check: the target port is hidden for `none` and `icmp`,
  *  TLS verification is shown only for `https`. */
 export function poolHealthCheckFields(
-  f: { hcType: DNSPoolWrite["hc_type"]; hcPort: number; hcVerifyTls: boolean },
+  f: {
+    hcType: DNSPoolWrite["hc_type"];
+    hcPort: number | null;
+    hcVerifyTls: boolean;
+  },
   editing: boolean,
 ): Pick<DNSPoolWrite, "hc_target_port" | "hc_verify_tls"> {
   const out: Pick<DNSPoolWrite, "hc_target_port" | "hc_verify_tls"> = {};
