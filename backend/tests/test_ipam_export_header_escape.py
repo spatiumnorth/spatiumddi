@@ -110,3 +110,57 @@ def test_xlsx_round_trip_keeps_values() -> None:
     assert list(parsed.subnets[0]["custom_fields"].values()) == VALUES
     assert parsed.addresses[0]["hostname"] == "@h"
     assert list(parsed.addresses[0]["custom_fields"].values()) == VALUES
+
+
+# ── Text that already starts with apostrophes (#4351) ──────────────────────────
+
+from app.services.dns_io import spreadsheet as sheet_io  # noqa: E402
+from app.services.ipam_io.export import sanitize_cell, unescape_cell  # noqa: E402
+
+TRICKY = ["=v", "'=lit", "''=x", "'+1 555 0100", "'abc", "abc"]
+
+
+def test_helpers_pair() -> None:
+    assert sanitize_cell("=v") == "'=v"
+    assert sanitize_cell("'=lit") == "''=lit"
+    assert sanitize_cell("''=x") == "'''=x"
+    assert sanitize_cell("'abc") == "'abc"
+    assert sanitize_cell("abc") == "abc"
+    assert unescape_cell("'=v") == "=v"
+    assert unescape_cell("''=lit") == "'=lit"
+    assert unescape_cell("'abc") == "'abc"
+    assert unescape_cell("abc") == "abc"
+    for v in TRICKY:
+        assert unescape_cell(sanitize_cell(v)) == v
+
+
+def _tricky_bundle() -> ExportBundle:
+    cf = {k: k for k in TRICKY}
+    sub = {"network": "10.0.0.0/24", "description": "'=note", "custom_fields": dict(cf)}
+    return ExportBundle(None, [], [sub], [], include_addresses=False)
+
+
+def test_ipam_csv_round_trip_apostrophes() -> None:
+    sub = parse_csv(_to_csv(_tricky_bundle())).subnets[0]
+    assert sub["description"] == "'=note"
+    assert sub["custom_fields"] == {k: k for k in TRICKY}
+
+
+def test_ipam_xlsx_round_trip_apostrophes() -> None:
+    sub = parse_xlsx(_to_xlsx(_tricky_bundle())).subnets[0]
+    assert sub["description"] == "'=note"
+    assert sub["custom_fields"] == {k: k for k in TRICKY}
+
+
+def _dns_rows() -> list[dict]:
+    return [{"name": "h", "type": "TXT", "value": v, "comment": v, "ttl": 300} for v in TRICKY]
+
+
+def test_dns_sheet_round_trip_apostrophes() -> None:
+    for data, parse in (
+        (sheet_io.to_csv(_dns_rows()), sheet_io.parse_csv),
+        (sheet_io.to_xlsx(_dns_rows()), sheet_io.parse_xlsx),
+    ):
+        rows = parse(data)
+        assert [r.value for r in rows] == TRICKY
+        assert [r.comment for r in rows] == TRICKY

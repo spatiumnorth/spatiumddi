@@ -244,7 +244,9 @@ def _sanitize_cell(value: Any) -> Any:
     ``None`` and booleans pass through unchanged so numeric columns
     (``utilization_percent``, ``vlan_id``, …) keep their type in XLSX.
     """
-    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+    if isinstance(value, str) and value.lstrip("'").startswith(_FORMULA_TRIGGERS):
+        # Also when apostrophes come first: ``'=lit`` is written ``''=lit``, so
+        # the importer can tell it from an escaped ``=lit`` (#4351).
         return "'" + value
     return value
 
@@ -278,13 +280,14 @@ sanitize_cell = _sanitize_cell
 def unescape_cell(value: Any) -> Any:
     """Undo the export's formula escape, and nothing more.
 
-    A cell exported as ``'=x`` reads back as ``'=x`` (CSV, and openpyxl, keep
-    the apostrophe), so a round trip would otherwise change the value. Only an
-    apostrophe in front of a formula trigger is removed. Nothing is ever
-    evaluated: a leading ``=`` is text.
+    The export writes one more apostrophe in front of any text whose part after
+    its leading apostrophes begins with a formula trigger (``=v`` becomes
+    ``'=v``, ``'=lit`` becomes ``''=lit``). This removes exactly one, so the
+    round trip is exact. Text such as ``'abc`` is never touched, and nothing
+    is ever evaluated: a leading ``=`` is text.
     """
-    if isinstance(value, str) and len(value) > 1 and value[0] == "'":
-        if value[1:].startswith(FORMULA_TRIGGERS):
+    if isinstance(value, str) and value.startswith("'"):
+        if value.lstrip("'").startswith(FORMULA_TRIGGERS):
             return value[1:]
     return value
 
