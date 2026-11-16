@@ -3083,6 +3083,10 @@ export interface BackupSection {
   table_count: number;
   volatile: boolean;
   selectable: boolean;
+  /** Tables of OTHER sections a selective restore of this one also
+   *  replaces from the archive (FK cascade, #4333). Absent from an older
+   *  server. */
+  also_restores?: { key: string; label: string; tables: string[] }[];
 }
 
 export interface BackupManifestPreviewResponse {
@@ -3532,6 +3536,9 @@ export const backupTargetsApi = {
         pre_restore_safety_path: string | null;
         selective?: boolean;
         restored_sections?: string[] | null;
+        /** Post-restore advisories, the same list the file path returns
+         *  (cascade-widened tables, DNSSEC re-publish, ...). */
+        warnings?: string[];
       }>(`/backup/targets/${id}/archives/restore`, body)
       .then((r) => r.data),
 };
