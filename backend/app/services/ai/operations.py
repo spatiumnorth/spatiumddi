@@ -5357,7 +5357,7 @@ class GrantTemporaryAccessArgs(BaseModel):
 _GRANT_MAKES_SUPERADMIN = (
     "This grant would make {n} member(s) of the group superadmins, and that needs "
     "your password or authenticator code, which a chat Apply cannot ask for "
-    "(#1412). Grant it from Groups → Time-bound grants instead."
+    "(#1412). Grant it from Administration → Groups → Time-bound grants instead."
 )
 
 

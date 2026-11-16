@@ -147,6 +147,15 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     ),
     # #4143 — the delete dialogs' cascade registry is read by the console too.
     "test_delete_cascade_copy_4143.py": ("frontend/src/lib/delete-cascade.json"),
+    # #4334 — console paths named in Copilot text must exist in the console.
+    "test_ai_tool_nav_paths_4334.py": (
+        "frontend/src/lib/navigation.ts",
+        "frontend/src/components/layout/Sidebar.tsx",
+        "frontend/src/pages/SettingsPage.tsx",
+        "frontend/src/pages/dns/DNSPage.tsx",
+        "frontend/src/pages/appliance/",
+        "frontend/src/pages/admin/",
+    ),
     # #3119 — every resource type the server checks must be offered by New Role.
     "test_grant_vocabulary_covers_routes_3119.py": ("frontend/src/lib/permissionVocabulary.ts"),
     "test_e911_held.py": (

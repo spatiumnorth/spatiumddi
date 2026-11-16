@@ -197,6 +197,16 @@ frontend/src/lib/delete-cascade.json
 # frontend-only edit, so without this the backend half would not run on it.
 frontend/src/lib/permissionVocabulary.ts
 
+# test_ai_tool_nav_paths_4334.py (#4334) checks every console path the Copilot's
+# text names ("Appliance → Cluster → etcd snapshots") against the labels these
+# files define, so renaming a page here must run the backend half.
+frontend/src/lib/navigation.ts
+frontend/src/components/layout/Sidebar.tsx
+frontend/src/pages/SettingsPage.tsx
+frontend/src/pages/dns/DNSPage.tsx
+frontend/src/pages/appliance/
+frontend/src/pages/admin/
+
 # test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
 # watcher, and checks the Dockerfile copies it in and the chart's frontend
 # Deployment no longer rolls on a certificate change.
