@@ -247,7 +247,7 @@ function PoolCard({
           <p className="mt-0.5 text-xs text-muted-foreground">
             {pool.hc_type === "none"
               ? "No health check — all enabled members rendered"
-              : `${pool.hc_type.toUpperCase()} check${pool.hc_target_port ? ` :${pool.hc_target_port}` : ""}${pool.hc_path && pool.hc_type !== "tcp" ? ` ${pool.hc_path}` : ""} · every ${pool.hc_interval_seconds}s`}
+              : `${pool.hc_type.toUpperCase()} check${pool.hc_target_port ? ` :${pool.hc_target_port}` : pool.hc_type === "https" ? " :443 (default)" : pool.hc_type === "http" ? " :80 (default)" : ""}${pool.hc_path && pool.hc_type !== "tcp" ? ` ${pool.hc_path}` : ""} · every ${pool.hc_interval_seconds}s`}
             {" · "}
             ttl {pool.ttl}s
           </p>
@@ -476,7 +476,12 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
   const [hcType, setHcType] = useState<DNSPoolWrite["hc_type"]>(
     pool?.hc_type ?? "tcp",
   );
-  const [hcPort, setHcPort] = useState(pool?.hc_target_port ?? 80);
+  // #4307 — empty means "the check type's default port" (what the API stores
+  // as null), so it is never shown as, or saved as, a number the operator did
+  // not type. TCP has no default: it needs a port.
+  const [hcPort, setHcPort] = useState<number | null>(
+    pool?.hc_target_port ?? null,
+  );
   const [hcPath, setHcPath] = useState(pool?.hc_path ?? "/");
   const [hcMethod, setHcMethod] = useState(pool?.hc_method ?? "GET");
   const [hcVerifyTls, setHcVerifyTls] = useState(pool?.hc_verify_tls ?? false);
@@ -681,6 +686,9 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
             return;
           }
           const hcError =
+            (hcType === "tcp" && !hcPort
+              ? "A TCP health check needs a target port."
+              : null) ??
             secondsFieldError(
               "Health-check interval",
               hcInterval,
@@ -788,8 +796,17 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
                   type="number"
                   min={1}
                   max={65535}
-                  value={hcPort}
-                  onChange={(e) => setHcPort(parseInt(e.target.value, 10) || 0)}
+                  value={hcPort ?? ""}
+                  placeholder={
+                    hcType === "https"
+                      ? "443 (HTTPS default)"
+                      : hcType === "http"
+                        ? "80 (HTTP default)"
+                        : "required"
+                  }
+                  onChange={(e) =>
+                    setHcPort(parseInt(e.target.value, 10) || null)
+                  }
                   className={inputCls}
                 />
               </Field>

@@ -126,6 +126,12 @@ describe("a refused save shows the server's reason as text (#2465)", () => {
     const name = screen.getByText("Name", { selector: "label" })
       .nextElementSibling as HTMLInputElement;
     fireEvent.change(name, { target: { value: "web" } });
+    // A TCP check needs a port (#4307); this test is about the refusal.
+    fireEvent.change(
+      screen.getByText("Type", { selector: "label" })
+        .nextElementSibling as HTMLSelectElement,
+      { target: { value: "http" } },
+    );
     fireEvent.submit(name.form!);
 
     await waitFor(() => expect(createPool).toHaveBeenCalledTimes(1));
