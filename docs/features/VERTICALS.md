@@ -71,11 +71,12 @@ multicast shop that never enables `network.av` gets no extra columns on a hot
 table, and disabling the module is a clean table drop.
 
 > **Module relationship.** `network.av` is only meaningful alongside
-> `network.multicast` — an AV flow is a multicast group. There is no
-> module-dependency mechanism in the feature-module system, so this is
-> documentation rather than an enforced constraint: turning off
-> `network.multicast` while leaving `network.av` on leaves the AV surface
-> pointing at groups the operator can no longer browse.
+> `network.multicast` — an AV flow is a multicast group. The feature-module
+> system does have a dependency mechanism (`requires`, #1068), but
+> `network.av` does not declare it, so this is documentation rather than an
+> enforced constraint: turning off `network.multicast` while leaving
+> `network.av` on leaves the AV surface pointing at groups the operator can
+> no longer browse.
 
 ### Reserved ranges are what make the checks real
 
