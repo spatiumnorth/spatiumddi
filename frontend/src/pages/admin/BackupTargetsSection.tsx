@@ -576,9 +576,11 @@ function ArchiveList({
           targetId={targetId}
           filename={restoring}
           onClose={() => setRestoring(null)}
-          onSuccess={() => {
-            setRestoring(null);
+          onSuccess={(warnings) => {
             onAfterChange();
+            // A restore that carries advisories stays open so the operator
+            // reads them (#4333); a clean one closes as before.
+            if (warnings.length === 0) setRestoring(null);
           }}
         />
       )}
@@ -595,7 +597,7 @@ function RestoreFromArchiveModal({
   targetId: string;
   filename: string;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (warnings: string[]) => void;
 }) {
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -629,8 +631,9 @@ function RestoreFromArchiveModal({
         confirmation_phrase: confirm,
         sections: mode === "selective" ? sections : null,
       }),
-    onSuccess,
+    onSuccess: (data) => onSuccess(data.warnings ?? []),
   });
+  const restoreWarnings = restoreMut.data?.warnings ?? [];
 
   // The restore's own refusals (missing member, unsupported format_version,
   // a schema this install cannot place), read from the preview (#3287).
@@ -643,6 +646,7 @@ function RestoreFromArchiveModal({
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
+    !restoreMut.isSuccess &&
     !restoreRefused &&
     (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
@@ -764,13 +768,30 @@ function RestoreFromArchiveModal({
               {restoreMut.data.duration_ms} ms.
             </div>
           )}
+          {restoreWarnings.length > 0 && (
+            <div
+              role="alert"
+              className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
+            >
+              <div className="mb-1 font-medium">
+                Post-restore action required
+              </div>
+              <ul className="ml-4 list-disc space-y-1.5">
+                {restoreWarnings.map((w, i) => (
+                  <li key={i} className="whitespace-pre-wrap">
+                    {w}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="flex items-center justify-end gap-2">
             <button
               type="button"
               onClick={onClose}
               className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
             >
-              Cancel
+              {restoreMut.isSuccess ? "Close" : "Cancel"}
             </button>
             <button
               type="submit"

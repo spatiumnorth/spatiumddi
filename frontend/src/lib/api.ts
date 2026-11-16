@@ -3536,6 +3536,9 @@ export const backupTargetsApi = {
         pre_restore_safety_path: string | null;
         selective?: boolean;
         restored_sections?: string[] | null;
+        /** Post-restore advisories, the same list the file path returns
+         *  (cascade-widened tables, DNSSEC re-publish, ...). */
+        warnings?: string[];
       }>(`/backup/targets/${id}/archives/restore`, body)
       .then((r) => r.data),
 };
