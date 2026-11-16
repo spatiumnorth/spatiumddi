@@ -4708,6 +4708,27 @@ async def upload_branding_logo(
         )
 
     digest = hashlib.sha256(content).hexdigest()
+
+    # #4272 — read what is stored first, so the audit row can name the logo
+    # being replaced, and so re-uploading the stored bytes is a no-op: no
+    # rewrite, no ``modified_at`` bump, no audit row for a change nobody made.
+    previous = (
+        await db.execute(
+            select(BrandingAsset).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
+        )
+    ).scalar_one_or_none()
+    if previous is not None and previous.sha256 == digest:
+        return BrandingLogoInfo(
+            sha256=digest,
+            byte_size=previous.byte_size,
+            media_type=previous.media_type,
+        )
+    old_logo = (
+        {"sha256": previous.sha256, "byte_size": previous.byte_size}
+        if previous is not None
+        else None
+    )
+
     # Upsert rather than read-then-insert: ``kind`` is UNIQUE, so two
     # concurrent uploads would both see no row, both INSERT, and the loser
     # would 500 on uq_branding_asset_kind. ON CONFLICT makes last-write-wins
@@ -4748,6 +4769,7 @@ async def upload_branding_logo(
             resource_id="branding_logo",
             resource_display="Branding logo",
             result="success",
+            old_value=old_logo,
             new_value={"sha256": digest, "byte_size": len(content)},
         )
     )
@@ -4772,6 +4794,7 @@ async def delete_branding_logo(current_user: SuperAdmin, db: DB) -> Response:
         )
     ).scalar_one_or_none()
     if row is not None:
+        removed = {"sha256": row.sha256, "byte_size": row.byte_size}
         await db.delete(row)
         db.add(
             AuditLog(
@@ -4783,6 +4806,7 @@ async def delete_branding_logo(current_user: SuperAdmin, db: DB) -> Response:
                 resource_id="branding_logo",
                 resource_display="Branding logo",
                 result="success",
+                old_value=removed,
             )
         )
         await db.commit()

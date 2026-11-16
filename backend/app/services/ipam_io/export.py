@@ -256,6 +256,17 @@ def _xlsx_number(value: Any) -> Any:
     return value
 
 
+def _cf_cell(value: Any) -> Any:
+    """A custom-field value as a spreadsheet / CSV cell. A list or object (the
+    API stores any JSON) is written as compact JSON text: openpyxl refuses to
+    write one (the XLSX export answered 500) and csv would write a Python repr
+    (#4282). Scalars go through ``_sanitize_cell`` unchanged. The importer reads
+    JSON-looking text back into the same list / object."""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, separators=(",", ":"), default=str)
+    return _sanitize_cell(value)
+
+
 # Public names for the other spreadsheet exporters (the DNS zone records sheet,
 # #2139), so the escape stays one rule rather than a copy per exporter.
 FORMULA_TRIGGERS = _FORMULA_TRIGGERS
@@ -280,7 +291,7 @@ def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
     for row in addresses:
         out = {k: _sanitize_cell(row.get(k)) for k in ADDRESS_COLUMNS}
         for k in cf_keys:
-            out[k] = _sanitize_cell((row.get("custom_fields") or {}).get(k))
+            out[k] = _cf_cell((row.get("custom_fields") or {}).get(k))
         writer.writerow(out)
     return buf.getvalue().encode("utf-8")
 
@@ -311,7 +322,7 @@ def _to_csv(bundle: ExportBundle) -> bytes:
     for row in bundle.subnets:
         out = {k: _sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS}
         for k in cf_keys:
-            out[k] = _sanitize_cell((row.get("custom_fields") or {}).get(k))
+            out[k] = _cf_cell((row.get("custom_fields") or {}).get(k))
         writer.writerow(out)
     return buf.getvalue().encode("utf-8")
 
@@ -351,7 +362,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
     for row in bundle.subnets:
         base = [_xlsx_number(_sanitize_cell(row.get(k))) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
-        ws.append(base + [_sanitize_cell(cf.get(k)) for k in cf_keys])
+        ws.append(base + [_cf_cell(cf.get(k)) for k in cf_keys])
 
     # Blocks sheet
     blocks_ws = wb.create_sheet("blocks")
@@ -385,7 +396,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
         for a in bundle.addresses:
             base = [_sanitize_cell(a.get(k)) for k in ADDRESS_COLUMNS]
             cf = a.get("custom_fields") or {}
-            addr_ws.append(base + [_sanitize_cell(cf.get(k)) for k in addr_cf_keys])
+            addr_ws.append(base + [_cf_cell(cf.get(k)) for k in addr_cf_keys])
 
     buf = io.BytesIO()
     wb.save(buf)

@@ -58,6 +58,22 @@ async def find_parent_zone(
     return candidates[0]
 
 
+def unauthored_parent_reason(parent: DNSZone) -> str | None:
+    """Why ``parent`` cannot take the delegation's NS + glue records, or None (#4258).
+
+    The records are written into the parent, and only a primary zone is one
+    SpatiumDDI serves records from (#3838): a secondary's or stub's data is its
+    masters', so a record written there would be served by nobody.
+    """
+    zone_type = parent.zone_type or "primary"
+    if zone_type == "primary":
+        return None
+    return (
+        f"The parent zone {parent.name.rstrip('.')} is a {zone_type} zone, served from "
+        "its masters: add the delegation on the primary server."
+    )
+
+
 def child_label_in_parent(parent: DNSZone, child: DNSZone) -> str:
     """Return the relative label that names the child inside the parent.
 

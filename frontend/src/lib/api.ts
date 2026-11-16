@@ -6221,7 +6221,11 @@ export interface DelegationPreview {
 }
 
 export type DelegationPreviewResponse =
-  | { has_parent: false }
+  | {
+      has_parent: false;
+      reason?: string | null;
+      parent_zone_name?: string | null;
+    }
   | DelegationPreview;
 
 // Zone-template wizard catalog. Templates carry a parameter manifest

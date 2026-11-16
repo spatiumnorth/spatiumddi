@@ -3,12 +3,14 @@
 import contextlib
 import contextvars
 import hashlib
+import heapq
 import ipaddress
 import itertools
 import re
+import secrets
 import string
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, cast
 
@@ -1853,6 +1855,63 @@ class _NextIPPick(NamedTuple):
     strategy: str
 
 
+# Most candidates the delegate walk looks at before it gives up (#4279). Bounds
+# the work done under the subnet lock when the caller's ranges are huge and
+# nearly all of them are taken or inside a dynamic pool.
+_MAX_DELEGATE_CANDIDATES: int = 1_000_000
+
+
+def _host_bounds(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> tuple[int, int]:
+    """First and last host of ``net``, as ``net.hosts()`` yields them."""
+    first = int(net.network_address)
+    last = int(net.broadcast_address)
+    if net.prefixlen < net.max_prefixlen:
+        first += 1
+        if isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
+            last -= 1
+    return first, last
+
+
+def _delegate_candidates(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    allowed: WritableSetRanges,
+) -> Iterator[int]:
+    """Yield, in ascending order, the hosts of ``net`` the caller's
+    address-set ranges cover (#4279): what ``net.hosts()`` offers, narrowed to
+    ``allowed`` without walking the rest of the subnet."""
+    first, last = _host_bounds(net)
+
+    def spans() -> Iterator[int]:
+        for lo, hi in allowed.intervals:
+            yield from range(max(lo, first), min(hi, last) + 1)
+
+    yield from heapq.merge(spans(), sorted(h for h in allowed.hosts if first <= h <= last))
+
+
+def _random_delegate_candidate(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    allowed: WritableSetRanges,
+) -> int | None:
+    """One uniformly drawn host inside the caller's ranges, or ``None`` when
+    they hold no host of ``net`` (#4279)."""
+    first, last = _host_bounds(net)
+    spans = [
+        (max(lo, first), min(hi, last))
+        for lo, hi in allowed.intervals
+        if max(lo, first) <= min(hi, last)
+    ]
+    spans += [(h, h) for h in allowed.hosts if first <= h <= last]
+    total = sum(hi - lo + 1 for lo, hi in spans)
+    if total == 0:
+        return None
+    pick = secrets.randbelow(total)
+    for lo, hi in spans:
+        if pick <= hi - lo:
+            return lo + pick
+        pick -= hi - lo + 1
+    return None  # pragma: no cover - pick < total always lands in a span
+
+
 async def _pick_next_available_ip(
     db: AsyncSession,
     subnet: Subnet,
@@ -1873,7 +1932,10 @@ async def _pick_next_available_ip(
     pass their resolved ranges here so the picker never hands out an address
     the per-IP gate would then 403 (and reports "no available IP" only when no
     free host inside *their* ranges exists). ``None`` = unconstrained (the
-    subnet-write-holder path).
+    subnet-write-holder path). A constrained pick draws (``random``) or walks
+    (everything else) inside the ranges themselves, not the whole subnet, so a
+    small set in a /64, or one past the subnet's first 65,536 hosts, is found
+    (#4279).
 
     For IPv6 the ``strategy`` argument is honoured but also falls back
     to ``Subnet.ipv6_allocation_policy`` when the caller doesn't know
@@ -1905,6 +1967,50 @@ async def _pick_next_available_ip(
         """#8: when the caller is address-set-delegated, the candidate must
         fall inside their writable ranges. ``None`` = unconstrained."""
         return allowed_ranges is None or allowed_ranges.contains(ip_int)
+
+    # ── Address-set delegate (#4279) ──────────────────────────────────
+    # A caller confined to its sets' ranges draws or walks INSIDE them. The
+    # whole-subnet walks below cap at 65,536 hosts and the v6 random draw
+    # tries 32 addresses of the whole subnet, so a set that is a small part
+    # of a /64 (or sits past the first 65,536 hosts) was answered "none free"
+    # while it held free hosts.
+    if allowed_ranges is not None:
+        is_v6 = isinstance(net, ipaddress.IPv6Network)
+        effective = strategy
+        if (
+            is_v6
+            and effective == "sequential"
+            and subnet.ipv6_allocation_policy in ("random", "eui64")
+        ):
+            effective = subnet.ipv6_allocation_policy
+        if effective == "eui64" and isinstance(net, ipaddress.IPv6Network):
+            candidate = _eui64_from_mac(net, mac_address or "")
+            if candidate is not None and str(candidate) not in used and _allowed(int(candidate)):
+                return _NextIPPick(candidate, "eui64")
+            effective = "random"
+        if not is_v6 and effective != "random":
+            effective = "sequential"
+        make = ipaddress.IPv6Address if is_v6 else ipaddress.IPv4Address
+
+        def _free(ip_int: int) -> bool:
+            return not (
+                str(make(ip_int)) in used
+                or (dynamic_ranges and _ip_int_in_dynamic_pool(ip_int, dynamic_ranges))
+            )
+
+        if effective == "random":
+            for _ in range(32):
+                drawn = _random_delegate_candidate(net, allowed_ranges)
+                if drawn is None:
+                    break
+                if _free(drawn):
+                    return _NextIPPick(make(drawn), "random")
+        for ip_int in itertools.islice(
+            _delegate_candidates(net, allowed_ranges), _MAX_DELEGATE_CANDIDATES
+        ):
+            if _free(ip_int):
+                return _NextIPPick(make(ip_int), effective)
+        return _NextIPPick(None, effective)
 
     # ── IPv6 ──────────────────────────────────────────────────────────
     if isinstance(net, ipaddress.IPv6Network):
@@ -1948,8 +2054,6 @@ async def _pick_next_available_ip(
         # At /64 the birthday collision probability is astronomical;
         # the loop exists to be correct under degenerate cases (tiny v6
         # subnets) rather than because we expect it to iterate.
-        import secrets  # noqa: PLC0415
-
         host_bits = net.max_prefixlen - net.prefixlen
         if host_bits <= 0:
             return _NextIPPick(None, "random")  # /128 — network IS the address
@@ -6218,8 +6322,8 @@ async def plan_block_allocation(
     """Pack requested subnet sizes into the block's free space.
 
     Largest-first heuristic — sorts requests by ascending prefix_len (= largest
-    network first) and best-fits each into the smallest free range that can hold
-    it. Returns the planned allocations plus anything that couldn't fit. This is
+    network first) and places each first-fit by address, in the lowest-addressed
+    free range that can hold it. Returns the planned allocations plus anything that couldn't fit. This is
     a preview only; nothing is written.
     """
     _refuse_container_scan_for_bound_token(current_user)
