@@ -168,6 +168,7 @@ from app.services.dns.delegation import (
     compute_delegation,
     find_parent_zone,
     preview_to_dict,
+    unauthored_parent_reason,
 )
 from app.services.dns.dnssec_trust import (
     NEEDS_ANCHOR_MESSAGE,
@@ -7168,6 +7169,53 @@ async def update_zone(
                     "them first (and purge them from the Trash)."
                 ),
             )
+    # #4257 — #3838 refuses a record written into a zone SpatiumDDI does not
+    # serve as primary, but Edit Zone could still turn a primary zone that holds
+    # records into a secondary / stub / forward one, leaving them stored, listed
+    # and served by nobody. Refused like the rename above, Trash included (a
+    # restore brings the record back).
+    # #4261 — the other direction: a secondary / stub holds none of its data in
+    # SpatiumDDI, and a type change imports nothing, so promoting one that holds
+    # no records makes the agent render it from nothing and serve it empty.
+    new_type = changes.get("zone_type")
+    old_type = zone.zone_type or "primary"
+    if new_type is not None and new_type != old_type:
+        held, trashed = (
+            await db.execute(
+                select(
+                    func.count(),
+                    func.count().filter(DNSRecord.deleted_at.is_not(None)),
+                )
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == zone.id)
+                .execution_options(include_deleted=True)
+            )
+        ).one()
+        if new_type != "primary" and held:
+            in_trash = f", {trashed} of them in the Trash" if trashed else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} holds {held} record(s){in_trash}, and its type "
+                    f"cannot be changed to {new_type} while it does: a {new_type} zone is "
+                    "not one SpatiumDDI serves records from, so they would be stored and "
+                    "listed but served by nobody. Delete them first (and purge them from "
+                    "the Trash), or create the zone under the new type and move the records."
+                ),
+            )
+        if new_type == "primary" and old_type in {"secondary", "stub"} and held == trashed:
+            how = (
+                "Pull them first with Sync with server, then change the type."
+                if old_type == "secondary"
+                else "Add its records first, then change the type."
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This {old_type} zone's records come from its masters and SpatiumDDI "
+                    f"holds none, so as a primary it would be served empty. {how}"
+                ),
+            )
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
@@ -8110,12 +8158,15 @@ class DelegationRecordPreview(BaseModel):
 class DelegationPreviewResponse(BaseModel):
     """What stamping a delegation into the parent zone would change.
 
-    ``has_parent`` false means no managed parent zone exists, so there is
-    nothing to delegate *from* — every other field is absent, and a client
+    ``has_parent`` false means no managed primary parent zone exists, so there
+    is nothing to delegate *from* — every other field is absent, and a client
     must not read that as "nothing to do".
     """
 
     has_parent: bool
+    # #4258 — set with has_parent false when the nearest parent zone exists but
+    # is a secondary / stub: why it cannot take the delegation.
+    reason: str | None = None
     parent_zone_id: uuid.UUID | None = None
     parent_zone_name: str | None = None
     child_zone_id: uuid.UUID | None = None
@@ -9024,6 +9075,16 @@ async def get_delegation_preview(
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
         return DelegationPreviewResponse(has_parent=False)
+    # #4258 — only a primary parent can take the NS + glue records; a secondary
+    # or stub parent is named with the reason, and has_parent stays false.
+    reason = unauthored_parent_reason(parent)
+    if reason is not None:
+        return DelegationPreviewResponse(
+            has_parent=False,
+            parent_zone_id=parent.id,
+            parent_zone_name=parent.name,
+            reason=reason,
+        )
     # The preview reads the parent's records and the apply writes them: a
     # zone-bound token must be bound to the parent as well as the child.
     _enforce_zone_token_scope(current_user, parent.id)
@@ -9061,6 +9122,9 @@ async def apply_delegation(
             detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
         )
     _enforce_zone_token_scope(current_user, parent.id)
+    reason = unauthored_parent_reason(parent)
+    if reason is not None:
+        raise HTTPException(status_code=409, detail=reason)
     parent_id = parent.id
     await lock_zone_rows(db, [child.id, parent_id])
     child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
@@ -9074,6 +9138,9 @@ async def apply_delegation(
         raise HTTPException(
             status_code=409, detail="The zone hierarchy changed during the request; retry"
         )
+    reason = unauthored_parent_reason(parent)
+    if reason is not None:
+        raise HTTPException(status_code=409, detail=reason)
     await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
     pending = preview.ns_records_to_create + preview.glue_records_to_create

@@ -59,7 +59,11 @@ export function DelegationModal({
           </FormError>
         )}
 
-        {data && data.has_parent === false && (
+        {data && data.has_parent === false && data.reason && (
+          <p className="text-xs text-muted-foreground">{data.reason}</p>
+        )}
+
+        {data && data.has_parent === false && !data.reason && (
           <p className="text-xs text-muted-foreground">
             No parent zone for <code className="font-mono">{childDisplay}</code>{" "}
             exists in this server group, so there is nothing to delegate. Create

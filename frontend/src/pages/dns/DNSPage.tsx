@@ -4542,6 +4542,12 @@ export function ZoneDetailView({
     delegationPreview?.has_parent === true &&
     (delegationPreview.ns_records_to_create.length > 0 ||
       delegationPreview.glue_records_to_create.length > 0);
+  // #4258 — the nearest parent is a secondary / stub: it cannot take the NS +
+  // glue records, so the item is shown disabled with the server's reason.
+  const delegateRefusal =
+    delegationPreview?.has_parent === false
+      ? (delegationPreview.reason ?? null)
+      : null;
 
   // "Sync with server" — bi-directional additive sync against the zone's
   // primary authoritative server (any driver that can pull a zone). AXFR imports missing
@@ -5086,6 +5092,18 @@ export function ZoneDetailView({
             badge={showDelegateButton}
             badgeTitle="The parent zone is missing NS / glue records for this zone."
             items={[
+              ...(delegateRefusal
+                ? [
+                    {
+                      key: "delegate",
+                      label: "Delegate",
+                      icon: Workflow,
+                      onSelect: () => {},
+                      disabled: true,
+                      title: delegateRefusal,
+                    },
+                  ]
+                : []),
               ...(showDelegateButton
                 ? [
                     {
