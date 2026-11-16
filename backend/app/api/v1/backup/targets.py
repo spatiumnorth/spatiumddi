@@ -575,6 +575,7 @@ def _require_secrets_with_new_destination(
         supplied,
         destination=keys,
         secrets={name: stored.get(name) for name in secrets},
+        transport=weakened,
     )
 
 

@@ -103,7 +103,13 @@ describe("Edit asks for the stored credential on a weaker transport", () => {
     const c = await openEdit(stored);
     expect(save()).toHaveProperty("disabled", false);
     fireEvent.change(input(c, label), { target: { value } });
-    expect(input(c, "Password").placeholder).toMatch(/re-enter/);
+    expect(input(c, "Password").placeholder).toBe(
+      "re-enter for the changed transport",
+    );
+    expect(
+      screen.getByText(/less protected transport/, { exact: false }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/new address/)).toBeNull();
     expect(save()).toHaveProperty("disabled", true);
     fireEvent.change(input(c, "Password"), { target: { value: "pw" } });
     expect(save()).toHaveProperty("disabled", false);

@@ -69,6 +69,10 @@ const BACKUP_DESTINATION_KEYS = [
   "endpoint_url",
 ];
 
+const TRANSPORT_REASK_HINT =
+  "Re-enter the credential: the connection settings changed to a less protected transport.";
+const TRANSPORT_REASK_PLACEHOLDER = "re-enter for the changed transport";
+
 const cfgText = (
   c: Record<string, unknown> | undefined,
   key: string,
@@ -990,6 +994,18 @@ function TargetFormModal({
         return next;
       }),
   );
+  // Say why the credential is asked for: a transport-only change is not a
+  // new address. Both changed: the shared address text is still true.
+  const transportOnly =
+    mode === "edit" &&
+    transportReask(kind, config, existing?.config) !== "" &&
+    !destKeys.some(
+      (k) => String(config[k] ?? "") !== String(existing?.config?.[k] ?? ""),
+    );
+  const askHint = transportOnly ? TRANSPORT_REASK_HINT : reask.hint;
+  const askPlaceholder = transportOnly
+    ? TRANSPORT_REASK_PLACEHOLDER
+    : reask.placeholder;
   const mustEnter = (name: string) =>
     mode === "edit" &&
     reask.asks(Boolean(existing?.config?.[name])) &&
@@ -1183,7 +1199,7 @@ function TargetFormModal({
                 key={f.name}
                 label={f.label}
                 required={(f.required && !isSecretInEdit) || askAgain}
-                help={askAgain ? reask.hint : f.description}
+                help={askAgain ? askHint : f.description}
               >
                 {f.multiline ? (
                   // A PEM key, a known_hosts file or one header per line:
@@ -1208,7 +1224,7 @@ function TargetFormModal({
                     required={askAgain}
                     placeholder={
                       askAgain
-                        ? reask.placeholder
+                        ? askPlaceholder
                         : isSecretStored
                           ? "(set — leave empty to keep, type to replace)"
                           : undefined

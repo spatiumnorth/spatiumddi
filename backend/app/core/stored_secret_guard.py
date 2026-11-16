@@ -28,6 +28,7 @@ def require_secret_with_destination_change(
     destination: Iterable[str],
     secrets: Mapping[str, Any],
     replaced: Iterable[str] = (),
+    transport: Iterable[str] = (),
 ) -> None:
     """422 when a destination field changes and a stored credential is kept.
 
@@ -42,6 +43,10 @@ def require_secret_with_destination_change(
     ``replaced`` names destinations that are themselves stored encrypted (so
     they cannot be compared with the row): a non-empty value in ``changes``
     counts as a move.
+
+    ``transport`` names destination fields that are settings of how the
+    credential travels (not where it goes); the refusal then says the
+    transport changed rather than the destination.
     """
     moved = [f for f in replaced if changes.get(f)]
     for field in destination:
@@ -55,6 +60,14 @@ def require_secret_with_destination_change(
         return
     for name, stored in secrets.items():
         if _present(stored) and changes.get(name) is None:
+            if moved[0] in set(transport):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{moved[0]} changed to a less protected transport: "
+                        f"re-enter {name} in the same request"
+                    ),
+                )
             raise HTTPException(
                 status_code=422,
                 detail=(

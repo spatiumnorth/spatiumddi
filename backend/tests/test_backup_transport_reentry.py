@@ -74,6 +74,7 @@ async def test_weaker_transport_without_credential_is_refused(
 ):
     t, headers, res = await _patch(client, db_session, kind, stored, edit)
     assert res.status_code == 422, res.text
+    assert "less protected transport" in res.json()["detail"]
     assert "re-enter" in res.json()["detail"]
     await db_session.refresh(t)
     for k in edit:
