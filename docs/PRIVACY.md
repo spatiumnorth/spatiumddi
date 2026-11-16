@@ -249,10 +249,16 @@ SpatiumDDI is built to be delegated without handing over everything:
 * every mutation is written to an append-only, hash-chained audit log
   before the response returns (non-negotiable #4), so administrative
   access is recorded rather than assumed;
-* credentials at rest (provider secrets, agent keys, cloud tokens) are
+* credentials at rest (provider secrets, cloud tokens) are
   Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (or a key
   derived from `SECRET_KEY` when you have not set one) and never
-  returned by the API — endpoints report `*_set: true`, not the value.
+  returned by the API in a normal response — endpoints report
+  `*_set: true`, not the value. A few can be shown on purpose: a
+  superadmin who confirms with a password or TOTP code can reveal the
+  agent bootstrap keys and the SNMP community (every reveal is audited).
+  The agent bootstrap keys are not stored encrypted; they are values in the
+  control plane's environment (`.env`, Helm values, or `/etc/spatiumddi/.env`
+  on the appliance).
 
 ## 8. Keeping this page true
 
