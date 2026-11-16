@@ -115,6 +115,15 @@ class Settings(BaseSettings):
     task_db_command_timeout: float = 120
     task_db_long_command_timeout: float = 900
 
+    # Celery worker child recycling (#4306). A prefork child that grows is
+    # replaced after this many tasks or once its RSS passes the memory cap,
+    # so a slow leak is bounded per child rather than per pod. 0 disables
+    # either one. Memory is in KiB (Celery's unit): 409600 = 400 MiB, well
+    # under the worker's 2Gi pod limit at concurrency 4 (children rest near
+    # 130 MB). Only the worker reads these; beat ignores them.
+    worker_max_tasks_per_child: int = 1000
+    worker_max_memory_per_child_kib: int = 409600
+
     # Redis
     redis_url: str = "redis://redis:6379/0"
     # Redis Sentinel (#272 Phase 3). When ``redis_url`` /

@@ -250,6 +250,10 @@ celery_app.conf.update(
     task_acks_late=True,  # Required for idempotency — task not acked until complete
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
+    # #4306 — replace a prefork child after N tasks / once it passes the
+    # memory cap (KiB). 0 means off, which Celery spells None.
+    worker_max_tasks_per_child=settings.worker_max_tasks_per_child or None,
+    worker_max_memory_per_child=settings.worker_max_memory_per_child_kib or None,
     broker_pool_limit=BROKER_POOL_LIMIT,
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},

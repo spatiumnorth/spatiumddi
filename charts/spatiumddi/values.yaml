@@ -673,6 +673,11 @@ worker:
   # here to replace the default entirely.
   topologySpreadConstraints: []
   concurrency: 4
+  # #4306 — recycle a prefork child after this many tasks, or once its RSS
+  # passes this many KiB (409600 = 400 MiB; keep it well under the memory
+  # limit below, which has to hold ``concurrency`` children). 0 disables.
+  maxTasksPerChild: 1000
+  maxMemoryPerChildKiB: 409600
   # #1111 — ``bundles`` carries the DNS agent bundle renders; give it its
   # own worker (concurrency 1, its own memory cap) on large-record estates.
   queues: "ipam,dns,dhcp,default,bundles"
