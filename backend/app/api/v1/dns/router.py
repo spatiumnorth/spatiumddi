@@ -61,6 +61,7 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
+from app.core.celery_dispatch import dispatch
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
@@ -996,6 +997,9 @@ class ServerResponse(BaseModel):
     agent_version: str | None = None
     last_config_etag: str | None
     pending_approval: bool
+    # #4173 — a delete was requested and the worker is still removing the
+    # server's rows; the UI shows "Removing…" and disables its actions.
+    removing: bool = False
     is_primary: bool
     # Per-server maintenance mode (issue #182).
     maintenance_mode: bool = False
@@ -1105,6 +1109,7 @@ class ServerResponse(BaseModel):
             agent_version=s.agent_version,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
+            removing=s.removing_at is not None,
             is_primary=s.is_primary,
             maintenance_mode=s.maintenance_mode,
             maintenance_started_at=s.maintenance_started_at,
@@ -3145,37 +3150,66 @@ async def update_server(
     return ServerResponse.from_model(server)
 
 
-@router.delete("/groups/{group_id}/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/groups/{group_id}/servers/{server_id}",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=ServerResponse,
+)
 async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
-) -> None:
+) -> ServerResponse:
+    """Start deleting a server; a worker finishes it (#4173).
+
+    The cascade over a server's query log, bundles and record ops used to run
+    inside this request, minutes long on a big install. Now the row is marked
+    ``removing`` (its agent is refused, the UI shows "Removing…"), and the
+    ``dns_server_removal`` task deletes the rest in batches and the row last.
+    Answers 202, not 204; a client that treats any 2xx as success is unaffected.
+    Calling it again on a server already being removed re-enqueues the task,
+    which is the recovery if the first enqueue was lost.
+    """
     server = await _require_server(group_id, server_id, db)
-    # #2276 — deleting the primary elects a successor in the same transaction,
-    # the way the #934 move does. A group left without one used to drop every
-    # later record write before the agent fan-out, behind a 200.
-    successor = None
-    if server.is_primary:
-        successor = await elect_primary(db, server.group_id, exclude_id=server.id)
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="delete",
-            resource_type="dns_server",
-            resource_id=str(server.id),
-            resource_display=server.name,
-            new_value=(
-                {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
-                if successor is not None
-                else None
-            ),
-            result="success",
+    already = server.removing_at is not None
+    if not already:
+        # #2276 — deleting the primary elects a successor in the same
+        # transaction, the way the #934 move does. A group left without one
+        # used to drop every later record write before the agent fan-out,
+        # behind a 200.
+        successor = None
+        if server.is_primary:
+            successor = await elect_primary(db, server.group_id, exclude_id=server.id)
+            # The row outlives this request now; two primaries in a group
+            # 500s the agent long-poll, so it stops being one here.
+            server.is_primary = False
+        server.removing_at = datetime.now(UTC)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_server",
+                resource_id=str(server.id),
+                resource_display=server.name,
+                new_value=(
+                    {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
+                    if successor is not None
+                    else None
+                ),
+                result="success",
+            )
         )
-    )
-    collect_wake(dns_server_channel(server.id), dns_group_channel(server.group_id))
-    await db.delete(server)
-    await db.commit()
+        collect_wake(dns_server_channel(server.id), dns_group_channel(server.group_id))
+        await db.commit()
+        await db.refresh(server)
+    try:
+        from app.tasks.dns_server_removal import remove_dns_server  # noqa: PLC0415
+
+        await dispatch(remove_dns_server, str(server.id))
+    except Exception:
+        # The row stays "removing"; DELETE again re-enqueues (idempotent).
+        logger.exception("dns_server_removal_enqueue_failed", server_id=str(server.id))
+    return ServerResponse.from_model(server)
 
 
 # ── Agent approval (spatiumddi#1121) ────────────────────────────────────────

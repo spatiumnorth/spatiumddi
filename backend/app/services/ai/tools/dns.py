@@ -1583,6 +1583,8 @@ async def find_dns_queries(
     from app.services.logs.agent_logs import (  # noqa: PLC0415
         InvalidLogFilter,
         LogScopeError,
+        include_orphaned_logs,
+        log_row_server_name,
         resolve_dns_log_servers,
         search_dns_queries,
     )
@@ -1617,14 +1619,15 @@ async def find_dns_queries(
             qtype=args.qtype,
             rcode=args.rcode,
             limit=args.limit,
+            include_orphans=include_orphaned_logs(user, **scope),
         )
     except InvalidLogFilter as exc:
         return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat(),
-            "server_id": str(r.server_id),
-            "server_name": names.get(r.server_id),
+            "server_id": str(r.server_id) if r.server_id else None,
+            "server_name": log_row_server_name(r.server_id, r.server_name, names),
             "client_ip": str(r.client_ip) if r.client_ip is not None else None,
             "qname": r.qname,
             "qtype": r.qtype,

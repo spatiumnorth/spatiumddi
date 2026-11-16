@@ -94,7 +94,7 @@ async def test_deleting_the_primary_keeps_record_writes_flowing(
     ns1_id, ns2_id, ns3_id, gid, zid = ns1.id, ns2.id, ns3.id, grp.id, zone.id
 
     resp = await client.delete(f"/api/v1/dns/groups/{gid}/servers/{ns1_id}", headers=_auth(token))
-    assert resp.status_code == 204, resp.text
+    assert resp.status_code == 202, resp.text
 
     # Exactly one primary among the survivors — the oldest.
     assert await _primaries(db_session, gid) == [ns2_id]

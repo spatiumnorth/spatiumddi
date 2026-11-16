@@ -6,7 +6,7 @@ import uuid
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
@@ -20,7 +20,7 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(require_resource_permission("custom_field"))])
 
 _VALID_RESOURCE_TYPES = {"ip_space", "ip_block", "subnet", "ip_address"}
-_VALID_FIELD_TYPES = {"text", "number", "boolean", "select", "url", "email"}
+_VALID_FIELD_TYPES = {"text", "number", "boolean", "date", "select", "multi_select", "url", "email"}
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -85,6 +85,13 @@ class CustomFieldCreate(BaseModel):
         if v not in _VALID_FIELD_TYPES:
             raise ValueError(f"field_type must be one of: {', '.join(sorted(_VALID_FIELD_TYPES))}")
         return v
+
+    @model_validator(mode="after")
+    def validate_options(self) -> CustomFieldCreate:
+        # A multi_select with no options could never hold a value (#4288).
+        if self.field_type == "multi_select" and not [o for o in (self.options or []) if o.strip()]:
+            raise ValueError("options must list at least one choice for a multi_select field")
+        return self
 
     @field_validator("name")
     @classmethod
@@ -244,6 +251,16 @@ async def update_custom_field(
     field = await db.get(CustomFieldDefinition, field_id)
     if field is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom field not found")
+
+    if (
+        field.field_type == "multi_select"
+        and "options" in body.model_fields_set
+        and not [o for o in (body.options or []) if o.strip()]
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="options must list at least one choice for a multi_select field",
+        )
 
     old_value = _snapshot(field)
     # #1563 — explicit null clears default_value / options; null for a
