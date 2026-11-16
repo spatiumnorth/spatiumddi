@@ -117,7 +117,7 @@ const cases: Array<
     "Logs DHCP Audit",
     () => <DhcpAuditTab sources={[]} />,
     () => {},
-    /DHCP audit logs require a Windows DHCP server/,
+    /DHCP Audit reads the audit logs of Windows DHCP servers/,
     "Register one under DHCP",
   ],
   [

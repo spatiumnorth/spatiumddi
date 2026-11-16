@@ -1,4 +1,5 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useSharedSessionSet } from "./zoneTreeState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -1251,7 +1252,10 @@ function GroupModalForm({
     queryKey: ["settings"],
     queryFn: () => settingsApi.get(),
     enabled: !group,
-    staleTime: 30_000,
+    // Re-read on open: the starting value is derived from this, so a default
+    // another client changed is shown as it is now (#4309).
+    staleTime: 0,
+    refetchOnMount: "always",
     retry: false,
   });
   const [pickedRecursive, setPickedRecursive] = useState<boolean | null>(
@@ -1323,7 +1327,11 @@ function GroupModalForm({
             name,
             description,
             group_type: groupType,
-            is_recursive: isRecursive,
+            // An untouched new group leaves it out and the server fills it
+            // from Settings as stored now (#4309).
+            ...(group || pickedRecursive !== null || !dnsDefaults
+              ? { is_recursive: isRecursive }
+              : {}),
             catalog_zones_enabled: catalogZonesEnabled,
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
@@ -2997,7 +3005,9 @@ function ZoneModalForm({
     queryKey: ["settings"],
     queryFn: () => settingsApi.get(),
     enabled: !zone,
-    staleTime: 30_000,
+    // Re-read on open; Type and TTL derive from it until picked (#4309).
+    staleTime: 0,
+    refetchOnMount: "always",
     retry: false,
   });
   const [pickedZoneType, setPickedZoneType] = useState<string | null>(
@@ -3165,7 +3175,6 @@ function ZoneModalForm({
       view_id: viewId || null,
       primary_ns: primaryNs,
       admin_email: adminEmail,
-      ttl: zoneTtl,
       color,
       domain_id: domainId,
       customer_id: customerId,
@@ -3175,6 +3184,13 @@ function ZoneModalForm({
     // stale flag (unsigning a zone signed since), and for a non-superadmin
     // any change to it is refused (#1861).
     if (!zone) payload.dnssec_enabled = dnssec;
+    // A new zone whose TTL the operator left alone sends none, and the server
+    // takes it from Settings as stored now (#4309); the agentless Technitium
+    // driver's fixed stock TTL is sent.
+    // When Settings could not be read the dialog shows the built-in value,
+    // so that is what is sent.
+    if (zone || pickedTtl !== null || technitiumApi || !dnsDefaults)
+      payload.ttl = zoneTtl;
     if (zoneType === "forward") {
       const fwds = forwardersText
         .split(/[,\s]+/)
@@ -3703,6 +3719,8 @@ function RecordModalForm({
         : dnsApi.createRecord(groupId, zoneId, d),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-records", zoneId] });
+      // An apex NS change alters what Delegate would create (#4310).
+      qc.invalidateQueries({ queryKey: ["dns-delegation-preview"] });
       onClose();
     },
     onError: (e: ApiError) => setError(formatApiError(e)),
@@ -6895,8 +6913,13 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
       {confirmDeleteServer && (
         <ConfirmDestroyModal
           title="Delete DNS Server"
-          description={`Remove "${confirmDeleteServer.name}" (${confirmDeleteServer.host}:${confirmDeleteServer.port}) from this group? Its query log and RPZ history is kept; the rest is removed in the background.`}
-          checkLabel="I understand this server will be removed from SpatiumDDI management."
+          description={
+            <>
+              {`Remove "${confirmDeleteServer.name}" (${confirmDeleteServer.host}:${confirmDeleteServer.port}) from this group? Its query log and RPZ history is kept; the rest is removed in the background.`}
+              <ServerDeleteAgentNote />
+            </>
+          }
+          checkLabel="I understand this deletes the server row, and a running agent will register it again."
           onConfirm={() => del.mutate(confirmDeleteServer)}
           onClose={() => setConfirmDeleteServer(null)}
           isPending={del.isPending}

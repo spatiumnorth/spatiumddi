@@ -136,6 +136,10 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # SQLAlchemy 2.1 needs a port (typing of row unpacking, a soft-delete
+      # query), tracked separately; 2.0.x patches still come through.
+      - dependency-name: "sqlalchemy"
+        versions: [">=2.1"]
 
   # Python — the three standalone agents (no lock file yet; see #3693 follow-up).
   - package-ecosystem: "pip"

@@ -669,11 +669,15 @@ export function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
       <div className="flex flex-1 items-center justify-center p-10">
         <div className="max-w-md rounded-lg border border-dashed p-10 text-center">
           <FileClock className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-          <p className="text-sm font-medium">No DHCP servers configured</p>
+          <p className="text-sm font-medium">
+            No Windows DHCP servers configured
+          </p>
           <p className="mt-2 text-xs text-muted-foreground">
-            DHCP audit logs require a Windows DHCP server with WinRM
-            credentials.
-            {isSuperadmin && " Register one under DHCP → Server Groups first."}
+            DHCP Audit reads the audit logs of Windows DHCP servers that have
+            WinRM credentials.
+            {isSuperadmin &&
+              " Register one under DHCP → Server Groups first."}{" "}
+            Kea servers&apos; lease events are on the DHCP Activity tab.
           </p>
         </div>
       </div>
