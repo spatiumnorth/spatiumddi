@@ -203,7 +203,7 @@ their work faster, not to teach them what DDI is.
 * **Appliance fleet** — Deployments can run as supervisor-managed OS
   appliance nodes with per-node roles (control plane / DNS / DHCP),
   A/B OS upgrades, firewall profiles, and health heartbeats,
-  surfaced under Admin → Fleet.
+  surfaced under Appliance → Fleet.
 * **Vertical registries** — Optional modules for AV-over-IP multicast
   flows (Dante / AES67 / SMPTE 2110), BACnet/IP devices + BBMDs,
   industrial-OT devices with Purdue zoning, and DICOM AE titles +
