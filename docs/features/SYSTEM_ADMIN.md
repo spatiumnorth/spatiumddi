@@ -807,7 +807,7 @@ The restore endpoint is superadmin-only. Operators must type the literal phrase 
 
 Selecting "Selective restore" on the modal reveals a section checklist driven by `GET /backup/sections`. The checklist auto-ticks every non-volatile selectable section the first time the operator flips into selective mode; volatile sections (DHCP leases, DNS query log, DHCP activity log, nmap scan history, metric samples, Celery scratch) stay unticked by default but can be ticked individually. `platform_internal` is forced-on (alembic_version + oui_vendor are install-state, not user data, so they always ride along).
 
-The UI surfaces a TRUNCATE-CASCADE warning on the selective panel because the restore necessarily reaches past the ticked sections: rows in *non-selected* sections that reference wiped data via foreign key are cascade-truncated, and since #781 are **restored from the archive** rather than left empty. The restore response reports the widened set as `cascade_widened_tables`.
+The UI surfaces a TRUNCATE-CASCADE warning on the selective panel because the restore necessarily reaches past the ticked sections: rows in *non-selected* sections that reference wiped data via foreign key are cascade-truncated, and since #781 are **restored from the archive** rather than left empty. The restore response reports the widened set as `cascade_widened_tables`. The picker names that set **before** the restore runs: each entry of `GET /backup/sections` carries `also_restores` (other sections' tables the section's restore also replaces), computed from the same `cascade_closure` the restore uses, and the panel unions it over the ticked sections (#4333).
 
 #### Cross-install rewrap counters
 

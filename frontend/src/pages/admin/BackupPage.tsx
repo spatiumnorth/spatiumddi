@@ -364,7 +364,9 @@ function RestoreBackupCard() {
             {mode === "selective" ? (
               <>
                 Only the sections you tick below are replaced with what&rsquo;s
-                in the archive; the rest of the install is left as it is.
+                in the archive, along with every table in other sections that
+                references them (listed under the section picker); everything
+                else is left as it is.
               </>
             ) : (
               <>

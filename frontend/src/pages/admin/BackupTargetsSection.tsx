@@ -681,9 +681,9 @@ function RestoreFromArchiveModal({
             <>
               <strong>Selective restore.</strong> The selected sections will be
               wiped + re-loaded from{" "}
-              <code className="font-mono">{filename}</code>. The rest of the
-              install is left untouched (with the FK-cascade caveat in the
-              section picker below).
+              <code className="font-mono">{filename}</code>. Tables in other
+              sections that reference them are replaced from the archive too
+              (listed in the section picker below); nothing else is touched.
             </>
           )}
         </div>
