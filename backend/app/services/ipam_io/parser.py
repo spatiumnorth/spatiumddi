@@ -23,7 +23,11 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.services.csv_text import CSVReadError, read_csv_table
-from app.services.ipam_io.export import ADDRESS_COMPUTED_COLUMNS, SUBNET_COMPUTED_COLUMNS
+from app.services.ipam_io.export import (
+    ADDRESS_COMPUTED_COLUMNS,
+    SUBNET_COMPUTED_COLUMNS,
+    unescape_cell,
+)
 
 
 @dataclass
@@ -88,7 +92,7 @@ def _row_to_subnet(row: dict[str, Any], skipped: set[str] | None = None) -> dict
     for raw_key, value in row.items():
         if raw_key is None:
             continue
-        key = raw_key.strip()
+        key = unescape_cell(raw_key.strip())
         if not key:
             continue
         norm = key.lower()
@@ -158,7 +162,7 @@ def _row_to_address(row: dict[str, Any], skipped: set[str] | None = None) -> dic
     for raw_key, value in row.items():
         if raw_key is None:
             continue
-        key = raw_key.strip()
+        key = unescape_cell(raw_key.strip())
         if not key:
             continue
         norm = key.lower().replace(" ", "_")
