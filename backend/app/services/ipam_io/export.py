@@ -41,6 +41,12 @@ SUBNET_COLUMNS = [
     "utilization_percent",
 ]
 
+# Columns the exporter writes that are derived, not settable: the importer
+# skips them instead of storing them as custom fields (#4289). Kept beside
+# the column lists above so a new computed column is declared once.
+SUBNET_COMPUTED_COLUMNS = frozenset({"total_ips", "allocated_ips", "utilization_percent"})
+ADDRESS_COMPUTED_COLUMNS = frozenset({"last_seen_at"})
+
 # Column order used by the address CSV / XLSX. Matches the field names the
 # subnet-scoped importer recognises so a subnet export with
 # ``include_addresses=true`` round-trips cleanly back through

@@ -23,6 +23,7 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.services.csv_text import CSVReadError, read_csv_table
+from app.services.ipam_io.export import ADDRESS_COMPUTED_COLUMNS, SUBNET_COMPUTED_COLUMNS
 
 
 @dataclass
@@ -33,6 +34,8 @@ class ParsedPayload:
     blocks: list[dict[str, Any]] = field(default_factory=list)
     subnets: list[dict[str, Any]] = field(default_factory=list)
     addresses: list[dict[str, Any]] = field(default_factory=list)
+    # Exporter-computed columns seen and ignored (#4289), for a preview note.
+    skipped_columns: set[str] = field(default_factory=set)
 
 
 _KNOWN_SUBNET_COLUMNS = {
@@ -75,8 +78,11 @@ def _coerce_int(v: Any) -> int | None:
         return None
 
 
-def _row_to_subnet(row: dict[str, Any]) -> dict[str, Any]:
-    """Coerce a generic row dict into a subnet dict with custom_fields."""
+def _row_to_subnet(row: dict[str, Any], skipped: set[str] | None = None) -> dict[str, Any]:
+    """Coerce a generic row dict into a subnet dict with custom_fields.
+
+    Columns in ``SUBNET_COMPUTED_COLUMNS`` are dropped (recorded in
+    ``skipped``), not stored as custom fields (#4289)."""
     out: dict[str, Any] = {}
     custom: dict[str, Any] = {}
     for raw_key, value in row.items():
@@ -88,8 +94,14 @@ def _row_to_subnet(row: dict[str, Any]) -> dict[str, Any]:
         norm = key.lower()
         if value == "":
             value = None
-        if norm in _KNOWN_SUBNET_COLUMNS:
+        if _norm_header(key) in SUBNET_COMPUTED_COLUMNS:
+            if skipped is not None:
+                skipped.add(_norm_header(key))
+        elif norm in _KNOWN_SUBNET_COLUMNS:
             out[norm] = value
+        elif norm in ("custom_fields", "customfields") and isinstance(value, dict):
+            # Pass-through from our JSON exporter, as for addresses.
+            custom.update(value)
         elif norm in {"vlan", "vlan id"}:
             out["vlan_id"] = value
         elif norm in {"vxlan", "vxlan id"}:
@@ -129,7 +141,7 @@ def _row_has_address(row: dict[str, Any]) -> bool:
     return False
 
 
-def _row_to_address(row: dict[str, Any]) -> dict[str, Any]:
+def _row_to_address(row: dict[str, Any], skipped: set[str] | None = None) -> dict[str, Any]:
     """Coerce a generic row dict into an IPAddress dict with custom_fields.
 
     Recognises ``address`` / ``ip`` / ``ip_address`` as the canonical
@@ -138,7 +150,8 @@ def _row_to_address(row: dict[str, Any]) -> dict[str, Any]:
     and preserved verbatim on pass-through exports from our own
     exporter. Unrecognised columns become ``custom_fields`` entries —
     same pattern as the subnet coercer — so a CSV like
-    ``address,hostname,department,cost_center`` Just Works.
+    ``address,hostname,department,cost_center`` Just Works. Columns in
+    ``ADDRESS_COMPUTED_COLUMNS`` are dropped, not stored (#4289).
     """
     out: dict[str, Any] = {}
     custom: dict[str, Any] = {}
@@ -151,7 +164,10 @@ def _row_to_address(row: dict[str, Any]) -> dict[str, Any]:
         norm = key.lower().replace(" ", "_")
         if value == "":
             value = None
-        if norm in ("ip", "ip_address"):
+        if norm in ADDRESS_COMPUTED_COLUMNS:
+            if skipped is not None:
+                skipped.add(norm)
+        elif norm in ("ip", "ip_address"):
             out["address"] = value
         elif norm == "mac":
             out["mac_address"] = value
@@ -203,11 +219,11 @@ def parse_csv(data: bytes) -> ParsedPayload:
         if is_addresses:
             if not _row_has_address(row):
                 continue
-            payload.addresses.append(_row_to_address(row))
+            payload.addresses.append(_row_to_address(row, payload.skipped_columns))
         else:
             if not row.get("network") and not row.get("Network"):
                 continue
-            payload.subnets.append(_row_to_subnet(row))
+            payload.subnets.append(_row_to_subnet(row, payload.skipped_columns))
     return payload
 
 
@@ -232,9 +248,9 @@ def parse_json(data: bytes) -> ParsedPayload:
             if not isinstance(item, dict):
                 continue
             if is_addresses:
-                payload.addresses.append(_row_to_address(item))
+                payload.addresses.append(_row_to_address(item, payload.skipped_columns))
             else:
-                payload.subnets.append(_row_to_subnet(item))
+                payload.subnets.append(_row_to_subnet(item, payload.skipped_columns))
         return payload
 
     if isinstance(decoded, dict):
@@ -246,9 +262,9 @@ def parse_json(data: bytes) -> ParsedPayload:
                 if not isinstance(item, dict):
                     continue
                 if key == "subnets":
-                    payload.subnets.append(_row_to_subnet(item))
+                    payload.subnets.append(_row_to_subnet(item, payload.skipped_columns))
                 elif key == "addresses":
-                    payload.addresses.append(_row_to_address(item))
+                    payload.addresses.append(_row_to_address(item, payload.skipped_columns))
                 else:
                     getattr(payload, key).append(dict(item))
         return payload
@@ -328,7 +344,7 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
         for row in _sheet_rows("subnets"):
             if not row.get("network") and not row.get("Network"):
                 continue
-            payload.subnets.append(_row_to_subnet(row))
+            payload.subnets.append(_row_to_subnet(row, payload.skipped_columns))
     elif "addresses" not in wb.sheetnames and wb.sheetnames:
         # Single-sheet workbook with neither well-known name — sniff the
         # first row's headers to decide whether it's subnets or addresses.
@@ -344,17 +360,17 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
             if is_addresses:
                 if not _row_has_address(row):
                     continue
-                payload.addresses.append(_row_to_address(row))
+                payload.addresses.append(_row_to_address(row, payload.skipped_columns))
             else:
                 if not row.get("network") and not row.get("Network"):
                     continue
-                payload.subnets.append(_row_to_subnet(row))
+                payload.subnets.append(_row_to_subnet(row, payload.skipped_columns))
 
     if "addresses" in wb.sheetnames:
         for row in _sheet_rows("addresses"):
             if not _row_has_address(row):
                 continue
-            payload.addresses.append(_row_to_address(row))
+            payload.addresses.append(_row_to_address(row, payload.skipped_columns))
 
     for key in ("spaces", "blocks"):
         for row in _sheet_rows(key):

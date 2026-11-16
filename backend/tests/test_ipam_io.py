@@ -490,6 +490,92 @@ async def test_export_csv_include_addresses_follows_the_box_not_the_data(
     assert json.loads(as_json)["subnets"][0]["name"] == "lab"
 
 
+# ── Computed export columns are not custom fields (#4289) ──────────────────────
+
+
+async def _seed_roundtrip_tree(db: AsyncSession, name: str) -> IPSpace:
+    space = await _seed_space(db, name)
+    block = IPBlock(space_id=space.id, network="10.0.0.0/8", name="b")
+    db.add(block)
+    await db.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.7.1.0/24",
+        name="n",
+        total_ips=254,
+        allocated_ips=1,
+        custom_fields={"owner": "netops"},
+    )
+    db.add(subnet)
+    await db.flush()
+    db.add(
+        IPAddress(
+            subnet_id=subnet.id,
+            address="10.7.1.5",
+            status="allocated",
+            hostname="h",
+            custom_fields={"rack": "r1"},
+        )
+    )
+    await db.flush()
+    return space
+
+
+_COMPUTED = {"total_ips", "allocated_ips", "utilization_percent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["csv", "xlsx", "json"])
+async def test_reimport_skips_computed_columns(db_session: AsyncSession, fmt: str) -> None:
+    space = await _seed_roundtrip_tree(db_session, f"Computed-{fmt}")
+    data, _, _ = await export_subtree(db_session, space_id=space.id, format=fmt)
+    parsed = parse_payload(data, f"rt.{fmt}", None)
+    assert parsed.subnets
+    for row in parsed.subnets:
+        cf = row.get("custom_fields") or {}
+        assert not _COMPUTED & set(cf)
+        assert not _COMPUTED & set(row)
+    assert cf.get("owner") == "netops"
+    assert _COMPUTED <= parsed.skipped_columns
+    preview = await preview_import(db_session, parsed, space_id=space.id, strategy="skip")
+    assert _COMPUTED <= set(preview.skipped_columns)
+    assert preview.as_dict()["skipped_columns"] == sorted(preview.skipped_columns)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["csv", "xlsx"])
+async def test_reimport_skips_computed_address_columns(db_session: AsyncSession, fmt: str) -> None:
+    space = await _seed_roundtrip_tree(db_session, f"ComputedAddr-{fmt}")
+    data, _, _ = await export_subtree(
+        db_session, space_id=space.id, format=fmt, include_addresses=True
+    )
+    if fmt == "csv":
+        # The address table is its own CSV (same shape the address import reads).
+        from app.services.ipam_io.export import ADDRESS_COLUMNS
+
+        buf = io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(ADDRESS_COLUMNS + ["rack"])
+        w.writerow(["10.7.1.0/24", "10.7.1.5", "allocated", "h", "", "", "", "2026-01-01", "r1"])
+        parsed = parse_payload(buf.getvalue().encode(), "a.csv", "text/csv")
+    else:
+        parsed = parse_payload(data, "rt.xlsx", None)
+    assert parsed.addresses
+    for row in parsed.addresses:
+        assert "last_seen_at" not in (row.get("custom_fields") or {})
+        assert "last_seen_at" not in row
+    assert (parsed.addresses[0].get("custom_fields") or {}).get("rack") == "r1"
+    assert "last_seen_at" in parsed.skipped_columns
+
+
+def test_unknown_column_still_a_custom_field() -> None:
+    parsed = parse_payload(
+        b"network,name,total_ips,cost_center\n10.9.0.0/24,x,254,cc1\n", "x.csv", "text/csv"
+    )
+    assert parsed.subnets[0]["custom_fields"] == {"cost_center": "cc1"}
+
+
 # ── List / object custom fields (#4282) ───────────────────────────────────────
 
 
