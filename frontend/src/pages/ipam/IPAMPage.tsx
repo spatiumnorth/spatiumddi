@@ -1264,7 +1264,11 @@ function DnsSettingsSection({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     enabled: dnsOn && canReadGroups,
-    staleTime: 60_000,
+    // Re-read on open: the dialog's row is read fresh, and a group or zone
+    // another client made since a cached list was taken would be missing
+    // from the options, so the select showed None (#4311).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   // Fetch effective inherited DNS from parent block (if provided)
@@ -1299,7 +1303,8 @@ function DnsSettingsSection({
     queries: (activeGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
-      staleTime: 60_000,
+      staleTime: 0,
+      refetchOnMount: "always" as const,
       // Needs its own gate, unlike the dashboard's: these ids come from
       // the inherited block/space settings, not from the dns-groups query
       // that the module gate empties.
@@ -1545,7 +1550,8 @@ function DhcpSettingsSection({
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
-    staleTime: 60_000,
+    staleTime: 0,
+    refetchOnMount: "always",
     enabled: dhcpOn && canReadGroups,
   });
 
@@ -2954,6 +2960,10 @@ export function CreateSubnetModal({
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "subnet"],
     queryFn: () => customFieldsApi.list("subnet"),
+    // Defaults are pre-filled and sent: re-read them on open, so a default
+    // another client changed is not sent as it was (#4308).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
@@ -3798,6 +3808,10 @@ export function AddAddressModal({
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
     queryFn: () => customFieldsApi.list("ip_address"),
+    // Defaults are pre-filled and sent: re-read them on open, so a default
+    // another client changed is not sent as it was (#4308).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
@@ -13365,6 +13379,10 @@ export function CreateBlockModal({
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
     queryFn: () => customFieldsApi.list("ip_block"),
+    // Defaults are pre-filled and sent: re-read them on open, so a default
+    // another client changed is not sent as it was (#4308).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
@@ -13379,10 +13397,17 @@ export function CreateBlockModal({
   });
   const cfInherited = parentFields?.custom_fields ?? {};
 
-  const { data: blockTemplates } = useQuery({
-    queryKey: ["ipam-templates", "block"],
-    queryFn: () => ipamApi.listTemplates({ applies_to: "block" }),
-  });
+  // Re-read on open, and hold the picker until it answers: applying a
+  // template copies its DHCP group and tags into the form, and another client
+  // may have changed it since a cached list was taken (#4308, as #4029).
+  const { data: blockTemplates, isFetching: blockTemplatesFetching } = useQuery(
+    {
+      queryKey: ["ipam-templates", "block"],
+      queryFn: () => ipamApi.listTemplates({ applies_to: "block" }),
+      staleTime: 0,
+      refetchOnMount: "always",
+    },
+  );
 
   // #1304 — as in New Subnet. This dialog has no DDNS fields and sends
   // none, so the API applies a block template's DDNS itself.
@@ -13505,6 +13530,7 @@ export function CreateBlockModal({
               <select
                 className={inputCls}
                 value={templateId}
+                disabled={blockTemplatesFetching}
                 onChange={(e) => applyTemplate(e.target.value)}
               >
                 <option value="">— none —</option>
