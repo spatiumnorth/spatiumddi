@@ -81,6 +81,7 @@ import { ZoneSpreadsheetImportModal } from "./ZoneSpreadsheetImportModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
+import { cascadeList } from "@/lib/delete-cascade";
 import { ConfirmDestroyModal } from "./ConfirmDestroyModal";
 import { DeleteZoneDialog, BulkDeleteZonesDialog } from "./ZoneDeleteDialogs";
 import { DriftView } from "./DriftView";
@@ -720,7 +721,7 @@ export function DeleteDNSGroupModal({
             Group "{group.name}" still holds {held}, so it cannot be deleted.
             First move or delete {servers + zones === 1 ? "it" : "them"}.
             {zones > 0 &&
-              " A deleted zone goes to Trash; deleting the group then deletes its zones in Trash for good, with their records."}
+              ` A deleted zone goes to Trash; deleting the group then deletes its zones in Trash for good, with their ${cascadeList("dns_zone")}.`}
           </p>
           <div className="flex justify-end">
             <button
@@ -759,8 +760,8 @@ export function DeleteDNSGroupModal({
   return (
     <ConfirmDestroyModal
       title={title}
-      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records and pools, and can no longer be restored.${config} Its server options go too. None of this can be restored.`}
-      checkLabel={`I understand the group "${group.name}", its zones in Trash and its views, ACLs, TSIG keys and options will be deleted for good.`}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their ${cascadeList("dns_zone")}, and can no longer be restored. An external ACME client that uses one of those accounts has to register again.${config} Its server options go too. None of this can be restored.`}
+      checkLabel={`I understand the group "${group.name}", its zones in Trash (with their ${cascadeList("dns_zone")}) and its views, ACLs, TSIG keys and options will be deleted for good.`}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
