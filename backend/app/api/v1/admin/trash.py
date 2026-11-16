@@ -813,8 +813,17 @@ async def restore_row(
     # task: a restore is rare and operator-driven, and the zone must not answer
     # a name IPAM gave up for even a moment (nor for good if the broker is down
     # and the opt-in auto-sync is off). The task is the retry if this fails.
-    if restored_zone_ids:
+    # #4227 — the same for the subnets a restore brought back (a subnet, or a
+    # block / space holding some): the zone restore before it left their
+    # records with the subnet's batch, and they come back as the Trash held
+    # them. One pass over zone + subnets, so the order of the two restores
+    # does not matter.
+    reconcile_subnet_ids = {o.id for o in restored if isinstance(o, Subnet)}
+    if restored_zone_ids or reconcile_subnet_ids:
+        from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            reconcile_restored_subnet_records,
+            reconcile_restored_subnet_records_task,
             reconcile_restored_zone_records,
             reconcile_restored_zone_records_task,
         )
@@ -822,22 +831,37 @@ async def restore_row(
         # The restore's UPDATE left the identity map holding the rows as they
         # were read; the planner must read them as they are now.
         db.expunge_all()
-        try:
-            _changed, reconcile_wake = await reconcile_restored_zone_records(
-                db, list(restored_zone_ids)
-            )
-            restore_wake_groups |= set(reconcile_wake)
-        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
-            await db.rollback()
-            logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
-            from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
-
+        if restored_zone_ids:
             try:
-                await _dispatch(
-                    reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                _changed, reconcile_wake = await reconcile_restored_zone_records(
+                    db, list(restored_zone_ids)
                 )
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+                restore_wake_groups |= set(reconcile_wake)
+            except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+                await db.rollback()
+                logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
+                try:
+                    await _dispatch(
+                        reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+        if reconcile_subnet_ids:
+            try:
+                _changed, reconcile_wake = await reconcile_restored_subnet_records(
+                    db, list(reconcile_subnet_ids)
+                )
+                restore_wake_groups |= set(reconcile_wake)
+            except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+                await db.rollback()
+                logger.warning("trash.restore_subnet_reconcile_failed", error=str(exc))
+                try:
+                    await _dispatch(
+                        reconcile_restored_subnet_records_task,
+                        [str(i) for i in reconcile_subnet_ids],
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("trash.restore_subnet_reconcile_enqueue_failed", error=str(exc2))
     if republish_subnet_ids:
         from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
