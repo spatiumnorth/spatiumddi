@@ -105,7 +105,7 @@ DICOMAESource = Literal["manual", "import", "echo"]
 ImportAction = Literal["create", "update", "skip", "error"]
 
 # Raw-input ceiling for ``ae_title`` before validation. Generous: the
-# real rule is 16 bytes *after* trimming padding, enforced by
+# real rule is 16 characters *after* trimming padding, enforced by
 # ``validate_ae_title``. This only stops an unbounded string from
 # reaching it, and is loose enough that a title made entirely of legal
 # pad space still gets the specific "empty or all spaces" message rather

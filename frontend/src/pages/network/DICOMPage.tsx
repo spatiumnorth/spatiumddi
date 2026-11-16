@@ -1139,10 +1139,15 @@ function AEModal({
       setError(formatApiError(e, "Failed to save application entity")),
   });
 
-  // The AE value representation is capped at 16 *bytes*, and a non-ASCII
-  // character costs more than one — so measure bytes, like the server.
-  const titleBytes = new TextEncoder().encode(aeTitle.trim()).length;
-  const titleValid = titleBytes >= 1 && titleBytes <= 16;
+  // The AE value representation is 1-16 printable ASCII characters
+  // (0x20-0x7E) excluding backslash; only ASCII space is padding. Mirrors
+  // app.services.dicom.titles.validate_ae_title, which is authoritative.
+  const trimmedTitle = aeTitle.replace(/^ +| +$/g, "");
+  const titleLength = trimmedTitle.length;
+  const titleValid =
+    titleLength >= 1 &&
+    titleLength <= 16 &&
+    /^[\x20-\x5b\x5d-\x7e]+$/.test(trimmedTitle);
   const parsedPort = /^\d+$/.test(port.trim()) ? Number(port.trim()) : null;
   const portValid =
     port.trim() === "" ||
@@ -1175,9 +1180,10 @@ function AEModal({
             required
           />
           <p className="text-[11px] text-muted-foreground">
-            Unique across the whole institution. Up to 16 bytes ({titleBytes}{" "}
-            used); spaces are legal padding, backslash and control characters
-            are not. Case is significant — peers match the title exactly.
+            Unique across the whole institution. Up to 16 printable ASCII
+            characters ({titleLength} used); spaces are legal padding,
+            backslash, control characters and non-ASCII characters are not. Case
+            is significant — peers match the title exactly.
           </p>
         </Field>
 
