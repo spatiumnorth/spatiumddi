@@ -365,10 +365,14 @@ jobs:
   #               (BIND and Kea compile from source; under QEMU that is hours).
   #               Pushed by digest only, no tag. The leg then pulls its own
   #               digest, runs Trivy + trivy-gate.sh on it and, for amd64, Red
-  #               Hat's ``preflight check container`` (check only: a
-  #               submission needs a Partner Connect token and is not CI's).
+  #               Hat's ``preflight check container`` (check only; the
+  #               submission is the separate submit-ubi-preflight job).
   #   images-ubi  once EVERY leg of an image passed, joins its two digests into
   #               one multi-arch ``:<version>-ubi``. Nothing is rebuilt.
+  #   submit-ubi-preflight
+  #               after images-ubi, submits preflight results for the PUBLISHED
+  #               ``:<version>-ubi`` (each arch) to Red Hat's certification
+  #               components when ``PYXIS_API_TOKEN`` is set. Non-gating.
   #   promote-latest-ubi
   #               ``:latest-ubi`` moves last, after the GitHub release exists,
   #               all four or none, like ``:latest``.
@@ -515,6 +519,57 @@ jobs:
             tag "${IMAGE_PREFIX}/${img}:${VERSION}-ubi" \
               "${IMAGE_PREFIX}/${img}@${amd64}" "${IMAGE_PREFIX}/${img}@${arm64}"
           done
+
+  # ── Submit preflight results to Red Hat (#3913) ────────────────────────────
+  # After images-ubi has published the multi-arch ``:<version>-ubi``, submit
+  # `preflight check container` results for each image and architecture to its
+  # Partner Connect certification component (``rh_component_id`` in
+  # images-ubi.json). It checks the PUBLISHED ghcr.io reference, never the
+  # localhost registry build-ubi uses: Red Hat records the repository path from
+  # what preflight checks. preflight runs on x86-64 and reaches the arm64 image
+  # with ``--platform arm64``.
+  #
+  # Non-gating by design. Nothing ``needs:`` this job (promote-latest-ubi and
+  # release do not), the submit step is continue-on-error and a failure only
+  # raises a ::warning:: naming the image and architecture: the images are
+  # already published, and a Red Hat API outage must not hold a release back.
+  # With no ``PYXIS_API_TOKEN`` secret it logs a notice and submits nothing.
+  submit-ubi-preflight:
+    name: Submit ${{ matrix.image_def.image }} ${{ matrix.arch }} to Red Hat
+    runs-on: ubuntu-latest
+    needs: [meta, images-ubi]
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image_def: ${{ fromJSON(needs.meta.outputs.images_ubi) }}
+        arch: [amd64, arm64]
+    env:
+      HAVE_TOKEN: ${{ secrets.PYXIS_API_TOKEN != '' }}
+    steps:
+      - name: Skip when no Pyxis token is configured
+        if: env.HAVE_TOKEN != 'true'
+        run: echo "::notice::PYXIS_API_TOKEN is not set; preflight results for ${{ matrix.image_def.image }} ${{ matrix.arch }} are not submitted to Red Hat"
+      - uses: actions/checkout@v7
+        if: env.HAVE_TOKEN == 'true'
+      - id: submit
+        if: env.HAVE_TOKEN == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/preflight-check
+        with:
+          mode: submit
+          registry-ref: ghcr.io/${{ github.repository_owner }}
+          name: ${{ matrix.image_def.image }}
+          tag: ${{ needs.meta.outputs.version }}-ubi
+          platform: ${{ matrix.arch }}
+          component-id: ${{ matrix.image_def.rh_component_id }}
+          pyxis-api-token: ${{ secrets.PYXIS_API_TOKEN }}
+      - name: Warn when the submission failed
+        if: steps.submit.outcome == 'failure'
+        run: echo "::warning::preflight submission to Red Hat failed for ${{ matrix.image_def.image }} ${{ matrix.arch }}; the images are published and the release is unaffected. Re-run this job or submit by hand."
 
   # ── Publish Helm chart (OCI) ───────────────────────────────────────────────
   # Packages `charts/spatiumddi` (umbrella: api + frontend + worker + beat

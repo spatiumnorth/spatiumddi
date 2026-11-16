@@ -702,7 +702,7 @@
         { "path": ".github/actions/preflight-check/action.yml", "match": "default: '{version}'", "count": 1 }
       ],
       "upstream": {"kind": "github-release", "repo": "redhat-openshift-ecosystem/openshift-preflight"},
-      "note": "Red Hat's `preflight check container` (#3913), installed in CI by .github/actions/preflight-check from the GitHub release and verified against `sha256-amd64` in the same file -- a bump must move that digest with it (GitHub shows it on the release asset). Check only, never `--submit`."
+      "note": "Red Hat's `preflight check container` (#3913), installed in CI by .github/actions/preflight-check from the GitHub release and verified against `sha256-amd64` in the same file -- a bump must move that digest with it (GitHub shows it on the release asset). The check-only mode never submits; the release's `submit-ubi-preflight` job runs the same action in `submit` mode against the published images."
     },
 
     "rhel9-postgresql-16": {

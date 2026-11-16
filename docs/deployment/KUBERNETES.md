@@ -156,9 +156,13 @@ ship radvd, for platforms where you grant it). `restricted-v3` (4.22+) also requ
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
-**Red Hat certification status.** The chart and images are **not** Red Hat
-certified: the submission itself needs a Red Hat Partner Connect account and is
-not done. What exists is everything short of it. Every image carries `name`,
+**Red Hat certification status.** The chart and images are **not yet** Red Hat
+certified. Partner Connect certification components exist for the four `-ubi`
+images, and when the repository secret `PYXIS_API_TOKEN` is set the release
+submits `preflight` results for each image and architecture against the published
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (the `submit-ubi-preflight` job; it is
+non-gating and skipped without the secret). Certification stays pending until Red
+Hat reviews and publishes them. What exists is everything short of it. Every image carries `name`,
 `vendor`, `version`, `release`, `summary`, `description`, `maintainer` and `url`
 labels (plus the `org.opencontainers.image.*` set) and the project `LICENSE` and
 `NOTICE` under `/licenses`; the chart has a `values.schema.json`,
