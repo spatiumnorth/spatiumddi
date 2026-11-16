@@ -22,6 +22,7 @@ from celery.signals import (
     worker_shutdown,
 )
 from celery.worker.consumer import Consumer
+from celery.worker.consumer.connection import Connection as ConnectionStep
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
@@ -1112,6 +1113,28 @@ def build_redis_transport_options(
     return opts
 
 
+class SpatiumConnectionStep(ConnectionStep):
+    """Consumer connection step whose ``inspect stats`` broker info is JSON-safe (#4330).
+
+    ``stats`` replies carry ``connection.info()``, which includes
+    ``transport_options``; on Sentinel that holds ``sentinel_kwargs`` with a
+    ``redis.retry.Retry`` object (see ``build_redis_transport_options``) that
+    kombu cannot JSON-encode, so the reply died with ``EncodeError`` and no
+    node answered. ``sentinel_kwargs`` is connection configuration, not a
+    statistic, and it can carry the Sentinel password, so it is left out of
+    the report; the live connection keeps it.
+    """
+
+    def info(self, c: Any) -> dict[str, Any]:
+        out = super().info(c)
+        broker = out.get("broker")
+        if isinstance(broker, dict) and isinstance(broker.get("transport_options"), dict):
+            broker["transport_options"] = {
+                k: v for k, v in broker["transport_options"].items() if k != "sentinel_kwargs"
+            }
+        return out
+
+
 class SpatiumConsumer(Consumer):
     """Worker consumer whose broker reconnect retries every <= 2 s (#1669).
 
@@ -1132,6 +1155,12 @@ class SpatiumConsumer(Consumer):
     worker exits and its restart policy brings it back; the k8s liveness
     probe (5 x 30 s) restarts it sooner than either.
     """
+
+    class Blueprint(Consumer.Blueprint):
+        default_steps = [
+            "app.celery_app:SpatiumConnectionStep" if step.endswith(":Connection") else step
+            for step in Consumer.Blueprint.default_steps
+        ]
 
     def ensure_connected(self, conn: Any) -> Any:
         conn.ensure_connection = functools.partial(
