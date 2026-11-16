@@ -2830,6 +2830,7 @@ async def agent_log_entries(
         db.add(
             DHCPLogEntry(
                 server_id=server.id,
+                server_name=server.name,
                 ts=parsed.ts,
                 severity=parsed.severity,
                 code=parsed.code,

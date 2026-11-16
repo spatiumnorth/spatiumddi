@@ -310,7 +310,9 @@ async def recent_hits(
         {
             "id": str(h.id),
             "ts": h.ts,
+            # NULL after the server was deleted (#4173); the name stays.
             "server_id": str(h.server_id) if h.server_id else None,
+            "server_name": h.server_name,
             "client_ip": str(h.client_ip) if h.client_ip is not None else None,
             "qname": h.qname,
             "trigger": h.trigger,

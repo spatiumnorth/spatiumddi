@@ -391,7 +391,9 @@ async def _agent_from_authorization(
     if not server_id:
         raise HTTPException(status_code=401, detail="Token missing subject")
     server = await db.get(DNSServer, uuid.UUID(server_id))
-    if server is None:
+    if server is None or server.removing_at is not None:
+        # A server being deleted (#4173) answers like a gone one: 404 is what
+        # makes an agent discard its token, and its re-register is refused (409).
         raise HTTPException(status_code=404, detail="Server not found")
     # Defence-in-depth: verify hash match if we have one stored
     if server.agent_jwt_hash and server.agent_jwt_hash != hash_token(token):
@@ -643,6 +645,13 @@ async def agent_register(
         db.add(server)
         await db.flush()
         await _warn_if_second_signer(db, group, server)
+    elif server.removing_at is not None:
+        # #4173 — the operator is deleting this server. Re-registering would
+        # revive a row a worker is about to drop; refuse until it is gone, then
+        # the same call creates a fresh server.
+        raise HTTPException(
+            status_code=409, detail="Server is being removed; retry once the removal finishes"
+        )
     else:
         # Anti-hijack: fingerprint change → force approval IFF the
         # operator has opted into the approval gate. Otherwise the
@@ -2316,6 +2325,7 @@ async def agent_query_log_entries(
                 db.add(
                     DNSRPZHit(
                         server_id=server.id,
+                        server_name=server.name,
                         ts=rpz.ts,
                         client_ip=rpz.client_ip,
                         qname=rpz.qname,
@@ -2354,6 +2364,7 @@ async def agent_query_log_entries(
             continue
         entry = DNSQueryLogEntry(
             server_id=server.id,
+            server_name=server.name,
             ts=parsed.ts,
             client_ip=parsed.client_ip,
             client_port=parsed.client_port,

@@ -602,7 +602,8 @@ async def primary_candidate(
     ``exclude_id`` names a server still in the group in this session that is
     on its way out (see ``elect_primary``).
     """
-    conditions = [DNSServer.group_id == group_id]
+    # A server being deleted (#4173) is never the stand-in or the new primary.
+    conditions = [DNSServer.group_id == group_id, DNSServer.removing_at.is_(None)]
     if exclude_id is not None:
         conditions.append(DNSServer.id != exclude_id)
     base = select(DNSServer).where(*conditions).order_by(DNSServer.created_at, DNSServer.id)
@@ -1879,6 +1880,8 @@ async def enqueue_record_op(
                 .where(
                     DNSServer.group_id == zone.group_id,
                     DNSServer.is_enabled.is_(True),
+                    # A server being deleted (#4173) takes no new ops.
+                    DNSServer.removing_at.is_(None),
                 )
                 .order_by(DNSServer.is_primary.desc(), DNSServer.created_at)
             )
@@ -2042,6 +2045,8 @@ async def _fanout_agent_ops(
                 .where(
                     DNSServer.group_id == zone.group_id,
                     DNSServer.is_enabled.is_(True),
+                    # A server being deleted (#4173) takes no new ops.
+                    DNSServer.removing_at.is_(None),
                 )
                 .order_by(DNSServer.is_primary.desc(), DNSServer.created_at)
             )
