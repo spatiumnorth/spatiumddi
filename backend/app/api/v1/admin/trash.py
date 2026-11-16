@@ -39,6 +39,7 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
+from app.services.e911.address_bindings import bound_static_mirror_ids
 from app.services.e911.delete_guard import refuse_if_e911_bound
 from app.services.ipam.orphan_aliases import (
     is_withdrawn_alias,
@@ -999,6 +1000,8 @@ async def permanent_delete_from_trash(
     # before the commit (#3354).
     touched_subnets: set[uuid.UUID] = set()
     if isinstance(target, DHCPScope):
+        # #4286: the purge takes the binding on a reservation's address (#3891).
+        await refuse_if_e911_bound(db, label, ip_ids=await bound_static_mirror_ids(db, [target.id]))
         await _tear_down_scope_leases_before_purge(db, target.id, label)
     try:
         if isinstance(target, DHCPScope):
