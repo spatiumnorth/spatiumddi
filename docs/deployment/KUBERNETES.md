@@ -65,10 +65,11 @@ resolves as the latest on its own (#1182).
 
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
-same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36, OpenShift
-Local): every control-plane pod admitted by `restricted-v2`, the BIND9 and Kea
-agents by the chart's own SCCs, DNS and DHCP serving. OpenShift 4.22 has the
-same SCCs and is being verified. OKD is not tested.
+same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
+OpenShift 4.22.14, both on OpenShift Local: every control-plane pod admitted by
+`restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs, DNS and DHCP
+serving, `helm test` passing. On 4.22 `restricted-v3` exists but does not admit
+the chart's pods, so no `hostUsers` setting is needed. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
