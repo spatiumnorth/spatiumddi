@@ -75,10 +75,13 @@ class ImportPreview:
     updates: list[DiffRow] = field(default_factory=list)
     conflicts: list[DiffRow] = field(default_factory=list)
     errors: list[DiffRow] = field(default_factory=list)
+    # Exporter-computed columns present in the upload and ignored (#4289).
+    skipped_columns: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "space_id": self.space_id,
+            "skipped_columns": self.skipped_columns,
             "space_name": self.space_name,
             "summary": {
                 "creates": len(self.creates),
@@ -249,6 +252,7 @@ async def preview_import(
 ) -> ImportPreview:
     space = await _resolve_space(db, space_id, space_name)
     preview = ImportPreview(space_id=str(space.id), space_name=space.name)
+    preview.skipped_columns = sorted(payload.skipped_columns)
 
     existing_subnets = await _load_existing_subnets(db, space.id)
     existing_blocks = await _load_existing_blocks(db, space.id)
@@ -869,6 +873,7 @@ async def preview_address_import(
     """
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
+    preview.skipped_columns = sorted(payload.skipped_columns)
 
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
