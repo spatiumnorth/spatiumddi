@@ -13550,6 +13550,8 @@ export function ZoneTreeRows({
             <button
               className="flex items-center justify-center w-5 h-6 flex-shrink-0 text-muted-foreground hover:text-foreground"
               onClick={() => toggleNode(node.domain)}
+              aria-expanded={expanded}
+              aria-label={`${expanded ? "Collapse" : "Expand"} ${node.domain}`}
               title={expanded ? "Collapse" : "Expand"}
             >
               {expanded ? (
@@ -13989,6 +13991,8 @@ export function DNSPage() {
                       e.stopPropagation();
                       toggleGroup(g.id);
                     }}
+                    aria-expanded={expanded}
+                    aria-label={`${expanded ? "Collapse" : "Expand"} ${g.name}`}
                     title={expanded ? "Collapse" : "Expand"}
                   >
                     {expanded ? "−" : "+"}
