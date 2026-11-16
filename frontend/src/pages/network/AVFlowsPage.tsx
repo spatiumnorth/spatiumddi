@@ -261,9 +261,10 @@ export function AVFlowsPage() {
                       setPtpFilter("");
                       setPage(1);
                     }}
+                    gate={{ disabled: !canWrite }}
+                    hint="Stamp a multicast group as an AV flow to start documenting the plant."
                   >
-                    No AV flows recorded. Stamp a multicast group as an AV flow
-                    to start documenting the plant.
+                    No AV flows recorded.
                   </ListEmpty>
                 )}
               </div>

@@ -568,9 +568,13 @@ function SchedulesTab() {
                   colSpan={6}
                   className="px-3 py-8 text-center text-muted-foreground"
                 >
-                  <ListEmpty error={schedulesQ.error} what="wake schedules">
-                    No wake schedules yet. Create one to wake a tagged fleet on
-                    a recurring, holiday-aware schedule.
+                  <ListEmpty
+                    error={schedulesQ.error}
+                    what="wake schedules"
+                    gate={writeGate}
+                    hint="Create one to wake a tagged fleet on a recurring, holiday-aware schedule."
+                  >
+                    No wake schedules yet.
                   </ListEmpty>
                 </td>
               </tr>
@@ -1435,8 +1439,9 @@ function CalendarsTab() {
                   colSpan={6}
                   className="px-3 py-8 text-center text-muted-foreground"
                 >
-                  No calendars subscribed yet. Add one so a schedule can skip
-                  holidays (or fire only on school days) from a live feed.
+                  No calendars subscribed yet.
+                  {!writeGate.disabled &&
+                    " Add one so a schedule can skip holidays (or fire only on school days) from a live feed."}
                 </td>
               </tr>
             )}

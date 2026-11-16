@@ -134,9 +134,10 @@ export function ConformityPage() {
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               Periodic policy checks against PCI / HIPAA / internet-facing
-              classifications. Built-in policies are seeded disabled — toggle
-              them on to start collecting evidence. Companion to the reactive
-              compliance-change alerts in #105.
+              classifications. Built-in policies are seeded disabled.
+              {!adminGate.disabled &&
+                " Toggle them on to start collecting evidence."}{" "}
+              Companion to the reactive compliance-change alerts in #105.
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-1.5">
@@ -549,6 +550,8 @@ function ResultsList({
     [policies],
   );
   const [expanded, setExpanded] = useState<string | null>(null);
+  // Re-evaluate now is an admin's on conformity (#4314).
+  const canAdmin = usePermissions().can("admin", "conformity");
 
   if (loading) {
     return (
@@ -560,8 +563,10 @@ function ResultsList({
   if (results.length === 0) {
     return (
       <div className="rounded-lg border bg-card p-6 text-center text-xs text-muted-foreground">
-        No results match the current filter. Re-evaluate a policy or relax the
-        filter.
+        No results match the current filter.{" "}
+        {canAdmin
+          ? "Re-evaluate a policy or relax the filter."
+          : "Relax the filter."}
       </div>
     );
   }
