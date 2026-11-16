@@ -35,11 +35,11 @@ export function DNSBLPage() {
   const perms = usePermissions();
   const writeGate = permissionGate(
     perms.can("write", "dnsbl"),
-    "Requires write on DNS blocklists",
+    "Requires write on DNSBL lists",
   );
   const deleteGate = permissionGate(
     perms.can("delete", "dnsbl"),
-    "Requires delete on DNS blocklists",
+    "Requires delete on DNSBL lists",
   );
   const canWrite = !writeGate.disabled;
 
