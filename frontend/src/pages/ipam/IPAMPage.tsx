@@ -175,6 +175,8 @@ import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { DeleteChoiceModal } from "@/components/ui/delete-choice-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
+import { BulkCustomFieldsSection } from "@/components/ipam/BulkCustomFieldsSection";
+import { bulkCustomFieldChanges } from "@/components/ipam/bulk-custom-fields";
 import { TagRows, TagsField } from "@/components/ipam/TagRows";
 import {
   tagRowsFromRecord,
@@ -11588,14 +11590,7 @@ export function BulkEditAddressesModal({
       }
 
       if (editCustomFields) {
-        const cfObj: Record<string, unknown> = {};
-        for (const [key, optedIn] of Object.entries(cfOptIn)) {
-          if (!optedIn) continue;
-          const v = customFields[key];
-          // Treat explicitly empty as a removal (null). Without this the
-          // backend would store "" and the field would still look "set".
-          cfObj[key] = v === "" || v === undefined ? null : v;
-        }
+        const cfObj = bulkCustomFieldChanges(cfOptIn, customFields);
         if (Object.keys(cfObj).length > 0) changes.custom_fields = cfObj;
       }
       if (dnsZoneEditing) changes.dns_zone_id = dnsZoneId; // "" clears the zone
@@ -11856,111 +11851,16 @@ export function BulkEditAddressesModal({
           )}
         </div>
 
-        {cfDefs.length > 0 && (
-          <div className="rounded-md border p-3 space-y-2">
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <input
-                type="checkbox"
-                checked={editCustomFields}
-                onChange={(e) => setEditCustomFields(e.target.checked)}
-              />
-              Custom fields (merge)
-            </label>
-            {editCustomFields && (
-              <>
-                <p className="text-[11px] text-muted-foreground -mt-1">
-                  Tick the box next to each field you want to change — only
-                  ticked fields are written to selected IPs. Leaving a ticked
-                  field empty clears it on every selected IP.
-                </p>
-                <div className="space-y-3">
-                  {cfDefs.map((def) => {
-                    const checked = !!cfOptIn[def.name];
-                    const val = customFields[def.name] ?? "";
-                    return (
-                      <div key={def.name} className="space-y-1">
-                        <label className="flex items-center gap-2 text-xs font-medium">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(e) =>
-                              setCfOptIn((prev) => ({
-                                ...prev,
-                                [def.name]: e.target.checked,
-                              }))
-                            }
-                          />
-                          {def.label}
-                        </label>
-                        {checked && (
-                          <div className="pl-5">
-                            {def.description && (
-                              <p className="mb-1 text-xs text-muted-foreground">
-                                {def.description}
-                              </p>
-                            )}
-                            {def.field_type === "boolean" ? (
-                              <input
-                                type="checkbox"
-                                className="rounded"
-                                checked={!!val}
-                                onChange={(e) =>
-                                  setCustomFields((prev) => ({
-                                    ...prev,
-                                    [def.name]: e.target.checked,
-                                  }))
-                                }
-                              />
-                            ) : def.field_type === "select" && def.options ? (
-                              <select
-                                className={inputCls}
-                                value={String(val)}
-                                onChange={(e) =>
-                                  setCustomFields((prev) => ({
-                                    ...prev,
-                                    [def.name]: e.target.value,
-                                  }))
-                                }
-                              >
-                                <option value="">— Clear value —</option>
-                                {def.options.map((opt) => (
-                                  <option key={opt} value={opt}>
-                                    {opt}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : (
-                              <input
-                                className={inputCls}
-                                type={
-                                  def.field_type === "number"
-                                    ? "number"
-                                    : def.field_type === "email"
-                                      ? "email"
-                                      : def.field_type === "url"
-                                        ? "url"
-                                        : "text"
-                                }
-                                value={String(val)}
-                                onChange={(e) =>
-                                  setCustomFields((prev) => ({
-                                    ...prev,
-                                    [def.name]: e.target.value,
-                                  }))
-                                }
-                                placeholder="(empty clears field)"
-                              />
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
-            )}
-          </div>
-        )}
+        <BulkCustomFieldsSection
+          definitions={cfDefs}
+          enabled={editCustomFields}
+          onEnabledChange={setEditCustomFields}
+          optIn={cfOptIn}
+          onOptInChange={setCfOptIn}
+          values={customFields}
+          onValuesChange={setCustomFields}
+          target="selected IPs"
+        />
 
         {error && (
           <p role="alert" className="text-xs text-destructive">
@@ -16915,7 +16815,7 @@ export function SpaceTableView({
 
 // ─── Bulk-edit Modal ─────────────────────────────────────────────────────────
 
-function BulkEditSubnetsModal({
+export function BulkEditSubnetsModal({
   subnetIds,
   onClose,
   onDone,
@@ -16929,7 +16829,16 @@ function BulkEditSubnetsModal({
   const [description, setDescription] = useState("");
   const [statusVal, setStatusVal] = useState("");
   const [vlanId, setVlanId] = useState("");
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
+  // Per-custom-field opt-in: only ticked keys are sent in the merge payload.
+  const [cfOptIn, setCfOptIn] = useState<Record<string, boolean>>({});
+  const [editCustomFields, setEditCustomFields] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "subnet"],
+    queryFn: () => customFieldsApi.list("subnet"),
+  });
 
   const mut = useMutation({
     mutationFn: () => {
@@ -16941,6 +16850,10 @@ function BulkEditSubnetsModal({
         const n = Number(vlanId);
         if (Number.isNaN(n)) throw new Error("VLAN ID must be a number");
         changes.vlan_id = n;
+      }
+      if (editCustomFields) {
+        const cfObj = bulkCustomFieldChanges(cfOptIn, customFields);
+        if (Object.keys(cfObj).length > 0) changes.custom_fields = cfObj;
       }
       if (Object.keys(changes).length === 0) {
         throw new Error("Set at least one field to apply");
@@ -16965,7 +16878,8 @@ function BulkEditSubnetsModal({
       onClose={onClose}
     >
       <p className="mb-3 text-xs text-muted-foreground">
-        Leave a field blank to keep it unchanged.
+        Leave a field blank to keep it unchanged. Custom fields are merged: only
+        the ones you tick are written.
       </p>
       <div className="space-y-3 text-sm">
         <label className="block">
@@ -17013,6 +16927,16 @@ function BulkEditSubnetsModal({
             inputMode="numeric"
           />
         </label>
+        <BulkCustomFieldsSection
+          definitions={cfDefs}
+          enabled={editCustomFields}
+          onEnabledChange={setEditCustomFields}
+          optIn={cfOptIn}
+          onOptInChange={setCfOptIn}
+          values={customFields}
+          onValuesChange={setCustomFields}
+          target="selected subnets"
+        />
       </div>
       {error && <FormError className="mt-2">{error}</FormError>}
       <div className="mt-4 flex justify-end gap-2">

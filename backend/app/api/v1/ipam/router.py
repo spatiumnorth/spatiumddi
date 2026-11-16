@@ -12872,11 +12872,24 @@ async def remove_subnet_domain(
 _BULK_ALLOWED_STATUSES = {"active", "deprecated", "reserved", "quarantine"}
 
 
+def _merge_dict_patch(existing: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``patch`` into ``existing`` per key; a ``None`` value removes the key."""
+    merged = dict(existing or {})
+    for k, v in patch.items():
+        if v is None:
+            merged.pop(k, None)
+        else:
+            merged[k] = v
+    return merged
+
+
 class SubnetBulkChanges(BaseModel):
     name: str | None = None
     description: str | None = None
     status: str | None = None
     vlan_id: int | None = None
+    # Merged into the existing dicts per key (set a key to null to remove it),
+    # like the address bulk edit (#4304).
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
 
@@ -12906,6 +12919,11 @@ async def bulk_edit_subnets(
     db: DB,
 ) -> SubnetBulkEditResponse:
     """Apply the same set of changes to multiple subnets atomically.
+
+    ``name`` / ``description`` / ``status`` / ``vlan_id`` replace the existing
+    value. ``tags`` and ``custom_fields`` are **merged** into each subnet's
+    existing dict per key; a key set to ``null`` is removed (same as the
+    address bulk edit). Before #4304 they replaced the whole dict.
 
     All mutations happen in a single transaction; one audit row per
     successfully-updated subnet shares a `batch_id` in `new_value`.
@@ -12941,6 +12959,8 @@ async def bulk_edit_subnets(
 
         old = {k: getattr(subnet, k, None) for k in changes.keys()}
         for field, value in changes.items():
+            if field in ("tags", "custom_fields"):
+                value = _merge_dict_patch(getattr(subnet, field, None), value)
             setattr(subnet, field, value)
 
         db.add(
@@ -13633,21 +13653,11 @@ async def bulk_edit_addresses(
                 touched_subnets.add(ip.subnet_id)
 
             if tags_patch is not None:
-                merged = dict(ip.tags or {})
-                for k, v in tags_patch.items():
-                    if v is None:
-                        merged.pop(k, None)
-                    else:
-                        merged[k] = v
+                merged = _merge_dict_patch(ip.tags, tags_patch)
                 old["tags"] = ip.tags or {}
                 ip.tags = merged
             if cf_patch is not None:
-                merged_cf = dict(ip.custom_fields or {})
-                for k, v in cf_patch.items():
-                    if v is None:
-                        merged_cf.pop(k, None)
-                    else:
-                        merged_cf[k] = v
+                merged_cf = _merge_dict_patch(ip.custom_fields, cf_patch)
                 old["custom_fields"] = ip.custom_fields or {}
                 ip.custom_fields = merged_cf
 
