@@ -495,16 +495,68 @@ async def create_target(
 _DESTINATION_KEYS = ("host", "port", "server", "url", "endpoint_url")
 
 
+def _text(config: dict[str, Any], key: str, default: str) -> str:
+    value = config.get(key)
+    return (value if isinstance(value, str) and value.strip() else default).strip().lower()
+
+
+def _transport_level(kind: str, config: dict[str, Any]) -> int:
+    """How well the destination protects a credential in transit, higher is
+    better. Defaults match the drivers' own (an unset setting reads the same
+    here as when a backup runs)."""
+    if kind == "ftp":
+        if _text(config, "mode", "ftp") not in {"ftps_explicit", "ftps_implicit"}:
+            return 0  # plain FTP
+        return 2 if _text(config, "verify_tls", "true") != "false" else 1
+    if kind in {"https_put", "webdav"}:
+        return 1 if _text(config, "verify_tls", "true") != "false" else 0
+    if kind == "scp":
+        return 0 if _text(config, "host_key_check", "known_hosts") == "insecure_skip" else 1
+    return 1
+
+
+# Settings that decide who the credential is trusted to reach, per kind; one
+# edited to a different value counts as a change of destination, as a new
+# host does, even when it is not weaker on its face (a replaced known_hosts).
+_TRUST_KEYS = {"scp": ("known_hosts",)}
+
+
+def _weakened_transport_keys(
+    kind: str, stored: dict[str, Any], incoming: dict[str, Any]
+) -> list[str]:
+    """Transport settings this edit changes in a way that is weaker for the
+    stored credential (FTPS to FTP, TLS verification off, host-key checking
+    off), or re-points at other trusted keys."""
+    merged = {**stored, **incoming}
+    if _transport_level(kind, merged) >= _transport_level(kind, stored):
+        changed: list[str] = []
+    else:
+        changed = [
+            k
+            for k in ("mode", "verify_tls", "host_key_check")
+            if k in incoming and str(incoming[k] or "") != str(stored.get(k) or "")
+        ]
+    for k in _TRUST_KEYS.get(kind, ()):
+        if k in incoming and str(incoming[k] or "") != str(stored.get(k) or ""):
+            changed.append(k)
+    return changed
+
+
 def _require_secrets_with_new_destination(
     driver: BackupDestination, stored: dict[str, Any], incoming: dict[str, Any]
 ) -> None:
-    """422 when an edit moves the destination but keeps a stored credential.
+    """422 when an edit moves the destination, or weakens how the credential
+    travels to it, but keeps a stored credential.
 
     The console leaves a stored secret blank on Edit, so an edit of only the
-    host would otherwise carry the credential to the new host unasked.
+    host would otherwise carry the credential to the new host unasked; the
+    same goes for FTPS to plain FTP, TLS verification off, or host-key
+    checking off.
     """
     secrets = secret_field_names(driver)
-    supplied: dict[str, Any] = {k: incoming[k] for k in _DESTINATION_KEYS if k in incoming}
+    weakened = _weakened_transport_keys(driver.kind, stored, incoming)
+    keys = (*_DESTINATION_KEYS, *weakened)
+    supplied: dict[str, Any] = {k: incoming[k] for k in keys if k in incoming}
     for name in secrets:
         if name not in incoming:
             continue
@@ -519,9 +571,9 @@ def _require_secrets_with_new_destination(
         ):
             supplied[name] = value
     require_secret_with_destination_change(
-        SimpleNamespace(**{k: stored.get(k) for k in _DESTINATION_KEYS}),
+        SimpleNamespace(**{k: stored.get(k) for k in keys}),
         supplied,
-        destination=_DESTINATION_KEYS,
+        destination=keys,
         secrets={name: stored.get(name) for name in secrets},
     )
 

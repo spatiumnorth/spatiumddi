@@ -69,6 +69,49 @@ const BACKUP_DESTINATION_KEYS = [
   "endpoint_url",
 ];
 
+const cfgText = (
+  c: Record<string, unknown> | undefined,
+  key: string,
+  dflt: string,
+) => {
+  const v = c?.[key];
+  return (typeof v === "string" && v.trim() ? v : dflt).trim().toLowerCase();
+};
+
+// How well a destination protects a credential in transit (higher is better);
+// the same ranking the API applies, defaults included.
+function transportLevel(
+  kind: string,
+  c: Record<string, unknown> | undefined,
+): number {
+  if (kind === "ftp") {
+    if (!["ftps_explicit", "ftps_implicit"].includes(cfgText(c, "mode", "ftp")))
+      return 0;
+    return cfgText(c, "verify_tls", "true") !== "false" ? 2 : 1;
+  }
+  if (kind === "https_put" || kind === "webdav")
+    return cfgText(c, "verify_tls", "true") !== "false" ? 1 : 0;
+  if (kind === "scp")
+    return cfgText(c, "host_key_check", "known_hosts") === "insecure_skip"
+      ? 0
+      : 1;
+  return 1;
+}
+
+// A weaker transport, or other trusted host keys, ask for the stored
+// credential again exactly as a new host does (the API refuses otherwise).
+function transportReask(
+  kind: string,
+  edited: Record<string, unknown>,
+  stored: Record<string, unknown> | undefined,
+): string {
+  const weaker = transportLevel(kind, edited) < transportLevel(kind, stored);
+  const keys =
+    kind === "scp" &&
+    String(edited.known_hosts ?? "") !== String(stored?.known_hosts ?? "");
+  return weaker || keys ? "changed" : "";
+}
+
 // Settings the API reads as numbers (#3946). The form holds every value as
 // text; a whole number in one of these goes out as a number, anything else
 // as typed so the API refuses it by name.
@@ -919,8 +962,8 @@ function TargetFormModal({
     () => kindsQ.data?.find((k) => k.kind === kind),
     [kindsQ.data, kind],
   );
-  // #4135 — a moved host / port / server / URL needs every stored secret of
-  // this destination entered again (the same keys the API compares).
+  // #4135 — a moved host / port / server / URL, or a weaker transport, needs
+  // every stored secret of this destination entered again (what the API compares).
   const secretFieldNames = (kindMeta?.config_fields ?? [])
     .filter((f) => f.secret)
     .map((f) => f.name);
@@ -928,9 +971,17 @@ function TargetFormModal({
     BACKUP_DESTINATION_KEYS.includes(k),
   );
   const reask = useCredentialReask(
-    Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+    {
+      ...Object.fromEntries(destKeys.map((k) => [k, config[k]])),
+      transport: transportReask(kind, config, existing?.config),
+    },
     mode === "edit" && existing
-      ? Object.fromEntries(destKeys.map((k) => [k, existing.config?.[k] ?? ""]))
+      ? {
+          ...Object.fromEntries(
+            destKeys.map((k) => [k, existing.config?.[k] ?? ""]),
+          ),
+          transport: "",
+        }
       : null,
     () =>
       setConfig((prev) => {
