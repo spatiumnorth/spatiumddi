@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   SPATIUM_AGENT_KEY: {{ .Values.dhcpAgents.agentKey.value | quote }}
----
+{{- "\n---\n" }}
 {{- end }}
 {{- range $server := .Values.dhcpAgents.servers }}
 {{- $flavor := $server.flavor | default "kea" -}}
@@ -161,7 +161,7 @@ spec:
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "keaState") | default "2Gi" }}
----
+{{- "\n---\n" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -195,7 +195,7 @@ spec:
       {{- with (get ($server.service | default dict) "nodePort") }}
       nodePort: {{ . }}
       {{- end }}
----
+{{- "\n---\n" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -212,6 +212,6 @@ spec:
   ports:
     - { name: dhcp-udp,  port: 67,   protocol: UDP }
     - { name: ctrl-http, port: 8000, protocol: TCP }
----
+{{- "\n---\n" }}
 {{- end }}
 {{- end }}
