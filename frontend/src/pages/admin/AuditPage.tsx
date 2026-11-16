@@ -52,9 +52,30 @@ const RESOURCE_TYPE_OPTIONS = [
   "dhcp_static_assignment",
 ];
 
-// `failure` is what a rejected sign-in is audited with, and `forbidden`
-// what a refused break-glass or secret reveal is (#1874).
-const RESULT_OPTIONS = ["success", "failure", "denied", "forbidden", "error"];
+// Every `result` the backend writes to audit_log. `failure` is what a
+// rejected sign-in is audited with, `forbidden` a refused break-glass or
+// secret reveal (#1874); `ok`, `failed`, `accepted` and `skipped` come from
+// the appliance, sync and agent paths (#4293). The API filters on any string.
+const RESULT_OPTIONS = [
+  "success",
+  "ok",
+  "accepted",
+  "failure",
+  "failed",
+  "error",
+  "denied",
+  "forbidden",
+  "skipped",
+];
+
+const SUCCESS_RESULTS = new Set(["success", "ok", "accepted"]);
+const FAILURE_RESULTS = new Set([
+  "failure",
+  "failed",
+  "error",
+  "denied",
+  "forbidden",
+]);
 
 function ActionBadge({ action }: { action: string }) {
   const cls =
@@ -72,14 +93,17 @@ function ActionBadge({ action }: { action: string }) {
 }
 
 function ResultBadge({ result }: { result: string }) {
-  const ok = result === "success";
+  // Colour by meaning: anything not known to fail (e.g. `skipped`) is neutral.
+  const cls = SUCCESS_RESULTS.has(result)
+    ? "bg-green-500/15 text-green-600 dark:text-green-400"
+    : FAILURE_RESULTS.has(result)
+      ? "bg-red-500/15 text-red-600 dark:text-red-400"
+      : "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400";
   return (
     <span
       className={cn(
         "inline-flex rounded px-1.5 py-0.5 text-xs font-medium",
-        ok
-          ? "bg-green-500/15 text-green-600 dark:text-green-400"
-          : "bg-red-500/15 text-red-600 dark:text-red-400",
+        cls,
       )}
     >
       {result}
