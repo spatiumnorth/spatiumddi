@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -34,6 +34,7 @@ import {
   type LogSource,
   formatApiError,
 } from "@/lib/api";
+import { formatClientEndpoint } from "@/lib/clientEndpoint";
 import { Modal } from "@/components/ui/modal";
 import { AgentLogScopePicker } from "@/components/AgentLogScopePicker";
 import {
@@ -1644,19 +1645,19 @@ export function DNSQueryRow({
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const { open, setOpen, closeDetails, rowProps } = useRowDetails(
+    `Details for ${row.qname ?? "query"} ${row.qtype ?? ""} from ${row.client_ip ?? "unknown client"}`,
+  );
   return (
     <div
-      className={cn(
-        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
-        showServer ? DNS_COLS_SERVER : DNS_COLS,
-      )}
+      {...rowProps}
+      className={cn(ROW_CLICKABLE_CLS, showServer ? DNS_COLS_SERVER : DNS_COLS)}
     >
       <RowDetailsButton onClick={() => setOpen(true)} />
       {open && (
         <DNSQueryDetailModal
           row={row}
-          onClose={() => setOpen(false)}
+          onClose={closeDetails}
           onFilterClient={onFilterClient}
           onFilterQname={onFilterQname}
         />
@@ -1672,7 +1673,7 @@ export function DNSQueryRow({
         className="truncate font-mono text-[11px]"
         title={
           row.client_ip
-            ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+            ? formatClientEndpoint(row.client_ip, row.client_port)
             : ""
         }
       >
@@ -1902,7 +1903,12 @@ export function DHCPActivityRow({
   /** Render the Server column (#2120) — the read merged several servers. */
   showServer?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const { open, setOpen, closeDetails, rowProps } = useRowDetails(
+    `Details for ${row.code ?? "activity"} ${row.mac_address ?? ""} ${row.ip_address ?? ""}`.replace(
+      /\s+/g,
+      " ",
+    ),
+  );
   const sevCls =
     row.severity === "ERROR" || row.severity === "FATAL"
       ? "text-destructive"
@@ -1913,15 +1919,14 @@ export function DHCPActivityRow({
           : "text-foreground";
   return (
     <div
+      {...rowProps}
       className={cn(
-        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
+        ROW_CLICKABLE_CLS,
         showServer ? DHCP_COLS_SERVER : DHCP_COLS,
       )}
     >
       <RowDetailsButton onClick={() => setOpen(true)} />
-      {open && (
-        <DHCPActivityDetailModal row={row} onClose={() => setOpen(false)} />
-      )}
+      {open && <DHCPActivityDetailModal row={row} onClose={closeDetails} />}
       <span
         className="font-mono tabular-nums text-muted-foreground"
         title={row.ts}
@@ -1963,6 +1968,46 @@ export function DHCPActivityRow({
 // event, and a hover ``title`` is not selectable, not usable on touch
 // and clipped by the browser for long lines. The details button opens
 // every field of the row untruncated, with the raw line copyable.
+
+// Whole-row activation (#4248). A click anywhere on the row opens the
+// details modal, except on a control inside it (the arrow has its own
+// handler) and except when the click ended a text selection. The row is a
+// focusable group (no role=button: it holds the arrow button); Enter / Space open it, and focus returns to it
+// when the modal closes (the shared Modal does not restore focus itself).
+const ROW_CLICKABLE_CLS =
+  "grid cursor-pointer items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring";
+
+function useRowDetails(label: string) {
+  const [open, setOpen] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const closeDetails = () => {
+    setOpen(false);
+    rowRef.current?.focus();
+  };
+  const rowProps = {
+    ref: rowRef,
+    role: "group" as const,
+    tabIndex: 0,
+    "aria-label": `${label} (press Enter to open details)`,
+    onClick: (e: React.MouseEvent<HTMLDivElement>) => {
+      if (
+        (e.target as HTMLElement).closest("button, a, input, select, textarea")
+      )
+        return;
+      if (window.getSelection()?.toString()) return;
+      setOpen(true);
+    },
+    onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      // Only the row itself: Enter / Space on an inner control is its own.
+      if (e.target !== e.currentTarget) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setOpen(true);
+      }
+    },
+  };
+  return { open, setOpen, closeDetails, rowProps };
+}
 
 function RowDetailsButton({ onClick }: { onClick: () => void }) {
   return (
@@ -2079,7 +2124,7 @@ function DNSQueryDetailModal({
   const answers = row.answer_count ?? null;
   const result = describeRcode(rcode, answers);
   const client = row.client_ip
-    ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+    ? formatClientEndpoint(row.client_ip, row.client_port)
     : null;
   return (
     <Modal title="DNS query details" onClose={onClose} wide>
