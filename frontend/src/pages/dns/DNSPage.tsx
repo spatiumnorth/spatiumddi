@@ -1,4 +1,5 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useSharedSessionSet } from "./zoneTreeState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -6884,8 +6885,13 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
       {confirmDeleteServer && (
         <ConfirmDestroyModal
           title="Delete DNS Server"
-          description={`Remove "${confirmDeleteServer.name}" (${confirmDeleteServer.host}:${confirmDeleteServer.port}) from this group?`}
-          checkLabel="I understand this server will be removed from SpatiumDDI management."
+          description={
+            <>
+              {`Remove "${confirmDeleteServer.name}" (${confirmDeleteServer.host}:${confirmDeleteServer.port}) from this group?`}
+              <ServerDeleteAgentNote />
+            </>
+          }
+          checkLabel="I understand this deletes the server row, and a running agent will register it again."
           onConfirm={() => del.mutate(confirmDeleteServer)}
           onClose={() => setConfirmDeleteServer(null)}
           isPending={del.isPending}

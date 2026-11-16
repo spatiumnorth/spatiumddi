@@ -150,7 +150,7 @@ export function DeleteConfirmModal({
   acknowledgement = "I understand this action cannot be undone.",
 }: {
   title: string;
-  description: string;
+  description: React.ReactNode;
   acknowledgement?: string;
   referencesTitle?: string;
   references?: string[];
