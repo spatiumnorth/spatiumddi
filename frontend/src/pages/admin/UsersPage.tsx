@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
@@ -63,23 +64,6 @@ function PolicyErrorList({ errors }: { errors: string[] }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 // ── Create User Modal ─────────────────────────────────────────────────────────
 
