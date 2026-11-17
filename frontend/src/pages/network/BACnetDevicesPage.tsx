@@ -495,16 +495,16 @@ export function BACnetDevicesPage() {
               {del?.device_name ? ` (${del.device_name})` : ""}? The instance
               number is freed for re-use; the IPAM address itself is untouched.
             </>
-            {delMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(delMut.error, "Failed to delete BACnet device")}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
+        error={
+          delMut.isError
+            ? formatApiError(delMut.error, "Failed to delete BACnet device")
+            : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
         onClose={() => {
           setDel(null);

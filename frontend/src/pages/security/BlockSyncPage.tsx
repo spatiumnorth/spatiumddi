@@ -151,7 +151,6 @@ export function BlockSyncPage() {
       invalidateAll();
       setLiftTarget(null);
     },
-    onError: (e) => setPageError(errMsg(e, "Failed to lift block")),
   });
 
   return (
@@ -515,8 +514,14 @@ export function BlockSyncPage() {
         tone="destructive"
         confirmLabel="Lift block"
         loading={liftMut.isPending}
+        error={
+          liftMut.error ? errMsg(liftMut.error, "Failed to lift block") : null
+        }
         onConfirm={() => liftTarget && liftMut.mutate(liftTarget.id)}
-        onClose={() => setLiftTarget(null)}
+        onClose={() => {
+          setLiftTarget(null);
+          liftMut.reset();
+        }}
       />
     </div>
   );

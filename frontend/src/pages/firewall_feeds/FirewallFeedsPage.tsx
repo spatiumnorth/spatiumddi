@@ -16,6 +16,7 @@ import {
 
 import {
   firewallFeedsApi,
+  formatApiError,
   type FirewallFeed,
   type FirewallFeedCreate,
   type FirewallFeedTokenResult,
@@ -295,8 +296,16 @@ export function FirewallFeedsPage() {
         tone="destructive"
         confirmLabel="Rotate token"
         loading={rotateMut.isPending}
+        error={
+          rotateMut.error
+            ? formatApiError(rotateMut.error, "Rotate failed")
+            : null
+        }
         onConfirm={() => rotate && rotateMut.mutate(rotate.id)}
-        onClose={() => setRotate(null)}
+        onClose={() => {
+          setRotate(null);
+          rotateMut.reset();
+        }}
       />
       {del && (
         <DeleteFeedModal

@@ -71,7 +71,10 @@ export function DNSBLPage() {
   });
   const deleteList = useMutation({
     mutationFn: (id: string) => dnsblApi.deleteList(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dnsbl-lists"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dnsbl-lists"] });
+      setConfirmDelete(null);
+    },
   });
   const saveSettings = useMutation({
     mutationFn: (data: Partial<DNSBLSettings>) => dnsblApi.updateSettings(data),
@@ -94,7 +97,10 @@ export function DNSBLPage() {
   });
   const deletePinned = useMutation({
     mutationFn: (id: string) => dnsblApi.deletePinned(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dnsbl-pinned"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dnsbl-pinned"] });
+      setConfirmUnpin(null);
+    },
   });
 
   const [newIp, setNewIp] = useState("");
@@ -419,11 +425,17 @@ export function DNSBLPage() {
           message={`Delete the custom list "${confirmDelete.name}"? This removes its listing history.`}
           confirmLabel="Delete"
           tone="destructive"
-          onClose={() => setConfirmDelete(null)}
-          onConfirm={() => {
-            deleteList.mutate(confirmDelete.id);
+          loading={deleteList.isPending}
+          error={
+            deleteList.error
+              ? formatApiError(deleteList.error, "Delete failed")
+              : null
+          }
+          onClose={() => {
             setConfirmDelete(null);
+            deleteList.reset();
           }}
+          onConfirm={() => deleteList.mutate(confirmDelete.id)}
         />
       )}
       {confirmUnpin && (
@@ -433,11 +445,17 @@ export function DNSBLPage() {
           message={`Stop monitoring ${confirmUnpin.ip}?`}
           confirmLabel="Unpin"
           tone="destructive"
-          onClose={() => setConfirmUnpin(null)}
-          onConfirm={() => {
-            deletePinned.mutate(confirmUnpin.id);
+          loading={deletePinned.isPending}
+          error={
+            deletePinned.error
+              ? formatApiError(deletePinned.error, "Unpin failed")
+              : null
+          }
+          onClose={() => {
             setConfirmUnpin(null);
+            deletePinned.reset();
           }}
+          onConfirm={() => deletePinned.mutate(confirmUnpin.id)}
         />
       )}
     </div>

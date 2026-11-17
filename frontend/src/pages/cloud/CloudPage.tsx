@@ -20,6 +20,7 @@ import {
 import {
   cloudApi,
   dnsApi,
+  formatApiError,
   type CloudEndpoint,
   type CloudEndpointCreate,
   type CloudEndpointUpdate,
@@ -395,8 +396,14 @@ export function CloudPage() {
         confirmLabel="Delete"
         tone="destructive"
         loading={delMut.isPending}
+        error={
+          delMut.error ? formatApiError(delMut.error, "Delete failed") : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
         message={
           del ? (
             <>

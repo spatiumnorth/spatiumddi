@@ -11227,21 +11227,16 @@ export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
         confirmLabel="Delete"
         loading={delSet.isPending}
         message={
-          <>
-            {confirmDel
-              ? `Delete address set "${confirmDel.name}"? Any permissions ` +
-                `granted on this set will no longer match. The IP addresses ` +
-                `themselves are not removed.`
-              : ""}
-            {delSet.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatDialogError(
-                  delSet.error,
-                  "Failed to delete address set",
-                )}
-              </p>
-            )}
-          </>
+          confirmDel
+            ? `Delete address set "${confirmDel.name}"? Any permissions ` +
+              `granted on this set will no longer match. The IP addresses ` +
+              `themselves are not removed.`
+            : ""
+        }
+        error={
+          delSet.isError
+            ? formatDialogError(delSet.error, "Failed to delete address set")
+            : null
         }
         onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
         onClose={() => {

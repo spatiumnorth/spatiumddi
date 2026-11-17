@@ -510,19 +510,16 @@ export function AVFlowsPage() {
               The multicast group itself is kept — it simply stops being an AV
               flow.
             </>
-            {deleteFlowMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteFlowMut.error,
-                  "Failed to delete AV flow",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Remove"
         loading={deleteFlowMut.isPending}
+        error={
+          deleteFlowMut.isError
+            ? formatApiError(deleteFlowMut.error, "Failed to delete AV flow")
+            : null
+        }
         onConfirm={() =>
           deleteFlow && deleteFlowMut.mutate(deleteFlow.group_id)
         }
@@ -541,19 +538,19 @@ export function AVFlowsPage() {
               Nothing cascades — groups and flows inside the range are
               untouched, they just stop being checkable against it.
             </>
-            {deleteRangeMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteRangeMut.error,
-                  "Failed to delete reserved range",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteRangeMut.isPending}
+        error={
+          deleteRangeMut.isError
+            ? formatApiError(
+                deleteRangeMut.error,
+                "Failed to delete reserved range",
+              )
+            : null
+        }
         onConfirm={() => deleteRange && deleteRangeMut.mutate(deleteRange.id)}
         onClose={() => {
           setDeleteRange(null);

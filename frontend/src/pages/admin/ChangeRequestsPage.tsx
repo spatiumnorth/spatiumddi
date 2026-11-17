@@ -993,8 +993,16 @@ export function ChangeRequestsPage() {
             operation will not run.
           </span>
         }
+        error={
+          cancelMutation.error
+            ? formatApiError(cancelMutation.error, "Cancel failed")
+            : null
+        }
         onConfirm={() => cancelTarget && cancelMutation.mutate(cancelTarget.id)}
-        onClose={() => setCancelTarget(null)}
+        onClose={() => {
+          setCancelTarget(null);
+          cancelMutation.reset();
+        }}
       />
     </div>
   );
