@@ -100,7 +100,7 @@ from app.core.db_transient import is_transient_db_error
 from app.core.denial_audit import note_denial_audited
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
-from app.core.versions import is_installed_target, upgrade_direction
+from app.core.versions import includes_release, is_installed_target, upgrade_direction
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -1056,6 +1056,33 @@ async def supervisor_tls_pins(db: DB) -> SupervisorTlsPinsResponse:
     return SupervisorTlsPinsResponse(**pin_set)
 
 
+_UNSIGNED_REGISTER_REFUSED = (
+    "Registration refused: an existing appliance must register with a signature "
+    "from its own key. Upgrade the appliance's supervisor to 1.0.1 or later, or "
+    "delete the appliance's row under Fleet and pair it again, or have an "
+    "administrator change APPLIANCE_UNSIGNED_REGISTER_ALLOWED."
+)
+
+# First release whose supervisor signs its registration.
+_FIRST_SIGNING_RELEASE = "1.0.1"
+
+
+def _unsigned_register_permitted(row: Appliance) -> bool:
+    """Whether ``row`` may re-register without a signature.
+
+    Never once the row has reported it signs, never under
+    ``appliance_unsigned_register_allowed = never``, and never when its last
+    reported supervisor version already includes the first signing release.
+    A version that is missing, a dev build or a nightly counts as older: those
+    rows cannot be told apart from a supervisor that never signed.
+    """
+    if settings.appliance_unsigned_register_allowed != "legacy":
+        return False
+    if (row.capabilities or {}).get("register_proof"):
+        return False
+    return includes_release(row.supervisor_version, _FIRST_SIGNING_RELEASE) is not True
+
+
 @router.post(
     "/supervisor/register",
     response_model=SupervisorRegisterResponse,
@@ -1131,15 +1158,59 @@ async def supervisor_register(
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # The row's owner is whoever holds the private key. A supervisor
-        # that has reported it signs its registrations is held to that; an
-        # older one (no signature) is accepted only while
-        # ``appliance_legacy_signature_allowed`` stays on, and logged.
+        # that has reported it signs its registrations is held to that. An
+        # unsigned one is accepted only under ``appliance_unsigned_register_
+        # allowed = legacy`` and only while the row's last-reported
+        # supervisor version predates the first one that signs (a missing or
+        # unreadable version counts as older). Each acceptance is audited
+        # and spends an attempt from the registration budget.
         if not key_proven:
-            if (existing.capabilities or {}).get(
-                "register_proof"
-            ) or not settings.appliance_legacy_signature_allowed:
+            if not _unsigned_register_permitted(existing):
+                logger.warning(
+                    "supervisor_register_unsigned_refused",
+                    appliance_id=str(existing.id),
+                    ip=client_ip,
+                    last_reported_version=existing.supervisor_version,
+                )
                 await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-                raise HTTPException(status.HTTP_403_FORBIDDEN, "Registration refused.")
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _UNSIGNED_REGISTER_REFUSED,
+                )
+            try:
+                allowed, _ip_failures, _global_failures = await claim_pairing_attempt(client_ip)
+            except PairingThrottleUnavailable:
+                await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Registration is paused: the attempt limiter is unavailable. Retrying shortly.",
+                    headers={"Retry-After": "60"},
+                ) from None
+            if not allowed:
+                await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "Too many failed registration attempts. Try again in 15 minutes.",
+                    headers={"Retry-After": "900"},
+                )
+            db.add(
+                AuditLog(
+                    user_id=None,
+                    user_display_name="anonymous supervisor",
+                    auth_source="anonymous",
+                    source_ip=client_ip,
+                    action="appliance.supervisor_register_unsigned",
+                    resource_type="appliance",
+                    resource_id=str(existing.id),
+                    resource_display=existing.hostname or str(existing.id),
+                    result="success",
+                    new_value={
+                        "fingerprint": pubkey_fingerprint,
+                        "last_reported_version": existing.supervisor_version,
+                        "submitted_version": body.supervisor_version,
+                    },
+                )
+            )
             logger.warning(
                 "supervisor_register_unsigned",
                 appliance_id=str(existing.id),
