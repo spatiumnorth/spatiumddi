@@ -102,19 +102,28 @@ function open() {
 }
 
 // The first test pays the cold import of DeviceFormModal; on a busy CI
-// runner that alone came to 5,014 ms, past the 5 s vitest default.
-describe("network device Edit dialog (#4370)", { timeout: 15000 }, () => {
+// runner that alone came to 5,014 ms, past the 5 s vitest default; and a
+// starved runner has let a 5 s wait for the Save expire too, so each wait
+// here has 10 s.
+describe("network device Edit dialog (#4370)", { timeout: 30000 }, () => {
   it("opens on what is stored now and a Save sends only what was changed", async () => {
     h.get.mockResolvedValue(NEWER);
     open();
-    await screen.findByDisplayValue("changed elsewhere", {}, { timeout: 5000 });
+    await screen.findByDisplayValue(
+      "changed elsewhere",
+      {},
+      { timeout: 10000 },
+    );
     expect(screen.queryByDisplayValue("old description")).toBeNull();
     fireEvent.change(screen.getByDisplayValue("300"), {
       target: { value: "600" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(screen.getByDisplayValue("600")).toBeTruthy();
+    const save = screen.getByRole("button", { name: "Save" });
+    expect((save as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(save);
     await waitFor(() => expect(h.update).toHaveBeenCalledTimes(1), {
-      timeout: 5000,
+      timeout: 10000,
     });
     expect(h.update).toHaveBeenCalledWith("d1", {
       poll_interval_seconds: 600,
@@ -124,12 +133,19 @@ describe("network device Edit dialog (#4370)", { timeout: 15000 }, () => {
   it("a changed description is sent, and nothing else", async () => {
     h.get.mockResolvedValue(NEWER);
     open();
-    fireEvent.change(await screen.findByDisplayValue("changed elsewhere"), {
-      target: { value: "mine" },
-    });
+    fireEvent.change(
+      await screen.findByDisplayValue(
+        "changed elsewhere",
+        {},
+        { timeout: 10000 },
+      ),
+      {
+        target: { value: "mine" },
+      },
+    );
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(h.update).toHaveBeenCalledTimes(1), {
-      timeout: 5000,
+      timeout: 10000,
     });
     expect(h.update).toHaveBeenCalledWith("d1", { description: "mine" });
   });
@@ -137,7 +153,11 @@ describe("network device Edit dialog (#4370)", { timeout: 15000 }, () => {
   it("a failed read opens no form", async () => {
     h.get.mockRejectedValue(new Error("boom"));
     open();
-    await screen.findByText(/Couldn't read the current values/);
+    await screen.findByText(
+      /Couldn't read the current values/,
+      {},
+      { timeout: 10000 },
+    );
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 });
