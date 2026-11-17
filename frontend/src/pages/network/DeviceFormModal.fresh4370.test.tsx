@@ -101,7 +101,9 @@ function open() {
   );
 }
 
-describe("network device Edit dialog (#4370)", () => {
+// The first test pays the cold import of DeviceFormModal; on a busy CI
+// runner that alone came to 5,014 ms, past the 5 s vitest default.
+describe("network device Edit dialog (#4370)", { timeout: 15000 }, () => {
   it("opens on what is stored now and a Save sends only what was changed", async () => {
     h.get.mockResolvedValue(NEWER);
     open();
