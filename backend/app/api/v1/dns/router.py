@@ -12802,14 +12802,18 @@ def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
+_PAST_TENSE = {"edit": "edited", "delete": "deleted", "add": "added", "create": "created"}
+
+
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
     """Same gate, applied to records belonging to a synthesised zone."""
+    done = _PAST_TENSE.get(op, f"{op}ed")
     if record.tailscale_tenant_id is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12818,7 +12822,7 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12827,8 +12831,8 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is managed by a DNS pool and cannot "
-                f"be {op}ed manually. Edits would be overwritten on the next "
-                f"health-check pass — manage the pool / member instead."
+                f"be {done} manually. Edits would be overwritten on the next "
+                f"health-check pass — a superadmin manages the pool or its member."
             ),
         )
 
