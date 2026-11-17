@@ -20,7 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_permission
