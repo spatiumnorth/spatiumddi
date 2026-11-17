@@ -23,7 +23,11 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.services.csv_text import CSVReadError, read_csv_table
-from app.services.ipam_io.export import ADDRESS_COMPUTED_COLUMNS, SUBNET_COMPUTED_COLUMNS
+from app.services.ipam_io.export import (
+    ADDRESS_COMPUTED_COLUMNS,
+    SUBNET_COMPUTED_COLUMNS,
+    unescape_cell,
+)
 
 
 @dataclass
@@ -88,12 +92,14 @@ def _row_to_subnet(row: dict[str, Any], skipped: set[str] | None = None) -> dict
     for raw_key, value in row.items():
         if raw_key is None:
             continue
-        key = raw_key.strip()
+        key = unescape_cell(raw_key.strip())
         if not key:
             continue
         norm = key.lower()
         if value == "":
             value = None
+        # Undo the export's formula escape (every value cell it writes).
+        value = unescape_cell(value)
         if _norm_header(key) in SUBNET_COMPUTED_COLUMNS:
             if skipped is not None:
                 skipped.add(_norm_header(key))
@@ -158,12 +164,14 @@ def _row_to_address(row: dict[str, Any], skipped: set[str] | None = None) -> dic
     for raw_key, value in row.items():
         if raw_key is None:
             continue
-        key = raw_key.strip()
+        key = unescape_cell(raw_key.strip())
         if not key:
             continue
         norm = key.lower().replace(" ", "_")
         if value == "":
             value = None
+        # Undo the export's formula escape (every value cell it writes).
+        value = unescape_cell(value)
         if norm in ADDRESS_COMPUTED_COLUMNS:
             if skipped is not None:
                 skipped.add(norm)

@@ -232,6 +232,8 @@ def _is_subnet_of(
 # file is opened. Prefix any such value with a single quote so the spreadsheet
 # renders it as literal text — the apostrophe is the canonical,
 # Excel/LibreOffice-recognised escape and stays hidden in the cell display.
+# Header cells take the same escape: a custom-field key is operator-supplied
+# text too, and the importer strips it back off (``unescape_cell``).
 _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -242,7 +244,9 @@ def _sanitize_cell(value: Any) -> Any:
     ``None`` and booleans pass through unchanged so numeric columns
     (``utilization_percent``, ``vlan_id``, …) keep their type in XLSX.
     """
-    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+    if isinstance(value, str) and value.lstrip("'").startswith(_FORMULA_TRIGGERS):
+        # Also when apostrophes come first: ``'=lit`` is written ``''=lit``, so
+        # the importer can tell it from an escaped ``=lit`` (#4351).
         return "'" + value
     return value
 
@@ -273,6 +277,21 @@ FORMULA_TRIGGERS = _FORMULA_TRIGGERS
 sanitize_cell = _sanitize_cell
 
 
+def unescape_cell(value: Any) -> Any:
+    """Undo the export's formula escape, and nothing more.
+
+    The export writes one more apostrophe in front of any text whose part after
+    its leading apostrophes begins with a formula trigger (``=v`` becomes
+    ``'=v``, ``'=lit`` becomes ``''=lit``). This removes exactly one, so the
+    round trip is exact. Text such as ``'abc`` is never touched, and nothing
+    is ever evaluated: a leading ``=`` is text.
+    """
+    if isinstance(value, str) and value.startswith("'"):
+        if value.lstrip("'").startswith(FORMULA_TRIGGERS):
+            return value[1:]
+    return value
+
+
 # ── Serialisers ────────────────────────────────────────────────────────────────
 
 
@@ -287,7 +306,7 @@ def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
                 cf_keys.append(k)
     headers = ADDRESS_COLUMNS + cf_keys
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
-    writer.writeheader()
+    writer.writerow({h: _sanitize_cell(h) for h in headers})
     for row in addresses:
         out = {k: _sanitize_cell(row.get(k)) for k in ADDRESS_COLUMNS}
         for k in cf_keys:
@@ -318,7 +337,7 @@ def _to_csv(bundle: ExportBundle) -> bytes:
                 cf_keys.append(k)
     headers = SUBNET_COLUMNS + cf_keys
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
-    writer.writeheader()
+    writer.writerow({h: _sanitize_cell(h) for h in headers})
     for row in bundle.subnets:
         out = {k: _sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS}
         for k in cf_keys:
@@ -358,7 +377,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
                 seen.add(k)
                 cf_keys.append(k)
     headers = SUBNET_COLUMNS + cf_keys
-    ws.append(headers)
+    ws.append([_sanitize_cell(h) for h in headers])
     for row in bundle.subnets:
         base = [_xlsx_number(_sanitize_cell(row.get(k))) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
@@ -392,7 +411,7 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
                 if k not in addr_seen:
                     addr_seen.add(k)
                     addr_cf_keys.append(k)
-        addr_ws.append(ADDRESS_COLUMNS + addr_cf_keys)
+        addr_ws.append([_sanitize_cell(h) for h in ADDRESS_COLUMNS + addr_cf_keys])
         for a in bundle.addresses:
             base = [_sanitize_cell(a.get(k)) for k in ADDRESS_COLUMNS]
             cf = a.get("custom_fields") or {}
