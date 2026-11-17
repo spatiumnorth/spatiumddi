@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import {
@@ -58,6 +60,28 @@ const V3_PRIV_PROTOCOLS: NetworkV3PrivProtocol[] = [
 // the operator can either clear the value or paste a new one — leaving
 // it untouched keeps whatever the backend already has stored.
 export function DeviceFormModal({
+  device,
+  onClose,
+}: {
+  device?: NetworkDeviceRead;
+  onClose: () => void;
+}) {
+  // Edit reads the device when it opens (#4370); the form is seeded once, and
+  // the row the list or detail page holds may predate another client's change.
+  if (!device) return <DeviceForm onClose={onClose} />;
+  return (
+    <FreshEdit
+      row={device}
+      load={() => networkApi.getDevice(device.id)}
+      title="Edit device"
+      onClose={onClose}
+    >
+      {(fresh) => <DeviceForm device={fresh} onClose={onClose} />}
+    </FreshEdit>
+  );
+}
+
+function DeviceForm({
   device,
   onClose,
 }: {
@@ -288,7 +312,19 @@ export function DeviceFormModal({
   const saveMut = useMutation({
     mutationFn: () => {
       if (editing) {
-        return networkApi.updateDevice(device!.id, buildUpdatePayload());
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4370). The row has null where the form holds "".
+        const body = changedFields(
+          {
+            ...device!,
+            hostname: device!.hostname ?? "",
+            v3_security_name: device!.v3_security_name ?? "",
+            v3_context_name: device!.v3_context_name ?? "",
+          },
+          buildUpdatePayload(),
+        );
+        if (Object.keys(body).length === 0) return Promise.resolve(device!);
+        return networkApi.updateDevice(device!.id, body);
       }
       return networkApi.createDevice(buildCreatePayload());
     },

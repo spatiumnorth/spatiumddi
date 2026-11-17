@@ -10792,23 +10792,15 @@ async def bulk_delete_records(
     # zone skipped every record and returned ``deleted: 0`` while the
     # singular route deleted the same rows (appliance sizing campaign,
     # 2026-09-02).
-    # Rows whose wire delete was DISPATCHED (queued or applied) — the ones
-    # about to leave the live table. Not "kept in the DB": that is the
-    # ``failed`` branch above.
+    # Rows whose wire delete was DISPATCHED (queued or applied) or had no
+    # server to go to — the ones about to leave the live table. Not "kept in
+    # the DB": that is the ``failed`` branch above.
     dispatched: list[DNSRecord] = []
     for rec, op_row in zip(targets, op_rows, strict=True):
-        if op_row is None:
-            skipped.append(
-                {
-                    "record_id": str(rec.id),
-                    "reason": (
-                        "no enabled server in the zone's group to send it to — "
-                        "wire delete skipped"
-                    ),
-                }
-            )
-            continue
-        if op_row.state == "failed":
+        # ``None`` = no wire op was queued (a group with no server, #2276, or a
+        # paused agentless primary): nothing is published, so there is nothing
+        # to retract. The singular route deletes in that case too (#4368).
+        if op_row is not None and op_row.state == "failed":
             skipped.append(
                 {
                     "record_id": str(rec.id),

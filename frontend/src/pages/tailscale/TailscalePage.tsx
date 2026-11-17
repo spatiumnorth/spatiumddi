@@ -1,5 +1,7 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -351,7 +353,18 @@ export function TailscalePage() {
       </div>
 
       {showCreate && <TenantModal onClose={() => setShowCreate(false)} />}
-      {edit && <TenantModal tenant={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["tailscale-tenants"]]}
+          title="Edit Tailscale Tenant"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <TenantModal tenant={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {del && (
         <DeleteTenantModal
           tenant={del}
@@ -456,7 +469,12 @@ function TenantModal({
         } else if (!expiryReadFromApi && expiresOn !== initialExpiresOn) {
           update.api_key_expires_at = expiresOnToIso(expiresOn);
         }
-        return tailscaleApi.updateTenant(tenant!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(tenant!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(tenant!);
+        return tailscaleApi.updateTenant(tenant!.id, body);
       }
       const create: TailscaleTenantCreate = {
         name,

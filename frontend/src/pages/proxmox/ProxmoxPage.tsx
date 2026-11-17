@@ -1,5 +1,7 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -363,7 +365,16 @@ export function ProxmoxPage() {
       </div>
 
       {showCreate && <NodeModal onClose={() => setShowCreate(false)} />}
-      {edit && <NodeModal node={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["proxmox-nodes"]]}
+          title="Edit Proxmox Endpoint"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => <NodeModal node={fresh} onClose={() => setEdit(null)} />}
+        </FreshEdit>
+      )}
       {discover && (
         <DiscoveryModal node={discover} onClose={() => setDiscover(null)} />
       )}
@@ -820,7 +831,12 @@ function NodeModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (tokenSecret) update.token_secret = tokenSecret;
-        return proxmoxApi.updateNode(node!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(node!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(node!);
+        return proxmoxApi.updateNode(node!.id, body);
       }
       const create: ProxmoxNodeCreate = {
         name,

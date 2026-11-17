@@ -468,6 +468,10 @@ async def update_device_policy(
     # a class by name, so regenerating it here would leave every pool with
     # a ``client-class`` naming a class that no longer exists — which Kea
     # accepts and which silently stops the pool serving anyone.
+    if changes.get("enabled") is False and row.enabled:
+        # The bundle renders enabled policies only, so a disable takes the
+        # class away from every pool (live or in the Trash) that names it (#4362).
+        await refuse_if_name_referenced(db, row.group_id, row.class_name, "disable device policy")
     before = snapshot(row, changes)
     for k, v in changes.items():
         setattr(row, k, v)

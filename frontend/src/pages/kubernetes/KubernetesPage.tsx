@@ -1,5 +1,7 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -390,7 +392,18 @@ export function KubernetesPage() {
       </div>
 
       {showCreate && <ClusterModal onClose={() => setShowCreate(false)} />}
-      {edit && <ClusterModal cluster={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["kubernetes-clusters"]]}
+          title="Edit Kubernetes Cluster"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <ClusterModal cluster={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {del && (
         <DeleteClusterModal
           cluster={del}
@@ -515,7 +528,12 @@ function ClusterModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (token) update.token = token;
-        return kubernetesApi.updateCluster(cluster!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(cluster!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(cluster!);
+        return kubernetesApi.updateCluster(cluster!.id, body);
       }
       if (!token) {
         throw new Error("Bearer token is required");

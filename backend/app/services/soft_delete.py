@@ -47,7 +47,12 @@ from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
 from app.services.dns.cname_conflict import describe_cname_conflict
-from app.services.ipam.orphan_aliases import orphan_record_owners, orphan_record_reason
+from app.services.ipam.orphan_aliases import (
+    orphan_record_owners,
+    orphan_record_reason,
+    superseded_record_owners,
+    superseded_record_reason,
+)
 
 # Types the trash UI browses, and that ``restore_row`` /
 # ``permanent_delete_from_trash`` accept as an addressable target. Cascade-only
@@ -854,6 +859,21 @@ async def restore_batch(
                     "reason": orphan_record_reason(address),
                 }
             )
+        # #4361 — and one whose address was renamed (or blanked) meanwhile.
+        for rid, (fqdn, rtype, address) in (
+            await superseded_record_owners(db, batch_id=batch_id)
+        ).items():
+            if rid in record_conflicts or rid in record_parent_conflicts:
+                continue
+            record_parent_conflicts[rid] = superseded_record_reason(address)
+            result.conflicts.append(
+                {
+                    "type": "dns_record",
+                    "id": str(rid),
+                    "display": _record_label(fqdn, rtype),
+                    "reason": superseded_record_reason(address),
+                }
+            )
 
     # Look up every row across all in-scope models. Each query opts into
     # include_deleted so it can see soft-deleted rows; without that the
@@ -1220,6 +1240,31 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
                     )
                 except HTTPException as exc:
                     return str(exc.detail)
+
+    elif isinstance(obj, DHCPPool):
+        # #4362: a restore brings the pool back with its class restriction, and
+        # the class may have stopped being rendered meanwhile (a PXE / phone
+        # profile disabled, a class removed). Kea accepts the dangling reference
+        # and never matches it, so apply the rule the pool API applies to a new
+        # pool rather than restore a pool that serves no client.
+        if obj.class_restriction:
+            from app.api.v1.dhcp.pools import _check_class_family  # noqa: PLC0415
+
+            pool_scope_stmt: Any = (
+                select(DHCPScope)
+                .where(DHCPScope.id == obj.scope_id)
+                .execution_options(include_deleted=True)
+            )
+            pool_scope = (await db.execute(pool_scope_stmt)).scalar_one_or_none()
+            if pool_scope is not None:
+                try:
+                    await _check_class_family(db, pool_scope, obj.class_restriction)
+                except HTTPException as exc:
+                    return (
+                        f"Pool {obj.start_ip}-{obj.end_ip} is restricted to a client class "
+                        f"that is no longer available: {exc.detail} Clear or change the "
+                        "pool's class restriction, or re-enable the class's profile, first."
+                    )
 
     elif isinstance(obj, DHCPStaticAssignment):
         # A reservation's MAC is unique across the whole group, not just the
