@@ -28,6 +28,8 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { exportErrorMessage, isRefused } from "@/lib/refusal";
@@ -383,11 +385,20 @@ export function ConformityPage() {
         />
       )}
       {editing && (
-        <PolicyEditorModal
-          existing={editing}
-          checks={checksQ.data ?? []}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["conformity-policies"]]}
+          title="Edit conformity policy"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <PolicyEditorModal
+              existing={fresh}
+              checks={checksQ.data ?? []}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );
@@ -791,7 +802,14 @@ function PolicyEditorModal({
         update.severity = severity;
         update.enabled = enabled;
         update.eval_interval_hours = intervalHours;
-        return conformityApi.updatePolicy(existing.id, update);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379); a null description is shown as "".
+        const changed = changedFields(
+          { ...existing, description: existing.description ?? "" },
+          update,
+        );
+        if (Object.keys(changed).length === 0) return existing;
+        return conformityApi.updatePolicy(existing.id, changed);
       }
       const body: ConformityPolicyCreate = {
         name,

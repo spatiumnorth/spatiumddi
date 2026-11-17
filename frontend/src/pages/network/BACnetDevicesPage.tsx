@@ -14,6 +14,8 @@ import {
   type BACnetSegmentation,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
@@ -475,13 +477,29 @@ export function BACnetDevicesPage() {
         </section>
       </div>
 
-      {modal && (
-        <DeviceModal
-          mode={modal.mode}
-          device={modal.mode === "edit" ? modal.device : null}
-          onClose={() => setModal(null)}
-        />
-      )}
+      {modal &&
+        (modal.mode === "edit" ? (
+          <FreshEdit
+            row={modal.device}
+            queryKeys={[["bacnet-devices"]]}
+            title="Edit BACnet device"
+            onClose={() => setModal(null)}
+          >
+            {(fresh) => (
+              <DeviceModal
+                mode="edit"
+                device={fresh}
+                onClose={() => setModal(null)}
+              />
+            )}
+          </FreshEdit>
+        ) : (
+          <DeviceModal
+            mode="create"
+            device={null}
+            onClose={() => setModal(null)}
+          />
+        ))}
       <ConfirmModal
         open={del !== null}
         title="Delete BACnet device"
@@ -623,7 +641,11 @@ function DeviceModal({
           ip_address_id: ipAddressId ?? undefined,
           device_instance: Number(instance.trim()),
         };
-        return bacnetApi.updateDevice(device.id, body);
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(device, body);
+        if (Object.keys(diff).length === 0) return Promise.resolve(device);
+        return bacnetApi.updateDevice(device.id, diff);
       }
       const body: BACnetDeviceCreate = {
         ...shared,

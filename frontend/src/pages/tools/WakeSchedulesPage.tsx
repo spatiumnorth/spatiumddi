@@ -19,6 +19,8 @@ import {
 } from "lucide-react";
 
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
@@ -596,17 +598,36 @@ function SchedulesTab() {
         </table>
       </div>
 
-      {editing && (
-        <WolScheduleModal
-          existing={editing.mode === "edit" ? editing.schedule : null}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
+      {editing &&
+        (() => {
+          const onSaved = () => {
             setEditing(null);
             qc.invalidateQueries({ queryKey: ["wol-schedules"] });
             qc.invalidateQueries({ queryKey: ["wol-schedule-preview"] });
-          }}
-        />
-      )}
+          };
+          return editing.mode === "edit" ? (
+            <FreshEdit
+              row={editing.schedule}
+              queryKeys={[["wol-schedules"]]}
+              title="Edit wake schedule"
+              onClose={() => setEditing(null)}
+            >
+              {(fresh) => (
+                <WolScheduleModal
+                  existing={fresh}
+                  onClose={() => setEditing(null)}
+                  onSaved={onSaved}
+                />
+              )}
+            </FreshEdit>
+          ) : (
+            <WolScheduleModal
+              existing={null}
+              onClose={() => setEditing(null)}
+              onSaved={onSaved}
+            />
+          );
+        })()}
 
       {detailSchedule && (
         <ScheduleDetailModal
@@ -1465,16 +1486,35 @@ function CalendarsTab() {
         </table>
       </div>
 
-      {editing && (
-        <CalendarModal
-          existing={editing.mode === "edit" ? editing.calendar : null}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
+      {editing &&
+        (() => {
+          const onSaved = () => {
             setEditing(null);
             invalidate();
-          }}
-        />
-      )}
+          };
+          return editing.mode === "edit" ? (
+            <FreshEdit
+              row={editing.calendar}
+              queryKeys={[["wol-calendars"]]}
+              title="Edit calendar subscription"
+              onClose={() => setEditing(null)}
+            >
+              {(fresh) => (
+                <CalendarModal
+                  existing={fresh}
+                  onClose={() => setEditing(null)}
+                  onSaved={onSaved}
+                />
+              )}
+            </FreshEdit>
+          ) : (
+            <CalendarModal
+              existing={null}
+              onClose={() => setEditing(null)}
+              onSaved={onSaved}
+            />
+          );
+        })()}
 
       <ConfirmModal
         open={!!confirm}
@@ -1652,9 +1692,14 @@ function CalendarModal({
           enabled,
           refresh_interval_minutes: refreshInterval,
         };
-        if (clearPassword) body.password = "";
-        else if (password) body.password = password;
-        return wakeSchedulesApi.updateCalendar(existing.id, body);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379); a typed or cleared password is never in the row, so
+        // it is always sent, and a blank one is kept.
+        const changed = changedFields(existing, body);
+        if (clearPassword) changed.password = "";
+        else if (password) changed.password = password;
+        if (Object.keys(changed).length === 0) return Promise.resolve(existing);
+        return wakeSchedulesApi.updateCalendar(existing.id, changed);
       }
       const body: WolCalendarCreate = {
         name: name.trim(),
@@ -2029,9 +2074,12 @@ function WolScheduleModal({
         verify_method: verifyMethod,
         verify_alert_enabled: verifyAlertEnabled,
       };
-      return existing
-        ? wakeSchedulesApi.update(existing.id, body)
-        : wakeSchedulesApi.create(body);
+      if (!existing) return wakeSchedulesApi.create(body);
+      // Only what the operator changed against the row read when the dialog
+      // opened (#4379), so a field another client set since is kept.
+      const changed = changedFields(existing, body);
+      if (Object.keys(changed).length === 0) return Promise.resolve(existing);
+      return wakeSchedulesApi.update(existing.id, changed);
     },
     onSuccess: onSaved,
     onError: (e) => setError(formatApiError(e, "Failed to save schedule")),

@@ -56,6 +56,8 @@ import { featureModulesApi } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
@@ -491,9 +493,13 @@ function PolicyEditor({
       // the full axios response so the #62 self-governance lock's 202
       // approval-queue envelope (weakening a policy while the lock is on) is
       // observable.
-      return existing
-        ? changeRequestsApi.updatePolicy(existing.id, body)
-        : changeRequestsApi.createPolicy(body);
+      if (!existing) return changeRequestsApi.createPolicy(body);
+      // Only what the operator changed against the row read when the dialog
+      // opened (#4379); nothing changed sends nothing (an unwrapped row reads
+      // as "executed inline" below).
+      const changed = changedFields(existing, body);
+      if (Object.keys(changed).length === 0) return Promise.resolve(existing);
+      return changeRequestsApi.updatePolicy(existing.id, changed);
     },
     onSuccess: (resp) => {
       // #62: a weakening edit (disable / lower applies_to_superadmin) returns
@@ -792,15 +798,28 @@ function PoliciesTab() {
         </div>
       )}
 
-      {(creating || editing) && (
+      {creating && (
         <PolicyEditor
-          existing={editing}
-          onClose={() => {
-            setCreating(false);
-            setEditing(null);
-          }}
+          existing={null}
+          onClose={() => setCreating(false)}
           onQueued={() => setQueuedNotice(APPROVAL_QUEUED_MESSAGE)}
         />
+      )}
+      {editing && (
+        <FreshEdit
+          row={editing}
+          queryKeys={[["change-requests", "policies"]]}
+          title="Edit approval policy"
+          onClose={() => setEditing(null)}
+        >
+          {(fresh) => (
+            <PolicyEditor
+              existing={fresh}
+              onClose={() => setEditing(null)}
+              onQueued={() => setQueuedNotice(APPROVAL_QUEUED_MESSAGE)}
+            />
+          )}
+        </FreshEdit>
       )}
 
       <ConfirmModal

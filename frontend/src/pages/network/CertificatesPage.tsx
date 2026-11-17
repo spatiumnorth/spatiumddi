@@ -1,4 +1,6 @@
 import { useState, type ReactNode } from "react";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
@@ -253,7 +255,13 @@ function CertTargetEditorModal({
         interval_hours: parsedInterval,
         enabled,
       };
-      if (existing) return tlsCertsApi.update(existing.id, body);
+      if (existing) {
+        // Only what the operator changed against the row read when the
+        // dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return tlsCertsApi.update(existing.id, changed);
+      }
       return tlsCertsApi.create(body as TLSCertTargetCreate);
     },
     onSuccess: (saved) => {
@@ -1095,10 +1103,19 @@ export function CertificatesPage() {
           />
         )}
         {editing && (
-          <CertTargetEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => tlsCertsApi.get(editing.id)}
+            title="Edit certificate target"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CertTargetEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

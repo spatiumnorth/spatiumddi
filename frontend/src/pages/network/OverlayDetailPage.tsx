@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -501,11 +503,20 @@ function SitesTab({ overlayId }: { overlayId: string }) {
         />
       )}
       {editing && (
-        <SiteEditorModal
-          overlayId={overlayId}
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["overlay-sites", overlayId]]}
+          title="Edit overlay site"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <SiteEditorModal
+              overlayId={overlayId}
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={confirmDetachId !== null}
@@ -732,7 +743,10 @@ function SiteEditorModal({
         notes,
       };
       if (existing) {
-        return overlaysApi.updateSite(overlayId, existing.id, body);
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return overlaysApi.updateSite(overlayId, existing.id, changed);
       }
       return overlaysApi.attachSite(overlayId, { site_id: siteId, ...body });
     },
@@ -1151,11 +1165,20 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
         />
       )}
       {editing && (
-        <PolicyEditorModal
-          overlayId={overlayId}
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["overlay-policies", overlayId]]}
+          title="Edit routing policy"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <PolicyEditorModal
+              overlayId={overlayId}
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={confirm !== null}
@@ -1227,7 +1250,10 @@ function PolicyEditorModal({
         notes,
       };
       if (existing) {
-        return overlaysApi.updatePolicy(overlayId, existing.id, body);
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return overlaysApi.updatePolicy(overlayId, existing.id, changed);
       }
       return overlaysApi.createPolicy(overlayId, body as RoutingPolicyCreate);
     },
