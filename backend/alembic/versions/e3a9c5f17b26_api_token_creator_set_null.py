@@ -12,7 +12,7 @@ The downgrade restores NOT NULL, filling a cleared creator with the token's
 owner first (nothing issues an ownerless token, so every row has one).
 
 Revision ID: e3a9c5f17b26
-Revises: c4e8a2d6b917
+Revises: b6d2e9f41a07
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "e3a9c5f17b26"
-down_revision: str | None = "c4e8a2d6b917"
+down_revision: str | None = "b6d2e9f41a07"
 branch_labels = None
 depends_on = None
 
