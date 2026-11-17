@@ -15,6 +15,7 @@ import {
   staticMacField,
 } from "@/lib/formPayloads";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 type StaticModalProps = {
   staticAssignment?: DHCPStaticAssignment;
@@ -218,9 +219,9 @@ function StaticModalForm({
           />
         </Field>
         {error && (
-          <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <Btns
           onClose={onClose}

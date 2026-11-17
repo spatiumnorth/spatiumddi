@@ -32,6 +32,7 @@ import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // OT / industrial device registry + Purdue zoning (issue #542, part of
 // #543). Read-only identification: nothing here probes, scans, reads a
@@ -123,6 +124,7 @@ export function OTDevicesPage() {
       qc.invalidateQueries({ queryKey: ["ot-zones"] });
       setDeleteDevice(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["ot-devices"] }),
   });
 
   const deleteZoneMut = useMutation({
@@ -131,6 +133,7 @@ export function OTDevicesPage() {
       qc.invalidateQueries({ queryKey: ["ot-zones"] });
       setDeleteZone(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["ot-zones"] }),
   });
 
   return (
@@ -559,10 +562,20 @@ export function OTDevicesPage() {
         title="Delete OT descriptor"
         message={
           <>
-            Delete the OT descriptor for{" "}
-            <span className="font-mono">{deleteDevice?.address}</span>? This
-            says &ldquo;no longer an OT device&rdquo;, not &ldquo;this address
-            is free&rdquo; — the IPAM row itself is untouched.
+            <>
+              Delete the OT descriptor for{" "}
+              <span className="font-mono">{deleteDevice?.address}</span>? This
+              says &ldquo;no longer an OT device&rdquo;, not &ldquo;this address
+              is free&rdquo; — the IPAM row itself is untouched.
+            </>
+            {deleteDeviceMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(
+                  deleteDeviceMut.error,
+                  "Failed to delete OT descriptor",
+                )}
+              </p>
+            )}
           </>
         }
         tone="destructive"
@@ -571,24 +584,40 @@ export function OTDevicesPage() {
         onConfirm={() =>
           deleteDevice && deleteDeviceMut.mutate(deleteDevice.id)
         }
-        onClose={() => setDeleteDevice(null)}
+        onClose={() => {
+          setDeleteDevice(null);
+          deleteDeviceMut.reset();
+        }}
       />
       <ConfirmModal
         open={deleteZone !== null}
         title="Delete Purdue zone"
         message={
           <>
-            Un-zone{" "}
-            <span className="font-mono">{deleteZone?.subnet_network}</span>?
-            Devices inside keep their own declared levels; they simply stop
-            having a zone to be compared against.
+            <>
+              Un-zone{" "}
+              <span className="font-mono">{deleteZone?.subnet_network}</span>?
+              Devices inside keep their own declared levels; they simply stop
+              having a zone to be compared against.
+            </>
+            {deleteZoneMut.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatApiError(
+                  deleteZoneMut.error,
+                  "Failed to delete Purdue zone",
+                )}
+              </p>
+            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteZoneMut.isPending}
         onConfirm={() => deleteZone && deleteZoneMut.mutate(deleteZone.id)}
-        onClose={() => setDeleteZone(null)}
+        onClose={() => {
+          setDeleteZone(null);
+          deleteZoneMut.reset();
+        }}
       />
     </div>
   );
@@ -820,7 +849,9 @@ function DeviceModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -984,7 +1015,9 @@ function ZoneModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button

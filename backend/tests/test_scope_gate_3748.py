@@ -19,7 +19,6 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dhcp.agents import _auth_agent
@@ -34,32 +33,60 @@ from tests.test_lease_events_trashed_scope_3733 import (
 _KEY_SHARE = "SELECT id FROM dhcp_scope WHERE id = :s FOR KEY SHARE"
 
 
-async def _holder(scope_id: Any, offset: float, stop: asyncio.Event, gated: bool) -> None:
-    """A batch stand-in: gate (shared) then the scope ``FOR KEY SHARE``, held
-    0.4 s, in a loop. Two of them, offset by half a hold, keep a share lock
-    on the row at every instant."""
-    from app.services.lock_order import lock_scope_gates  # noqa: PLC0415
-
-    await asyncio.sleep(offset)
-    while not stop.is_set():
-        async with _TestSessionLocal() as db:
-            if gated:
-                await lock_scope_gates(db, [scope_id], exclusive=False)
-            await db.execute(text(_KEY_SHARE), {"s": scope_id})
-            await asyncio.sleep(0.4)
-            await db.commit()
+async def _wait_until(predicate: Any, what: str, timeout: float = 15.0) -> None:
+    """Poll an async predicate; a timeout is an infrastructure failure (the
+    state never arose), not the behaviour under test."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not await predicate():
+        assert loop.time() < end, f"never observed: {what}"
+        await asyncio.sleep(0.02)
 
 
-async def _delete_like(scope_id: Any, gated: bool) -> None:
+async def _lock_waiting(pid: int) -> bool:
+    """True when backend ``pid`` is blocked on a heavyweight lock (tuple,
+    transactionid or advisory), as ``pg_stat_activity`` reports it."""
+    async with _TestSessionLocal() as obs:
+        row = await obs.execute(
+            text("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :p"), {"p": pid}
+        )
+        return row.scalar_one_or_none() == "Lock"
+
+
+async def _batch_standin(
+    scope_id: Any,
+    gated: bool,
+    pid_out: list[int],
+    acquired: asyncio.Event,
+    release: asyncio.Event,
+    order: list[str],
+) -> None:
+    """A lease batch: gate (shared) then the scope ``FOR KEY SHARE``, held
+    until ``release`` is set."""
     from app.services.lock_order import lock_scope_gates  # noqa: PLC0415
 
     async with _TestSessionLocal() as db:
-        await db.execute(text("SET LOCAL statement_timeout = '4s'"))
+        pid_out.append((await db.execute(text("SELECT pg_backend_pid()"))).scalar_one())
+        if gated:
+            await lock_scope_gates(db, [scope_id], exclusive=False)
+        await db.execute(text(_KEY_SHARE), {"s": scope_id})
+        order.append("batch")
+        acquired.set()
+        await release.wait()
+        await db.commit()
+
+
+async def _delete_like(scope_id: Any, gated: bool, pid_out: list[int], order: list[str]) -> None:
+    from app.services.lock_order import lock_scope_gates  # noqa: PLC0415
+
+    async with _TestSessionLocal() as db:
+        pid_out.append((await db.execute(text("SELECT pg_backend_pid()"))).scalar_one())
         if gated:
             await lock_scope_gates(db, [scope_id], exclusive=True)
         await db.execute(
             text("SELECT id FROM dhcp_scope WHERE id = :s FOR UPDATE"), {"s": scope_id}
         )
+        order.append("delete")  # recorded while still holding the row
         await db.commit()
 
 
@@ -68,24 +95,61 @@ async def _delete_like(scope_id: Any, gated: bool) -> None:
 async def test_overlapping_key_shares_starve_a_for_update_unless_gated(
     db_session: AsyncSession, gated: bool
 ) -> None:
-    """Ungated, the FOR UPDATE times out behind two alternating KEY SHAREs (the
-    reported 503); gated, it gets the row as soon as the running batches end."""
+    """Driven by lock-wait evidence, not timing. Batch A holds the scope; the
+    delete queues behind it (observed waiting); then batch B arrives and A
+    ends. Ungated, B joins A's KEY SHARE past the queued FOR UPDATE and the
+    delete is still blocked after A is gone (the reported 503); gated, B
+    queues behind the delete's exclusive gate, so the delete gets the row as
+    soon as A ends and B only runs after it."""
     _server, scope_id, _subnet, _admin = await _estate(db_session)
     app.dependency_overrides.pop(_auth_agent, None)
-    stop = asyncio.Event()
-    holders = [asyncio.create_task(_holder(scope_id, off, stop, gated)) for off in (0.0, 0.2)]
+    a_pid: list[int] = []
+    b_pid: list[int] = []
+    d_pid: list[int] = []
+    order: list[str] = []
+    a_in, b_in = asyncio.Event(), asyncio.Event()
+    a_out, b_out = asyncio.Event(), asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = []
     try:
-        await asyncio.sleep(0.5)
+        task_a = asyncio.create_task(_batch_standin(scope_id, gated, a_pid, a_in, a_out, order))
+        tasks.append(task_a)
+        await asyncio.wait_for(a_in.wait(), 15)
+
+        delete = asyncio.create_task(_delete_like(scope_id, gated, d_pid, order))
+        tasks.append(delete)
+
+        async def _d_waiting() -> bool:
+            return bool(d_pid) and await _lock_waiting(d_pid[0])
+
+        await _wait_until(_d_waiting, "the delete waiting behind batch A")
+
+        task_b = asyncio.create_task(_batch_standin(scope_id, gated, b_pid, b_in, b_out, order))
+        tasks.append(task_b)
         if gated:
-            await asyncio.wait_for(_delete_like(scope_id, True), 3.5)
+            # B queues behind the delete's exclusive gate instead of joining.
+            async def _b_waiting() -> bool:
+                return bool(b_pid) and await _lock_waiting(b_pid[0])
+
+            await _wait_until(_b_waiting, "batch B queued behind the delete's gate")
+            assert not b_in.is_set()
+            a_out.set()
+            await asyncio.wait_for(delete, 15)  # only A was ahead of it
+            await asyncio.wait_for(b_in.wait(), 15)  # and B runs after it
+            assert order == ["batch", "delete", "batch"], order
         else:
-            with pytest.raises(DBAPIError):
-                await _delete_like(scope_id, False)
+            await asyncio.wait_for(b_in.wait(), 15)  # B joined past the queue
+            a_out.set()
+            await asyncio.wait_for(task_a, 15)
+            # A is gone, yet the delete is still blocked: starved by B.
+            await asyncio.sleep(0.3)
+            assert not delete.done()
+            assert await _lock_waiting(d_pid[0])
     finally:
-        stop.set()
-        for h in holders:
-            with contextlib.suppress(BaseException):
-                await asyncio.wait_for(h, 5)
+        a_out.set()
+        b_out.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 30)
+    # B released: the ungated delete now completes (no deadlock, just starved).
+    assert delete.done() and delete.exception() is None
 
 
 @contextlib.contextmanager

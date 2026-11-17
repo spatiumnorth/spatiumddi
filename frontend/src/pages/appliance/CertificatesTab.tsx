@@ -39,6 +39,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { NEEDS_APPLIANCE_ADMIN } from "@/hooks/useApplianceAdmin";
+import { FormError } from "@/components/ui/form-error";
 
 /** #3067 — the store's own permission. Each store route also accepts the
  *  `appliance` grant it took before (`admin` for a write or delete). */
@@ -198,9 +199,9 @@ export function CertificatesTab() {
       {acmeModuleOn && <AcmeStatusBlock />}
 
       {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           Failed to load certificates: {formatApiError(error)}
-        </div>
+        </FormError>
       )}
 
       {isLoading ? (

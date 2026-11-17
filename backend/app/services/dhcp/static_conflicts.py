@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
 from app.services.dhcp.normalize import canonical_duid, canonicalize_mac
+from app.services.refusal import HTTPRefusal
 
 
 def resolve_static_identity(
@@ -90,11 +91,12 @@ async def check_static_conflicts(
         for row in same_mac.scalars().all():
             if exclude_id is not None and row.id == exclude_id:
                 continue
-            where = f" in scope {row.scope_id}" if name_other_scope else ""
-            raise HTTPException(
-                status_code=409,
-                detail=f"MAC {mac} already reserved in this group{where}",
-            )
+            plain = f"MAC {mac} already reserved in this group"
+            if not name_other_scope:
+                raise HTTPException(status_code=409, detail=plain)
+            # The caller may be an approver applying a portal request: the
+            # requester reads the failure and holds read on this scope only.
+            raise HTTPRefusal(409, f"{plain} in scope {row.scope_id}", requester_text=plain)
 
     if duid is not None:
         same_duid = await db.execute(
