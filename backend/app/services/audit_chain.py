@@ -201,6 +201,7 @@ def _service_account_actor(session: Session, user_id: object) -> bool:
     actor = session.identity_map.get(identity_key(User, uid))
     return actor is not None and getattr(actor, "is_service_account", False)
 
+
 #: Tables whose rows a writer locks BEFORE its audit row, so they must never
 #: be locked after the audit-chain lock (#3389, #3503). A record create bumps
 #: its zone's serial and flushes at once, holding the ``dns_zone`` row from
