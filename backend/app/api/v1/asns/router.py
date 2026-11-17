@@ -185,7 +185,7 @@ async def list_asns(
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
-    stmt = stmt.order_by(ASN.number.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(ASN.number.asc(), ASN.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
 
     return ASNListResponse(

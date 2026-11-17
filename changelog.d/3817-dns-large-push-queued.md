@@ -1,0 +1,3 @@
+### Fixed
+
+- Sync with Servers on an agentless DNS server (cloud providers, Technitium API) no longer pushes a large zone's records one provider call at a time inside the request, which could outrun the reverse-proxy timeout. Above 200 missing records they are queued as record ops and delivered, with retry, in the background, and the result, in the zone's dialog and in the server group's Sync with Servers dialog, says the records are queued for delivery rather than pushed; smaller zones still push inline. A zone move and the rollback of a failed zone delete still push inline whatever the size, because they delete or re-create the zone in the same request and a merely queued push would leave the target answering with an empty zone (#3817).

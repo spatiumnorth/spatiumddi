@@ -112,3 +112,24 @@ EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
     CMD wget -qO- "http://127.0.0.1:${FRONTEND_HTTP_PORT:-80}/nginx-health" || exit 1
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG APP_VERSION=dev
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="spatiumddi-frontend" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI web UI" \
+      description="nginx serving the SpatiumDDI React web UI and reverse-proxying the API." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="spatiumddi-frontend" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

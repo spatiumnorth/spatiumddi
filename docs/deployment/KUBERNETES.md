@@ -154,6 +154,30 @@ Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
+**Red Hat certification status.** The chart and images are **not** Red Hat
+certified. What ships today is the part that needs no Red Hat account: every
+image carries `name`, `vendor`, `version`, `release`, `summary`, `description`,
+`maintainer` and `url` labels (plus the `org.opencontainers.image.*` set) and the
+project `LICENSE` and `NOTICE` under `/licenses`; the chart has a
+`values.schema.json`, `charts.openshift.io/*` annotations in `Chart.yaml` and a
+`helm test` hook (`helm test <release>` checks the api and the frontend answer).
+Not done, and tracked in
+[#4020](https://github.com/spatiumnorth/spatiumddi/issues/4020) for 1.1.0: UBI-based
+image variants (the images keep their current Alpine / Debian bases) and the
+certification submission itself, which needs a Red Hat Partner Connect
+account. Two image checks are knowingly unmet: the frontend, `dns-bind9` and
+`dhcp-kea` images still start as root and drop privileges themselves (the
+chart already runs them under a random uid on OpenShift), so a `USER` line would
+break Docker Compose, which relies on the start-as-root volume chown.
+
+To run Red Hat's checks yourself, install
+[`openshift-preflight`](https://github.com/redhat-openshift-ecosystem/openshift-preflight)
+and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>`
+(add `--platform amd64`). Check-only mode needs no account; do not pass
+`--submit`. Expect `RunAsNonRoot` and `BasedOnUbi` failures on the images
+described above. For the chart, `chart-verifier verify` against the packaged
+`.tgz` runs the offline checks (`helm lint`, schema, annotations).
+
 ---
 
 ## 2. Install

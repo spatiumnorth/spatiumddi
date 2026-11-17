@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/clipboard";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { attemptReasonText, codeRequestFor } from "./pairingCodes";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Pairing codes tab (#169 + #170 Wave A3 reshape).
@@ -729,9 +730,9 @@ export function GenerateCodeModal({
             </label>
 
             {mutation.error && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
                 {formatApiError(mutation.error)}
-              </div>
+              </FormError>
             )}
 
             <div className="flex justify-end gap-2">
@@ -925,9 +926,9 @@ function RevealModal({
             autoFocus
           />
           {mutation.error && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
               {formatApiError(mutation.error)}
-            </div>
+            </FormError>
           )}
           <div className="flex justify-end gap-2">
             <button

@@ -131,18 +131,22 @@ def _describe(
     other_type: str,
     other_value: str,
     other_id: uuid.UUID | None,
+    *,
+    requester_safe: bool = False,
 ) -> str:
     name = fqdn.rstrip(".")
     rtype = record_type.strip().upper()
-    ref = f" (id {other_id})" if other_id is not None else ""
+    # A portal requester may hold no read on the zone: the words say which
+    # rule was hit, never the other record's value or id.
+    ref = f" (id {other_id})" if other_id is not None and not requester_safe else ""
+    to = "" if requester_safe else f" to {other_value}"
     if other_type.upper() == "CNAME":
         if rtype == "CNAME":
-            what = (
-                f"{name} already has a CNAME to {other_value}{ref}, "
-                "and a name holds at most one CNAME"
-            )
+            what = f"{name} already has a CNAME{to}{ref}, and a name holds at most one CNAME"
         else:
-            what = f"{name} is a CNAME to {other_value}{ref}, so it can hold no {rtype} record"
+            what = f"{name} is a CNAME{to}{ref}, so it can hold no {rtype} record"
+    elif requester_safe:
+        what = f"{name} already holds other data, so it cannot take a CNAME"
     else:
         what = f"{name} already holds data ({other_type} {other_value}{ref}), so it cannot take a CNAME"
     return (
@@ -152,9 +156,19 @@ def _describe(
     )
 
 
-def describe_cname_conflict(record_type: str, fqdn: str, existing: DNSRecord) -> str:
-    """The refusal message, shared so REST and the Copilot say the same thing."""
-    return _describe(record_type, fqdn, existing.record_type, existing.value, existing.id)
+def describe_cname_conflict(
+    record_type: str, fqdn: str, existing: DNSRecord, *, requester_safe: bool = False
+) -> str:
+    """The refusal message, shared so REST and the Copilot say the same thing.
+    ``requester_safe`` leaves out the other record's value and id (#3642)."""
+    return _describe(
+        record_type,
+        fqdn,
+        existing.record_type,
+        existing.value,
+        existing.id,
+        requester_safe=requester_safe,
+    )
 
 
 @dataclass(frozen=True)

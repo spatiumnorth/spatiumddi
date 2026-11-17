@@ -377,7 +377,7 @@ async def test_put_then_get_redacts_secrets(client: AsyncClient, db_session):
     assert len(rows) == 1
     nv = rows[0].new_value or {}
     assert nv.get("managed") is True
-    assert nv.get("gpg_key_count") == 1
+    assert len(nv.get("gpg_keys")) == 1
     blob = repr(nv)
     assert "s3cret" not in blob and "PGP PUBLIC KEY" not in blob
 
@@ -513,13 +513,21 @@ async def test_put_of_the_masked_value_keeps_the_stored_credential(client: Async
     await db_session.refresh(settings)
     assert settings.apt_proxy_http == _PROXY_WITH_CREDS
 
-    # Editing the host / port while leaving the mask keeps the credential.
+    # A path-only edit while leaving the mask keeps the credential.
     r = await client.put(
-        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy2.lan:8080/"}
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy.lan:3128/other"}
     )
     assert r.status_code == 200, r.text
     await db_session.refresh(settings)
-    assert settings.apt_proxy_http == "http://bob:hunter2@proxy2.lan:8080/"
+    assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128/other"
+
+    # Moving the host / port with the mask left in is refused, nothing stored.
+    for moved in ("http://***@proxy2.lan:3128/other", "http://***@proxy.lan:8080/other"):
+        r = await client.put("/api/v1/settings", headers=h, json={"apt_proxy_http": moved})
+        assert r.status_code == 422, r.text
+        assert "re-enter" in r.text and "hunter2" not in r.text
+        await db_session.refresh(settings)
+        assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128/other"
 
     # A real new credential replaces it; clearing still clears.
     r = await client.put(
@@ -532,6 +540,34 @@ async def test_put_of_the_masked_value_keeps_the_stored_credential(client: Async
     assert r.status_code == 200, r.text
     await db_session.refresh(settings)
     assert settings.apt_proxy_http == ""
+
+
+async def test_put_of_a_masked_proxy_with_an_ambiguous_host_part_is_refused(
+    client: AsyncClient, db_session
+):
+    await _store_proxy(
+        db_session, "http://bob:hunter2@proxy.lan:3128", "https://tok3n@proxy.lan:3129"
+    )
+    _, token = await _superadmin(db_session)
+    h = _hdr(token)
+    for field, base in (
+        ("apt_proxy_http", "http://***@proxy.lan:3128"),
+        ("apt_proxy_https", "https://***@proxy.lan:3129"),
+    ):
+        for sep in ("?", "#", "\\"):
+            r = await client.put(
+                "/api/v1/settings", headers=h, json={field: f"{base}{sep}@other.lan:3128"}
+            )
+            assert r.status_code == 422, (field, sep, r.text)
+            assert "hunter2" not in r.text and "tok3n" not in r.text
+    settings = await db_session.get(PlatformSettings, 1)
+    await db_session.refresh(settings)
+    assert settings.apt_proxy_http == "http://bob:hunter2@proxy.lan:3128"
+    assert settings.apt_proxy_https == "https://tok3n@proxy.lan:3129"
+    r = await client.put(
+        "/api/v1/settings", headers=h, json={"apt_proxy_http": "http://***@proxy.lan:3128"}
+    )
+    assert r.status_code == 200, r.text
 
 
 async def test_put_of_a_mask_with_no_stored_credential_is_refused(client: AsyncClient, db_session):

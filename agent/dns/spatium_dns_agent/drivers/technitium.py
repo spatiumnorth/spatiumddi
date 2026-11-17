@@ -75,6 +75,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 import structlog
 
+from ..blocklist_entries import iter_entries
 from ..secure_io import write_private
 from ._caa import parse_caa
 from ._forwarders import zone_forward_transport as _zone_forward_transport
@@ -86,6 +87,15 @@ log = structlog.get_logger(__name__)
 
 
 _API_BASE = "http://127.0.0.1:5380/api"
+
+# #1776: the web console + API are for the co-located agent only. Technitium's
+# default is 0.0.0.0 / [::]:5380 over plaintext HTTP, so every container on
+# the network (and the LAN, under host networking) could reach them. v4
+# loopback only: the agent dials 127.0.0.1, and listing ::1 would make
+# Kestrel throw on a container with IPv6 disabled and take the API down.
+_WEB_SERVICE_LOCAL_ADDRESSES = "127.0.0.1"
+_CONFIG_DIR = Path("/etc/dns")
+_WEB_CONFIG_NAME = "webservice.config"
 _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
@@ -104,6 +114,13 @@ _CREDS_RETRY_SECONDS = 15 * 60
 # Zones this agent created from a bundle — the only ones it may delete when
 # the bundle drops them (see ``_retire_dropped_zones``).
 _MANAGED_ZONES_FILE = "technitium-managed-zones.json"
+# Durable "this agent created the zone" marker, kept in Technitium itself so it
+# survives a lost state dir (#1775): the comment on the apex SOA record
+# (``zones/records/get`` returns it as ``comments``, ``zones/records/update``
+# takes ``comments``, 15.4.0). Plain text on purpose: a comment starting with
+# ``{`` is parsed as JSON by Technitium. Every SOA update must send it again,
+# because an update without ``comments`` clears it.
+_OWNER_MARKER = "managed by SpatiumDDI agent"
 
 # Record types whose zone-apex form is daemon-managed (SOA always; NS only
 # at the apex — an off-apex NS is a legitimate delegation record and IS
@@ -558,6 +575,10 @@ def _norm_error(message: Any) -> str:
 def _is_record_noop(message: Any) -> bool:
     """True when Technitium says the record op was already satisfied."""
     return _norm_error(message) in _RECORD_NOOP_MESSAGES
+
+
+class _ZoneNotOwned(Exception):
+    """A same-named zone exists that this agent never created (#1775)."""
 
 
 def _is_zone_exists(message: Any) -> bool:
@@ -1976,7 +1997,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
         for exc in bl.get("exceptions") or []:
             if exc:
                 allowed.add(str(exc).rstrip(".").lower())
-        for entry in bl.get("entries") or []:
+        for entry in iter_entries(bl):
             domain = str(entry.get("domain") or "").rstrip(".").lower()
             if not domain:
                 continue
@@ -2285,6 +2306,81 @@ def _creds_message(reason: str, detail: str = "") -> str:
     return f"{what}. {fix}." + (f" Technitium said: {detail}" if detail else "")
 
 
+def _web_config_bind_span(blob: bytes) -> tuple[int, int, list[str]] | None:
+    """Locate the stored web-service address list in a ``webservice.config``.
+
+    Layout (Technitium 15.x, versions 1-4 share this prefix): ``"WC"``,
+    version byte, int32 HTTP port, int32 TLS port, a count byte, then
+    ``count`` addresses each tagged ``1`` + 4 bytes or ``2`` + 16 bytes.
+    Returns ``(start, end, addresses)`` of the count byte + addresses, or
+    ``None`` when the bytes are not that layout.
+    """
+    if len(blob) < 12 or blob[:2] != b"WC" or not 1 <= blob[2] <= 4:
+        return None
+    start = 11
+    count = blob[start]
+    pos = start + 1
+    addrs: list[str] = []
+    for _ in range(count):
+        if pos >= len(blob) or blob[pos] not in (1, 2):
+            return None
+        size = 4 if blob[pos] == 1 else 16
+        raw = blob[pos + 1 : pos + 1 + size]
+        if len(raw) != size:
+            return None
+        addrs.append(str(ipaddress.ip_address(raw)))
+        pos += 1 + size
+    return start, pos, addrs
+
+
+def pin_stored_web_service_bind(config_dir: Path = _CONFIG_DIR) -> bool:
+    """Make an existing ``webservice.config`` bind to loopback before the daemon starts.
+
+    ``DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES`` only applies to a fresh
+    ``/etc/dns``; an older one keeps its stored bind, and the daemon would
+    listen on it from its first start until ``_pin_web_service_to_loopback``
+    corrected it through the API. Only the address list is rewritten, the
+    rest of the file is copied byte for byte; the original is kept once as
+    ``webservice.config.spatium-bak`` and the new file lands atomically. A
+    missing file (fresh install: the env var handles it) or an unrecognised
+    layout is left untouched. Returns True when the file was rewritten.
+    """
+    path = config_dir / _WEB_CONFIG_NAME
+    try:
+        blob = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("technitium_web_config_unreadable", error=str(exc))
+        return False
+    span = _web_config_bind_span(blob)
+    if span is None:
+        log.warning("technitium_web_config_format_unrecognised", path=str(path))
+        return False
+    start, end, addrs = span
+    if addrs == [_WEB_SERVICE_LOCAL_ADDRESSES]:
+        return False
+    loopback = ipaddress.ip_address(_WEB_SERVICE_LOCAL_ADDRESSES).packed
+    new = blob[:start] + bytes([1, 1]) + loopback + blob[end:]
+    tmp = config_dir / (_WEB_CONFIG_NAME + ".spatium-tmp")
+    try:
+        backup = config_dir / (_WEB_CONFIG_NAME + ".spatium-bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        with tmp.open("wb") as fh:
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("technitium_web_config_rewrite_failed", error=str(exc))
+        tmp.unlink(missing_ok=True)
+        return False
+    log.info("technitium_web_config_bind_rewritten", previous=addrs)
+    return True
+
+
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
 
@@ -2320,6 +2416,8 @@ class TechnitiumDriver(DriverBase):
     # ``swap_and_reload``: the cause is one group option, and a refusal per
     # zone would bury every other refusal in the truncated apply error.
     _unapplied_acl: dict[str, list[str]] | None = None
+    # Zone names in the ledger before the current pass; see _retire_dropped_zones.
+    _owned_before: frozenset[str] | None = None
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -2622,6 +2720,8 @@ class TechnitiumDriver(DriverBase):
             log.error("technitium_reconcile_skipped_no_token")
             raise RuntimeError("technitium reconcile skipped: no API token available")
 
+        self._pin_web_service_to_loopback(token)
+
         # TSIG keys first: a zone's ``zoneTransferTsigKeyNames`` is accepted
         # even when it names a key the server does not have (verified — the
         # API stores it happily), and the failure only shows up later as a
@@ -2756,20 +2856,33 @@ class TechnitiumDriver(DriverBase):
         desired = {str(z.get("zone") or "").lower() for z in payload if z.get("zone")}
         path = self._managed_zones_path()
         managed: set[str]
+        # What this agent owned BEFORE this pass (#1775). The ledger is
+        # rewritten below with every zone the bundle names, so by the time
+        # the reconcile meets a zone that already exists on the daemon the
+        # file can no longer say whether we put it there. ``None`` = unknown.
+        self._owned_before = None
         try:
             managed = {str(n).lower() for n in json.loads(path.read_text())}
+            self._owned_before = frozenset(managed)
         except FileNotFoundError:
+            self._owned_before = frozenset()
             managed = set()
             try:
                 previous = json.loads(previous_render.read_text())
                 managed = {str(z.get("zone") or "").lower() for z in previous if z.get("zone")}
             except (OSError, ValueError, AttributeError):
                 pass
+            # Not ``managed``: a zone named by a previous render is one we
+            # tried to apply, not one we created. A hand-made zone of the same
+            # name sits in rendered/ too, so only the ledger and the SOA owner
+            # marker prove ownership (#1775); ``managed`` here only keeps
+            # retirement working for a zone dropped while the ledger was gone.
         except (OSError, ValueError, TypeError) as exc:
             # An unreadable ledger must not turn into "delete nothing ever"
             # silently, nor into a guess. Rebuild it from this bundle.
             log.warning("technitium_managed_zones_unreadable", error=str(exc))
             managed = set()
+            self._owned_before = None
 
         if not isinstance(bundle_zone_names, list):
             if managed - desired:
@@ -2982,6 +3095,39 @@ class TechnitiumDriver(DriverBase):
                 zone_type=prev_type,
             )
 
+    def _pin_web_service_to_loopback(self, token: str) -> None:
+        """Bind the daemon's web service to loopback on an existing ``/etc/dns`` (#1776).
+
+        ``DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES`` (see ``start_daemon``) is
+        read only when ``webservice.config`` does not exist yet, so a
+        daemon whose config predates the fix keeps listening everywhere.
+        ``settings/set webServiceLocalAddresses`` restarts the web service
+        (v15.4.0 ``WebServiceSettingsApi``), which drops this very
+        connection, so the reply is allowed to be lost and the API is
+        awaited again afterwards. Idempotent: a no-op once already pinned.
+        Best-effort: a failure leaves the daemon as it was, which is the
+        pre-fix state, so it must not fail the whole apply.
+        """
+        try:
+            got = self._call(token, "GET", "settings/get", {}).json()
+            current = (got.get("response") or {}).get("webServiceLocalAddresses")
+            if current == [_WEB_SERVICE_LOCAL_ADDRESSES]:
+                return
+        except (httpx.HTTPError, ValueError, RuntimeError, AttributeError) as exc:
+            log.warning("technitium_web_bind_read_failed", error=str(exc))
+        try:
+            self._call(
+                token,
+                "POST",
+                "settings/set",
+                {"webServiceLocalAddresses": _WEB_SERVICE_LOCAL_ADDRESSES},
+            )
+        except (httpx.HTTPError, RuntimeError) as exc:
+            # Expected when the restart cuts the reply short.
+            log.info("technitium_web_bind_reply_lost", error=str(exc))
+        log.info("technitium_web_service_pinned_to_loopback")
+        self._wait_for_api_up()
+
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
         deadline = time.monotonic() + timeout_s
         with httpx.Client(timeout=1.0) as client:
@@ -3050,6 +3196,7 @@ class TechnitiumDriver(DriverBase):
 
         zone = op["zone_name"].rstrip(".")
         op_kind = op["op"]
+        self._require_owned_for_op(token, zone)
 
         # DNSSEC ops (issue #740) are zone-level, not rrset-shaped. They
         # ride the same record-op queue but branch off before any of the
@@ -3954,7 +4101,10 @@ class TechnitiumDriver(DriverBase):
         release (agent killed mid-pass, release refused).
         """
         zone = zone_payload["zone"]
-        new_primary = self._ensure_zone_exists(token, zone_payload)
+        try:
+            new_primary = self._ensure_zone_exists(token, zone_payload, check_owned=True)
+        except _ZoneNotOwned:
+            return held
         is_primary = zone_payload.get("type", "Primary") == "Primary"
         options = zone_payload.get("options") or {}
         if new_primary and is_primary and self._hold_zone(token, zone):
@@ -3962,6 +4112,8 @@ class TechnitiumDriver(DriverBase):
             self._save_held_zone_now(zone)
         if not held:
             self._reconcile_zone_body(token, zone, zone_payload, options)
+            if is_primary:
+                self._stamp_owner_marker(token, zone)
             return False
         try:
             # The zone's options, query access among them, are what release
@@ -3969,6 +4121,8 @@ class TechnitiumDriver(DriverBase):
             self._reconcile_zone_body(token, zone, zone_payload, None)
         finally:
             released = self._release_zone(token, zone, options)
+        if is_primary:
+            self._stamp_owner_marker(token, zone)
         return not released
 
     def _hold_zone(self, token: str, zone: str) -> bool:
@@ -4278,6 +4432,8 @@ class TechnitiumDriver(DriverBase):
                     "ttl": ttl if ttl is not None else soa.get("ttl"),
                     **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
                     **{f: current.get(f) for f in _SOA_TIMERS},
+                    # An update without it clears the owner marker (#1775).
+                    "comments": _OWNER_MARKER,
                 }
                 params.update(desired_soa)
                 body = self._call(token, "POST", "zones/records/update", params).json()
@@ -4377,7 +4533,117 @@ class TechnitiumDriver(DriverBase):
                 ns_retimed=retimed,
             )
 
-    def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> bool:
+    def _zone_is_ours(self, token: str, zone: str) -> bool:
+        """May this agent take over a zone that already exists on the daemon?
+
+        Only a zone from its own ledger, one carrying the owner marker on
+        its apex SOA (which outlives a lost state dir), or when the operator
+        opted in with ``TECHNITIUM_ADOPT_EXISTING_ZONES``. An unknown ledger
+        (unreadable, or the retire step never ran) does not block: refusing
+        there would stop every zone on a guess. Only a Primary can carry the
+        marker; a Secondary / Stub / Forwarder rests on the ledger alone.
+        """
+        return self._zone_owned(token, zone, self._owned_before)
+
+    def _ledger_names(self) -> frozenset[str] | None:
+        """The ledger as it stands now; ``None`` when unreadable (do not block)."""
+        try:
+            return frozenset(
+                str(n).lower() for n in json.loads(self._managed_zones_path().read_text())
+            )
+        except FileNotFoundError:
+            return frozenset()
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _require_owned_for_op(self, token: str, zone: str) -> None:
+        """Refuse a record or DNSSEC op for a zone this agent does not own (#1775).
+
+        The same decision as the full-zone reconcile, so a record change in the
+        group cannot write into (or delete from) a hand-made zone the reconcile
+        refused. Raising makes the op ack as an error naming the zone, never
+        as applied.
+        """
+        if not self._zone_owned(token, zone, self._ledger_names()):
+            log.error("technitium_zone_not_owned", zone=zone, via="record_op")
+            raise RuntimeError(
+                f"{zone}: a zone of that name already exists on this Technitium server "
+                "and SpatiumDDI did not create it, so the change was not applied. "
+                "Delete it in the Technitium console, or set "
+                "TECHNITIUM_ADOPT_EXISTING_ZONES=true on the agent to take it over"
+            )
+
+    def _zone_owned(self, token: str, zone: str, owned: frozenset[str] | None) -> bool:
+        if owned is None or zone.lower() in owned:
+            return True
+        if os.environ.get("TECHNITIUM_ADOPT_EXISTING_ZONES", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return True
+        return self._owner_marker_present(token, zone)
+
+    def _owner_marker_present(self, token: str, zone: str) -> bool:
+        try:
+            apex = self._apex_records(token, zone)
+        except (httpx.HTTPError, ValueError):
+            return False
+        soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+        return soa is not None and soa.get("comments") == _OWNER_MARKER
+
+    def _stamp_owner_marker(self, token: str, zone: str) -> None:
+        """Write the owner marker on a Primary zone this agent owns (#1775).
+
+        Also the self-healing step for a zone an older agent created: it is
+        in the ledger, has no marker yet, and gets one on its next pass. A
+        SOA update bumps the serial once; a stamped zone writes nothing.
+        """
+        try:
+            apex = self._apex_records(token, zone)
+            soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+            if soa is None or soa.get("comments") == _OWNER_MARKER:
+                return
+            rdata = soa.get("rData") or {}
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/update",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "SOA",
+                    "ttl": soa.get("ttl"),
+                    "primaryNameServer": rdata.get("primaryNameServer") or "",
+                    "responsiblePerson": rdata.get("responsiblePerson") or "",
+                    "serial": rdata.get("serial"),
+                    **{f: rdata.get(f) for f in _SOA_TIMERS},
+                    "comments": _OWNER_MARKER,
+                },
+            ).json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("technitium_owner_marker_failed", zone=zone, error=str(exc))
+            return
+        if body.get("status") != "ok":
+            log.warning("technitium_owner_marker_failed", zone=zone, error=body.get("errorMessage"))
+
+    def _disown_zone(self, zone: str) -> None:
+        """Drop a refused zone from the ledger ``_retire_dropped_zones`` just wrote.
+
+        Left in, the next pass would read it as ours and wipe its records.
+        """
+        path = self._managed_zones_path()
+        try:
+            names = {str(n).lower() for n in json.loads(path.read_text())}
+        except (OSError, ValueError, TypeError):
+            return
+        names.discard(zone.lower())
+        self._write_secret(path, json.dumps(sorted(names)))
+
+    def _ensure_zone_exists(
+        self, token: str, entry: dict[str, Any], *, check_owned: bool = False
+    ) -> bool:
         """Create the zone if absent, with the params its type requires.
 
         Returns True when this call created the zone, or converted an
@@ -4424,6 +4690,20 @@ class TechnitiumDriver(DriverBase):
         body = resp.json()
         if body.get("status") == "error":
             if _is_zone_exists(body.get("errorMessage")):
+                if check_owned and not self._zone_is_ours(token, zone):
+                    # #1775: a zone the operator made on the daemon. Taking
+                    # it over deletes every record the bundle lacks, and
+                    # retiring it later deletes the zone, so leave it alone.
+                    self._disown_zone(zone)
+                    log.error("technitium_zone_not_owned", zone=zone)
+                    self._note_apply_failure(
+                        f"{zone}: a zone of that name already exists on this Technitium "
+                        "server and SpatiumDDI did not create it, so it was left untouched "
+                        "(applying the bundle would delete every record it does not list). "
+                        "Delete it in the Technitium console, or set "
+                        "TECHNITIUM_ADOPT_EXISTING_ZONES=true on the agent to take it over"
+                    )
+                    raise _ZoneNotOwned(zone)
                 # The create params carry the zone's UPSTREAM (a
                 # secondary/stub's primaries, a forwarder's target), and
                 # create is a no-op once the zone exists. Without this,
@@ -4716,6 +4996,7 @@ class TechnitiumDriver(DriverBase):
                 "retry": str(rdata.get("retry") or 300),
                 "expire": str(rdata.get("expire") or 604800),
                 "minimum": str(rdata.get("minimum") or 900),
+                "comments": _OWNER_MARKER,
             },
         ).json()
         if body.get("status") != "ok":
@@ -5092,8 +5373,15 @@ class TechnitiumDriver(DriverBase):
                 note="did not spawn a second daemon",
             )
             return
+        # An existing /etc/dns keeps its stored bind, so rewrite it before
+        # the daemon's first listener rather than via the API afterwards.
+        pin_stored_web_service_bind(_CONFIG_DIR)
         env = dict(os.environ)
         env["DNS_SERVER_ADMIN_PASSWORD"] = self.admin_bootstrap_password()
+        # #1776: first-boot only (an existing config is rewritten by
+        # pin_stored_web_service_bind above; _pin_web_service_to_loopback is
+        # the second line). Overrides an operator-set value on purpose.
+        env["DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES"] = _WEB_SERVICE_LOCAL_ADDRESSES
         log_path = self.state_dir / "technitium.log"
         log_fh = log_path.open("ab", buffering=0)
         self.daemon_pid = subprocess.Popen(
