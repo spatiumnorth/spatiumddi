@@ -46,6 +46,8 @@ from app.services.ipam.orphan_aliases import (
     orphan_record_owners,
     orphan_record_reason,
     refusal_reason,
+    superseded_record_owners,
+    superseded_record_reason,
     withdrawn_alias_owners,
 )
 from app.services.ipam.utilization import recount_subnets_and_blocks
@@ -661,6 +663,16 @@ async def restore_row(
             raise HTTPException(
                 status_code=409,
                 detail=f"Cannot restore {_row_label(target)}: {orphan_record_reason(owner[2])}.",
+            )
+        # #4361 — and one whose address was renamed or blanked meanwhile.
+        superseded = (await superseded_record_owners(db, record_ids=[target.id])).get(target.id)
+        if superseded is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot restore {_row_label(target)}: "
+                    f"{superseded_record_reason(superseded[2])}."
+                ),
             )
 
     batch_id = target.deletion_batch_id
