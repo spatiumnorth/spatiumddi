@@ -410,3 +410,45 @@ async def test_superadmin_api_tokens(client: AsyncClient, db_session: AsyncSessi
         url, headers=open_token, json={"name": "p1", "record_type": "LUA", "value": LUA_VALUE}
     )
     assert r.status_code == 201, r.text
+
+
+async def test_editor_cannot_rename_a_lua_record_but_may_change_its_ttl(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _user(db_session, superadmin=False)
+    zone = await _zone(db_session)
+    rec = await _lua_row(db_session, zone)
+    rec_id = rec.id
+    await db_session.commit()
+
+    r = await client.put(f"{_base(zone)}/records/{rec_id}", headers=h, json={"name": "www"})
+    assert r.status_code == 403, r.text
+    r = await client.put(
+        f"{_base(zone)}/records/{rec_id}", headers=h, json={"name": "www", "value": LUA_VALUE}
+    )
+    assert r.status_code == 403, r.text
+    db_session.expire_all()
+    assert (await db_session.get(DNSRecord, rec_id)).name == "p1"
+    r = await client.put(f"{_base(zone)}/records/{rec_id}", headers=h, json={"ttl": 90})
+    assert r.status_code == 200, r.text
+
+
+async def test_editor_cannot_rename_a_lua_record_by_spreadsheet_import(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    ed = await _user(db_session, superadmin=False)
+    zone = await _zone(db_session)
+    rec = await _lua_row(db_session, zone)
+    rec_id = rec.id
+    await db_session.commit()
+    quoted = LUA_VALUE.replace(chr(34), chr(34) * 2)
+    body = f'id,name,type,value,ttl\n{rec_id},www,LUA,"{quoted}",300\n'
+    r = await client.post(
+        f"{_base(zone)}/import/spreadsheet/commit",
+        headers=ed,
+        data={"mode": "merge"},
+        files={"file": ("r.csv", body.encode(), "text/csv")},
+    )
+    assert r.status_code == 403, r.text
+    db_session.expire_all()
+    assert (await db_session.get(DNSRecord, rec_id)).name == "p1"
