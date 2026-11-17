@@ -23,9 +23,6 @@ const ALLOWED: Record<string, string> = {
     "mounts DeviceFormModal, which reads the device fresh itself (#4370)",
   "pages/network/AsnsPage.tsx":
     "mounts AsnFormModal, which reads the ASN fresh itself (#3114)",
-  "pages/admin/UsersPage.tsx": "Users / Roles / Groups are covered separately",
-  "pages/admin/RolesPage.tsx": "Users / Roles / Groups are covered separately",
-  "pages/admin/GroupsPage.tsx": "Users / Roles / Groups are covered separately",
   "pages/admin/AIPromptsPage.tsx": "not in #4379's list; follow-up",
   "pages/dhcp/DHCPPage.tsx":
     "scope / static / client-class dialogs: not in #4379's list; follow-up",
