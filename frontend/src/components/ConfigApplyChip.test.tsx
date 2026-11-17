@@ -40,9 +40,9 @@ describe("partial apply", () => {
     expect(isPartialApply(null, null)).toBe(false);
   });
 
-  it("chip says zones refused, not reverted, and names no rejected config", () => {
+  it("chip says zones held back, not reverted, and names no rejected config", () => {
     render(<ConfigApplyChip server={PARTIAL} />);
-    const chip = screen.getByText("Zones refused");
+    const chip = screen.getByText("Zones held back");
     const title = chip.getAttribute("title") ?? "";
     expect(title).toContain("nothing was rolled back");
     expect(title).toContain("bad.test.");
@@ -53,7 +53,7 @@ describe("partial apply", () => {
 
   it("banner explains the partial apply and hides the live etag", () => {
     render(<ConfigApplyBanner server={PARTIAL} />);
-    expect(screen.getByText("Zones refused")).toBeTruthy();
+    expect(screen.getByText("Zones held back")).toBeTruthy();
     expect(screen.getByText(/nothing was rolled back/)).toBeTruthy();
     expect(screen.queryByText(/rejected: sha256:live/)).toBeNull();
     expect(screen.queryByText(/NOT with what is saved/)).toBeNull();

@@ -26,6 +26,8 @@ on-demand backup endpoint emits.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -623,6 +625,7 @@ async def _stamp_end_on_fresh_session(
     stamp: dict[str, Any],
     audit_kwargs: dict[str, Any],
     original: BaseException,
+    stamp_session: Callable[[], AbstractAsyncContextManager[AsyncSession]] | None = None,
 ) -> None:
     """Record a run's end when its own session was closed under it (#2353).
 
@@ -631,11 +634,19 @@ async def _stamp_end_on_fresh_session(
     newer run, or a claim a restore replaced and #2175 already settled.
     The audit row is written regardless: the run happened. Re-raises
     ``original`` when even a fresh session cannot write.
+
+    ``stamp_session`` opens that fresh session. The Celery sweep builds a
+    new event loop every tick, so it passes ``task_session`` (an engine
+    bound to the running loop): the shared ``AsyncSessionLocal`` pool can
+    hold a connection from an earlier tick's loop, which fails with
+    "Event loop is closed" and strands the row ``in_progress`` (#3939).
+    Without one (Run now, on the api's own loop) the shared pool is used.
     """
     from app.db import AsyncSessionLocal  # noqa: PLC0415
 
+    open_session = stamp_session or AsyncSessionLocal
     try:
-        async with AsyncSessionLocal() as fresh:
+        async with open_session() as fresh:
             await fresh.execute(
                 update(BackupTarget)
                 .where(
@@ -658,6 +669,7 @@ async def run_backup_for_target(
     triggered_by: str,
     actor_id: Any | None = None,
     actor_display: str = "system",
+    stamp_session: Callable[[], AbstractAsyncContextManager[AsyncSession]] | None = None,
 ) -> dict[str, Any]:
     """Build + write + prune for one target. Caller passes the
     fully-loaded ``target`` row + a label for ``triggered_by``
@@ -669,6 +681,9 @@ async def run_backup_for_target(
     The run is claimed atomically first (:func:`claim_backup_run`);
     a target already ``in_progress`` raises
     :class:`BackupRunBusyError` rather than running twice (#1571).
+
+    ``stamp_session`` is forwarded to :func:`_stamp_end_on_fresh_session`
+    (a loop-safe session opener for callers on their own event loop, #3939).
     """
     started = datetime.now(UTC)
     if not await claim_backup_run(db, target=target, started=started):
@@ -861,6 +876,7 @@ async def run_backup_for_target(
             stamp=stamp,
             audit_kwargs=audit_kwargs,
             original=exc,
+            stamp_session=stamp_session,
         )
         try:
             await db.rollback()

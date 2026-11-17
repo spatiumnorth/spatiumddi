@@ -44,7 +44,8 @@ function cidrSpan(cidr: string): { base: bigint; size: bigint } | null {
 /**
  * A CIDR inside `parent` that no sibling in `existing` holds, or "" when
  * nothing fits (#3711). Aims at parent + 8 bits (IPv4, held to /30) or + 16
- * (IPv6, held to /127), walks the aligned slots of that size for the first
+ * (IPv6, held to /127; a subnet under an IPv6 node shorter than /64 aims
+ * at /64), walks the aligned slots of that size for the first
  * free one, and halves the slot size when all are taken. BigInt throughout:
  * an IPv6 node is far past 2^53 addresses. Never answers a sibling's CIDR;
  * the operator fills an empty field in.
@@ -52,6 +53,7 @@ function cidrSpan(cidr: string): { base: bigint; size: bigint } | null {
 export function suggestChildCidr(
   parent: PlanNode,
   existing: PlanNode[],
+  kind: "block" | "subnet" = "block",
 ): string {
   const span = cidrSpan(parent.network);
   if (!span) return "";
@@ -66,7 +68,13 @@ export function suggestChildCidr(
     .filter((c): c is NonNullable<typeof c> => c !== null)
     .map((c) => ({ start: c.base, end: c.base + c.size }));
 
-  const first = Math.min(parentPrefix + (v6 ? 16 : 8), max);
+  // An IPv6 subnet starts on /64 like New Subnet and Find Free (#3850): SLAAC
+  // needs 64-bit interface IDs. Only a node already past /63 goes deeper.
+  const aim =
+    v6 && kind === "subnet" && parentPrefix < 64
+      ? 64
+      : parentPrefix + (v6 ? 16 : 8);
+  const first = Math.min(aim, max);
   for (let target = first; target <= max; target++) {
     if (target <= parentPrefix) continue;
     const slot = 1n << BigInt(total - target);

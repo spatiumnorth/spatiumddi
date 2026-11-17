@@ -35,6 +35,7 @@ export function ConfirmModal({
   requirePassword = false,
   autoFocusCancel = false,
   passwordError,
+  error,
   onConfirm,
   onClose,
 }: {
@@ -54,6 +55,9 @@ export function ConfirmModal({
   // callers to render the server's 403 "Current password incorrect."
   // body without bouncing the operator out of the modal.
   passwordError?: string | null;
+  // A refused confirm's reason, drawn inside the open dialog as an alert so
+  // it is announced: the page behind an aria-modal dialog is inert (#4218).
+  error?: string | null;
   onConfirm: (password?: string) => void;
   onClose: () => void;
 }) {
@@ -121,6 +125,11 @@ export function ConfirmModal({
               </p>
             )}
           </div>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
         )}
         <div className="flex justify-end gap-2">
           <button

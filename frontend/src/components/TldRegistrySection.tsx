@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Globe, RefreshCw } from "lucide-react";
 import { dnsApi, formatApiError } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * IANA root-zone TLD list — the data behind a zone's name scope (#986).
@@ -162,9 +163,9 @@ export function TldRegistrySection({
       )}
 
       {error && (
-        <p className="mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <FormError className="mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
           {error}
-        </p>
+        </FormError>
       )}
 
       <div className="mt-3">

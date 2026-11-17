@@ -31,6 +31,7 @@
       "category": "ads",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": true
@@ -42,6 +43,7 @@
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
       "category": "ads",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -53,6 +55,7 @@
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
       "category": "ads",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -64,6 +67,7 @@
       "category": "ads",
       "feed_url": "https://big.oisd.nl/domainswild",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://oisd.nl/",
       "recommended": false
@@ -75,6 +79,7 @@
       "category": "ads",
       "feed_url": "https://small.oisd.nl/domainswild",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://oisd.nl/",
       "recommended": true
@@ -97,6 +102,7 @@
       "category": "adult",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nsfw-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -108,6 +114,7 @@
       "category": "adult",
       "feed_url": "https://nsfw.oisd.nl/domainswild",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://oisd.nl/",
       "recommended": false
@@ -130,6 +137,7 @@
       "category": "bypass",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -141,6 +149,7 @@
       "category": "bypass",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nosafesearch-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -152,6 +161,7 @@
       "category": "gambling",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -185,6 +195,7 @@
       "category": "malware",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
@@ -229,6 +240,7 @@
       "category": "tracking",
       "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.plus-onlydomains.txt",
       "feed_format": "domains",
+      "wildcard_mode": "always",
       "license": "GPL-3.0",
       "homepage": "https://github.com/hagezi/dns-blocklists",
       "recommended": false
