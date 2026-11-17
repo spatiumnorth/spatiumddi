@@ -63,6 +63,21 @@ resolves as the latest on its own (#1182).
 
 ### OpenShift
 
+**Supported OpenShift versions**
+
+| OpenShift Container Platform | Kubernetes | Status | Last tested |
+|---|---|---|---|
+| 5.0 | 1.36 | Supported | 5.0.0 |
+| 4.22 | 1.35 | Supported | 4.22.14 |
+
+Supported means the chart is tested on that minor release before each
+SpatiumDDI release and installs under OpenShift's default security context
+constraints, as described below. Supported from SpatiumDDI 1.0.1, the release
+that adds the Red Hat UBI 9 images and the certified values profile
+(`values-openshift-certified.yaml`). OpenShift 4.21 and earlier, and OKD, are
+not tested and not supported. Report a problem on a supported version in
+[GitHub Issues](https://github.com/spatiumnorth/spatiumddi/issues).
+
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
 same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
