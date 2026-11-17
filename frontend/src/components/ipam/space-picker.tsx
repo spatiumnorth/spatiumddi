@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatApiError, ipamApi, type IPSpace } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
+import { FormError } from "@/components/ui/form-error";
 
 // Dropdown + "+ New" shortcut used inside the integration-endpoint modals
 // (Proxmox / Kubernetes / Docker). Operators coming from a fresh install
@@ -151,9 +152,9 @@ function QuickCreateSpaceModal({
           page.
         </p>
         {error && (
-          <p className="rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-xs text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <button

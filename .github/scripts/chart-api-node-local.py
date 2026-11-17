@@ -47,7 +47,11 @@ def _is_api_service(doc: dict) -> bool:
     if doc.get("kind") != "Service":
         return False
     labels = (doc.get("metadata") or {}).get("labels") or {}
-    return labels.get("app.kubernetes.io/component") == "api"
+    if labels.get("app.kubernetes.io/component") != "api":
+        return False
+    # #3645: the node-local Service is a separate object with its own check
+    # (chart-api-local-service.py); it carries no trafficDistribution.
+    return not (doc.get("metadata") or {}).get("name", "").endswith("-api-local")
 
 
 def check(path: Path, absent: bool) -> tuple[list[str], int]:

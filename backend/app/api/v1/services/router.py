@@ -403,7 +403,7 @@ async def list_services(
     stmt = apply_tag_filter(stmt, NetworkService.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(NetworkService.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(NetworkService.name.asc(), NetworkService.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
 
     if not rows:

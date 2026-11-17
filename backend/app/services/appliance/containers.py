@@ -10,14 +10,17 @@ these helpers + add permission gates + audit-log rows. The public
 exception name + dataclass shape are unchanged so callers don't
 have to follow the rewrite.
 
-Gated on ``settings.appliance_mode`` + the ServiceAccount actually
-being mounted (``services/appliance/k8s.get_config()``). On docker-
+The appliance's Cluster -> Pods surface is gated on ``settings.appliance_mode``
++ the ServiceAccount actually being mounted (``services/appliance/k8s.get_config()``). On docker-
 compose / non-k8s deployments the gate fails fast + the endpoints
-log + 503 — same shape the docker path used.
+log + 503 — same shape the docker path used. Platform Insights >
+Containers (#3761) reuses the log helpers on any Kubernetes install via
+``release_pods`` / ``find_release_pod``, gated on the ServiceAccount only.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -39,6 +42,15 @@ class DockerUnavailableError(RuntimeError):
     Name kept for backwards compat with the router which translates
     this to 503 Service Unavailable. The error message body
     distinguishes the real cause for the operator's log.
+    """
+
+
+class PodActionRefusedError(Exception):
+    """A pod action that cannot be done on this pod; the router answers 409.
+
+    ``start`` / ``stop`` have no meaning for a pod (the owning workload has to
+    be scaled), and a pod no controller owns is gone for good once deleted, so
+    ``restart`` refuses it too (#4232).
     """
 
 
@@ -175,8 +187,62 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
     )
 
 
-def list_containers() -> list[ContainerSummary]:
-    if not settings.appliance_mode:
+def release_pods() -> list[dict[str, Any]]:
+    """SpatiumDDI's own pods in the api pod's namespace -- the inventory the
+    Platform Insights Containers tab lists AND the allowlist its log routes
+    resolve a pod name against (#3761).
+
+    Scope is the namespace of the mounted ServiceAccount, narrowed to pods
+    labelled as ours (same rule as ``service_control.kube``) and then to the
+    api pod's own release: only pods whose ``app.kubernetes.io/instance``
+    equals the api pod's (both absent counts as equal, which is the raw
+    ``k8s/`` manifests' case), so a second SpatiumDDI install in the
+    namespace is not offered. The api pod is found by ``HOSTNAME`` (the pod
+    name) in the same listing; when it cannot be found the release is
+    unknown and this refuses rather than widening to every labelled pod.
+    Always a fresh listing: a pod name is never trusted from the caller.
+    """
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        raise DockerUnavailableError(str(exc)) from exc
+
+    def _instance(p: dict[str, Any]) -> str | None:
+        return ((p.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/instance")
+
+    own_name = os.environ.get("HOSTNAME", "")
+    own = next(
+        (p for p in pods if own_name and (p.get("metadata") or {}).get("name") == own_name),
+        None,
+    )
+    if own is None:
+        raise DockerUnavailableError(
+            f"cannot find the api's own pod ({own_name or 'HOSTNAME unset'}) in the "
+            "namespace, so the release to scope to is unknown"
+        )
+    release = _instance(own)
+    return [p for p in pods if _parse_pod_to_summary(p).is_spatium and _instance(p) == release]
+
+
+def list_release_containers() -> list[ContainerSummary]:
+    out = [_parse_pod_to_summary(p) for p in release_pods()]
+    out.sort(key=lambda c: (c.component, c.name))
+    return out
+
+
+def find_release_pod(name: str) -> tuple[ContainerSummary, str | None] | None:
+    """``(summary, default log container)`` for a current release pod, or None
+    when ``name`` is not one of them (the caller answers 404)."""
+    for p in release_pods():
+        if (p.get("metadata") or {}).get("name") == name:
+            return _parse_pod_to_summary(p), _pick_log_container(p)
+    return None
+
+
+def list_containers(*, appliance_only: bool = True) -> list[ContainerSummary]:
+    """``appliance_only`` keeps the appliance's own Cluster -> Pods behaviour
+    (empty off the appliance). Platform Insights uses ``release_pods()``."""
+    if appliance_only and not settings.appliance_mode:
         return []
     try:
         pods = k8s.list_pods()
@@ -261,39 +327,56 @@ def resolve_workload_pod(component: str) -> tuple[str, str | None] | None:
 
 
 def container_action(name: str, action: str) -> None:
-    """Apply ``start`` / ``stop`` / ``restart`` to the named pod.
+    """Apply ``restart`` to the named pod; ``start`` / ``stop`` are refused.
 
     K8s vocabulary:
-      * ``restart`` → delete the pod; the owning Deployment /
-        DaemonSet recreates it on the next reconcile.
-      * ``start`` / ``stop`` → not directly supported on a single
-        pod (you'd scale the owning Deployment). For the appliance
-        Fleet UI's purposes ``restart`` is the only meaningful
-        action; ``start`` / ``stop`` raise ValueError (was a
-        wishlist UX in the docker era).
+      * ``restart`` -> delete the pod; the owning Deployment / StatefulSet /
+        DaemonSet recreates it on the next reconcile. Only a pod in the api's
+        own namespace that a controller owns is deleted: a bare pod would not
+        come back, so it is refused (``PodActionRefusedError``).
+      * ``start`` / ``stop`` -> a pod has neither; stopping it means scaling
+        its workload, which this page does not do. Raises
+        ``PodActionRefusedError`` (HTTP 409), not a 500 (#4232).
     """
-    if action == "restart":
-        ok, err = k8s.delete_pod(name)
-        if not ok:
-            raise DockerUnavailableError(err or f"failed to delete pod {name}")
-        logger.info("appliance_pod_restart", name=name)
-        return
     if action in ("start", "stop"):
-        raise ValueError(
-            f"pod action {action!r} requires scaling the owning Deployment; "
-            "use kubectl scale for now (UI exposure pending)"
+        raise PodActionRefusedError(
+            f"cannot {action} a pod: stopping a pod needs its owning workload "
+            "scaled, which is not supported from this page (use Restart)"
         )
-    raise ValueError(f"unknown pod action: {action!r}")
+    if action != "restart":
+        raise ValueError(f"unknown pod action: {action!r}")
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        raise DockerUnavailableError(str(exc)) from exc
+    pod = next((p for p in pods if (p.get("metadata") or {}).get("name") == name), None)
+    if pod is None:
+        raise LookupError(f"pod {name} not found")
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    if not any(o.get("controller") for o in owners):
+        raise PodActionRefusedError(
+            f"pod {name} has no owning controller, so deleting it would not bring it "
+            "back; refusing to restart it"
+        )
+    ok, err = k8s.delete_pod(name)
+    if not ok:
+        raise DockerUnavailableError(err or f"failed to delete pod {name}")
+    logger.info("appliance_pod_restart", name=name)
 
 
-def get_container_logs(name: str, tail: int = 200, since_seconds: int | None = None) -> str:
+def get_container_logs(
+    name: str,
+    tail: int = 200,
+    since_seconds: int | None = None,
+    container: str | None = None,
+) -> str:
     """Return the last ``tail`` log lines (or lines since N seconds ago).
 
     Decoded UTF-8 with replacement for binary fragments. Truncated at
     ``tail`` lines server-side so response is bounded.
     """
     try:
-        body = k8s.get_pod_logs(name, tail=tail, since_seconds=since_seconds)
+        body = k8s.get_pod_logs(name, tail=tail, since_seconds=since_seconds, container=container)
     except k8s.KubeapiUnavailableError as exc:
         raise DockerUnavailableError(str(exc)) from exc
     return body
@@ -349,9 +432,13 @@ async def stream_container_logs(
 __all__ = [
     "ContainerSummary",
     "DockerUnavailableError",
+    "PodActionRefusedError",
     "container_action",
     "get_container_logs",
+    "find_release_pod",
     "list_containers",
+    "list_release_containers",
+    "release_pods",
     "stream_container_logs",
 ]
 

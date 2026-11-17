@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import uuid
 from collections.abc import Callable
@@ -160,7 +161,7 @@ async def import_preview(
     """Dry-run an import and return the would-create / would-update / conflict diff."""
     _refuse_bound_token(current_user, "a whole-space import")
     data = await _read_upload(file)
-    payload = parse_payload(data, file.filename or "", file.content_type)
+    payload = await asyncio.to_thread(parse_payload, data, file.filename or "", file.content_type)
     preview = await preview_import(
         db,
         payload,
@@ -200,7 +201,7 @@ async def import_commit(
                 detail=f"Permission denied: need 'write' on '{rtype}'",
             )
     data = await _read_upload(file)
-    payload = parse_payload(data, file.filename or "", file.content_type)
+    payload = await asyncio.to_thread(parse_payload, data, file.filename or "", file.content_type)
     result = await commit_import(
         db,
         payload,
@@ -309,7 +310,7 @@ async def import_addresses_preview(
     # the address sets it holds.
     can_write = await _address_import_write_gate(db, current_user, subnet_id)
     data = await _read_upload(file)
-    payload = parse_payload(data, file.filename or "", file.content_type)
+    payload = await asyncio.to_thread(parse_payload, data, file.filename or "", file.content_type)
     preview = await preview_address_import(
         db,
         payload,
@@ -345,7 +346,7 @@ async def import_addresses_commit(
     _enforce_subnet_token_binding(current_user, subnet_id)
     can_write = await _address_import_write_gate(db, current_user, subnet_id)
     data = await _read_upload(file)
-    payload = parse_payload(data, file.filename or "", file.content_type)
+    payload = await asyncio.to_thread(parse_payload, data, file.filename or "", file.content_type)
 
     result = await commit_address_import(
         db,
