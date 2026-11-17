@@ -269,7 +269,7 @@ async def _load_visible(
         or cr.origin != _ORIGIN
         or (not _can_see_all(user) and cr.requested_by_user_id != user.id)
     ):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
     return cr
 
 

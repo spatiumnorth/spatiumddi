@@ -404,7 +404,9 @@ async def update_policy(
 ):  # noqa: ANN201 — ApprovalPolicyResponse OR a 202 JSONResponse (gated)
     policy = await db.get(ApprovalPolicy, policy_id)
     if policy is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Approval policy not found"
+        )
     changes = body.model_dump(exclude_unset=True)
     # Validate the post-update (action, resource_type) — an operator can't
     # repoint a policy at an action/type that isn't wired yet (#4).
@@ -469,7 +471,9 @@ async def delete_policy(
 ):  # noqa: ANN201 — 204 (deleted) OR a 202 JSONResponse (gated)
     policy = await db.get(ApprovalPolicy, policy_id)
     if policy is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Approval policy not found"
+        )
     if policy.is_builtin:
         # Built-in policies are kept for the registry-completeness check;
         # toggle ``enabled`` off instead of deleting them.
@@ -529,7 +533,9 @@ async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Ch
             and cr.requested_by_user_id != current_user.id
         )
     ):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found"
+        )
     return _cr_to_response(cr, current_user)
 
 
@@ -546,7 +552,9 @@ async def _assert_gate_row(db: DB, cr_id: uuid.UUID) -> None:
     """
     cr = await get_change_request(db, cr_id)
     if cr is None or cr.origin != "gate":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found"
+        )
 
 
 @router.post("/{cr_id}/approve", response_model=ChangeRequestResponse)
@@ -642,7 +650,9 @@ async def cancel_request(
     cr = await get_change_request(db, cr_id, for_update=True)
     # #696 — gate rows only; a portal row is cancelled via /requests.
     if cr is None or cr.origin != "gate":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found"
+        )
     enforce_operation_token_scope(request, cr.operation)  # #3302
     is_requester = (
         cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id
