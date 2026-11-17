@@ -537,8 +537,10 @@ export function AsnsPage() {
                     setSearch("");
                     setTagFilters([]);
                   }}
+                  gate={writeGate}
+                  hint="Add one to start the registry."
                 >
-                  No ASNs tracked yet — add one to start the registry.
+                  No ASNs tracked yet.
                 </ListEmpty>
               </p>
               <button

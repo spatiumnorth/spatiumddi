@@ -309,9 +309,10 @@ export function OTDevicesPage() {
                       setSubnetFilter("");
                       setPage(1);
                     }}
+                    gate={{ disabled: !canWrite }}
+                    hint="Attach one to an existing IPAM address to start documenting the plant."
                   >
-                    No OT descriptors recorded. Attach one to an existing IPAM
-                    address to start documenting the plant.
+                    No OT descriptors recorded.
                   </ListEmpty>
                 )}
               </div>

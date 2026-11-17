@@ -66,8 +66,18 @@ export function DNSSECPoliciesPage() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Reusable BIND9 signing policies (algorithm, NSEC3, KSK/ZSK
-            lifetimes). Attach one to a zone from its DNSSEC card; leave a zone
-            on <code>default</code> for BIND&rsquo;s built-in policy.
+            lifetimes).{" "}
+            {gate.disabled ? (
+              <>
+                A zone on <code>default</code> uses BIND&rsquo;s built-in
+                policy.
+              </>
+            ) : (
+              <>
+                Attach one to a zone from its DNSSEC card; leave a zone on{" "}
+                <code>default</code> for BIND&rsquo;s built-in policy.
+              </>
+            )}
           </p>
         </div>
         <HeaderButton

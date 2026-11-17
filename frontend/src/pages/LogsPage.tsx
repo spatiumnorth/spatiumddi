@@ -4,6 +4,7 @@ import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useSessionState } from "@/lib/useSessionState";
 import {
@@ -592,7 +593,9 @@ const WEEKDAYS: DhcpAuditDay[] = [
   "Sun",
 ];
 
-function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
+export function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
+  // Add Server on a DHCP server group is a superadmin's (#4314).
+  const { isSuperadmin } = usePermissions();
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [day, setDay] = useState<DhcpAuditDay | "today">("today");
   const [maxEvents, setMaxEvents] = useState(500);
@@ -671,7 +674,9 @@ function DhcpAuditTab({ sources }: { sources: LogSource[] }) {
           </p>
           <p className="mt-2 text-xs text-muted-foreground">
             DHCP Audit reads the audit logs of Windows DHCP servers that have
-            WinRM credentials. Register one under DHCP → Server Groups first.
+            WinRM credentials.
+            {isSuperadmin &&
+              " Register one under DHCP → Server Groups first."}{" "}
             Kea servers&apos; lease events are on the DHCP Activity tab.
           </p>
         </div>

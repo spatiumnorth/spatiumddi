@@ -875,7 +875,9 @@ function OpenAlertsPanel({
 
 // ── ASN Summary card ─────────────────────────────────────────────────────────
 
-function AsnSummaryCard() {
+export function AsnSummaryCard() {
+  // The page behind "Add one" gates its create button on this (#4314).
+  const canAdd = usePermissions().can("write", "manage_asns");
   const { enabled, ready } = useFeatureModules();
   // Gate on ``ready`` so the query waits for the real module state (``enabled``
   // is optimistically true while loading → a one-shot 404 on hard load).
@@ -917,12 +919,14 @@ function AsnSummaryCard() {
       return (
         <div className="mt-3 flex-1 flex flex-col justify-between">
           <p className="text-xs text-muted-foreground">No ASNs configured.</p>
-          <Link
-            to="/network/asns"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Add one →
-          </Link>
+          {canAdd && (
+            <Link
+              to="/network/asns"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Add one →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1015,7 +1019,9 @@ function AsnSummaryCard() {
 
 // ── VRF Summary card ─────────────────────────────────────────────────────────
 
-function VrfSummaryCard() {
+export function VrfSummaryCard() {
+  // The page behind "Add one" gates its create button on this (#4314).
+  const canAdd = usePermissions().can("write", "vrf");
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.vrf");
   const {
@@ -1059,12 +1065,14 @@ function VrfSummaryCard() {
       return (
         <div className="mt-3 flex-1 flex flex-col justify-between">
           <p className="text-xs text-muted-foreground">No VRFs configured.</p>
-          <Link
-            to="/network/vrfs"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Add one →
-          </Link>
+          {canAdd && (
+            <Link
+              to="/network/vrfs"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Add one →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1114,7 +1122,9 @@ function VrfSummaryCard() {
 
 // ── Domains Summary card ──────────────────────────────────────────────────────
 
-function DomainsSummaryCard() {
+export function DomainsSummaryCard() {
+  // The page behind "Add one" gates its create button on this (#4314).
+  const canAdd = usePermissions().can("write", "manage_domains");
   const { enabled, ready } = useFeatureModules();
   // Wait for the real module state: ``enabled`` is optimistically true while
   // loading, which would fire one 404 on a hard load with the module off.
@@ -1155,12 +1165,14 @@ function DomainsSummaryCard() {
           <p className="text-xs text-muted-foreground">
             No domains configured.
           </p>
-          <Link
-            to="/admin/domains"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Add one →
-          </Link>
+          {canAdd && (
+            <Link
+              to="/admin/domains"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Add one →
+            </Link>
+          )}
         </div>
       );
     }
@@ -3302,6 +3314,8 @@ function ServerRow({
  * either would render as a red exhaustion bar for behaving correctly.
  */
 export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
+  // Add Pool on a scope is a write on dhcp_pool (#4314).
+  const canAddPool = usePermissions().can("write", "dhcp_pool");
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
@@ -3339,8 +3353,9 @@ export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   if (!data || data.pool_count === 0) {
     return (
       <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
-        No dynamic DHCP pools configured. Add a pool to a scope to see
-        allocation pressure here.
+        No dynamic DHCP pools configured.
+        {canAddPool &&
+          " Add a pool to a scope to see allocation pressure here."}
       </div>
     );
   }
