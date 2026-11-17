@@ -625,6 +625,7 @@ async def _assert_no_overlapping_group_cidr(
     subnet: Subnet,
     *,
     exclude_scope_id: uuid.UUID | None = None,
+    restoring: bool = False,
 ) -> None:
     """Refuse a scope whose subnet CIDR overlaps another ACTIVE scope's subnet
     in the same group (#844).
@@ -637,7 +638,11 @@ async def _assert_no_overlapping_group_cidr(
     reservation guard (#619): refuse at the API instead of shipping a config
     the daemon will refuse. Overlap within one space is already impossible
     (IPAM validates), so a hit here means two IP spaces — the fix is a
-    separate DHCP server group per overlapping space.
+    separate DHCP server group per overlapping space. The Trash's Restore
+    cannot follow that advice (it takes no group, and a scope cannot move to
+    another group), so ``restoring=True`` words the refusal with what the
+    operator can do there instead (#4363): name the live scope and say to
+    deactivate or delete it first.
 
     Raw SQL for the ``&&`` cidr operator (mirrors the IPAM overlap checks);
     that bypasses the ORM soft-delete filter, hence the explicit
@@ -645,8 +650,9 @@ async def _assert_no_overlapping_group_cidr(
     """
     res = await db.execute(
         sa_text("""
-            SELECT s.network FROM subnet s
+            SELECT s.network, sc.name, COALESCE(sp.name, '') FROM subnet s
             JOIN dhcp_scope sc ON sc.subnet_id = s.id
+            LEFT JOIN ip_space sp ON sp.id = s.space_id
             WHERE sc.group_id = CAST(:gid AS uuid)
               AND sc.subnet_id != CAST(:sid AS uuid)
               AND sc.is_active
@@ -663,6 +669,18 @@ async def _assert_no_overlapping_group_cidr(
         },
     )
     row = res.first()
+    if row and restoring:
+        live = f"scope '{row[1]}'" if row[1] else "a scope"
+        space = f" (IP space '{row[2]}')" if row[2] else " (another IP space)"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{live.capitalize()}{space} in this DHCP server group now holds "
+                f"{row[0]}, which overlaps {subnet.network}; two scopes on one "
+                f"prefix would make the server reject the whole config (#844). "
+                f"Deactivate or delete that scope, then restore this one."
+            ),
+        )
     if row:
         raise HTTPException(
             status_code=409,

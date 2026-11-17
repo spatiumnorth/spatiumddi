@@ -117,3 +117,40 @@ async def test_scope_restore_without_an_overlap_still_restores(
     r = await client.post(f"/api/v1/admin/trash/dhcp_scope/{scope_a}/restore", headers=h)
     assert r.status_code == 200, r.text
     assert await _active_scopes(db_session, grp.id) == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_restore_refusal_names_the_live_scope_not_the_create_advice_4363(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The Trash cannot pick a group, so its refusal names the holder (#4363)."""
+    h, grp, _sub_a, sub_b, scope_a = await _setup(client, db_session)
+    r = await client.delete(f"/api/v1/dhcp/scopes/{scope_a}", headers=h)
+    assert r.status_code == 204, r.text
+    r = await client.post(
+        f"/api/v1/dhcp/subnets/{sub_b.id}/dhcp-scopes",
+        headers=h,
+        json={"group_id": str(grp.id), "name": "live-b"},
+    )
+    assert r.status_code == 201, r.text
+
+    r = await client.post(f"/api/v1/admin/trash/dhcp_scope/{scope_a}/restore", headers=h)
+    assert r.status_code == 409, r.text
+    reasons = [c["reason"] for c in r.json()["detail"]["conflicts"]]
+    assert any("live-b" in x for x in reasons), reasons
+    assert any("Deactivate or delete" in x for x in reasons), reasons
+    assert not any("separate DHCP server group" in x for x in reasons), reasons
+
+
+@pytest.mark.asyncio
+async def test_create_refusal_keeps_its_separate_group_advice_4363(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, grp, _sub_a, sub_b, _scope_a = await _setup(client, db_session)
+    r = await client.post(
+        f"/api/v1/dhcp/subnets/{sub_b.id}/dhcp-scopes",
+        headers=h,
+        json={"group_id": str(grp.id), "name": "b"},
+    )
+    assert r.status_code == 409, r.text
+    assert "separate DHCP server group" in r.json()["detail"]
