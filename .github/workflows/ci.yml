@@ -1,10 +1,15 @@
 name: CI
 
 on:
+  # #3948 — ``release/X.Y.Z`` branches carry the next releases' work while
+  # main is frozen for a release candidate; they merge into main before
+  # their tag. A PR into one gets the same checks as a PR into main. A push
+  # to one always runs the full backend suite: ci-tested-on-pr-head.sh only
+  # recognises merges into main, and fails safe for anything else.
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
   # #2429 — most pushes to main now skip the backend shards (their tree was
   # already tested on the PR head, see the ``changes`` job), so the two
   # artifacts only a full main run produces — the test-impact map (#1020)
@@ -279,10 +284,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            backend/requirements.txt
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -c requirements.txt -e ".[dev]"
 
       - name: ruff check
         run: python -m ruff check app tests
@@ -479,10 +486,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            backend/requirements.txt
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -c requirements.txt -e ".[dev]"
 
       - name: Install the PostgreSQL 16 client
         # From PGDG, as backend/Dockerfile does: the client major must match

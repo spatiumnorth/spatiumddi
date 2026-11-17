@@ -234,7 +234,7 @@ def test_shipper_backoff_skips_posts_but_keeps_batches(tmp_path: Path, monkeypat
     assert sh.ship({"i": 1}) == RETRY  # inside the backoff: no POST attempted
     assert not sh.drain()
     assert post.calls == 1
-    now[0] += 6
+    now[0] += 8  # past the longest jittered backoff (5 s x 1.5, #3811)
     assert sh.ship({"i": 2}) == SENT
     assert [p["i"] for p in post.received] == [0, 1, 2]
 

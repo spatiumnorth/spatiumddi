@@ -34,6 +34,7 @@ from app.core.auth_throttle import (
     stepup_block_seconds_left,
     stepup_password_blocked,
 )
+from app.core.denial_audit import note_denial_audited
 from app.models.audit import AuditLog
 from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, User
 from app.services.reauth import ReauthOutcome, reverify_operator, uses_local_password
@@ -100,6 +101,7 @@ def _denied_row(
     resource_display: str,
     reason: str,
 ) -> AuditLog:
+    note_denial_audited()
     return AuditLog(
         user_id=user.id,
         user_display_name=user.display_name,

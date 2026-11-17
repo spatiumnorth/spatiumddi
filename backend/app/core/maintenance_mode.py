@@ -168,9 +168,9 @@ async def _bearer_is_effective_superadmin(token: str, method: str, path: str) ->
     resolution)."""
     # Lazy imports — avoid pulling the auth/permission/model graph into
     # this module's import path (and any circular-import risk at boot).
-    from jose import JWTError  # noqa: PLC0415
     from sqlalchemy.orm import selectinload  # noqa: PLC0415
 
+    from app.core.jwt_compat import JWTError  # noqa: PLC0415
     from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
     from app.core.security import (  # noqa: PLC0415
         decode_access_token,

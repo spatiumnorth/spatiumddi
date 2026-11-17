@@ -11,6 +11,11 @@
     --popover: 0 0% 100%;
     --popover-foreground: 222.2 84% 4.9%;
     --primary: 222.2 47.4% 11.2%;
+    /* Selected table rows (#4075): tint + hover, one pair per stripe parity
+       so adjacent selected rows still alternate. H S L / alpha. */
+    --row-selected-even: 222 55% 38% / 0.2;
+    --row-selected-odd: 222 55% 38% / 0.13;
+    --row-selected-hover: 222 55% 38% / 0.3;
     --primary-foreground: 210 40% 98%;
     --secondary: 210 40% 96.1%;
     --secondary-foreground: 222.2 47.4% 11.2%;
@@ -44,6 +49,9 @@
     --card-foreground: 210 40% 98%;
     --popover: 222.2 84% 4.9%;
     --popover-foreground: 210 40% 98%;
+    --row-selected-even: 210 85% 65% / 0.22;
+    --row-selected-odd: 210 85% 65% / 0.14;
+    --row-selected-hover: 210 85% 65% / 0.32;
     --primary: 210 40% 98%;
     --primary-foreground: 222.2 47.4% 11.2%;
     --secondary: 217.2 32.6% 17.5%;

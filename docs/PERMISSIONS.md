@@ -227,8 +227,13 @@ grant) is refused outright. See
    aliases, bulk-edit and bulk-delete addresses, deprecate stale IPs, and the
    address import (preview and commit). Each of those checks every address it
    touches against the set's range, so the holder changes only addresses
-   inside the sets it holds. Every other mutating IPAM route, including one
-   added later, refuses such a holder with 403 until it is listed
+   inside the sets it holds. Like a subnet-scoped holder, it publishes only
+   into the zones the subnet uses, or a zone it holds `write` on (#3636).
+   Deleting an address, or one of its aliases, takes a `delete` grant that
+   covers that address: `delete` on subnets, or on an address set holding
+   it, so a `delete` grant on one set does not reach addresses outside it,
+   whatever `write` the caller holds. Every other mutating IPAM route,
+   including one added later, refuses such a holder with 403 until it is listed
    (`_ADDRESS_SET_ROUTES` in `backend/app/api/v1/ipam/router.py`). Reads
    still need a normal read grant.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
@@ -282,7 +287,7 @@ A route missing from the map admits no type-level grant at all, and
 | Routes | Needs |
 |---|---|
 | `/spaces…` | `ip_space` |
-| `/blocks…`, the aggregation snoozes, `/plans…` (except `POST /blocks/{block_id}/allocate-subnet`, which needs `subnet` only) | `ip_block` |
+| `/blocks…`, the aggregation snoozes, `/plans…` (except `POST /blocks/{block_id}/allocate-subnet`, which needs `write` on `subnet` and, as well, `write` on the target block — see the #3425 paragraph above) | `ip_block` |
 | `/subnets…`, including the subnet's own addresses, aliases, network context and reconciliation | `subnet` |
 | `/addresses/{id}` reads, address search, stale-IP / hygiene / vendor reports | `ip_address` |
 | Address writes: create, next-IP, bulk-allocate, edit, delete, aliases, bulk edit / delete, profile, wake, stale-IP deprecate, address import | `subnet` (the action of the method; the handler also checks the row's subnet, or an address set covering the address, #103) |
@@ -349,7 +354,7 @@ classified.
 
 | Routes | Needs |
 |---|---|
-| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` (except `POST /servers/{server_id}/apply-record`, which needs `dns_record` only) | `dns_group` |
+| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` (except `POST /servers/{server_id}/apply-record`, which is superadmin-only: its handler takes `SuperAdmin`, so no grant reaches it) | `dns_group` |
 | `/groups/{id}/zones`, a zone and its settings (DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
 | `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
 
@@ -496,9 +501,13 @@ when there are none.
 
 Every 403 the permission gates produce leaves a `denied` audit row, including a
 refusal from a route that takes `SuperAdmin` (recorded as `access` on
-`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
-dependency rather than check `is_effective_superadmin` and raise by hand, or its
-refusal is invisible to the audit log and the security dashboard.
+`superadmin`, #2304). A 403 a handler raises itself, after its own
+`user_has_permission` check, is recorded too (#3644): the API's 403 handler writes
+a `denied` row (`endpoint` as the resource, the method and path as the display)
+when the caller was authenticated and no gate already wrote one. Prefer a gate,
+or `SuperAdmin` for a superadmin-only handler, because the row then names the
+permission refused. A refusal with no request to attribute (the approval engine)
+leaves no row.
 
 ## The console mirrors the server, it does not enforce
 

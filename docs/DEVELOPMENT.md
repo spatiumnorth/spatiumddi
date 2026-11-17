@@ -453,7 +453,7 @@ triggered on push to `main` and on every pull request:
 
 | Job | What it does |
 |---|---|
-| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
+| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -c requirements.txt -e ".[dev]"` on Python 3.12 (the pinned set, #3693), then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
 | **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.2-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a full `main` run (a push that ran the shards, the daily schedule or a dispatch) it builds the `test-impact-map` artifact from the shards' coverage contexts. A push to `main` whose tree a green full PR run already tested skips the shards (#2429 — see §Skipping the shards on a push to main). Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
@@ -851,6 +851,32 @@ multi-arch fan-out happens in CI on a tagged release.
 - **Run `make ci` before pushing**, and `make test` for any
   behavioral change.
 - **Add a changelog fragment; don't edit `CHANGELOG.md`.** See below.
+
+### Release branches
+
+While `main` is frozen for a release candidate, work for the next releases
+goes on long-lived `release/X.Y.Z` branches (#3948), for example
+`release/1.0.1` and `release/1.1.0`:
+
+- **Target the branch of the release the issue is milestoned for.** Branch
+  `issue-NNN` off `release/X.Y.Z` instead of `main`, and open the PR against
+  it. CI runs the same checks as for `main`, and the PR takes the `X.Y.Z`
+  milestone automatically.
+- **Tags stay on `main`.** `release.yml` publishes only a tag on `main`, so a
+  release branch is squash-merged into `main` through a PR once the release
+  before it has shipped, and the release is tagged on that commit. Squash,
+  because `protect-main` requires linear history; the branch's own PRs stay
+  linked from the merge PR and from their issues.
+- **Keep the branches current.** Merge `main` into each release branch after
+  every release-candidate fix, and `release/1.0.1` into `release/1.1.0`, so
+  the final merge into `main` is small and every fix reaches the later
+  release.
+- **Alembic heads.** When a merge brings migrations from both sides, the
+  result has two heads and CI fails. Re-point the `down_revision` of the
+  first migration the incoming side added at the other side's head, in the
+  merge commit.
+- **Changelog fragments** come along with the merge; release prep folds them
+  as usual.
 
 ### Changelog fragments
 

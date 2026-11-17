@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
@@ -51,7 +52,7 @@ from app.core.permissions import (
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
-from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, APIToken, User
+from app.models.auth import APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
 from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
@@ -104,6 +105,9 @@ class ApiTokenCreate(BaseModel):
         return validate_scopes(v)
 
 
+TokenStatus = Literal["active", "revoked", "expired", "owner_disabled", "password_change_required"]
+
+
 class ApiTokenResponse(BaseModel):
     """Safe-to-list representation — no hash, no raw token."""
 
@@ -128,6 +132,15 @@ class ApiTokenResponse(BaseModel):
     # list can tell an external system's token from a person's. None only
     # for an ownerless token.
     owner_is_service_account: bool | None = None
+    # True when the owner must change their password: auth refuses every call
+    # with the token (403) until they do (#3784).
+    owner_password_change_required: bool | None = None
+    # The EFFECTIVE state — what the token will actually do at auth, derived
+    # at serialisation (no column). "active" | "revoked" | "expired" |
+    # "owner_disabled" | "password_change_required"; ``blocked_reason`` is
+    # the operator-readable sentence, None when active.
+    status: TokenStatus = "active"
+    blocked_reason: str | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
     is_active: bool
@@ -140,6 +153,38 @@ class ApiTokenResponse(BaseModel):
     def _grants_default(cls, v: object) -> list[dict]:
         # The column is nullable; surface NULL as an empty list on the wire.
         return v if isinstance(v, list) else []
+
+
+_BLOCKED_REASONS = {
+    "revoked": "The token was revoked.",
+    "expired": "The token has expired.",
+    "owner_disabled": "The owner account is disabled.",
+    "password_change_required": (
+        "The owner must change their password; every call with this token is "
+        "refused (403) until they do."
+    ),
+}
+
+
+def apply_effective_status(row: ApiTokenResponse) -> ApiTokenResponse:
+    """Fill ``status`` / ``blocked_reason`` in the order auth refuses them."""
+    exp = row.expires_at
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=UTC)
+    st: TokenStatus
+    if not row.is_active:
+        st = "revoked"
+    elif exp is not None and exp <= datetime.now(UTC):
+        st = "expired"
+    elif row.owner_is_active is False:
+        st = "owner_disabled"
+    elif row.owner_password_change_required:
+        st = "password_change_required"
+    else:
+        st = "active"
+    row.status = st
+    row.blocked_reason = _BLOCKED_REASONS.get(st)
+    return row
 
 
 class ApiTokenCreateResponse(ApiTokenResponse):
@@ -292,22 +337,22 @@ async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenRespons
     """List tokens owned by the caller. Superadmin sees everyone's, each
     row naming its owner."""
     stmt = (
-        select(APIToken, User.username, User.display_name, User.is_active, User.auth_source)
+        select(APIToken, User)
         .outerjoin(User, User.id == APIToken.user_id)
         .order_by(APIToken.created_at.desc())
     )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
     out: list[ApiTokenResponse] = []
-    for token, username, display_name, owner_active, owner_source in (await db.execute(stmt)).all():
+    for token, owner in (await db.execute(stmt)).all():
         row = ApiTokenResponse.model_validate(token)
-        row.owner_username = username
-        row.owner_display_name = display_name or None
-        row.owner_is_active = owner_active
-        row.owner_is_service_account = (
-            None if owner_source is None else owner_source == SERVICE_ACCOUNT_AUTH_SOURCE
-        )
-        out.append(row)
+        if owner is not None:
+            row.owner_username = owner.username
+            row.owner_display_name = owner.display_name or None
+            row.owner_is_active = owner.is_active
+            row.owner_password_change_required = owner.password_change_required
+            row.owner_is_service_account = owner.is_service_account
+        out.append(apply_effective_status(row))
     return out
 
 
@@ -434,6 +479,9 @@ async def mint_api_token(
         "owner_display_name": owner.display_name or None,
         "owner_is_active": True,
         "owner_is_service_account": owner.is_service_account,
+        "owner_password_change_required": current_user.password_change_required,
+        "status": "active",
+        "blocked_reason": None,
         "token": raw,
     }
 
@@ -643,18 +691,15 @@ async def with_owner(db: DB, token: APIToken) -> ApiTokenResponse:
     row = ApiTokenResponse.model_validate(token)
     if token.user_id is not None:
         owner = (
-            await db.execute(
-                select(User.username, User.display_name, User.is_active, User.auth_source).where(
-                    User.id == token.user_id
-                )
-            )
-        ).one_or_none()
+            await db.execute(select(User).where(User.id == token.user_id))
+        ).scalar_one_or_none()
         if owner is not None:
             row.owner_username = owner.username
             row.owner_display_name = owner.display_name or None
             row.owner_is_active = owner.is_active
-            row.owner_is_service_account = owner.auth_source == SERVICE_ACCOUNT_AUTH_SOURCE
-    return row
+            row.owner_password_change_required = owner.password_change_required
+            row.owner_is_service_account = owner.is_service_account
+    return apply_effective_status(row)
 
 
 async def _require_owned(token_id: uuid.UUID, db: DB, current_user: CurrentUser) -> APIToken:

@@ -116,6 +116,12 @@ class NetworkDashboardSummary(BaseModel):
     # distinguish a real all-clear from stale or absent data (#942).
     rpki_total_count: int
     rpki_last_checked_at: datetime | None
+    # ROAs whose certificate lifetime is actually known (#3557). Only a
+    # source in ``_LIFETIME_VALIDITY_SOURCES`` that ships ``notAfter`` fills
+    # it; neither Cloudflare's dump nor RIPE's export does, so 0 here means
+    # the expiring / expired counts are not measured, not that nothing
+    # expires.
+    rpki_expiry_known_count: int
     circuit_term_expiring_count: int
     circuit_status_changed_count: int
     service_orphan_count: int
@@ -226,6 +232,18 @@ async def network_summary(db: DB, current_user: CurrentUser) -> NetworkDashboard
     rpki_last_checked_at = (
         await db.execute(select(func.max(ASNRpkiRoa.last_checked_at)))
     ).scalar_one()
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.tasks.rpki_roa_refresh import _LIFETIME_VALIDITY_SOURCES  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    rpki_source = ((ps.rpki_roa_source if ps is not None else None) or "cloudflare").lower()
+    rpki_expiry_known_count = 0
+    if rpki_source in _LIFETIME_VALIDITY_SOURCES:
+        rpki_expiry_known_count = (
+            await db.execute(
+                select(func.count()).select_from(ASNRpkiRoa).where(ASNRpkiRoa.valid_to.is_not(None))
+            )
+        ).scalar_one()
     rpki_expiring: list[RpkiRoaRow] = []
     for r in expiring_rows[:_DETAIL_LIMIT]:
         asn_number = await _resolve_asn_number(db, r.asn_id)
@@ -394,6 +412,7 @@ async def network_summary(db: DB, current_user: CurrentUser) -> NetworkDashboard
         rpki_expired_count=len(expired_rows),
         rpki_total_count=rpki_total_count,
         rpki_last_checked_at=rpki_last_checked_at,
+        rpki_expiry_known_count=rpki_expiry_known_count,
         circuit_term_expiring_count=circuit_term_expiring_count,
         circuit_status_changed_count=circuit_status_changed_count,
         service_orphan_count=service_orphan_count,
@@ -422,6 +441,7 @@ def _mask_unreadable_panels(summary: NetworkDashboardSummary, user: Any) -> Netw
         summary.rpki_expired_count = 0
         summary.rpki_total_count = 0
         summary.rpki_last_checked_at = None
+        summary.rpki_expiry_known_count = 0
         summary.rpki_expiring = []
     if not user_has_permission(user, "read", "circuit"):
         summary.withheld.circuit = True

@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status:** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
+> **Implementation status:** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** published by the group's primary for external secondaries; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -33,17 +33,17 @@ SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — se
 | Native DoT / DoH (no sidecar) | ✅ (issue #50) | — (needs dnsdist sidecar) | ✅ + DoQ (issue #741) | — |
 | Encrypted *upstream* forwarding | DoT only (no client-side HTTP) | — | DoT / DoH / DoQ (#741) | — |
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | ❌ (broken, refused — #1782, fix #1766) | — |
-| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | ❌ (broken, refused — #1782, fix #1766) | — |
+| Catalog zones (RFC 9432) — consumer | — (producer-only in a group, #3764; external BIND secondaries consume, §1) | — | ❌ (refused — #1782) | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
 | RPZ blocklists | ✅ | — (recursor feature only) | native blocking, not RPZ (#744) | — |
 | AD-integrated zones | — | — | — | ✅ |
 | Agent shape | sidecar agent + named | sidecar agent + pdns_server | sidecar agent + DnsServerApp.dll | agentless (control plane → WinRM) |
 
-**Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone consumer + RPZ paths SpatiumDDI ships.
+**Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone producer + RPZ paths SpatiumDDI ships.
 
 **Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumnorth/spatiumddi/issues/127) for the full driver rationale.
 
-**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't need ALIAS/LUA. It covers primary / secondary / stub / forward zones, TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). **Catalog zones are not supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)): both roles are broken, so enabling them on a Technitium group is refused with a 422 and a group that already has them on shows a warning; the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) (1.1.0) — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding over all three — BIND9 forwards over DoT only, and PowerDNS does not forward at all. That wiring shipped in [#741](https://github.com/spatiumnorth/spatiumddi/issues/741); see §20 below. The live-pull importer ([#744](https://github.com/spatiumnorth/spatiumddi/issues/744)) shipped too (DNSSEC signing on Technitium was withdrawn in #1783 and is tracked in #1767). The one thing still outstanding is query-log shipping — [#742](https://github.com/spatiumnorth/spatiumddi/issues/742) — so a Technitium group's queries don't reach the Logs page's DNS Queries tab yet.
+**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't need ALIAS/LUA. It covers primary / secondary / stub / forward zones, TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). **Catalog zones are not supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)): both roles are broken, so enabling them on a Technitium group is refused with a 422 and a group that already has them on shows a warning; the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) (1.1.0) — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding over all three — BIND9 forwards over DoT only, and PowerDNS does not forward at all. That wiring shipped in [#741](https://github.com/spatiumnorth/spatiumddi/issues/741); see §20 below. The live-pull importer ([#744](https://github.com/spatiumnorth/spatiumddi/issues/744)) shipped too (DNSSEC is not supported on Technitium in 1.0, agent-managed or agentless: signing was withdrawn in #1783 and is tracked in #1767). The one thing still outstanding is query-log shipping — [#742](https://github.com/spatiumnorth/spatiumddi/issues/742) — so a Technitium group's queries don't reach the Logs page's DNS Queries tab yet.
 
 **Pick `technitium_api` when the Technitium server already exists** and should stay where it is. It is the same daemon and a different *ownership* model: agentless, nothing deployed, and the control plane drives Technitium's HTTP API directly with an operator-supplied bearer token — the same shape as Windows DNS Path B. Zones and records only; DNSSEC, encrypted transports, forwarders and blocklists stay managed in Technitium's own console, because those are the agent-managed driver's surface. **Experimental in 1.0.** Supported: one server per group, Primary zones SpatiumDDI creates (an existing zone of the same name is adopted only if it is an empty Primary), and records on them. Not supported, and refused with a 422 rather than accepted and ignored: DNS pools, SOA fields beyond the defaults, zone ACLs / transfer / notify, group options, catalog zones, and blocklists. An existing group that already breaks these limits keeps serving and shows a warning ([#1784](https://github.com/spatiumnorth/spatiumddi/issues/1784); full support is tracked for 1.1.0). Add it under **Add DNS server → Technitium (agentless, remote API)** with the API URL (`https://host:53443`, or `:5380` for plain HTTP) and a permanent token from Administration → Sessions → Create Token. Technitium **15.0 or later** is required (earlier versions have no Bearer auth). Create that token against a dedicated user that is a member of the **DNS Administrators** group rather than the admin account — it inherits that user's permissions, including per-zone ACLs. "Zones: Modify" alone is not enough: it cannot delete zones and sees no zone created before the user existed, so the connection test reports 0 zones. Shipped in [#810](https://github.com/spatiumnorth/spatiumddi/issues/810); internals in [`DNS_DRIVERS.md` §4C](../drivers/DNS_DRIVERS.md).
 
@@ -57,7 +57,7 @@ Driver-gated features are enforced server-side by the API's `_DRIVER_GATED_RECOR
 |---|---|
 | `ALIAS`, `LUA` records | `powerdns` |
 | `SVCB`, `HTTPS`, `DNAME` records | `bind9`, `powerdns`, `technitium` |
-| `dnssec_sign` | `bind9`, `powerdns` (Technitium refused, #1783 / #1767) |
+| `dnssec_sign` | `bind9`, `powerdns` (`technitium` and `technitium_api` refused with a 422, #1783 / #1767 / #3806) |
 | `dnssec_unsign` | `bind9`, `powerdns`, `technitium` |
 | `dnssec_rollover` (manual key rollover) | `bind9` |
 
@@ -300,6 +300,56 @@ sweep marks that server primary. Only a group with no servers at all queues
 nothing, and nothing is lost there: a server added later receives the zone's
 records in its bundle.
 
+### Catalog zones (RFC 9432) — published for external secondaries (#3764)
+
+With **Use BIND9 catalog zones** on, the group's primary (`is_primary`)
+publishes an RFC 9432 catalog zone (default name `catalog.spatium.invalid.`)
+listing every primary zone in the group. BIND9 and PowerDNS producers render
+the same records.
+
+**Members of the group do not consume it.** Every agent in a group already
+receives every zone in its own config bundle and serves it as its own
+primary, so a member that also loaded the catalog held each zone twice, and
+BIND then refused the next `rndc reconfig` ("zone … already exists"). Before
+#3764 the other members were sent a consumer block; now only the primary gets
+a catalog block at all. An agent that still receives a consumer block from an
+older control plane ignores it and logs `bind9_catalog_consumer_ignored` (or
+`technitium_catalog_consumer_ignored`).
+
+The catalog exists for **BIND secondaries outside the group**, an operator's
+own servers that should pick up every zone SpatiumDDI adds without per-zone
+config. On BIND9 the catalog zone itself is transferable by any client (on
+PowerDNS it carries the group's transfer grant); its member zones keep the
+group's transfer grant (§3.6), so the external secondary signs
+member transfers with the group's TSIG key (shown under **Group TSIG key** in
+the group editor) or with a key or address the operator adds to the group's
+or zone's `allow_transfer`. On the external BIND (9.18 or later):
+
+```
+key "<group key name>" { algorithm hmac-sha256; secret "<group key secret>"; };
+
+options {
+    catalog-zones {
+        zone "catalog.spatium.invalid."
+            default-masters { 192.0.2.10 key "<group key name>"; }
+            in-memory yes;
+    };
+};
+
+zone "catalog.spatium.invalid." {
+    type secondary;
+    primaries { 192.0.2.10 key "<group key name>"; };
+};
+```
+
+`192.0.2.10` is the primary's address as the external server reaches it;
+`default-masters` takes addresses only, not hostnames. The producer sends no
+NOTIFY for the catalog zone (its only NS is `invalid.`), so the external
+server sees new zones at the catalog's SOA refresh (24 h) or on
+`rndc refresh catalog.spatium.invalid.`. Catalog zones are skipped on a BIND9
+group with views (the flat render only), and are refused on Technitium
+(#1782).
+
 ### Control-plane memory for large groups (#2227)
 
 Every DNS agent's config is rendered once per change by the Celery worker
@@ -422,14 +472,18 @@ DNSView
 
 ### BIND9 Implementation
 - Views map directly to BIND9 `view {}` blocks in `named.conf`
-- Each view has its own set of `zone {}` directives
+- Each view has its own set of `zone {}` directives; a copy identical to an earlier view's is an `in-view` reference rather than a second load (see "What a view costs in memory" below)
 - Config is generated by the driver and pushed via `rndc reconfig` (no restart)
 
 ### Where a zone renders, and deleting a view (#2275)
 
-A zone renders into the view its `view_id` names **and** into the view of each
-view-scoped record in it. A zone with neither is *shared* and renders into every
-view (and every geo view, §17). A group with no views renders each zone once.
+A zone with a `view_id` renders into that view alone among the operator views
+(and into every geo view, §17); a record in it scoped to another view is not
+rendered and does not carry the zone into that view. A zone with no `view_id`
+renders into the view of each view-scoped record in it, and with none of those
+it is *shared* and renders into every view (and every geo view). A record
+learned from an RFC 2136 update (§19.5) follows its zone and never decides
+where it renders. A group with no views renders each zone once.
 
 - **A view that still scopes zones or records cannot be deleted** (409, naming
   them). `view_id` is `ON DELETE SET NULL`, and NULL means shared, so deleting
@@ -450,6 +504,95 @@ view (and every geo view, §17). A group with no views renders each zone once.
   would render a zone name twice in a view. A collision that already exists
   does not block unrelated edits.
 
+### What a view costs in memory (#3551)
+
+named holds every zone it loads in memory, once per view that loads it. A
+zone's copies in two views used to be two separate loads even when they were
+identical, so memory scaled with **views × data**: adding a second view to a
+group could double named's resident size and put it over the container's
+memory limit.
+
+The BIND9 agent now loads such a zone **once**. When a zone's copy in a view
+would render exactly as in an earlier view, the earlier view defines it and
+the later one references it with BIND's `in-view`:
+
+```
+view "restricted" { zone "example.com." { type master; file "…"; … }; };
+view "default"    { zone "example.com." { in-view "restricted"; }; };
+```
+
+Views keep the order you gave them (it decides which view a client lands
+in); the defining view is simply the first one that holds the copy. Only
+that view has a zone file, and a record change to the zone reaches every
+view that references it. A zone that accepts RFC 2136 updates from clients
+is never shared (#3632): an update sent through one view would land in the
+one shared zone and be answered in every view, which split-horizon exists to
+prevent. When copies that were shared stop being shared (they stop being
+identical, or a zone an earlier build shared accepts updates), each view's
+new copy starts from the shared zone's data, so no view loses a record it was
+serving.
+
+| Shared once | Still one copy per view |
+|---|---|
+| A zone with no view-scoped records, the same options in each view, and the same view-level `allow-query` | A zone with any record scoped to a view: its copies differ |
+| Primary, secondary and stub zones | A zone whose `allow-transfer`, notify, also-notify, dynamic-update ACL or DNSSEC settings differ between its copies (options live on the defining view only) |
+| | A zone in views whose `allow-query` differs: a shared zone takes its query ACL from the defining view, so sharing it would refuse the other view's clients |
+| | Forward zones (BIND refuses `in-view` of one; they hold no data, so the repeat is free) |
+| | A dynamic zone (dynamic updates on): an update a client sends through one view would be answered in the others |
+| | Every primary zone of a group with no usable group key of its own: the first operator TSIG key then holds the zone-wide update grant, and clients hold that key |
+| | A zone that has stopped taking dynamic updates while a copy still holds RFC 2136 records the control plane did not render (§8 #2850): the copies differ on named even when the bundle's are identical. Each copy keeps its own until the zone itself next changes, which reloads the copy from the render and drops those records anyway (#3632). The control plane's preview cannot see named, so for that window it shows the zone shared |
+| | **Every RPZ (blocklist) zone** |
+
+**Blocklists are not shared, and are usually the larger cost.** BIND
+refuses a response-policy zone defined with `in-view` ("is not a primary or
+secondary zone"), so each view that applies a list loads its own copy of its
+RPZ zone. Under views every view gets an RPZ zone of its own
+(`spatium-blocklist-<view>.rpz.`) with the group's lists folded in (#1706),
+so a group-level list on a group with two views is loaded twice. Measured on
+BIND 9.20.29:
+
+| Data | Resident, per copy |
+|---|---|
+| Authoritative zone, 200,000 A records | about 86 MiB (about 0.45 kB per record) |
+| RPZ zone, 100,000 entries (200,000 policy records) | about 135 MiB (about 1.4 kB per entry) |
+
+So a view adds roughly **1.4 kB × entries** for each list it applies, and
+nothing for the authoritative zones it shares. A 190,000-entry list costs
+about 260 MiB per view that applies it. If a view exists only to give some
+clients a different blocklist, size the DNS pod for one copy of every list
+per view (§8.0); if two views would apply the same lists, consider whether
+they need to be separate views at all.
+
+**The memory warning.** The control plane estimates what named will hold
+for each BIND9 group and compares it with the memory limit the group's
+agents run under. It warns; it never refuses a change.
+
+- *The estimate*: 400 MiB for named and the agent at idle, plus about
+  0.45 kB per record of each zone copy named loads (a copy shared through
+  `in-view` counts once), plus about 1.4 kB per RPZ owner name per view that
+  loads it. RPZ owners are counted as the bundle builds each view's zone:
+  every domain once across the lists it draws on (the §8 first-writer dedup),
+  plus exception domains, which render as passthru owners. Records of a
+  secondary zone arrive by transfer and are not counted.
+- *The limit*: each BIND9 agent reports its container's cgroup `memory.max`
+  on the heartbeat (`dns_server.memory_limit_bytes`), and the smallest one in
+  the group is used, since every server renders the same config. When no
+  agent has reported one (an older agent, or a container with no limit), the
+  shipped 2 GiB DNS pod limit is assumed and the warning says so.
+- *The threshold*: 80 % of the limit. At or above it, the warning appears:
+  - as `memory_estimate` on `GET /dns/groups/{id}` and the whole estimate
+    on `GET /dns/groups/{id}/memory-estimate`;
+  - as `memory_warning` on each view of `GET /dns/groups/{id}/views` and on
+    each blocking list applied to the group;
+  - as a banner on the group's Views and Blocking Lists tabs, with the
+    numbers and the fix;
+  - as the default-on `dns_memory_pressure` alert (warning from 80 %,
+    critical from 100 %);
+  - in the Copilot's `get_dns_group_memory_estimate` tool.
+
+  The fix is one of two things: fewer views drawing on the same lists, or a
+  larger memory limit for the DNS pod (§8.0 says where to raise it).
+
 ---
 
 ## 3. DNS Server Options & ACLs
@@ -468,7 +611,7 @@ DNSServerOptions.forward_policy: enum(
 )
 ```
 
-- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` or per-view
+- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` (group-level; per-view forwarders are not implemented, see #3523)
 - Per-zone forward overrides (stub/forward zone type) take precedence over global forwarders
 
 ### 3.2 Recursion
@@ -509,7 +652,7 @@ DNSTrustAnchor
   added_at, added_by
 ```
 
-- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). `yes` with no anchor validates nothing in BIND 9.20, so the options response carries a `dnssec_warnings` entry (advisory, never a 422); `auto` uses the built-in root anchor
+- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). BIND 9.20 refuses to load `yes` with no anchor, so on a group holding a BIND9 server (an empty group counts) setting `yes` without one, removing the last anchor while `yes`, adding a BIND9 server to such a group, and a `yes` platform default for new groups are all 422 (#3560); the message offers `auto` (the built-in root anchor) or adding an anchor. A row already stored that way is rendered as `auto` so the group keeps converging, and the options response carries a `dnssec_warnings` entry saying so, shown on the group's Options tab. The Options tab disables `yes` (with the reason) until the group has an anchor, and Settings does not offer it as a default. PowerDNS and Technitium accept `yes` unchanged. A root (`.`) anchor must be `initial-key`: a `static-key` root anchor is a 422 in every validation mode (#3609), because BIND 9.20 refuses it beside `auto` ("static trust anchor for root zone cannot be used with 'dnssec-validation auto'") and warns that it "WILL FAIL after key rollover" under `yes`. A static root anchor stored before that refusal is rendered as `initial-key` (RFC 5011 tracking from the same key, which loads under `auto`, `yes` and `no`) and the options response carries a `dnssec_warnings` entry saying so; switching such a group to `auto` and adding a BIND9 server to it therefore stay allowed. Static anchors for other zones are accepted as before
 - **PowerDNS / Technitium / agentless drivers:** have no equivalent, so adding a trust anchor to a group with such a server is a 422. Values are validated (zone name, algorithm 1-255, key tag, base64 key) because they land verbatim in `named.conf`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
 - UI shows DNSSEC chain validation status for each zone
@@ -571,19 +714,7 @@ so there is no private-key custody.
 
 ### 3.4 GSS-TSIG
 
-GSS-TSIG enables Kerberos-based authentication for secure DNS updates, used primarily with Active Directory / Windows DNS integration.
-
-```
-DNSServerOptions.gss_tsig_enabled: bool        -- default false
-DNSServerOptions.gss_tsig_keytab_path: str     -- path to keytab on DNS server host
-DNSServerOptions.gss_tsig_realm: str           -- e.g. "CORP.EXAMPLE.COM"
-DNSServerOptions.gss_tsig_principal: str       -- e.g. "DNS/ns1.corp.example.com@CORP.EXAMPLE.COM"
-```
-
-- **BIND9:** `tkey-gssapi-keytab "/etc/bind/dns.keytab";` + `tkey-domain "CORP.EXAMPLE.COM";`
-- When enabled, DDNS updates from Windows clients use Kerberos tickets rather than HMAC-TSIG keys
-- The keytab file is deployed to the DNS server host by the SpatiumDDI agent; the path is stored (not the keytab content itself)
-- Required for seamless AD/DNS integration and Windows Secure Dynamic Update
+**Not supported yet.** GSS-TSIG (Kerberos-signed RFC 2136 updates, which AD-integrated zones set to "Secure only" require) is not implemented, so SpatiumDDI cannot accept or send such updates. The `gss_tsig_*` server options that used to appear here were stored but never rendered, and were removed in #3561. Real support is tracked in [#1128](https://github.com/spatiumnorth/spatiumddi/issues/1128) (Kerberos transport) and [#444](https://github.com/spatiumnorth/spatiumddi/issues/444); it will use `tkey-gssapi-keytab` with a mounted keytab and `krb5-*` / `ms-*` update-policy rules. `tkey-domain` is obsolete (no effect since BIND 9.20, removed in 9.21.15) and must not be configured.
 
 ### 3.5 Notify
 
@@ -738,10 +869,12 @@ Settings can be defined at three levels and are evaluated from most-specific to 
 ```
 Zone override  (per-zone notify, allow-transfer, also-notify)
     ↓
-View override  (per-view recursion, allow-query, allow-query-cache, forwarders)
+View override  (per-view recursion, allow-query, allow-query-cache)
     ↓
 Server default (DNSServerOptions — applies to all views/zones on that server)
 ```
+
+Forwarders are **group-level only**: a view has no forwarder fields and the only view-level options the agent renders are `match-clients`, `match-destinations`, recursion, `allow-query` and `allow-query-cache`, so every view inherits the group's `forwarders`. Per-view forwarders are tracked in [#3523](https://github.com/spatiumnorth/spatiumddi/issues/3523).
 
 The driver is responsible for generating the correct BIND9 config that reflects this layered precedence. Service-layer code must not hard-code driver specifics.
 
@@ -798,7 +931,7 @@ A subnet gets one reverse zone per `/24` it spans (#1840), never one enclosing z
 
 `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SRV`, `CAA`, `TLSA`, `SSHFP`, `NAPTR`, `LOC`, `SVCB`, `HTTPS`, `DNAME`
 
-Plus the PowerDNS-only `ALIAS` (CNAME-at-apex) and `LUA` (computed responses) types, which are driver-gated — see §0 and `_DRIVER_GATED_RECORD_TYPES` in `backend/app/api/v1/dns/router.py`.
+Plus the PowerDNS-only `ALIAS` (CNAME-at-apex) and `LUA` (computed responses) types, which are driver-gated (and `LUA` writes are also superadmin-only) — see §0 and `_DRIVER_GATED_RECORD_TYPES` in `backend/app/api/v1/dns/router.py`.
 
 ### Record Model
 
@@ -935,7 +1068,7 @@ The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle l
 
 ### Idempotency
 
-DDNS is safe to call repeatedly. If the resolved hostname matches what's already on the `IPAddress` row and there's already a linked auto-generated DNS record, no ops are enqueued. The agentless lease-pull loop hits this path every poll; post-steady-state it's effectively a no-op.
+DDNS is safe to call repeatedly. If the resolved hostname matches what's already on the `IPAddress` row, the linked forward record carries it, the PTR exists in the address's reverse zone, and the DDNS-generated records carry the effective `ddns_ttl`, no ops are enqueued and no zone is locked. Otherwise the renewal repairs what drifted (#3776): a deleted PTR is republished and a changed `ddns_ttl` is applied as an update. A TTL hand-edited on a DDNS-generated record is therefore reset to the effective `ddns_ttl` at the next renewal; to pin one, change `ddns_ttl` on the subnet, block or space, or replace the record with a manual one. The agentless lease-pull loop hits this path every poll; post-steady-state it's effectively a no-op.
 
 ### Security
 
@@ -1015,12 +1148,24 @@ DNSBlockListException
     `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow
     a rule, and DNS cannot express that, so keeping the bare name would
     block more than the feed asked for.
+  - Two non-`||` shapes that name a complete DNS name **are** enforced
+    (#4037), and neither follows the list's "Block subdomains" setting:
+    a dot-led `.name^` blocks the name's subdomains only (stored as
+    `*.name`; the apex keeps resolving), and `|name^` blocks exactly that
+    name (no subdomains). Both need the closing `^` (without it adblock
+    reads a substring), and a name with an all-digit label or a file
+    extension as its last label (`.n.2.1.js^`) is a filename fragment and
+    stays skipped. `@@|name^` becomes an exception for the name, which
+    every renderer applies to its subdomains too; `@@.name^` has no
+    exception to map to and stays skipped.
   - Regex rules (`/…/`), paths (`||host/ads`), a `*` inside a name and
     other non-`||name^` rules are skipped.
 
   Skipped rules are counted by category (regex / modifier / badfilter /
   malformed), stored on the list as `feed_parse_skipped`, and shown on the
-  list as "N rules not enforced". Every `||name^` rule means "this name and
+  list as "N rules skipped", with the list's entry count first and the
+  reasons in plain words on hover and on the list's detail page: they are
+  rules only a browser ad blocker can apply, not a fault. Every `||name^` rule means "this name and
   its subdomains", so an adblock feed on a list set to apex-only logs the
   same override warning a `*.`-prefixed feed does (#894).
 
@@ -1050,8 +1195,8 @@ lists to `nxdomain`, which changes nothing they answer.
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
 - Block list entries are written as RPZ zone records
-- Updating the RPZ zone uses `rndc reload <rpz-zone>` (no full restart)
-- Multiple RPZ zones can be chained (per-list)
+- Updating the RPZ zone is an incremental RFC 2136 update when only a few names changed, else `rndc reload <rpz-zone>` (no full restart). The zone is dynamic, so a manual `rndc reload` alone does not re-read it: use `rndc freeze <rpz-zone>`, `rndc reload <rpz-zone>`, `rndc thaw <rpz-zone>`. See [DNS drivers](../drivers/DNS_DRIVERS.md)
+- Every list a scope draws on is folded into ONE RPZ zone per view (plus one group zone), so BIND's limit of 64 zones per `response-policy` statement can never be reached by assigning lists; there is deliberately no assignment-time cap (#3564)
 
 ### UI Features
 - Dashboard showing blocked query stats (pulled from DNS server logs)
@@ -1075,6 +1220,18 @@ everywhere" means in practice. It shipped with the split-horizon work in
 #24 and has been rendered end-to-end by the BIND9 agent since — but until
 #876 the UI wrote only the group half, so per-subnet filtering was
 unreachable from the product despite being fully implemented underneath.
+
+Both relationships are written through
+`PUT /api/v1/dns/blocklists/{id}/assignments`. `server_group_ids` /
+`view_ids` replace the stored set; `add_server_group_ids` /
+`remove_server_group_ids` / `add_view_ids` / `remove_view_ids` change only
+the ids named, against the stored set under a row lock, so a client that
+speaks for one group cannot drop an assignment another client made since it
+last read the list (#3737) — the console's Apply, Detach and Save scope all
+send deltas. Adding an id already present or removing one that is not is a
+no-op. A request carrying both the full set and deltas for one relationship,
+or the same id in its add and remove, is refused with 422. An empty body
+changes nothing and writes no audit row.
 
 A **view** is a set of clients, identified by source address. `match_clients`
 is a BIND address-match-list: addresses, CIDR prefixes, a named ACL from
@@ -1195,9 +1352,10 @@ still an outage: **size the limit for the lists you subscribe to.**
 
 Rule of thumb for the limit: 400 MB for named and the agent at idle, plus
 about 3 kB per blocklist entry per RPZ zone while an apply is in flight
-(named and the agent's render each hold a copy). A group with views writes a
-list once per view that carries it (the one-copy-per-view fix is #1706, so
-the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
+(named and the agent's render each hold a copy). A group with views loads a
+list once per view that carries it (#1706 stopped a view loading the group
+list beside its own); BIND cannot share an RPZ zone between views, so that
+factor stays (see §2, "What a view costs in memory"). So 582k entries x 2 zones is about 3.9 GB and
 needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
 
@@ -1347,7 +1505,10 @@ container's memory limit, split across the views that recurse (at least
 32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
 recursive views. With no limit it writes nothing and BIND keeps its default.
 Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
-BIND does) on the agent to override it.
+BIND does) on the agent to override it. `unlimited` and `0` are not accepted:
+BIND 9.21.21+ stops honouring them and falls back to 90 % of physical memory,
+so the agent ignores them (logging `bind9_max_cache_size_ignored`) and keeps
+the derived ceiling. Use an explicit size.
 
 ### 8.1 Content filtering / family filter (issue #878)
 
@@ -1432,9 +1593,18 @@ letting one silently win.
   feeds in the profile are the mitigation, not a fix. Blocking outbound
   :53 and :853 to anything but your resolvers at the firewall is what
   actually closes it.
-- **Blocklists disable DNSSEC validation** on a group that has any (RPZ
-  rewriting is by definition answer tampering). The agent handles this
-  automatically; it is why a filtered group cannot also validate.
+- **Blocklists do not change DNSSEC validation.** A filtered group keeps
+  the `dnssec-validation` it is configured with. Every `response-policy`
+  is rendered with `break-dnssec yes`, so a blocked name is rewritten for
+  clients that set the DO bit as well as for those that do not, while
+  every other name is still validated (a bogus answer is still SERVFAIL).
+  Before [#3563](https://github.com/spatiumnorth/spatiumddi/issues/3563)
+  the agent forced `dnssec-validation no` on any group with a blocklist,
+  silently, while Settings still showed validation on.
+  A consequence on upgrade: a filtered group that forwards to resolvers
+  which strip DNSSEC records now answers SERVFAIL for signed names, as an
+  unfiltered group with the same forwarders always has. Use DNSSEC-clean
+  forwarders, or set the group's validation to `no` explicitly.
 
 #### How often are feeds refreshed?
 
@@ -1497,23 +1667,34 @@ still contains `***` in a credential position is refused (422).
 
 #### Do feed entries block subdomains?
 
-Yes by default, and it is a **per-list** setting — *Block subdomains of
-feed entries* on the list's edit form (`feed_entries_are_wildcard`,
-issue #894).
+It depends on the entry's own syntax, and it is a **per-list** setting —
+*Block subdomains of feed entries* on the list's edit form
+(`feed_wildcard_mode`, issues #894 and #4190). Three values:
 
-Leave it on for anything in the curated catalog. Every one of those 19
-sources is a "block this domain and everything under it" list, and off
-would mean a feed naming `tracker.example` leaves
-`cdn.tracker.example` resolving — which is what these lists exist to
-stop.
+| Mode | What it does |
+|---|---|
+| **By syntax** (default) | Each entry follows its own line. An adblock `\|\|name^` rule, or a `*.name` line, blocks `name` and every subdomain (`name` plus `*.name` in the RPZ). A hosts line (`0.0.0.0 name`) or a bare domain blocks only `name` (one RPZ record), the way AdGuard Home and hosts-file resolvers read it. |
+| **Always** | Every feed entry also blocks its subdomains, whatever its syntax. For a plain-domain feed whose publisher means "this domain and everything under it". |
+| **Never** | Exact names only. For a feed of specific hosts (a threat-intel drop of individual C2 FQDNs) where blocking the parent would be too broad. |
 
-Turn it off only for a feed that lists **specific hosts** rather than
-domains: a threat-intel drop of individual C2 FQDNs, say, where
-blocking the parent domain would take out everything else hosted under
-it. Toggling it restamps the entries already imported, so the change
-takes effect immediately rather than waiting for the feed's contents to
-churn — the save takes a few seconds on a large list (measured ~7 s on
-a 464k-entry feed) because it rewrites every row in one transaction.
+The curated catalog sets **Always** on the HaGeZi `wildcard/` and OISD
+`domainswild` sources (plain-domain feeds that mean "and everything under
+it") and leaves the hosts-format (StevenBlack, 1Hosts) and adblock-format
+(AdGuard DNS filter, EasyPrivacy, URLhaus) sources and Phishing Army on
+**By syntax**. Before #4190 every list was "Always"; on upgrade a list
+that had the box unticked becomes **Never**, one subscribed to a HaGeZi /
+OISD wildcard feed becomes **Always**, and every other list becomes
+**By syntax**, with its stored entries restamped by the next refresh. A
+hosts-format list therefore drops to one RPZ record per entry.
+
+Changing the mode restamps the entries already imported: to **Always** or
+**Never** immediately (the save takes a few seconds on a large list,
+measured ~7 s on a 464k-entry feed, because it rewrites every row in one
+transaction); to **By syntax** by refreshing the feed, since stored rows
+do not remember which syntax they came from. The old boolean
+`feed_entries_are_wildcard` is still read in responses (false only for
+**Never**) and still accepted on write (true = **Always**, false =
+**Never**); send `feed_wildcard_mode` instead.
 
 Two related behaviours worth knowing:
 
@@ -1524,7 +1705,7 @@ Two related behaviours worth knowing:
   the feed means. The prefix is instead read as the feed declaring
   "and every subdomain", which is exactly what this setting expresses.
 - If such a feed is imported into an apex-only list, the refresh logs
-  `blocklist_feed_wildcard_intent_overridden` naming the count. That is
+  `blocklist_feed_wildcard_intent_overridden` (mode *Never* only) naming the count. That is
   a legitimate configuration, not an error — but it overrides something
   the feed stated, so it says so.
 
@@ -1533,11 +1714,12 @@ and is never rewritten by this list-level switch.
 
 #### Sizing
 
-Feed-sourced entries block the named domain *and* its subdomains, which
-takes two RPZ records each (`example.com` and `*.example.com`) — an RPZ
-wildcard matches subdomains only, so the bare name is not redundant.
-Budget roughly **two records per feed entry** (halve it for a list with
-*Block subdomains* off):
+A feed entry that blocks the named domain *and* its subdomains takes two
+RPZ records (`example.com` and `*.example.com`) — an RPZ wildcard matches
+subdomains only, so the bare name is not redundant. An exact entry (a hosts
+line under *By syntax*, or a list set to *Never*) takes one. The table
+below is for lists that block subdomains, so budget roughly **two records
+per feed entry** for those and **one** for a hosts-format list:
 
 | Profile feed | Entries | RPZ records |
 |---|---|---|
@@ -2013,6 +2195,32 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   into storage. Underscore labels are allowed (`_msdcs.example.com` is a real
   zone); wildcards are not. `422` via `app.core.dns_names.validate_fqdn` at
   `backend/app/api/v1/dns/router.py:785` (create) / `:832` (update). See §18.
+- **Apex names past 253 characters (issue #3672).** A primary zone with no
+  Primary NS is served with the placeholder name server `ns1.<zone>`, and
+  with no Admin Email the mailbox `admin.<zone>`. A zone name of 250
+  characters or more without a Primary NS, or 248 or more without an Admin
+  Email, makes those longer than 253, so BIND refuses the zone. Add Zone,
+  Edit Zone (when the name, type, Primary NS or Admin Email changes), the
+  template create, the Copilot create and the importers refuse it with a
+  `422` naming the field to set, via
+  `app.services.dns.zone_apex.apex_name_length_error`.
+- **Zone names near the file-name limit (issue #3672).** The BIND9 agent
+  stores a zone as `<zone>.db`, with sidecars beside it (`.db.owned` for a
+  dynamic zone, `.db.sha256` for an RPZ zone), and named opens its journal
+  (`.db.jnl`, and with inline-signing `.db.signed.jnl`) every time it loads
+  a primary zone, dynamic or not. A file name is capped at 255 bytes, and
+  named refuses to load a zone whose journal it cannot name. So on BIND9 a
+  primary or RPZ zone of 249 characters or more, a DNSSEC-signed zone of
+  242 or more, and a dynamic zone of 247 or more cannot be served. Such a
+  zone is held back on its own at render (reported with the reason, its
+  stanza kept so named answers SERVFAIL for it rather than recursing),
+  exactly as a zone `named-checkzone` refuses, and every other zone in the
+  bundle applies. An RPZ zone with no room for its hash sidecar (246 to
+  248 characters) is still served, just rendered on every apply. The
+  control plane does not refuse these names: PowerDNS and the agentless
+  drivers serve them. A DNSSEC-signed zone is held back from 215 characters
+  (issue #3750): BIND cannot write the key files it names after the zone, so
+  it would serve the zone unsigned with no key.
 
 ### Servers & server groups
 
@@ -2074,10 +2282,9 @@ unrelated edit.
   line and are refused. `query_log_print_category` / `_print_severity`
   are honoured; `query_log_print_time` must stay on (the shipper reads the
   timestamp).
-- **Paths.** `gss_tsig_keytab_path` must be a file under `/etc/` or
-  `/var/lib/`. It must be
-  absolute, with no `.` or `..` segment, using only letters, digits, `.`,
-  `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
+- **Paths.** `query_log_file` must be absolute, with no `.` or `..`
+  segment, using only letters, digits, `.`, `_`, `-` and `/`: the path sits
+  inside `"…"` in `named.conf`.
 
 A zone's own `allow_query`, `allow_transfer`, `also_notify` and
 `notify_enabled` go through the same checks on zone create and update (#1316),
@@ -2504,6 +2711,22 @@ other case nothing is filed and the endpoint answers
 `skipped: view_ambiguous` or `view_not_read`: the control plane never
 guesses a view, because a guess mirrors one view's records into another
 view's zone, where that view's clients are answered them.
+
+**A learned record keeps the view it was written in.** A zone rendered into
+several views loads one copy per view, and an RFC 2136 update lands in one
+of them. A record learned from a report that names its view is stored scoped
+to that view, so it renders into that view's copy only rather than into every
+view's. A zone rendered into a single view, or a group with no views, keeps
+learned records unscoped. A learned record's view never changes which views
+the zone itself renders into, and a report from one view never matches or
+removes a record learned in another. A report that names no view (an agent
+built before the field) stores unscoped records as before, and the control
+plane logs `dns_ingest_report_without_view` (once per server and zone, then at
+debug) when the zone is in more than one view. Learned records stored unscoped
+before this change stay unscoped. A learned record keeps its view when the
+zone later stops rendering into that view: it is then served nowhere, is not
+removed by reports from the zone's other views, and is listed (blocking the
+delete) when that view is deleted, until an operator removes it.
 
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only
@@ -3266,7 +3489,7 @@ per zone, AXFR the live zone from every server in the group and diff it against 
 
 synthesised at query time by `pdns_server`, so they have no BIND9 equivalent:
   - **ALIAS** — an apex CNAME-equivalent. Lets `example.com` itself point at a cloud load balancer's hostname, which a real CNAME can't do at the apex without breaking the SOA / NS rrset
-  - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. Authoring is gated on the usual DNS write permission — scope that permission accordingly, and treat it as more privileged than authoring an A record
+  - **LUA** — scripted answers (health-aware, client-aware, arithmetic). **Security boundary worth stating plainly:** LUA record scripts execute inside the `pdns_server` process, so anyone who can author one has code execution in your DNS daemon. **Creating a LUA record, or changing an existing one's value, needs a superadmin** (#3637) — the DNS Editor role, which otherwise holds `admin` on `dns_record`, is refused with a 403 on the record create / update, bulk create, zone-file and spreadsheet import, and create-zone-from-template routes, and the refusal is audited. The snippet menu offers `ifportup` / `ifurlup`, which make the DNS server probe TCP ports and fetch URLs, so it is held to the same bar as GSLB pool health checks. Deleting a LUA record follows the ordinary record `delete` permission, and existing LUA records keep serving. The PowerDNS agent turns `enable-lua-records` on for every PowerDNS server (a global setting, not per-zone metadata)
 
 ### DNS pools (GSLB-lite)
 

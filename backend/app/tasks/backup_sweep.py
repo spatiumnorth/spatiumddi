@@ -80,6 +80,10 @@ async def _sweep() -> dict[str, int]:
                     triggered_by="schedule",
                     actor_id=None,
                     actor_display="system (schedule)",
+                    # This tick's own loop: the end stamp must not use the
+                    # shared pool, which may hold a connection from an
+                    # earlier tick's closed loop (#3939).
+                    stamp_session=task_session,
                 )
                 fired += 1
             except BackupRunBusyError:

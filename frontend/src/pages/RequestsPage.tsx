@@ -21,11 +21,16 @@
  * That means the form fields ARE the server's contract: adding a field to an
  * operation surfaces it here with no frontend change, and the two can't drift.
  */
+import { FormError } from "@/components/ui/form-error";
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   authApi,
-  ipamApi,
   requestsApi,
   type ChangeRequestState,
   type ProvisioningRequest,
@@ -136,9 +141,19 @@ const STATE_FILTERS: { value: ChangeRequestState; label: string }[] = [
   { value: "expired", label: "Expired" },
 ];
 
+// The server's bound on a decision note and on a justification (2000); the boxes
+// stop at it so an over-long text is never sent and refused after the press (#3835).
+const NOTE_MAX = 2000;
+
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString();
+}
+
+const REQUESTS_PAGE_SIZE = 100;
+
+function axiosStatus(e: unknown): number | undefined {
+  return (e as { response?: { status?: number } })?.response?.status;
 }
 
 function errMessage(e: unknown, fallback: string): string {
@@ -327,7 +342,7 @@ export function ResourcePicker({
           )}
           {options.length > 0 && data?.truncated ? (
             <div className="border-t border-border px-2 py-1 text-[11px] text-muted-foreground">
-              More may exist — keep typing to narrow
+              Showing {options.length} — more match, keep typing to narrow
             </div>
           ) : null}
         </div>
@@ -479,6 +494,7 @@ function NewRequestModal({
           </label>
           <textarea
             rows={3}
+            maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             placeholder="Context for whoever reviews this — what it's for, how long you need it."
             value={justification}
@@ -486,11 +502,9 @@ function NewRequestModal({
           />
         </div>
 
-        {error ? (
-          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        ) : null}
+        <FormError className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
 
         <p className="text-xs text-muted-foreground">
           Submitting changes nothing yet. Your request goes to an approver who
@@ -520,25 +534,19 @@ function NewRequestModal({
 /**
  * The IPAM template a subnet request names (#3251). Approving stamps its
  * tags, zone binding, server groups and DDNS settings on the new subnet, so
- * the approver is shown which one before deciding. Shows the id until the
- * name arrives, and keeps it when this user cannot read the template, so the
- * line never waits on a lookup or reads "undefined".
+ * the approver is shown which one before deciding. The name rides on the
+ * request itself (#3649): the templates route needs a grant the Requester and
+ * Change Approver roles lack, so this never looks the template up. Falls back
+ * to the id only when the server resolved no name (template since deleted).
  */
 function TemplateLine({ request }: { request: ProvisioningRequest }) {
   const raw = request.args?.template_id;
   const id = typeof raw === "string" && raw ? raw : null;
-  const tpl = useQuery({
-    queryKey: ["ipam-template", id],
-    queryFn: () => ipamApi.getTemplate(id as string),
-    enabled: id !== null,
-    retry: false,
-    staleTime: 60_000,
-  });
   if (!id) return null;
   return (
     <p data-testid="request-template" className="mt-1 text-xs">
       <span className="font-medium">Template applied on approval:</span>{" "}
-      {tpl.data?.name || id}
+      {request.template_name || id}
     </p>
   );
 }
@@ -592,18 +600,56 @@ function DecisionModal({
       }
       onClose();
     },
-    onError: (e) => setError(errMessage(e, `Could not ${action} the request`)),
+    onError: (e) => {
+      setError(errMessage(e, `Could not ${action} the request`));
+      // A 409 means the request was decided elsewhere since the list loaded
+      // (#3935): refresh so the row stops offering the decision.
+      if (axiosStatus(e) === 409) {
+        setFailed(true);
+        void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
+      }
+    },
   });
+
+  // What approving does NOW (#3934): the stored text was composed at submit,
+  // and the approval runs against the estate as it is at the press.
+  const current = useQuery({
+    queryKey: ["provisioning-requests", "current-preview", request.id],
+    queryFn: () => requestsApi.currentPreview(request.id),
+    enabled: action === "approve",
+    staleTime: 0,
+    gcTime: 0,
+  });
+  const shownText =
+    action === "approve" && current.data?.ok
+      ? current.data.preview_text
+      : request.preview_text;
 
   return (
     <Modal title={title} onClose={onClose} wide>
       <div className="space-y-3">
         <div className="rounded border border-border bg-muted/40 p-2">
           <p className="whitespace-pre-wrap break-words text-xs font-medium">
-            {plainText(request.preview_text)}
+            {plainText(shownText)}
           </p>
           <TemplateLine request={request} />
         </div>
+        {action === "approve" && current.data?.changed ? (
+          <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+            This request changed since it was submitted. Approving does what is
+            shown above, not what the requester first read:{" "}
+            <span className="break-words">
+              {plainText(request.preview_text)}
+            </span>
+          </p>
+        ) : null}
+        {action === "approve" && current.data && !current.data.ok ? (
+          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
+            This can no longer be provisioned as requested:{" "}
+            {plainText(current.data.detail ?? "it was refused")} Approving will
+            mark the request failed.
+          </p>
+        ) : null}
         {request.justification ? (
           <div>
             <p className="text-[11px] font-medium text-muted-foreground">
@@ -627,16 +673,15 @@ function DecisionModal({
           </label>
           <textarea
             rows={2}
+            maxLength={NOTE_MAX}
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
             value={note}
             onChange={(e) => setNote(e.target.value)}
           />
         </div>
-        {error ? (
-          <p className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-400">
-            {error}
-          </p>
-        ) : null}
+        <FormError className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1.5 text-rose-600 dark:text-rose-400">
+          {error}
+        </FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
             {failed ? "Close" : "Cancel"}
@@ -688,13 +733,28 @@ export default function RequestsPage() {
     enabled: canSubmit,
   });
 
-  const list = useQuery({
+  // Paged (#3937): the page used to read the newest 100 and say nothing of
+  // the rest, so the oldest pending requests (the first to expire) were
+  // unreachable once the queue passed 100.
+  const list = useInfiniteQuery({
     queryKey: ["provisioning-requests", "list", stateFilter],
-    queryFn: () => requestsApi.list(stateFilter ? { state: stateFilter } : {}),
+    queryFn: ({ pageParam }) =>
+      requestsApi.listPage({
+        ...(stateFilter ? { state: stateFilter } : {}),
+        limit: REQUESTS_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
     refetchInterval: pollUnlessRefused(30000),
   });
 
-  const rows = list.data ?? [];
+  const rows = (list.data?.pages ?? []).flatMap((p) => p.items);
+  const rowsTotal =
+    list.data?.pages[list.data.pages.length - 1]?.total ?? rows.length;
 
   return (
     <div className="space-y-4 p-4">
@@ -821,7 +881,12 @@ export default function RequestsPage() {
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex justify-end gap-1.5">
-                      {r.state === "pending" && canApprove ? (
+                      {/* The server refuses an approver's decision on their
+                          own request, so only the requester's Withdraw is
+                          offered on it (#3648). */}
+                      {r.state === "pending" &&
+                      canApprove &&
+                      !(myUserId && r.requested_by_user_id === myUserId) ? (
                         <>
                           <HeaderButton
                             variant="primary"
@@ -864,6 +929,21 @@ export default function RequestsPage() {
           </tbody>
         </table>
       </div>
+
+      {list.hasNextPage ? (
+        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+          <span>
+            Showing the newest {rows.length} of {rowsTotal}.
+          </span>
+          <HeaderButton
+            variant="secondary"
+            disabled={list.isFetchingNextPage}
+            onClick={() => void list.fetchNextPage()}
+          >
+            {list.isFetchingNextPage ? "Loading…" : "Load more"}
+          </HeaderButton>
+        </div>
+      ) : null}
 
       {showNew ? (
         <NewRequestModal

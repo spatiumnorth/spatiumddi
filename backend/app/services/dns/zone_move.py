@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 import zlib
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,7 +60,7 @@ from app.models.dns import (
 from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import SIGNING_DRIVERS, lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
-from app.services.dns.pool_geo import build_geo_steering
+from app.services.dns.pool_geo import EXTERNAL_IMPORT_SOURCE, build_geo_steering
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
     count_queued_zone_ops,
@@ -139,6 +140,12 @@ class ZoneMovePlan:
 
     # Per-record view scoping, same three outcomes.
     records_total: int = 0
+    # Records in the Trash: they move with the zone, answer nowhere, and are
+    # left out of every other figure here (#3921).
+    records_trashed: int = 0
+    # Trashed records whose view the move clears: restored later they come back
+    # shared (every view), so the widening acknowledgement covers them too.
+    records_trashed_widened: int = 0
     records_remapped: int = 0
     records_widened: int = 0
     records_cleared_inert: int = 0
@@ -261,6 +268,244 @@ async def _group_has_views(db: AsyncSession, group_id: uuid.UUID) -> bool:
     return bool((await build_geo_steering(db, group_id)).active)
 
 
+@dataclass
+class SharedProviderResult:
+    """Source-group agentless servers whose zone copy a move must NOT delete."""
+
+    #: Server ids to leave out of the source-group delete.
+    keep_ids: set[uuid.UUID] = field(default_factory=set)
+    #: Operator-readable reason per kept server.
+    notes: list[str] = field(default_factory=list)
+
+
+async def same_provider_target_ids(
+    db: AsyncSession, source_group_id: uuid.UUID, target_group_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """Target agentless servers whose provider identity KNOWN-equals a source server's.
+
+    Such a target's create finds the zone the source group already holds,
+    through the same provider, with SpatiumDDI's own records in it. The driver
+    may then adopt it without the foreign-records refusal (#3805). An unknown
+    identity on either side never qualifies: the refusal then still runs.
+    """
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+
+    sources = await _agentless_servers(db, source_group_id)
+    targets = await _agentless_servers(db, target_group_id)
+    known: set[tuple[str, str]] = set()
+    for src in sources:
+        ident = get_driver(src.driver).provider_identity(src)
+        if ident is not None:
+            known.add((src.driver, ident))
+    out: set[uuid.UUID] = set()
+    for tgt in targets:
+        ident = get_driver(tgt.driver).provider_identity(tgt)
+        if ident is not None and (tgt.driver, ident) in known:
+            out.add(tgt.id)
+    return out
+
+
+async def _agentless_servers(db: AsyncSession, group_id: uuid.UUID) -> list[DNSServer]:
+    from app.drivers.dns import is_agentless  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == group_id,
+                    DNSServer.credentials_encrypted.isnot(None),
+                    DNSServer.is_enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if is_agentless(r.driver)]
+
+
+async def shared_provider_sources(
+    db: AsyncSession,
+    source_group_id: uuid.UUID,
+    target_group_id: uuid.UUID,
+    adopted_on: Collection[str] | None = None,
+) -> SharedProviderResult:
+    """Find source servers that may reach the same provider as a target server (#3805).
+
+    The move pushes a create into the target, then a delete into the source.
+    When one provider sits behind a server on each side the create adopts the
+    existing zone and the delete then removes the only copy. Delete is the
+    destructive direction, so a source server is kept (not deleted) when ANY
+    of these says it might share a store with a target server of its driver:
+
+    * its provider identity equals a target server's;
+    * its identity, or a same-driver target's, cannot be determined;
+    * ``adopted_on`` (the commit passes the target servers whose create found
+      the zone already there) names a target server of the same driver.
+
+    The last rule is the one that does not depend on the identity being
+    right. An identity is only what the credentials say: two Route 53 keys
+    can belong to one AWS account, two Cloudflare tokens to one account, two
+    Technitium URLs (an IP and a hostname) to one daemon, and two domain
+    controllers share every AD-integrated zone by replication. In each of
+    those the target's create finds the zone already present, and that is
+    the evidence the identities cannot give.
+
+    ``adopted_on=None`` is the preview, which cannot know the create's
+    outcome yet: it says the copy WILL be kept if the target already holds
+    the zone, rather than promising a delete it may not do.
+    """
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+
+    result = SharedProviderResult()
+    targets = await _agentless_servers(db, target_group_id)
+    if not targets:
+        return result
+    sources = await _agentless_servers(db, source_group_id)
+
+    def _identity(server: DNSServer) -> str | None:
+        return get_driver(server.driver).provider_identity(server)
+
+    adopted = set(adopted_on or ())
+    # Per target: (name, driver, identity). Only a same-driver target can
+    # share a provider with a source server.
+    tgt = [(t.name, t.driver, _identity(t)) for t in targets]
+    for src in sources:
+        same_driver = [(n, i) for n, d, i in tgt if d == src.driver]
+        if not same_driver:
+            continue
+        ident = _identity(src)
+        match = next((n for n, i in same_driver if ident is not None and i == ident), None)
+        adopted_by = next((n for n, _ in same_driver if n in adopted), None)
+        unknown = ident is None or any(i is None for _, i in same_driver)
+        if match is not None:
+            reason = f"it reaches the same provider as target server '{match}'"
+        elif adopted_by is not None:
+            reason = (
+                f"target server '{adopted_by}' already held the zone, which means the "
+                "two may be one provider"
+            )
+        elif unknown:
+            logger.warning(
+                "dns.zone_move.provider_identity_unknown",
+                source_server=src.name,
+                target_servers=[n for n, _ in same_driver],
+            )
+            reason = "whether it shares a provider with a target server could not be determined"
+        else:
+            if adopted_on is None:
+                result.notes.append(
+                    f"Source copy on '{src.name}' is deleted unless a target "
+                    f"{src.driver} server already holds the zone when the move "
+                    "runs; then it is kept, because the two may be one provider."
+                )
+            continue
+        result.keep_ids.add(src.id)
+        result.notes.append(
+            f"Source copy kept on '{src.name}': {reason}, so deleting it there could "
+            "remove the zone the target now serves. Remove it by hand if it is a "
+            "separate copy."
+        )
+    return result
+
+
+def provider_copies_kept_header(notes: Collection[str]) -> str:
+    """The ``X-Provider-Copies-Kept`` header value for ``notes`` (#3812).
+
+    A header must be latin-1 with no line breaks, and a server or zone name
+    may be neither; escape rather than fail a delete that has already
+    committed.
+    """
+    joined = " | ".join(" ".join(n.split()) for n in notes)
+    return joined.encode("ascii", "backslashreplace").decode("ascii")
+
+
+async def shared_zone_copy_servers(
+    db: AsyncSession, zone: DNSZone, group_id: uuid.UUID | None = None
+) -> SharedProviderResult:
+    """Servers of ``zone``'s group whose provider copy another zone still uses (#3812).
+
+    A delete (permanent, Trash purge, reverse-zone retirement, a move's source
+    delete) pushes ``delete`` to every agentless server of the group it leaves
+    (``group_id``, default the zone's own). A provider holds ONE copy of a zone
+    name, so the copy is kept on a server when another zone of the same name
+    may use it:
+
+    - a zone in another view of the same group (the same servers push it);
+    - a zone in another group that has an agentless server of the same driver
+      sharing the provider (same identity, or either identity unreadable:
+      unknown counts as shared, as in #3805). That server counts while paused
+      and the zone counts while in the Trash, because neither re-creates the
+      copy on resume or restore.
+
+    Names compare without case or the trailing dot, as the provider compares
+    them. Erring towards keeping is deliberate: a kept copy is named in the
+    caller's audit row; a wrong delete removes a zone another group serves.
+    """
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+
+    result = SharedProviderResult()
+    source_group_id = group_id if group_id is not None else zone.group_id
+    sources = await _agentless_servers(db, source_group_id)
+    if not sources:
+        return result
+    bare = zone.name.rstrip(".").lower()
+    other_group_ids = set(
+        (
+            await db.execute(
+                select(DNSZone.group_id)
+                .where(
+                    func.lower(func.rtrim(DNSZone.name, ".")) == bare,
+                    DNSZone.id != zone.id,
+                )
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if source_group_id in other_group_ids:
+        for src in sources:
+            result.keep_ids.add(src.id)
+            result.notes.append(
+                f"Provider copy kept on '{src.name}': another zone '{zone.name}' in the "
+                "same server group (another view) uses the same provider copy."
+            )
+        return result
+    for gid in other_group_ids:
+        others = [
+            r
+            for r in (
+                await db.execute(
+                    select(DNSServer).where(
+                        DNSServer.group_id == gid,
+                        DNSServer.credentials_encrypted.isnot(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if is_agentless(r.driver)
+        ]
+        for src in sources:
+            if src.id in result.keep_ids:
+                continue
+            ident = get_driver(src.driver).provider_identity(src)
+            for oth in others:
+                if oth.driver != src.driver:
+                    continue
+                oident = get_driver(oth.driver).provider_identity(oth)
+                if ident is None or oident is None or ident == oident:
+                    result.keep_ids.add(src.id)
+                    result.notes.append(
+                        f"Provider copy kept on '{src.name}': another group still has a "
+                        f"zone '{zone.name}' that may use the same provider copy "
+                        f"(via '{oth.name}'). Remove it there by hand if it is separate."
+                    )
+                    break
+    return result
+
+
 async def _drivers_of(db: AsyncSession, group_id: uuid.UUID) -> list[str]:
     rows = (
         (
@@ -334,6 +579,14 @@ async def assemble_move_plan(
             select(func.count()).select_from(DNSRecord).where(DNSRecord.zone_id == zone.id)
         )
     ).scalar_one()
+    plan.records_trashed = (
+        await db.execute(
+            select(func.count())
+            .select_from(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id, DNSRecord.deleted_at.isnot(None))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
 
     # Only view-scoped rows need looking at, and only their ``view_id`` —
     # so this selects two columns rather than hydrating every DNSRecord in
@@ -346,17 +599,25 @@ async def assemble_move_plan(
     # then renders into no operator view at all rather than into one.
     scoped = (
         await db.execute(
-            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at)
+            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at, DNSRecord.import_source)
             .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
             .execution_options(include_deleted=True)
         )
     ).all()
     # Where the zone's LIVE scoped records would place it in the target (#2275).
+    # A learned record follows the zone and does not place it (``places_zone``).
     live_record_view_ids: set[uuid.UUID] = set()
-    for _rid, view_id, deleted_at in scoped:
+    for _rid, view_id, deleted_at, import_source in scoped:
         action, new_id, old_name = _resolve(view_id)
-        if deleted_at is None and new_id is not None:
+        if deleted_at is None and new_id is not None and import_source != EXTERNAL_IMPORT_SOURCE:
             live_record_view_ids.add(new_id)
+        if deleted_at is not None:
+            # In the Trash: it answers nowhere now, so it stays out of the
+            # live figures — but the commit rewrites its view, and a cleared
+            # one comes back SHARED on restore. Counted apart; still acked.
+            if action == "cleared_widening":
+                plan.records_trashed_widened += 1
+            continue
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
@@ -563,6 +824,19 @@ async def assemble_move_plan(
             plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
 
     _fill_warnings(plan)
+    shared = await shared_provider_sources(db, zone.group_id, target_group.id)
+    # The commit also keeps the source copy for a third group's (or a sibling
+    # view's) zone of the same name (#3812); say so here instead of promising
+    # a delete (#3896).
+    others = await shared_zone_copy_servers(db, zone, group_id=zone.group_id)
+    notes = list(shared.notes)
+    if others.keep_ids:
+        by_id = {s_.id: s_.name for s_ in await _agentless_servers(db, zone.group_id)}
+        for sid in others.keep_ids:
+            name = by_id.get(sid)
+            notes = [n for n in notes if not n.startswith(f"Source copy on '{name}' is deleted")]
+    plan.warnings.extend(notes)
+    plan.warnings.extend(n for n in others.notes if n not in plan.warnings)
     return plan
 
 
@@ -681,7 +955,16 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             f"have ({detail}). They will become unscoped, which means they start answering in "
             f"EVERY view in the target rather than in one."
         )
-    if plan.zone_view_action == "cleared_widening" or plan.records_widened:
+    if plan.records_trashed_widened:
+        plan.warnings.append(
+            f"{plan.records_trashed_widened} records in the Trash would also lose their view "
+            f"and come back shared (answering in EVERY view) if restored."
+        )
+    if (
+        plan.zone_view_action == "cleared_widening"
+        or plan.records_widened
+        or plan.records_trashed_widened
+    ):
         plan.required_acknowledgements.append(ACK_VIEW_WIDENING)
 
     if plan.zone_view_action == "cleared_inert":
@@ -760,8 +1043,11 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
 
     if plan.pending_ops:
         plan.warnings.append(
-            f"{plan.pending_ops} queued record update(s) for this zone will be discarded — they "
-            f"target the current group's servers."
+            f"{plan.pending_ops} queued record update(s) for this zone target the current "
+            f"group's servers and are dropped by the move; agentless target servers are given "
+            f"the zone's records as they stand now, which already include every queued add or "
+            f"update, and a queued delete is applied to a target server that already held the "
+            f"zone (a provider shared with the source group)."
         )
 
 
@@ -991,14 +1277,4 @@ async def commit_move(
 
     collect_wake(dns_group_channel(old_group_id), dns_group_channel(target_group.id))
 
-    logger.info(
-        "dns_zone_moved_group",
-        zone_id=str(zone.id),
-        zone_name=zone.name,
-        old_group_id=str(old_group_id),
-        new_group_id=str(target_group.id),
-        records_widened=plan.records_widened,
-        acl_keys_lost=len(plan.acl_keys_lost),
-        dnssec_signed=plan.dnssec_signed,
-    )
     return plan

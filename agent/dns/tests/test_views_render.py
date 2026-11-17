@@ -258,13 +258,15 @@ def test_global_zone_renders_into_every_view(tmp_path: Path) -> None:
     drv = Bind9Driver(state_dir=tmp_path)
     drv.render(bundle)
     zdir = tmp_path / "rendered.new" / "zones"
-    assert (zdir / "internal" / "global.example.db").exists()
-    assert (zdir / "external" / "global.example.db").exists()
-    for v in ("internal", "external"):
-        assert (
-            "shared 300 IN A 198.51.100.5"
-            in (zdir / v / "global.example.db").read_text()
-        )
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    # #3551 — identical copies load once: the first view defines the zone,
+    # the later one references it with ``in-view`` and has no file.
+    assert (
+        "shared 300 IN A 198.51.100.5"
+        in (zdir / "internal" / "global.example.db").read_text()
+    )
+    assert not (zdir / "external" / "global.example.db").exists()
+    assert 'zone "global.example." { in-view "internal"; };' in conf
 
 
 # ── #920: the control plane's own transfers select a view by key ────────────

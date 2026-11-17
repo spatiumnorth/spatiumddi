@@ -1122,7 +1122,7 @@ def _ha_hook(failover: dict[str, Any], ha_tls_dir: str = DEFAULT_HA_TLS_DIR) -> 
         },
         "this-server-name": failover["this_server_name"],
         "mode": failover["mode"],
-        "heartbeat-delay": int(failover.get("heartbeat_delay_ms", 10000)),
+        "heartbeat-delay": int(failover.get("heartbeat_delay_ms", 2000)),
         "max-response-delay": int(failover.get("max_response_delay_ms", 60000)),
         "max-ack-delay": int(failover.get("max_ack_delay_ms", 10000)),
         "max-unacked-clients": int(failover.get("max_unacked_clients", 5)),

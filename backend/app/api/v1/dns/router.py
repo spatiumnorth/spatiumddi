@@ -37,7 +37,9 @@ from pydantic import (
 )
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -82,6 +84,10 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
 from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -153,7 +159,16 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.dnssec_trust import (
+    NEEDS_ANCHOR_MESSAGE,
+    STATIC_ROOT_ANCHOR_MESSAGE,
+    count_anchors,
+    has_static_root_anchor,
+    is_root_zone,
+    stored_validation,
+)
 from app.services.dns.drift import zone_state_in_sync
+from app.services.dns.memory_estimate import GroupMemoryEstimate, group_memory_estimate
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.name_targets import (
     absolute_target_error,
@@ -248,15 +263,20 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
+from app.services.dns.zone_apex import apex_name_length_error, served_apex_for_zones
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
+    provider_copies_kept_header,
+    same_provider_target_ids,
+    shared_provider_sources,
+    shared_zone_copy_servers,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
-from app.services.dns.zone_synthesis import synthesised_zone_error
+from app.services.dns.zone_synthesis import synthesised_zone_error, unauthored_zone_error
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -271,12 +291,17 @@ from app.services.dns_io import (
     apply_cname_rule,
     diff_records,
     parse_zone_file,
-    write_zone_file,
+    write_zone_file_served,
 )
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
 from app.services.ipam.zone_binding import prune_group_ids, prune_zone_ids
+from app.services.lock_order import (
+    address_ids_of_records,
+    lock_addresses_before,
+    lock_zone_rows,
+)
 from app.services.soft_delete import (
     SoftDeleteBatch,
     add_to_batch,
@@ -350,6 +375,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "PUT /groups/{group_id}/tsig-keys/{key_id}": _G,
     "POST /groups/{group_id}/tsig-keys/{key_id}/rotate": _G,
     "DELETE /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "GET /groups/{group_id}/memory-estimate": _G,
     "GET /groups/{group_id}/views": _G,
     "POST /groups/{group_id}/views": _G,
     "PUT /groups/{group_id}/views/{view_id}": _G,
@@ -592,6 +618,69 @@ class ServerGroupUpdate(BaseModel):
         return v
 
 
+class DNSMemoryRpzLoad(BaseModel):
+    """One blocklist (RPZ) zone as named loads it (#3551)."""
+
+    zone: str
+    views: list[str]
+    entries: int
+    estimated_bytes: int
+
+
+class DNSMemoryEstimateResponse(BaseModel):
+    """A BIND9 group's estimated named memory against its agents' limit (#3551).
+
+    Advisory: under split-horizon each view that applies a blocklist loads its
+    own copy of it (BIND cannot share an RPZ zone between views), so adding a
+    view can push named over the container limit. ``warn`` is set at 80 % of
+    the limit. ``limit_source`` is ``agent`` when a BIND9 agent of the group
+    reported its container limit (the smallest is used), ``default`` when none
+    did and the shipped 2 GiB DNS pod limit is assumed.
+    """
+
+    group_id: uuid.UUID
+    estimated_bytes: int
+    limit_bytes: int
+    limit_source: Literal["agent", "default"]
+    limit_server: str | None = None
+    unknown_limit_servers: list[str] = []
+    percent: float
+    warn: bool
+    message: str | None = None
+    baseline_bytes: int
+    zone_records_loaded: int
+    zone_bytes: int
+    rpz_bytes: int
+    rpz: list[DNSMemoryRpzLoad] = []
+    views: list[str] = []
+
+    @classmethod
+    def from_estimate(cls, est: GroupMemoryEstimate) -> DNSMemoryEstimateResponse:
+        a = est.assessment
+        return cls(
+            group_id=est.group_id,
+            estimated_bytes=a.estimated_bytes,
+            limit_bytes=a.limit_bytes,
+            limit_source=a.limit_source,
+            limit_server=est.limit_server,
+            unknown_limit_servers=list(est.unknown_limit_servers),
+            percent=a.percent,
+            warn=a.warn,
+            message=est.message,
+            baseline_bytes=est.baseline_bytes,
+            zone_records_loaded=est.zone_records_loaded,
+            zone_bytes=est.zone_bytes,
+            rpz_bytes=est.rpz_bytes,
+            rpz=[
+                DNSMemoryRpzLoad(
+                    zone=r.zone, views=list(r.views), entries=r.entries, estimated_bytes=r.bytes
+                )
+                for r in est.rpz
+            ],
+            views=list(est.views),
+        )
+
+
 class ServerGroupResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -619,6 +708,11 @@ class ServerGroupResponse(BaseModel):
     # server, and says where an already-existing group falls outside the
     # supported scope (second server, pools). Empty for every other group.
     scope_warnings: list[str] = []
+    # #3551 — the group's estimated named memory against its agents' limit.
+    # Filled by ``GET /groups/{id}`` only (counting the RPZ entries each view
+    # loads is too heavy for the list); null there and for non-BIND9 groups.
+    # ``GET /groups/{id}/memory-estimate`` returns the same object.
+    memory_estimate: DNSMemoryEstimateResponse | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1062,10 +1156,6 @@ class ServerOptionsUpdate(BaseModel):
     recursion_enabled: bool | None = None
     allow_recursion: list[str] | None = None
     dnssec_validation: str | None = None
-    gss_tsig_enabled: bool | None = None
-    gss_tsig_keytab_path: str | None = None
-    gss_tsig_realm: str | None = None
-    gss_tsig_principal: str | None = None
     notify_enabled: str | None = None
     also_notify: list[str] | None = None
     allow_notify: list[str] | None = None
@@ -1211,10 +1301,6 @@ class ServerOptionsResponse(BaseModel):
     recursion_enabled: bool
     allow_recursion: list[str]
     dnssec_validation: str
-    gss_tsig_enabled: bool
-    gss_tsig_keytab_path: str | None
-    gss_tsig_realm: str | None
-    gss_tsig_principal: str | None
     notify_enabled: str
     also_notify: list[str]
     allow_notify: list[str]
@@ -1266,8 +1352,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored group forwarders that cannot work with the group's transport,
     # saved before the #2128 refusal. Advisory: the save is not refused.
     forwarder_warnings: list[str] = Field(default_factory=list)
-    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
-    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    # DNSSEC config stored before the API refused it, and what is rendered
+    # instead: ``yes`` with no trust anchor on a BIND9 group renders as
+    # ``auto`` (#3560), a static root anchor as initial-key (#3609).
     dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
@@ -1352,6 +1439,10 @@ class ViewResponse(BaseModel):
     order: int
     allow_query: list[str] | None = None
     allow_query_cache: list[str] | None = None
+    # #3551 — set on ``GET /groups/{id}/views`` when the group's estimated
+    # named memory is at 80 % or more of its agents' limit: each view that
+    # applies a blocklist loads its own copy of it.
+    memory_warning: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1841,7 +1932,9 @@ class RecordCreate(BaseModel):
         # (``_acme-challenge``, ``_443._tcp``) and a leftmost ``*`` wildcard,
         # normalizes ``""``/``@`` to the apex sentinel ``@`` the handlers use
         # (``fqdn = name.zone if name != "@" else zone``).
-        return validate_record_owner(v, field="record name")
+        # An RFC 2317 delegation owner (``64/26``) passes by shape here and is
+        # held to NS / DS in a classless child's parent by the handlers' check-names (#4166).
+        return validate_record_owner(v, field="record name", allow_classless=True)
 
 
 class RecordUpdate(BaseModel):
@@ -1861,7 +1954,7 @@ class RecordUpdate(BaseModel):
         # Optional on update; same RFC 2181 owner rule as RecordCreate.
         if v is None:
             return v
-        return validate_record_owner(v, field="record name")
+        return validate_record_owner(v, field="record name", allow_classless=True)
 
 
 class RecordResponse(BaseModel):
@@ -1893,6 +1986,96 @@ class RecordResponse(BaseModel):
     provider_warning: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ServedApexSoa(BaseModel):
+    mname: str
+    rname: str
+
+
+class ServedApexInView(BaseModel):
+    """One split-horizon view's apex, when the views do not all agree."""
+
+    view: str
+    soa: ServedApexSoa
+    ns: list[str]
+    source: Literal["declared", "primary_ns", "placeholder"]
+    placeholder_glue_loopback: bool
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    unaddressed_ns: list[str] = []
+
+
+class ServedApex(BaseModel):
+    """The SOA and apex NS a primary zone serves from its settings (#3518).
+
+    Read-only and never a ``DNSRecord``: nothing here can be edited, exported,
+    imported or counted as a record. Present only on a primary zone; every
+    field but ``driver_applies`` is meaningful only when that is true.
+    """
+
+    # False when the group runs a driver that does not render the zone apex by
+    # the BIND9 agent's rule (PowerDNS, Technitium, Windows, cloud, mixed
+    # groups). The rest then describes what BIND9 *would* serve, so the UI
+    # shows it only as a note.
+    driver_applies: bool
+    soa: ServedApexSoa
+    # The NS set the zone serves at its apex, absolute names.
+    ns: list[str]
+    # ``declared``: the zone's own apex NS records are the set (nothing is
+    # synthesised); ``primary_ns``: Edit Zone's Primary NS; ``placeholder``:
+    # the invented ``ns1.<zone>`` (or ``invalid.`` for a non-host-name zone).
+    source: Literal["declared", "primary_ns", "placeholder"]
+    # The placeholder NS is glued to 127.0.0.1: every resolver that follows
+    # the zone's NS set is sent to its own loopback. This also holds for a
+    # declared apex NS record naming ``ns1.<zone>`` with no address record.
+    placeholder_glue_loopback: bool
+    # Why the placeholder is served (#3670), null unless ``source`` is
+    # ``placeholder``: ``primary_ns_has_no_address`` (the Primary NS is inside
+    # the zone and no A/AAAA record holds it; ``unaddressed_primary_ns`` names
+    # it) or ``no_primary_ns`` (no Primary NS that can resolve, no NS records).
+    placeholder_reason: Literal["primary_ns_has_no_address", "no_primary_ns"] | None = None
+    unaddressed_primary_ns: str | None = None
+    # Declared apex NS inside the zone, other than the placeholder, with no
+    # A/AAAA record: BIND will not load the zone until one is added.
+    unaddressed_ns: list[str] = []
+    # Under split-horizon the apex is rendered per view, from that view's
+    # records. Empty when every view serves the same apex (or there are no
+    # views); otherwise each view's apex in render order, and the fields above
+    # are the worst of them, so the loopback glue is never summarised away.
+    by_view: list[ServedApexInView] = []
+
+
+class RecordPage(Page[RecordResponse]):
+    """A page of records plus the apex the zone serves beside them (#3518).
+    ``total`` and ``items`` count stored records only."""
+
+    served_apex: ServedApex | None = None
+
+
+async def _refresh_record_or_404(db: AsyncSession, record: DNSRecord) -> None:
+    """``db.refresh(record)`` after a commit, a vanished row answered 404 (#3801).
+
+    A permanent delete of the record's zone queued behind the zone-row lock
+    runs the instant the write commits and takes the new record with the zone,
+    so the re-read finds no row and SQLAlchemy raises ``InvalidRequestError``.
+    The zone is gone, which is what ``404 Zone not found`` says to a request
+    that arrives after the delete. Whether the row is gone is decided by
+    looking for it, not by the exception's wording; anything else re-raises.
+    The id is read from the instance's identity, never ``record.id``: after the
+    failed refresh the instance is expired and an attribute read would lazy-load
+    on the sync path, raising ``MissingGreenlet`` (#4043).
+    """
+    try:
+        await db.refresh(record)
+    except InvalidRequestError as exc:
+        identity = sa_inspect(record).identity
+        if identity is None:
+            raise
+        still_there = await db.scalar(select(DNSRecord.id).where(DNSRecord.id == identity[0]))
+        if still_there is not None:
+            raise
+        raise HTTPException(status_code=404, detail="Zone not found") from exc
 
 
 def _agentless_op_warning(op: Any) -> str | None:
@@ -2156,7 +2339,26 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    out = ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
+    est = await group_memory_estimate(db, group.id)
+    if est is not None:
+        out.memory_estimate = DNSMemoryEstimateResponse.from_estimate(est)
+    return out
+
+
+@router.get(
+    "/groups/{group_id}/memory-estimate",
+    response_model=DNSMemoryEstimateResponse | None,
+)
+async def get_group_memory_estimate(
+    group_id: uuid.UUID, db: DB, _: CurrentUser
+) -> DNSMemoryEstimateResponse | None:
+    """#3551 — estimated named memory for a BIND9 group against the memory
+    limit its agents report, with a warning at 80 %. Null for a group with no
+    BIND9 server."""
+    await _require_group(group_id, db)
+    est = await group_memory_estimate(db, group_id)
+    return DNSMemoryEstimateResponse.from_estimate(est) if est is not None else None
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
@@ -2688,6 +2890,19 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    require_secret_with_destination_change(
+        server,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+            "api_key": body.api_key,
+        },
+        destination=("host", "port"),
+        secrets={
+            "credentials": server.credentials_encrypted,
+            "api_key": server.api_key_encrypted,
+        },
+    )
     reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
@@ -3244,6 +3459,9 @@ class SyncFromServerResponse(BaseModel):
     zones_failed: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that was queued as record ops (a large
+    # agentless zone, #3817) rather than applied inline.
+    total_queued: int = 0
     total_push_errors: int
     # Zones listed by the server over WinRM (windows_dns Path B only).
     # Empty for BIND9 and Windows DNS without credentials — the caller can
@@ -3282,6 +3500,8 @@ class GroupSyncWithServersResponse(BaseModel):
     servers_succeeded: int
     total_imported: int
     total_pushed: int
+    # Subset of ``total_pushed`` that is queued for delivery, not yet applied.
+    total_queued: int = 0
     total_push_errors: int
     total_zones_imported: int
     total_zones_pushed_to_server: int
@@ -3341,7 +3561,10 @@ async def _sync_single_server(
       4. Run the existing bi-directional per-zone sync for records.
     """
     from app.drivers.dns import get_driver  # noqa: PLC0415
-    from app.services.dns.pull_from_server import sync_zone_with_server  # noqa: PLC0415
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        non_authoritative_reason,
+        sync_zone_with_server,
+    )
 
     group_id = server.group_id
     # Agentless drivers that can list zones from the authoritative side:
@@ -3482,14 +3705,20 @@ async def _sync_single_server(
     zones_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
 
     for zone in zones:
+        # #3758 — forward / stub zones aren't held authoritatively; skip.
+        if non_authoritative_reason(zone) is not None:
+            continue
         try:
             result = await sync_zone_with_server(db, zone, apply=True, server=server)
             zones_succeeded += 1
             total_imported += result.pull.imported
             total_pushed += result.push.pushed
+            if result.push.queued_for_agent:
+                total_queued += result.push.pushed
             total_push_errors += len(result.push.push_errors)
             items.append(
                 ZoneSyncItem(
@@ -3556,6 +3785,7 @@ async def _sync_single_server(
         zones_failed=len(zones) - zones_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         zones_on_server=sorted(set(zones_on_server)),
         new_zones_on_server=new_zones,
@@ -3619,6 +3849,7 @@ async def sync_group_with_servers(
     servers_succeeded = 0
     total_imported = 0
     total_pushed = 0
+    total_queued = 0
     total_push_errors = 0
     total_zones_imported = 0
     total_zones_pushed_to_server = 0
@@ -3643,6 +3874,7 @@ async def sync_group_with_servers(
             servers_succeeded += 1
             total_imported += result.total_imported
             total_pushed += result.total_pushed
+            total_queued += result.total_queued
             total_push_errors += result.total_push_errors
             total_zones_imported += len(result.zones_imported)
             total_zones_pushed_to_server += len(result.zones_pushed_to_server)
@@ -3670,6 +3902,7 @@ async def sync_group_with_servers(
         servers_succeeded=servers_succeeded,
         total_imported=total_imported,
         total_pushed=total_pushed,
+        total_queued=total_queued,
         total_push_errors=total_push_errors,
         total_zones_imported=total_zones_imported,
         total_zones_pushed_to_server=total_zones_pushed_to_server,
@@ -3728,9 +3961,15 @@ async def apply_record(
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="DNS server not found")
-    zone = await db.get(DNSZone, body.zone_id)
-    if zone is None or zone.group_id != server.group_id:
-        raise HTTPException(status_code=404, detail="Zone not found on this server's group")
+    # #3688: the zone row first, as every record write takes it (#3535): the
+    # serial bump below must not meet a zone delete that committed meanwhile
+    # (StaleDataError) or land on a zone just moved to the trash.
+    try:
+        zone = await _require_zone(server.group_id, body.zone_id, db, lock="write")
+    except HTTPException:
+        raise HTTPException(
+            status_code=404, detail="Zone not found on this server's group"
+        ) from None
 
     if body.op != "delete":
         record = await db.get(DNSRecord, body.record_id)
@@ -4062,9 +4301,16 @@ async def _options_response(
     drivers = await _group_driver_names(db, group_id)
     if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
         out.dnssec_warnings.append(
-            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
-            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
-            "validate against BIND's built-in root anchor."
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND 9.20 "
+            "refuses that config, so it is rendered as 'auto' (BIND's built-in root key) "
+            "until you add a trust anchor or set 'auto' here."
+        )
+    if "bind9" in drivers and has_static_root_anchor(opts.trust_anchors or ()):
+        out.dnssec_warnings.append(
+            "The root ('.') trust anchor is stored as static, which BIND refuses beside "
+            "'auto' and which fails at the next root key rollover in any mode, so it is "
+            "rendered as initial-key (RFC 5011). Re-add it as an initial-key anchor to "
+            "make the stored row match (#3609)."
         )
     if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
@@ -4476,6 +4722,15 @@ async def update_options(
     for k, v in changes.items():
         setattr(opts, k, v)
 
+    # #3560: BIND9 refuses ``dnssec-validation yes`` with no trust anchor.
+    # Transition-only, so a row stored before this check still saves other options.
+    if (
+        changes.get("dnssec_validation") == "yes"
+        and before.get("dnssec_validation") != "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id)
+    ):
+        raise HTTPException(status_code=422, detail=NEEDS_ANCHOR_MESSAGE)
     _refuse_plain_port_forwarders_on_encrypted(opts, forwarders_before, transport_before)
     await _assert_encrypted_transport_sane(opts, db)
     if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
@@ -4554,6 +4809,10 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # #3609: a static root anchor is never right — BIND refuses it under
+    # ``auto`` and it breaks at the next root key rollover under ``yes``.
+    if is_root_zone(body.zone_name) and not body.is_initial_key:
+        raise HTTPException(status_code=422, detail=STATIC_ROOT_ANCHOR_MESSAGE)
     # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
     # group another driver serves would be accepted and ignored.
     others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")
@@ -4617,6 +4876,22 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    # #3560: removing the last anchor under ``yes`` would leave BIND9 with a
+    # config it refuses to load.
+    if (
+        await stored_validation(db, group_id) == "yes"
+        and "bind9" in await _group_driver_names(db, group_id)
+        and not await count_anchors(db, group_id, exclude_id=anchor.id)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This is the group's last trust anchor and dnssec_validation is 'yes', "
+                "which BIND9 refuses to load without one. Set dnssec_validation to 'auto' "
+                "first (BIND's built-in root key), or add another trust anchor before "
+                "removing this one."
+            ),
+        )
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4726,6 +5001,14 @@ async def _assert_acl_graph_is_acyclic(group_id: uuid.UUID, db: DB) -> None:
         ) from exc
 
 
+#: Way out of a delete / rename refused because a zone in the Trash cites the
+#: name (#4226).
+_TRASHED_ZONE_HINT = (
+    " A zone marked 'in the Trash' comes back with its citations on restore: purge it "
+    "from Administration > Trash, or restore it and clear the citation first."
+)
+
+
 async def _assert_acl_is_unreferenced(
     group_id: uuid.UUID, acl: DNSAcl, db: DB, *, action: str
 ) -> None:
@@ -4789,9 +5072,16 @@ async def _assert_acl_is_unreferenced(
         if opts is not None
         else []
     )
+    # A zone in the Trash counts (#4226): its Restore brings the citation back.
     citing_zones = sorted(
-        f"{z.name} {f}"
-        for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id)))
+        (f"{z.name} {f}", z.deleted_at is not None)
+        for z in (
+            await db.execute(
+                select(DNSZone)
+                .where(DNSZone.group_id == group_id)
+                .execution_options(include_deleted=True)
+            )
+        )
         .scalars()
         .all()
         for f in ("allow_query", "allow_transfer", "also_notify")
@@ -4804,9 +5094,10 @@ async def _assert_acl_is_unreferenced(
             *(f"ACL '{n}'" for n in sorted(citing_acls)),
             *(f"view '{n}'" for n in sorted(citing_views)),
             *(f"server option '{n}'" for n in citing_options),
-            *(f"zone '{n}'" for n in citing_zones),
+            *(f"zone '{n}'" + (" in the Trash" if t else "") for n, t in citing_zones),
         ]
     )
+    hint = _TRASHED_ZONE_HINT if any(t for _n, t in citing_zones) else ""
     raise HTTPException(
         status_code=409,
         detail={
@@ -4815,7 +5106,7 @@ async def _assert_acl_is_unreferenced(
             "message": (
                 f"Cannot {action} ACL '{acl.name}' — it is still referenced by "
                 f"{cited_by}. BIND would refuse the whole server group's config "
-                f"with that name undefined. Remove the references first."
+                f"with that name undefined. Remove the references first." + hint
             ),
         },
     )
@@ -5212,10 +5503,20 @@ async def _assert_tsig_key_is_unreferenced(
         for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
             if cites(getattr(opts, f, None)):
                 cited.append(f"server option '{f}'")
-    for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars():
+    # A zone in the Trash counts (#4226): its Restore brings the citation back.
+    trashed_zone = False
+    for z in (
+        await db.execute(
+            select(DNSZone)
+            .where(DNSZone.group_id == group_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalars():
         for f in ("allow_query", "allow_transfer", "also_notify"):
             if cites(getattr(z, f)):
-                cited.append(f"zone '{z.name}' {f}")
+                in_trash = z.deleted_at is not None
+                trashed_zone = trashed_zone or in_trash
+                cited.append(f"zone '{z.name}' {f}" + (" in the Trash" if in_trash else ""))
     if not cited:
         return
     raise HTTPException(
@@ -5228,6 +5529,7 @@ async def _assert_tsig_key_is_unreferenced(
                 f"Cannot {action} TSIG key '{name}' — it is still referenced by "
                 f"{', '.join(cited)}. BIND would refuse the whole server group's "
                 f"config with that key undefined. Remove the references first."
+                + (_TRASHED_ZONE_HINT if trashed_zone else "")
             ),
         },
     )
@@ -5432,12 +5734,18 @@ async def delete_tsig_key(
 
 
 @router.get("/groups/{group_id}/views", response_model=list[ViewResponse])
-async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSView]:
+async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ViewResponse]:
     await _require_group(group_id, db)
     result = await db.execute(
         select(DNSView).where(DNSView.group_id == group_id).order_by(DNSView.order, DNSView.name)
     )
-    return list(result.scalars().all())
+    views = [ViewResponse.model_validate(v) for v in result.scalars().all()]
+    if views:
+        est = await group_memory_estimate(db, group_id)
+        if est is not None and est.assessment.warn:
+            for v in views:
+                v.memory_warning = est.message
+    return views
 
 
 async def _validated_view_fields(
@@ -5874,6 +6182,11 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, zone_fields, None, db)
+    if body.zone_type == "primary":
+        # #3672 — a name too long to carry the apex defaults is never served.
+        apex_err = apex_name_length_error(body.name, body.primary_ns, body.admin_email)
+        if apex_err is not None:
+            raise HTTPException(status_code=422, detail=apex_err)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -5972,7 +6285,7 @@ async def export_all_zones(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for zone in zones:
             records = await _load_zone_records(zone.id, db)
-            text = write_zone_file(zone, records)
+            text = await write_zone_file_served(db, zone, records)
             zf.writestr(zone.name.rstrip(".") + ".zone", text)
     buf.seek(0)
 
@@ -6013,11 +6326,16 @@ class ServerZoneStateEntry(BaseModel):
     # for ``ok``.
     freshness: Literal["ok", "unreachable", "paused", "disabled"] = "ok"
     counted: bool = True
+    # The verdict on this server's report: a primary zone serves our serial, a
+    # secondary / stub zone holds a copy (its serial is its primary's, not
+    # ours) and no op is pending. False when it has not reported.
+    in_sync: bool = False
 
 
 class ServerZoneStateResponse(BaseModel):
     zone_id: uuid.UUID
     zone_name: str
+    zone_type: str = "primary"
     target_serial: int
     servers: list[ServerZoneStateEntry]
     in_sync: bool
@@ -6079,6 +6397,11 @@ async def get_zone_server_state(
             freshness = "unreachable"
         else:
             freshness = "ok"
+        entry_in_sync = (
+            current is not None
+            and not pending
+            and zone_state_in_sync(zone, current, target, srv.driver)
+        )
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -6089,6 +6412,7 @@ async def get_zone_server_state(
                 pending_ops=pending,
                 freshness=freshness,
                 counted=freshness == "ok",
+                in_sync=entry_in_sync,
             )
         )
         if freshness in ("paused", "disabled"):
@@ -6100,12 +6424,13 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if pending or not zone_state_in_sync(zone, current, target, srv.driver):
+            if not entry_in_sync:
                 all_in_sync = False
 
     return ServerZoneStateResponse(
         zone_id=zone.id,
         zone_name=zone.name,
+        zone_type=zone.zone_type or "primary",
         target_serial=target,
         servers=entries,
         in_sync=all_in_sync and any_reported,
@@ -6607,7 +6932,19 @@ async def update_zone(
     db: DB,
     current_user: CurrentUser,
 ) -> ZoneResponse:
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3688: the zone row first, as the record writes take it (#3535). A change
+    # to name or view_id rewrites a key column of UNIQUE (group_id, view_id,
+    # name), which takes FOR UPDATE anyway, so take that lock up front; every
+    # other edit takes the FOR NO KEY UPDATE its serial bump takes. Read
+    # plainly, an edit caught by a permanent delete died with StaleDataError
+    # (a bare 500), and one caught by a soft delete wrote into the trashed zone.
+    zone = await _require_zone(
+        group_id,
+        zone_id,
+        db,
+        current_user,
+        lock="delete" if {"name", "view_id"} & body.model_fields_set else "write",
+    )
     _reject_if_synthesised_zone(zone, "edit")
     # #1563 — explicit null CLEARS the nullable zone fields: view_id,
     # linked_subnet_id, domain_id, customer_id and notify_enabled (the
@@ -6669,9 +7006,13 @@ async def update_zone(
         mail_err = admin_email_error(changes["admin_email"])
         if mail_err is not None:
             raise HTTPException(status_code=422, detail=f"Admin Email (admin_email) {mail_err}")
+    await _enforce_apex_name_length(db, zone, changes)  # #3672
     # #2917 — a changed view must be a view of this zone's own server group.
     if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
         await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
+        await _enforce_no_records_in_other_view(
+            db, zone.id, changes["view_id"], already_pinned=zone.view_id is not None
+        )  # #3839
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -6800,9 +7141,14 @@ async def update_zone(
         )
     )
     collect_wake(dns_group_channel(group_id))
-    await db.commit()
+    # #3688: answer from the transaction's own state. A zone delete queued
+    # behind the zone-row lock runs the moment we commit, so a refresh or
+    # read AFTER the commit finds the row gone and 500s a committed edit.
+    await db.flush()
     await db.refresh(zone)
-    return await _zone_out(db, zone)
+    out = await _zone_out(db, zone)
+    await db.commit()
+    return out
 
 
 # ── Dynamic-update (RFC 2136) ACLs (issue #641) ─────────────────────────────
@@ -7176,18 +7522,15 @@ async def _push_windows_dynamic_update(
     return warnings
 
 
-async def _replace_update_acl_rows(
+async def _validate_update_acl_body(
     db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
 ) -> tuple[list[str], list[str]]:
-    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+    """Validate a full-replace ACL payload without writing (#3738).
 
-    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
-    apply. Verifies every referenced TSIG key belongs to the group, runs
-    the driver capability gate (raising ``HTTPException(422)`` on a
-    hard-unsupported entry), then drops + re-inserts the ordered set and
-    optionally flips ``dynamic_update_enabled``. Returns
-    ``(driver_names, warnings)``; the caller writes the audit row +
-    commits.
+    Verifies every referenced TSIG key belongs to the group and runs the
+    driver capability gate (422 on a hard-unsupported entry). Returns
+    ``(driver_names, warnings)``. Run before the no-op shortcut so an
+    unchanged save is refused exactly as it was before.
     """
     driver_names = await _group_driver_names(db, group_id)
 
@@ -7234,6 +7577,21 @@ async def _replace_update_acl_rows(
                 status_code=422,
                 detail={"code": "DYNAMIC_UPDATE_UNSUPPORTED", "message": str(exc)},
             ) from exc
+    return driver_names, warnings
+
+
+async def _replace_update_acl_rows(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+) -> tuple[list[str], list[str]]:
+    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+
+    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
+    apply. Validates (see ``_validate_update_acl_body``), then drops +
+    re-inserts the ordered set and optionally flips
+    ``dynamic_update_enabled``. Returns ``(driver_names, warnings)``; the
+    caller writes the audit row + commits.
+    """
+    driver_names, warnings = await _validate_update_acl_body(db, group_id, zone, body)
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
@@ -7291,6 +7649,39 @@ async def replace_zone_update_acl(
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
     await _lock_acl_and_check_version(db, zone, body.expected_version)
+
+    # #3738 — audit only what changed; a save that changes nothing writes no
+    # audit row, no wake and no Windows push, and answers with the stored state.
+    await _validate_update_acl_body(db, group_id, zone, body)
+    old_entries = await _load_acl_out(db, zone.id)
+
+    # Entry order is meaningful (seq = first-match order in update-policy),
+    # so entries compare as an ordered list; only record_types is a set.
+    def _canon(rows: Any) -> list[Any]:
+        return [
+            (
+                r.action,
+                r.match_kind,
+                r.ip_cidr,
+                str(r.tsig_key_id) if r.tsig_key_id else None,
+                r.name_scope,
+                r.name_pattern,
+                sorted(r.record_types) if r.record_types else None,
+            )
+            for r in rows
+        ]
+
+    changed_fields: list[str] = []
+    if _canon(old_entries) != _canon(body.entries):
+        changed_fields.append("update_acl")
+    if (
+        body.dynamic_update_enabled is not None
+        and body.dynamic_update_enabled != zone.dynamic_update_enabled
+    ):
+        changed_fields.append("dynamic_update_enabled")
+    if not changed_fields:
+        return await get_zone_update_acl(group_id, zone_id, db, current_user)
+
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
     db.add(
@@ -7302,7 +7693,7 @@ async def replace_zone_update_acl(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=f"{zone.name} dynamic-update ACL",
-            changed_fields=["update_acl", "dynamic_update_enabled"],
+            changed_fields=changed_fields,
             result="success",
         )
     )
@@ -7917,6 +8308,8 @@ class ZoneMovePreviewResponse(BaseModel):
     zone_view_action: str
     zone_view_from: str | None
     records_total: int
+    records_trashed: int = 0
+    records_trashed_widened: int = 0
     records_remapped: int
     records_widened: int
     records_cleared_inert: int
@@ -7968,6 +8361,8 @@ class ZoneMovePreviewResponse(BaseModel):
             zone_view_action=plan.zone_view_action,
             zone_view_from=plan.zone_view_from,
             records_total=plan.records_total,
+            records_trashed=plan.records_trashed,
+            records_trashed_widened=plan.records_trashed_widened,
             records_remapped=plan.records_remapped,
             records_widened=plan.records_widened,
             records_cleared_inert=plan.records_cleared_inert,
@@ -8053,7 +8448,11 @@ async def move_zone_commit(
     db: DB,
     current_user: SuperAdmin,
 ) -> ZoneMoveCommitResponse:
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3688: FOR UPDATE first (group_id is a key column), before the move's
+    # sweep of the zone's queued ops and every other write, so a record write
+    # that held the row first has committed its op by the time the sweep runs
+    # and a zone delete meets the move in the same order it takes everything.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="delete")
     # A reconciler-owned zone is not the operator's to re-home — the next
     # sync would recreate it in the group the integration is bound to.
     _reject_if_synthesised_zone(zone, "move")
@@ -8072,6 +8471,12 @@ async def move_zone_commit(
         # (``forward_transport_refusal``), so the preview reports the same
         # refusal commit_zone_move raises below.
     source_group_id = zone.group_id
+    # The deletes still queued for retry against the source group's servers.
+    # The move discards those ops (``sweep_zone_ops``), so they are read first:
+    # a server that adopts the provider's existing copy (#3805) may still hold
+    # the records they were to remove, and the additive record push never
+    # removes anything.
+    queued_deletes = await _queued_delete_changes(db, zone, source_group_id)
     try:
         plan = await commit_zone_move(
             db,
@@ -8093,39 +8498,118 @@ async def move_zone_commit(
     # fail leaves the zone existing in both places (visible, fixable) where
     # delete-then-fail would have removed it from the old server with the
     # database still saying it lives there.
-    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
-    await _push_zone_to_agentless_servers(db, zone, "delete", group_id=source_group_id)
+    #
+    # A source server that may reach the same provider as a target server
+    # is NOT deleted from (#3805): the create adopted the provider's one copy,
+    # and deleting through the source would remove it. Decided AFTER the
+    # create, because a target that already held the zone is the evidence
+    # that does not depend on the credentials naming the provider correctly.
+    # #3888: the name gate, before the source-copy check below reads other
+    # groups' zones (the target push takes it too; this covers a target with no
+    # agentless server, whose source delete still shares a provider).
+    from app.services.lock_order import lock_provider_zone_name  # noqa: PLC0415
 
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="move",
-            resource_type="dns_zone",
-            resource_id=str(zone.id),
-            resource_display=zone.name,
-            old_value={"group_id": str(plan.source_group_id)},
-            new_value={
-                "group_id": str(plan.target_group_id),
-                "zone_view_action": plan.zone_view_action,
-                "records_remapped": plan.records_remapped,
-                "records_widened": plan.records_widened,
-                "records_cleared_inert": plan.records_cleared_inert,
-                "acl_rows_remapped": plan.acl_rows_remapped,
-                "acl_keys_lost": plan.acl_keys_lost,
-                "pools_repointed": plan.pools_repointed,
-                "dnssec_signed": plan.dnssec_signed,
-                "acknowledgements": sorted(body.acknowledgements),
-                "adopted_existing_on": adopted_on,
-            },
-            result="success",
+    await lock_provider_zone_name(db, zone.name)
+    try:
+        adopted_on = await _push_zone_to_agentless_servers(
+            db,
+            zone,
+            "create",
+            group_id=target_group.id,
+            adopt_existing_server_ids=await same_provider_target_ids(
+                db, source_group_id, target_group.id
+            ),
         )
+        # The create gives each NEW target server an empty zone (SOA + NS), so the
+        # zone's saved records are pushed too (#3815) — or every one of them
+        # answers NXDOMAIN while SpatiumDDI lists it as served. A server that
+        # ADOPTED an existing copy is pushed to as well: the push is additive, so
+        # it sends only what that copy lacks — on a shared provider (#3805),
+        # exactly the record whose write was still queued for retry against the
+        # source group. The push sends the zone's live rows as they stand now, so
+        # a queued add / update is in the rows; a queued delete is applied to an
+        # adopted copy first (and its record is soft-deleted, so never resurrected).
+        pushed = await _push_moved_zone_records(
+            db, zone, target_group.id, set(adopted_on), queued_deletes
+        )
+        shared = await shared_provider_sources(
+            db, source_group_id, target_group.id, adopted_on=adopted_on
+        )
+        # A THIRD group's zone of the same name (or a sibling view's in the source
+        # group) may use the same provider copy too (#3812).
+        others = await shared_zone_copy_servers(db, zone, group_id=source_group_id)
+        shared.keep_ids |= others.keep_ids
+        shared.notes.extend(n for n in others.notes if n not in shared.notes)
+        await _push_zone_to_agentless_servers(
+            db, zone, "delete", group_id=source_group_id, skip_server_ids=shared.keep_ids
+        )
+
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="move",
+                resource_type="dns_zone",
+                resource_id=str(zone.id),
+                resource_display=zone.name,
+                old_value={"group_id": str(plan.source_group_id)},
+                new_value={
+                    "group_id": str(plan.target_group_id),
+                    "zone_view_action": plan.zone_view_action,
+                    "records_remapped": plan.records_remapped,
+                    "records_widened": plan.records_widened,
+                    "records_cleared_inert": plan.records_cleared_inert,
+                    "acl_rows_remapped": plan.acl_rows_remapped,
+                    "acl_keys_lost": plan.acl_keys_lost,
+                    "pools_repointed": plan.pools_repointed,
+                    "dnssec_signed": plan.dnssec_signed,
+                    "acknowledgements": sorted(body.acknowledgements),
+                    "adopted_existing_on": adopted_on,
+                    "source_copies_kept": shared.notes,
+                    "records_pushed": pushed["pushed"],
+                    "record_types_not_served": pushed["unsupported_types"],
+                },
+                result="success",
+            )
+        )
+        await db.commit()
+    except HTTPException as exc:
+        # The provider push (or the commit) failed and the request answers an
+        # error: nothing is saved and the zone stays where it was (#3832). Say
+        # so under its own name rather than leaving the planned move's line.
+        logger.warning(
+            "dns_zone_move_rolled_back",
+            zone_id=str(zone.id),
+            zone_name=zone.name,
+            old_group_id=str(plan.source_group_id),
+            target_group_id=str(plan.target_group_id),
+            status_code=exc.status_code,
+        )
+        raise
+    logger.info(
+        "dns_zone_moved_group",
+        zone_id=str(zone.id),
+        zone_name=zone.name,
+        old_group_id=str(plan.source_group_id),
+        new_group_id=str(plan.target_group_id),
+        records_widened=plan.records_widened,
+        acl_keys_lost=len(plan.acl_keys_lost),
+        dnssec_signed=plan.dnssec_signed,
     )
-    await db.commit()
-    await db.refresh(zone)
+    # No refresh after the commit (#3688): a delete queued behind the zone
+    # lock runs right after it, and the response is built from the plan.
     resp = ZoneMoveCommitResponse.from_plan(plan)
     resp.target_tsig_key_generated = plan.target_tsig_key_generated
+    # What the move actually kept (#3805) — the plan's notes were written
+    # before the create, when whether the target already held the zone
+    # was not yet known.
+    resp.warnings.extend(n for n in shared.notes if n not in resp.warnings)
+    for name, types in pushed["unsupported_types"].items():
+        resp.warnings.append(
+            f"{name} cannot serve record type(s) {', '.join(types)}; those records of the zone "
+            "were not written there."
+        )
     return resp
 
 
@@ -8175,7 +8659,14 @@ async def delete_zone(
     pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
     if pending is not None:
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
-    await op.apply(db, current_user, args)
+    result = await op.apply(db, current_user, args)
+    kept = result.get("provider_copies_kept") if isinstance(result, dict) else None
+    if kept:
+        # #3812: 204 has no body; say so in a header.
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept)},
+        )
     return None
 
 
@@ -8296,6 +8787,9 @@ async def create_zone_from_template(
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=_validation_message(exc)) from exc
+        await _require_superadmin_for_lua(
+            db, current_user, [checked.record_type], what="create a LUA record"
+        )
         await _check_driver_gated_record_type(checked.record_type, group_id, db)
         checked.priority, checked.weight, checked.port = _normalize_record_struct_fields(
             checked.record_type, checked.priority, checked.weight, checked.port
@@ -8317,6 +8811,16 @@ async def create_zone_from_template(
             weight=checked.weight,
             port=checked.port,
         )
+
+    # #3672 — the template's apex NS records stand in for the placeholder.
+    apex_err = apex_name_length_error(
+        body.zone_name,
+        None,
+        None,
+        [(r["name"], r["record_type"], r["value"]) for r in record_payloads],
+    )
+    if apex_err is not None:
+        raise HTTPException(status_code=422, detail=apex_err)
 
     existing = await db.execute(
         select(DNSZone).where(
@@ -8460,6 +8964,11 @@ async def apply_delegation(
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
     once and the agent / Windows-driver push happens uniformly.
     """
+    # #3688: the child and its parent are both written (the parent's records
+    # and serial), so lock both in ascending id order (``lock_order``) before
+    # anything is read for the write. The parent is found by name, so it is
+    # probed first, locked, and re-found: a parent that changed meanwhile is a
+    # 409, not a write into the wrong zone.
     child = await _require_zone(group_id, zone_id, db, current_user)
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
@@ -8468,6 +8977,20 @@ async def apply_delegation(
             detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
         )
     _enforce_zone_token_scope(current_user, parent.id)
+    parent_id = parent.id
+    await lock_zone_rows(db, [child.id, parent_id])
+    child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    parent = await find_parent_zone(db, group_id, child.name)
+    if parent is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
+        )
+    if parent.id != parent_id:
+        raise HTTPException(
+            status_code=409, detail="The zone hierarchy changed during the request; retry"
+        )
+    await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
@@ -8532,16 +9055,37 @@ async def apply_delegation(
             result="success",
         )
     )
-    await db.commit()
+    # #3688: load server-generated columns BEFORE the commit. A delete of the
+    # parent zone queued behind the zone-row lock runs the instant we commit,
+    # so a refresh after it finds the records gone and 500s a committed
+    # delegation. ``expire_on_commit=False`` keeps the loaded values.
     for record in created:
         await db.refresh(record)
+    await db.commit()
     return created
 
 
 async def _push_zone_to_agentless_servers(
-    db: DB, zone: DNSZone, op: str, group_id: uuid.UUID | None = None
+    db: DB,
+    zone: DNSZone,
+    op: str,
+    group_id: uuid.UUID | None = None,
+    skip_server_ids: set[uuid.UUID] | None = None,
+    adopt_existing_server_ids: set[uuid.UUID] | None = None,
+    kept_notes: list[str] | None = None,
 ) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    ``kept_notes`` (delete, no ``group_id`` override): a delete leaves out the
+    servers whose provider copy another group's live zone of the same name
+    still uses (#3812); the reasons are appended here for the caller's audit
+    row and response.
+
+    ``adopt_existing_server_ids`` (create only): servers whose existing copy
+    of the zone is SpatiumDDI's own, reached through the source group's server
+    of the same provider (#3805). Their driver adopts it without refusing for
+    the records it holds. Every other caller leaves it empty, so the
+    foreign-records guard still runs.
 
     Returns the names of the servers that were already in the requested
     state (#1537): on a create, the servers that already held a zone of
@@ -8594,7 +9138,26 @@ async def _push_zone_to_agentless_servers(
             DNSServer.is_enabled.is_(True),
         )
     )
-    targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
+    # ``skip_server_ids``: servers the caller has decided not to drive (the
+    # move keeps a source copy that shares a provider with the target, #3805).
+    skip = set(skip_server_ids or set())
+    group_servers = list(servers_res.scalars().all())
+    if any(is_agentless(s.driver) for s in group_servers):
+        # #3888: one zone name at a time per provider, before the shared-copy
+        # check reads other groups' rows and until this transaction commits.
+        from app.services.lock_order import lock_provider_zone_name  # noqa: PLC0415
+
+        await lock_provider_zone_name(db, zone.name)
+    if op == "delete" and group_id is None:
+        # #3812: the zone's own group is being deleted from; the move passes
+        # ``group_id`` and decides its keeps itself (#3805).
+        shared = await shared_zone_copy_servers(db, zone)
+        skip |= shared.keep_ids
+        if kept_notes is not None:
+            kept_notes.extend(shared.notes)
+        for note in shared.notes:
+            logger.warning("dns.zone.delete_kept_shared_provider_copy", zone=zone.name, note=note)
+    targets = [s for s in group_servers if is_agentless(s.driver) and s.id not in skip]
     if not targets:
         return []
 
@@ -8626,7 +9189,15 @@ async def _push_zone_to_agentless_servers(
             records = managed_records
             if this_op == "delete" and records is None:
                 records = await _managed_zone_records(db, zone)
-            result = await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+            result = await driver.apply_zone_change(
+                server,
+                zone,
+                this_op,
+                managed_records=records,
+                adopt_existing=(
+                    this_op == "create" and server.id in (adopt_existing_server_ids or set())
+                ),
+            )
         else:
             result = await driver.apply_zone_change(server, zone, this_op)
         return result is not False
@@ -8730,7 +9301,7 @@ async def _push_zone_to_agentless_servers(
 
     kinds = ", ".join(sorted(_agentless_driver_label(d) for d in failed_drivers))
     detail = (
-        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors)}. "
+        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors).rstrip('. ')}. "
         "The change was not saved in SpatiumDDI."
     )
     if compensated:
@@ -8758,6 +9329,219 @@ async def _push_zone_to_agentless_servers(
     # resolving it alone would not make a retry succeed.
     status_code = 409 if conflicts == len(errors) else 502
     raise HTTPException(status_code=status_code, detail=detail)
+
+
+async def _queued_delete_changes(db: DB, zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
+    """The record deletes still queued for ``zone`` on ``group_id``'s servers,
+    as driver changes, deduplicated by record (#3805)."""
+    from app.models.dns import DNSRecordOp  # noqa: PLC0415
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        _change_from_op_row,
+        queued_zone_ops_where,
+    )
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecordOp).where(
+                    *queued_zone_ops_where(zone, group_id), DNSRecordOp.op == "delete"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: dict[tuple[Any, ...], Any] = {}
+    for row in rows:
+        change = _change_from_op_row(row)
+        if change is not None:
+            r = change.record
+            out[_record_identity(r.name, r.record_type, r.value, r.priority, r.weight, r.port)] = (
+                change
+            )
+    return list(out.values())
+
+
+def _record_identity(
+    name: str, rtype: str, value: str, priority: Any, weight: Any, port: Any
+) -> tuple[Any, ...]:
+    """The fields that tell one RR from another (#3805). ``priority`` /
+    ``weight`` / ``port`` are part of it: ``MX 10 mail`` and ``MX 20 mail``
+    share a value and are two records, so a key without them would collapse
+    two queued deletes into one, or skip a delete because its sibling is live.
+    """
+    return (name, rtype.upper(), value, priority, weight, port)
+
+
+async def _push_moved_zone_records(
+    db: DB,
+    zone: DNSZone,
+    group_id: uuid.UUID,
+    adopted_names: set[str],
+    queued_deletes: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Push a moved zone's saved records to the target group's agentless
+    servers (#3815), through the additive push the create rollback and Sync
+    with Servers use: each server's copy is read first and only what it
+    lacks is sent.
+
+    Every target server is pushed to, including one whose create ADOPTED an
+    existing copy: that copy is usually the source's own (one provider, #3805)
+    and already holds the records, so the push sends nothing — except a
+    record whose write was still queued for retry against the source group,
+    which the move drops and which only this push delivers.
+
+    The push never removes anything, so a record DELETE still queued against
+    the source group (``queued_deletes``) is applied to an adopted copy first
+    (#3805): the provider answered the caller's delete as queued, and the move
+    discards that op, so without this the record stays live there for good.
+    A delete is skipped when SpatiumDDI holds the same record live again, and
+    a failure to deliver one fails the move like a failed record write.
+
+    A record that cannot be written is a 502 naming it, like a failed create,
+    so the move is never reported clean while the target answers NXDOMAIN.
+    Before raising, the zone is deleted again from each server whose create
+    made a FRESH copy — the compensation a failed create gets — so a retry
+    does not adopt a half-filled copy. An adopted copy is never deleted: the
+    move did not create it.
+
+    Returns what was pushed, per server, and the record types a target
+    driver cannot serve (those rows are not sent and are reported, not
+    failed: the move preview's driver-change warning already names it)."""
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+    from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        _PUSHABLE_TYPES,
+        _syncable_types,
+        restore_zone_records_to_server,
+    )
+
+    res = await db.execute(
+        select(DNSServer).where(
+            DNSServer.group_id == group_id,
+            DNSServer.credentials_encrypted.isnot(None),
+            DNSServer.is_enabled.is_(True),
+        )
+    )
+    servers = [s for s in res.scalars().all() if is_agentless(s.driver)]
+    summary: dict[str, Any] = {"pushed": {}, "unsupported_types": {}}
+    if not servers:
+        return summary
+    live_types = {
+        t.upper()
+        for t in (
+            await db.execute(
+                select(DNSRecord.record_type).where(DNSRecord.zone_id == zone.id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    }
+    stale = list(queued_deletes or [])
+    if stale and adopted_names:
+        live_keys = {
+            _record_identity(r.name, r.record_type, r.value, r.priority, r.weight, r.port)
+            for r in (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
+            .scalars()
+            .all()
+        }
+        stale = [
+            c
+            for c in stale
+            if _record_identity(
+                c.record.name,
+                c.record.record_type,
+                c.record.value,
+                c.record.priority,
+                c.record.weight,
+                c.record.port,
+            )
+            not in live_keys
+        ]
+    deletes_applied_on: list[str] = []
+    failures: list[str] = []
+    for server in servers:
+        driver = get_driver(server.driver)
+        unsupported = sorted(live_types - _syncable_types(driver, _PUSHABLE_TYPES))
+        if unsupported:
+            summary["unsupported_types"][server.name] = unsupported
+        try:
+            problems = []
+            if stale and server.name in adopted_names:
+                results = await driver.apply_record_changes(server, stale)
+                problems = [
+                    f"delete of {res.change.record.name} {res.change.record.record_type} "
+                    f"failed: {res.error or 'unknown'}"
+                    for res in results
+                    if not res.ok
+                ]
+                if any(res.ok for res in results):
+                    deletes_applied_on.append(server.name)
+            restored = await restore_zone_records_to_server(db, server, driver, zone)
+            problems += list(restored.push_errors)
+            if restored.pushed < restored.candidates and not problems:
+                problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
+            summary["pushed"][server.name] = restored.pushed
+        except Exception as exc:  # noqa: BLE001 — reported below
+            problems = [_exc_text(exc)]
+        if problems:
+            failures.append(f"{server.name} ({'; '.join(problems)})")
+            logger.warning(
+                "dns.zone.move_record_push_failed",
+                server=str(server.id),
+                zone=zone.name,
+                errors=problems,
+            )
+    if not failures:
+        return summary
+
+    removed: list[str] = []
+    left: list[str] = []
+    for server in servers:
+        if server.name in adopted_names:
+            continue
+        driver = get_driver(server.driver)
+        try:
+            if isinstance(driver, CloudDNSDriverBase):
+                await driver.apply_zone_change(
+                    server,
+                    zone,
+                    "delete",
+                    managed_records=await _managed_zone_records(db, zone),
+                )
+            else:
+                await driver.apply_zone_change(server, zone, "delete")
+            removed.append(server.name)
+        except Exception as exc:  # noqa: BLE001 — best effort; reported below
+            left.append(f"{server.name}: {_exc_text(exc)}")
+            logger.warning(
+                "dns.zone.move_record_push_compensation_failed",
+                server=str(server.id),
+                zone=zone.name,
+                error=_exc_text(exc),
+            )
+    detail = (
+        f"Zone {zone.name}'s records could not all be written to the target group: "
+        f"{'; '.join(failures)}. The move was not saved in SpatiumDDI."
+    )
+    if removed:
+        detail += f" The zone created for the move was removed again from: {', '.join(removed)}."
+    if adopted_names:
+        detail += (
+            f" Left as found on: {', '.join(sorted(adopted_names))} "
+            "(those servers already held the zone)."
+        )
+        if deletes_applied_on:
+            detail += (
+                " Except that the record deletes still queued for this zone, for records "
+                f"SpatiumDDI no longer holds, were applied on: {', '.join(deletes_applied_on)}."
+            )
+    if left:
+        detail += (
+            f" Removing the zone created for the move failed on: {'; '.join(left)} — "
+            "those servers may still hold a partial copy; delete it there before retrying."
+        )
+    raise HTTPException(status_code=502, detail=detail)
 
 
 async def _managed_zone_records(db: DB, zone: DNSZone) -> list[Any]:
@@ -8934,7 +9718,7 @@ async def list_group_records(
 
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/records",
-    response_model=Page[RecordResponse],
+    response_model=RecordPage,
 )
 async def list_records(
     group_id: uuid.UUID,
@@ -8946,15 +9730,20 @@ async def list_records(
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-) -> Page[RecordResponse]:
+) -> RecordPage:
     """Records in a zone, server-side paginated (#455).
 
     A large zone (the perf seed reaches 20k+ records) used to return its whole
     record set on every poll. ``search`` matches name / fqdn / value / type so
     a row is findable without paging; ``record_type`` is an exact filter for
     the type dropdown.
+
+    ``served_apex`` (#3518) carries the SOA and apex NS the zone serves from
+    its settings, which no stored record holds. It is not part of ``items`` or
+    ``total``. It comes from the zone's settings, so it is returned only to a
+    caller who may read the zone itself; a record-only reader gets null.
     """
-    await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(_, zone_id)
     stmt = select(DNSRecord).where(DNSRecord.zone_id == zone_id)
     if record_type:
@@ -8972,11 +9761,80 @@ async def list_records(
     stmt = apply_tag_filter(stmt, DNSRecord.tags, tag)
     stmt = stmt.order_by(DNSRecord.name, DNSRecord.record_type)
     rows, total = await paginate(db, stmt, page=page, page_size=page_size)
-    return Page[RecordResponse](
+    return RecordPage(
         items=[RecordResponse.model_validate(r) for r in rows],
         total=total,
         page=page,
         page_size=page_size,
+        served_apex=(
+            await _served_apex(db, zone)
+            if user_has_permission(_, "read", "dns_zone", zone.id)
+            else None
+        ),
+    )
+
+
+async def _enforce_apex_name_length(db: DB, zone: DNSZone, changes: dict[str, Any]) -> None:
+    """422 an edit that leaves a primary zone's apex names past 253 (#3672).
+
+    Only an edit that moves one of the inputs (the name, the type, the Primary
+    NS or the Admin Email) is checked, so a zone stored before the rule stays
+    editable by a request that re-sends what it holds. The zone's own apex NS
+    records count, as they replace the placeholder name server.
+    """
+    keys = ("name", "zone_type", "primary_ns", "admin_email")
+    if not any(k in changes and changes[k] != getattr(zone, k) for k in keys):
+        return
+    if changes.get("zone_type", zone.zone_type) != "primary":
+        return
+    ns_rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value).where(
+                DNSRecord.zone_id == zone.id,
+                DNSRecord.record_type == "NS",
+                DNSRecord.name.in_(("@", "")),
+                DNSRecord.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    err = apex_name_length_error(
+        changes.get("name", zone.name),
+        changes.get("primary_ns", zone.primary_ns),
+        changes.get("admin_email", zone.admin_email),
+        [(r.name, r.record_type, r.value) for r in ns_rows],
+    )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
+
+
+async def _served_apex(db: DB, zone: DNSZone) -> ServedApex | None:
+    """The apex a primary zone is served with (#3518), or None for a zone that
+    is not primary (a secondary, stub or forward zone has no apex of ours)."""
+    view = (await served_apex_for_zones(db, [zone])).get(zone.id)
+    if view is None:
+        return None
+    return ServedApex(
+        driver_applies=view.driver_applies,
+        soa=ServedApexSoa(mname=view.apex.soa_mname, rname=view.apex.soa_rname),
+        ns=list(view.apex.ns),
+        source=view.apex.source,
+        placeholder_glue_loopback=view.apex.placeholder_glue,
+        placeholder_reason=view.apex.placeholder_reason,
+        unaddressed_primary_ns=view.apex.unaddressed_primary_ns,
+        unaddressed_ns=list(view.apex.unaddressed_ns),
+        by_view=[
+            ServedApexInView(
+                view=name,
+                soa=ServedApexSoa(mname=a.soa_mname, rname=a.soa_rname),
+                ns=list(a.ns),
+                source=a.source,
+                placeholder_glue_loopback=a.placeholder_glue,
+                placeholder_reason=a.placeholder_reason,
+                unaddressed_primary_ns=a.unaddressed_primary_ns,
+                unaddressed_ns=list(a.unaddressed_ns),
+            )
+            for name, a in view.by_view
+        ],
     )
 
 
@@ -9031,6 +9889,64 @@ async def _enforce_zone_view_in_group(
         )
 
 
+async def _enforce_no_records_in_other_view(
+    db: DB, zone_id: uuid.UUID, pin: uuid.UUID, *, already_pinned: bool = False
+) -> None:
+    """422 pinning a zone while it holds a record scoped to another view (#3839).
+
+    A pinned zone renders into its pin alone, so a record scoped to a different
+    view is served in no view. The record API refuses writing that state
+    (``_enforce_views_in_zone_group``); a change of the zone's pin is held to
+    the same rule, naming the records and their views. While the zone is still
+    pinned, the record API takes no view but that pin, so moving a record to the
+    new view is refused too (#3943): the remedy then is removing the records'
+    view first, and the words say only that.
+    """
+    rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.record_type, DNSRecord.value, DNSView.name)
+            .join(DNSView, DNSView.id == DNSRecord.view_id)
+            .where(DNSRecord.zone_id == zone_id, DNSRecord.view_id != pin)
+            .order_by(DNSRecord.name, DNSRecord.record_type)
+            .limit(6)
+        )
+    ).all()
+    if not rows:
+        return
+    shown = ", ".join(f"{n} {t} {v} (view '{vn}')" for n, t, v, vn in rows[:5])
+    more = ", and more" if len(rows) > 5 else ""
+    remedy = (
+        "Remove their view first (the zone is pinned to its current view, so a "
+        "record cannot be moved to the new one until the zone is), then scope "
+        "them to the new view."
+        if already_pinned
+        else "Move those records to the new view or remove their view first."
+    )
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "Cannot pin this zone to that view: it holds records scoped to another "
+            f"view, which would then be rendered in no view: {shown}{more}. {remedy}"
+        ),
+    )
+
+
+def _zone_pin_view_error(zone: DNSZone, view_ids: Iterable[uuid.UUID | None]) -> str | None:
+    """The refusal for a record view a pinned zone never serves, else None.
+
+    A pinned zone renders into its pin alone, so a record scoped to any other
+    view is served nowhere (#3839). The one rule behind the record API, the
+    zone-file import and the spreadsheet import (#3942).
+    """
+    wanted = {v for v in view_ids if v is not None}
+    if zone.view_id is not None and wanted and wanted != {zone.view_id}:
+        return (
+            "view_id differs from the view this zone is pinned to, so the "
+            "record would never be rendered"
+        )
+    return None
+
+
 async def _enforce_views_in_zone_group(
     db: DB, zone: DNSZone, view_ids: Iterable[uuid.UUID | None]
 ) -> None:
@@ -9059,14 +9975,9 @@ async def _enforce_views_in_zone_group(
             status_code=422,
             detail="view_id does not name a view in this zone's server group",
         )
-    if zone.view_id is not None and wanted != {zone.view_id}:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "view_id differs from the view this zone is pinned to, so the "
-                "record would never be rendered"
-            ),
-        )
+    pin_error = _zone_pin_view_error(zone, wanted)
+    if pin_error is not None:
+        raise HTTPException(status_code=422, detail=pin_error)
 
 
 @router.post(
@@ -9081,9 +9992,13 @@ async def create_record(
     db: DB,
     current_user: CurrentUser,
 ) -> DNSRecord:
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
+    await _require_superadmin_for_lua(
+        db, current_user, [body.record_type], what="create a LUA record"
+    )
     await _check_driver_gated_record_type(body.record_type, group_id, db)
     await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
@@ -9175,7 +10090,7 @@ async def create_record(
         )
     )
     await db.commit()
-    await db.refresh(record)
+    await _refresh_record_or_404(db, record)
     # #1539 — an agentless op is dispatched by the commit above, so its
     # outcome is only known now.
     provider_warning = provider_warning or _agentless_op_warning(op)
@@ -9195,10 +10110,12 @@ async def update_record(
     db: DB,
     current_user: CurrentUser,
 ) -> DNSRecord:
-    record = await _require_record(group_id, zone_id, record_id, db)
+    record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
+    if zone is not None:
+        _reject_if_unauthored_zone(zone, "edit")
     # #1563 — explicit null clears view_id and ttl (ttl null = inherit
     # the zone TTL; exclude_none dropped both, so the clear never
     # landed); null for a NOT NULL column is a 422.
@@ -9214,6 +10131,10 @@ async def update_record(
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
         return record
+    if set(changes) - {"ttl"}:
+        await _require_superadmin_for_lua(
+            db, current_user, [record.record_type], what="change a LUA record other than its TTL"
+        )
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     if "value" in changes or "ttl" in changes:
@@ -9364,7 +10285,7 @@ async def update_record(
         )
     )
     await db.commit()
-    await db.refresh(record)
+    await _refresh_record_or_404(db, record)
     # #1539 — an agentless op is dispatched by the commit above, so its
     # outcome is only known now (either half of a rename may have failed).
     provider_warning = provider_warning or _agentless_op_warning(
@@ -9394,7 +10315,17 @@ async def delete_record(
     BIND9 / PowerDNS also converge via the bundle drop; the enqueued op is an
     idempotent delete there. Restore re-pushes ``create`` (admin/trash.py).
     """
-    record = await _require_record(group_id, zone_id, record_id, db)
+    if permanent:
+        # #3691: the delete nulls ``ip_address.dns_record_id`` (ON DELETE SET
+        # NULL), which locks those rows; they come before the zone row, as a
+        # lease batch takes them (``app.services.lock_order``).
+        record = await lock_addresses_before(
+            db,
+            lambda: address_ids_of_records(db, [record_id]),
+            lambda: _require_record(group_id, zone_id, record_id, db, lock=True),
+        )
+    else:
+        record = await _require_record(group_id, zone_id, record_id, db, lock=True)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
 
@@ -9423,11 +10354,17 @@ async def delete_record(
         # the soft and permanent paths retract identically (#632).
         if zone is not None:
             target_serial = bump_zone_serial(zone)
+            # #3503: the zone row before the audit-chain lock, which the audit
+            # rows added after this take at their flush (see
+            # ``_replace_update_acl_rows``).
+            await db.flush()
             await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, record)
         await apply_soft_delete(db, batch, current_user.id)
+        await _check_render()
+        await _push_delete()
         for row in batch.rows:
             db.add(
                 AuditLog(
@@ -9442,13 +10379,14 @@ async def delete_record(
                     result="success",
                 )
             )
-        await _check_render()
-        await _push_delete()
         await db.commit()
         return
 
     ensure_superadmin(current_user)
 
+    await db.delete(record)
+    await _check_render()
+    await _push_delete()
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -9461,9 +10399,6 @@ async def delete_record(
             result="success",
         )
     )
-    await db.delete(record)
-    await _check_render()
-    await _push_delete()
     await db.commit()
 
 
@@ -9551,7 +10486,15 @@ async def bulk_delete_records(
     if not body.record_ids:
         return BulkDeleteRecordsResponse(deleted=0, skipped=[])
 
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    if permanent:
+        # #3691 — see delete_record: the addresses linked to the records first.
+        zone = await lock_addresses_before(
+            db,
+            lambda: address_ids_of_records(db, body.record_ids),
+            lambda: _require_zone(group_id, zone_id, db, current_user, lock="write"),
+        )
+    else:
+        zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.
@@ -9781,10 +10724,14 @@ async def bulk_create_records(
     current_user: CurrentUser,
 ) -> BulkCreateRecordsResponse:
     """Bulk-create records in one zone — one serial bump, one commit, one dispatch."""
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, lock="write")
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
+    _reject_if_unauthored_zone(zone, "add")
 
+    await _require_superadmin_for_lua(
+        db, current_user, [r.record_type for r in body.records], what="create a LUA record"
+    )
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
@@ -10242,6 +11189,8 @@ async def import_zone_preview(
     Non-mutating: this endpoint never writes to the database.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3838 — preview and commit agree: the commit refuses this zone.
+    _reject_if_unauthored_zone(zone, "import")
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -10303,7 +11252,12 @@ async def import_zone_commit(
     Per-record changes are encoded in the ``new_value`` JSONB payload so
     per-record history is recoverable without generating N audit rows.
     """
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3535: the zone row first, as every record writer takes it, so an import
+    # caught behind a zone delete answers 404. Its serial bump used to fail on
+    # the deleted row (a 500). With a view, its record edits went out before
+    # the bump and could deadlock with a delete that took the zone row first.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
+    _reject_if_unauthored_zone(zone, "import")  # #3838, before any parsing
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -10330,6 +11284,12 @@ async def import_zone_commit(
     # record type the group's drivers cannot serve (the provider would reject
     # the op and keep retrying it, rather than the operator getting a 422).
     _reject_if_synthesised_zone(zone, "import")
+    await _require_superadmin_for_lua(
+        db,
+        current_user,
+        [c.record_type for c in diff.to_create] + [c.record_type for c in diff.to_update],
+        what="import a LUA record",
+    )
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
     await _check_driver_refusals(
@@ -10503,6 +11463,8 @@ class SyncWithServerResponse(BaseModel):
     imported_records: list[dict]
     # Push (DB → server)
     push_candidates: int
+    # #3671 — the zone's records the server already holds, so none was pushed.
+    push_skipped_matching: int = 0
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
@@ -10583,6 +11545,7 @@ async def sync_zone_with_server_endpoint(
         skipped_unsupported=result.pull.skipped_unsupported,
         imported_records=result.pull.imported_records,
         push_candidates=result.push.candidates,
+        push_skipped_matching=result.push.already_matched,
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
@@ -10650,7 +11613,7 @@ async def export_zone(
         rows = await sheet_io.zone_record_rows(db, zone)
         return _sheet_response(rows, format, _sheet_filename(zone, format))
     records = await _load_zone_records(zone_id, db)
-    text = write_zone_file(zone, records)
+    text = await write_zone_file_served(db, zone, records)
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     filename = f"{zone.name.rstrip('.')}-{ts}.zone"
     return Response(
@@ -10782,6 +11745,12 @@ def _sheet_row_validator(
         if row.value is None:
             return "value is required"
         name = row.name if row.name is not None else target.name  # type: ignore[union-attr]
+        # #3942 — the record API's pin rule; a row that leaves an existing
+        # record's view as it is is not re-judged.
+        if target is None or target.view_id != view_id:
+            pin_error = _zone_pin_view_error(zone, [view_id])
+            if pin_error is not None:
+                return pin_error
         # A trailing dot makes a name absolute, as in a zone file: it must sit
         # in this zone, and is stored relative. Without it the name is relative
         # to the zone, as on the record API. (The record API strips a trailing
@@ -10958,6 +11927,7 @@ async def import_zone_spreadsheet_preview(
     for the columns and the match rule.
     """
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    _reject_if_unauthored_zone(zone, "import")  # #3838, as the commit
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     return SheetImportPreviewResponse(
         zone_id=zone.id,
@@ -11019,7 +11989,11 @@ async def import_zone_spreadsheet_commit(
     are queued as record ops in one batch on one serial bump, like the
     zone-file import, and audited as one ``dns_zone_import`` row.
     """
-    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # #3535: the zone row first, as every record writer takes it, so an import
+    # caught behind a zone delete answers 404. Its record edits go out before
+    # its serial bump, and a delete that took the zone row between them
+    # deadlocked with it.
+    zone = await _require_zone(group_id, zone_id, db, current_user, lock="write")
     if mode == "replace" and (confirm_zone or "").strip().rstrip(".").lower() != (
         zone.name.rstrip(".").lower()
     ):
@@ -11031,6 +12005,7 @@ async def import_zone_spreadsheet_commit(
             ),
         )
     _reject_if_synthesised_zone(zone, "import")
+    _reject_if_unauthored_zone(zone, "import")
     fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
     if plan.errors:
         raise HTTPException(
@@ -11048,6 +12023,18 @@ async def import_zone_spreadsheet_commit(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
+    await _require_superadmin_for_lua(
+        db,
+        current_user,
+        [c.record_type for c in plan.creates]
+        + [
+            rt
+            for u in plan.updates
+            if set(u.changed) - {"ttl", "comment"}
+            for rt in (u.candidate.record_type, u.record.record_type)
+        ],
+        what="import a LUA record",
+    )
 
     await _check_driver_refusals(
         [(c.record_type, c.value, c.ttl) for c in plan.creates]
@@ -11324,11 +12311,36 @@ def _refuse_superadmin_zone_fields(
 
 
 async def _require_zone(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, user: Any | None = None
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    user: Any | None = None,
+    *,
+    lock: Literal["write", "delete"] | None = None,
 ) -> DNSZone:
-    result = await db.execute(
-        select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
-    )
+    stmt = select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
+    if lock is not None:
+        # #3535: a writer of the zone's records takes the zone row first, as it
+        # reads it: FOR NO KEY UPDATE ("write"), the lock its serial bump takes
+        # anyway. A zone delete takes it too, FOR UPDATE ("delete") or FOR NO
+        # KEY UPDATE for a soft delete, before it touches the zone's records
+        # (``_apply_delete_zone``). Whichever comes second waits here for the
+        # first, and none waits for the zone row while it holds a record. A
+        # writer that waited on a delete then reads no zone (gone, or in the
+        # trash): 404, as a request sent after the delete gets. Read plainly,
+        # the writer went on, and its serial bump matched no row once a
+        # permanent delete committed (StaleDataError), or held the zone row
+        # while it waited on a record the delete held (a deadlock): a bare
+        # 500 either way. The lock is its own ``SELECT dns_zone.id``, the form
+        # the audit-chain hook and its test guard know (#3503); the read below
+        # then sees the row as the lock found it.
+        await db.execute(
+            select(DNSZone.id)
+            .where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
+            .with_for_update(key_share=lock == "write")
+        )
+        stmt = stmt.execution_options(populate_existing=True)
+    result = await db.execute(stmt)
     zone = result.scalar_one_or_none()
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
@@ -11358,11 +12370,12 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
     if not drivers:
         return
     incompatible = drivers - allowed
-    if op == "dnssec_sign" and incompatible & dnssec_signers.UNMANAGED_SIGNING_DRIVERS:
+    if op == "dnssec_sign" and incompatible & dnssec_signers.SIGN_REFUSED_TECHNITIUM_DRIVERS:
         raise HTTPException(
             status_code=422,
             detail=(
-                "DNSSEC signing is not supported on Technitium servers: "
+                "DNSSEC signing is not supported on Technitium servers "
+                "(agent-managed or agentless API) in 1.0: "
                 "SpatiumDDI cannot keep a Technitium zone signed (it is signed "
                 "once and never re-signed on a new server, a re-created zone "
                 "or a lost volume, and the zone's DNSSEC policy is ignored). "
@@ -11388,6 +12401,45 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
                 f"supports manual DNSSEC key management (#49)."
             ),
         )
+
+
+# LUA records are code PowerDNS runs inside pdns_server at query time, and the
+# snippet menu offers TCP / HTTP(S) probes made from the DNS server's address.
+# That is infrastructure authority, so writing one is superadmin-only (like the
+# GSLB pools' health checks), on top of the ``write`` on ``dns_record`` the
+# routes take. Reading, serving and deleting an existing LUA record are not
+# affected: a delete removes code rather than adding it.
+_SUPERADMIN_ONLY_RECORD_TYPES = frozenset({"LUA"})
+
+
+async def _require_superadmin_for_lua(
+    db: DB, user: Any, record_types: Iterable[str | None], *, what: str
+) -> None:
+    """403 (audited) unless ``user`` is a superadmin, when ``record_types``
+    holds a type whose records run code on the DNS server.
+
+    Call before anything is written: the refusal commits its audit row.
+    """
+    gated = sorted(
+        {(t or "").strip().upper() for t in record_types} & _SUPERADMIN_ONLY_RECORD_TYPES
+    )
+    if not gated or is_effective_superadmin(user):
+        return
+    names = ", ".join(gated)
+    await refuse_and_audit(
+        db,
+        user,
+        None,
+        action="write",
+        resource_type="dns_record",
+        resource_id="",
+        resource_display=f"{names} record ({what})",
+        reason=f"{names} record write refused: superadmin only",
+        detail=(
+            f"Permission denied: {names} records run code inside the DNS server "
+            f"at query time, so only a superadmin may {what}."
+        ),
+    )
 
 
 async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID, db: DB) -> None:
@@ -11487,10 +12539,16 @@ async def _check_driver_refusals(
 
 
 async def _require_record(
-    group_id: uuid.UUID, zone_id: uuid.UUID, record_id: uuid.UUID, db: DB
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    record_id: uuid.UUID,
+    db: DB,
+    *,
+    lock: bool = False,
 ) -> DNSRecord:
-    # Verify zone belongs to group first
-    await _require_zone(group_id, zone_id, db)
+    # Verify zone belongs to group first. A writer of the record (``lock``)
+    # takes the zone row first, before the record (#3535, see _require_zone).
+    await _require_zone(group_id, zone_id, db, lock="write" if lock else None)
     result = await db.execute(
         select(DNSRecord).where(DNSRecord.id == record_id, DNSRecord.zone_id == zone_id)
     )
@@ -11511,6 +12569,13 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
     the operator can manage the zone manually.
     """
     msg = synthesised_zone_error(zone, op)
+    if msg is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
+
+
+def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
+    """Refuse a record write into a secondary, stub or forward zone (#3838)."""
+    msg = unauthored_zone_error(zone, op)
     if msg is not None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 

@@ -12,8 +12,6 @@ from urllib.parse import urlencode
 import structlog
 from fastapi import APIRouter, Form, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from jose import JWTError
-from jose import jwt as jose_jwt
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +20,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
 from app.api.token_binding import honours_token_binding
 from app.config import settings
+from app.core import jwt_compat
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
 from app.core.auth.oidc import build_authorize_url as oidc_authorize_url
@@ -58,6 +57,8 @@ from app.core.auth_throttle import (
     refund_stepup_attempt,
 )
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.denial_audit import note_denial_audited
+from app.core.jwt_compat import JWTError
 from app.core.mfa_enrol_proof import (
     ProofUnavailable,
     claim_flow,
@@ -68,6 +69,7 @@ from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.core.responses import XmlResponse
 from app.core.security import (
+    burn_password_check,
     create_access_token,
     create_mfa_challenge_token,
     create_refresh_token,
@@ -668,7 +670,12 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is temporarily locked due to repeated failed logins.",
             )
-        if not user.hashed_password or not verify_password(body.password, user.hashed_password):
+        if not user.hashed_password:
+            burn_password_check(body.password)
+            password_ok = False
+        else:
+            password_ok = verify_password(body.password, user.hashed_password)
+        if not password_ok:
             await _audit_login_failure(db, request, body.username, reason="bad_password", user=user)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -717,6 +724,12 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             access_token=external_response.access_token,
             force_password_change=external_response.force_password_change,
         )
+
+    # A refused sign-in for any name that is not a local account (no row, or a
+    # directory/SSO row) costs the one password compare a wrong local password
+    # costs, on top of the provider chain, so those answers are equally
+    # expensive whichever of the two the name is.
+    burn_password_check(body.password)
 
     # Existing-but-external user with no matching provider → fall through to
     # the generic 401 so we don't leak account-existence information.
@@ -1397,6 +1410,7 @@ async def mfa_enroll_begin(
     if outcome is ReauthOutcome.BAD_CREDENTIAL:
         await record_stepup_password_failure(current_user.id)
     if outcome is not ReauthOutcome.OK:
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -1735,12 +1749,12 @@ def _oidc_callback_url(base: str, provider_id: uuid.UUID) -> str:
 
 
 def _sign_flow_token(payload: dict) -> str:
-    return jose_jwt.encode(payload, settings.secret_key, algorithm="HS256")
+    return jwt_compat.encode(payload, settings.secret_key, algorithm="HS256")
 
 
 def _verify_flow_token(token: str) -> dict:
     try:
-        return jose_jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        return jwt_compat.decode(token, settings.secret_key, algorithms=["HS256"])
     except JWTError as exc:
         raise ValueError("invalid flow token") from exc
 

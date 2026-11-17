@@ -39,6 +39,7 @@ async def _noop_publish(_channel: str) -> None:
 def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, body: str) -> None:
     class _Resp:
         is_redirect = False  # the guarded fetch follows redirects by hand
+        headers = {"content-type": "text/plain"}  # read by refuse_html (#3607)
         text = body
 
         def raise_for_status(self) -> None:
@@ -167,7 +168,9 @@ async def test_refresh_across_several_batches_adds_prunes_and_counts(
         .scalars()
         .all()
     )
-    assert all(r.is_wildcard and r.entry_type == "block" for r in rows if r.domain in added)
+    # Plain-domain feed lines are exact triggers under the default by_syntax
+    # mode (#4190); an adblock ||name^ line would be a wildcard.
+    assert all(not r.is_wildcard and r.entry_type == "block" for r in rows if r.domain in added)
 
     await db_session.refresh(bl)
     assert bl.entry_count == 10

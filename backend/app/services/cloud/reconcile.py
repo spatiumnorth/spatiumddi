@@ -67,13 +67,15 @@ from app.services.integration_ownership import (
     SpaceRelease,
     address_taken,
     addresses_in_space,
+    drop_wrapper_block,
+    gateway_changed,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owned_subnets_in_space,
     owning_integration,
     refuse_sync_into_trashed_space,
-    subnet_has_surviving_addresses,
+    retire_vanished_subnet,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 
@@ -350,7 +352,10 @@ def _compute_desired(
                         status="cloud-instance",
                         hostname=inst.name,
                         description=desc,
-                        mac=nic.mac,
+                        # MACADDR loads as lowercase colon form; Azure
+                        # reports ``00-0D-3A-…``, which would compare
+                        # unequal on every sync (#3596).
+                        mac=nic.mac.lower().replace("-", ":") if nic.mac else None,
                     )
                 )
             if nic.public_ip:
@@ -481,16 +486,15 @@ async def _apply_blocks_and_subnets(
         for net_str, row in current_subnets.items():
             if net_str in desired_map:
                 continue
-            # #1558: don't cascade-delete operator / foreign /
-            # operator-edited addresses with the subnet — un-claim it
-            # instead when any survive, like the OPNsense reconciler.
-            if await subnet_has_surviving_addresses(db, row.id, "cloud_endpoint_id"):
-                row.cloud_endpoint_id = None
+            # #1558 / #3532: a subnet carrying operator content (addresses,
+            # a DHCP scope live or in Trash, tags, links …) is un-claimed,
+            # not cascade-deleted with it; either way it is audited.
+            if await retire_vanished_subnet(
+                db, row, "cloud_endpoint_id", warnings=summary.warnings
+            ):
                 summary.subnets_updated += 1
-                continue
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
-            summary.subnets_deleted += 1
+            else:
+                summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # An operator subnet at this exact CIDR wins — reused untouched.
@@ -560,7 +564,7 @@ async def _apply_blocks_and_subnets(
                 changed = True
             # Only set the gateway when we know one; never clear an
             # operator-set value back to None on a sync.
-            if d.gateway and str(existing.gateway or "") != d.gateway:
+            if gateway_changed(existing.gateway, d.gateway):
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
@@ -577,9 +581,7 @@ async def _apply_blocks_and_subnets(
         for net_str, block in endpoint_blocks.items():
             if net_str in desired_block_cidrs:
                 continue
-            refs = await db.execute(select(Subnet).where(Subnet.block_id == block.id))
-            if refs.scalar_one_or_none() is None:
-                await db.delete(block)
+            if await drop_wrapper_block(db, block, "cloud_endpoint_id", warnings=summary.warnings):
                 summary.blocks_deleted += 1
 
 

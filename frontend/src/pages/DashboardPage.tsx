@@ -115,8 +115,10 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import {
+  type UtilizationThresholds,
   useUtilizationThresholds,
   utilizationBand,
 } from "@/hooks/useUtilizationThresholds";
@@ -230,14 +232,43 @@ function agentNeedsAttention(s: {
   );
 }
 
-function UtilColor(percent: number): string {
-  if (percent >= 95) return "bg-red-500";
-  if (percent >= 85) return "bg-red-400";
-  if (percent >= 70) return "bg-amber-400";
+function UtilColor(percent: number, t: UtilizationThresholds): string {
+  // Amber and red sit at Settings' Warning / Critical Threshold (#3539), the
+  // same lines the IPAM tree and the page's counts use; below the warning
+  // line only the green shade steps with fill.
+  if (percent >= t.critical) return "bg-red-500";
+  if (percent >= t.warn) return "bg-amber-400";
   if (percent >= 50) return "bg-emerald-500";
   if (percent >= 25) return "bg-emerald-400";
   if (percent > 0) return "bg-emerald-300";
   return "bg-muted/60 dark:bg-muted/40";
+}
+
+/** The heatmap legend: each swatch labelled with the percentage its colour
+ *  starts at, matching ``UtilColor``. A green step at or above the warning
+ *  line, and an amber step when warning is not below critical, are never
+ *  drawn, so they are left out rather than listed out of order (#3539). */
+function heatmapLegend(
+  t: UtilizationThresholds,
+): { cls: string; label: string }[] {
+  const entries: { cls: string; label: string }[] = [];
+  if (t.warn > 0 && t.critical > 0) {
+    entries.push({ cls: "bg-muted/60", label: "0%" });
+    entries.push({ cls: "bg-emerald-300", label: ">0" });
+  }
+  for (const [start, cls] of [
+    [25, "bg-emerald-400"],
+    [50, "bg-emerald-500"],
+  ] as const) {
+    if (start < t.warn && start < t.critical) {
+      entries.push({ cls, label: String(start) });
+    }
+  }
+  if (t.warn < t.critical) {
+    entries.push({ cls: "bg-amber-400", label: String(t.warn) });
+  }
+  entries.push({ cls: "bg-red-500", label: String(t.critical) });
+  return entries;
 }
 
 /** One entry in the Overview inventory strip (#942) — a value, its unit,
@@ -306,15 +337,20 @@ function capacityLabel(subnet: {
   return `${subnet.allocated_ips.toLocaleString()} / ${subnet.total_ips.toLocaleString()}`;
 }
 
-function UtilizationBar({
+export function UtilizationBar({
   percent,
   network,
+  tone,
 }: {
   percent: number;
   /** When this is a v6 prefix the bar renders n/a: "0%" of a /64 is
    *  true, useless, and indistinguishable from an empty v4 subnet. */
   network?: string;
+  /** Fill class for a bar that is not subnet utilization (a DHCP pool's
+   *  occupancy), which Settings' IPAM thresholds do not govern. */
+  tone?: string;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (network && isV6(network)) {
     return (
       <div className="flex items-center gap-2">
@@ -334,7 +370,7 @@ function UtilizationBar({
         <div
           className={cn(
             "h-full rounded-full transition-all",
-            UtilColor(percent),
+            tone ?? UtilColor(percent, thresholds),
           )}
           style={{ width: `${Math.min(percent, 100)}%` }}
         />
@@ -354,7 +390,7 @@ function UtilizationBar({
  * end. Cells stay square at every breakpoint via aspect-square +
  * grid-cols-autofill.
  */
-function SubnetHeatmap({
+export function SubnetHeatmap({
   subnets,
   unreadable = null,
 }: {
@@ -363,6 +399,7 @@ function SubnetHeatmap({
    *  says so rather than "No subnets yet". */
   unreadable?: string | null;
 }) {
+  const thresholds = useUtilizationThresholds();
   if (unreadable) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center">
@@ -393,7 +430,9 @@ function SubnetHeatmap({
     .sort((a, b) => a - b);
   const p95Index = Math.max(0, Math.floor(sorted.length * 0.95) - 1);
   const p95 = sorted.length > 0 ? sorted[p95Index] : 0;
-  const hot = active.filter((s) => s.utilization_percent >= 85).length;
+  const hot = active.filter(
+    (s) => s.utilization_percent >= thresholds.critical,
+  ).length;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -408,30 +447,14 @@ function SubnetHeatmap({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px]">
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted/60" />
-            <span className="text-muted-foreground">0%</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-300" />
-            <span className="text-muted-foreground">25</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" />
-            <span className="text-muted-foreground">50</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400" />
-            <span className="text-muted-foreground">70</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-400" />
-            <span className="text-muted-foreground">85</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-500" />
-            <span className="text-muted-foreground">100%</span>
-          </div>
+          {heatmapLegend(thresholds).map((e) => (
+            <div key={e.cls} className="flex items-center gap-1">
+              <span
+                className={cn("inline-block h-2.5 w-2.5 rounded-sm", e.cls)}
+              />
+              <span className="text-muted-foreground">{e.label}</span>
+            </div>
+          ))}
         </div>
       </div>
       <div className="p-4">
@@ -452,7 +475,7 @@ function SubnetHeatmap({
               }`}
               className={cn(
                 "aspect-square rounded transition-all hover:scale-110 hover:ring-2 hover:ring-primary/40",
-                UtilColor(s.utilization_percent),
+                UtilColor(s.utilization_percent, thresholds),
               )}
             />
           ))}
@@ -857,7 +880,7 @@ function AsnSummaryCard() {
   // Gate on ``ready`` so the query waits for the real module state (``enabled``
   // is optimistically true while loading → a one-shot 404 on hard load).
   const moduleOn = ready && enabled("network.asn");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["asns-summary"],
     queryFn: () => asnsApi.list({ limit: 200 }),
     staleTime: 30_000,
@@ -884,8 +907,8 @@ function AsnSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load ASN data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="ASNs" />
         </p>
       );
     }
@@ -999,6 +1022,7 @@ function VrfSummaryCard() {
     data: vrfs = [],
     isLoading,
     isError,
+    error,
   } = useQuery<VRF[]>({
     queryKey: ["vrfs-summary"],
     queryFn: () => vrfsApi.list(),
@@ -1026,8 +1050,8 @@ function VrfSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load VRF data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="VRFs" />
         </p>
       );
     }
@@ -1095,7 +1119,7 @@ function DomainsSummaryCard() {
   // Wait for the real module state: ``enabled`` is optimistically true while
   // loading, which would fire one 404 on a hard load with the module off.
   const moduleOn = ready && enabled("network.domains");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
@@ -1119,8 +1143,8 @@ function DomainsSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load domain data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="domains" />
         </p>
       );
     }
@@ -1325,6 +1349,8 @@ function SubnetDecomCard() {
 function LookingGlassHealthCard() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.looking_glass");
+  // Add Peer on the Looking Glass page is a write on bgp_lg_peer (#4116).
+  const canConfigure = usePermissions().can("write", "bgp_lg_peer");
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
@@ -1366,12 +1392,14 @@ function LookingGlassHealthCard() {
           <p className="text-xs text-muted-foreground">
             No Looking Glass peers configured.
           </p>
-          <Link
-            to="/network/looking-glass"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Configure a peer →
-          </Link>
+          {canConfigure && (
+            <Link
+              to="/network/looking-glass"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Configure a peer →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1605,7 +1633,11 @@ export function DashboardPage() {
   // The route takes read on `audit_log`: a user without it is not asked at
   // all (each refusal writes a `denied` audit row), and the card says so
   // rather than "No recent activity" (#2702). A refusal also ends the poll.
-  const { can: canRead, isLoading: permsLoading } = usePermissions();
+  const {
+    can: canRead,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadAudit = canRead("read", "audit_log");
   const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
@@ -1752,10 +1784,9 @@ export function DashboardPage() {
       ? (rows ?? []).filter((s) => ipamSpaceFilter.includes(s.space_id))
       : (rows ?? []);
 
-  // Derived stats — every utilization-driven counter reads from
-  // `reportSubnets` so small PTP / loopback subnets don't skew the
-  // dashboard. `subnets` (the unfiltered list) is still used for
-  // inventory counts like "N subnets". Both feed through `filterSpaces`
+  // Derived stats — the heatmap, Top Subnets and threshold counters read
+  // from `reportSubnets` so small PTP / loopback subnets don't skew them;
+  // the address totals and inventory counts read the unfiltered list. Both feed through `filterSpaces`
   // so the IPAM-tab filter, when active, scopes every downstream number.
   const reporting = filterSpaces(reportSubnets);
   const subnetsScoped = filterSpaces(subnets);
@@ -1764,8 +1795,12 @@ export function DashboardPage() {
   // meaningless (a single /64 swamps every IPv4 subnet combined). Restrict
   // the top-line counters to IPv4. The heatmap + per-subnet stats keep
   // IPv6 since per-subnet utilization_percent is still meaningful.
-  const reportingV4 = reporting.filter((s) => !s.network.includes(":"));
-  const reportingV6 = reporting.filter((s) => s.network.includes(":"));
+  // The totals count EVERY subnet's addresses (#3785): the
+  // utilization_max_prefix_* cut is for the heatmap, Top Subnets and alerts,
+  // and a total that left a /30's addresses out beside a Subnets card that
+  // counts the /30 told two stories.
+  const reportingV4 = subnetsScoped.filter((s) => !s.network.includes(":"));
+  const reportingV6 = subnetsScoped.filter((s) => s.network.includes(":"));
   const totalIPs = reportingV4.reduce((s, n) => s + n.total_ips, 0);
   const allocatedIPs = reportingV4.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
@@ -2584,13 +2619,20 @@ export function DashboardPage() {
                           error={recentError}
                           what="the audit log"
                         />
+                      ) : permsFailed ? (
+                        // A failed permissions read is not a missing grant
+                        // (#3541): ``can`` is false for everyone then.
+                        "Your permissions could not be read, so the audit log was not requested. Reload to try again."
                       ) : (
                         "You don't have permission to see the audit log."
                       )}
                     </div>
                   ) : !recent || recent.items.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                      No recent activity. Try creating a subnet or a DNS record.
+                      No recent activity.
+                      {(canRead("write", "subnet") ||
+                        canRead("write", "dns_record")) &&
+                        " Try creating a subnet or a DNS record."}
                     </div>
                   ) : (
                     recent.items.slice(0, 12).map((entry) => (
@@ -3046,7 +3088,14 @@ export function IpamSpaceFilter({
             <div className="border-t px-3 py-2">
               <button
                 type="button"
-                onClick={() => onChange([])}
+                onClick={() => {
+                  onChange([]);
+                  // The button is drawn only while a filter is set, so it
+                  // removes itself: close the list and hand focus to the
+                  // trigger, as Esc does, rather than the page body (#4222).
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
                 className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3 w-3" />
@@ -3086,7 +3135,7 @@ function ConfigApplyChip({
     return (
       <StatusChip
         tone="amber"
-        label="zones refused"
+        label="zones held back"
         title={`${PARTIAL_APPLY_EXPLAIN}\n\n${partialApplyDetail(error)}`}
       />
     );
@@ -3252,7 +3301,7 @@ function ServerRow({
  * offered to a client and a reserved one is *supposed* to fill up, so
  * either would render as a red exhaustion bar for behaving correctly.
  */
-function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
+export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
@@ -3388,7 +3437,10 @@ function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
                   />
                 )}
                 <div className="flex-1">
-                  <UtilizationBar percent={p.percent} />
+                  <UtilizationBar
+                    percent={p.percent}
+                    tone={poolOccupancyTone(p.percent)}
+                  />
                 </div>
                 <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
                   {p.assigned.toLocaleString()} / {p.total.toLocaleString()}
@@ -4440,7 +4492,11 @@ function CertsExpiringKpi() {
 
   // The route takes read on `tls_cert`; a user without it is not asked, and
   // the card says it is withheld rather than "0 of 0 monitored" (#2702).
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const canReadCerts = can("read", "tls_cert");
   const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
@@ -4478,7 +4534,9 @@ function CertsExpiringKpi() {
         {withheld
           ? error && !isRefused(error)
             ? "couldn't load certificates"
-            : "you may not read certificates"
+            : !error && permsFailed
+              ? "couldn't read your permissions"
+              : "you may not read certificates"
           : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
@@ -4893,6 +4951,11 @@ function NetworkPanel() {
   const w = data.withheld ?? {};
   const NV = "not visible to your role";
 
+  // Nothing pulled: a zero here is not an all-clear (#3540). A withheld
+  // grant zeroes the total too, so it is excluded: that tile says "not
+  // visible to your role", never "nothing pulled". A missing total (an
+  // older API) is unknown, not zero, and keeps the plain count.
+  const rpkiUntracked = !w.asn && data.rpki_total_count === 0;
   return (
     <div className="space-y-5">
       {/* KPI ribbon */}
@@ -4915,15 +4978,35 @@ function NetworkPanel() {
         ) : (
           <RpkiExpiringKpi data={data} />
         )}
-        <NetworkKpi
-          label="RPKI expired"
-          value={w.asn ? "—" : data.rpki_expired_count}
-          tone={
-            w.asn ? "default" : data.rpki_expired_count > 0 ? "bad" : "good"
-          }
-          hint={w.asn ? NV : undefined}
-          to="/network/asns"
-        />
+        {!w.asn && !rpkiUntracked && rpkiExpiryUnmeasured(data) ? (
+          <NetworkKpi
+            label="RPKI expired"
+            value="n/a"
+            tone="default"
+            to="/network/asns"
+            hint={RPKI_NO_LIFETIME_HINT}
+            title={RPKI_NO_LIFETIME_TITLE}
+          />
+        ) : (
+          <NetworkKpi
+            label="RPKI expired"
+            value={w.asn || rpkiUntracked ? "—" : data.rpki_expired_count}
+            tone={
+              w.asn || rpkiUntracked
+                ? "default"
+                : data.rpki_expired_count > 0
+                  ? "bad"
+                  : "good"
+            }
+            hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
+            title={
+              rpkiUntracked
+                ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+                : undefined
+            }
+            to="/network/asns"
+          />
+        )}
         <NetworkKpi
           label="Circuit alerts"
           value={
@@ -5007,7 +5090,13 @@ function NetworkPanel() {
           title="RPKI ROAs expiring soon"
           withheld={w.asn}
           withheldHint="Not visible to your role."
-          emptyHint="No ROAs are expiring in the next 30 days."
+          emptyHint={
+            rpkiUntracked
+              ? "No RPKI ROAs are tracked yet."
+              : rpkiExpiryUnmeasured(data)
+                ? "Not measured: the ROA source ships no per-ROA lifetime."
+                : "No ROAs are expiring in the next 30 days."
+          }
         >
           {data.rpki_expiring.map((row) => (
             <Link
@@ -5145,6 +5234,20 @@ function NetworkPanel() {
  * ticks hourly) — six missed cycles, generous enough not to flap on a
  * slow sweep and short enough to notice a dead task the same day.
  */
+/**
+ * True when ROAs are tracked but none carries a known certificate lifetime
+ * (#3557). Neither Cloudflare's dump nor RIPE's export ships one, so the
+ * expiring / expired counts are then always 0 by construction, and a green
+ * 0 would read as an all-clear that nothing measured.
+ */
+function rpkiExpiryUnmeasured(data: NetworkDashboardSummary): boolean {
+  return data.rpki_total_count > 0 && data.rpki_expiry_known_count === 0;
+}
+
+const RPKI_NO_LIFETIME_HINT = "source has no ROA lifetimes";
+const RPKI_NO_LIFETIME_TITLE =
+  "The configured ROA source does not publish each ROA's certificate lifetime, so expiry is not measured. This is not an all-clear.";
+
 function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
   const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
   const checkedAt = data.rpki_last_checked_at;
@@ -5172,6 +5275,18 @@ function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
         to="/network/asns"
         hint={checkedAt ? `checked ${humanTime(checkedAt)}` : "never checked"}
         title={`The ROA refresh has not run recently, so any count here would be fiction. ${data.rpki_total_count} ROAs tracked.`}
+      />
+    );
+  }
+  if (rpkiExpiryUnmeasured(data)) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="n/a"
+        tone="default"
+        to="/network/asns"
+        hint={`${RPKI_NO_LIFETIME_HINT} · ${data.rpki_total_count.toLocaleString()} tracked`}
+        title={RPKI_NO_LIFETIME_TITLE}
       />
     );
   }
@@ -5541,7 +5656,11 @@ export function DNSThreatCard() {
   // The route needs read on servers (#3450): a user without it was refused
   // every 60 s, each a 403 and a denied audit row. ``can`` is false while
   // the grants load, so the query waits for them as well.
-  const { can, isLoading: permsLoading } = usePermissions();
+  const {
+    can,
+    isLoading: permsLoading,
+    isError: permsFailed,
+  } = usePermissions();
   const mayRead = can("read", "server");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
@@ -5563,8 +5682,9 @@ export function DNSThreatCard() {
       <div className="rounded-lg border bg-card p-4">
         <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Not shown: the DNS tunneling rollup needs read on servers (the server
-          logs permission), which your role does not have.
+          {permsFailed
+            ? "Not shown: your permissions could not be read, so the DNS tunneling rollup was not requested. Reload to try again."
+            : "Not shown: the DNS tunneling rollup needs read on servers (the server logs permission), which your role does not have."}
         </p>
       </div>
     );

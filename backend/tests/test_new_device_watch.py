@@ -905,3 +905,33 @@ async def test_block_all_groups_refused_when_one_group_is_not_writable(
     )
     assert resp.status_code == 200, resp.text
     assert await _block_count(db_session) == 1
+
+
+async def test_trashed_subnet_leaves_the_new_devices_views_3492(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3492: a subnet in the Trash takes its sightings out of the list, the
+    ``?subnet_id=`` filter, and the summary counts; restoring brings them back."""
+    await _enable_watch(db_session)
+    subnet = await _make_subnet(db_session)
+    ip = await _ip(db_session, subnet, "10.40.1.80", status="allocated")
+    await record_mac_observation(db_session, ip.id, "3c:5a:b4:de:ad:80", source="manual")
+    _u, token = await _superadmin(db_session)
+    await db_session.commit()
+
+    async def _views() -> tuple[int, int, int]:
+        h = _hdr(token)
+        plain = (await client.get("/api/v1/new-devices/sightings", headers=h)).json()["total"]
+        scoped = (
+            await client.get(f"/api/v1/new-devices/sightings?subnet_id={subnet.id}", headers=h)
+        ).json()["total"]
+        summ = (await client.get("/api/v1/new-devices/summary", headers=h)).json()
+        return plain, scoped, summ["new_count"]
+
+    assert await _views() == (1, 1, 1)
+    subnet.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    assert await _views() == (0, 0, 0)
+    subnet.deleted_at = None
+    await db_session.commit()
+    assert await _views() == (1, 1, 1)

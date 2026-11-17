@@ -151,7 +151,9 @@ spec:
         seccompProfile:
           type: {{ . }}
         {{- end }}
+        {{- if not (include "spatiumddi.isOpenShift" .) }}
         fsGroup: 999
+        {{- end }}
       initContainers:
         # Render redis.conf + sentinel.conf from the ConfigMap template:
         # the password, this pod's stable FQDN, and its role, taken from

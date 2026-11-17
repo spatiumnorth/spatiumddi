@@ -43,7 +43,7 @@ import httpx
 import structlog
 
 from . import cp_tls
-from .cert_auth import build_auth_headers, load_cert
+from .cert_auth import JSON_CONTENT_TYPE, build_auth_headers, encode_json, load_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url
 from .identity import Identity, load_appliance_id
@@ -231,9 +231,6 @@ def _post_reply(
     cert_pem = load_cert(cfg.state_dir)
     if cert_pem is None:
         return
-    headers = build_auth_headers(
-        "POST", path, cert_pem, identity.private_key, appliance_id
-    )
     base_url = _effective_control_plane_url(cfg)
     if not base_url:
         return
@@ -241,9 +238,16 @@ def _post_reply(
     # 422s without it — which, with the status unchecked, meant every
     # action timed out at the operator's end with nothing logged. The
     # nettool proxy has always sent it; this one did not.
-    body = {"request_id": request_id, **outcome}
+    body = encode_json({"request_id": request_id, **outcome})
+    headers = build_auth_headers(
+        "POST", path, cert_pem, identity.private_key, appliance_id, body
+    )
     try:
-        resp = client.post(base_url.rstrip("/") + path, headers=headers, json=body)
+        resp = client.post(
+            base_url.rstrip("/") + path,
+            headers={**headers, **JSON_CONTENT_TYPE},
+            content=body,
+        )
     except httpx.HTTPError as exc:
         log.warning("supervisor.storage.reply_failed", error=str(exc))
         return

@@ -1,15 +1,17 @@
 import asyncio
 import re
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import structlog
 import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
@@ -19,6 +21,7 @@ from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.body_limit import RequestBodyLimitMiddleware
+from app.core.denial_audit import audit_unrecorded_denial
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
@@ -598,6 +601,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_spool_trimmed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_spool_trimmed_alert_rule_seed_skipped", reason=str(exc))
+    # DNS group memory-pressure alert rule — singleton, ENABLED by default
+    # (issue #3551). Silent unless a BIND9 group's estimated named memory
+    # nears its agents' limit. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_memory_pressure_alert_rule,
+        )
+
+        await seed_dns_memory_pressure_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_memory_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DNSSEC multi-signer alert rule — singleton, ENABLED by default
     # (issue #1762). Silent unless a signed zone sits on a group with more than
     # one DNS server, each signing with its own keys. Idempotent.
@@ -1247,6 +1261,15 @@ def create_app() -> FastAPI:
         OperationalError as SAOperationalError,
     )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_audited(request: Request, exc: StarletteHTTPException) -> Response:
+        """The stock HTTPException response, plus (#3644) a ``denied`` audit row
+        for a 403 decided inside a handler, which writes none of its own. The
+        row is skipped when a gate or ``refuse_and_audit`` already wrote one."""
+        if exc.status_code == 403:
+            await audit_unrecorded_denial(request, exc.detail)
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(SAInterfaceError)
     @app.exception_handler(SAOperationalError)
     async def _transient_db_connection(request: Request, exc: Exception) -> Response:
@@ -1373,6 +1396,7 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_constraint,
         unique_violation_message,
     )
 
@@ -1455,7 +1479,11 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": unique_violation_message(extract_detail(exc))},
+            content={
+                "detail": unique_violation_message(
+                    extract_detail(exc), unique_violation_constraint(exc)
+                )
+            },
         )
 
     @app.exception_handler(SADBAPIError)
@@ -1524,6 +1552,21 @@ def create_app() -> FastAPI:
             return [_safe_errors(v) for v in value]
         return value
 
+    # The submitted value is never echoed back (#3639): ``input`` carries
+    # whatever the client sent for the failing field - a passphrase, key or
+    # token among them - and ``ctx.error`` is the validator's exception, which
+    # can quote it. Neither is part of the documented 422 shape (``loc`` /
+    # ``msg`` / ``type`` say what is wrong and where), and no client reads them.
+    def _without_submitted_values(errors: Sequence[Any]) -> list[Any]:
+        cleaned: list[Any] = []
+        for err in errors:
+            item = {k: v for k, v in err.items() if k != "input"}
+            ctx = item.get("ctx")
+            if isinstance(ctx, dict):
+                item["ctx"] = {k: v for k, v in ctx.items() if k != "error"}
+            cleaned.append(item)
+        return cleaned
+
     @app.exception_handler(RequestValidationError)
     async def _request_validation_422(request: Request, exc: RequestValidationError) -> Response:
         from fastapi.encoders import jsonable_encoder  # noqa: PLC0415
@@ -1531,7 +1574,9 @@ def create_app() -> FastAPI:
 
         return JSONResponse(
             status_code=422,
-            content={"detail": jsonable_encoder(_safe_errors(exc.errors()))},
+            content={
+                "detail": jsonable_encoder(_safe_errors(_without_submitted_values(exc.errors())))
+            },
         )
 
     @app.exception_handler(Exception)

@@ -32,6 +32,7 @@ from app.api.deps import DB
 from app.core.permissions import require_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam.host_name import current_fqdn
+from app.services.ipam.live_address import live_subnet_clause
 
 logger = structlog.get_logger(__name__)
 
@@ -77,7 +78,8 @@ async def ansible_inventory(
 ) -> dict[str, Any]:
     """Return the full ``--list`` inventory (with ``_meta.hostvars``), or a
     single host's vars when ``?host=`` is supplied."""
-    addresses = (await db.execute(select(IPAddress))).scalars().all()
+    # #3537: an address whose subnet is in the Trash is not a host.
+    addresses = (await db.execute(select(IPAddress).where(live_subnet_clause()))).scalars().all()
     if len(addresses) >= _LARGE_INVENTORY_WARN:
         logger.warning(
             "ansible.inventory.large",

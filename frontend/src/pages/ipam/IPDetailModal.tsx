@@ -55,6 +55,7 @@ import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -690,7 +691,8 @@ export function ReputationSection({ address }: { address: string }) {
 
   // GET /dnsbl/listings/by-ip takes read on 'dnsbl'; a user without it is
   // not asked, and told so rather than "No blocklists are enabled" (#2704).
-  const canReadDnsbl = usePermissions().can("read", "dnsbl");
+  const dnsblPerms = usePermissions();
+  const canReadDnsbl = dnsblPerms.can("read", "dnsbl");
   const q = useQuery({
     queryKey: ["dnsbl", "by-ip", bareIp],
     queryFn: () => dnsblApi.byIp(bareIp),
@@ -749,7 +751,8 @@ export function ReputationSection({ address }: { address: string }) {
           {q.error ? (
             <ListReadError error={q.error} what="this IP's blocklist status" />
           ) : (
-            "You don't have permission to see this IP's blocklist status."
+            (dnsblPerms.unanswered ??
+            "You don't have permission to see this IP's blocklist status.")
           )}
         </div>
       ) : entries.length === 0 ? (
@@ -1220,10 +1223,11 @@ function DeviceProfileSection({
   // The tools.nmap module being off refuses every scan route with "Feature
   // 'tools.nmap' is disabled.", so it closes the same door (#3271).
   const nmapOn = useModuleOn("tools.nmap");
-  const canReadScans =
-    usePermissions().can("read", "manage_nmap_scans") && nmapOn;
+  const scanPerms = usePermissions();
+  const canReadScans = scanPerms.can("read", "manage_nmap_scans") && nmapOn;
   const scansUnavailable = nmapOn
-    ? "You don't have permission to see this IP's profile scan."
+    ? (scanPerms.unanswered ??
+      "You don't have permission to see this IP's profile scan.")
     : "Nmap scanning is turned off, so this IP's profile scan is not shown.";
   const [error, setError] = useState<string | null>(null);
   const [showRawSig, setShowRawSig] = useState(false);
@@ -1410,9 +1414,9 @@ function DeviceProfileSection({
       </div>
 
       {error && (
-        <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
+        <FormError className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
           {error}
-        </div>
+        </FormError>
       )}
 
       {/* Passive layer — DHCP fingerprint via fingerbank. */}
@@ -1502,7 +1506,8 @@ function DeviceProfileSection({
               No active profile yet.{" "}
               {!canReadScans
                 ? nmapOn
-                  ? "You don't have permission to run or see profile scans."
+                  ? (scanPerms.unanswered ??
+                    "You don't have permission to run or see profile scans.")
                   : "Nmap scanning is turned off."
                 : dhcpOn
                   ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`

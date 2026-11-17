@@ -61,13 +61,14 @@ from app.services.integration_ownership import (
     SpaceRelease,
     address_taken,
     addresses_in_space,
+    drop_wrapper_block,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owned_subnets_in_space,
     refuse_sync_into_trashed_space,
+    retire_vanished_subnet,
     subnet_for_address,
-    subnet_has_surviving_addresses,
     unowned_subnets_at,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -484,13 +485,12 @@ async def _apply_blocks_and_subnets(
     # like the OPNsense reconciler does.
     for net_str, row in current_subnets.items():
         if net_str not in desired_map:
-            if await subnet_has_surviving_addresses(db, row.id, "kubernetes_cluster_id"):
-                row.kubernetes_cluster_id = None
+            if await retire_vanished_subnet(
+                db, row, "kubernetes_cluster_id", warnings=summary.warnings
+            ):
                 summary.subnets_updated += 1
-                continue
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
-            summary.subnets_deleted += 1
+            else:
+                summary.subnets_deleted += 1
 
     # #2790: an un-owned subnet at exactly a desired CIDR is reused as it
     # stands, never twinned, as the Docker reconciler does (#2601). It is one
@@ -584,9 +584,9 @@ async def _apply_blocks_and_subnets(
         # Defensive — before deleting, check no subnet still points at
         # this wrapper (pathological state; only cluster-owned subnets
         # should, and we already reparented those).
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == wrapper.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(
+            db, wrapper, "kubernetes_cluster_id", warnings=summary.warnings
+        ):
             summary.blocks_deleted += 1
 
 

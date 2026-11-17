@@ -187,6 +187,23 @@ describe("IPAM delete confirmations", () => {
     ).toBe(true);
   });
 
+  it("announces a refused delete's reason in both steps (#3489)", () => {
+    const reason = "Subnet 10.231.12.0/24 still has allocated addresses.";
+    open(
+      <ConfirmDestroyModal
+        title="Delete Subnet"
+        description="Delete subnet 10.231.12.0/24?"
+        checkLabel="I understand 10.231.12.0/24 and its contents will be moved to Trash."
+        onConfirm={() => {}}
+        onClose={() => {}}
+        error={reason}
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toBe(reason);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(within(topDialog()).getByRole("alert").textContent).toBe(reason);
+  });
+
   it("calls nothing in IPAM permanent but the deletes that are", () => {
     // The only IPAM deletes that do not go to Trash are an IP address's:
     // its purge (DELETE /ipam/addresses/{id}?permanent=true), the orphan
@@ -209,8 +226,8 @@ describe("IPAM delete confirmations", () => {
         ", greyed out in the list, and excluded from next-free allocation. DNS and DHCP cascades still run: its DNS records and aliases leave the zone. You can restore or permanently delete it later from the orphans view; restoring it publishes its DNS records and aliases again.",
         "the orphan option: a purge is possible later",
       ],
-      ["Delete Permanently (irreversible)", "the address purge option"],
-      ["Delete Permanently", "the address purge's button"],
+      // The address purge's heading and button are the shared
+      // DeleteChoiceModal's defaults (#4078), no longer literals here.
     ]);
     // jsdom gives this module an http: URL, so the file is found from here.
     const file = join(__dirname, "IPAMPage.tsx");

@@ -14,31 +14,40 @@ expired and its IPAM row (if auto_from_lease) removed.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import and_, or_, select
 
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPLease
-from app.models.ipam import IPAddress
-
-# The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
-# longer imports *up* from a task — servers.py:delete_lease used to); the sweep
-# imports them back here.
 from app.services.dhcp.lease_cleanup import (
     _load_subnet_cache,
     _resolve_lease_subnet_id,
     address_still_held,
+    tear_down_scope_leases,
+    trashed_scopes_with_leases,
 )
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.dhcp.normalize import norm_ip
 from app.services.dns.record_ops import purge_trashed_address_records
+
+# The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
+# longer imports *up* from a task — servers.py:delete_lease used to); the sweep
+# imports them back here.
+from app.services.e911.address_bindings import keep_row_if_bound
 from app.services.feature_modules import is_module_enabled
 from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.services.lock_order import (
+    lock_mirror_rows,
+    lock_zones_for_addresses,
+)
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -57,6 +66,23 @@ EXPIRY_GRACE = timedelta(minutes=5)
 EXPIRED_DELETE_GRACE = timedelta(hours=24)
 
 
+def _write_order(subnet_id: Any, address: Any) -> tuple[str, int, int, str]:
+    """(subnet id string, address version, int address): lease-events' order (#3601)."""
+    key = str(subnet_id) if subnet_id is not None else ""
+    ip = norm_ip(str(address))
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return (key, 0, 0, ip)
+    return (key, addr.version, int(addr), ip)
+
+
+# Bind parameters per statement in the mirror lookups below. An expiry backlog
+# (a control plane down for a day) can hold tens of thousands of addresses, and
+# asyncpg refuses a statement with more than 32,767 parameters.
+_MIRROR_LOOKUP_CHUNK = 1000
+
+
 async def _sweep() -> tuple[int, int]:
     cutoff = datetime.now(UTC) - EXPIRY_GRACE
     async with task_session() as db:
@@ -65,13 +91,40 @@ async def _sweep() -> tuple[int, int]:
         if not await is_module_enabled(db, "core.dhcp"):
             return (0, 0)
         # Find any active-marked lease whose actual expiry passed the grace.
+        # #3605: row-locked, in id order, before anything else is written. A
+        # lease-events batch updates its lease rows first (one flush, which
+        # writes them in primary-key order) and only then locks mirror rows and
+        # zones, so taking the lease rows in that same order up front means a
+        # batch and the sweep never hold one lease row each that the other
+        # wants. The sweep used to update them one by one, in no fixed order,
+        # interleaved with its mirror deletes. The lock also closes a lost
+        # update: a batch that renews a lease while the sweep waits on it
+        # commits first, the row no longer matches ``expires_at < cutoff`` when
+        # the lock is granted, and the sweep leaves it alone instead of
+        # stamping the renewed lease ``expired``.
+        #
+        # #3624 — the second pass's rows (``expired`` past the longer grace)
+        # are locked in the same statement, not when their DELETE flushes. That
+        # flush came after the DDNS revokes below, which hold zone rows: a
+        # lease-events batch renewing one of those leases holds its row, then
+        # wants the zone to publish the renewal, while the sweep held the zone
+        # and wanted the row — 40P01. One statement keeps every lease lock
+        # ahead of the mirror and zone locks, and in one id order.
+        delete_cutoff = datetime.now(UTC) - EXPIRED_DELETE_GRACE
         res = await db.execute(
-            select(DHCPLease).where(
-                DHCPLease.state == "active",
+            select(DHCPLease)
+            .where(
                 DHCPLease.expires_at.is_not(None),
-                DHCPLease.expires_at < cutoff,
+                or_(
+                    and_(DHCPLease.state == "active", DHCPLease.expires_at < cutoff),
+                    and_(DHCPLease.state == "expired", DHCPLease.expires_at < delete_cutoff),
+                ),
             )
+            .order_by(DHCPLease.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
+        locked = list(res.scalars().all())
         cleaned = 0
         touched_subnets: set[Any] = set()  # recounted once below (#3345)
         # Lazy-import the DDNS revoke to keep this task light when
@@ -83,13 +136,45 @@ async def _sweep() -> tuple[int, int]:
         # Load the subnet list once for the longest-prefix fallback in
         # _resolve_lease_subnet_id instead of re-querying per stale lease.
         subnet_cache = await _load_subnet_cache(db)
-        for lease in res.scalars().all():
+
+        # #3605: one total order, shared with the lease-events handler (#3601):
+        # lease rows by id (above); the mirror rows they delete locked FOR
+        # UPDATE by id BEFORE any DDNS work; then DDNS + deletes in
+        # (subnet, version, address) order. Unordered, the sweep interleaved a
+        # lease's DDNS revoke (which bumps a zone's serial row and holds it to
+        # commit) with that lease's mirror delete, while a lease-events batch
+        # held the mirror rows and then wanted the zone rows: a lock cycle,
+        # 40P01, one side answered 500.
+        resolved: list[tuple[DHCPLease, Any]] = []
+        for lease in locked:
+            if lease.state != "active":
+                continue  # already expired: only the second pass wants it
+            resolved.append((lease, await _resolve_lease_subnet_id(db, lease, subnet_cache)))
+        resolved.sort(key=lambda pair: _write_order(pair[1], pair[0].ip_address))
+
+        # The leases behind each mirror to tear down, keyed by (subnet, address).
+        candidates: dict[tuple[Any, str], list[DHCPLease]] = {}
+        for lease, subnet_id in resolved:
             # Stamp lease history before flipping state. ``expired`` is
             # the time-based sweep label (vs ``removed`` from the
             # pull-leases absence-delete branch) so consumers can tell
             # the two apart.
             record_lease_history(db, lease, lease_state="expired", expired_at=now_ts)
             lease.state = "expired"
+            # Remove the mirrored IPAM row if auto_from_lease — but only
+            # within this lease's owning subnet. An address-only lookup
+            # would delete same-address mirrors in other subnets too.
+            if subnet_id is None:
+                continue
+            candidates.setdefault((subnet_id, norm_ip(str(lease.ip_address))), []).append(lease)
+
+        rows = await lock_mirror_rows(db, set(candidates), chunk=_MIRROR_LOOKUP_CHUNK)
+        # #3617: then every zone their revokes may write, in id order: each
+        # revoke locks its own zones in order, but one address's after
+        # another's are not.
+        await lock_zones_for_addresses(db, retracting=rows)
+        rows.sort(key=lambda r: _write_order(r.subnet_id, r.address))
+        for row in rows:
             # #1110 — a failover / HA partner still holding an active,
             # unexpired lease on the address owns the shared mirror and DDNS
             # now; this server's copy aging out does not free the address.
@@ -101,55 +186,50 @@ async def _sweep() -> tuple[int, int]:
             # a row left ``active`` past its expiry for an address that has
             # since gone to a new client (Kea reused it without a release
             # line for the old one) must not take the new client's mirror.
-            if await address_still_held(db, lease, now=now_ts):
+            #
+            # #3605 — asked only now, with the mirror row locked. The lock may
+            # have waited on a lease-events batch that renewed the address on
+            # a partner; asked before the wait, the answer was "free", and
+            # the sweep deleted the mirror that batch had just refreshed.
+            # A batch still to come must take this row's lock before it can
+            # commit, so it finds the row gone and inserts a fresh mirror for
+            # its renewal, as for any new lease.
+            held_at = datetime.now(UTC)
+            still_held = False
+            for lease in candidates[(row.subnet_id, norm_ip(str(row.address)))]:
+                if await address_still_held(db, lease, now=held_at):
+                    still_held = True
+                    break
+            if still_held:
                 continue
-            # Remove the mirrored IPAM row if auto_from_lease — but only
-            # within this lease's owning subnet. An address-only lookup
-            # would delete same-address mirrors in other subnets too.
-            subnet_id = await _resolve_lease_subnet_id(db, lease, subnet_cache)
-            if subnet_id is None:
-                continue
-            ipam_res = await db.execute(
-                select(IPAddress)
-                .where(
-                    IPAddress.subnet_id == subnet_id,
-                    IPAddress.address == lease.ip_address,
-                    IPAddress.auto_from_lease.is_(True),
-                )
-                .options(selectinload(IPAddress.subnet))
-            )
-            for row in ipam_res.scalars().all():
-                subnet = row.subnet
-                if subnet is not None:
-                    try:
-                        await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=row)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "dhcp_lease_cleanup_ddns_revoke_failed",
-                            ip=str(row.address),
-                            error=str(exc),
-                        )
-                await purge_trashed_address_records(db, [row.id])  # #3186
+            subnet = row.subnet
+            if subnet is not None:
+                try:
+                    await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=row)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dhcp_lease_cleanup_ddns_revoke_failed",
+                        ip=str(row.address),
+                        error=str(exc),
+                    )
+            await purge_trashed_address_records(db, [row.id])  # #3186
+            # An address an E911 binding names stays (#3899), as a free row.
+            if not await keep_row_if_bound(db, row):
                 await db.delete(row)
-                touched_subnets.add(subnet_id)
-                cleaned += 1
+            touched_subnets.add(row.subnet_id)
+            cleaned += 1
 
         # Second pass — hard-delete leases that have sat in ``expired`` past the
         # longer grace so they stop lingering in the DHCP view (#478). History
         # was already stamped when the lease flipped to expired, and the mirror
         # was dropped above / by the agent, so this only removes the dead row.
-        delete_cutoff = datetime.now(UTC) - EXPIRED_DELETE_GRACE
-        stale = await db.execute(
-            select(DHCPLease).where(
-                DHCPLease.state == "expired",
-                DHCPLease.expires_at.is_not(None),
-                DHCPLease.expires_at < delete_cutoff,
-            )
-        )
+        # Taken from the rows locked above (#3624): every one is ``expired``
+        # by now, including a lease the first pass has just expired, as before.
         deleted = 0
-        for lease in stale.scalars().all():
-            await db.delete(lease)
-            deleted += 1
+        for lease in locked:
+            if lease.expires_at is not None and lease.expires_at < delete_cutoff:
+                await db.delete(lease)
+                deleted += 1
 
         # The sweep writes no audit row, so it never waits for the audit-chain
         # lock and need not take it before the row locks (#3345).
@@ -211,26 +291,130 @@ async def _remirror_live_leases() -> int:
         return len(handovers)
 
 
-async def _run_both() -> tuple[tuple[int, int], int]:
-    return await _sweep(), await _remirror_live_leases()
+# How long one run tears down the leases of scopes in the Trash (#3733): the
+# task a scope delete enqueues when its request stopped at its deadline, and
+# the sweep's own pass, which finds what that teardown left behind. What is
+# left goes on the next run; the teardown is idempotent.
+TRASHED_SCOPE_TEARDOWN_BUDGET_S = 240.0
+SWEEP_TRASHED_SCOPE_BUDGET_S = 60.0
+
+# The sweep leaves a scope in the Trash alone this long after its delete: past
+# the delete's inline 10 s (``SCOPE_DELETE_INLINE_DEADLINE_S``) and its task's
+# 240 s, so the sweep never contends batch for batch with that teardown and
+# finds only what it left behind (the task's enqueue lost, or a scope larger
+# than one task run).
+SWEEP_TRASHED_SCOPE_GRACE = timedelta(minutes=10)
+
+
+async def _tear_down_trashed_scopes(
+    scope_id: str | None = None,
+    *,
+    budget_s: float = TRASHED_SCOPE_TEARDOWN_BUDGET_S,
+    trashed_before: datetime | None = None,
+) -> tuple[int, int, bool]:
+    """Tear down the leases still held by scopes in the Trash (#3733): the one
+    named, or every one that has any (trashed before ``trashed_before``, when
+    given). Each batch commits on its own (``tear_down_scope_leases``).
+    Returns ``(leases_removed, mirrors_removed, done)``; ``done`` is False when
+    the budget ran out first."""
+    async with task_session() as db:
+        if not await is_module_enabled(db, "core.dhcp"):
+            return 0, 0, True
+        if scope_id is not None:
+            scope_ids = [uuid.UUID(str(scope_id))]
+        else:
+            scope_ids = await trashed_scopes_with_leases(db, trashed_before=trashed_before)
+        await db.rollback()
+        deadline = time.monotonic() + budget_s
+        removed = mirrors = 0
+        done = True
+        for sid in scope_ids:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                done = False
+                break
+            r, m, finished = await tear_down_scope_leases(db, sid, deadline_s=left)
+            removed += r
+            mirrors += m
+            if not finished:
+                done = False
+                break
+        if removed:
+            # Removing leases and freeing their addresses is a mutation, and
+            # mutations are audited (non-negotiable #4): one row per run.
+            db.add(
+                AuditLog(
+                    user_display_name="<system>",
+                    auth_source="system",
+                    action="dhcp-scope-lease-teardown",
+                    resource_type="platform",
+                    resource_id="dhcp-scope-lease-teardown",
+                    resource_display="leases of DHCP scopes in the Trash",
+                    result="success",
+                    new_value={
+                        "leases_removed": removed,
+                        "lease_mirrors_removed": mirrors,
+                        "scopes": [str(sid) for sid in scope_ids[:50]],
+                        "capped": not done,
+                    },
+                )
+            )
+            await db.commit()
+        return removed, mirrors, done
+
+
+@celery_app.task(name="app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases")
+@module_gated("core.dhcp")
+def tear_down_trashed_scope_leases(scope_id: str | None = None) -> dict[str, int]:
+    """The rest of a scope delete's lease teardown, past its request's deadline
+    (#3733)."""
+    removed, mirrors, done = asyncio.run(_tear_down_trashed_scopes(scope_id))
+    logger.info(
+        "dhcp_trashed_scope_lease_teardown",
+        scope=scope_id,
+        leases_removed=removed,
+        lease_mirrors_removed=mirrors,
+        done=done,
+    )
+    return {"leases_removed": removed, "lease_mirrors_removed": mirrors, "done": int(done)}
+
+
+async def _run_both() -> tuple[tuple[int, int], int, int]:
+    expiry = await _sweep()
+    remirrored = await _remirror_live_leases()
+    # #3733 — and the leases a scope delete's own teardown left behind, once
+    # it has had its time.
+    left_behind, _mirrors, _done = await _tear_down_trashed_scopes(
+        budget_s=SWEEP_TRASHED_SCOPE_BUDGET_S,
+        trashed_before=datetime.now(UTC) - SWEEP_TRASHED_SCOPE_GRACE,
+    )
+    return expiry, remirrored, left_behind
 
 
 @celery_app.task(name="app.tasks.dhcp_lease_cleanup.sweep_expired_leases")
 @module_gated("core.dhcp")
 def sweep_expired_leases() -> dict[str, int]:
-    (cleaned, deleted), remirrored = asyncio.run(_run_both())
+    (cleaned, deleted), remirrored, left_behind = asyncio.run(_run_both())
     if remirrored:
         # Warning, not info: since the row locks of #2580 only a lease batch
         # the agent dropped should leave an address here, which wants finding.
         logger.warning("dhcp_lease_sweep_remirrored_available_rows", rows=remirrored)
+    if left_behind:
+        # Warning: past its grace a scope in the Trash should have no leases
+        # left, since its delete hands the rest to its own task. Two things
+        # leave some (#3733): that task's enqueue was lost, or the scope is
+        # larger than one task run tears down.
+        logger.warning("dhcp_lease_sweep_tore_down_trashed_scope_leases", leases=left_behind)
     logger.info(
         "dhcp_lease_sweep_complete",
         ipam_rows_removed=cleaned,
         expired_leases_deleted=deleted,
         ipam_rows_remirrored=remirrored,
+        trashed_scope_leases_removed=left_behind,
     )
     return {
         "ipam_rows_removed": cleaned,
         "expired_leases_deleted": deleted,
         "ipam_rows_remirrored": remirrored,
+        "trashed_scope_leases_removed": left_behind,
     }

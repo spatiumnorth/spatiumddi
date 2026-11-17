@@ -414,8 +414,13 @@ export interface FreeCidrRange {
   network: string;
   first: string;
   last: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   size: number;
+  size_exact?: string;
   prefix_len: number;
+  /** Non-zero only on the last range of a capped answer: free ranges left out
+   *  past it (#3848). */
+  more_after?: number;
 }
 
 export interface PlanRequestItem {
@@ -428,7 +433,9 @@ export interface PlannedSubnet {
   network: string;
   first: string;
   last: string;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   size: number;
+  size_exact?: string;
 }
 
 export interface UnfulfilledItem {
@@ -440,7 +447,9 @@ export interface UnfulfilledItem {
 export interface AggregationSuggestion {
   supernet: string;
   prefix_len: number;
+  /** Saturates at 2^63 - 1; use the `_exact` string for display (#3708). */
   total_size: number;
+  total_size_exact?: string;
   subnet_ids: string[];
   subnet_networks: string[];
   // Stable hash that ties the suggestion to a snooze entry. The popover
@@ -1271,6 +1280,8 @@ export interface BlockMovePreviewResponse {
   target_space_id: string;
   target_parent_id: string | null;
   descendant_blocks_count: number;
+  /** Child blocks in the Trash: they move too, but are not counted above. */
+  descendant_blocks_trashed?: number;
   descendant_subnets_count: number;
   descendant_ip_addresses_total: number;
   reparent_chain_block_ids: string[];
@@ -1540,6 +1551,7 @@ export interface TemplateReapplyAllResponse {
   instances_processed: number;
   instances_skipped: number;
   cap_reached: boolean;
+  skipped: { target_id: string; network: string; reason: string }[];
 }
 
 export const ipamApi = {
@@ -1605,7 +1617,9 @@ export const ipamApi = {
       .then((r) => r.data),
   blockFreeSpace: (blockId: string) =>
     api
-      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
+      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`, {
+        params: { limit: 2000 },
+      })
       .then((r) => r.data),
   blockAggregationSuggestions: (
     blockId: string,
@@ -2116,6 +2130,8 @@ export const ipamApi = {
         skipped: string[];
         /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
         dns_cleared: string[];
+        /** Why each skipped row was skipped, keyed by id (#3905). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -2153,6 +2169,7 @@ export const ipamApi = {
       mac_address?: string;
       description?: string;
       custom_fields?: Record<string, unknown>;
+      tags?: Record<string, unknown>;
       dns_zone_id?: string | null;
       /** Issue #25 — additional zones to publish A/AAAA records into. */
       extra_zone_ids?: string[];
@@ -3539,8 +3556,13 @@ async function _unwrapBlobError(err: unknown): Promise<Error> {
           if (typeof detail === "string") {
             return new Error(detail);
           }
-          // FastAPI 422 returns a list under ``detail``; fall back
-          // to the JSON-stringified version.
+          // FastAPI 422 returns a list under ``detail``; format it like
+          // every other error site rather than showing raw JSON.
+          if (Array.isArray(detail)) {
+            return new Error(
+              formatApiError({ response: { data: parsed } }, "Request failed"),
+            );
+          }
           return new Error(JSON.stringify(parsed));
         }
       } catch {
@@ -4043,6 +4065,9 @@ export interface PlatformSettings {
   appliance_revoked_retention_days: number;
   metric_retention_days: number;
   log_retention_hours: number;
+  /** E911 lookup trail bounds (#3514). Superadmin-only. */
+  e911_resolution_log_retention_days: number;
+  e911_lookup_log_budget_per_minute: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
@@ -4492,7 +4517,7 @@ export const settingsApi = {
     api
       .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
       .then((r) => r.data),
-  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+  updateAuditTarget: (id: string, body: Partial<AuditForwardTargetWrite>) =>
     api
       .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
       .then((r) => r.data),
@@ -4503,6 +4528,8 @@ export const settingsApi = {
       .post<{
         status: string;
         target: string;
+        confirmed?: boolean;
+        detail?: string;
       }>(`/settings/audit-forward-targets/${id}/test`)
       .then((r) => r.data),
   /** Issue #889 — InfluxDB push-export targets. Superadmin-only server
@@ -4513,7 +4540,7 @@ export const settingsApi = {
     api
       .post<InfluxDBTarget>("/settings/influxdb-targets", body)
       .then((r) => r.data),
-  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+  updateInfluxTarget: (id: string, body: Partial<InfluxDBTargetWrite>) =>
     api
       .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
       .then((r) => r.data),
@@ -5185,6 +5212,8 @@ export const customFieldsApi = {
         params: resource_type ? { resource_type } : undefined,
       })
       .then((r) => r.data),
+  get: (id: string) =>
+    api.get<CustomField>(`/custom-fields/${id}`).then((r) => r.data),
   create: (data: Omit<CustomField, "id">) =>
     api.post<CustomField>("/custom-fields", data).then((r) => r.data),
   update: (
@@ -5214,6 +5243,9 @@ export interface ZoneMovePreview {
   zone_view_action: string;
   zone_view_from: string | null;
   records_total: number;
+  /** Records in the Trash: they move too but are left out of the other counts. */
+  records_trashed: number;
+  records_trashed_widened: number;
   records_remapped: number;
   /** Records whose view scoping is lost while the TARGET renders views —
    *  they go from answering in one view to answering in every one. */
@@ -5272,9 +5304,9 @@ export interface DNSServerGroup {
   group_type: string;
   default_view: string | null;
   is_recursive: boolean;
-  // RFC 9432 BIND9 catalog zones — distribute zones via one catalog
-  // instead of per-server config push. Producer is the group's primary
-  // bind9 server; consumers auto-pull members.
+  // RFC 9432 BIND9 catalog zones — the group's primary publishes a
+  // catalog for secondaries outside the group; members never consume it
+  // (#3764).
   catalog_zones_enabled: boolean;
   catalog_zone_name: string;
   // Issue #25 — flag this group as exposed to the public internet.
@@ -5299,8 +5331,43 @@ export interface DNSServerGroup {
    *  driver; says where an existing group falls outside its supported scope
    *  (second server, pools). Empty for every other group. */
   scope_warnings?: string[];
+  /** #3551 — estimated named memory against the agents' limit. Filled by
+   *  `getGroup` only (null on the list, and for a group with no BIND9
+   *  server); `getMemoryEstimate` returns the same object. */
+  memory_estimate?: DNSMemoryEstimate | null;
   created_at: string;
   modified_at: string;
+}
+
+/** #3551 — one blocklist (RPZ) zone as named loads it. */
+export interface DNSMemoryRpzLoad {
+  zone: string;
+  views: string[];
+  entries: number;
+  estimated_bytes: number;
+}
+
+/** #3551 — a BIND9 group's estimated named memory against the memory limit
+ *  its agents report. Each view that applies a blocklist loads its own copy
+ *  of it (BIND cannot share one between views), so `warn` is set at 80 % of
+ *  the limit. `limit_source` is `default` when no agent has reported a limit
+ *  and the shipped 2 GiB DNS pod limit is assumed. */
+export interface DNSMemoryEstimate {
+  group_id: string;
+  estimated_bytes: number;
+  limit_bytes: number;
+  limit_source: "agent" | "default";
+  limit_server: string | null;
+  unknown_limit_servers: string[];
+  percent: number;
+  warn: boolean;
+  message: string | null;
+  baseline_bytes: number;
+  zone_records_loaded: number;
+  zone_bytes: number;
+  rpz_bytes: number;
+  rpz: DNSMemoryRpzLoad[];
+  views: string[];
 }
 
 /** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
@@ -5329,6 +5396,8 @@ export interface DNSZoneSyncItem {
   pushed: number;
   server_records: number;
   push_errors: string[];
+  /** The pushed records are queued for background delivery (#3817). */
+  queued_for_agent?: boolean;
   error: string | null;
 }
 
@@ -5338,6 +5407,8 @@ export interface DNSServerSyncResult {
   zones_failed: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   /** Zones listed on the server via WinRM — windows_dns Path B only.
    * Empty for BIND9 and windows_dns without credentials. */
@@ -5371,6 +5442,8 @@ export interface DNSGroupSyncResult {
   servers_succeeded: number;
   total_imported: number;
   total_pushed: number;
+  /** Part of total_pushed that is queued, not yet on the server. */
+  total_queued?: number;
   total_push_errors: number;
   total_zones_imported: number;
   total_zones_pushed_to_server: number;
@@ -5594,6 +5667,15 @@ export interface AgentSpoolStreamStatus {
   expired_entries_total: number;
   rejected_entries_total: number;
   write_failures_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
 }
 
 /**
@@ -5615,6 +5697,15 @@ export interface AgentSpoolStatus {
   trimmed_bytes_total: number;
   last_trim_at: string | null;
   expired_entries_total: number;
+  /** #3782 — read but undelivered + unspooled events; `null`/absent = unknown. */
+  pending_events?: number | null;
+  pending_oldest_at?: string | null;
+  /** Lease-file bytes the agent has not read yet (busy posting). */
+  unread_bytes?: number | null;
+  /** How many of `pending_events` are estimated from `unread_bytes`. */
+  unread_events_estimated?: number | null;
+  /** Age of the oldest undelivered row as of the agent's report. */
+  pending_lag_seconds?: number | null;
   streams: Record<string, AgentSpoolStreamStatus>;
 }
 
@@ -5733,10 +5824,6 @@ export interface DNSServerOptions {
   recursion_enabled: boolean;
   allow_recursion: string[];
   dnssec_validation: string;
-  gss_tsig_enabled: boolean;
-  gss_tsig_keytab_path: string | null;
-  gss_tsig_realm: string | null;
-  gss_tsig_principal: string | null;
   notify_enabled: string;
   also_notify: string[];
   allow_notify: string[];
@@ -5869,6 +5956,9 @@ export interface DNSView {
   order: number;
   allow_query: string[] | null;
   allow_query_cache: string[] | null;
+  /** #3551 — set on the list when the group's estimated named memory is at
+   *  80 % or more of its agents' limit. */
+  memory_warning?: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -5988,11 +6078,16 @@ export interface ZoneServerStateEntry {
   // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
+  // The API's verdict on this server's report (#3940): a primary zone serves
+  // our serial, a secondary / stub zone holds a copy of its primary's zone
+  // (its serial is not ours to compare) and no op is pending.
+  in_sync?: boolean;
 }
 
 export interface ZoneServerState {
   zone_id: string;
   zone_name: string;
+  zone_type?: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
   // `false` while any server hasn't reported, is on a different serial, or
@@ -6237,6 +6332,43 @@ export interface DNSRecord {
   modified_at: string;
 }
 
+// #3518 — the SOA and apex NS a primary zone serves from its settings. Not
+// records: nothing here is editable, exportable or counted.
+export interface ServedApex {
+  // False when the group's driver does not render the apex by the BIND9
+  // agent's rule; the rest is then only what BIND9 would serve.
+  driver_applies: boolean;
+  soa: { mname: string; rname: string };
+  ns: string[];
+  source: "declared" | "primary_ns" | "placeholder";
+  placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
+  // Split-horizon views that serve different apexes, in render order; empty
+  // when they agree. The fields above are then the worst view's.
+  by_view: ServedApexInView[];
+}
+
+export interface ServedApexInView {
+  view: string;
+  soa: { mname: string; rname: string };
+  ns: string[];
+  source: "declared" | "primary_ns" | "placeholder";
+  placeholder_glue_loopback: boolean;
+  // #3670 — why the placeholder is served, and the in-zone names the agent
+  // found with no A/AAAA record.
+  placeholder_reason?: "primary_ns_has_no_address" | "no_primary_ns" | null;
+  unaddressed_primary_ns?: string | null;
+  unaddressed_ns?: string[];
+}
+
+export interface DNSRecordPage extends Page<DNSRecord> {
+  served_apex: ServedApex | null;
+}
+
 export interface DNSGroupRecord {
   id: string;
   zone_id: string;
@@ -6335,6 +6467,11 @@ export const dnsApi = {
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
   getGroup: (id: string) =>
     api.get<DNSServerGroup>(`/dns/groups/${id}`).then((r) => r.data),
+  // #3551 — estimated named memory against the agents' limit.
+  getMemoryEstimate: (groupId: string) =>
+    api
+      .get<DNSMemoryEstimate | null>(`/dns/groups/${groupId}/memory-estimate`)
+      .then((r) => r.data),
   // Multi-resolver propagation check
   checkPropagation: (body: {
     name: string;
@@ -6801,7 +6938,7 @@ export const dnsApi = {
     },
   ) =>
     api
-      .get<Page<DNSRecord>>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
+      .get<DNSRecordPage>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
         params,
       })
       .then((r) => r.data),
@@ -6821,8 +6958,16 @@ export const dnsApi = {
         data,
       )
       .then((r) => r.data),
-  deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
-    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
+  // ``permanent`` is superadmin-only server-side (#4078).
+  deleteRecord: (
+    groupId: string,
+    zoneId: string,
+    recordId: string,
+    opts?: { permanent?: boolean },
+  ) =>
+    api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, {
+      params: opts?.permanent ? { permanent: true } : undefined,
+    }),
 
   // Soft-deletes by default (#963) — the whole selection shares one
   // deletion_batch_id, so it restores from Admin → Trash in one action.
@@ -6980,6 +7125,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_candidates: number;
+        push_skipped_matching: number;
         pushed: number;
         pushed_records: {
           name: string;
@@ -7109,6 +7255,8 @@ export interface DNSImportCommit {
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
 
+export type BlocklistWildcardMode = "by_syntax" | "always" | "never";
+
 export interface DNSBlockList {
   id: string;
   name: string;
@@ -7120,8 +7268,12 @@ export interface DNSBlockList {
   update_interval_hours: number;
   block_mode: string;
   sinkhole_ip: string | null;
-  /** Whether feed-sourced entries block subdomains too (#894). */
-  feed_entries_are_wildcard: boolean;
+  /**
+   * How feed entries treat subdomains (#4190): `by_syntax` follows each
+   * line's own syntax, `always` blocks subdomains of every entry, `never`
+   * is apex-only.
+   */
+  feed_wildcard_mode: BlocklistWildcardMode;
   enabled: boolean;
   last_synced_at: string | null;
   last_sync_status: string | null;
@@ -7138,13 +7290,27 @@ export interface DNSBlockList {
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+  /** #3551 — set when a BIND9 group this list is applied to is estimated at
+   *  80 % or more of its agents' memory limit. */
+  memory_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
   regex: number;
   modifier: number;
   badfilter: number;
+  /** Total of the reason buckets below (#3519). */
   malformed: number;
+  /** Absent on rows written before #3519, which carry only the total. */
+  star_in_name?: number;
+  no_anchor?: number;
+  trailing_dot?: number;
+  start_anchor?: number;
+  bare_star?: number;
+  dotless?: number;
+  other?: number;
+  /** hosts / domains feeds: tokens that are not DNS names (#3531). */
+  invalid_name?: number;
 }
 
 export interface DNSBlockListEntry {
@@ -8392,7 +8558,15 @@ export const dnsBlocklistApi = {
 
   updateAssignments: (
     id: string,
-    data: { server_group_ids?: string[]; view_ids?: string[] },
+    data: {
+      server_group_ids?: string[];
+      view_ids?: string[];
+      // Deltas (#3737): change only the named ids, server-side.
+      add_server_group_ids?: string[];
+      remove_server_group_ids?: string[];
+      add_view_ids?: string[];
+      remove_view_ids?: string[];
+    },
   ) =>
     api
       .put<DNSBlockList>(`/dns/blocklists/${id}/assignments`, data)
@@ -10884,6 +11058,15 @@ export interface ApiToken {
   owner_is_active?: boolean | null;
   /** True when the owner is a service account (#2144). */
   owner_is_service_account?: boolean | null;
+  owner_password_change_required?: boolean | null;
+  /** Effective state at auth (#3784); older servers omit it. */
+  status?:
+    | "active"
+    | "revoked"
+    | "expired"
+    | "owner_disabled"
+    | "password_change_required";
+  blocked_reason?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -11130,8 +11313,30 @@ export const alertsApi = {
     api.patch<AlertRule>(`/alerts/rules/${id}`, body).then((r) => r.data),
   deleteRule: (id: string) => api.delete(`/alerts/rules/${id}`),
   listEvents: (
-    params: { open_only?: boolean; rule_id?: string; limit?: number } = {},
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => r.data),
+  // One window of events plus the number matching the filters (the
+  // X-Total-Count header), so a page can say how many it did not draw (#3830).
+  listEventsPage: (
+    params: {
+      open_only?: boolean;
+      rule_id?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
   resolveEvent: (id: string) =>
     api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
   evaluateNow: () =>
@@ -11376,6 +11581,10 @@ export interface NetworkDashboardSummary {
    *  panel tell a real all-clear from stale or absent data (#942). */
   rpki_total_count: number;
   rpki_last_checked_at: string | null;
+  /** ROAs whose certificate lifetime is known (#3557). 0 with ROAs tracked
+   *  means the source ships no per-ROA lifetime, so the expiring / expired
+   *  counts are not measured — never an all-clear. */
+  rpki_expiry_known_count: number;
   circuit_term_expiring_count: number;
   circuit_status_changed_count: number;
   service_orphan_count: number;
@@ -11751,7 +11960,7 @@ export const webhooksApi = {
     api.get<WebhookSubscription>(`/webhooks/${id}`).then((r) => r.data),
   create: (body: WebhookSubscriptionWrite) =>
     api.post<WebhookSubscription>("/webhooks", body).then((r) => r.data),
-  update: (id: string, body: WebhookSubscriptionWrite) =>
+  update: (id: string, body: Partial<WebhookSubscriptionWrite>) =>
     api.put<WebhookSubscription>(`/webhooks/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/webhooks/${id}`),
   test: (id: string) =>
@@ -11806,6 +12015,11 @@ export interface ChangeRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  /** Whether the caller may approve this row, from the server's own approve
+   * check (#4189). False once the row is no longer pending. */
+  can_approve: boolean;
+  /** The server's refusal text when a pending row is not approvable. */
+  approve_blocked_reason: string | null;
 }
 
 export interface ChangeRequestListParams {
@@ -11965,6 +12179,9 @@ export interface ProvisioningRequest {
   executed_at: string | null;
   created_at: string;
   modified_at: string;
+  // Name of the IPAM template args.template_id names, resolved server-side so
+  // viewers without read on IPAM templates still get it (#3649).
+  template_name?: string | null;
 }
 
 export interface ProvisioningRequestListParams {
@@ -11972,6 +12189,14 @@ export interface ProvisioningRequestListParams {
   mine?: boolean;
   limit?: number;
   offset?: number;
+}
+
+// What approving a pending request would do now, re-previewed server-side (#3934).
+export interface RequestCurrentPreview {
+  preview_text: string;
+  ok: boolean;
+  detail: string | null;
+  changed: boolean;
 }
 
 export interface SubmitRequestBody {
@@ -12006,6 +12231,20 @@ export const requestsApi = {
       .then((r) => r.data),
   list: (params: ProvisioningRequestListParams = {}) =>
     api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // page can say how many it did not draw (#3937).
+  listPage: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => {
+      const header = Number(r.headers?.["x-total-count"]);
+      return {
+        items: r.data,
+        total: Number.isFinite(header) ? header : r.data.length,
+      };
+    }),
+  currentPreview: (id: string) =>
+    api
+      .get<RequestCurrentPreview>(`/requests/${id}/current-preview`)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
   submit: (body: SubmitRequestBody) =>
@@ -13430,7 +13669,7 @@ export interface ApplianceRow {
   host_config_health: Record<
     string,
     {
-      state: "retrying" | "failing";
+      state: "applying" | "retrying" | "failing";
       attempts: number;
       at: string | null;
     }
@@ -16264,6 +16503,8 @@ export interface NATMapping {
   // hide-NAT path); without these the UI can only show the bare UUID.
   internal_subnet_cidr: string | null;
   internal_subnet_name: string | null;
+  /** True when the caller cannot read the subnet, so the labels above are withheld (#3641). */
+  internal_subnet_redacted?: boolean;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;
@@ -16480,12 +16721,66 @@ export interface ContainerStatsResponse {
   rows: ContainerStat[];
 }
 
+/** #3761 — which runtimes the Containers tab can see. */
+export interface ContainerBackendStatus {
+  available: boolean;
+  reason: string | null;
+  detail: string | null;
+}
+export interface ContainerBackends {
+  docker: ContainerBackendStatus;
+  kubernetes: ContainerBackendStatus;
+  appliance: boolean;
+}
+export interface PodRow {
+  name: string;
+  component: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string | null;
+  started_at: string | null;
+  containers: string[];
+}
+export interface PodListResponse {
+  available: boolean;
+  reason: string | null;
+  rows: PodRow[];
+}
+
 export const containersApi = {
   stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
     api
       .get<ContainerStatsResponse>("/admin/containers/stats", { params })
       .then((r) => r.data),
+  backends: () =>
+    api
+      .get<ContainerBackends>("/admin/containers/backends")
+      .then((r) => r.data),
+  pods: () =>
+    api.get<PodListResponse>("/admin/containers/pods").then((r) => r.data),
+  podLogs: (name: string, tail = 200) =>
+    api
+      .get<{
+        name: string;
+        tail: string;
+      }>(`/admin/containers/pods/${encodeURIComponent(name)}/logs`, {
+        params: { tail },
+      })
+      .then((r) => r.data),
 };
+
+/** Follow one release pod's logs (redacted server-side) — #3761. */
+export function streamPodLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/admin/containers/pods/${encodeURIComponent(name)}/logs/stream?tail=${tail}`,
+    signal,
+  );
+}
 
 // ── Service lifecycle control (issue #890) ────────────────────────────────────
 
@@ -21409,6 +21704,8 @@ export interface ERLBinding {
   mac_address: string | null;
   ip_address_id: string | null;
   site_id: string | null;
+  target_label?: string | null;
+  target_missing?: boolean;
   is_active: boolean;
   notes: string;
   created_at: string;

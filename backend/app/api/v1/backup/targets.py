@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from email.utils import format_datetime
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -30,6 +31,7 @@ from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.responses import ZipResponse
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
 from app.services.api_token_scopes import token_outbound
@@ -55,16 +57,20 @@ from app.services.backup.targets import (
     InvalidArchiveNameError,
     SecretFieldError,
     UnsupportedOperationError,
+    check_config_value_types,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
     is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
+    normalize_config_for_create,
     redact_config_secrets,
     safe_filename,
     secret_field_names,
 )
+from app.services.backup.targets.base import BackupDestination
+from app.services.backup.targets.secrets_config import ENC_PREFIX, REDACTED_SENTINEL
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
 # so every body here is authorised from its headers before it is read
@@ -388,7 +394,28 @@ async def create_target(
     _assert_hint_keeps_passphrase_secret(body.passphrase, body.passphrase_hint)
 
     driver = get_destination(body.kind)
+    # ``__enc__:`` marks stored ciphertext. A value arriving on create is
+    # never that: accepting it would skip the driver's checks (a driver may
+    # treat it as an already-validated stored secret) and be stored unwrapped.
+    for name in sorted(secret_field_names(driver)):
+        value = body.config.get(name)
+        # ``<set>`` is what a read shows for a stored secret. On Edit it means
+        # "keep the stored one"; on Add nothing is stored, so it would be saved
+        # as the secret itself (#3846).
+        if value == REDACTED_SENTINEL:
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not the '<set>' placeholder",
+            )
+        if isinstance(value, str) and value.startswith(ENC_PREFIX):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{name}' must be the secret itself, not a stored '{ENC_PREFIX}' value",
+            )
     try:
+        check_config_value_types(driver, body.config)
+        # Same auth-mode rules as Edit (#3696): one mode, no unused credential.
+        body.config = normalize_config_for_create(driver, body.config)
         driver.validate_config(body.config)
         # Second pass, allowed to resolve DNS (the https_put SSRF guard).
         # Only at create / update / test — never on the scheduled-run
@@ -464,6 +491,41 @@ async def create_target(
     return _to_response(row)
 
 
+# Config keys that decide where the stored credentials are sent.
+_DESTINATION_KEYS = ("host", "port", "server", "url", "endpoint_url")
+
+
+def _require_secrets_with_new_destination(
+    driver: BackupDestination, stored: dict[str, Any], incoming: dict[str, Any]
+) -> None:
+    """422 when an edit moves the destination but keeps a stored credential.
+
+    The console leaves a stored secret blank on Edit, so an edit of only the
+    host would otherwise carry the credential to the new host unasked.
+    """
+    secrets = secret_field_names(driver)
+    supplied: dict[str, Any] = {k: incoming[k] for k in _DESTINATION_KEYS if k in incoming}
+    for name in secrets:
+        if name not in incoming:
+            continue
+        value = incoming[name]
+        if value is None:
+            supplied[name] = ""  # an explicit null takes the stored secret away
+        elif (
+            isinstance(value, str)
+            and value
+            and value != REDACTED_SENTINEL
+            and not value.startswith(ENC_PREFIX)
+        ):
+            supplied[name] = value
+    require_secret_with_destination_change(
+        SimpleNamespace(**{k: stored.get(k) for k in _DESTINATION_KEYS}),
+        supplied,
+        destination=_DESTINATION_KEYS,
+        secrets={name: stored.get(name) for name in secrets},
+    )
+
+
 @router.patch("/{target_id}", response_model=BackupTargetResponse)
 async def update_target(
     target_id: uuid.UUID,
@@ -476,6 +538,12 @@ async def update_target(
         raise HTTPException(status_code=404, detail="backup target not found")
 
     payload = body.model_dump(exclude_unset=True)
+    # What the row held before this edit, for the audit diff (#3697).
+    before = {k: getattr(row, k, None) for k in payload if k not in ("passphrase", "config")}
+    # A driver can force ``write_only`` whatever the form sent.
+    before.setdefault("write_only", row.write_only)
+    before_config = dict(row.config or {})
+    before_passphrase = row.passphrase_encrypted
 
     new_keep_n = payload.get("retention_keep_last_n", row.retention_keep_last_n)
     new_keep_days = payload.get("retention_keep_days", row.retention_keep_days)
@@ -537,11 +605,13 @@ async def update_target(
         # (#3289). Validation runs on the merged dict so shape checks see
         # all fields.
         try:
+            check_config_value_types(driver, payload["config"])
             merged = merge_config_for_update(
                 driver, incoming=payload["config"], existing=row.config
             )
         except DestinationConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _require_secrets_with_new_destination(driver, row.config or {}, payload["config"])
         # #989 item 3 — same derivation as create. No-op unless the path
         # moved under the removable root and no node was set by hand.
         from app.services.appliance.removable import stamp_node_name  # noqa: PLC0415
@@ -614,32 +684,85 @@ async def update_target(
                 continue
             setattr(row, key, payload[key])
 
-    db.add(
-        AuditLog(
-            action="update",
-            resource_type="backup_target",
-            resource_id=str(row.id),
-            resource_display=row.name,
-            user_id=current_user.id,
-            user_display_name=current_user.username,
-            result="success",
-            # Never the raw payload: ``config`` carries credentials, and
-            # ``url`` can too (a presigned query string). Record which
-            # config keys changed, not their values.
-            new_value={
-                **{k: v for k, v in payload.items() if k not in ("passphrase", "config")},
-                **(
-                    {"config_keys_changed": sorted(payload["config"] or {})}
-                    if "config" in payload
-                    else {}
-                ),
-                **({"config_fields_cleared": secrets_cleared} if secrets_cleared else {}),
-            },
-        )
+    # Audit only what this edit changed (#3697): the console's Save sends
+    # the whole form, so a payload key is not evidence of a change. Config
+    # secrets are compared by their stored (wrapped) form, and only the key
+    # name is recorded, never a value.
+    old_value: dict[str, Any] = {}
+    new_value: dict[str, Any] = {}
+    for k, old in before.items():
+        cur = getattr(row, k, None)
+        if cur != old:
+            old_value[k] = old
+            new_value[k] = cur
+    config_keys_changed: list[str] = []
+    if "config" in payload and row.config is not None:
+        after_config = row.config
+        secret_names = set(secret_field_names(driver))
+        for key in sorted(set(before_config) | set(after_config)):
+            a, b = before_config.get(key), after_config.get(key)
+            if _reads_as(a) == _reads_as(b):
+                continue
+            if key in secret_names and a and b and a != b:
+                # Re-wrapping an unchanged secret yields fresh ciphertext;
+                # compare plaintext so only a real rotation counts.
+                try:
+                    if (
+                        decrypt_config_secrets(driver, {key: a})[key]
+                        == decrypt_config_secrets(driver, {key: b})[key]
+                    ):
+                        continue
+                except SecretFieldError:
+                    pass
+            config_keys_changed.append(key)
+    passphrase_changed = row.passphrase_encrypted != before_passphrase
+    if passphrase_changed:
+        try:
+            passphrase_changed = decrypt_str(before_passphrase) != decrypt_str(
+                row.passphrase_encrypted
+            )
+        except ValueError:
+            pass
+    changed_fields = sorted(
+        [
+            *new_value,
+            *(["config"] if config_keys_changed else []),
+            *(["passphrase"] if passphrase_changed else []),
+        ]
     )
+    if changed_fields:
+        if config_keys_changed:
+            new_value["config_keys_changed"] = config_keys_changed
+        if secrets_cleared:
+            new_value["config_fields_cleared"] = secrets_cleared
+        db.add(
+            AuditLog(
+                action="update",
+                resource_type="backup_target",
+                resource_id=str(row.id),
+                resource_display=row.name,
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                changed_fields=changed_fields,
+                old_value=old_value or None,
+                new_value=new_value,
+            )
+        )
     await db.commit()
     await db.refresh(row)
     return _to_response(row)
+
+
+def _reads_as(value: Any) -> str | None:
+    """A config value as it reads, for the audit diff (#3947): unset is
+    None, and a number reads as its text, so ``21`` and ``"21"`` are one
+    setting."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
 @router.delete("/{target_id}", status_code=204)

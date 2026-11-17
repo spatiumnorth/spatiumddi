@@ -324,6 +324,7 @@ them:
 | `api.service.type` | `ClusterIP` |  |
 | `api.service.port` | `8000` |  |
 | `api.service.trafficDistribution` | `""` | #1805 — `""` renders no field (kube-proxy spreads every caller over every api pod). `PreferSameNode` keeps each node's in-cluster callers (the supervisor, the DNS/DHCP agents, the frontend's `/api` proxy) on the api pod on their own node while it is ready, so a lost node's api pod cannot hold their requests. The appliance sets it (firstboot's `spatium-control` values and the supervisor's HelmChartConfig), where every control-plane node runs one api pod. Elsewhere it pins a node's callers to the one api pod on that node, which can leave the others idle and the HPA reacting late. Rendered on Kubernetes 1.34+ |
+| `api.service.nodeLocal` | `false` | #3645 — `true` adds a second Service, `<release>-api-local`, with `internalTrafficPolicy: Local` (answers only from an api pod on the caller's node) for the member supervisors' heartbeat, so that plain-http hop never crosses the node LAN (a supervisor with no ready api pod on its node falls back to its pinned https URL, or the cluster Service when it has none, as the seed does). The frontend keeps the cluster `-api` Service, so a node whose api pod is down or rolling still serves the UI. Appliance only: firstboot and the supervisor set it |
 | `api.autoscaling.enabled` | `true` | HPA on CPU (memory is opt-in). It needs a metrics-server; without one it holds the api at `minReplicas` |
 | `api.autoscaling.minReplicas` / `maxReplicas` | `2` / `10` |  |
 | `api.autoscaling.targetCPUUtilizationPercentage` | `70` | #3110 — of the api's CPU request (200m), so 140m a pod. Each of two api pods used about 100m under light load |
@@ -332,7 +333,7 @@ them:
 | `api.probes.liveness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `10` / `30` / `30` / `4` | #1051 — `/health/live` budgets, sized for a busy single-worker loop: four 30 s misses restart a process that has said nothing for two minutes |
 | `api.probes.readiness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `5` / `10` / `15` / `3` | #1051 — `/health/ready` budgets; the timeout exceeds the handler's own bounded worst case (4 s db + 4 s schema + 2 s redis) so the kubelet sees the 503 naming the failing check instead of a bare deadline |
 | `api.serviceControl.enabled` | `false` | Sets `SERVICE_CONTROL_ENABLED` on the api — what the Services screen's capability probe reports |
-| `api.serviceControlRBAC.enabled` | `false` | Grants the api ServiceAccount `list` + `patch` on Deployments / StatefulSets / DaemonSets. Needs `serviceAccount.enabled` |
+| `api.serviceControlRBAC.enabled` | `false` | Grants the api ServiceAccount `list` + `patch` on Deployments / StatefulSets / DaemonSets, and `delete` on pods (Cluster → Pods Restart, #4232). Needs `serviceAccount.enabled` |
 | `frontend.replicas` | `2` |  |
 | `frontend.service.type` / `.port` | `ClusterIP` / `80` |  |
 | `frontend.apiUpstream.host` | `""` (→ `{{ fullname }}-api`) | nginx-proxy target Service name |
@@ -375,6 +376,7 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
 | `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
+| `dhcpAgents.upgradeUnstickPods` | `true` | #3907 — a `pre-upgrade` hook deletes a DHCP agent StatefulSet (PVCs kept) holding a pod that is Running but not Ready for 2+ minutes, so Helm recreates it from the new template (needed coming from `2026.10.02-1` or older). Ready pods are never touched; `false` turns the hook off |
 | `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dhcpAgents.servers` | `[]` |  |
 

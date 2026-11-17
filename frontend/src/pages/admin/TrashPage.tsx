@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronLeft,
@@ -15,6 +15,8 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { cascadeList } from "@/lib/delete-cascade";
+import { invalidateAfterTrashChange } from "@/lib/trash-invalidate";
 import { ListReadError } from "@/components/ui/list-read-error";
 
 const TYPE_LABELS: Record<TrashEntryType, string> = {
@@ -85,11 +87,19 @@ function ConfirmRestoreModal({
     display: string;
   } | null>(null);
 
+  // What a "Restore {parent} first" left in the Trash (#3505): a parent's own
+  // restore can hold rows back exactly as this row's can (#3188), and its
+  // answer is otherwise never read. Shown as soon as it lands and kept for the
+  // life of the dialog, so a retry of this row that fails, or that is refused
+  // by a further trashed ancestor, still says it, while leaving the retry
+  // buttons in place. Several parents restored in turn accumulate. The ref is
+  // what the retry's callbacks read, since they were bound before the state
+  // update re-rendered; the dialog unmounts on close, which resets both.
+  const [parentLeft, setParentLeft] = useState<string[]>([]);
+  const parentLeftRef = useRef<string[]>([]);
+
   const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ["trash"] });
-    qc.invalidateQueries({ queryKey: ["ipam"] });
-    qc.invalidateQueries({ queryKey: ["dns"] });
-    qc.invalidateQueries({ queryKey: ["dhcp"] });
+    invalidateAfterTrashChange(qc);
   };
 
   const showError = (err: unknown) => {
@@ -140,7 +150,7 @@ function ConfirmRestoreModal({
     onSuccess: (res) => {
       invalidate();
       const left = [...(res.skipped ?? []), ...(res.held_back ?? [])];
-      if (left.length === 0) {
+      if (left.length === 0 && parentLeftRef.current.length === 0) {
         onClose();
         return;
       }
@@ -157,15 +167,23 @@ function ConfirmRestoreModal({
   const parentMut = useMutation({
     mutationFn: (p: { type: TrashEntryType; id: string }) =>
       trashApi.restore(p.type, p.id),
-    onSuccess: () => {
+    onSuccess: (res) => {
       invalidate();
       setError(null);
       setBlocker(null);
+      const left = [...(res.skipped ?? []), ...(res.held_back ?? [])].map(
+        (c) => `${c.display} — ${c.reason}`,
+      );
+      if (left.length > 0) {
+        parentLeftRef.current = [...parentLeftRef.current, ...left];
+        setParentLeft(parentLeftRef.current);
+      }
       mut.mutate(false);
     },
     onError: showError,
   });
   const pending = mut.isPending || parentMut.isPending;
+  const hasLeft = leftBehind !== null || parentLeft.length > 0;
 
   return (
     <Modal title="Restore from trash?" onClose={onClose}>
@@ -180,25 +198,37 @@ function ConfirmRestoreModal({
           ?
         </p>
         {error && (
-          <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
+          <p
+            role="alert"
+            className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300"
+          >
             {error}
           </p>
         )}
-        {leftBehind && (
-          <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
-            {/* No row count: one held-back entry stands for all of a
+        {/* A status region is announced most reliably when its container is
+            already on the page before its text changes, so the container is
+            always rendered and only the box inside it comes and goes. It is
+            never hidden while empty (display:none takes it out of the
+            accessibility tree, and showing it with its text is then a new
+            region, which screen readers do not announce): an empty one only
+            gives up the space-y gap above it. */}
+        <div role="status" style={hasLeft ? undefined : { marginTop: 0 }}>
+          {hasLeft && (
+            <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
+              {/* No row count: one held-back entry stands for all of a
                 subnet's records ("2 IPAM records of …"), so counting entries
                 would understate what stayed behind (#3188). */}
-            <p className="font-medium">
-              Restored, but these were left in the Trash:
-            </p>
-            <ul className="mt-1 list-disc pl-4">
-              {leftBehind.map((l) => (
-                <li key={l}>{l}</li>
-              ))}
-            </ul>
-          </div>
-        )}
+              <p className="font-medium">
+                Restored, but these were left in the Trash:
+              </p>
+              <ul className="mt-1 list-disc pl-4">
+                {[...parentLeft, ...(leftBehind ?? [])].map((l, i) => (
+                  <li key={`${i}-${l}`}>{l}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -260,9 +290,9 @@ function ConfirmRestoreModal({
 function purgeScope(entry: TrashEntry): string {
   switch (entry.type) {
     case "subnet":
-      return ` Its DHCP scopes (with their pools and static assignments), its addresses and the DNS records published for them are removed with it.`;
+      return ` Its ${cascadeList("subnet")} are removed with it. It cannot be purged while an E911 location binding names it or one of its addresses: remove the binding first.`;
     case "dns_zone":
-      return ` All of its DNS records and its DNS pools are removed with it.`;
+      return ` All of its DNS records, its DNS pools, its dynamic update ACLs, its DNSSEC keys and its ACME DNS-01 accounts are removed with it. An auto-created reverse zone that still holds another trashed subnet's records cannot be purged on its own: purge those subnets first, or purge or restore the subnet the zone was deleted with.`;
     case "dhcp_scope":
       return ` Its pools and static assignments are removed with it.`;
     case "customer":
@@ -284,7 +314,7 @@ function ConfirmPermanentDeleteModal({
   const mut = useMutation({
     mutationFn: () => trashApi.permanentDelete(entry.type, entry.id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["trash"] });
+      invalidateAfterTrashChange(qc);
       onClose();
     },
     onError: (err: unknown) => {
@@ -300,12 +330,19 @@ function ConfirmPermanentDeleteModal({
           <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
           {TYPE_LABELS[entry.type]}).
           {entry.type === "ip_block" || entry.type === "ip_space"
-            ? " The subnets and blocks in the Trash under it, with their addresses, DHCP scopes and DNS records, are removed with it."
+            ? ` The subnets and blocks in the Trash under it are removed with it, and so is everything on those subnets: ${cascadeList("subnet")}.${
+                entry.type === "ip_space"
+                  ? ` So are its ${cascadeList("ip_space")}.`
+                  : ""
+              }`
             : ""}
           {purgeScope(entry)} It cannot be restored.
         </p>
         {error && (
-          <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
+          <p
+            role="alert"
+            className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300"
+          >
             {error}
           </p>
         )}
@@ -569,6 +606,9 @@ export function TrashPage() {
 
         {pendingRestore && (
           <ConfirmRestoreModal
+            // Keyed by row, so nothing one row's dialog learnt (an error, a
+            // parent's leftovers) can carry into another's (#3505).
+            key={`${pendingRestore.type}:${pendingRestore.id}`}
             entry={pendingRestore}
             onClose={() => setPendingRestore(null)}
           />

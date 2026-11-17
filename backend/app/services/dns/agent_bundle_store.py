@@ -100,7 +100,17 @@ _MAX_ERROR = 2000
 #   now carry under ``update-policy``. Unchanged for a group without that key;
 #   for one with it the ETag moves once, so every agent re-renders at the
 #   upgrade instead of at the group's first change.
-RENDERER_REVISION = 15
+# 16 (#3560, #3609): a BIND9 group stored at ``dnssec_validation: yes`` with no
+#   trust anchor renders ``auto``, and a stored static root anchor renders as
+#   ``initial-key``. Unchanged for every other group; for one in either state
+#   the ETag moves once, so a group BIND refused before the upgrade converges at
+#   the upgrade instead of at its first change.
+# 17 (#3638): a zone pinned to a view renders into that view alone among the
+#   operator views, even when one of its records names another view (left by
+#   a re-pin or a restore). Unchanged for every other zone; a group holding
+#   such a zone stops serving it in the other view at the upgrade instead of
+#   at its next change.
+RENDERER_REVISION = 17
 
 
 def _serves(revision: int | None) -> bool:
@@ -252,6 +262,7 @@ async def store(
     records: int,
     render_ms: int,
     rendered_by: str,
+    packed_blocklists: bool = False,
 ) -> DNSAgentBundle | None:
     """Insert one rendered bundle and mirror it onto the server row.
 
@@ -287,6 +298,7 @@ async def store(
         "rendered_by": rendered_by,
         "app_version": app_version,
         "renderer_revision": RENDERER_REVISION,
+        "packed_blocklists": packed_blocklists,
     }
     insert_stmt = pg_insert(DNSAgentBundle).values(
         id=uuid.uuid4(), server_id=server.id, dirty_watermark=dirty_watermark, **payload

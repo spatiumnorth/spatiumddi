@@ -51,7 +51,10 @@ export function ConfirmDestroyModal({
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">{description}</p>
           {error && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+            >
               {error}
             </div>
           )}
@@ -94,7 +97,10 @@ export function ConfirmDestroyModal({
           {checkLabel}
         </label>
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <div
+            role="alert"
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          >
             {error}
           </div>
         )}

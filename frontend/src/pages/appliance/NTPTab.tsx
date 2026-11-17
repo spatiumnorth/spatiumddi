@@ -8,8 +8,8 @@ import { TimezoneSection } from "@/components/TimezoneSection";
 /**
  * Appliance → NTP tab (issue #154).
  *
- * Thin wrapper around the shared ``NTPSection`` component. Same shape
- * as ``SNMPTab``: settings + auth + version queries here, the form
+ * Thin wrapper around the shared <code className="font-mono">NTPSection</code> component. Same shape
+ * as <code className="font-mono">SNMPTab</code>: settings + auth + version queries here, the form
  * itself in the component so it could be reused elsewhere if needed.
  */
 export function NTPTab() {
@@ -48,12 +48,14 @@ export function NTPTab() {
         <h2 className="text-base font-semibold">NTP (chrony)</h2>
         <p className="mt-1 text-xs text-muted-foreground">
           chrony runs at the OS level on every SpatiumDDI appliance host — local
-          + every registered remote agent. The rendered ``chrony.conf`` ships
-          through the ConfigBundle long-poll, validated host-side via ``chronyd
-          -t`` before activation. Pool mode uses resolver-expanded NTP pools
-          (internet-connected default); servers mode is for air-gapped sites
-          pointing at internal time sources; mixed runs both. Optionally serve
-          NTP to clients (opens UDP 123 in the host firewall).
+          + every registered remote agent. The rendered{" "}
+          <code className="font-mono">chrony.conf</code> ships through the
+          ConfigBundle long-poll, validated host-side via{" "}
+          <code className="font-mono">chronyd -t</code> before activation. Pool
+          mode uses resolver-expanded NTP pools (internet-connected default);
+          servers mode is for air-gapped sites pointing at internal time
+          sources; mixed runs both. Optionally serve NTP to clients (opens UDP
+          123 in the host firewall).
         </p>
       </div>
       <NTPSection

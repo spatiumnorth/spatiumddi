@@ -20,6 +20,7 @@ of every driver into the router.
 
 from __future__ import annotations
 
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -293,6 +294,46 @@ def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]
     because a consumer forgot to branch on the type.
     """
     return tuple(f for f in driver.config_fields if f.type != NOTICE_FIELD_TYPE)
+
+
+#: Text-typed fields whose value may legitimately arrive as a JSON number.
+#: Every other text / password field must be a string.
+NUMERIC_TEXT_FIELDS = frozenset({"port", "object_lock_days", "version", "uid", "gid", "timeout_s"})
+
+
+def check_config_value_types(driver: BackupDestination, config: dict[str, Any]) -> None:
+    """Refuse a config value of the wrong JSON type (#3845), naming the field.
+
+    ``config`` is free-form JSON, and the drivers' ``validate_config`` call
+    string methods (``.strip()``) on optional fields such as ``mode``, so a
+    boolean or object there raised ``AttributeError`` and answered 500.
+    Checked once here, for every driver, rather than field by field.
+    Absent and ``null`` stay legal; the driver decides whether they are
+    required.
+    """
+    for spec in config_field_specs(driver):
+        value = config.get(spec.name)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if spec.name in NUMERIC_TEXT_FIELDS and value.strip():
+                try:
+                    int(value)
+                except ValueError:
+                    raise DestinationConfigError(f"{spec.name!r} must be a whole number") from None
+            continue
+        if (
+            spec.name in NUMERIC_TEXT_FIELDS
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+        ):
+            # A whole, finite number only: ``int(inf)`` raises OverflowError
+            # in the drivers' parses (a 500) and ``int(21.5)`` silently
+            # becomes 21 (#3946).
+            if isinstance(value, float) and (not math.isfinite(value) or value != int(value)):
+                raise DestinationConfigError(f"{spec.name!r} must be a whole number")
+            continue
+        raise DestinationConfigError(f"{spec.name!r} must be a string")
 
 
 class BackupDestination(ABC):

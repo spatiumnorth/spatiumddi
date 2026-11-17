@@ -91,6 +91,17 @@ const block = {
 } as unknown as IPBlock;
 
 async function openDnsTab(b: IPBlock) {
+  // The group and zone lists are asked only of a user who may read them
+  // (#3466).
+  answer("authApi", "myPermissions", () =>
+    Promise.resolve({
+      is_superadmin: false,
+      grants: [
+        { action: "read", resource_type: "dns_group", resource_id: null },
+        { action: "read", resource_type: "dns_zone", resource_id: null },
+      ],
+    }),
+  );
   answer("dnsApi", "listGroups", () =>
     Promise.resolve([{ id: "grp-1", name: "corp-dns" }]),
   );

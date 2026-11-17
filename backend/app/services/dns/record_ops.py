@@ -57,6 +57,7 @@ from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
+from app.services.lock_order import lock_zone_rows
 
 logger = structlog.get_logger(__name__)
 
@@ -1101,6 +1102,11 @@ async def _dispatch_claimed(
                     )
                 )
         await s.commit()
+    if len(current) < len(ids):
+        kept_ids = {r.id for r in current}
+        await _retract_zone_removed_mid_dispatch(
+            bind, server, [r for r in rows if r.id not in kept_ids]
+        )
     if applied or failures:
         logger.info(
             "record_op_applied_agentless",
@@ -1110,6 +1116,136 @@ async def _dispatch_claimed(
             failed=len(failures),
         )
     return {r.id: r for r in current}
+
+
+async def _retract_zone_removed_mid_dispatch(
+    bind: Any, server: DNSServer, dropped: list[DNSRecordOp]
+) -> None:
+    """Re-send a permanent zone delete's removal to ``server`` when a dispatch
+    that was already in flight outlived it (#3688).
+
+    A record write claims its op row, then calls the provider with no lock. A
+    permanent zone delete that commits in between sweeps the claimed row and
+    pushes the zone's removal; the in-flight call can then reach the provider
+    AFTER it, and its outcome is dropped with the row. So the removal is sent
+    again — but this is a zone DELETE at a customer's provider, and a dropped
+    outcome has several other causes (the retry sweep reclaiming an expired
+    lease, a zone move, a server move, a soft delete), so it fires only when
+    every one of these holds:
+
+    - the op carries the id of the zone it was queued for, and that zone row
+      is gone (a permanent delete; a soft-deleted or moved zone still has its
+      row, and an op queued before ``zone_id`` existed is left alone);
+    - the server is still in the group it was in when the op was claimed, and
+      still enabled with credentials — the permanent delete pushed only to that
+      group's enabled servers, and a server moved away (#934) may serve a live
+      zone of the same name in its new group;
+    - no zone of that name exists in that group now, live or in the Trash (a
+      zone re-created since, or a sibling view's same-named zone, is what the
+      provider's zone of that name is for);
+    - no other group's zone of that name may share the server's provider copy,
+      which the delete kept for that reason (#3812).
+
+    The zone delete is idempotent at the provider (an absent zone reports
+    unchanged), and no database session is open across the calls. Best
+    effort: a failure is logged, never raised.
+    """
+    by_zone: dict[uuid.UUID, list[DNSRecordOp]] = {}
+    for r in dropped:
+        if r.zone_id is not None:
+            by_zone.setdefault(r.zone_id, []).append(r)
+    if not by_zone:
+        return
+    try:
+        claimed_group_id = server.group_id
+        async with AsyncSession(bind) as s:
+            now_server = (
+                await s.execute(
+                    select(
+                        DNSServer.group_id,
+                        DNSServer.is_enabled,
+                        DNSServer.credentials_encrypted.isnot(None),
+                    ).where(DNSServer.id == server.id)
+                )
+            ).one_or_none()
+            if (
+                now_server is None
+                or now_server[0] != claimed_group_id
+                or not now_server[1]
+                or not now_server[2]
+            ):
+                return
+            surviving = set(
+                (
+                    await s.execute(
+                        select(DNSZone.id)
+                        .where(DNSZone.id.in_(list(by_zone)))
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            gone = {zid: rows for zid, rows in by_zone.items() if zid not in surviving}
+            if not gone:
+                return
+            names = sorted({rows[0].zone_name for rows in gone.values()})
+            present = set(
+                (
+                    await s.execute(
+                        select(DNSZone.name)
+                        .where(DNSZone.group_id == claimed_group_id, DNSZone.name.in_(names))
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            # #3812: a provider copy another group's zone of that name may use
+            # was kept by the delete; re-sending the removal would take it.
+            from app.services.dns.zone_move import shared_zone_copy_servers  # noqa: PLC0415
+
+            for name in names:
+                if name in present:
+                    continue
+                probe = DNSZone(id=uuid.uuid4(), group_id=claimed_group_id, name=name)
+                if server.id in (await shared_zone_copy_servers(s, probe)).keep_ids:
+                    present.add(name)
+        from app.drivers.dns._cloud_base import CloudDNSDriverBase  # noqa: PLC0415
+
+        driver = get_driver(server.driver)
+        for name in names:
+            if name in present:
+                continue
+            # The leaked records, for a cloud provider that must empty a zone
+            # before deleting it; it removes only these, never anything else.
+            managed = [
+                c.record
+                for rows in gone.values()
+                for r in rows
+                if r.zone_name == name and (c := _change_from_op_row(r)) is not None
+            ]
+            zone = DNSZone(id=uuid.uuid4(), group_id=claimed_group_id, name=name)
+            if isinstance(driver, CloudDNSDriverBase):
+                changed = await driver.apply_zone_change(
+                    server, zone, "delete", managed_records=managed
+                )
+            else:
+                changed = await driver.apply_zone_change(server, zone, "delete")
+            logger.warning(
+                "agentless_dispatch_after_zone_delete_retracted",
+                server=str(server.id),
+                driver=server.driver,
+                zone=name,
+                changed=changed is not False,
+            )
+    except Exception as exc:  # noqa: BLE001 — the dispatch itself already finished
+        logger.warning(
+            "agentless_dispatch_after_zone_delete_retract_failed",
+            server=str(server.id),
+            driver=server.driver,
+            error=str(exc),
+        )
 
 
 # #1932 — a zone SpatiumDDI auto-creates (a subnet's reverse zone, from IPAM
@@ -1541,6 +1677,8 @@ async def reassert_ptrs_after_a_deletes(
     zone: DNSZone,
     primary: DNSServer,
     ops: Collection[dict[str, Any]],
+    *,
+    lock_zones: bool = False,
 ) -> int:
     """Queue a PTR ``create`` after every A/AAAA ``delete`` that took its PTR.
 
@@ -1570,8 +1708,9 @@ async def reassert_ptrs_after_a_deletes(
         owners[ip.reverse_pointer.lower()] = _qualified_owner(zone, rec.get("name") or "@")
     if not owners:
         return 0
-    rows = (
-        await db.execute(
+
+    async def _ptr_rows(*, refresh: bool = False) -> list[Any]:
+        stmt = (
             select(DNSRecord, DNSZone)
             .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
             .where(
@@ -1581,7 +1720,19 @@ async def reassert_ptrs_after_a_deletes(
                 func.lower(func.rtrim(DNSRecord.fqdn, ".")).in_(list(owners)),
             )
         )
-    ).all()
+        if refresh:
+            stmt = stmt.execution_options(populate_existing=True)
+        return list((await db.execute(stmt)).all())
+
+    rows = await _ptr_rows()
+    if lock_zones and rows:
+        # #3688: a caller that holds no zone row yet (the agent's ack, after its
+        # op rows are committed) takes the reverse zones, ascending, before it
+        # bumps them, then reads again: a zone a delete removed meanwhile drops
+        # out, the bump never meets a row that is gone, and it counts from the
+        # serial the lock found (``populate_existing``), not one read earlier.
+        await lock_zone_rows(db, {rev_zone.id for _, rev_zone in rows})
+        rows = await _ptr_rows(refresh=True)
     by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
     for ptr, rev_zone in rows:
         owner = owners.get(ptr.fqdn.rstrip(".").lower())
@@ -2115,6 +2266,10 @@ async def _queue_record_deletes(
             continue  # a zone in the trash is not served: nothing on the wire
         by_zone.setdefault(zone.id, (zone, []))[1].append(rec)
     wake: set[uuid.UUID] = set()
+    # #3617 — the zones' rows locked in id order before any serial bump below:
+    # bumped reverse-first, they were taken out of id order, against a DDNS
+    # publish taking the forward zone first (``app.services.lock_order``).
+    await lock_zone_rows(db, by_zone)
     # #1800 — reverse zones first, so a Technitium A/AAAA delete finds its PTR's
     # delete already queued and the re-assert queues no create that delete
     # would only undo.
@@ -2263,6 +2418,23 @@ async def retract_address_records(
     )
     if count:
         logger.info("ipam_address_records_retracted", subnets=len(ids), records=count, zones=zones)
+    return count, wake
+
+
+async def retract_records_of_addresses(
+    db: AsyncSession, *address_where: Any
+) -> tuple[int, set[uuid.UUID]]:
+    """Withdraw the auto-generated DNS records of the addresses ``address_where``
+    selects, the way :func:`retract_address_records` does a subnet's (#3744).
+
+    A subnet / block / space soft delete calls it for the DHCP lease mirrors
+    its scopes' leases leave behind: their teardown runs after the delete's
+    commit, in committed batches, so their records are withdrawn here, set-based,
+    before the stamp, or the stamp would take them into the batch for a restore
+    to bring back. Returns ``(records_retracted, dns_group_ids)``."""
+    count, wake, _zones = await _retract_auto_records(
+        db, [DNSRecord.ip_address_id.in_(select(IPAddress.id).where(*address_where))]
+    )
     return count, wake
 
 
@@ -2572,7 +2744,7 @@ async def lock_heartbeat_ops(
 
 async def apply_acks(
     db: AsyncSession, server_id: uuid.UUID, acks: Collection[dict[str, Any]]
-) -> None:
+) -> list[tuple[str, dict[str, Any]]]:
     """Record an agent's verdicts on its ops (#1232). One load, one batched
     successor lookup, however many acks.
 
@@ -2587,6 +2759,13 @@ async def apply_acks(
     an earlier dispatch has already been counted — by the reset — and counting
     it again would spend the retry budget twice. An agent too old to echo
     ``dispatch`` is taken at its word, as before.
+
+    Returns the ``(zone name, record)`` of each A/AAAA delete that applied on a
+    retry (#1800). The caller commits, then passes them to
+    :func:`reassert_after_retried_deletes`: the re-assert bumps the PTR's
+    reverse zone, and a zone delete takes the zone row BEFORE the queued ops
+    this transaction holds, so bumping it from here deadlocked with a delete of
+    that zone (#3688).
     """
     parsed: list[tuple[uuid.UUID, dict[str, Any]]] = []
     for ack in acks:
@@ -2595,7 +2774,7 @@ async def apply_acks(
         except ValueError:
             continue
     if not parsed:
-        return
+        return []
     ops = {
         op.id: op
         for op in (
@@ -2635,14 +2814,18 @@ async def apply_acks(
     if failures:
         await fail_attempts(db, list(failures.values()), now=now)
     await db.flush()
-    if retried_deletes:
-        await _reassert_after_retried_deletes(db, server_id, retried_deletes)
+    return [(op.zone_name, dict(op.record)) for op in retried_deletes]
 
 
-async def _reassert_after_retried_deletes(
-    db: AsyncSession, server_id: uuid.UUID, ops: list[DNSRecordOp]
+async def reassert_after_retried_deletes(
+    db: AsyncSession, server_id: uuid.UUID, retried: Sequence[tuple[str, dict[str, Any]]]
 ) -> None:
     """#1800 — re-assert PTRs a RETRIED A/AAAA delete took with it.
+
+    Run in a transaction of its own AFTER the ack's commit (#3688): it holds no
+    op row then, so taking a reverse zone row cannot deadlock with a zone delete
+    (which takes the zone row, then the zone's ops). Losing it to a crash in
+    between leaves the PTR for the next structural pass, as before #1800.
 
     The PTR ``create`` queued after the delete ships in the same page, and the
     agent keeps going past a failed op. So when the delete failed and the
@@ -2655,9 +2838,9 @@ async def _reassert_after_retried_deletes(
     if server is None or server.driver not in PTR_CLEANUP_DRIVERS:
         return
     by_zone: dict[str, list[dict[str, Any]]] = {}
-    for op in ops:
-        by_zone.setdefault(op.zone_name.rstrip(".").lower(), []).append(
-            {"op": "delete", "record": op.record}
+    for zone_name, record in retried:
+        by_zone.setdefault(zone_name.rstrip(".").lower(), []).append(
+            {"op": "delete", "record": record}
         )
     for zone_name, zone_ops in by_zone.items():
         zone = (
@@ -2673,7 +2856,7 @@ async def _reassert_after_retried_deletes(
             .first()
         )
         if zone is not None:
-            await reassert_ptrs_after_a_deletes(db, zone, server, zone_ops)
+            await reassert_ptrs_after_a_deletes(db, zone, server, zone_ops, lock_zones=True)
 
 
 async def ack_op(
@@ -2683,9 +2866,79 @@ async def ack_op(
     message: str | None = None,
     *,
     server_id: uuid.UUID,
-) -> None:
+) -> list[tuple[str, dict[str, Any]]]:
     """One ack; see :func:`apply_acks`."""
-    await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])
+    return await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])
+
+
+def _subnet_address_records(subnet_ids: Sequence[uuid.UUID], *address_where: Any) -> list[Any]:
+    """The WHERE of the live, auto-generated records of the addresses of
+    ``subnet_ids``, less any address ``address_where`` rules out. The
+    retraction (spatiumddi#1906) and the approval preview's counts of what a
+    delete takes (spatiumddi#3511, spatiumddi#3536) select through it alike."""
+    return [
+        DNSRecord.auto_generated.is_(True),
+        DNSRecord.deleted_at.is_(None),
+        DNSRecord.ip_address_id.in_(
+            select(IPAddress.id).where(IPAddress.subnet_id.in_(subnet_ids), *address_where)
+        ),
+    ]
+
+
+async def count_records_to_retract(db: AsyncSession, batch: Any, *address_where: Any) -> int:
+    """How many records :func:`retract_trashed_subnet_records` would retract
+    from zones that stay if ``batch`` were applied now (spatiumddi#3536).
+
+    Read before the apply, so it leaves out what the apply takes first: the
+    records of a zone the batch holds, which ``apply_soft_delete`` stamps with
+    their zone, and those of any address ``address_where`` rules out (the
+    caller's rows deleted before the stamp, with their records). It only
+    reads. The approval preview of a subnet, block or space delete counts
+    these with the batch's records, so it names them and the approve-time
+    drift check sees an address added in between.
+    """
+    return await _count_address_records(db, batch, address_where, in_held_zones=False)
+
+
+async def count_held_records_deleted_first(
+    db: AsyncSession, batch: Any, *address_where: Any
+) -> int:
+    """How many records of the zones ``batch`` holds belong to the addresses
+    ``address_where`` names, which the caller's apply deletes before its
+    stamp, with their records (the DHCP mirrors a delete tears down first,
+    spatiumddi#3536).
+
+    ``batch.counts()`` counts a held zone's records as they stand (#1231),
+    but ``apply_soft_delete`` stamps only those still live then, so these are
+    never trashed. It only reads. The approval preview of a subnet, block or
+    space delete takes them off its count, so it names what the delete
+    trashes, and a lease granted or expiring in a reverse zone the delete
+    trashes leaves the preview, and the approve-time drift check, as they
+    were (spatiumddi#3511).
+    """
+    return await _count_address_records(db, batch, address_where, in_held_zones=True)
+
+
+async def _count_address_records(
+    db: AsyncSession, batch: Any, address_where: Sequence[Any], *, in_held_zones: bool
+) -> int:
+    """How many live, auto-generated records of the addresses of ``batch``'s
+    subnets, less any address ``address_where`` rules out, are in a zone the
+    batch holds (``in_held_zones``) or in a zone that stays (otherwise)."""
+    subnet_ids = [row.obj.id for row in batch.rows if row.resource_type == "subnet"]
+    if not subnet_ids:
+        return 0
+    held = {row.obj.id for row in batch.rows if row.resource_type == "dns_zone"}
+    total = 0
+    for start in range(0, len(subnet_ids), _RETRACT_CHUNK):
+        chunk = subnet_ids[start : start + _RETRACT_CHUNK]
+        per_zone = await db.execute(
+            select(DNSRecord.zone_id, func.count())
+            .where(*_subnet_address_records(chunk, *address_where))
+            .group_by(DNSRecord.zone_id)
+        )
+        total += sum(n for zone_id, n in per_zone.all() if (zone_id in held) == in_held_zones)
+    return total
 
 
 async def retract_trashed_subnet_records(
@@ -2719,13 +2972,7 @@ async def retract_trashed_subnet_records(
             (
                 await db.execute(
                     select(DNSRecord)
-                    .where(
-                        DNSRecord.auto_generated.is_(True),
-                        DNSRecord.deleted_at.is_(None),
-                        DNSRecord.ip_address_id.in_(
-                            select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
-                        ),
-                    )
+                    .where(*_subnet_address_records(chunk))
                     .options(selectinload(DNSRecord.zone))
                 )
             )

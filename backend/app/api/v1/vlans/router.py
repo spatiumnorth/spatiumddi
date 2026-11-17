@@ -16,6 +16,7 @@ from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.models.vlans import VLAN, Router
+from app.services.e911.delete_guard import refuse_if_e911_bound
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(require_resource_permission("vlan"))])
@@ -225,6 +226,10 @@ async def update_router(
     return r
 
 
+def _in_trash(n: int | None) -> str:
+    return f" ({n} of them in the Trash)" if n else ""
+
+
 @router.delete("/routers/{router_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_router(router_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
     r = await db.get(Router, router_id)
@@ -234,20 +239,36 @@ async def delete_router(router_id: uuid.UUID, current_user: CurrentUser, db: DB)
     # Deleting the router would CASCADE to the VLANs and SET NULL the subnet
     # references, silently orphaning operational data — refuse instead and let
     # the user reassign first.
+    # Subnets in the Trash count: the FK would SET NULL their link and a
+    # restore does not bring it back (#3892).
     used = await db.scalar(
         select(func.count(Subnet.id))
         .join(VLAN, Subnet.vlan_ref_id == VLAN.id)
         .where(VLAN.router_id == router_id)
+        .execution_options(include_deleted=True)
     )
     if used:
+        trashed = await db.scalar(
+            select(func.count(Subnet.id))
+            .join(VLAN, Subnet.vlan_ref_id == VLAN.id)
+            .where(VLAN.router_id == router_id, Subnet.deleted_at.is_not(None))
+            .execution_options(include_deleted=True)
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Cannot delete router '{r.name}': {used} subnet"
-                f"{'s' if used != 1 else ''} still reference VLANs on this router. "
-                "Reassign or clear the VLAN on those subnets first."
+                f"{'s' if used != 1 else ''} still reference VLANs on this router"
+                f"{_in_trash(trashed)}. "
+                "Reassign or clear the VLAN on those subnets first "
+                "(or permanently delete the ones in the Trash)."
             ),
         )
+    # Its VLANs go with it, and so do the E911 bindings keyed to them (#3891).
+    vlan_ids = (
+        (await db.execute(select(VLAN.id).where(VLAN.router_id == router_id))).scalars().all()
+    )
+    await refuse_if_e911_bound(db, f"router '{r.name}'", vlan_ids=vlan_ids)
     name = r.name
     db.add(
         _audit(
@@ -394,17 +415,30 @@ async def delete_vlan(vlan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
     v = await db.get(VLAN, vlan_id)
     if v is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VLAN not found")
-    used = await db.scalar(select(func.count(Subnet.id)).where(Subnet.vlan_ref_id == vlan_id))
+    # Subnets in the Trash count: the FK would SET NULL their link and a
+    # restore does not bring it back (#3892).
+    used = await db.scalar(
+        select(func.count(Subnet.id))
+        .where(Subnet.vlan_ref_id == vlan_id)
+        .execution_options(include_deleted=True)
+    )
     if used:
+        trashed = await db.scalar(
+            select(func.count(Subnet.id))
+            .where(Subnet.vlan_ref_id == vlan_id, Subnet.deleted_at.is_not(None))
+            .execution_options(include_deleted=True)
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Cannot delete VLAN {v.vlan_id} ({v.name}): {used} subnet"
-                f"{'s' if used != 1 else ''} still reference it. "
-                "Reassign or clear the VLAN on those subnets first."
+                f"{'s' if used != 1 else ''} still reference it{_in_trash(trashed)}. "
+                "Reassign or clear the VLAN on those subnets first "
+                "(or permanently delete the ones in the Trash)."
             ),
         )
     display = f"VLAN {v.vlan_id} ({v.name})"
+    await refuse_if_e911_bound(db, display, vlan_ids=[v.id])  # #3891
     db.add(
         _audit(
             current_user,
