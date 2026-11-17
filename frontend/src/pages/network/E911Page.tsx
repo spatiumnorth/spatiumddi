@@ -1,3 +1,4 @@
+import { bindingTargetText } from "./bindingTarget";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -35,6 +36,7 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { FormError } from "@/components/ui/form-error";
 import { Pager } from "@/components/ui/pager";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -185,6 +187,8 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
   const [verdictFor, setVerdictFor] = useState<ERL | null>(null);
   const [del, setDel] = useState<ERL | null>(null);
   const [error, setError] = useState("");
+  // A refused delete is read inside the confirm that stays open (#4218).
+  const [delError, setDelError] = useState("");
 
   const query = useQuery({
     queryKey: ["e911-erls", page, search, validation, dispatchable],
@@ -201,6 +205,7 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => e911Api.removeErl(id),
+    onMutate: () => setDelError(""),
     onSuccess: () => {
       setDel(null);
       setError("");
@@ -210,7 +215,7 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
       // tab showing rules that no longer exist.
       void qc.invalidateQueries({ queryKey: ["e911-bindings"] });
     },
-    onError: (e) => setError(formatApiError(e)),
+    onError: (e) => setDelError(formatApiError(e)),
   });
 
   // The exports need the same read on `e911_location` the list does, so a
@@ -303,7 +308,7 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
         )}
       </div>
 
-      {error && <p className="mb-2 text-sm text-rose-600">{error}</p>}
+      <FormError className="mb-2 text-sm text-rose-600">{error}</FormError>
 
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[56rem] text-sm">
@@ -474,11 +479,15 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
               "no location at all."
             : ""
         }
+        error={delError}
         confirmLabel="Delete"
         tone="destructive"
         loading={remove.isPending}
         onConfirm={() => del && remove.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          setDelError("");
+        }}
       />
     </div>
   );
@@ -737,7 +746,7 @@ function ERLModal({
           back to a coarser rule
         </label>
 
-        {error && <p className="text-sm text-rose-600">{error}</p>}
+        <FormError className="text-sm text-rose-600">{error}</FormError>
 
         <div className="flex justify-end gap-2">
           <HeaderButton type="button" onClick={onClose}>
@@ -832,7 +841,7 @@ function VerdictModal({
             className="w-full rounded-md border bg-background px-2 py-1.5"
           />
         </label>
-        {error && <p className="text-sm text-rose-600">{error}</p>}
+        <FormError className="text-sm text-rose-600">{error}</FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton type="button" onClick={onClose}>
             Cancel
@@ -862,7 +871,8 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
   const [kind, setKind] = useState<"" | E911RuleKind>("");
   const [creating, setCreating] = useState(false);
   const [del, setDel] = useState<ERLBinding | null>(null);
-  const [error, setError] = useState("");
+  // A refused delete is read inside the confirm that stays open (#4218).
+  const [delError, setDelError] = useState("");
 
   const query = useQuery({
     queryKey: ["e911-bindings", page, kind],
@@ -877,18 +887,22 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
 
   const remove = useMutation({
     mutationFn: (id: string) => e911Api.removeBinding(id),
+    onMutate: () => setDelError(""),
     onSuccess: () => {
       setDel(null);
       void qc.invalidateQueries({ queryKey: ["e911-bindings"] });
       // binding_count on the Locations tab moves with this.
       void qc.invalidateQueries({ queryKey: ["e911-erls"] });
     },
-    onError: (e) => setError(formatApiError(e)),
+    onError: (e) => setDelError(formatApiError(e)),
   });
 
   const items = query.data?.items ?? [];
 
   function targetOf(b: ERLBinding): string {
+    return bindingTargetText(b);
+  }
+  function rawTargetOf(b: ERLBinding): string {
     return (
       b.mac_address ??
       b.bssid ??
@@ -938,8 +952,6 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
         )}
       </div>
 
-      {error && <p className="mb-2 text-sm text-rose-600">{error}</p>}
-
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[48rem] text-sm">
           <thead className="bg-muted/50 text-left">
@@ -986,7 +998,10 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
                     </Chip>
                   )}
                 </td>
-                <td className="break-all px-3 py-2 font-mono text-xs text-muted-foreground">
+                <td
+                  className="break-all px-3 py-2 font-mono text-xs text-muted-foreground"
+                  title={rawTargetOf(b)}
+                >
                   {targetOf(b)}
                 </td>
                 <td className="px-3 py-2">{b.erl_name}</td>
@@ -1036,11 +1051,15 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
               "back to a coarser rule, or to no location at all."
             : ""
         }
+        error={delError}
         confirmLabel="Delete"
         tone="destructive"
         loading={remove.isPending}
         onConfirm={() => del && remove.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          setDelError("");
+        }}
       />
     </div>
   );
@@ -1155,7 +1174,7 @@ function BindingModal({
             className="w-full rounded-md border bg-background px-2 py-1.5"
           />
         </label>
-        {error && <p className="text-sm text-rose-600">{error}</p>}
+        <FormError className="text-sm text-rose-600">{error}</FormError>
         <div className="flex justify-end gap-2">
           <HeaderButton type="button" onClick={onClose}>
             Cancel
@@ -1265,7 +1284,7 @@ function LookupTab({ canQuery }: { canQuery: boolean }) {
         </div>
       </form>
 
-      {error && <p className="mb-3 text-sm text-rose-600">{error}</p>}
+      <FormError className="mb-3 text-sm text-rose-600">{error}</FormError>
 
       {result && (
         <div className="rounded-md border">

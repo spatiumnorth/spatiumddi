@@ -155,3 +155,77 @@ def test_build_argv_omits_filter_when_empty() -> None:
     # Last element is the output path (no trailing filter).
     assert argv[-2] == "-w"
     assert argv[-1] == "/tmp/x.pcap"
+
+
+# ── filter is an expression, never an option ────────────────────────
+
+
+@pytest.mark.parametrize("bad", ["-V/tmp/x", "  -w/tmp/x", "-n", "- 1"])
+def test_validate_bpf_rejects_leading_dash(bad: str) -> None:
+    with pytest.raises(PcapArgError):
+        validate_bpf_filter(bad)
+
+
+@pytest.mark.parametrize(
+    "good", ["host 10.0.0.1 and port 53", "len - 10 > 0", "ip[2:2] - 4 > 0", "vlan 5"]
+)
+def test_validate_bpf_still_accepts_inner_minus(good: str) -> None:
+    assert validate_bpf_filter(good) == good
+
+
+def test_build_argv_ends_option_parsing_before_filter() -> None:
+    argv = build_pcap_argv(
+        interface="eth0",
+        bpf_filter="len - 10 > 0",
+        snaplen=256,
+        promiscuous=True,
+        max_packets=None,
+        output_path="/tmp/x.pcap",
+    )
+    assert argv[-2:] == ["--", "len - 10 > 0"]
+
+
+# ── a failed capture never echoes tcpdump's own output ───────────────
+
+
+@pytest.mark.asyncio
+async def test_failed_capture_error_message_hides_tcpdump_stderr(
+    db_session, tmp_path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.models.pcap import PacketCapture
+    from app.services.pcap import runner
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "tcpdump"
+    fake.write_text("#!/bin/sh\necho 'tcpdump: SECRET-FILE-LINE: No such file' >&2\nexit 1\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    monkeypatch.setenv("SPATIUM_PCAP_DIR", str(tmp_path / "pcaps"))
+
+    cap = PacketCapture(
+        vantage_kind="server",
+        vantage_label="control plane",
+        interface="any",
+        status="queued",
+        bpf_filter="port 53",
+        max_duration_s=5,
+    )
+    db_session.add(cap)
+    await db_session.commit()
+
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(
+        runner, "_new_engine_factory", lambda: (SimpleNamespace(dispose=AsyncMock()), factory)
+    )
+    await runner.run_pcap(cap.id)
+
+    await db_session.refresh(cap)
+    assert cap.status == "failed"
+    assert "SECRET-FILE-LINE" not in (cap.error_message or "")
+    assert "status 1" in (cap.error_message or "")

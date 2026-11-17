@@ -232,6 +232,48 @@ describe("clearing a value (#1986)", () => {
   });
 });
 
+describe("an unreadable number (#3929)", () => {
+  // A number input holding `85-` reports value "" and validity.badInput.
+  const typeBad = (el: HTMLElement) => {
+    Object.defineProperty(el, "validity", {
+      configurable: true,
+      value: { badInput: true },
+    });
+    fireEvent.change(el, { target: { value: "" } });
+  };
+
+  it("refuses to save it as the default, in words", async () => {
+    mount(rule({ rule_type: "subnet_utilization", threshold_percent: 80 }));
+    typeBad(await screen.findByLabelText("Threshold (%)"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(/Threshold \(%\): not a number/),
+    ).toBeTruthy();
+    expect(updateRule).not.toHaveBeenCalled();
+  });
+
+  it("refuses it on a new rule too", async () => {
+    mount(null);
+    fireEvent.change(await screen.findByLabelText(/^Name/), {
+      target: { value: "n" },
+    });
+    typeBad(await screen.findByLabelText("Threshold (%)"));
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    expect(await screen.findByText(/not a number/)).toBeTruthy();
+    expect(createRule).not.toHaveBeenCalled();
+  });
+
+  it("a genuinely cleared field still saves as empty", async () => {
+    updateRule.mockResolvedValue(rule({}));
+    mount(rule({ rule_type: "subnet_utilization", threshold_percent: 80 }));
+    fireEvent.change(await screen.findByLabelText("Threshold (%)"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateRule).toHaveBeenCalled());
+  });
+});
+
 describe("refused save (#1993)", () => {
   it("renders a 422 list as text and keeps the dialog open", async () => {
     createRule.mockRejectedValue({

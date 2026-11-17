@@ -363,10 +363,15 @@ class BulkDeleteResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def _fetch_counts(db, vrf_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[int, int]]:
+async def _fetch_counts(
+    db, vrf_ids: list[uuid.UUID], *, include_trashed: bool = False
+) -> dict[uuid.UUID, tuple[int, int]]:
     """Return a {vrf_id: (space_count, block_count)} map for the given VRFs.
 
-    Issued as two grouped COUNT queries rather than a per-row N+1.
+    Issued as two grouped COUNT queries rather than a per-row N+1. Live rows
+    only by default (what the list shows); the delete paths pass
+    ``include_trashed=True`` because a space / block in the Trash still carries
+    ``vrf_id`` and the FK would clear it, which a restore does not undo (#3892).
     """
     if not vrf_ids:
         return {}
@@ -375,6 +380,7 @@ async def _fetch_counts(db, vrf_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[i
             select(IPSpace.vrf_id, func.count(IPSpace.id))
             .where(IPSpace.vrf_id.in_(vrf_ids))
             .group_by(IPSpace.vrf_id)
+            .execution_options(include_deleted=include_trashed)
         )
     ).all()
     block_rows = (
@@ -382,6 +388,7 @@ async def _fetch_counts(db, vrf_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[i
             select(IPBlock.vrf_id, func.count(IPBlock.id))
             .where(IPBlock.vrf_id.in_(vrf_ids))
             .group_by(IPBlock.vrf_id)
+            .execution_options(include_deleted=include_trashed)
         )
     ).all()
     out: dict[uuid.UUID, tuple[int, int]] = {vid: (0, 0) for vid in vrf_ids}
@@ -601,7 +608,7 @@ async def delete_vrf(
     v = await db.get(VRF, vrf_id)
     if v is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VRF not found")
-    counts = await _fetch_counts(db, [v.id])
+    counts = await _fetch_counts(db, [v.id], include_trashed=True)
     sc, bc = counts.get(v.id, (0, 0))
     if (sc or bc) and not force:
         raise HTTPException(
@@ -609,7 +616,7 @@ async def delete_vrf(
             detail=(
                 f"Cannot delete VRF '{v.name}': still referenced by "
                 f"{sc} IP space{'s' if sc != 1 else ''} and "
-                f"{bc} IP block{'s' if bc != 1 else ''}. "
+                f"{bc} IP block{'s' if bc != 1 else ''} (rows in the Trash count). "
                 "Reassign or pass force=true to detach (FK ON DELETE SET NULL)."
             ),
         )
@@ -657,7 +664,7 @@ async def bulk_delete_vrfs(
     found_ids = {r.id for r in rows}
     not_found = [vid for vid in body.ids if vid not in found_ids]
 
-    counts = await _fetch_counts(db, list(found_ids))
+    counts = await _fetch_counts(db, list(found_ids), include_trashed=True)
     deleted = 0
     detached_spaces = 0
     detached_blocks = 0

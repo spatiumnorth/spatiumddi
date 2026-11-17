@@ -1482,8 +1482,9 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
         {"ntp": {"state": "failing", "attempts": 7, "at": "<iso>"}, ...}
 
     ``state`` is ``failing`` once the same hash has been fired
-    ``_HOSTCFG_FAILING_ATTEMPTS`` times (apply keeps failing), else
-    ``retrying``. A plane whose applied-hash matches its last-fired hash
+    ``_HOSTCFG_FAILING_ATTEMPTS`` times (apply keeps failing), ``retrying``
+    after a second fire (the first apply did not land), and ``applying``
+    for the first fire — in flight, no failure reported yet (#3818). A plane whose applied-hash matches its last-fired hash
     (success) — or that was never fired — is omitted, so a healthy box
     reports ``{}`` (which clears any stale server-side entry)."""
     out: dict[str, dict[str, object]] = {}
@@ -1495,10 +1496,17 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
         applied = _read_release_state_line(applied_sidecar) or ""
         if applied == fhash:
             continue  # last-fired config is applied → healthy, omit
+        # First fire of a hash: the runner has not yet had a chance to fail
+        # (a retry needs the 60 s backoff to elapse), so say "applying",
+        # not "retrying" (#3818).
+        if attempts >= _HOSTCFG_FAILING_ATTEMPTS:
+            state = "failing"
+        elif attempts >= 2:
+            state = "retrying"
+        else:
+            state = "applying"
         out[name] = {
-            "state": (
-                "failing" if attempts >= _HOSTCFG_FAILING_ATTEMPTS else "retrying"
-            ),
+            "state": state,
             "attempts": attempts,
             "at": when.isoformat() if when else None,
         }

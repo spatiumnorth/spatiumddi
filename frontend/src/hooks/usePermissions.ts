@@ -164,6 +164,21 @@ export function permissionGate(
   return { disabled: true, title: cachedUnanswered() ?? reason };
 }
 
+/** Props for a control that is disabled for a reason other than a missing
+ *  permission (#4212): nothing to act on yet, a precondition unmet. The
+ *  reason becomes its tooltip, as ``permissionGate`` does for a denial.
+ *  Spread it BEFORE ``permissionGate`` so a denial's reason wins, and after
+ *  the control's own ``title`` so the reason replaces that only while
+ *  disabled. Leaves ``disabled`` alone when ``when`` is false, so the caller
+ *  keeps its own ``disabled={...}`` for other states (e.g. a pending call). */
+export function disabledBecause(
+  when: boolean,
+  reason: string,
+): { disabled?: boolean; title?: string } {
+  if (!when) return {};
+  return { disabled: true, title: reason };
+}
+
 /** The reason on a control whose route takes a superadmin whatever the
  *  caller's grants (the handler's `SuperAdmin` dependency, refused as
  *  "Superadmin required"). Gate it on `isSuperadmin`, not on `can()`. */

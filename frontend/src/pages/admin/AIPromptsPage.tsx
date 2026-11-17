@@ -9,7 +9,9 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -68,9 +70,9 @@ function PromptEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div>
@@ -113,28 +115,35 @@ function PromptEditor({
           />
         </div>
 
-        <label
+        <div
           className={cn(
             "flex items-start gap-2 text-sm",
             !canShare && "opacity-60",
           )}
         >
           <input
+            id="ai-prompt-share"
             type="checkbox"
             checked={form.is_shared}
             onChange={(e) => set("is_shared", e.target.checked)}
             disabled={!canShare}
+            aria-describedby="ai-prompt-share-help"
             className="mt-0.5"
           />
           <div>
-            <div className="font-medium">Share with all users</div>
-            <div className="text-xs text-muted-foreground">
+            <label htmlFor="ai-prompt-share" className="font-medium">
+              Share with all users
+            </label>
+            <div
+              id="ai-prompt-share-help"
+              className="text-xs text-muted-foreground"
+            >
               {canShare
                 ? "Shared prompts appear in every operator's picker. Only superadmins can create or modify shared prompts."
                 : "Only superadmins can create or modify shared prompts."}
             </div>
           </div>
-        </label>
+        </div>
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -205,15 +214,13 @@ export function AIPromptsPage() {
     queryFn: aiApi.listPrompts,
   });
 
-  // Whether the current user is a superadmin is implicit in
-  // ``is_owner`` over a shared prompt, but the cleaner signal is the
-  // ability to share at all. We approximate it: anyone whose existing
-  // shared prompts come back as ``is_owner=true`` is at minimum the
-  // creator. For a fresh page load with no shared rows yet, fall back
-  // to optimistic-allow and let the backend 403 if they aren't.
-  const canShare = (promptsQ.data ?? []).some((p) => p.is_shared && p.is_owner)
-    ? true
-    : true; // optimistic — server enforces.
+  // Mirrors the server (api/v1/ai/prompts.py): sharing, and editing or
+  // deleting another user's prompt, need effective superadmin. The list's
+  // ``is_owner`` is creator-only, so a superadmin needs the second term.
+  // Fail-closed while permissions load; the server stays the real gate.
+  const { isSuperadmin } = usePermissions();
+  const canShare = isSuperadmin;
+  const canManage = (p: AIPrompt) => p.is_owner || isSuperadmin;
 
   const [showCreate, setShowCreate] = useState(false);
   const [editing, setEditing] = useState<AIPrompt | null>(null);
@@ -345,9 +352,9 @@ export function AIPromptsPage() {
                     <td className="px-4 py-2">
                       <div className="flex justify-end gap-1">
                         <button
-                          disabled={!p.is_owner}
+                          disabled={!canManage(p)}
                           title={
-                            p.is_owner
+                            canManage(p)
                               ? "Edit"
                               : "Only the creator (or a superadmin) can edit this prompt"
                           }
@@ -355,18 +362,20 @@ export function AIPromptsPage() {
                             setError(undefined);
                             setEditing(p);
                           }}
+                          aria-label="Edit"
                           className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-30"
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
-                          disabled={!p.is_owner}
+                          disabled={!canManage(p)}
                           title={
-                            p.is_owner
+                            canManage(p)
                               ? "Delete"
                               : "Only the creator (or a superadmin) can delete this prompt"
                           }
                           onClick={() => setConfirmDelete(p)}
+                          aria-label="Delete"
                           className="rounded p-1.5 text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-30 dark:hover:bg-red-950/30"
                         >
                           <Trash2 className="h-3.5 w-3.5" />

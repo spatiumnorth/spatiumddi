@@ -13,7 +13,9 @@
  *
  * Gating is server-side (every endpoint re-enforces the two-person spine);
  * this only drives affordance *visibility*: Approve/Reject need
- * ``approve,change_request``; Cancel needs requester-or-superadmin; the
+ * ``approve,change_request`` (Approve is disabled, with the server's reason,
+ * when the row's ``can_approve`` is false — e.g. the approver lacks the
+ * operation's own permission, #4189); Cancel needs requester-or-superadmin; the
  * Policies tab needs superadmin. The whole page is reached only when the
  * default-off ``governance.approvals`` module is on (the Sidebar nav entry
  * + backend ``require_module`` both gate it).
@@ -58,6 +60,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
 import { BreakGlassModal } from "./BreakGlassModal";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -162,6 +165,10 @@ function fmtTime(iso: string | null): string {
 // ConfirmModal carries only checkbox + password — no free-text field — so
 // the note-bearing decision uses the shared draggable Modal directly.
 
+// The server's bound on a decision note (`max_length=2000`); the box stops at
+// it so an over-long note is never sent and refused as "decision_note: ..." (#3835).
+const DECISION_NOTE_MAX = 2000;
+
 function DecisionModal({
   cr,
   mode,
@@ -223,6 +230,7 @@ function DecisionModal({
           </label>
           <textarea
             className={cn(inputCls, "min-h-[64px] resize-y")}
+            maxLength={DECISION_NOTE_MAX}
             value={note}
             onChange={(e) => setNote(e.target.value)}
             placeholder={
@@ -248,7 +256,7 @@ function DecisionModal({
           </label>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
@@ -338,6 +346,12 @@ function RequestRow({
                 <HeaderButton
                   variant="primary"
                   icon={Check}
+                  disabled={!cr.can_approve}
+                  title={
+                    cr.can_approve
+                      ? undefined
+                      : (cr.approve_blocked_reason ?? "You cannot approve this")
+                  }
                   onClick={() => onDecide(cr, "approve")}
                 >
                   Approve
@@ -408,7 +422,9 @@ function RequestTable({
             <RequestRow
               key={cr.id}
               cr={cr}
-              canApprove={canApprove}
+              // The server refuses an approver's decision on their own
+              // request (#3834); only Cancel is offered on it.
+              canApprove={canApprove && !isRequester(cr)}
               canCancel={isRequester(cr) || isSuperadmin}
               onDecide={onDecide}
               onCancel={onCancel}
@@ -600,7 +616,7 @@ function PolicyEditor({
           </span>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>

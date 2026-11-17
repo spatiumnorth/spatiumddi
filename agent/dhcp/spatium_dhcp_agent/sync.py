@@ -265,6 +265,13 @@ class SyncLoop:
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
                 self._live = (bundle, etag or "")
+                if not booting_from_previous:
+                    # #4139 — the cache boot reports its verdict like the DNS
+                    # agent's does. Without it the heartbeats carry nothing, and
+                    # on an unchanged bundle (every poll 304) the row a restart
+                    # cleared to unknown never read ok again. Booting from
+                    # ``previous`` keeps the REVERTED status set above.
+                    self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
                 if not booting_from_previous and self._reload_confirmed:
                     # #882 — ``current`` demonstrably loads, so it becomes the
                     # bundle we fall back TO. Skipped when we booted from
