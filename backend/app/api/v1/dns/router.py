@@ -7213,6 +7213,26 @@ async def update_zone(
     # no records makes the agent render it from nothing and serve it empty.
     new_type = changes.get("zone_type")
     old_type = zone.zone_type or "primary"
+    if new_type is not None and new_type != "primary" and new_type != old_type:
+        # #4390 — a pool holds no row while it is disabled or its members are
+        # down, so the record count below misses it; once it renders again it
+        # would write into a zone nobody serves as primary. Refuse by name.
+        pool_names = (
+            (await db.execute(select(DNSPool.name).where(DNSPool.zone_id == zone.id)))
+            .scalars()
+            .all()
+        )
+        if pool_names:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} is the zone of DNS pool(s) {', '.join(sorted(pool_names))}"
+                    f", and its type cannot be changed to {new_type} while they target it: a "
+                    f"{new_type} zone is not one SpatiumDDI serves records from, so the pool's "
+                    "records would be listed but served by nobody. A superadmin can delete the "
+                    "pool (or move it to a primary zone) first."
+                ),
+            )
     if new_type is not None and new_type != old_type:
         held, trashed = (
             await db.execute(
