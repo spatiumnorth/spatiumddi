@@ -1,4 +1,6 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { Link } from "react-router-dom";
@@ -347,7 +349,16 @@ export function UnifiPage() {
 
       {showCreate && <ControllerModal onClose={() => setShowCreate(false)} />}
       {edit && (
-        <ControllerModal controller={edit} onClose={() => setEdit(null)} />
+        <FreshEdit
+          row={edit}
+          queryKeys={[["unifi-controllers"]]}
+          title="Edit UniFi Controller"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <ControllerModal controller={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
       )}
       {del && (
         <DeleteControllerModal
@@ -533,7 +544,12 @@ export function ControllerModal({
         if (apiKey) update.api_key = apiKey;
         if (username) update.username = username;
         if (password) update.password = password;
-        return unifiApi.updateController(controller!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(controller!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(controller!);
+        return unifiApi.updateController(controller!.id, body);
       }
       const create: UnifiControllerCreate = {
         name,

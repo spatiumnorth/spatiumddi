@@ -1,4 +1,6 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -380,7 +382,18 @@ export function PanosPage() {
       </div>
 
       {showCreate && <FirewallModal onClose={() => setShowCreate(false)} />}
-      {edit && <FirewallModal firewall={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["panos-firewalls"]]}
+          title="Edit Palo Alto Firewall"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <FirewallModal firewall={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {objectsFor && (
         <ObjectsModal
           firewall={objectsFor}
@@ -676,7 +689,12 @@ export function FirewallModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiKey) update.api_key = apiKey;
-        return panosApi.update(firewall!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(firewall!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(firewall!);
+        return panosApi.update(firewall!.id, body);
       }
       const create: PANOSFirewallCreate = {
         name,
