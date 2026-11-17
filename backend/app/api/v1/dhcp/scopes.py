@@ -27,7 +27,7 @@ from app.api.v1.dhcp.pxe_profiles import refuse_if_pxe_pools_lose_class
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, snapshot
-from app.models.dhcp import DHCPPool, DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
@@ -1031,31 +1031,13 @@ async def update_scope(
         # config with their class restriction; a class that stopped rendering
         # while the scope was inactive (profile / policy disabled) would leave
         # a pool that matches no client. Same rule as the pool API and Restore.
-        from app.api.v1.dhcp.pools import _check_class_family  # noqa: PLC0415
+        from app.api.v1.dhcp.pools import scope_activation_class_problems  # noqa: PLC0415
 
-        for _pool in (
-            (
-                await db.execute(
-                    select(DHCPPool)
-                    .where(DHCPPool.scope_id == scope.id, DHCPPool.class_restriction.is_not(None))
-                    .order_by(DHCPPool.start_ip)
-                )
+        _problems = await scope_activation_class_problems(db, scope)
+        if _problems:
+            raise HTTPException(
+                status_code=409, detail=f"Cannot activate this scope: {_problems[0]}"
             )
-            .scalars()
-            .all()
-        ):
-            try:
-                await _check_class_family(db, scope, _pool.class_restriction)
-            except HTTPException as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Cannot activate this scope: pool {_pool.start_ip}-{_pool.end_ip} is "
-                        f"restricted to a client class that is no longer available: "
-                        f"{exc.detail} Clear or change the pool's class restriction, or "
-                        "re-enable the class's profile, first."
-                    ),
-                ) from exc
         subnet = await db.get(Subnet, scope.subnet_id)
         if subnet is not None:
             await _assert_no_overlapping_group_cidr(

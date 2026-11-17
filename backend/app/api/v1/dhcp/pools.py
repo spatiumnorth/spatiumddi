@@ -210,6 +210,37 @@ def _validate_pd(
     return net, str(net.network_address)
 
 
+async def scope_activation_class_problems(db: AsyncSession, scope: DHCPScope) -> list[str]:
+    """One message per class-restricted pool of ``scope`` whose class no longer
+    renders (#4367). Activation brings the pools back into the rendered config;
+    a class that stopped rendering while the scope was inactive (profile /
+    policy disabled) would leave a pool that matches no client. Shared by the
+    scope update and the Windows cutover, so every door that turns a scope on
+    applies the same rule as the pool API and Restore."""
+    problems: list[str] = []
+    pools = (
+        (
+            await db.execute(
+                select(DHCPPool)
+                .where(DHCPPool.scope_id == scope.id, DHCPPool.class_restriction.is_not(None))
+                .order_by(DHCPPool.start_ip)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for pool in pools:
+        try:
+            await _check_class_family(db, scope, pool.class_restriction)
+        except HTTPException as exc:
+            problems.append(
+                f"pool {pool.start_ip}-{pool.end_ip} is restricted to a client class that is "
+                f"no longer available: {exc.detail} Clear or change the pool's class "
+                "restriction, or re-enable the class's profile, first."
+            )
+    return problems
+
+
 async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | None) -> None:
     """422 when a pool restricts to an operator client class its daemon does
     not define (#1229). Kea accepts the reference, so the pool would silently
