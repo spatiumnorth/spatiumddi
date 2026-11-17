@@ -178,21 +178,33 @@ async def superseded_record_owners(
         stmt = stmt.where(DNSRecord.id.in_(record_ids))
     if batch_id is not None:
         stmt = stmt.where(DNSRecord.deletion_batch_id == batch_id)
-    out: dict[uuid.UUID, tuple[str, str, str]] = {}
-    for rid, fqdn, rtype, name, value, ip_id, address, hostname in (await db.execute(stmt)).all():
-        # The soft-delete filter hides trashed rows: these are the live ones.
-        live = (
-            await db.execute(
-                select(DNSRecord.name, DNSRecord.value).where(
-                    DNSRecord.ip_address_id == ip_id,
-                    DNSRecord.record_type == rtype,
-                    DNSRecord.auto_generated.is_(True),
-                    DNSRecord.ip_alias.is_(False),
-                )
+    candidates = (await db.execute(stmt)).all()
+    if not candidates:
+        return {}
+    # One read of every live record of these addresses, however many there are.
+    # The soft-delete filter hides trashed rows, so these are the live ones.
+    live: dict[tuple[uuid.UUID, str], set[tuple[str, str]]] = {}
+    for ip_id, rtype, name, value in (
+        await db.execute(
+            select(
+                DNSRecord.ip_address_id,
+                DNSRecord.record_type,
+                DNSRecord.name,
+                DNSRecord.value,
+            ).where(
+                DNSRecord.ip_address_id.in_({c[5] for c in candidates}),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_alias.is_(False),
             )
-        ).all()
-        held = (name.lower(), value.lower()) in {(n.lower(), v.lower()) for n, v in live}
-        if live and not held or not live and not (hostname or "").strip():
+        )
+    ).all():
+        live.setdefault((ip_id, rtype), set()).add((name.lower(), value.lower()))
+    out: dict[uuid.UUID, tuple[str, str, str]] = {}
+    for rid, fqdn, rtype, name, value, ip_id, address, hostname in candidates:
+        held = live.get((ip_id, rtype), set())
+        if (held and (name.lower(), value.lower()) not in held) or (
+            not held and not (hostname or "").strip()
+        ):
             out[rid] = (fqdn, rtype, str(address))
     return out
 
