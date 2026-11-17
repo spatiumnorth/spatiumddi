@@ -251,8 +251,9 @@ SpatiumDDI is built to be delegated without handing over everything:
   before the response returns (non-negotiable #4), so administrative
   access is recorded rather than assumed;
 * credentials at rest (provider secrets, agent keys, cloud tokens) are
-  Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (or a key
-  derived from `SECRET_KEY` when you have not set one) and never
+  Fernet-encrypted with your `CREDENTIAL_ENCRYPTION_KEY` (the chart
+  and appliance generate one; on Compose you set it, otherwise a key is
+  derived from `SECRET_KEY`) and never
   returned by the API — endpoints report `*_set: true`, not the value.
 
 ## 8. Keeping this page true
@@ -367,9 +368,11 @@ OIDC discovery URL) and `host.docker.internal` (a local Ollama for the
 Copilot).
 
 **In-cluster addresses**, which never leave the node:
-`spatium-control-spatiumddi-api.spatium.svc.cluster.local` — the
-Kubernetes service name an appliance supervisor uses to reach the
-control plane it is already part of — and
+`spatium-control-spatiumddi-api.spatium.svc.cluster.local` and
+`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local` — the
+Kubernetes service names an appliance supervisor uses to reach the
+control plane it is already part of (the `-local` one keeps that
+traffic on the supervisor's own node) — and
 `kubernetes.default.svc.cluster.local`, the API-server service name the
 cluster-health check resolves from inside its own pod.
 

@@ -70,7 +70,7 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 |---|---|---|
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
 | `SECRET_KEY` | (none) | JWT signing key, and the source of the credential-encryption key when `CREDENTIAL_ENCRYPTION_KEY` is empty. **Required:** the api refuses to boot on the `.env.example` placeholder, anything under 32 characters, or anything that reads like a placeholder, such as `change-me…` (#1222). Use `openssl rand -hex 32`. To replace one an install already uses, see [Rotating `SECRET_KEY`](#rotating-secret_key) |
-| `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. Empty derives it from `SECRET_KEY`. A value that is not a valid Fernet key stops the api from booting |
+| `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. **Set it** (`python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`): empty derives the key from `SECRET_KEY`, which also signs session tokens. Setting it on a running install is safe, values already stored keep decrypting; see [Moving stored credentials onto a dedicated key](#moving-stored-credentials-onto-a-dedicated-key). A value that is not a valid Fernet key stops the api from booting. Back it up: values written under it are unreadable without it |
 | `ALLOW_INSECURE_SECRET_KEY` | `false` | Boot on a placeholder or weak `SECRET_KEY` with a warning instead of refusing. **Local development only** — `docker-compose.dev.yml` sets it; nothing else should |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
 | `API_PORT` | `8000` | Host port for the API |
@@ -263,6 +263,16 @@ To upgrade to a specific release rather than the newest, set
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
 
+### Moving stored credentials onto a dedicated key
+
+Until `CREDENTIAL_ENCRYPTION_KEY` is set, every stored credential is encrypted under a key derived from `SECRET_KEY`. Compose does not generate one for you (the helm chart and the appliance do), so on an existing install:
+
+1. Generate a key and add it to `.env`: `CREDENTIAL_ENCRYPTION_KEY=<Fernet.generate_key()>`. Keep a copy somewhere that is not this host; the backup archive's `secrets.enc` carries it too.
+2. Restart the stack (`docker compose up -d`). Nothing is lost at this point: new writes use the new key, and the `SECRET_KEY`-derived key stays a read fallback, so every value already stored still decrypts.
+3. Move the existing values across: `docker compose exec api python -m app.core.rotate_credential_key`. It re-encrypts every stored credential (the same column walk a cross-install restore uses), records an audit row (`rotate_credential_key`, counts only, never keys), and is idempotent and resumable: a value already under the dedicated key is skipped, so re-running it after an interruption, or after an old pod wrote one more value, is safe. It can run while the stack is up.
+
+The `SECRET_KEY`-derived fallback is never removed, so a missed value still decrypts. To replace a dedicated key that is already in use, stop the stack, set the new one, and run the command with `OLD_CREDENTIAL_ENCRYPTION_KEY` set to the old one (environment only).
+
 ### Rotating `SECRET_KEY`
 
 Needed when an install has been running on the `.env.example` placeholder or another weak key: from #1222 the api refuses to start on one, and an upgrade stops there with an error pointing here. It is also how you rotate a key you suspect has leaked.
@@ -312,7 +322,7 @@ docker compose up -d api worker beat
 
 If it reports `NOT COMPLETE`, leave `.env.old-secret-key` where it is: it is the only copy of the old key. Fix what the output names and run the `docker compose run` line again.
 
-The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, stored credentials never depended on `SECRET_KEY`: the command finds every value already under the current key and moves nothing.
+The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, values already moved onto it (see [above](#moving-stored-credentials-onto-a-dedicated-key)) are found under the current key and skipped; only values still under the old `SECRET_KEY`-derived key are re-encrypted.
 
 If the install ran on a **placeholder** key, anyone who knew it could sign requests as any user. After rotating, review **Admin → API tokens** and the users and superadmins list, and check the audit log for changes you do not recognise: a token or account created with a forged session survives the rotation.
 

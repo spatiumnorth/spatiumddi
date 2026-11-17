@@ -762,3 +762,30 @@ async def test_restoring_an_ipv6_subnet_that_overlaps_a_live_one_is_refused(
     resp = await _restore(client, h, "subnet", sid)
     assert resp.status_code == 409, resp.text
     assert "2001:db8:0:1::/80" in resp.json()["detail"]["conflicts"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_restoring_a_block_a_live_block_now_contains_says_what_to_do(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4228: the create's advice (set parent_block_id) is unusable at a Restore."""
+    h = await _admin(db_session)
+    space = IPSpace(name=f"th-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    sp = space.id
+    small = IPBlock(space_id=sp, network="10.98.140.0/24", name="small")
+    db_session.add(small)
+    await db_session.flush()
+    smid = small.id
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/blocks/{smid}")
+    db_session.add(IPBlock(space_id=sp, network="10.98.128.0/20", name="big"))
+    await db_session.commit()
+
+    resp = await _restore(client, h, "ip_block", smid)
+    assert resp.status_code == 409, resp.text
+    reason = resp.json()["detail"]["conflicts"][0]["reason"]
+    assert "parent_block_id" not in reason
+    assert "10.98.128.0/20" in reason
+    assert "Move, resize or delete" in reason

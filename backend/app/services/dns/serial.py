@@ -8,8 +8,11 @@ as wrap-around, which breaks AXFR/IXFR.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+from collections.abc import Iterator
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from app.models.dns import DNSZone
@@ -74,4 +77,54 @@ def bump_zone_serial(zone: DNSZone, *, now: datetime | None = None) -> int:
     return nxt
 
 
-__all__ = ["bump_zone_serial", "compute_next_serial"]
+# Inside ``coalesced_zone_serials`` this maps each zone id to the serial the
+# scope already bumped it to. Task-local, so concurrent requests never share it.
+_coalesced: contextvars.ContextVar[dict[Any, int] | None] = contextvars.ContextVar(
+    "_coalesced_zone_serials", default=None
+)
+
+
+@contextlib.contextmanager
+def coalesced_zone_serials() -> Iterator[None]:
+    """Bump each zone's serial once for everything written inside the block
+    (#3816).
+
+    A lease-events DDNS chunk publishes dozens of names into the same few
+    zones. Bumped per name, every one of them flushed another ``UPDATE`` of
+    the zone row it holds locked and queued its op under a serial of its own.
+    Inside this block :func:`bump_zone_serial_once` bumps a zone the first
+    time and hands every later caller the same serial, so the zone's serial
+    still rises for the block (one transaction) and every op carries the
+    serial its zone reaches with them, as a bulk write's ops already do."""
+    token = _coalesced.set({})
+    try:
+        yield
+    finally:
+        _coalesced.reset(token)
+
+
+def bump_zone_serial_once(zone: DNSZone) -> int:
+    """:func:`bump_zone_serial`, except inside ``coalesced_zone_serials``,
+    where a zone already bumped by the block keeps that serial.
+
+    The serial is set on the row again whenever it no longer carries it: a
+    savepoint that rolled back an earlier name's bump reloads the zone at the
+    old value, and a later op would otherwise name a serial the row never
+    reached."""
+    scope = _coalesced.get()
+    if scope is None:
+        return bump_zone_serial(zone)
+    serial = scope.get(zone.id)
+    if serial is None:
+        serial = scope[zone.id] = bump_zone_serial(zone)
+    elif int(getattr(zone, "last_serial", 0) or 0) != serial:
+        zone.last_serial = serial
+    return serial
+
+
+__all__ = [
+    "bump_zone_serial",
+    "bump_zone_serial_once",
+    "coalesced_zone_serials",
+    "compute_next_serial",
+]

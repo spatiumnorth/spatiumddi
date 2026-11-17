@@ -24,6 +24,7 @@ from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
@@ -311,6 +312,12 @@ async def update_org(org_pk: uuid.UUID, body: OrgUpdate, db: DB, user: SuperAdmi
         raise HTTPException(status_code=404, detail="Meraki org not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        o,
+        changes,
+        destination=["base_url"],
+        secrets={"api_key": o.api_key_encrypted},
+    )
     new_ipam = changes.get("ipam_space_id", o.ipam_space_id)
     new_dns = changes.get("dns_group_id", o.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:

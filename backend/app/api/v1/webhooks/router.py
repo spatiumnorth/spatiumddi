@@ -39,6 +39,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_dict, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_credential_problem, header_value_problem
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
@@ -106,6 +107,34 @@ class WebhookSubscriptionWrite(BaseModel):
                 raise ValueError(problem)
             out[name] = value
         return out
+
+
+class WebhookSubscriptionUpdate(WebhookSubscriptionWrite):
+    """PUT body: only the keys the caller sent are applied (#4236).
+
+    The Edit dialog sends just the fields the operator changed, so a field
+    another client stored since the dialog read the subscription is not put
+    back. Every plain field is optional here; ``null`` for a field that has
+    no "all" meaning is read as not sent. ``event_types: null`` still means
+    all events.
+    """
+
+    name: str | None = Field(None, min_length=1, max_length=128)  # type: ignore[assignment]
+    description: str | None = Field(None, max_length=1000)  # type: ignore[assignment]
+    enabled: bool | None = None  # type: ignore[assignment]
+    url: str | None = Field(None, min_length=1, max_length=1024)  # type: ignore[assignment]
+    timeout_seconds: int | None = Field(default=None, ge=1, le=30)  # type: ignore[assignment]
+    max_attempts: int | None = Field(default=None, ge=1, le=20)  # type: ignore[assignment]
+
+    @field_validator("url")
+    @classmethod
+    def _v_url(cls, v: str | None) -> str | None:  # type: ignore[override]
+        if v is None:
+            return None
+        v = v.strip()
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("url must start with http:// or https://")
+        return v
 
 
 class WebhookSubscriptionResponse(BaseModel):
@@ -347,7 +376,7 @@ async def get_subscription(
 @router.put("/{sub_id}", response_model=WebhookSubscriptionResponse)
 async def update_subscription(
     sub_id: uuid.UUID,
-    body: WebhookSubscriptionWrite,
+    patch: WebhookSubscriptionUpdate,
     user: SuperAdmin,
     db: DB,
 ) -> WebhookSubscriptionResponse:
@@ -357,6 +386,29 @@ async def update_subscription(
         raise HTTPException(status_code=404, detail="Subscription not found")
     old = _snapshot(sub)
     old_url = sub.url
+    # Keys the caller did not send keep their stored value (#4236).
+    sent = patch.model_dump(exclude_unset=True)
+
+    def pick(field: str, stored: Any) -> Any:
+        return sent[field] if sent.get(field) is not None else stored
+
+    body = WebhookSubscriptionWrite(
+        name=pick("name", sub.name),
+        description=pick("description", sub.description),
+        enabled=pick("enabled", sub.enabled),
+        url=pick("url", sub.url),
+        event_types=sent["event_types"] if "event_types" in sent else sub.event_types,
+        timeout_seconds=pick("timeout_seconds", sub.timeout_seconds),
+        max_attempts=pick("max_attempts", sub.max_attempts),
+        headers=patch.headers,
+        secret=patch.secret,
+    )
+    require_secret_with_destination_change(
+        sub,
+        {k: v for k, v in (("url", sent.get("url")), ("headers", patch.headers)) if k in sent},
+        destination=("url",),
+        secrets={"headers": sub.headers_encrypted},
+    )
     plaintext = _apply_body(sub, body, creating=False)
     new = _snapshot(sub)
     # The displayed URL drops the path, so flag a repoint within one host.

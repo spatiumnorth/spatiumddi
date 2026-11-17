@@ -3,7 +3,7 @@
 Mounted at ``/api/v1/appliance/containers``:
 
     GET    /                          list all containers + spatium-only first
-    POST   /{name}/{action}           start / stop / restart
+    POST   /{name}/{action}           restart (start / stop answer 409)
     GET    /{name}/logs               tail (non-streaming)
     GET    /{name}/logs/stream        SSE — follow=true tail (close to disconnect)
 """
@@ -28,6 +28,7 @@ from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.services.appliance.containers import (
     DockerUnavailableError,
+    PodActionRefusedError,
     container_action,
     get_container_logs,
     resolve_workload_pod,
@@ -90,7 +91,7 @@ async def list_containers() -> list[ContainerInfo]:
     "/{name}/{action}",
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Run start / stop / restart on a container",
+    summary="Restart a pod (start / stop answer 409: a pod has neither)",
 )
 async def post_container_action(
     name: str,
@@ -107,6 +108,10 @@ async def post_container_action(
         container_action(name, action)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    except PodActionRefusedError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     db.add(
         AuditLog(
             user_id=user.id,
@@ -150,7 +155,9 @@ _END = object()
 _closing_sources: set[asyncio.Task[None]] = set()
 
 
-def _sse_log_response(gen: AsyncIterator[str], request: Request) -> StreamingResponse:
+def _sse_log_response(
+    gen: AsyncIterator[str], request: Request, *, superadmin_only: bool = False
+) -> StreamingResponse:
     """Wrap a log-chunk generator as an SSE response.
 
     Chunks are JSON-encoded ``{"line": "..."}`` so embedded newlines /
@@ -159,14 +166,15 @@ def _sse_log_response(gen: AsyncIterator[str], request: Request) -> StreamingRes
     line reaches the browser ASAP (same pattern as the AI-chat stream).
 
     The caller is re-validated (``StreamAuthGuard``, against
-    ``_LOG_PERMISSION``) before each chunk is sent AND whenever the source
+    ``_LOG_PERMISSION``, or the superadmin flag when ``superadmin_only`` --
+    the Platform Insights pod stream, #3761) before each chunk is sent AND whenever the source
     has been quiet for a re-check interval, so a stream that prints nothing
     still ends once the caller loses access. Lines pass through a
     ``LogStreamRedactor``, which keeps state between chunks: a private key
     arrives one line per chunk, and redacting each chunk on its own would
     let every line but the BEGIN through.
     """
-    guard = StreamAuthGuard(request, permission=_LOG_PERMISSION)
+    guard = StreamAuthGuard(request, permission=_LOG_PERMISSION, superadmin_only=superadmin_only)
 
     async def event_source() -> AsyncIterator[str]:
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
