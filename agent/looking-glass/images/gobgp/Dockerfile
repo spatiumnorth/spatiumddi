@@ -88,12 +88,14 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # Upstream's go.mod lagged a CVE fix again (#1729): x/net below 0.60.0
 # carries CVE-2026-78669 (HIGH, net/http/internal/http2), so x/net is
 # raised past upstream's pin below — a strict upgrade, per the rule above.
+# Raised again (#3680): x/net 0.60.0 carries CVE-2026-78661 (HIGH,
+# x/net/html DoS), fixed in 0.62.0.
 # Drop the line once upstream's go.mod reaches it.
 #
 # Dependabot does not see these: they are `go get` arguments in a Dockerfile,
 # not a tracked manifest, which is why they live in versions.json's orbit and
 # why `make trivy IMAGE=looking-glass` is what surfaces the next one.
-RUN go get golang.org/x/net@v0.60.0 && go mod tidy
+RUN go get golang.org/x/net@v0.62.0 && go mod tidy
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
@@ -185,3 +187,23 @@ ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-lg-entrypoint"]
 # "dev". Last, so a new version only rebuilds this layer.
 ARG APP_VERSION=dev
 ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="looking-glass" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI BGP Looking Glass collector" \
+      description="Receive-only GoBGP collector with the SpatiumDDI agent for the BGP Looking Glass." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="looking-glass" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

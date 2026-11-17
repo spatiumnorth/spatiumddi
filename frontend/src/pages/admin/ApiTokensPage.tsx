@@ -22,6 +22,7 @@ import {
   type ApiTokenCreated,
   type ApiTokenResourceGrant,
   type ApiTokenScope,
+  formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -37,6 +38,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -334,9 +336,9 @@ function CreateTokenModal({
           />
         </div>
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -769,7 +771,11 @@ function ReenableTokenModal({
               <strong className="text-foreground">{ownerLabel(token)}</strong>)
             </>
           )}
-          ? It starts authenticating again immediately. Confirm it's you.
+          ?{" "}
+          {token.owner_password_change_required
+            ? "Its owner must still change their password, so it will keep being refused (403) until they do."
+            : "It starts authenticating again immediately."}{" "}
+          Confirm it's you.
         </p>
         <ReauthFields
           password={stepPassword}
@@ -778,7 +784,9 @@ function ReenableTokenModal({
           onTotp={setStepTotp}
           autoFocus
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -815,13 +823,18 @@ export function ApiTokensPage() {
   const [justCreated, setJustCreated] = useState<ApiTokenCreated | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
   const [reenable, setReenable] = useState<ApiToken | null>(null);
+  const [revokeTarget, setRevokeTarget] = useState<ApiToken | null>(null);
   // Only a superadmin can re-enable an inactive token; owners mint a new one.
   const { isSuperadmin } = usePermissions();
 
   const revokeMut = useMutation({
     mutationFn: (t: ApiToken) =>
       apiTokensApi.update(t.id, { is_active: false }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      setRevokeTarget(null);
+    },
+    onError: () => setRevokeTarget(null),
   });
   const [confirmRevokeAll, setConfirmRevokeAll] = useState(false);
   // #1359 — own tokens only (the route takes no user id).
@@ -843,6 +856,7 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setConfirmDelete(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
 
   return (
@@ -943,11 +957,13 @@ export function ApiTokensPage() {
                     </td>
                     <td className="px-3 py-2">
                       <span
+                        title={t.blocked_reason ?? undefined}
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
                           t.is_active &&
                             !isExpired(t.expires_at) &&
-                            t.owner_is_active !== false
+                            t.owner_is_active !== false &&
+                            !t.owner_password_change_required
                             ? "bg-emerald-500/15 text-emerald-600"
                             : "bg-muted text-muted-foreground",
                         )}
@@ -958,14 +974,16 @@ export function ApiTokensPage() {
                             ? "Expired"
                             : t.owner_is_active === false
                               ? "Owner disabled"
-                              : "Active"}
+                              : t.owner_password_change_required
+                                ? "Blocked: password change required"
+                                : "Active"}
                       </span>
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-1">
                         {t.is_active ? (
                           <button
-                            onClick={() => revokeMut.mutate(t)}
+                            onClick={() => setRevokeTarget(t)}
                             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                             title="Revoke"
                           >
@@ -1059,6 +1077,21 @@ export function ApiTokensPage() {
           onConfirm={() => revokeAllMut.mutate()}
           onClose={closeRevokeAll}
         />
+        <ConfirmModal
+          open={revokeTarget !== null}
+          title="Revoke API token?"
+          message={
+            revokeTarget
+              ? `Revoke ${revokeTarget.name}? Calls using this token fail at once; you can re-enable it later.`
+              : null
+          }
+          confirmLabel="Revoke"
+          tone="destructive"
+          autoFocusCancel
+          loading={revokeMut.isPending}
+          onClose={() => setRevokeTarget(null)}
+          onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
+        />
         {confirmDelete && (
           <Modal
             title="Delete API Token"
@@ -1082,6 +1115,11 @@ export function ApiTokensPage() {
                 )}
                 ? Any script still using it will start getting 401 responses.
               </p>
+              {deleteMut.isError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {formatApiError(deleteMut.error, "Failed to delete token")}
+                </p>
+              )}
               <div className="flex justify-end gap-2">
                 <button
                   onClick={() => setConfirmDelete(null)}
@@ -1090,7 +1128,10 @@ export function ApiTokensPage() {
                   Cancel
                 </button>
                 <button
-                  onClick={() => deleteMut.mutate(confirmDelete.id)}
+                  onClick={() => {
+                    deleteMut.reset();
+                    deleteMut.mutate(confirmDelete.id);
+                  }}
                   disabled={deleteMut.isPending}
                   className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
                 >

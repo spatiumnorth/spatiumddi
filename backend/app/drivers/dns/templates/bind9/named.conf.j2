@@ -227,7 +227,13 @@ view "{{ view.name }}" {
     {%- endif %}
 {%- for zone in zones %}
 {%- if zone.view_name == view.name %}
+{%- if (zone.view_name, zone.name) in zone_in_view %}
+{#- #3551 — identical to an earlier view's copy: load it once, as the agent
+    renderer does. #}
+    zone "{{ zone.name }}" { in-view "{{ zone_in_view[(zone.view_name, zone.name)] }}"; };
+{%- else %}
 {{ zone_stanzas[(zone.view_name, zone.name)] | indent(4, true) }}
+{%- endif %}
 {%- endif %}
 {%- endfor %}
 {%- for bl in view_bls %}

@@ -14,11 +14,12 @@ from datetime import datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, select, union_all
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import dns_group_channel, publish_wake
@@ -38,6 +39,7 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
+from app.services.e911.delete_guard import refuse_if_e911_bound
 from app.services.ipam.orphan_aliases import (
     is_withdrawn_alias,
     orphan_record_owners,
@@ -45,6 +47,7 @@ from app.services.ipam.orphan_aliases import (
     refusal_reason,
     withdrawn_alias_owners,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -200,6 +203,37 @@ def _refuse_live_children(label: str, live: list[str]) -> None:
             f"Cannot permanently delete {label}: it still holds live rows that are not in "
             f"the Trash ({shown}). Restore {label} from the Trash or move or delete those "
             "rows first; a permanent delete never takes live rows with it."
+        ),
+    )
+
+
+async def _refuse_shared_zone(db: Any, zone: DNSZone, label: str, sharers: list[Any]) -> None:
+    """409 for a trashed auto reverse zone that still holds the trashed records of
+    other subnets' Trash batches (spatiumddi#3504), naming those subnets and the
+    two ways out: purge them first, or purge or restore the subnet the zone was
+    deleted with (whose purge hands the zone over to them, #3190)."""
+    names = [f"subnet {_row_label(sub)}" for sub in sharers]
+    shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+    owner = None
+    if zone.linked_subnet_id is not None:
+        owner = (
+            await db.execute(
+                select(Subnet)
+                .where(Subnet.id == zone.linked_subnet_id)
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one_or_none()
+    with_owner = (
+        f"purge or restore subnet {_row_label(owner)}, which this zone was deleted with"
+        if owner is not None
+        else "purge or restore the subnet this zone was deleted with"
+    )
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot permanently delete {label}: it still holds the trashed DNS records "
+            f"of {shown}, in another Trash batch, and that batch's restore needs them. "
+            f"Purge those subnets from the Trash first, or {with_owner}; nothing was deleted."
         ),
     )
 
@@ -694,6 +728,10 @@ async def restore_row(
     # would be N serial bumps and, on an agentless driver, N WinRM round trips
     # inside one request — the cost the bulk-delete route exists to avoid.
     records_by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+    # #3503: the audit rows are added last, after every serial bump below. Their
+    # flush takes the audit-chain lock, and a zone row written after that waits
+    # for a record create on the zone that holds the row and waits for the lock.
+    audit_rows: list[AuditLog] = []
     for obj in restored:
         if isinstance(obj, DHCPScope):
             await push_scope_restore(db, obj)
@@ -705,7 +743,7 @@ async def restore_row(
             await remirror_scope_statics(db, obj)
         elif isinstance(obj, DNSRecord) and obj.zone_id not in restored_zone_ids:
             records_by_zone.setdefault(obj.zone_id, []).append(obj)
-        db.add(
+        audit_rows.append(
             AuditLog(
                 user_id=current_user.id,
                 user_display_name=current_user.display_name,
@@ -720,6 +758,19 @@ async def restore_row(
                 result="success",
             )
         )
+
+    # Before the recounts below too: they take the audit-chain lock (#3345).
+    restore_wake_groups: set[uuid.UUID] = set()
+    # #3617: the zones' rows in id order before the first serial bump, as
+    # every other multi-zone writer takes them (``app.services.lock_order``).
+    from app.services.lock_order import lock_zone_rows  # noqa: PLC0415
+
+    await lock_zone_rows(db, records_by_zone)
+    for zone_id, recs in records_by_zone.items():
+        await push_records_restore(db, zone_id, recs)
+        zone_row = await db.get(DNSZone, zone_id)
+        if zone_row is not None:
+            restore_wake_groups.add(zone_row.group_id)
 
     # A restored subnet / block is back in its parent chain's rollup (#2412).
     from app.api.v1.ipam.router import (  # noqa: PLC0415
@@ -737,14 +788,72 @@ async def restore_row(
     }:
         await _update_block_utilization(db, bid)
 
-    restore_wake_groups: set[uuid.UUID] = set()
-    for zone_id, recs in records_by_zone.items():
-        await push_records_restore(db, zone_id, recs)
-        zone_row = await db.get(DNSZone, zone_id)
-        if zone_row is not None:
-            restore_wake_groups.add(zone_row.group_id)
+    # #3827: a restored scope's reservation mirrors are back in its subnet
+    # (``remirror_scope_statics``), which counts them again, and so does the
+    # block above; the delete recounted both when it freed them. Subnets
+    # restored in the same batch are recounted above.
+    scope_subnets = {o.subnet_id for o in restored if isinstance(o, DHCPScope)} - {
+        sn.id for sn in restored_subnets
+    }
+    if scope_subnets:
+        await recount_subnets_and_blocks(db, scope_subnets)
 
+    # #3787 — the lease mirrors a restored subnet / scope brings back lost
+    # their A / PTR when the delete withdrew them; DDNS re-publishes them
+    # after the commit (chunked, idempotent), not 100 ms a lease in here.
+    republish_subnet_ids = {o.id for o in restored if isinstance(o, Subnet)} | {
+        o.subnet_id for o in restored if isinstance(o, DHCPScope)
+    }
+
+    db.add_all(audit_rows)
     await db.commit()
+    # #3924 — a restored zone's IPAM-generated records are as the Trash held
+    # them; the addresses they belong to went on changing while it sat there.
+    # Reconciled here, after the commit and before the response, not left to a
+    # task: a restore is rare and operator-driven, and the zone must not answer
+    # a name IPAM gave up for even a moment (nor for good if the broker is down
+    # and the opt-in auto-sync is off). The task is the retry if this fails.
+    if restored_zone_ids:
+        from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            reconcile_restored_zone_records,
+            reconcile_restored_zone_records_task,
+        )
+
+        # The restore's UPDATE left the identity map holding the rows as they
+        # were read; the planner must read them as they are now.
+        db.expunge_all()
+        try:
+            _changed, reconcile_wake = await reconcile_restored_zone_records(
+                db, list(restored_zone_ids)
+            )
+            restore_wake_groups |= set(reconcile_wake)
+        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+            await db.rollback()
+            logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
+            from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
+
+            try:
+                await _dispatch(
+                    reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                )
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+    if republish_subnet_ids:
+        from app.core.celery_dispatch import dispatch  # noqa: PLC0415
+        from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            republish_restored_lease_ddns_task,
+        )
+
+        try:
+            await dispatch(
+                republish_restored_lease_ddns_task,
+                [str(i) for i in republish_subnet_ids],
+            )
+        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+            # Broker down: no sweep re-publishes a lease mirror's records, so
+            # each lease gets its names back at its client's next renewal, or
+            # from the opt-in scheduled IPAM-DNS auto-sync.
+            logger.warning("trash.restore_ddns_enqueue_failed", error=str(exc))
     # This router carries no wake_publishing dependency (see the purge below),
     # so the create ops queued above are announced here, after the commit.
     for gid in restore_wake_groups:
@@ -765,13 +874,54 @@ async def restore_row(
     )
 
 
+async def _tear_down_scope_leases_before_purge(
+    db: AsyncSession, scope_id: uuid.UUID, label: str
+) -> None:
+    """Tear a trashed scope's remaining leases down in committed batches before
+    its purge (#3783), as the soft delete does (#3733): inline for a bounded
+    few seconds, never in the purge's one transaction, whose lease and mirror
+    locks ran past the proxy's 60 s with several hundred leases left.
+
+    Idempotent (each batch removes what it finds). When the deadline runs out
+    the rest goes to the background task and the purge answers 409 with a
+    Retry-After; sending it again finds the scope drained. What a racing
+    batch leaves is still swept by ``delete_leases_for_scope`` in the purge.
+    """
+    from app.services.dhcp.lease_cleanup import (  # noqa: PLC0415
+        SCOPE_DELETE_INLINE_DEADLINE_S,
+        tear_down_scope_leases,
+    )
+
+    _removed, _mirrors, done = await tear_down_scope_leases(
+        db, scope_id, deadline_s=SCOPE_DELETE_INLINE_DEADLINE_S
+    )
+    if done:
+        return
+    try:
+        from app.core.celery_dispatch import dispatch  # noqa: PLC0415
+        from app.tasks.dhcp_lease_cleanup import tear_down_trashed_scope_leases  # noqa: PLC0415
+
+        await dispatch(tear_down_trashed_scope_leases, str(scope_id))
+    except Exception as exc:  # noqa: BLE001 — a lost enqueue is safe: the lease sweep
+        # tears down the leases of any scope in the Trash every 300 s.
+        logger.warning("trash.purge_lease_teardown_enqueue_failed", error=str(exc))
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot permanently delete {label} yet: it still holds leases, which are "
+            "being removed in the background. Try again in a minute."
+        ),
+        headers={"Retry-After": "30"},
+    )
+
+
 @router.delete("/trash/{type}/{row_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def permanent_delete_from_trash(
     type: str,
     row_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
-) -> None:
+) -> Response:
     """Hard-delete a soft-deleted row from the trash.
 
     The agentless write-through for a Windows DHCP scope already fired at
@@ -780,7 +930,9 @@ async def permanent_delete_from_trash(
     new id + NS set, #632), so this endpoint is its retraction point — it is
     pushed to every agentless server (Windows DNS, cloud, ``technitium_api``)
     BEFORE the row goes, and a failing provider keeps the zone in the trash
-    with a 409/502 so it can be retried, never orphaned (#1830).
+    with a 409/502 so it can be retried, never orphaned (#1830). A shared auto
+    reverse zone that still holds another trashed subnet's records is refused
+    (409) rather than purged, since its FK cascade would take them (#3504).
 
     It does still have to release the IPAM mirror of any reservation it is about
     to destroy: the rows go via FK CASCADE, which runs no Python, so nothing else
@@ -816,8 +968,14 @@ async def permanent_delete_from_trash(
 
     label = _row_label(target)
     records_retracted = 0
-    purged_extra: dict[str, int] = {}
+    purged_extra: dict[str, Any] = {}
+    kept_provider_copies: list[str] = []
     dns_wake_group_ids: set[uuid.UUID] = set()
+    # Subnets whose DHCP mirrors the purge frees; recounted once, last, just
+    # before the commit (#3354).
+    touched_subnets: set[uuid.UUID] = set()
+    if isinstance(target, DHCPScope):
+        await _tear_down_scope_leases_before_purge(db, target.id, label)
     try:
         if isinstance(target, DHCPScope):
             live = await _live_children(db, [target], [], [])
@@ -827,8 +985,8 @@ async def permanent_delete_from_trash(
             # back into free gaps, and purge any dynamic leases still pointing here —
             # defense-in-depth for pre-fix strays / convergence-race leftovers (the
             # first soft-delete normally already cleaned both up).
-            await remove_ipam_for_scope_statics(db, target.id)
-            await delete_leases_for_scope(db, target.id)
+            await remove_ipam_for_scope_statics(db, target.id, touched_subnets=touched_subnets)
+            await delete_leases_for_scope(db, target.id, touched_subnets=touched_subnets)
         elif isinstance(target, Customer):
             # network_service.customer_id is RESTRICT, so a customer that still
             # has services (live or in the Trash) cannot go; say which, rather
@@ -860,15 +1018,33 @@ async def permanent_delete_from_trash(
         elif isinstance(target, DNSZone):
             # #1830 — retract from agentless servers first; raises (row + audit
             # untouched) when the provider refuses. Same helper as the 30-day sweep.
+            from app.services.dns.reverse_zone import trashed_sharers  # noqa: PLC0415
             from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
+            from app.services.lock_order import lock_zone_gate  # noqa: PLC0415
 
+            # #3724 — the zone's sync gate, exclusive, before any row lock: an
+            # auto-sync run's next batch queues behind this delete.
+            await lock_zone_gate(db, [target.id], exclusive=True)
+            # #3504 — a shared auto reverse zone still holding another trashed
+            # subnet's PTRs (in that subnet's batch) is not ours to purge: its FK
+            # cascade would take them, and that subnet's restore would come back
+            # with no reverse zone. The subnet-row purges hand such a zone over
+            # (#3190); this row refuses and says whose records they are.
+            sharers = await trashed_sharers(db, target)
+            if sharers:
+                await _refuse_shared_zone(db, target, label, sharers)
             # Refuses (409) while a LIVE record sits under the trashed zone (#1957).
-            await purge_trashed_zone(db, target)
+            kept_provider_copies = await purge_trashed_zone(db, target)
+            if kept_provider_copies:
+                # #3812: shared with another group's live zone; left at the provider.
+                purged_extra = {"provider_copies_kept": kept_provider_copies}
             dns_wake_group_ids.add(target.group_id)
         elif isinstance(target, Subnet):
             live = await _live_children(db, [target], [], [])
             if live:
                 _refuse_live_children(label, live)
+            # #3891: the purge takes the subnet's E911 binding (and those on its addresses).
+            await refuse_if_e911_bound(db, label, subnet_ids=[target.id])
             records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
                 db, [target], current_user
             )
@@ -883,6 +1059,7 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], blocks, subnets)
             if live:
                 _refuse_live_children(label, live)
+            await refuse_if_e911_bound(db, label, subnet_ids=[sub.id for sub in subnets])  # #3891
             records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
                 db, subnets, current_user
             )
@@ -944,6 +1121,7 @@ async def permanent_delete_from_trash(
             )
         elif not isinstance(target, DNSZone):
             await db.delete(target)
+        await recount_subnets_and_blocks(db, touched_subnets)
         await db.commit()
     except IntegrityError as exc:
         # Something we did not account for still references the row. Never a 500
@@ -962,3 +1140,12 @@ async def permanent_delete_from_trash(
     # instead of leaving them to the safety tick.
     for gid in dns_wake_group_ids:
         await publish_wake(dns_group_channel(gid))
+    if kept_provider_copies:
+        # #3812: 204 has no body; say so in a header, as the zone delete does.
+        from app.services.dns.zone_move import provider_copies_kept_header  # noqa: PLC0415
+
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept_provider_copies)},
+        )
+    return Response(status_code=204)

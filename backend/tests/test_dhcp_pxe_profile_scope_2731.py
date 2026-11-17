@@ -13,6 +13,11 @@ the subnet. Measured on kea-dhcp4 3.0.3, not assumed: such a class's
 ``next-server`` and ``boot-file-name`` still reach the OFFER, a subnet that
 lists nothing offers neither, and a class with no ``test`` is added for every
 client of a subnet that lists it.
+
+#3404: each rule renders as a selector (its own name and test, no boot fields,
+an ordinary class that pools can be restricted to) and a boot class (the boot
+fields, ``member('<selector>')``, ``only-in-additional-list``); the subnets list
+the boot classes, so the scoping above holds for the boot fields.
 """
 
 from __future__ import annotations
@@ -201,14 +206,16 @@ def test_the_preview_evaluates_a_class_only_for_the_scopes_that_list_it() -> Non
         )
     )["Dhcp4"]
 
-    (cls,) = doc["client-classes"]
-    assert cls == {
-        "name": "pxe-a",
+    selector, boot = doc["client-classes"]
+    # Evaluated for every packet, so it carries no boot fields (#3404).
+    assert selector == {"name": "pxe-a", "test": "option[93].hex == 0x0007"}
+    assert boot == {
+        "name": "pxe-a-boot",
         "next-server": "10.0.0.5",
         "boot-file-name": "ipxe.efi",
-        "test": "option[93].hex == 0x0007",
+        "test": "member('pxe-a')",
         "only-in-additional-list": True,
     }
     subnets = {s["subnet"]: s for s in doc["subnet4"]}
-    assert subnets[BOOTED]["evaluate-additional-classes"] == ["pxe-a"]
+    assert subnets[BOOTED]["evaluate-additional-classes"] == ["pxe-a-boot"]
     assert "evaluate-additional-classes" not in subnets[PLAIN]

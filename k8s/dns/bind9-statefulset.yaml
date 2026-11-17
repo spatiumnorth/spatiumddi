@@ -56,6 +56,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # #3757 — where the control plane reads zones back from (drift,
+            # pull-from-server). The bare pod name only resolves inside the
+            # pod; the pod DNS name under the headless Service resolves from
+            # the API pod. Must follow SERVER_NAME to expand.
+            - name: SERVER_HOST
+              value: "$(SERVER_NAME).dns-bind9-ns1-headless.spatiumddi.svc.cluster.local"
             - name: AGENT_GROUP
               value: internal-resolvers
             - name: AGENT_ROLES

@@ -193,8 +193,7 @@ def request_session_jti(request: Any) -> str | None:
     decode. The caller resolves it through the grace with
     :func:`resolve_live_session_id` to learn which session is the caller's.
     """
-    from jose import JWTError  # noqa: PLC0415
-
+    from app.core.jwt_compat import JWTError  # noqa: PLC0415
     from app.core.security import decode_access_token  # noqa: PLC0415
 
     header = request.headers.get("authorization") or ""

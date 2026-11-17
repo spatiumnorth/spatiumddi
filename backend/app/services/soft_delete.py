@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
@@ -130,6 +130,9 @@ class SoftDeleteBatch:
     batch_id: uuid.UUID
     rows: list[SoftDeleteRow] = field(default_factory=list)
     bulk: list[BulkChild] = field(default_factory=list)
+    # ``(resource_type, id)`` of every row in ``rows``, kept by ``add_to_batch``
+    # so an object reached twice joins the batch once (#3491).
+    row_keys: set[tuple[str, Any]] = field(default_factory=set, init=False, repr=False)
 
     def counts(self) -> dict[str, int]:
         """Rows per resource type, set-based children included."""
@@ -212,6 +215,11 @@ async def _collect_descendants(db: AsyncSession, root: Any) -> list[Any]:
     can stamp them in any order; restore reverses to root-first if it
     matters. Recursion is bounded by the tree depth, which in practice
     stays under a handful of levels.
+
+    For a space the list can name an object more than once: the walk takes
+    every block of the space and the subtree of each, so a nested block's
+    subtree comes once per level above it. ``add_to_batch`` keeps one row per
+    object (#3491).
     """
 
     out: list[Any] = []
@@ -295,14 +303,29 @@ async def add_to_batch(db: AsyncSession, batch: SoftDeleteBatch, root: Any) -> N
     For a row that must ride ANOTHER root's deletion: a subnet's auto-created
     reverse zone goes into the subnet's batch (spatiumddi#1066) so the trash
     shows one deletion and one restore brings both back, records included.
+
+    Each object joins the batch once (#3491). A space's walk reaches a nested
+    block's subtree once per level above it, and a root can be added to a
+    batch that already holds it. The batch is stamped, audited and counted
+    per row, so a second row for one object is a second ``soft_delete`` audit
+    entry and a second count in the approval preview. The first occurrence is
+    kept, which keeps the walk's order: descendants before their parent.
     """
 
-    objs = [*await _collect_descendants(db, root), root]
-    for obj in objs:
+    added: list[Any] = []
+    for obj in [*await _collect_descendants(db, root), root]:
+        resource_type = _resource_type(obj)
+        key = (resource_type, obj.id)
+        if key in batch.row_keys:
+            continue
+        batch.row_keys.add(key)
         batch.rows.append(
-            SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
+            SoftDeleteRow(obj=obj, resource_type=resource_type, display=_row_display(obj))
         )
-    await _attach_bulk(db, batch, objs)
+        added.append(obj)
+    # Only the rows added here: a zone the batch already holds keeps its one
+    # set-based child, and its records are counted once.
+    await _attach_bulk(db, batch, added)
 
 
 async def apply_soft_delete(
@@ -535,6 +558,45 @@ async def _record_cname_conflicts(
     return found
 
 
+async def _record_view_conflicts(
+    db: AsyncSession, batch_id: uuid.UUID
+) -> dict[uuid.UUID, tuple[str, str]]:
+    """The batch's records scoped to a view their live zone is no longer pinned to (#3920).
+
+    A pinned zone renders into its pin alone, so a record scoped to another
+    view is served in no view. The record API refuses writing that state and
+    Edit Zone refuses re-pinning into it (#3839), but a record waiting in the
+    Trash is counted by neither, so Restore was a door to it. Returns
+    ``{record id: (label, reason)}``. A zone in the Trash is
+    ``_record_parent_conflicts``'s case, and a record in a restored zone's own
+    batch keeps the pin it was deleted under.
+    """
+    zone = aliased(DNSZone)
+    pin = aliased(DNSView)
+    own = aliased(DNSView)
+    stmt: Any = (
+        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type, own.name, pin.name)
+        .join(zone, zone.id == DNSRecord.zone_id)
+        .join(own, own.id == DNSRecord.view_id)
+        .join(pin, pin.id == zone.view_id)
+        .where(
+            DNSRecord.deletion_batch_id == batch_id,
+            zone.deleted_at.is_(None),
+            DNSRecord.view_id != zone.view_id,
+        )
+        .execution_options(include_deleted=True)
+    )
+    return {
+        row_id: (
+            _record_label(fqdn, rtype),
+            f"it is scoped to view '{own_name}' but its zone is now pinned to view "
+            f"'{pin_name}', so it would be served in no view — move the zone's pin "
+            "back, or restore it after changing the zone's view",
+        )
+        for row_id, fqdn, rtype, own_name, pin_name in (await db.execute(stmt)).tuples()
+    }
+
+
 async def _record_parent_conflicts(
     db: AsyncSession, batch_id: uuid.UUID
 ) -> dict[uuid.UUID, tuple[str, str, DNSZone]]:
@@ -742,7 +804,13 @@ async def restore_batch(
     record_conflicts: dict[uuid.UUID, str] = {}
     record_parent_conflicts: dict[uuid.UUID, str] = {}
     record_cname_conflicts: dict[uuid.UUID, str] = {}
+    record_view_conflicts: dict[uuid.UUID, str] = {}
     if conflict_check is not None:
+        for rid, (label, reason) in (await _record_view_conflicts(db, batch_id)).items():
+            record_view_conflicts[rid] = reason
+            result.conflicts.append(
+                {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
+            )
         record_conflicts = await _record_conflicts(db, batch_id)
         for rid, (label, reason) in (await _record_cname_conflicts(db, batch_id)).items():
             if rid in record_conflicts:
@@ -833,10 +901,61 @@ async def restore_batch(
         if r.id not in record_conflicts
         and r.id not in record_parent_conflicts
         and r.id not in record_cname_conflicts
+        and r.id not in record_view_conflicts
     )
 
     if result.conflicts and not skip_conflicts:
         return RestoreResult(conflicts=result.conflicts)
+
+    # #3627: every zone this restore will write, locked in id order BEFORE the
+    # first row is un-stamped. The un-stamp of a restored (reverse) zone and the
+    # re-push of the records of a zone that stayed otherwise take their zones
+    # in whatever order the batch yields them, against a DDNS write that takes
+    # forward then reverse by id. Zones are step 3 of the lease / mirror / zone
+    # order (``app.services.lock_order``); nothing of steps 1 and 2 is written
+    # yet, so the whole order holds.
+    from app.services.lock_order import (  # noqa: PLC0415
+        lock_zone_rows,
+        zone_ids_for_scope_statics,
+        zone_ids_for_subnets,
+    )
+
+    # #3777: the restored scopes' rows first, ascending id, ``FOR NO KEY
+    # UPDATE`` (the lock their un-stamp takes anyway, which a lease-events
+    # batch's ``FOR KEY SHARE`` does not block). A scope's lease teardown holds
+    # its row ``FOR SHARE`` and then locks the zones of its mirrors, so an
+    # un-stamp flushed after the zones below would wait for a batch that waits
+    # for those zones. The scope sits before the zones in the order
+    # (``app.services.lock_order``).
+    restored_scope_ids = sorted(o.id for o in result.restored if isinstance(o, DHCPScope))
+    if restored_scope_ids:
+        await db.execute(
+            select(DHCPScope.id)
+            .where(DHCPScope.id.in_(restored_scope_ids))
+            .order_by(DHCPScope.id)
+            .with_for_update(key_share=True, of=DHCPScope)
+            .execution_options(include_deleted=True)
+        )
+
+    to_lock: set[Any] = set(zone_ids)
+    to_lock.update(o.zone_id for o in result.restored if isinstance(o, DNSRecord))
+    to_lock.update(
+        await zone_ids_for_subnets(
+            db,
+            [o.id for o in result.restored if isinstance(o, Subnet)]
+            + [o.subnet_id for o in result.restored if isinstance(o, DHCPScope)],
+        )
+    )
+    # A restored scope's reservations are re-mirrored (``remirror_scope_statics``)
+    # and publish into zones no record names yet: their forward and reverse
+    # zones are taken here too, or the re-mirror asks for the forward zone
+    # while holding the reverse one.
+    to_lock.update(
+        await zone_ids_for_scope_statics(
+            db, [o.id for o in result.restored if isinstance(o, DHCPScope)]
+        )
+    )
+    await lock_zone_rows(db, to_lock)
 
     # #2732 — records whose OTHER owner, their address's subnet, is still in
     # the Trash are not restored with their zone: they move to the subnet's
@@ -928,7 +1047,12 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
         try:
             covered = await _assert_no_block_overlap(
-                db, obj.space_id, str(obj.network), obj.parent_block_id, exclude_id=obj.id
+                db,
+                obj.space_id,
+                str(obj.network),
+                obj.parent_block_id,
+                exclude_id=obj.id,
+                for_restore=True,
             )
         except HTTPException as exc:
             return str(exc.detail)
@@ -1025,6 +1149,36 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active zone {obj.name!r} already exists in this group/view"
+        # #4226 — a zone cites ACLs and TSIG keys by name. The delete guards
+        # of those count a zone in the Trash now, but a row trashed before that,
+        # or a name removed by another path, leaves a citation the group no
+        # longer defines: BIND would refuse the config, and the bundle renders
+        # the emptied list as ``none``. The zone API refuses the same value
+        # with a 422, so a restore must not write it.
+        from app.services.dns.zone_citations import undefined_zone_citations  # noqa: PLC0415
+
+        missing = await undefined_zone_citations(db, obj)
+        if missing:
+            return (
+                f"Zone {obj.name!r} cites {', '.join(missing)}, which its server group no "
+                "longer defines. Create it again on the group's ACLs / TSIG keys tab, or "
+                "edit the zone's citation, then restore the zone."
+            )
+        # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
+        # not counted when a second server joins its group, so the restore must
+        # hold it to the same rule the direct sign does, or the group ends up
+        # with two servers each signing it with keys of their own. Locks the
+        # group like the other write paths: this runs on the committing restore.
+        if obj.dnssec_enabled:
+            from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
+
+            refusal = await sign_refusal(db, obj.group_id)
+            if refusal:
+                return (
+                    f"Zone {obj.name!r} is DNSSEC-signed and cannot be restored: "
+                    f"{refusal.removeprefix('Refusing to enable DNSSEC: ')} "
+                    "Remove the extra server first, then restore the zone."
+                )
 
     # DNSRecord is checked set-based for the whole batch by
     # ``_record_conflicts`` (#1389), which ``restore_batch`` runs itself.

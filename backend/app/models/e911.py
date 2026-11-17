@@ -76,6 +76,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -395,6 +396,14 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     never a subject name: the ERL's own ``nam`` element is as close to a
     person as this feature gets, and duplicating it per lookup would turn
     an access log into a movement history.
+
+    Every lookup that returns a location has a row of its own
+    (``suppressed_count`` NULL). Past the per-minute budget a HELD lookup is
+    refused (#3633) and writes nothing. The ``caller_key`` / ``window_start``
+    / ``suppressed_count`` columns hold counter rows written by development
+    builds before that (#3514; no release shipped them): "N lookups not
+    individually logged". They are kept so those rows stay readable until
+    the retention prune drops them.
     """
 
     __tablename__ = "e911_resolution_log"
@@ -402,6 +411,21 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
         Index("ix_e911_res_log_queried_at", "queried_at"),
         Index("ix_e911_res_log_identity", "identity_kind", "identity_value"),
         Index("ix_e911_res_log_actor", "actor_kind", "actor_id"),
+        # One counter row per caller per minute window (#3514); the upsert's
+        # ON CONFLICT target. Partial, so individual lookups stay out of it.
+        Index(
+            "uq_e911_res_log_suppressed_window",
+            "caller_key",
+            "window_start",
+            unique=True,
+            postgresql_where=text("caller_key IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "(caller_key IS NULL AND window_start IS NULL AND suppressed_count IS NULL)"
+            " OR (caller_key IS NOT NULL AND window_start IS NOT NULL"
+            " AND suppressed_count >= 1)",
+            name="ck_e911_res_log_suppressed_shape",
+        ),
     )
 
     #: No ``index=True`` here: ``ix_e911_res_log_queried_at`` in
@@ -428,3 +452,18 @@ class E911ResolutionLog(UUIDPrimaryKeyMixin, Base):
     #: Age in seconds of the evidence the answer rests on, so an
     #: after-action review can tell a fresh answer from a lucky one.
     evidence_age_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── Counter rows (#3514, no longer written since #3633) ──────────
+    # Builds of main between #3514 and #3633 COUNTED HELD lookups past the
+    # per-caller budget in one row per caller per minute window instead of
+    # logging each; on such a row the columns above describe the LAST lookup
+    # counted, and these three are set. Nothing writes them now: past the
+    # budget a lookup is refused. All three are NULL on every row written
+    # since, and the retention prune ages the old ones out.
+    #: The budget's caller key: the API token id, else the user id, else the
+    #: source address.
+    caller_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Start of the minute the counted lookups fell in.
+    window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: How many lookups in that window were not individually logged.
+    suppressed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -2,13 +2,13 @@
 
 The appliance vantage runs tcpdump on the appliance **host** (real NICs),
 not in a container — so the capture rides the supervisor channel. Unlike
-:mod:`app.services.appliance.agent_cmd` (an in-memory per-replica queue
+:mod:`app.services.appliance.agent_cmd` (a Redis-backed queue
 for short request/response nettools), the authority here is the
 ``packet_capture`` **DB row**: a minutes-long job that outlives any single
 poll and is replica-agnostic — *any* api replica can serve the
 supervisor's poll because the claim is a guarded UPDATE against the shared
-Postgres, not an in-memory queue (which would strand a capture enqueued on
-a different replica — the #430-class delivery gap we explicitly avoid).
+Postgres, not a transient queue (a minutes-long job must survive a Redis flush
+and a replica restart).
 
 Flow:
   * supervisor long-polls ``/supervisor/pcap/poll`` → :func:`claim_next`

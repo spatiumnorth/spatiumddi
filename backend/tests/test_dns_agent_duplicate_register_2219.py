@@ -242,3 +242,25 @@ async def test_the_survivor_registers_once_the_owner_has_gone_quiet(
     assert await a.poll(client) == 200
     srv = await _server(db_session, a.agent_id)
     assert srv.agent_instance == "agent-a"
+
+
+@pytest.mark.asyncio
+async def test_a_pair_registering_in_one_second_still_stales_the_displaced_token(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3538 — with the clock frozen both tokens carry identical claims; the
+    displaced agent's token must still be stale (it used to be byte-equal)."""
+    from app.services.dns import agent_token
+
+    frozen = datetime.now(UTC).replace(microsecond=0)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            return frozen
+
+    monkeypatch.setattr(agent_token, "datetime", _Frozen)
+    a, b = await _duplicate_pair(client)
+    assert a.token != b.token
+    assert await a.heartbeat(client) == 401
+    assert a.refusals >= 1

@@ -560,7 +560,8 @@ async def mark_integration_dns_released(
     ``DNSRecordOp`` (bundle-dirty is the delivery path), so this does the
     equivalent: collect the groups of the owned zones and of the zones holding
     owned records, mark them in the caller's transaction, and wake their
-    agents. Call it BEFORE ``db.delete(target)``; ``own_fk`` is the shared
+    agents. It also prunes the owned zones' ids from IPAM (#3443), since the
+    cascade removes them where ``prune_zone_ids`` cannot see it. Call it BEFORE ``db.delete(target)``; ``own_fk`` is the shared
     column name (``kubernetes_cluster_id`` / ``tailscale_tenant_id`` /
     ``netbird_instance_id``).
     """
@@ -576,6 +577,22 @@ async def mark_integration_dns_released(
             (await db.execute(select(DNSZone.group_id).where(zone_col == target_id)))
             .scalars()
             .all()
+        )
+        # The cascade removes the zones (Trash rows too) out from under IPAM,
+        # which names them in text / JSONB columns with no foreign key (#3443).
+        from app.services.ipam.zone_binding import prune_zone_ids  # noqa: PLC0415
+
+        await prune_zone_ids(
+            db,
+            (
+                await db.execute(
+                    select(DNSZone.id)
+                    .where(zone_col == target_id)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all(),
         )
     groups.update(
         (

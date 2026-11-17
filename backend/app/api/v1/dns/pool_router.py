@@ -38,6 +38,7 @@ from app.services.dns.pool_health_staleness import (
     is_member_check_stale,
     member_check_age_seconds,
 )
+from app.services.dns.zone_synthesis import unauthored_zone_error
 
 logger = structlog.get_logger(__name__)
 
@@ -414,6 +415,10 @@ async def create_pool(
     await _refuse_on_technitium_api(db, group_id)
     if zone.zone_type == "forward":
         raise HTTPException(status_code=400, detail="Pools are not supported on forward zones")
+    # #3838 — a pool's A/AAAA rows would be served by nobody in a secondary / stub.
+    unauthored = unauthored_zone_error(zone, "pool")
+    if unauthored is not None:
+        raise HTTPException(status_code=422, detail=unauthored)
     # Pools render A/AAAA records, which only belong in a forward zone.
     # Reverse (in-addr.arpa / ip6.arpa) zones hold PTR records, so a pool
     # there could never render a valid record — reject it defensively
@@ -497,6 +502,13 @@ async def update_pool(
     rrset_changed = any(k in payload and getattr(pool, k) != payload[k] for k in ("enabled", "ttl"))
     for k, v in payload.items():
         setattr(pool, k, v)
+    if rrset_changed:
+        # Don't wait for the next health-check tick (which skips disabled
+        # pools entirely). Record ops collect_wake the group channel.
+        await db.refresh(pool, ["members"])
+        await apply_pool_state(db, pool)
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
     db.add(
         AuditLog(
             user_id=user.id,
@@ -509,11 +521,6 @@ async def update_pool(
             result="success",
         )
     )
-    if rrset_changed:
-        # Don't wait for the next health-check tick (which skips disabled
-        # pools entirely). Record ops collect_wake the group channel.
-        await db.refresh(pool, ["members"])
-        await apply_pool_state(db, pool)
     await db.commit()
     await db.refresh(pool)
     return _pool_to_response(pool)
@@ -524,6 +531,13 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    # #1966 — withdraw every member's rendered record (row + delete op)
+    # before the pool goes. Members and records would otherwise vanish via
+    # the FK ``ON DELETE CASCADE`` with no op, and the agent would keep
+    # serving every address until something else reconciled the zone.
+    await withdraw_member_records(db, pool, list(pool.members))
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
     db.add(
         AuditLog(
             user_id=user.id,
@@ -536,11 +550,6 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
             result="success",
         )
     )
-    # #1966 — withdraw every member's rendered record (row + delete op)
-    # before the pool goes. Members and records would otherwise vanish via
-    # the FK ``ON DELETE CASCADE`` with no op, and the agent would keep
-    # serving every address until something else reconciled the zone.
-    await withdraw_member_records(db, pool, list(pool.members))
     await db.delete(pool)
     await db.commit()
 
@@ -735,19 +744,6 @@ async def update_member(
         member.last_check_error = None
         member.consecutive_successes = 0
         member.consecutive_failures = 0
-    db.add(
-        AuditLog(
-            user_id=user.id,
-            user_display_name=user.display_name,
-            auth_source=user.auth_source,
-            action="dns.pool.member.update",
-            resource_type="dns_pool_member",
-            resource_id=str(member.id),
-            resource_display=member.address,
-            result="success",
-        )
-    )
-
     # Reconcile on any rrset-affecting change (address or enabled);
     # weight is advisory today but cheap to include if/when weighted
     # rendering lands. Don't make the operator wait for the next
@@ -769,6 +765,21 @@ async def update_member(
                 # after this handler's ``db.commit()``.
                 collect_wake(dns_group_channel(pool.group_id))
 
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="dns.pool.member.update",
+            resource_type="dns_pool_member",
+            resource_id=str(member.id),
+            resource_display=member.address,
+            result="success",
+        )
+    )
+
     await db.commit()
     await db.refresh(member)
     return PoolMemberResponse.model_validate(member, from_attributes=True)
@@ -779,6 +790,15 @@ async def delete_member(member_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     member = await db.get(DNSPoolMember, member_id)
     if member is None:
         raise HTTPException(status_code=404, detail="Pool member not found")
+    # #1966 — withdraw the member's rendered record (row + delete op) while
+    # the member still exists. Deleting the member first lets the
+    # ``dns_record.pool_member_id`` FK cascade remove the record row without
+    # any op, and the agent keeps serving the address.
+    pool = await db.get(DNSPool, member.pool_id)
+    if pool is not None:
+        await withdraw_member_records(db, pool, [member])
+    # #3503: audited after the reconcile, whose serial bumps must take the zone
+    # row before the audit row's flush takes the audit-chain lock.
     db.add(
         AuditLog(
             user_id=user.id,
@@ -791,12 +811,5 @@ async def delete_member(member_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
             result="success",
         )
     )
-    # #1966 — withdraw the member's rendered record (row + delete op) while
-    # the member still exists. Deleting the member first lets the
-    # ``dns_record.pool_member_id`` FK cascade remove the record row without
-    # any op, and the agent keeps serving the address.
-    pool = await db.get(DNSPool, member.pool_id)
-    if pool is not None:
-        await withdraw_member_records(db, pool, [member])
     await db.delete(member)
     await db.commit()

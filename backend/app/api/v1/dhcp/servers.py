@@ -27,6 +27,10 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
 from app.core.update_nulls import changed_keys, snapshot
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
@@ -54,6 +58,7 @@ from app.services.dhcp.stats import (
     STATS_WINDOW_SECONDS,
     active_lease_count,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 router = APIRouter(
     prefix="/servers",
@@ -724,6 +729,15 @@ async def update_server(
         refusal = await server_join_refusal(db, s, target_group)
         if refusal is not None:
             raise HTTPException(status_code=422, detail=refusal)
+    require_secret_with_destination_change(
+        s,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+        },
+        destination=("host", "port"),
+        secrets={"credentials": s.credentials_encrypted},
+    )
     before = snapshot(s, changes)
     for k, v in changes.items():
         setattr(s, k, v)
@@ -877,14 +891,6 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
-    write_audit(
-        db,
-        user=user,
-        action="delete",
-        resource_type="dhcp_server",
-        resource_id=str(s.id),
-        resource_display=s.name,
-    )
     # #430 — capture the group before delete; removing a member can drop a
     # group out of HA, re-rendering the survivors' failover block. Wake it.
     gid = s.server_group_id
@@ -893,6 +899,19 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     from app.services.dhcp.lease_cleanup import delete_leases_for_server  # noqa: PLC0415
 
     await delete_leases_for_server(db, s.id)
+    # #3687: the audit row goes after the lease teardown. Its flush takes the
+    # audit-chain lock, and the teardown's first query autoflushes pending
+    # rows: an audit row staged earlier took the chain lock before the zone
+    # rows ``delete_leases_for_server`` locks, the reverse of the order a
+    # permanent zone delete takes them (``app.services.lock_order``).
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="dhcp_server",
+        resource_id=str(s.id),
+        resource_display=s.name,
+    )
     await db.delete(s)
     if gid is not None:
         collect_wake(dhcp_group_channel(gid))
@@ -1257,7 +1276,10 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
                 "poll. Nudged the agent to re-poll now."
             ),
         )
-    result = await pull_leases_from_server(db, s, apply=True)
+    # Recounted below, just before commit: the recount holds the audit-chain
+    # lock and subnet / block row locks until commit, and the MAC-block
+    # reconcile that follows is another WinRM call (#3345, #3354).
+    result = await pull_leases_from_server(db, s, apply=True, recount=False)
     if result.busy:
         # #2262 — the scheduled pull (or another Sync) is reconciling this
         # server right now; two at once used to insert the same lease twice.
@@ -1335,6 +1357,7 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "warnings": result.warnings[:20],
         },
     )
+    await recount_subnets_and_blocks(db, result.touched_subnet_ids)
     await db.commit()
     return SyncLeasesResponse(
         server_leases=result.server_leases,

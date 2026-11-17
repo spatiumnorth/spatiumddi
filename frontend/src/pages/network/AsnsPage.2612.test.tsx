@@ -77,7 +77,12 @@ describe("AsnsPage copy (#2612)", () => {
     expect(said).not.toMatch(/follow-up/i);
     expect(said).toMatch(/peerings/);
     expect(said).toMatch(/communities/);
-    expect(said).toMatch(/IP blocks, subnets/);
+    // #3893: the other rows the FKs cascade, and the real kept list.
+    expect(said).toMatch(/tracked prefixes \(hand-tracked ones too\)/);
+    expect(said).toMatch(/hijack detections/);
+    expect(said).toMatch(/IP spaces, IP blocks/);
+    expect(said).toMatch(/Looking Glass/);
+    expect(said).not.toMatch(/subnets/);
     expect(said).toMatch(/cleared/);
   });
 });

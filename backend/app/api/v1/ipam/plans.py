@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
-from app.models.dns import DNSServerGroup
+from app.models.dns import DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
 from app.services.api_token_scopes import read_only_post
 from app.services.ipam.custom_field_rules import (
@@ -37,6 +37,7 @@ from app.services.ipam.custom_field_rules import (
 )
 from app.services.ipam.gateway_rules import gateway_problem
 from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
+from app.services.ipam.zone_binding import stored_zone_uuid
 
 _V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
 _V6_MULTICAST = ipaddress.ip_network("ff00::/8")
@@ -319,6 +320,38 @@ async def _validate_tree(
                         network=n.network,
                         kind="invalid_binding",
                         message=f"dns_group_id names a DNS server group that does not exist: {gid}",
+                    )
+                )
+
+    # 1e. Likewise ``dns_zone_id`` (#3443): a zone purged after the plan was
+    #     saved would be written to the new rows as a binding to nothing.
+    zone_refs: dict[uuid.UUID, list[PlanNode]] = {}
+    for n in _walk(tree):
+        zid = stored_zone_uuid(n.dns_zone_id)
+        if zid is not None:
+            zone_refs.setdefault(zid, []).append(n)
+    if zone_refs:
+        live_zones = set(
+            (
+                await db.execute(
+                    select(DNSZone.id)
+                    .where(DNSZone.id.in_(zone_refs.keys()))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for zid, nodes in zone_refs.items():
+            if zid in live_zones:
+                continue
+            for n in nodes:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"dns_zone_id names a DNS zone that does not exist: {zid}",
                     )
                 )
 

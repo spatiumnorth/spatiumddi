@@ -42,6 +42,14 @@ provider, and returns to `/auth/{provider_id}/callback`. Only external
 users pass through `sync_external_user()`; a local login never changes
 group membership.
 
+A refused sign-in costs one password-hash comparison for every kind of
+name: a local account with a wrong password, a local account with no
+password, a name with no account, and a directory account. With no
+LDAP / RADIUS / TACACS+ provider configured those answers take about the
+same time. With providers configured, a local account is answered without
+contacting them, so its response is faster than a directory-backed or
+unknown name, whose time also includes the round trips to the providers.
+
 ## Local auth
 
 - `POST /auth/login` accepts JSON `{username, password}`. Returns
@@ -347,9 +355,24 @@ All providers are configured at runtime from `/admin/auth-providers`. The
 | `secrets_encrypted` | bytes | Fernet-encrypted secrets dict. |
 
 **Secrets at rest.** Everything in `secrets_encrypted` is wrapped with
-Fernet. The encryption key is derived from `settings.credential_encryption_key`
-(explicit) or `SHA-256(secret_key)` (fallback), so a fresh deploy that only
-sets `SECRET_KEY` still works. See `backend/app/core/crypto.py`.
+Fernet. New writes use `settings.credential_encryption_key` (a random key,
+independent of `SECRET_KEY`) when it is set. The key derived as
+`SHA-256(secret_key)` is always a **read** fallback while a dedicated key is
+set, so values written before it existed still decrypt, and it is the only key
+when none is set, so a deploy that only sets `SECRET_KEY` still works (the api
+logs a `credential_encryption_key_not_set` warning, since anyone who can recover
+`SECRET_KEY` can then open every stored secret). To move existing values onto
+the dedicated key run `python -m app.core.rotate_credential_key` (see
+[Moving stored credentials onto a dedicated key](../deployment/DOCKER.md#moving-stored-credentials-onto-a-dedicated-key)).
+When the Helm chart or the appliance adds the key to an install that is
+already running, it also stamps `CREDENTIAL_KEY_SINCE` with that release: while
+the api runs that release it reads the key but keeps writing under the derived
+one, because the rollout can still have pods (the previous image, or ones
+started before the Secret had the key) that cannot read it. Writes move onto
+the key from the next release, and the rotation command refuses until then
+(override with `CREDENTIAL_KEY_SINCE=` in its environment once every api,
+worker and beat pod has restarted).
+See `backend/app/core/crypto.py`.
 
 **Group mappings.** Each provider owns a list of `AuthGroupMapping` rows
 (`external_group` → `internal_group_id`). The unified sync in
@@ -1115,5 +1138,5 @@ multi-protocol auth.
 - Backup-server failover for every protocol
 - Delegate IP ranges and zones by role
 - API tokens with auto-expiry
-- **Scoped API tokens** — `scopes` JSONB column on `api_token` lists the resource_types the token is allowed to touch (vs. inheriting all of the user's permissions). Permission-name granularity (`subnet:read`, `subnet:admin`, `*` for full inheritance). Authorization enforces scope intersection — token can do at most what the scope set allows AND what the user has permission for.
+- **Scoped API tokens** — `scopes` JSONB column on `api_token` lists the scopes the token carries (vs. inheriting all of the user's permissions). The vocabulary is exactly `read`, `ipam:write`, `dns:write` and `dhcp:write`; anything else (`subnet:read`, `*`, …) is refused with a 422 naming the unknown scope, and the retired `agent` scope is refused with its own explanation. Scopes form a union — the first scope that matches a request passes it — and an empty list means no scope restriction. The token can do at most what its scopes allow AND what the user has permission for. The scope section above has the detail.
 - **Resource-scoped API tokens** (#374) — a `resource_grants` list binds a token to specific instances (`{action, resource_type, resource_id}`, resource_type ∈ `subnet` / `dns_zone`) so a leaked CI / Terraform secret can only touch the one subnet or zone it was minted for. The binding only ever *narrows* the owner: the effective permission is the intersection of the owner's RBAC and the token grants, validated at create time to be a subset of what the issuer holds (you can't mint a token more powerful than yourself). Enforced per-row at the IP-create/edit/delete + DNS-record CRUD handlers.

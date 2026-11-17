@@ -185,7 +185,7 @@ async def list_asns(
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
-    stmt = stmt.order_by(ASN.number.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(ASN.number.asc(), ASN.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
 
     return ASNListResponse(
@@ -494,7 +494,16 @@ async def refresh_asn_rpki(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> Refr
             source = candidate
 
     now = _dt.now(UTC)
-    summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+    from app.services.rpki_roa import RoaFetchError  # noqa: PLC0415
+
+    try:
+        summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+    except RoaFetchError as exc:
+        # The source could not be read: stored ROAs are untouched.
+        raise HTTPException(
+            status_code=502,
+            detail=f"RPKI refresh failed, stored ROAs kept: {exc}",
+        ) from exc
 
     write_audit(
         db,

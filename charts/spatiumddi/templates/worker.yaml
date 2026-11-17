@@ -9,7 +9,7 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicas }}
-  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas) | nindent 2 }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas "root" $ "deployment" (printf "%s-worker" (include "spatiumddi.fullname" .)) "container" "worker") | nindent 2 }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
@@ -65,12 +65,34 @@ spec:
         - name: worker
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.worker.netRawCapability }}
-          # NET_RAW unlocks nmap raw-socket scans (SYN, ``-O`` OS
-          # detection) for the device-profiling auto-nmap path. The
-          # image already grants the cap to the nmap binary via setcap;
-          # this line keeps it in the pod bounding set so restricted
-          # PSA / OpenShift-SCC clusters don't drop it.
+          {{- if include "spatiumddi.isOpenShift" . }}
+          {{- if .Values.openshift.workerNetRaw }}
+          # #3852 — OpenShift: NET_RAW is not in restricted-v2's allowed set,
+          # and CRI-O's default capability set does not carry it. The image's
+          # nmap carries net_raw + net_bind_service as FILE capabilities, and
+          # the kernel refuses to exec it unless BOTH are in the bounding set,
+          # so both are added. The pod is bound to a SCC that allows exactly
+          # these (openshift.yaml); without ``openshift.workerNetRaw`` the
+          # worker runs under plain restricted-v2 and nmap raw scans are off.
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_RAW", "NET_BIND_SERVICE"]
+            # Explicit, not left to the SCC: restricted-v2 also allows
+            # NET_BIND_SERVICE, and if admission picked it, its default
+            # (false) would set no_new_privs and the kernel would ignore the
+            # file capabilities. ``true`` makes restricted-v2 refuse the pod, so
+            # only the agents' SCC admits it. The uid stays non-root.
+            allowPrivilegeEscalation: true
+          {{- end }}
+          {{- else if .Values.worker.netRawCapability }}
+          # #3952 — opt-in, off by default. The image's nmap carries
+          # net_raw as a FILE capability, which works only while NET_RAW
+          # is in the bounding set. containerd's default set already has
+          # it, so this line matters only on a runtime whose set does not
+          # (CRI-O outside OpenShift). Adding it makes Pod Security
+          # ``baseline`` and ``restricted`` REFUSE the pod at admission,
+          # so the namespace must be ``privileged`` (or exempted).
           securityContext:
             capabilities:
               add: ["NET_RAW"]

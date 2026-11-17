@@ -46,7 +46,15 @@ import structlog
 
 from . import appliance_state, approval_state, etcd_evict, firewall_peer_audit, watchdog
 from . import cp_tls
-from .cert_auth import build_auth_headers, load_cert, save_cert
+from . import sealed_token
+from .cert_auth import (
+    JSON_CONTENT_TYPE,
+    build_auth_headers,
+    encode_json,
+    load_cert,
+    note_control_plane_signature_support,
+    save_cert,
+)
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
 from .identity import Identity
@@ -137,18 +145,94 @@ def _is_control_plane_member() -> bool:
     return appliance_state.is_control_plane_member()
 
 
+# #3645 — the node-local api Service (``internalTrafficPolicy: Local``). Plain
+# http is only ever sent to the api pod on this node, so it never crosses the
+# node LAN (pod traffic between nodes is flannel host-gw: routed, not
+# encrypted). A control plane that predates the Service has no such name; the
+# lookup fails and ``_effective_control_plane_url`` falls back like it does for
+# a node with no ready api pod of its own.
+_IN_CLUSTER_NODE_LOCAL_URL = (
+    "http://spatium-control-spatiumddi-api-local.spatium.svc.cluster.local.:8000"
+)
+
+# Connection failures to the node-local Service before the supervisor stops
+# using it, and how long it then waits before trying it again. One is enough:
+# the Service has no endpoint only while this node has no ready api pod.
+_LOCAL_API_FAIL_THRESHOLD = 1
+_LOCAL_API_RETRY_S = 60.0
+# A node with no ready api pod makes the Service DROP traffic (no refusal), so
+# the node-local attempt must not wait out the request timeout to find out.
+_LOCAL_API_CONNECT_TIMEOUT_S = 4.0
+
+_local_api: dict[str, Any] = {"failures": 0, "last_failure": 0.0, "fallback_logged": False}
+
+
+def note_local_api_result(url: str, ok: bool) -> None:
+    """Record whether a call to the node-local Service reached an api pod.
+
+    ``ok`` is True for any HTTP answer (even a 5xx: the pod is there) and
+    False for a connection-level failure. Calls to any other URL are ignored.
+    """
+    if not url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+        return
+    if ok:
+        if _local_api["failures"] >= _LOCAL_API_FAIL_THRESHOLD:
+            log.info("supervisor.control_plane.node_local_restored")
+        _local_api["failures"] = 0
+        _local_api["fallback_logged"] = False
+        return
+    _local_api["failures"] += 1
+    _local_api["last_failure"] = time.monotonic()
+
+
+def _local_api_usable() -> bool:
+    if _local_api["failures"] < _LOCAL_API_FAIL_THRESHOLD:
+        return True
+    # Down: use the fallback, but let one call through now and then so a
+    # restarted local api pod is picked up again.
+    return time.monotonic() - _local_api["last_failure"] >= _LOCAL_API_RETRY_S
+
+
+def _fallback_client(cfg: SupervisorConfig, url: str) -> httpx.Client | None:
+    """The client for the same-call fallback attempt to ``url``.
+
+    Built from the pin file as it is now, exactly as the ordinary heartbeat
+    client for that URL is. A TLS target with nothing pinned yet gets no
+    client at all (the caller skips the attempt) rather than one that
+    verifies against the system trust store.
+    """
+    if (
+        not cp_tls.skip_verify()
+        and cp_tls.tls_url(url) is not None
+        and cp_tls.load_pins(cfg.state_dir) is None
+    ):
+        return None
+    return cp_tls.client(cfg.state_dir, url, first_contact=False)
+
+
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
     """Resolve the heartbeat target.
 
-    Cluster members talk to the in-cluster api Service (resilient to
-    any single node loss + load-balanced); everyone else uses the
-    configured ``CONTROL_PLANE_URL``. Returns ``""`` only when a
-    non-member has no configured URL — the caller skips the
-    heartbeat in that case.
+    Cluster members talk to the api pod on their own node through the
+    node-local Service (#3645), so the plain-http hop never leaves the node.
+    While that node has no ready api pod, they use the configured
+    ``CONTROL_PLANE_URL``, which goes over https against the pinned
+    certificate (``cp_tls``), never plain http across the node LAN. A
+    member with none configured (the seed: firstboot writes it empty on a
+    control-plane install) uses the cluster-wide api Service, as it did
+    before #3645, so no node is ever left without a path. Everyone else
+    uses the configured URL. Returns ``""`` only when a non-member has no
+    configured URL — the caller skips the heartbeat.
     """
-    if _is_control_plane_member():
-        return _IN_CLUSTER_CONTROL_PLANE_URL
-    return cfg.control_plane_url
+    if not _is_control_plane_member():
+        return cfg.control_plane_url
+    if _local_api_usable():
+        return _IN_CLUSTER_NODE_LOCAL_URL
+    fallback = cfg.control_plane_url or _IN_CLUSTER_CONTROL_PLANE_URL
+    if not _local_api["fallback_logged"]:
+        _local_api["fallback_logged"] = True
+        log.warning("supervisor.control_plane.node_local_unavailable", fallback=fallback)
+    return fallback
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -268,6 +352,14 @@ def _capabilities_payload() -> dict[str, Any]:
         # "always compatible") — no service container needed, the
         # supervisor itself is the observer.
         "can_run_observer": True,
+        # #3631 — this supervisor sends a join-token key in its signed
+        # heartbeat and opens ``desired_k3s_join_token_sealed``. A control
+        # plane refuses to promote a node whose supervisor does not say so,
+        # since it would never be handed the join token.
+        "sealed_join_token": True,
+        # Registrations are signed with the supervisor's own key; once a row
+        # has reported this, an unsigned registration of it is refused.
+        "register_proof": True,
     }
     # Every baked appliance has every service image preloaded; the
     # control plane's role-checkbox UI uses these flags to gate
@@ -1123,6 +1215,10 @@ class _Housekeeper:
         self._pending: tuple[Callable[[], None], float, Any] | None = None
         self._pending_seq = 0
         self._done_seq = 0
+        # #3735 — the seqs whose run() gave up waiting. The worker logs
+        # housekeeping_done for exactly those jobs, decided under the lock, so
+        # the line no longer depends on two clocks agreeing about a near-tie.
+        self._deferred: set[int] = set()
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -1151,6 +1247,7 @@ class _Housekeeper:
             while self._done_seq < seq:
                 left = started + wait_s - time.monotonic()
                 if left <= 0:
+                    self._deferred.add(seq)
                     log.info(
                         "supervisor.heartbeat.housekeeping_deferred",
                         waited_s=round(time.monotonic() - started, 1),
@@ -1176,7 +1273,7 @@ class _Housekeeper:
             with self._cond:
                 while self._pending is None:
                     self._cond.wait()
-                (job, wait_s, log), seq = self._pending, self._pending_seq
+                (job, _wait_s, log), seq = self._pending, self._pending_seq
                 self._pending = None
                 self._running = True
             started = time.monotonic()
@@ -1187,11 +1284,19 @@ class _Housekeeper:
             finally:
                 took = time.monotonic() - started
                 with self._cond:
+                    # #3735 — log the job a run() deferred, and do it before
+                    # publishing completion: drain() may return the moment
+                    # notify_all() fires.
+                    if seq in self._deferred:
+                        log.info(
+                            "supervisor.heartbeat.housekeeping_done",
+                            elapsed_s=round(took, 1),
+                        )
+                    # A superseded job never runs; forget its seq with this one.
+                    self._deferred = {s for s in self._deferred if s > seq}
                     self._running = False
                     self._done_seq = seq
                     self._cond.notify_all()
-            if took > wait_s:
-                log.info("supervisor.heartbeat.housekeeping_done", elapsed_s=round(took, 1))
 
 
 _housekeeper = _Housekeeper()
@@ -1245,6 +1350,24 @@ def revocation_reason(resp: httpx.Response) -> str | None:
             if detail.startswith(prefix):
                 return reason
     return None
+
+
+def _join_token(
+    body_out: dict[str, Any],
+    appliance_id: uuid.UUID,
+    log: structlog.stdlib.BoundLogger,
+) -> str | None:
+    """The k3s join token from a heartbeat response (#3631): sealed to this
+    process's key by a current control plane. A plaintext token is still
+    read, for the window where this supervisor is newer than the api."""
+    sealed = body_out.get("desired_k3s_join_token_sealed")
+    if isinstance(sealed, str) and sealed:
+        token = sealed_token.open_sealed(sealed, appliance_id)
+        if token is None:
+            log.warning("supervisor.heartbeat.join_token_unsealable")
+        return token
+    plain = body_out.get("desired_k3s_join_token")
+    return plain if isinstance(plain, str) else None
 
 
 def heartbeat_once(
@@ -1382,11 +1505,36 @@ def heartbeat_once(
     # timestamp skew. When no cert yet (pre-approval), fall through
     # to the session_token body field — same shape as today.
     cached_cert = load_cert(cfg.state_dir)
-    headers: dict[str, str] = {}
+    if cached_cert is not None:
+        # #3631 — a join token for this node comes back sealed to this key
+        # (only on a cert-signed heartbeat, the only kind that gets one).
+        body["join_token_public_key"] = sealed_token.public_key_b64()
+
+    # #1747 — Postgres refuses U+0000 in a text value, so ONE NUL anywhere in
+    # this body (a host sidecar left NUL-filled by a power loss) makes the
+    # api answer 422 to every heartbeat and the node's Fleet row freezes for
+    # good. The slot-upgrade readers scrub their own values; this is the
+    # backstop for every other field read off a host file.
+    nul_fields: list[str] = []
+    body = _strip_nul(body, "", nul_fields)
+    if nul_fields:
+        log.warning("supervisor.heartbeat.nul_stripped", fields=nul_fields[:20])
+    # #3631 — the signature covers the body, so serialise it once and send
+    # exactly the bytes that were signed.
+    body_bytes = encode_json(body)
+
+    headers: dict[str, str] = dict(JSON_CONTENT_TYPE)
     if cached_cert is not None:
         try:
-            headers = build_auth_headers(
-                "POST", url_path, cached_cert, identity.private_key, appliance_id
+            headers.update(
+                build_auth_headers(
+                    "POST",
+                    url_path,
+                    cached_cert,
+                    identity.private_key,
+                    appliance_id,
+                    body_bytes,
+                )
             )
             # #411 — KEEP the session token in the body as a fallback even
             # when we present a cert. The server prefers the cert; if cert-
@@ -1401,30 +1549,57 @@ def heartbeat_once(
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 
-    # #1747 — Postgres refuses U+0000 in a text value, so ONE NUL anywhere in
-    # this body (a host sidecar left NUL-filled by a power loss) makes the
-    # api answer 422 to every heartbeat and the node's Fleet row freezes for
-    # good. The slot-upgrade readers scrub their own values; this is the
-    # backstop for every other field read off a host file.
-    nul_fields: list[str] = []
-    body = _strip_nul(body, "", nul_fields)
-    if nul_fields:
-        log.warning("supervisor.heartbeat.nul_stripped", fields=nul_fields[:20])
-
-    try:
-        resp = client.post(
-            url, json=body, headers=headers, timeout=float(hold_s) + 10.0
-        )
-    except httpx.HTTPError as exc:
-        # Transient network / DNS / timeout — don't count toward
-        # revocation strikes. The control plane is unreachable, not
-        # rejecting us; once it comes back the 200 path resumes.
-        log.warning("supervisor.heartbeat.failed", error=str(exc))
-        # #1219 — the control plane presented a certificate other than the
-        # pinned one. Re-pin if its CA vouches for the new one (a rotation),
-        # refuse if not (an interception). The next heartbeat uses the result.
-        if cp_tls.is_verification_failure(exc):
-            cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+    read_timeout = float(hold_s) + 10.0
+    resp = None
+    # Two attempts at most: the node-local Service, then (when that had no
+    # answer) the fallback target, in the same call so a node whose api pod is
+    # away loses one connect timeout, not a whole heartbeat interval.
+    send = client
+    retry_client: httpx.Client | None = None
+    for _attempt in range(2):
+        timeout = httpx.Timeout(read_timeout)
+        if url.startswith(_IN_CLUSTER_NODE_LOCAL_URL):
+            timeout = httpx.Timeout(read_timeout, connect=_LOCAL_API_CONNECT_TIMEOUT_S)
+        try:
+            resp = send.post(url, content=body_bytes, headers=headers, timeout=timeout)
+        except httpx.HTTPError as exc:
+            # A read timeout means an api pod took the request; anything else
+            # (refused, connect timeout, no endpoint, DNS) means the node-local
+            # Service has none.
+            note_local_api_result(url, isinstance(exc, httpx.ReadTimeout))
+            # Transient network / DNS / timeout — don't count toward
+            # revocation strikes. The control plane is unreachable, not
+            # rejecting us; once it comes back the 200 path resumes.
+            log.warning("supervisor.heartbeat.failed", error=str(exc))
+            # #1219 — the control plane presented a certificate other than the
+            # pinned one. Re-pin if its CA vouches for the new one (a rotation),
+            # refuse if not (an interception). The next heartbeat uses the result.
+            if cp_tls.is_verification_failure(exc):
+                cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
+                if retry_client is not None:
+                    retry_client.close()
+                return None
+            retry = _effective_control_plane_url(cfg).rstrip("/") + url_path
+            if retry == url:
+                if retry_client is not None:
+                    retry_client.close()
+                return None
+            url = retry
+            # ``client`` was built for the node-local URL (plain http, no
+            # certificate), so it carries no pin. The fallback gets a client
+            # built the way an ordinary heartbeat to that URL is: from the
+            # CURRENT pin file, so a re-pin since this process started is
+            # honoured, and never from the default trust store.
+            retry_client = _fallback_client(cfg, retry)
+            if retry_client is None:
+                return None
+            send = retry_client
+            continue
+        note_local_api_result(url, True)
+        break
+    if retry_client is not None:
+        retry_client.close()
+    if resp is None:
         return None
     revocation = revocation_reason(resp)
     if revocation is None and resp.status_code in (403, 404):
@@ -1539,6 +1714,25 @@ def heartbeat_once(
     # teardown un-applied.
     held_until_now = approval_state.role_services_hold(cfg.state_dir)
     approval_state.record_success(cfg.state_dir)
+
+    # #3631 — a control plane that checks the current signature form says so
+    # on every heartbeat answer. One that does not (an older build: a remote
+    # appliance paired to a control plane not yet upgraded, or a pod not yet
+    # rolled) refused our signature, accepted this heartbeat on the session
+    # token, and would refuse every proxy request too; sign the form it
+    # checks until it advertises the current one.
+    switched = note_control_plane_signature_support(resp.headers)
+    if switched is not None:
+        log.warning(
+            "supervisor.heartbeat.signature_form",
+            signing=switched,
+            reason=(
+                "control plane does not check the current signature form; "
+                "using the older one until it is upgraded"
+                if switched == "legacy"
+                else "control plane checks the current signature form"
+            ),
+        )
 
     try:
         body_out = resp.json()
@@ -1708,7 +1902,7 @@ def heartbeat_once(
         if appliance_state.maybe_fire_cluster_join(
             desired_cluster_role,
             body_out.get("desired_k3s_server_url"),  # type: ignore[arg-type]
-            body_out.get("desired_k3s_join_token"),  # type: ignore[arg-type]
+            _join_token(body_out, appliance_id, log),
             body_out.get("desired_cluster_transition_id"),  # type: ignore[arg-type]
             body_out.get("desired_cluster_transition_age_s"),  # type: ignore[arg-type]
         ):

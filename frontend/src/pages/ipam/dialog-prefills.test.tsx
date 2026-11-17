@@ -354,8 +354,19 @@ function template(
   };
 }
 
-/** The DNS and DHCP server groups (and the zone) a template can name. */
+/** The DNS and DHCP server groups (and the zone) a template can name, for a
+ *  user who may read them: the lists are asked only with the grant (#3466). */
 function serverGroups() {
+  answer("authApi", "myPermissions", () =>
+    Promise.resolve({
+      is_superadmin: false,
+      grants: [
+        { action: "read", resource_type: "dhcp_server", resource_id: null },
+        { action: "read", resource_type: "dns_group", resource_id: null },
+        { action: "read", resource_type: "dns_zone", resource_id: null },
+      ],
+    }),
+  );
   answer("dhcpApi", "listGroups", () =>
     Promise.resolve([{ id: "dhcp-grp-1", name: "campus" }]),
   );

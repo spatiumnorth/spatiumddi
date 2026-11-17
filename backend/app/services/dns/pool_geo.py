@@ -90,7 +90,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSPool, DNSPoolMember, DNSRecord
@@ -101,6 +101,11 @@ from app.models.ipam import Subnet
 # a specific geo view (rendered first) wins under BIND's first-match-wins
 # view evaluation.
 GEO_DEFAULT_VIEW = "spatium-geo-default"
+
+# Provenance marker of a record the agent read back off a live dynamic zone
+# (``app.services.dns.ingest``, which re-exports it). Defined here because the
+# placement rule below needs it and ``ingest`` imports this module.
+EXTERNAL_IMPORT_SOURCE = "ddns_external"
 
 
 @dataclass(frozen=True)
@@ -321,8 +326,9 @@ def build_view_descriptors(ordered_views: list, geo: GeoSteering) -> list[dict[s
 def view_renders_zone(view_desc: dict[str, Any], operator_target_ids: set[Any]) -> bool:
     """True when ``view_desc`` carries a copy of a zone scoped to ``operator_target_ids``.
 
-    ``operator_target_ids`` is the zone's own pinned ``view_id`` plus the view
-    of every view-scoped record in it (issue #24). An operator view renders
+    ``operator_target_ids`` is the zone's own pinned ``view_id``, or for an
+    unpinned zone the view of every view-scoped record in it (issue #24; see
+    :func:`views_rendering_zone`). An operator view renders
     the zone unless that set is non-empty and names only OTHER operator
     views; geo views and the catch-all always render it (issue #530).
 
@@ -337,6 +343,28 @@ def view_renders_zone(view_desc: dict[str, Any], operator_target_ids: set[Any]) 
     )
 
 
+def places_zone(record: Any) -> bool:
+    """Whether ``record``'s ``view_id`` counts towards where its zone renders.
+
+    A learned record (an RFC 2136 write the agent read back, filed under the
+    view whose copy it was read from) follows its zone and never moves it:
+    stamping one with a view must keep that record out of the zone's other
+    copies, not take the zone out of every other view. Every caller that
+    feeds :func:`views_rendering_zone` filters on this (or on
+    :func:`places_zone_clause` in SQL), so the bundle, the preview, the
+    transfer-key resolver and the #2275 guard agree.
+    """
+    return getattr(record, "import_source", None) != EXTERNAL_IMPORT_SOURCE
+
+
+def places_zone_clause() -> ColumnElement[bool]:
+    """:func:`places_zone` as a SQL predicate on ``DNSRecord``."""
+    return or_(
+        DNSRecord.import_source.is_(None),
+        DNSRecord.import_source != EXTERNAL_IMPORT_SOURCE,
+    )
+
+
 def views_rendering_zone(
     view_descs: list[dict[str, Any]],
     zone_view_id: Any,
@@ -345,15 +373,25 @@ def views_rendering_zone(
     """The views (in render order) that carry a copy of one zone.
 
     ``zone_view_id`` is the zone's own pinned view (or None) and
-    ``record_view_ids`` the views its view-scoped records name. The bundle
-    builder renders a zone stanza into exactly these views, and the #2275
-    collision guard counts placements from the same call, so the two cannot
-    disagree about where a zone lands. A group with no views (``view_descs``
-    empty) renders zones flat and is the caller's case to handle.
+    ``record_view_ids`` the views its view-scoped records name (those that
+    :func:`places_zone`). A pinned zone renders into its pin alone among the
+    operator views, whatever its records name: a record scoped to another
+    view is never rendered (``records_for_view`` keeps it out of the pin's
+    copy), so it must not carry the zone, and every unscoped record with it,
+    into that view's copy either. An unpinned zone renders into each view
+    its records name, or into every operator view when they name none. Geo
+    views and the catch-all render it either way (issue #530).
+
+    The bundle builder renders a zone stanza into exactly these views, and
+    the #2275 collision guard counts placements from the same call, so the
+    two cannot disagree about where a zone lands. A group with no views
+    (``view_descs`` empty) renders zones flat and is the caller's case to
+    handle.
     """
-    targets = {v for v in record_view_ids if v is not None}
     if zone_view_id is not None:
-        targets.add(zone_view_id)
+        targets = {zone_view_id}
+    else:
+        targets = {v for v in record_view_ids if v is not None}
     return [vd for vd in view_descs if view_renders_zone(vd, targets)]
 
 
@@ -409,5 +447,8 @@ __all__ = [
     "GeoView",
     "build_geo_steering",
     "build_view_descriptors",
+    "places_zone",
+    "places_zone_clause",
     "records_for_view",
+    "views_rendering_zone",
 ]

@@ -11,6 +11,14 @@ opt-in via the same compose toggle the Docker integration uses), the
 endpoint reports ``available=false`` with a one-line hint instead of
 500ing. No fallback to the per-host Docker integration: that's for
 mirroring data INTO IPAM, this is for monitoring our own runtime.
+
+#3761: the same screen also reports a Kubernetes backend. ``GET
+/containers/backends`` says which of Docker / Kubernetes / the appliance this
+deployment can see (and, for each one that cannot, which toggle enables it);
+``/containers/pods`` + the two ``/pods/{name}/logs`` routes list the release's
+pods and read their logs through ``services/appliance/containers`` and the
+support-bundle redactor. The pod inventory is the allowlist: a pod name that
+is not in a fresh listing is a 404.
 """
 
 from __future__ import annotations
@@ -18,13 +26,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import structlog
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
-from app.api.deps import SuperAdmin
+from app.api.deps import DB, SuperAdmin
+from app.api.v1.appliance.containers import _sse_log_response
+from app.config import settings
 from app.core.exc_text import describe_exc
+from app.core.responses import EventStreamResponse
+from app.models.audit import AuditLog
+from app.services.appliance import containers as pod_svc
+from app.services.appliance import k8s
+from app.services.support_bundle.scrub import LOG_CONTEXT_LINES, redact_log_tail
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -242,3 +258,178 @@ async def container_stats(
 
         rows.sort(key=lambda r: r.name)
         return ContainerStatsResponse(available=True, rows=rows)
+
+
+# ── Backends + Kubernetes pods (#3761) ─────────────────────────────────
+
+_SA_REASON = (
+    "The api has no usable Kubernetes ServiceAccount. Set api.serviceAccount.enabled=true "
+    "in the Helm values (it grants read on pods and pods/log in the release namespace)."
+)
+
+
+class BackendStatus(BaseModel):
+    available: bool
+    reason: str | None = None
+    detail: str | None = None  # namespace for kubernetes
+
+
+class ContainerBackendsResponse(BaseModel):
+    docker: BackendStatus
+    kubernetes: BackendStatus
+    appliance: bool
+
+
+class PodRow(BaseModel):
+    name: str
+    component: str
+    image: str
+    state: str
+    status: str
+    health: str | None
+    started_at: str | None
+    containers: list[str]
+
+
+class PodLogsResponse(BaseModel):
+    name: str
+    tail: str
+
+
+class PodListResponse(BaseModel):
+    available: bool
+    reason: str | None = None
+    rows: list[PodRow] = []
+
+
+def _kube_probe() -> tuple[bool, str | None]:
+    """Can the api list pods in its own namespace right now?"""
+    if k8s.get_config() is None:
+        return False, _SA_REASON
+    try:
+        pod_svc.release_pods()
+    except pod_svc.DockerUnavailableError as exc:
+        text = str(exc)
+        if "403" in text:
+            return False, (
+                "kubeapi refused to list pods; the api ServiceAccount lacks the pod "
+                "read Role. Set api.serviceAccount.enabled=true in the Helm values."
+            )
+        return False, f"kubeapi: {text}"
+    return True, None
+
+
+@router.get("/containers/backends", response_model=ContainerBackendsResponse)
+async def container_backends(_: SuperAdmin) -> ContainerBackendsResponse:
+    """Which runtimes this deployment can show, and why not for the others."""
+    docker_ok = _socket_available()
+    kube_ok, kube_reason = await anyio.to_thread.run_sync(_kube_probe)
+    cfg = k8s.get_config()
+    return ContainerBackendsResponse(
+        docker=BackendStatus(
+            available=docker_ok,
+            reason=None if docker_ok else f"{DOCKER_SOCKET} is not mounted into the api container.",
+        ),
+        kubernetes=BackendStatus(
+            available=kube_ok,
+            reason=kube_reason,
+            detail=cfg.namespace if (kube_ok and cfg) else None,
+        ),
+        appliance=bool(settings.appliance_mode),
+    )
+
+
+@router.get("/containers/pods", response_model=PodListResponse)
+async def container_pods(_: SuperAdmin) -> PodListResponse:
+    if k8s.get_config() is None:
+        return PodListResponse(available=False, reason=_SA_REASON)
+    try:
+        pods = await anyio.to_thread.run_sync(pod_svc.release_pods)
+    except pod_svc.DockerUnavailableError as exc:
+        return PodListResponse(available=False, reason=f"kubeapi: {exc}")
+    rows = []
+    for p in pods:
+        s = pod_svc._parse_pod_to_summary(p)  # noqa: SLF001
+        rows.append(
+            PodRow(
+                name=s.name,
+                component=s.component,
+                image=s.image,
+                state=s.state,
+                status=s.status,
+                health=s.health,
+                started_at=s.started_at.isoformat() if s.started_at else None,
+                containers=[
+                    c["name"]
+                    for c in (p.get("spec") or {}).get("containers") or []
+                    if c.get("name")
+                ],
+            )
+        )
+    rows.sort(key=lambda r: (r.component, r.name))
+    return PodListResponse(available=True, rows=rows)
+
+
+async def _resolve_pod(name: str) -> str | None:
+    """Fresh-listing allowlist: 404 for any name that is not a release pod.
+    Returns the default log container."""
+    if k8s.get_config() is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, _SA_REASON)
+    try:
+        found = await anyio.to_thread.run_sync(pod_svc.find_release_pod, name)
+    except pod_svc.DockerUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    if found is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no such pod {name!r}")
+    return found[1]
+
+
+def _audit_log_read(db: DB, user: Any, name: str, how: str) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="container_logs_read",
+            resource_type="container",
+            resource_id=f"pod/{name}",
+            resource_display=name,
+            result="success",
+            new_value={"mode": how},
+        )
+    )
+
+
+@router.get("/containers/pods/{name}/logs", response_model=PodLogsResponse)
+async def pod_logs(
+    name: str,
+    user: SuperAdmin,
+    db: DB,
+    tail: int = Query(200, ge=1, le=5000),
+) -> PodLogsResponse:
+    default_container = await _resolve_pod(name)
+    requested = tail + LOG_CONTEXT_LINES
+    try:
+        text = await anyio.to_thread.run_sync(
+            lambda: pod_svc.get_container_logs(name, tail=requested, container=default_container)
+        )
+    except pod_svc.DockerUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    _audit_log_read(db, user, name, "tail")
+    await db.commit()
+    return PodLogsResponse(name=name, tail=redact_log_tail(text, tail, requested=requested))
+
+
+@router.get("/containers/pods/{name}/logs/stream", response_class=EventStreamResponse)
+async def pod_logs_stream(
+    name: str,
+    request: Request,
+    user: SuperAdmin,
+    db: DB,
+    tail: int = Query(100, ge=1, le=5000),
+):
+    default_container = await _resolve_pod(name)
+    _audit_log_read(db, user, name, "stream")
+    await db.commit()
+    gen = pod_svc.stream_container_logs(name, tail=tail, container=default_container)
+    return _sse_log_response(gen, request, superadmin_only=True)

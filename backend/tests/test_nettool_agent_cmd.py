@@ -31,11 +31,12 @@ async def test_enqueue_pop_deliver_roundtrip() -> None:
         assert cmd is not None
         assert cmd.tool == "ping"
         assert cmd.params == {"host": "1.1.1.1"}
-        delivered = agent_cmd.deliver_result(
+        delivered = await agent_cmd.deliver_result(
             agent_cmd.NetToolResult(
                 request_id=cmd.request_id,
                 result={"tool": "ping", "argv": ["ping"], "available": True},
-            )
+            ),
+            appliance_id=appliance_id,
         )
         assert delivered is True
 
@@ -88,8 +89,9 @@ async def test_pop_skips_cancelled() -> None:
         assert cmd is not None
         # The cancelled entry must have been skipped — we get the live one.
         assert cmd.params == {"host": "9.9.9.9"}
-        agent_cmd.deliver_result(
-            agent_cmd.NetToolResult(request_id=cmd.request_id, result={"ok": True})
+        await agent_cmd.deliver_result(
+            agent_cmd.NetToolResult(request_id=cmd.request_id, result={"ok": True}),
+            appliance_id=appliance_id,
         )
 
     sup = asyncio.create_task(supervisor())
@@ -106,10 +108,11 @@ async def test_pop_returns_none_on_timeout() -> None:
     assert cmd is None
 
 
-def test_deliver_stale_when_future_evicted() -> None:
+async def test_deliver_stale_when_future_evicted() -> None:
     # A result for a request_id with no awaiting future returns False.
-    delivered = agent_cmd.deliver_result(
-        agent_cmd.NetToolResult(request_id=str(uuid.uuid4()), result={"ok": True})
+    delivered = await agent_cmd.deliver_result(
+        agent_cmd.NetToolResult(request_id=str(uuid.uuid4()), result={"ok": True}),
+        appliance_id=uuid.uuid4(),
     )
     assert delivered is False
 

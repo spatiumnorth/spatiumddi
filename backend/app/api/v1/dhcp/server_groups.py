@@ -75,7 +75,7 @@ class GroupCreate(BaseModel):
     description: str = ""
     mode: str = "hot-standby"
     dhcp_socket_mode: str = "direct"
-    heartbeat_delay_ms: int = 10000
+    heartbeat_delay_ms: int = 2000
     max_response_delay_ms: int = 60000
     max_ack_delay_ms: int = 10000
     max_unacked_clients: int = 5

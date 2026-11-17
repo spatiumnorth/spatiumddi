@@ -37,6 +37,7 @@ missed again; the alternative is a 15th caller getting it wrong.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import urlparse
 
@@ -128,6 +129,39 @@ def make_async_redis(url: str, **kwargs: Any) -> aioredis.Redis:
         db=db,
         password=url_password,
     )
+
+
+# One pooled client per event loop for the hot, unauthenticated probe paths
+# (#3693). ``/health/ready`` used to build a client — a fresh connection pool
+# — on every call and close it again, so every kubelet probe and every
+# load-balancer check paid a TCP connect plus the client's connect handshake
+# (``CLIENT SETINFO`` since redis-py 5; more round trips on later majors) for
+# a single PING. Under a probe-heavy soak that handshake was most of the
+# endpoint's CPU. A shared pool keeps the connections; the timeouts and the
+# Sentinel re-resolution are the pool's own, so a failover is still followed
+# and a dead host still costs its bounded timeout.
+#
+# Keyed on the running loop (an asyncio connection cannot cross loops), the
+# URL + kwargs, and the factory itself, so a test that monkeypatches
+# ``make_async_redis`` gets its own client rather than a previous test's.
+_shared: tuple[Any, ...] | None = None
+
+
+def shared_async_redis(url: str, **kwargs: Any) -> aioredis.Redis:
+    """Return the process's pooled client for ``url`` on the running loop.
+
+    Callers must NOT ``aclose()`` it. Same construction (and the same #925
+    default connect timeout) as ``make_async_redis``.
+    """
+    global _shared
+    loop = asyncio.get_running_loop()
+    factory = make_async_redis
+    key = (loop, url, tuple(sorted(kwargs.items())), factory)
+    if _shared is not None and _shared[:4] == key:
+        return _shared[4]  # type: ignore[no-any-return]
+    client = factory(url, **kwargs)
+    _shared = (*key, client)
+    return client
 
 
 def _sentinel_kwargs(password: str | None, kwargs: dict[str, Any]) -> dict[str, Any]:

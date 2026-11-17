@@ -50,10 +50,13 @@ _SKIP_FILE_NAMES: frozenset[str] = frozenset()
 # could not store them. ``_walk_rendered`` also drops any file holding a NUL
 # byte, which catches binary files whatever they are called.
 # And a dynamic zone's ``.owned`` sidecar: the RRsets the control plane owns
-# in it, bookkeeping for carrying RFC 2136 records across a render (#2850).
+# in it, bookkeeping for carrying RFC 2136 records across a render (#2850),
+# and a static zone's ``.unrendered`` marker (#3632), bookkeeping for keeping
+# a view's copy apart while named still holds a client's names in it.
 _SKIP_FILE_SUFFIXES: tuple[str, ...] = (
     ".sha256",
     ".owned",
+    ".unrendered",
     ".tmp",
     ".jnl",
     ".jbk",

@@ -42,6 +42,7 @@ supervisor, so this does not reach it; see ``docs/features/DNS.md`` 8.0.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -209,24 +210,32 @@ def _parse_ts(value: Any) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
 
 
-def container_oom_report(
+@dataclass(frozen=True)
+class ContainerOomKill:
+    """The kubelet's word that the server's container was last ended by the
+    OOM killer, and the kill is still current."""
+
+    killed_at: datetime
+    #: The container's memory limit as the kubelet states it (``"2Gi"``), or
+    #: None when the supervisor did not report one.
+    memory_limit: str | None
+    service: str
+    runtime: dict[str, Any]
+
+
+def container_oom_kill(
     role_health: dict[str, Any] | None,
     driver: str | None,
     now: datetime,
-) -> tuple[dict[str, str], datetime] | None:
-    """``({"status", "reason"}, killed_at)`` while the server's container
-    was last ended by the OOM killer and has not since stayed up for
-    :data:`STABLE_SECONDS`; None otherwise (no report, another reason, or
-    a kill the daemon has outlived)."""
-    service = DRIVER_SERVICE.get(driver or "")
-    if service is None or not isinstance(role_health, dict):
+) -> ContainerOomKill | None:
+    """The server's container's current OOM kill: its last termination was
+    ``OOMKilled`` and it has not since stayed up for :data:`STABLE_SECONDS`.
+    None otherwise (no report, another reason, or a kill the daemon has
+    outlived)."""
+    found = _container_entry(role_health, driver)
+    if found is None:
         return None
-    entry = role_health.get(service)
-    if not isinstance(entry, dict):
-        return None
-    runtime = entry.get("container")
-    if not isinstance(runtime, dict):
-        return None
+    service, _entry, runtime = found
     last = runtime.get("last_termination")
     if not isinstance(last, dict) or last.get("reason") != _OOM_REASON:
         return None
@@ -238,7 +247,31 @@ def container_oom_report(
     killed_at = _parse_ts(last.get("finished_at"))
     if killed_at is None or killed_at > now:
         killed_at = now
-    limit = str(runtime.get("memory_limit") or "").strip()
+    limit = str(runtime.get("memory_limit") or "").strip() or None
+    return ContainerOomKill(
+        killed_at=killed_at, memory_limit=limit, service=service, runtime=runtime
+    )
+
+
+def container_oom_report(
+    role_health: dict[str, Any] | None,
+    driver: str | None,
+    now: datetime,
+) -> tuple[dict[str, str], datetime] | None:
+    """``({"status", "reason"}, killed_at)`` while the server's container
+    was last ended by the OOM killer and has not since stayed up for
+    :data:`STABLE_SECONDS`; None otherwise (no report, another reason, or
+    a kill the daemon has outlived)."""
+    kill = container_oom_kill(role_health, driver, now)
+    if kill is None:
+        return None
+    service, runtime, killed_at, limit = (
+        kill.service,
+        kill.runtime,
+        kill.killed_at,
+        kill.memory_limit,
+    )
+    running_since = _parse_ts(runtime.get("running_since"))
     limit_txt = f"its {limit} memory limit" if limit else "its memory limit"
     try:
         restarts = int(runtime.get("restart_count") or 0)
@@ -669,6 +702,8 @@ __all__ = [
     "carry_restart_history",
     "restarts_in_window",
     "container_crash_loop_report",
+    "ContainerOomKill",
+    "container_oom_kill",
     "container_oom_report",
     "container_verdict",
     "daemon_reported_by",

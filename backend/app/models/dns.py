@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -185,12 +185,12 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(50), nullable=False, default="hmac-sha256"
     )
 
-    # ── BIND9 catalog zones (RFC 9432) — distribute zones across the
-    # group via one catalog instead of per-server config push. BIND 9.18+
-    # only. The producer is the group's `is_primary=True` server; every
-    # other bind9 member joins as a consumer. ``catalog_zone_serial`` is
-    # bumped by the bundle builder whenever the membership list changes,
-    # so a NOTIFY fires automatically on add/remove.
+    # ── BIND9 catalog zones (RFC 9432) — the group's `is_primary=True`
+    # server publishes one catalog of the group's primary zones, for
+    # secondaries OUTSIDE the group. BIND 9.18+ only. Other members never
+    # consume it: each already gets every zone in its bundle, and consuming
+    # would load every zone twice (#3764). The agent stamps the catalog's
+    # serial each time the membership in its bundle changes.
     catalog_zones_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
@@ -331,6 +331,21 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_renders_soa_timers: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # #3940 — this server's agent reports a secondary / stub zone's SERVED
+    # serial (``served-serials`` in ``X-Spatium-Agent-Features``) and nothing
+    # for a zone named holds no copy of. An older agent reports the bundle's
+    # serial, 0, whatever named holds, so a serving-0 secondary is "not
+    # synced" only for an agent that says so (``zone_state_in_sync``).
+    agent_reports_served_serials: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # #4040 — this server's agent reads blocklist entries packed as gzip +
+    # base64 runs of domains: it sent ``packed-blocklists`` in
+    # ``X-Spatium-Agent-Features`` on its last register or heartbeat. False for
+    # an agent of an older release, which is sent one JSON object per entry.
+    agent_renders_packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -366,6 +381,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #3551 — the agent container's own memory limit in bytes (its cgroup
+    # ``memory.max``), as last reported on the heartbeat. named and the agent
+    # share it, so it is what a group's RPZ and zone data must fit inside.
+    # NULL means UNKNOWN: an agent too old to report, an agentless driver, or
+    # a container with no limit at all. Only overwritten when a heartbeat
+    # carries the field. Read by ``services/dns/memory_estimate``.
+    memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # ── #1067 daemon state ──
     #
@@ -766,6 +788,12 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     # ``RENDERER_REVISION`` of the code that rendered it (#1185); NULL on
     # bundles rendered before the column existed, which read as stale.
     renderer_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # #4040 — the blocklist entries are packed runs (the server's agent read
+    # them at render time). The long-poll serves a bundle only in the shape
+    # THIS request's agent can read.
+    packed_blocklists: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -802,11 +830,12 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DNSSEC — auto | yes | no
     dnssec_validation: Mapped[str] = mapped_column(String(10), nullable=False, default="auto")
 
-    # GSS-TSIG (Kerberos)
-    gss_tsig_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    gss_tsig_keytab_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    gss_tsig_realm: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    gss_tsig_principal: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The four ``gss_tsig_*`` columns (#3561) are no longer mapped: they were
+    # stored and never rendered. They stay in the database for one release so
+    # a rolling upgrade's old api pods, which still map them, keep serving
+    # (expand/contract, docs/DEVELOPMENT.md); ``gss_tsig_enabled`` carries a
+    # ``false`` server default, so inserts from this model still satisfy its
+    # NOT NULL. The contract migration that drops them comes in the next release.
 
     # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")
@@ -1134,7 +1163,15 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     __tablename__ = "dns_zone"
     __table_args__ = (
-        UniqueConstraint("group_id", "view_id", "name", name="uq_dns_zone_group_view_name"),
+        # Partial: a trashed zone must not hold its name in a view (#3824).
+        Index(
+            "uq_dns_zone_group_view_name",
+            "group_id",
+            "view_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dns_zone_name", "name"),
     )
 
@@ -1152,6 +1189,19 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     # name: FQDN with trailing dot, e.g. "example.com."
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    @validates("name")
+    def _check_name(self, _key: str, value: str) -> str:
+        # Every path that creates a zone (REST, Copilot, importers,
+        # reconcilers) lands here, so a name the DNS server cannot take
+        # as a config statement / file name is refused at the row.
+        from app.core.dns_names import zone_name_storage_error  # noqa: PLC0415
+
+        err = zone_name_storage_error(value)
+        if err is not None:
+            raise ValueError(err)
+        return value
+
     # zone_type values: primary | secondary | stub | forward
     zone_type: Mapped[str] = mapped_column(String(20), nullable=False, default="primary")
     # kind: forward | reverse
@@ -1349,6 +1399,8 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "dns_record"
     __table_args__ = (
         Index("ix_dns_record_zone_name", "zone_id", "name"),
+        # The DDNS name-holder check (#3807) matches ``lower(name)``.
+        Index("ix_dns_record_zone_lower_name", "zone_id", sa_text("lower(name)")),
         Index("ix_dns_record_fqdn", "fqdn"),
     )
 
@@ -1673,6 +1725,9 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 # ── Blocking Lists / RPZ ────────────────────────────────────────────────────
 
+#: Values of ``DNSBlockList.feed_wildcard_mode`` (#4190).
+FEED_WILDCARD_MODES = ("by_syntax", "always", "never")
+
 # Association tables: a blocklist can be applied to many server groups and/or
 # many views. A view or group can reference many blocklists.
 dns_blocklist_group_assoc = Table(
@@ -1742,20 +1797,42 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # replaces :: (#2124).
     sinkhole_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     # Whether a feed-sourced entry blocks the named domain's SUBDOMAINS too
-    # (#894). Default on, because that is what every one of these feeds
-    # means — a list naming ``tracker.example`` intends
-    # ``cdn.tracker.example`` as well, and the manual add-entry form has
-    # always defaulted the same way. Off suits a host-specific feed (a
-    # threat-intel drop of individual C2 FQDNs), where blocking the parent
-    # domain would be over-blocking.
+    # (#894, tri-state since #4190):
+    #
+    # * ``by_syntax`` (default) — each entry follows what its own source
+    #   line says. An adblock ``||name^`` is "name and every subdomain"
+    #   (wildcard); a hosts line (``0.0.0.0 name``) or a bare domain names
+    #   exactly that host (exact trigger only), as AdGuard Home and every
+    #   hosts-file resolver read them. A ``*.name`` line of a domains feed is
+    #   wildcard. Halves the RPZ for a hosts-format list.
+    # * ``always`` — every feed entry blocks subdomains too, whatever the
+    #   syntax (the pre-#4190 behaviour). For a plain-domain feed whose
+    #   publisher means "this domain and everything under it" (HaGeZi's
+    #   ``wildcard/`` lists).
+    # * ``never`` — apex only; suits a host-specific feed (a threat-intel
+    #   drop of individual C2 FQDNs) where blocking the parent is over-blocking.
     #
     # Only feed entries consult it; a manual entry's ``is_wildcard`` is the
     # operator's own per-row choice and is never rewritten by this flag.
+    feed_wildcard_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="by_syntax", server_default="by_syntax"
+    )
+
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # DEPRECATED (#4190), removed in a later release: the pre-tri-state
+    # boolean, kept so an api pod still on the old release works during a
+    # rolling upgrade (expand/contract, #296). Derived from
+    # ``feed_wildcard_mode`` on every write (false only for ``never``); the
+    # API still returns it for old clients.
     feed_entries_are_wildcard: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    @validates("feed_wildcard_mode")
+    def _sync_legacy_wildcard(self, _key: str, value: str) -> str:
+        self.feed_entries_are_wildcard = value != "never"
+        return value
 
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
@@ -1765,7 +1842,10 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Rules the last adblock-format refresh could not enforce, by category
-    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count.
+    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count, where
+    # ``malformed`` is the total of the reason buckets (#3519: ``star_in_name``,
+    # ``no_anchor``, ``trailing_dot``, ``start_anchor``, ``bare_star``,
+    # ``dotless``, ``other``); rows written before #3519 carry only the total.
     # NULL = no adblock refresh yet, or a format with no rule syntax to lose.
     feed_parse_skipped: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
 

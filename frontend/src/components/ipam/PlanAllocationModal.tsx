@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { Loader2, Plus, X } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { formatCount } from "@/lib/format-count";
 import {
   ipamApi,
   type IPBlock,
@@ -9,6 +10,7 @@ import {
   type PlanRequestItem,
   formatApiError,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 interface RowDraft {
   count: string;
@@ -169,9 +171,9 @@ export function PlanAllocationModal({
           <p className="text-xs text-destructive">{validationError}</p>
         )}
         {planMut.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(planMut.error)}
-          </p>
+          </FormError>
         )}
 
         <div className="flex items-center justify-end gap-2">
@@ -221,7 +223,7 @@ export function PlanAllocationModal({
                             {a.first} – {a.last}
                           </td>
                           <td className="px-2 py-1 text-right">
-                            {a.size.toLocaleString()}
+                            {formatCount(a.size_exact, a.size)}
                           </td>
                         </tr>
                       ))}

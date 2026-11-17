@@ -5,7 +5,13 @@ import { Code2, LogOut, Menu, Moon, Sun, UserCircle2 } from "lucide-react";
 import { GlobalSearch } from "@/components/GlobalSearch";
 import { KeyboardShortcutsHelp } from "@/components/KeyboardShortcutsOverlay";
 
-export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
+export function Header({
+  onMobileMenu,
+  mobileNavOpen = false,
+}: {
+  onMobileMenu?: () => void;
+  mobileNavOpen?: boolean;
+}) {
   const { logout } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
@@ -22,6 +28,8 @@ export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
         type="button"
         onClick={onMobileMenu}
         aria-label="Open navigation"
+        aria-expanded={mobileNavOpen}
+        aria-controls="app-sidebar"
         className="md:hidden rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
       >
         <Menu className="h-5 w-5" />
