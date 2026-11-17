@@ -229,7 +229,15 @@ def _filtered(
     if origin is not None:
         stmt = stmt.where(ChangeRequest.origin == origin)
     if state is not None:
-        stmt = stmt.where(ChangeRequest.state == state)
+        # Several states as a comma list ("executed,rejected"): the admin
+        # History reads the decided ones without the pending ones eating its
+        # window (#4383).
+        states = [x.strip() for x in state.split(",") if x.strip()]
+        stmt = stmt.where(
+            ChangeRequest.state == states[0]
+            if len(states) == 1
+            else ChangeRequest.state.in_(states)
+        )
     if resource_type is not None:
         stmt = stmt.where(ChangeRequest.resource_type == resource_type)
     if requested_by_user_id is not None:

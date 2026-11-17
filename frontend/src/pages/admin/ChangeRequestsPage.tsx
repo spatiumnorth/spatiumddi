@@ -21,8 +21,13 @@
  * + backend ``require_module`` both gate it).
  */
 
-import { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { AxiosResponse } from "axios";
 import {
   Ban,
@@ -877,6 +882,63 @@ function PoliciesTab() {
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 
+const PAGE_SIZE = 100;
+
+type PagedRequests = ReturnType<typeof usePagedRequests>;
+
+// A paged read of the gate queue for the given states, newest first.
+function usePagedRequests(
+  states: ChangeRequestState[],
+  opts: { enabled?: boolean; refetchInterval?: (rows: number) => number } = {},
+) {
+  const q = useInfiniteQuery({
+    queryKey: ["change-requests", "list", states.join(",")],
+    queryFn: ({ pageParam }) =>
+      changeRequestsApi.listPage({
+        states,
+        limit: PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
+    enabled: opts.enabled,
+    refetchInterval: opts.refetchInterval
+      ? (query) =>
+          opts.refetchInterval!(
+            (query.state.data?.pages ?? []).reduce(
+              (n, p) => n + p.items.length,
+              0,
+            ),
+          )
+      : undefined,
+  });
+  const rows = (q.data?.pages ?? []).flatMap((p) => p.items);
+  const total = q.data?.pages[q.data.pages.length - 1]?.total ?? rows.length;
+  return { ...q, rows, total };
+}
+
+// "Showing the newest N of M" + Load more, so a cut list is never silent.
+function LoadMore({ q, noun }: { q: PagedRequests; noun: string }) {
+  if (!q.hasNextPage) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+      <span>
+        Showing the newest {q.rows.length} of {q.total} {noun} requests.
+      </span>
+      <HeaderButton
+        variant="secondary"
+        disabled={q.isFetchingNextPage}
+        onClick={() => void q.fetchNextPage()}
+      >
+        {q.isFetchingNextPage ? "Loading…" : "Load more"}
+      </HeaderButton>
+    </div>
+  );
+}
+
 export function ChangeRequestsPage() {
   const { can, isSuperadmin } = usePermissions();
   const canApprove = can("approve", "change_request");
@@ -895,26 +957,17 @@ export function ChangeRequestsPage() {
 
   const qc = useQueryClient();
 
-  const queueQuery = useQuery({
-    queryKey: ["change-requests", "pending"],
-    queryFn: () => changeRequestsApi.list({ state: "pending", limit: 500 }),
+  // Both tabs page the list with ``offset`` and read the total from
+  // X-Total-Count (#4383), as the Requests page does (#3937): a fixed window
+  // dropped the older requests with no word that they existed.
+  const queueQuery = usePagedRequests(["pending"], {
     // Adaptive poll (FleetTab pattern): tighter while anything is pending.
-    refetchInterval: (q) => ((q.state.data?.length ?? 0) > 0 ? 5000 : 20000),
+    refetchInterval: (rows) => (rows > 0 ? 5000 : 20000),
   });
 
-  const historyQuery = useQuery({
-    queryKey: ["change-requests", "history"],
-    queryFn: () => changeRequestsApi.list({ limit: 200 }),
+  const historyQuery = usePagedRequests(TERMINAL_STATES, {
     enabled: tab === "history",
   });
-
-  const historyRows = useMemo(
-    () =>
-      (historyQuery.data ?? []).filter((r) =>
-        TERMINAL_STATES.includes(r.state),
-      ),
-    [historyQuery.data],
-  );
 
   const cancelMutation = useMutation({
     mutationFn: (id: string) => changeRequestsApi.cancel(id),
@@ -962,9 +1015,9 @@ export function ChangeRequestsPage() {
                 )}
               >
                 {t}
-                {t === "queue" && (queueQuery.data?.length ?? 0) > 0 && (
+                {t === "queue" && queueQuery.total > 0 && (
                   <span className="ml-1.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-                    {queueQuery.data?.length}
+                    {queueQuery.total}
                   </span>
                 )}
               </button>
@@ -976,7 +1029,7 @@ export function ChangeRequestsPage() {
             <p className="text-xs text-muted-foreground">Loading…</p>
           ) : (
             <RequestTable
-              rows={queueQuery.data ?? []}
+              rows={queueQuery.rows}
               canApprove={canApprove}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
@@ -986,13 +1039,14 @@ export function ChangeRequestsPage() {
               emptyText="Nothing waiting for approval."
             />
           ))}
+        {tab === "queue" && <LoadMore q={queueQuery} noun="pending" />}
 
         {tab === "history" &&
           (historyQuery.isLoading ? (
             <p className="text-xs text-muted-foreground">Loading…</p>
           ) : (
             <RequestTable
-              rows={historyRows}
+              rows={historyQuery.rows}
               canApprove={false}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
@@ -1002,6 +1056,7 @@ export function ChangeRequestsPage() {
               emptyText="No decided requests yet."
             />
           ))}
+        {tab === "history" && <LoadMore q={historyQuery} noun="decided" />}
 
         {tab === "policies" && isSuperadmin && <PoliciesTab />}
       </div>

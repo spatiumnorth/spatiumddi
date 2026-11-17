@@ -26,7 +26,6 @@ vi.mock("@/lib/api", async () => {
     authApi: { ...actual.authApi, me: async () => ({ id: "me" }) },
     changeRequestsApi: {
       ...actual.changeRequestsApi,
-      list: async () => [cr("grown")],
       listPage: async () => ({ items: [cr("grown")], total: 1 }),
       approve: (...a: unknown[]) =>
         (approve as (...x: unknown[]) => unknown)(...a),

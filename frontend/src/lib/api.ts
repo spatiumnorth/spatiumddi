@@ -12107,6 +12107,30 @@ export const changeRequestsApi = {
     api
       .get<ChangeRequest[]>("/change-requests", { params })
       .then((r) => r.data),
+  // One window plus the number matching the filter (X-Total-Count), so the
+  // admin queue can say how many it did not draw (#4383). ``states`` is sent
+  // as the API's comma list.
+  listPage: (
+    params: Omit<ChangeRequestListParams, "state"> & {
+      states?: ChangeRequestState[];
+    } = {},
+  ) => {
+    const { states, ...rest } = params;
+    return api
+      .get<ChangeRequest[]>("/change-requests", {
+        params: {
+          ...rest,
+          ...(states?.length ? { state: states.join(",") } : {}),
+        },
+      })
+      .then((r) => {
+        const header = Number(r.headers?.["x-total-count"]);
+        return {
+          items: r.data,
+          total: Number.isFinite(header) ? header : r.data.length,
+        };
+      });
+  },
   get: (id: string) =>
     api.get<ChangeRequest>(`/change-requests/${id}`).then((r) => r.data),
   // No dedicated pending-count endpoint server-side — derive the badge from
