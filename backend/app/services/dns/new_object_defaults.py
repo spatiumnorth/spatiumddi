@@ -58,6 +58,11 @@ async def load_dns_defaults(db: AsyncSession) -> DNSNewObjectDefaults:
     if zone_type not in ZONE_TYPES:
         logger.warning("dns_default_invalid", field="dns_default_zone_type", value=zone_type)
         zone_type = builtin.zone_type
+    if dnssec == "yes":
+        # A new group has no trust anchor, and BIND9 refuses ``yes`` without
+        # one (#3560); a default stored before Settings refused it is "auto".
+        logger.warning("dns_default_invalid", field="dns_default_dnssec_validation", value=dnssec)
+        dnssec = builtin.dnssec_validation
     if dnssec not in DNSSEC_VALIDATION_MODES:
         logger.warning("dns_default_invalid", field="dns_default_dnssec_validation", value=dnssec)
         dnssec = builtin.dnssec_validation

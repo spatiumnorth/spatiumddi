@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import user_has_permission
 from app.models.address_set import AddressSet
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 
@@ -41,6 +42,7 @@ logger = structlog.get_logger(__name__)
 # we stop loading and log a structured warning; correctness is unchanged for the
 # normal (tens-of-sets) case. The interval list is additionally sorted + merged
 # so membership is a binary search, not a linear scan over every interval.
+ADDRESS_SETS_MODULE = "ipam.address_sets"
 _MAX_SETS_PER_SUBNET: int = 4096
 _MAX_EXPLICIT_HOSTS: int = 1_000_000
 
@@ -122,16 +124,26 @@ class WritableSetRanges:
 
 
 async def load_writable_set_ranges(
-    db: AsyncSession, user: Any, subnet_id: uuid.UUID
+    db: AsyncSession, user: Any, subnet_id: uuid.UUID, action: str = "write"
 ) -> WritableSetRanges:
     """Return the :class:`WritableSetRanges` the ``user`` can WRITE on this subnet.
+
+    ``action`` names the grant a set must carry to count: ``"write"`` (the
+    default) for a mutation, ``"delete"`` for removing addresses, so a delete
+    grant scoped to one set reaches only the addresses inside that set.
 
     A set counts when the user holds ``write`` on its address_set id — ``admin``
     implies ``write`` via the permission matcher, so a SINGLE ``write`` check per
     set is sufficient (#9; the old code resolved ``write`` then ``admin``,
     doubling the role-tree walk). Empty when none — the caller still must hold
     subnet write for any IP outside these ranges.
+
+    Always empty while the ``ipam.address_sets`` feature module is off (#3762):
+    the sets are hidden and their API 404s, so a grant on one must not widen
+    allocation write access the operator can no longer see or manage.
     """
+    if not await is_module_enabled(db, ADDRESS_SETS_MODULE):
+        return WritableSetRanges()
     # Bound the rows we pull per subnet (#7) — a pathological subnet with an
     # absurd number of delegated sets must not turn this per-request build into
     # an unbounded scan. ``+1`` so we can detect (and warn on) the overflow.
@@ -160,7 +172,7 @@ async def load_writable_set_ranges(
     explicit_overflowed = False
     for set_id, range_kind, start_addr, end_addr, explicit in fetched:
         # ``admin`` implies ``write`` through ``_action_matches`` — one check.
-        if not user_has_permission(user, "write", "address_set", set_id):
+        if not user_has_permission(user, action, "address_set", set_id):
             continue
         if range_kind == "contiguous" and start_addr is not None and end_addr is not None:
             s = _pack_ip(start_addr)

@@ -80,6 +80,13 @@ export function IPAddressPicker({
           setOpen(false),
         )
       }
+      // Focus leaving the picker (Tab / Shift+Tab past it) closes the list,
+      // or the next Esc, now outside the picker, closes the dialog with the
+      // list still showing (#3486). A move onto a result keeps it open.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setOpen(false);
+      }}
     >
       <div className="relative">
         <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -117,7 +124,14 @@ export function IPAddressPicker({
       </div>
 
       {open && debouncedQuery.length >= 2 && (
-        <div className="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-auto rounded-md border bg-background shadow-md">
+        <div
+          className="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-auto rounded-md border bg-background shadow-md"
+          // A press in the list keeps focus where it is, so the blur above
+          // cannot close the list before a click on a result lands (a
+          // browser that does not focus a pressed button would otherwise
+          // blur the search with no related target).
+          onMouseDown={(e) => e.preventDefault()}
+        >
           {q.isFetching && results.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
               Searching…

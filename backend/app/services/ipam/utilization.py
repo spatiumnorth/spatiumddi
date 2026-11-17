@@ -115,7 +115,11 @@ def block_utilization_percent(allocated: int, network: object) -> float:
 
 
 async def recount_subnets_and_blocks(
-    db: AsyncSession, subnet_ids: Iterable[uuid.UUID], *, audit_lock: bool = True
+    db: AsyncSession,
+    subnet_ids: Iterable[uuid.UUID],
+    *,
+    audit_lock: bool = True,
+    include_deleted: bool = False,
 ) -> None:
     """Recount the cached counters of ``subnet_ids`` and every block above them.
 
@@ -130,6 +134,11 @@ async def recount_subnets_and_blocks(
     after this call; see ``_lock_for_recount`` in the IPAM router. Holds the
     rows until commit, so call it last, never before slow work such as a
     driver call.
+
+    ``include_deleted=True`` is for a soft-delete batch recounting after its
+    own stamp: the soft-delete filter would hide the trashed subnets, and
+    they would keep the counts they held before their scopes' mirrors were
+    freed (#3354). Live rows are read as before.
     """
     # The writers live in the IPAM router; imported here, not at module
     # level, because the router imports this module.
@@ -145,9 +154,19 @@ async def recount_subnets_and_blocks(
     if not ids:
         return
     await db.flush()
-    await _update_subnets_utilization(db, ids, audit_lock=audit_lock)
+    await _update_subnets_utilization(
+        db, ids, audit_lock=audit_lock, include_deleted=include_deleted
+    )
     block_ids = (
-        (await db.execute(select(Subnet.block_id).where(Subnet.id.in_(ids)))).scalars().all()
+        (
+            await db.execute(
+                select(Subnet.block_id)
+                .where(Subnet.id.in_(ids))
+                .execution_options(include_deleted=include_deleted)
+            )
+        )
+        .scalars()
+        .all()
     )
     await _update_blocks_utilization(
         db, [b for b in block_ids if b is not None], audit_lock=audit_lock

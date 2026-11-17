@@ -93,6 +93,10 @@ class AgentConfig:
     # #1281 — pinned trust (the supervisor's pin, on an appliance). Wins over
     # tls_ca_path and the skip; see ``pinned_context``.
     tls_pinned_certs_path: str | None = None
+    # #3757 — address the control plane reads zones back from, sent at
+    # registration as ``host``. ``None`` leaves the server's host as it is
+    # (new rows then fall back to ``server_name``).
+    server_host: str | None = None
 
     def httpx_verify(self) -> bool | str | ssl.SSLContext:
         """Resolve the ``verify=`` argument for every control-plane client.
@@ -179,6 +183,7 @@ class AgentConfig:
             server_name=os.environ.get("SERVER_NAME")
             or os.environ.get("AGENT_HOSTNAME")
             or os.uname().nodename,
+            server_host=os.environ.get("SERVER_HOST", "").strip() or None,
             driver=os.environ.get("AGENT_DRIVER", "bind9"),
             roles=roles,
             group_name=os.environ.get("AGENT_GROUP") or None,

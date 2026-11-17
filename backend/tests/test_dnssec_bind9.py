@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -443,5 +444,7 @@ async def test_stored_key_lifetimes_bind_refuses_render_in_range(
     out = BIND9Driver().render_server_config(server, ServerOptions(), bundle=bundle)
     assert "ksk lifetime unlimited algorithm ecdsap256sha256;" in out
     assert "zsk lifetime 49710d algorithm ecdsap256sha256;" in out
-    assert "-1d" not in out
-    assert "1000000d" not in out
+    # Anchor on the lifetime clause: the rendered file also carries random
+    # UUIDs and a timestamp, which can contain "-1d" by chance (#3629).
+    assert not re.search(r"lifetime\s+-1d", out)
+    assert not re.search(r"lifetime\s+1000000d", out)

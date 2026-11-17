@@ -62,16 +62,16 @@ would be a lie. Only an active UP verdict writes ``last_seen_at``.
 ``probe_liveness`` takes a ``vantage`` for signature/forward-compat but always
 probes from the control-plane server, *regardless of the wake vantage*.
 Appliance-vantage active verify is deferred:
-:mod:`app.services.appliance.agent_cmd` is an in-memory, per-replica dispatch —
-the supervisor long-polls the **api** process while the verify task runs in the
-**worker**, so there is no worker→supervisor result-return path today. For an
+:mod:`app.services.appliance.agent_cmd` is Redis-backed (#3706), so the worker
+can now reach a supervisor and read its reply, but the verify task does not use
+it yet: the active probe stays server-vantage. For an
 appliance-vantage *wake*, an active probe still runs from the server; that is
 correct when the api/worker can reach the target segment (routed ICMP /
 directed broadcast) and, when it can't, yields a false-negative (unverified) —
 never a false wake. **``seen`` sidesteps the vantage problem entirely**: it is a
 pure DB read, so it works for a host on a segment the worker cannot reach at
 all, as long as some other subsystem (an SNMP poll of the local switch, a DHCP
-lease) observed it. A worker→supervisor result channel remains the named
+lease) observed it. Wiring the verify probe onto the command channel remains the named
 follow-up for active appliance-vantage probes.
 """
 

@@ -40,7 +40,16 @@ agent peaked at 480 MB while taking a bundle, so a group that size fits
 the default only while its resolver cache stays small, and wants 3Gi if it
 also recurses for clients. A cold start at that size spends tens of minutes
 checking zones before named listens, which the containers' 60-minute
-startup probe allows for. See
+startup probe allows for. **Views multiply blocklist memory, not zone
+memory:** an authoritative zone identical across views loads once (#3551),
+but each view that applies a blocklist loads its own copy of it, at about
+1.4 kB per entry, so a 190,000-entry list on two views costs about 520 MiB
+of named's memory rather than 260 MiB. Size the limit for one copy of every
+list per view. The control plane warns at 80 % of the limit the agents
+report (a banner on the group's Views and Blocking Lists tabs, and the
+`dns_memory_pressure` alert); see
+[`DNS.md` §2](../features/DNS.md#what-a-view-costs-in-memory-3551) for what
+shares and what does not, and
 [`DNS.md` §8.0](../features/DNS.md#80-memory-sizing-for-large-blocklists-issue-1725)
 for the measurements and where to raise each limit.
 
@@ -262,6 +271,9 @@ The Kubernetes flavour of Topology 4. The umbrella Helm chart
 (`charts/spatiumddi`) ships every component — api / worker / beat /
 frontend / migrate / Postgres + Redis (in-chart StatefulSets, or
 CloudNativePG, or external endpoints) / optional DNS+DHCP agent StatefulSets.
+The same chart installs on Red Hat OpenShift under its default security
+context constraints, with a Route for the UI; see
+[KUBERNETES.md → OpenShift](KUBERNETES.md#openshift).
 
 <p align="center">
   <img src="../assets/topologies/topology-6-kubernetes.svg" alt="Topology 6 — Kubernetes via the umbrella Helm chart" width="900"/>
@@ -274,7 +286,6 @@ postgresql.kind: cnpg           # HA Postgres via the CloudNativePG operator
 redis.kind: sentinel            # HA Redis via the in-chart sentinel shape
 api.autoscaling.minReplicas: 3  # the HPA sets the api's count (api.replicas only with it off)
 worker.replicas: 4
-worker.netRawCapability: true   # for passive DHCP fingerprinting
 dnsAgents.enabled: true         # spawns the bind9 StatefulSet
 dhcpAgents.enabled: true        # spawns the kea StatefulSet (group-centric HA)
 ```
@@ -374,7 +385,7 @@ SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default),
 
 Wire it up:
 
-1. In `internal-pdns`, create the zones as primaries on the single PowerDNS server. Do not enable catalog zones for the crossover: a catalog is only produced and consumed within one group on one driver, so it cannot carry zones from `internal-pdns` to `edge-bind`.
+1. In `internal-pdns`, create the zones as primaries on the single PowerDNS server. Do not enable catalog zones for the crossover: a group's catalog is published for secondaries SpatiumDDI does not manage, and no agent-managed server consumes one (#3764), so it cannot carry zones from `internal-pdns` to `edge-bind`.
 2. In `edge-bind`, create each fanned-out zone as `zone_type=secondary` (or `stub`) with its per-zone `masters` list pointing at the PowerDNS primary (an `ip` or `ip@port` string, issue #336). BIND loads each as `type slave;` and AXFRs from the master; every BIND member of `edge-bind` is its own secondary and AXFRs each zone independently.
 3. Operator changes land via the SpatiumDDI UI → write-through to the PowerDNS HTTP API → PowerDNS bumps zone serial → BIND notices via NOTIFY-then-IXFR.
 

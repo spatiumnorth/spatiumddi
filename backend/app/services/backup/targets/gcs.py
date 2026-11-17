@@ -51,6 +51,7 @@ from app.services.backup.targets.base import (
     DestinationConfigError,
     safe_filename,
 )
+from app.services.backup.targets.secrets_config import ENC_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -139,6 +140,11 @@ class GcsDestination(BackupDestination):
         # Sanity-check JSON syntax up-front so the operator gets a
         # clear error from validate_config rather than a 500 from
         # the first write.
+        # A value still wrapped with ``__enc__:`` is the stored key an Edit
+        # kept (a blank secret field): it was checked when it was saved, and
+        # is ciphertext, not JSON. Only a newly-supplied key is parsed.
+        if config["service_account_json"].startswith(ENC_PREFIX):
+            return
         try:
             info = json.loads(config["service_account_json"])
         except json.JSONDecodeError as exc:

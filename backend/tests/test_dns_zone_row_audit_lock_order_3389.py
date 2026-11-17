@@ -202,7 +202,8 @@ async def test_zone_put_waits_for_an_in_flight_record_create(
     assert resp.status_code == 200, resp.text
     zone = await _assert_both_landed(zone_id, ("dns_zone", "update"))
     assert zone.dynamic_update_enabled is True
-    assert "UPDATE dns_zone" in blocked_in, blocked_in
+    # #3688: it takes the zone row first, in a locking read, before any write.
+    assert "dns_zone" in blocked_in and "FOR NO KEY UPDATE" in blocked_in, blocked_in
     assert held_chain_lock is False
 
 
@@ -230,5 +231,6 @@ async def test_apply_record_waits_for_an_in_flight_record_create(
     assert resp.status_code == 202, resp.text
     zone = await _assert_both_landed(zone_id, ("dns_zone", "apply_record"))
     assert zone.last_pushed_at is not None
-    assert "UPDATE dns_zone" in blocked_in, blocked_in
+    # #3688: it takes the zone row first, in a locking read, before any write.
+    assert "dns_zone" in blocked_in and "FOR NO KEY UPDATE" in blocked_in, blocked_in
     assert held_chain_lock is False

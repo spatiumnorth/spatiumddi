@@ -337,6 +337,7 @@ describe("#3366 / #3369 a Save writes its answer into the cached copies", () => 
   it("Edit DHCP Server updates the page's own server copy at once", async () => {
     answers.dhcpApi = {
       listGroups: ok([]),
+      getServer: ok(srv("xp d1")),
       updateServer: ok({ ...srv("xp d2") }),
     };
     const client = new QueryClient({
@@ -349,7 +350,9 @@ describe("#3366 / #3369 a Save writes its answer into the cached copies", () => 
       <CreateServerModal server={srv("xp d1") as never} onClose={() => {}} />,
       client,
     );
-    fireEvent.submit(screen.getByLabelText(/^Name/).closest("form")!);
+    const desc = await screen.findByDisplayValue("xp d1");
+    fireEvent.change(desc, { target: { value: "xp d2" } });
+    fireEvent.submit(desc.closest("form")!);
     await waitFor(() =>
       expect(
         (client.getQueryData(["dhcp-server", "s1"]) as { description: string })

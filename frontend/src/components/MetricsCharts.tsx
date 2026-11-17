@@ -14,6 +14,8 @@
 
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { formatApiError } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import {
   Area,
   AreaChart,
@@ -134,7 +136,7 @@ export function DNSQueryRateCard({
   const [win, setWin] = useState<MetricsWindow>("24h");
   const [serverId, setServerId] = useState<string>(ALL_SERVERS);
   const scopedId = serverId === ALL_SERVERS ? undefined : serverId;
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["metrics", "dns", win, scopedId ?? ""],
     queryFn: () =>
       metricsApi.dnsTimeseries({ window: win, server_id: scopedId }),
@@ -205,8 +207,9 @@ export function DNSQueryRateCard({
           </div>
         ) : isError ? (
           <div className="text-xs text-muted-foreground">
-            DNS query rate is unavailable. Your role may not include read access
-            to DNS.
+            {isRefused(error)
+              ? "DNS query rate is unavailable. Your role may not include read access to DNS."
+              : `DNS query rate couldn't be loaded: ${formatApiError(error, "the request failed")}`}
           </div>
         ) : !hasData ? (
           <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
@@ -291,7 +294,7 @@ export function DHCPTrafficCard({
   const [serverId, setServerId] = useState<string>(ALL_SERVERS);
   const scopedId =
     pinnedServerId ?? (serverId === ALL_SERVERS ? undefined : serverId);
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["metrics", "dhcp", win, scopedId ?? ""],
     queryFn: () =>
       metricsApi.dhcpTimeseries({ window: win, server_id: scopedId }),
@@ -354,8 +357,9 @@ export function DHCPTrafficCard({
           </div>
         ) : isError ? (
           <div className="text-xs text-muted-foreground">
-            DHCP traffic is unavailable. Your role may not include read access
-            to DHCP servers.
+            {isRefused(error)
+              ? "DHCP traffic is unavailable. Your role may not include read access to DHCP servers."
+              : `DHCP traffic couldn't be loaded: ${formatApiError(error, "the request failed")}`}
           </div>
         ) : !hasData ? (
           <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">

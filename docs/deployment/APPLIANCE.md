@@ -397,7 +397,7 @@ separate profiles that STATE does not model.
 k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
 `*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
 way, the frontend nginx finds the api, and on a multi-node control plane a
-member's supervisor heartbeats the in-cluster api Service name. Nothing on
+member's supervisor heartbeats the node-local api Service name. Nothing on
 the appliance talks to it from the LAN — it is not a DNS server operators put
 zones on, and it is unrelated to the BIND9 / Kea role containers.
 
@@ -529,7 +529,9 @@ the reference topologies are in
   cluster-identity reset + rejoin** — wiping only the etcd `db` is not
   enough, the server CA / TLS / node password / flannel subnet all have
   to go too, then the node rejoins the seed via
-  `https://<seed-node-ip>:6443` with the Fernet'd join token. The
+  `https://<seed-node-ip>:6443` with the seed's join token (Fernet'd at
+  rest, and sealed in the heartbeat response to a one-off X25519 key the
+  joining supervisor sent in its signed request, never sent in clear). The
   host-side runner is `spatium-cluster-join` (etcd backup + rollback +
   a confirmation-marker guardrail so a stray trigger file can't fire a
   destructive wipe). **Even counts (2 / 4) are refused at the API** for
@@ -694,7 +696,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.service.nodeLocal` (`true` at every size, #3645); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -813,15 +815,51 @@ agent). Dismissal requires a deliberate checkbox and is remembered
 client-side.
 
 **Heartbeat targets.** A supervisor that is itself a control-plane
-cluster member heartbeats the **in-cluster api Service**
-(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
-than the seed node's IP it was installed/promoted against — so losing any
-single node never strands a member's control plane, and kube-proxy
-load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+cluster member heartbeats the **node-local api Service**
+(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local:8000`, #3645:
+only ever the api pod on its own node) rather than the seed node's IP it was
+installed/promoted against. With no ready api pod on its node it falls back to
+its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
+a node's api pod never strands a member's control plane and no plain http
+crosses the node LAN. The seed has no `CONTROL_PLANE_URL` (firstboot writes it
+empty on a control-plane install), so it falls back to the cluster-wide api
+Service, as before #3645: a path through another node's api pod beats none.
+Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
 `heartbeat.py`).
+
+**Node-local api traffic (#3645).** Pod-to-pod traffic between nodes is flannel
+`host-gw`: routed over the node LAN, not tunnelled or encrypted, and the api
+speaks plain http. So the two callers that carry credentials keep that hop on
+their own node: firstboot and the seed supervisor set `api.service.nodeLocal`,
+which renders a second Service, `spatium-control-spatiumddi-api-local`, with
+`internalTrafficPolicy: Local`. It answers only from an api pod on the caller's
+node. A member's supervisor uses it; the original `-api` Service is unchanged,
+for the frontend nginx, the worker, the role agents and the probes, and an
+older supervisor keeps using it.
+
+The requirement is **a ready api pod on every control-plane node** (the
+appliance already runs one per node: `replicas` equals the control-plane size,
+with required anti-affinity). A node whose api pod is down (crashed, rolling,
+or not yet scheduled after a node join) has no local endpoint, and its
+supervisor does not wait:
+the Service drops traffic rather than refusing it, so the node-local attempt has
+a 4 s connect timeout, and after the first failed attempt the same heartbeat is
+re-sent to its `CONTROL_PLANE_URL` over https against the pinned certificate
+(`cp_tls`; the seed uses the cluster Service). It tries the local Service again
+once 60 s have passed, on its next heartbeat, and goes back to it when that
+lands. Plain http is therefore only ever node-local, except for the seed's
+fallback. The frontend's `/api` proxy is deliberately not on the
+node-local Service: the node-local path has no fallback there, so it would turn
+an api pod rolling on a node into a UI outage on that node. It keeps the
+cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
+ready). Not covered yet, and tracked in #4019: the frontend's fallback window,
+the role agents, the worker and beat still reach the api over the
+cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
+On a network where the node LAN is not trusted, put a WireGuard-capable CNI
+under the cluster instead of relying on this alone.
 
 ### Guided etcd restore (Phase 9b)
 
@@ -1461,13 +1499,15 @@ on 22); everything else is advisory (`nft -c -f` on the host is the final
 authority), and the lint runs delta-only so pre-existing values are
 grandfathered.
 
+**SNMP and `firewall_extra` (#3819).** UDP 161 is accepted only from the sources in `snmp_allowed_sources` (Fleet → Services → SNMP). `firewall_extra` lands in the same input chain, whose policy is drop, and the SNMP rule only ever accepts. So a `firewall_extra` rule that accepts UDP 161 **adds** its sources to the allowed list rather than being narrowed by it. If you scope SNMP to a list, remove any older custom accept for port 161. IPv6 sources work: snmpd listens on all IPv6 addresses (`udp6:161`) whenever the list holds an IPv6 prefix or is empty, and stays on `::1` for an IPv4-only list (#3813).
+
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
 LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
 not compliant, but lost contact is never a FAIL), and **not applicable** when no
-appliance reports at all (#2259). Five Operator-Copilot MCP tools
+appliance reports at all (#2259). Six Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
-/ `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
+/ `find_firewall_effective` / `find_web_ui_access` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.
 
 **Web UI source restriction (Phase 6).** A `Web UI access` card on the same tab
@@ -1576,7 +1616,7 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. (The mTLS *verifier* middleware lands in a follow-up — the cert pipeline is in place; heartbeat + poll endpoints currently auth via session-token.)
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned; a supervisor from before that was added is accepted unsigned, and logged as `supervisor_register_unsigned`, while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true. On a multi-node control plane the supervisor-to-api hop inside the cluster is plain HTTP (it is not given TLS in this release); the join token is the only secret answered on it, and is sealed to a one-off key, but the request bodies a supervisor sends (heartbeat state, kubeconfig, join token it reports) are not encrypted on that hop.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
 - **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
@@ -2829,6 +2869,173 @@ After completion, the appliance reboots into normal operation.
 
 ---
 
+## Upgrading to 1.0.0
+
+SpatiumDDI 1.0.0 is the first SemVer release. Every SemVer release ranks
+above every CalVer one, but only a release that carries that ranking can
+tell (`backend/app/core/versions.py`, #1182). So **2026.10.02-1, the last
+CalVer release, is the bridge**: an install on anything older upgrades to
+2026.10.02-1 first, then to 1.0.0 (#1195, #1207, #1286). Take a database
+backup before you upgrade, and do not roll back to a CalVer release
+afterwards: 1.0.0 adds migrations the CalVer releases cannot run on
+(#1227; see [Rolling back](#rolling-back-the-database-stays-on-var-1227)).
+The 1.0.0 release notes carry the full upgrade checklist; this section
+covers how to get off 2026.10.02-1 on each deployment shape (#3915).
+
+### Single appliance, from 2026.10.02-1
+
+The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
+works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
+images (#1181). It went through in under 10 minutes, with DNS down for
+about 4 minutes during the reboot. A second, shorter DNS and DHCP
+interruption of a few seconds can follow about 3 minutes after boot
+(#3919).
+
+### Multi-node cluster, from 2026.10.02-1
+
+**Do not use the Rolling Upgrade tab on a cluster still on
+2026.10.02-1.** Both ways it can start are refused, for reasons already
+fixed in 1.0.0 but not in the release you are running:
+
+- **Upload** answers 502, `Mirror upload failed: All connection attempts
+  failed`. The slot-image mirror pod runs out of memory at its 256Mi limit
+  and crash-loops (#1174, fixed by #1738).
+- **By URL**, Plan answers 409, `preflight failed; refusing to plan:
+  replication_lag`, naming replicas "not streaming" while
+  `pg_stat_replication` shows them streaming and CNPG reports every
+  instance healthy. It is a false alarm (#1445, item 6).
+
+Nothing is harmed by either refusal: no run is created and no node is
+touched. The way off 2026.10.02-1 is **Fleet, node by node**. The order
+below converged a three-node cluster on 1.0.0-rc.2 with DNS and DHCP
+serving on at least two nodes throughout, and every zone, record,
+subnet, block, pool, reservation, lease and address came through
+unchanged by name.
+
+1. **Stage every node first, with no reboot.** On the node's page in
+   **Fleet**, press **Upgrade**, choose **From external URL**, and give
+   the 1.0.0 slot asset's release URL for your architecture. The node
+   fetches the image itself (about 1.9 GB) and writes it to its inactive
+   slot, which takes about 4 to 5 minutes per node. Its runner ends with
+   `next-boot armed. Operator needs to reboot to switch slots.` Do the
+   nodes one at a time, and start the next only once the previous node's
+   Fleet row shows the upgrade done and a reboot pending. Fleet shows the
+   upgrade still in flight, at step `bootloader`, for a while after the
+   runner has armed the next boot, so give it time.
+2. **Wait about 5 minutes after the last stage.** Each node's k3s keeps
+   importing the 1.0.0 images for about 3.5 minutes after its stage ends,
+   and the shared chart moves to 1.0.0's image tag about 80 seconds after
+   the first member boots 1.0.0. A node still importing when the chart
+   moves would meet the DNS and DHCP gap in #3136.
+3. **Reboot the members one at a time, then the seed.** The reboot is
+   your step: the Upgrade form in 2026.10.02-1 says the runner "reboots
+   into it", but the runner only writes the inactive slot and arms the
+   next boot. (1.0.0's form says "Reboot to boot the new slot".) Press
+   **Reboot** on the first member. Before pressing it on the next node,
+   wait until **every node is Ready, DNS and DHCP answer on each of them,
+   and the database has a primary**. Do not wait for all three database
+   replicas: a member that has booted 1.0.0 while the supervisor
+   DaemonSet is still 2026.10.02-1 loses its `spatium.io/role-control-plane`
+   label at every heartbeat, because the old supervisor cannot read the
+   host's cluster-join state through 1.0.0's tighter release-state
+   permissions. A database replica that has to move off that member then
+   cannot be placed again, so the database can sit at 2 of 3 replicas
+   until the seed has rebooted and the supervisors move to 1.0.0.
+4. **The seed's Fleet Reboot does nothing on 2026.10.02-1.** It is
+   accepted and then nothing happens (2 of 2 runs, #1445 item 7). Reboot
+   the seed from its hypervisor, as a guest reboot request rather than a
+   reset; that worked both times. Rebooting from its console was not
+   tested. Then see the API bullet under "What to expect".
+5. After the seed's first boot on 1.0.0 the supervisor and the
+   control-plane Deployments start moving to 1.0.0's images within about
+   3 minutes. How long the API then takes to become Ready depends on the
+   migration; see below.
+
+<!-- #3915-order -->
+Staging every node before rebooting any is the recommended order. In the
+drill it kept DNS and DHCP on at least two nodes at every 10-second
+sample, and no node was without DNS for more than 30 seconds or without
+DHCP for more than 40 seconds outside its own reboot, which took 2 to
+3.5 minutes. The other order, upgrading and rebooting each member in turn
+before the next, is the one #3136 describes: with it, nodes not yet
+upgraded lose DNS and DHCP.
+<!-- #3915-order -->
+
+What to expect:
+
+- **After the seed's reboot, the API and the console can show
+  "initialising" for a long time.** The 1.0.0 migration (`ff32b91acad8`)
+  waits for a lock held by a database session that the seed's old
+  2026.10.02-1 api left idle in a transaction, a parked DNS agent
+  long-poll. If the database primary is not on the seed, that session
+  outlives the pod that opened it, and nothing on the database ends it:
+  no idle-in-transaction timeout, no lock timeout, default keepalives. By
+  those settings it lasts about 2 hours 11 minutes after the seed went
+  down. In the drill the API answered 502 for about 2 hours 4 minutes;
+  then the session was dropped, the migration finished, and the cluster
+  converged by itself within 3 minutes. DNS and DHCP kept serving
+  throughout.
+  - **A manual way out (not yet drilled).** From the node holding the
+    database primary, end the stale sessions. The CNPG cluster in the
+    `spatium` namespace is `spatium-control-spatiumddi-postgresql`:
+
+    ```bash
+    kubectl -n spatium get pods \
+      -l cnpg.io/cluster=spatium-control-spatiumddi-postgresql,cnpg.io/instanceRole=primary
+    kubectl -n spatium exec -it <primary-pod> -c postgres -- \
+      psql -U postgres -d spatiumddi -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND state_change < now() - interval '5 minutes';"
+    ```
+
+    The migration is expected to continue within a minute.
+  - 1.0.0 shortens this (#3932): when its migration has waited 30 seconds
+    on a lock, it ends any session of the app's own role that is blocking
+    it and has been idle in a transaction for more than 5 minutes, and logs
+    each one as `migration_terminated_stale_session`. In testing, a
+    three-node upgrade from 2026.10.02-1 had the API back about 10 minutes
+    after the seed's reboot. The new Postgres settings also drop a dead
+    client's session within about 2 minutes, but only for sessions opened
+    after those settings apply. The session the old release left behind
+    still carries the old 2 hour 11 minute keepalive, so it is the
+    migration step that ends it. Check the 1.0.0 release notes to confirm
+    #3932 is included. If the console still shows "initialising" more than
+    about 15 minutes after the seed's reboot, use the manual way out above.
+- **Other things you will see.** The database primary moves four times (the last when the database
+  rolls its instances after the migration, with the API not ready for up
+  to 30 seconds);
+  every DNS and DHCP agent restarts twice (once when the chart moves,
+  once after the seed's boot), each restart a gap of 10 to 40 seconds on
+  that node; and a database replica on a member can crash-loop after the
+  seed's boot until the 1.0.0 API is back.
+- **No drain at each reboot (#1976).** A node goes down with its pods
+  still Ready, so API requests through the other nodes can fail for up to
+  about two minutes at a member's reboot. A node's k3s can also restart
+  while its slot is being written (#1804).
+- **Time.** Staging all three nodes takes about 14 minutes, and each
+  reboot about 3 minutes. The total depends on the migration wait above:
+  the drill took 3 hours 24 minutes in all, about 2 hours of it that
+  wait.
+- **Kea leases are per node.** Each node's Kea keeps its own leases with
+  no HA, so a member asked directly can offer addresses another node has
+  leased. A site whose relay points at several nodes needs HA for shared
+  scopes.
+
+A cluster already on 1.0.0 or later uses the Rolling Upgrade tab as
+normal.
+
+### Helm, from 2026.10.02-1
+
+A Helm install with DHCP agents can stall on the old Kea pod, which was
+never Ready under the 2026.10.02-1 probe, so its StatefulSet will not roll
+(#1589, #3907). The recovery, and what the chart now does about it, are in
+[`KUBERNETES.md` → Upgrading](KUBERNETES.md#8-upgrading); an air-gapped
+site must load the new api image before upgrading (#3907).
+
+### Docker Compose, from 2026.10.02-1
+
+The normal pull, migrate and `up -d` works (verified, #1181).
+
+---
+
 ## 5. Appliance Update Mechanism
 
 Two update paths exist, addressing different operator workflows.
@@ -2944,8 +3151,8 @@ installer excludes both paths from the live-root copy.
    containerd's unfinished content writes (`spatium-k3s-images
    clear-ingests`), so a write an earlier import left behind
    cannot fail this boot's imports (#1630). k3s imports the new
-   tarballs. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200. It then waits until k3s holds
+   tarballs. `spatiumddi-firstboot.service` waits for k3s's
+   `/readyz` to answer `ok`. It then waits until k3s holds
    none of the tarballs open, which is how long each import
    lasts (#2109), checks that k3s imported every baked tarball
    and that every image is in containerd, and has k3s
@@ -2995,7 +3202,7 @@ sudo spatium-upgrade-slot set-next-boot
 sudo reboot
 
 # Emergency: durably commit without waiting for firstboot
-sudo spatium-upgrade-slot commit slot_b
+sudo spatium-upgrade-slot set-default slot_b
 
 # Refresh /var/lib/spatiumddi/release-state/slot-versions.json
 # (called automatically by spatiumddi-firstboot at every boot + at
@@ -3056,8 +3263,21 @@ migrate step moves the schema forward, and the release you left cannot
 run on that schema afterwards. Alembic cannot migrate backwards from a
 revision it has never heard of. Its migrate Job fails with
 `Can't locate revision`, its api / worker / beat wait for migrate
-forever, and on a single node the newer release's api keeps serving
-behind the older UI. Nothing retries.
+forever, and nothing retries. Whether the newer release's api keeps
+serving meanwhile is decided by the chart of the release you go back
+TO:
+
+- **1.0.0-rc.1 and later** (#3780): at one replica, a rollback from a
+  newer release that is still serving rolls the api and the worker out
+  surge-first, so the newer release's pods keep serving behind the older
+  UI, and re-applying the newer release through the API works (below).
+  Beat stops either way: it can only be replaced, not surged.
+- **1.0.0-beta.1 to 1.0.0-beta.5** (#1659): on a single node the rollout
+  retires the newer release's only api and worker pods first, so the API
+  and the web UI answer `502` until the newer release is booted again
+  from the console (below). The Fleet UI cannot reach the node either.
+- **2026.10.02-1 and earlier**: the newer api keeps serving, as for
+  1.0.0-rc.1.
 
 **What is checked before you go back.** Every path that moves a
 control-plane node to an older release first compares the database's
@@ -3138,11 +3358,28 @@ logging `current=<written by a newer release, see above>`:
 kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
 ```
 
-Re-applying the newer release recovers it. Its migrate step finds
-nothing to do, and every workload rolls out:
+Booting the newer release again recovers it. Its migrate step finds
+nothing to do, and every workload rolls out. While the newer api still
+serves (see the list above), re-apply it through the API:
 `POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
-**Schedule OS upgrade** in the Fleet UI. The only other way out is to
-restore a pre-upgrade copy of the database by hand.
+**Schedule OS upgrade** in the Fleet UI.
+
+When the API answers `502` (a rollback onto a 1.0.0 beta on a single
+node), it cannot take that request, so boot the newer release from the
+console, or over SSH, as root. The inactive slot still holds it:
+
+```bash
+sudo spatium-upgrade-slot status          # the inactive slot holds the newer release
+sudo spatium-upgrade-slot set-next-boot   # re-copies its images, arms ONE boot of it
+sudo reboot
+```
+
+No api is needed: firstboot commits the slot as the durable default once
+k3s's `/readyz` answers and every baked image is in containerd, as for an
+upgrade (step 7 above), and the database is left as it is. If that boot
+fails, the next reboot falls back to the older slot, as any trial boot
+does. The only other way out is to restore a pre-upgrade copy of the
+database by hand.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
@@ -3554,7 +3791,15 @@ so a first-time operator never gets stuck looking for the upload.
    gives up (finishing only the node it is on) 8 minutes after its last
    renewal, before the Lease could lapse for anyone else. If a drive
    exits with the run still `running`, a beat sweep re-drives it once
-   the Lease has been free on two sweeps a minute apart (#1713). If the drive itself died, the Lease lapses after its
+   the Lease has been free on two sweeps a minute apart (#1713). After the shared-tag
+   hand-off the hop chain refreshes a 45 s heartbeat; if it stops (the worker holding
+   the hop was killed) the sweep re-drives the run on its second sighting, about
+   two minutes after the last hop when beat keeps running. The shared-tag flip
+   also recreates beat, and a restarted beat runs one sweep as it starts, so on
+   a rolling upgrade expect the re-drive within a few minutes (about five
+   measured on a three-node roll) rather than two. Otherwise (a hand-off from a
+   build without the heartbeat, or Redis unreadable) the sweep waits out the
+   15-minute grace (#3851). If the drive itself died, the Lease lapses after its
    10-minute duration; a superadmin can free it sooner with
    **Force release** beside the Lease pill (`POST
    /api/v1/upgrades/lease/force-release`). That is refused while the
@@ -3883,7 +4128,7 @@ Applied to both Alpine and Debian appliance images:
 - ASLR enabled (`/proc/sys/kernel/randomize_va_space = 2`)
 - Core dumps disabled
 - `/tmp` mounted as `tmpfs` (no-exec, no-suid)
-- SSH: `PermitRootLogin no`, `PasswordAuthentication no` (key-only), `Protocol 2`
+- SSH: `PermitRootLogin no`, `Protocol 2`. Password login is on by default, because the installer takes the admin password as the first credential. To go key-only, choose **Key only** when the installer takes your key, or add an authorized key later and turn **Password authentication** off under Appliance, Fleet, SSH
 - All services run as non-root system users (`spatiumddi`, `kea`, `named`)
 - AppArmor profiles (Debian) or seccomp profiles (Docker) for service isolation
 - CIS Benchmark hardening script applied at image build time
@@ -3893,12 +4138,16 @@ Applied to both Alpine and Debian appliance images:
 
 ## 8. Environment Variables for Appliance
 
-```bash
-SPATIUMDDI_FIRSTBOOT=true          # Set to false after first-boot wizard completes
-SPATIUMDDI_APPLIANCE_MODE=true     # Enables appliance-specific UI flows
-SPATIUMDDI_UPDATE_CHANNEL=stable
-SPATIUMDDI_LICENSE_ACCEPTED=false  # Must be true to complete first-boot
-```
+The appliance does not read `SPATIUMDDI_*` environment variables, and there is no first-boot wizard flag or licence-acceptance gate to set. First boot writes the control-plane chart's `sharedEnv` (the Helm values the api, worker and beat pods all receive; see `appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot`), which carries:
+
+| Variable | Meaning |
+|---|---|
+| `APPLIANCE_MODE` | Set to `"true"`. The backend reads it as `appliance_mode` and enables the appliance-specific UI flows and the Kubernetes-Secret certificate path. |
+| `APPLIANCE_VERSION` | The installed appliance version (rendered from the chart's `applianceVersion` value). |
+| `INITIAL_NTP_SERVERS` | The installer's Time source answer; it seeds the initial `ntp_pool_servers` setting and is ignored once that settings row exists. |
+| `APPLIANCE_HOSTNAME` / `APPLIANCE_HOST_IPS` | The host's hostname and global addresses, so every api replica builds the same self-signed Web UI certificate identity. |
+
+Update channels are future work (Phase 8d, pending).
 
 ---
 
@@ -4274,3 +4523,23 @@ success) commits the slot durable. **No reinstall required.**
 If the patch calls `spatium-grub-render`, it inherits all the renderer's
 safety guarantees: `grub-script-check` before swap, `.bak` preservation,
 atomic rename, and the boot-revert on failure.
+
+### Database sessions of a dead client (#3932)
+
+The control-plane CNPG cluster inherits the chart's `postgresql.cnpg.parameters`
+(the supervisor's HelmChartConfig only overrides `shared_buffers` and
+`max_connections`), so every appliance carries
+TCP keepalives of 60 s / 10 s / 6 and `idle_in_transaction_session_timeout=1h`.
+A session whose pod or node died is dropped within minutes, instead of holding a
+migration's lock for 2 h+ as in the 1.0.0 upgrade drill. These are reloads, not
+restarts. The migrate Job also bounds each lock wait, ends stale idle-in-transaction
+sessions of the app role that it is actually waiting on, and retries until the
+lock is free; see [Kubernetes](KUBERNETES.md). A session the old api opened
+before this release's database settings applied keeps the old keepalive, about
+2 h 11 min to notice a dead client (a reloaded setting only reaches a session
+when its client next sends a message, which a dead client never does). The
+migration ends it itself: when a lock wait times out (30 s), it ends sessions of
+its own role that block it and have been idle in a transaction for over 5
+minutes, and logs each one as `migration_terminated_stale_session`. A session
+that only holds a lock the migration does not wait on, such as a running
+backup's, is never ended.

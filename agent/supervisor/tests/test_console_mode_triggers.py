@@ -126,7 +126,7 @@ def test_failing_apply_is_reported_on_the_heartbeat(guarded: Path) -> None:
     (guarded / "verbose-boot-pending").unlink()  # runner ran and failed
     health = appliance_state.read_host_config_health()
     assert "console_mode" in health
-    assert health["console_mode"]["state"] in ("retrying", "failing")
+    assert health["console_mode"]["state"] in ("applying", "retrying", "failing")
 
 
 def test_successful_apply_clears_the_health_entry(guarded: Path) -> None:

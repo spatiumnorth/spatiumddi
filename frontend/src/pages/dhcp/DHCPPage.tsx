@@ -92,6 +92,7 @@ import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { syncLabel } from "@/lib/dhcp-sync-label";
 import { scopePickerLabel } from "@/lib/dhcp-scope-label";
+import { poolOccupancyTone } from "@/lib/pool-occupancy-tone";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -1147,7 +1148,9 @@ function GroupServersList({
 
       {servers.length === 0 ? (
         <p className="text-sm text-muted-foreground italic">
-          No servers. Add one manually or start a Kea agent container.
+          No servers.
+          {!superadminGate.disabled &&
+            " Add one manually or start a Kea agent container."}
         </p>
       ) : (
         <div className="space-y-2">
@@ -1524,6 +1527,7 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
               if (e.target.value) setCreateForSubnet(e.target.value);
               e.target.value = "";
             }}
+            aria-label="Serve leases on subnet"
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
             {...dhcpGate("write", "dhcp_scope")}
           >
@@ -1771,12 +1775,7 @@ function PoolOccupancyCell({
   if (!occ) {
     return <span className="text-xs text-muted-foreground/40">—</span>;
   }
-  const tone =
-    occ.percent >= 90
-      ? "bg-rose-500"
-      : occ.percent >= 75
-        ? "bg-amber-500"
-        : "bg-emerald-500";
+  const tone = poolOccupancyTone(occ.percent);
   return (
     <div
       className="flex min-w-[9rem] items-center gap-2"
@@ -1921,6 +1920,7 @@ export function ServerPoolsOrStaticsTab({
   // ``dhcp_static`` (#1861), so gate the UI the same way.
   const qc = useQueryClient();
   const perms = usePermissions();
+  const dhcpGate = useDhcpGate();
   const [showCreate, setShowCreate] = useState(false);
   const [createScopeId, setCreateScopeId] = useState("");
   const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
@@ -2104,6 +2104,9 @@ export function ServerPoolsOrStaticsTab({
                   >
                     Hostname
                   </SortableTh>
+                  <th className="px-3 py-2">
+                    <span className="sr-only">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
@@ -2121,6 +2124,26 @@ export function ServerPoolsOrStaticsTab({
                             {s.ip_address}
                           </td>
                           <td className="px-3 py-2">{s.hostname || "—"}</td>
+                          <td className="px-3 py-2 text-right whitespace-nowrap">
+                            <button
+                              onClick={() => setEditStatic({ scope, item: s })}
+                              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Edit static assignment ${s.ip_address}`}
+                              title="Edit static assignment"
+                              {...dhcpGate("write", "dhcp_static")}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              onClick={() => setDelStatic({ scope, item: s })}
+                              className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Delete static assignment ${s.ip_address}`}
+                              title="Delete static assignment"
+                              {...dhcpGate("delete", "dhcp_static")}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </td>
                         </tr>
                       </ContextMenuTrigger>
                       <ContextMenuContent>
@@ -2187,7 +2210,11 @@ export function ServerPoolsOrStaticsTab({
           title="Delete Static Assignment"
           description={`Delete reservation ${delStatic.item.ip_address} (${delStatic.item.mac_address})?`}
           onConfirm={() => delMut.mutate(delStatic)}
-          onClose={() => setDelStatic(null)}
+          onClose={() => {
+            setDelStatic(null);
+            // A refusal must not carry over to the next row's confirm.
+            delMut.reset();
+          }}
           isPending={delMut.isPending}
           error={
             delMut.isError
@@ -2489,7 +2516,7 @@ export function OptionTemplatesTab({ groupId }: { groupId: string }) {
   );
 }
 
-function LeasesTab({ server }: { server: DHCPServer }) {
+export function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
   const [deviceClass, setDeviceClass] = useState<string>("");
@@ -2635,13 +2662,18 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               <th className="px-3 py-2 text-left font-medium">State</th>
               <th className="px-3 py-2 text-left font-medium">Expires</th>
               <th className="px-3 py-2 text-left font-medium">Last Seen</th>
+              {isSuperadmin && (
+                <th className="px-3 py-2 text-right font-medium">
+                  <span className="sr-only">Actions</span>
+                </th>
+              )}
             </tr>
           </thead>
           <tbody className={zebraBodyCls}>
             {leases.length === 0 && (
               <tr>
                 <td
-                  colSpan={7}
+                  colSpan={isSuperadmin ? 8 : 7}
                   className="p-6 text-center text-sm text-muted-foreground"
                 >
                   {isFetching ? "Loading…" : "No leases."}
@@ -2729,6 +2761,22 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                         ? new Date(l.last_seen_at).toLocaleString()
                         : "—"}
                     </td>
+                    {isSuperadmin && (
+                      <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                        {/* The keyboard path to Delete lease (#3912): the
+                            right-click menu has no Tab stop to open it
+                            from. */}
+                        <button
+                          type="button"
+                          onClick={() => setDel(l)}
+                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                          aria-label={`Delete lease ${l.ip_address}`}
+                          title="Delete lease"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 </ContextMenuTrigger>
                 <ContextMenuContent>

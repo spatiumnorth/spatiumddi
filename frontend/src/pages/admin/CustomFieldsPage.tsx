@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { customFieldsApi, formatApiError, type CustomField } from "@/lib/api";
 import {
@@ -8,7 +9,10 @@ import {
 } from "@/lib/formPayloads";
 import { Plus, Pencil, Trash2, X, Check } from "lucide-react";
 import { usePermissions } from "@/hooks/usePermissions";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { FormError } from "@/components/ui/form-error";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
 const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
@@ -45,6 +49,46 @@ const EMPTY_FORM: FieldForm = {
   display_order: 0,
   description: "",
 };
+
+// Edit reads the field when it opens (#3863), not from the list's copy.
+function EditFieldModal({
+  field,
+  onClose,
+  onSave,
+  error,
+  saving,
+}: {
+  field: CustomField;
+  onClose: () => void;
+  onSave: (form: FieldForm, base: CustomField) => void;
+  error?: string;
+  saving: boolean;
+}) {
+  const fresh = useFreshRow<CustomField>(field, () =>
+    customFieldsApi.get(field.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Custom Field"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
+  return (
+    <FieldModal
+      mode="edit"
+      initial={fieldToForm(base)}
+      onClose={onClose}
+      onSave={(f) => onSave(f, base)}
+      error={error}
+      saving={saving}
+    />
+  );
+}
 
 function FieldModal({
   mode,
@@ -90,9 +134,9 @@ function FieldModal({
         </div>
         <div className="space-y-4 px-5 py-4">
           {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
               {error}
-            </div>
+            </FormError>
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -343,7 +387,11 @@ export function CustomFieldsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState<CustomField | null>(null);
   const [modalError, setModalError] = useState<string>("");
 
-  const { data: fields = [], isLoading } = useQuery({
+  const {
+    data: fields = [],
+    isLoading,
+    error: fieldsError,
+  } = useQuery({
     queryKey: ["custom-fields"],
     queryFn: () => customFieldsApi.list(),
   });
@@ -386,15 +434,22 @@ export function CustomFieldsPage() {
     },
   });
 
-  function handleSave(form: FieldForm) {
+  // `base` is the field as read when Edit opened (#3863): the Save sends only
+  // what the operator changed against it.
+  function handleSave(form: FieldForm, base?: CustomField) {
     setModalError("");
     if (modal?.mode === "create") {
       createMutation.mutate(customFieldCreatePayload(form));
-    } else if (modal?.mode === "edit" && modal.field) {
-      updateMutation.mutate({
-        id: modal.field.id,
-        data: customFieldUpdatePayload(form),
-      });
+    } else if (modal?.mode === "edit" && base) {
+      const data = changedFields(
+        customFieldUpdatePayload(fieldToForm(base)),
+        customFieldUpdatePayload(form),
+      );
+      if (Object.keys(data).length === 0) {
+        setModal(null);
+        return;
+      }
+      updateMutation.mutate({ id: base.id, data });
     }
   }
 
@@ -459,8 +514,10 @@ export function CustomFieldsPage() {
 
       {fields.length === 0 && (
         <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
-          No custom fields defined yet.
-          {canWrite && ' Click "New Field" to add one.'}
+          <ListEmpty error={fieldsError} what="custom fields">
+            No custom fields defined yet.
+            {canWrite && ' Click "New Field" to add one.'}
+          </ListEmpty>
         </div>
       )}
 
@@ -551,14 +608,23 @@ export function CustomFieldsPage() {
       })}
 
       {/* Create/Edit Modal */}
-      {modal && (
-        <FieldModal
-          mode={modal.mode}
-          initial={modal.field ? fieldToForm(modal.field) : EMPTY_FORM}
+      {modal?.mode === "edit" && modal.field && (
+        <EditFieldModal
+          field={modal.field}
           onClose={() => setModal(null)}
           onSave={handleSave}
           error={modalError}
-          saving={createMutation.isPending || updateMutation.isPending}
+          saving={updateMutation.isPending}
+        />
+      )}
+      {modal?.mode === "create" && (
+        <FieldModal
+          mode="create"
+          initial={EMPTY_FORM}
+          onClose={() => setModal(null)}
+          onSave={(f) => handleSave(f)}
+          error={modalError}
+          saving={createMutation.isPending}
         />
       )}
 

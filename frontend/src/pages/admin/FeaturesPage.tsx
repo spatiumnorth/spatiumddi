@@ -16,7 +16,11 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
-import { NEEDS_SUPERADMIN, usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { resolveEnabled } from "@/hooks/useFeatureModules";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
@@ -480,7 +484,10 @@ export function FeaturesPage() {
                               // superadmin (PATCH /admin/feature-modules).
                               !isSuperadmin
                             }
-                            title={isSuperadmin ? undefined : NEEDS_SUPERADMIN}
+                            title={
+                              permissionGate(isSuperadmin, NEEDS_SUPERADMIN)
+                                .title
+                            }
                             onChange={(v) => handleToggle(m, v)}
                           />
                         </div>

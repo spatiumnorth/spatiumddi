@@ -8,7 +8,8 @@ k8s/
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
 ├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)
-└── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+├── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
+└── pod-logs/           # Opt-in pod list + log read RBAC for Platform Insights > Containers (#3761)
 ```
 
 ## Managed DHCP servers (Kea)
@@ -298,7 +299,7 @@ have served straight through starts evicting them instead.
 
 ### Worker capability — `NET_RAW`
 
-The worker pod ships with `securityContext.capabilities.add: ["NET_RAW"]` so `nmap` can run SYN scans + `-O` OS detection from the device-profiling auto-nmap path. The image already grants the cap to the `nmap` binary via `setcap` — this line keeps it in the pod's bounding set so restricted Pod Security Admission (`restricted` profile), OpenShift SCC, and GKE Autopilot don't drop it. The cap is in containerd's default cap set on permissive clusters, so it's a no-op there. If you've turned device profiling off cluster-wide and want a tighter security posture, drop the `securityContext` block from `k8s/base/worker.yaml` (or set `worker.netRawCapability: false` in the Helm chart).
+The worker pod ships with `securityContext.capabilities.add: ["NET_RAW"]` so `nmap` can run SYN scans + `-O` OS detection from the device-profiling auto-nmap path. The image already grants the cap to the `nmap` binary via `setcap` — this line keeps it in the pod's bounding set so restricted Pod Security Admission (`restricted` profile), OpenShift SCC, and GKE Autopilot don't drop it. These raw manifests are not OpenShift-ready (they pin uids and use `:80`); for OpenShift use the Helm chart, which detects the platform. See [`docs/deployment/KUBERNETES.md`](../docs/deployment/KUBERNETES.md), "OpenShift". The cap is in containerd's default cap set on permissive clusters, so it's a no-op there. If you've turned device profiling off cluster-wide and want a tighter security posture, drop the `securityContext` block from `k8s/base/worker.yaml` (or set `worker.netRawCapability: false` in the Helm chart).
 
 ### Pod posture — seccomp + Pod Security Admission (issue #983)
 
@@ -518,6 +519,8 @@ patches:
 ```
 
 The Helm chart exposes the same thing as `migrate.annotations`.
+
+`spatiumddi-secrets` may also carry `credential-key`, the Fernet key stored credentials are encrypted under (`CREDENTIAL_ENCRYPTION_KEY`; `secrets.yaml.example` shows the command). Optional: without it the key is derived from `SECRET_KEY`. Adding it to a running install is safe, since the derived key stays a read fallback. Add `credential-key-since` set to the running version with it, so pods that have not restarted yet never meet a value written under a key they do not have (that version reads the key and keeps writing under the old one); after the next upgrade, run `python -m app.core.rotate_credential_key` in the api pod to move existing values onto it. The Helm chart generates and keeps one for you.
 
 The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 

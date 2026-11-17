@@ -30,6 +30,7 @@ section back rather than leaving half an install wiped.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -66,6 +67,23 @@ COOLDOWN_HOURS = 6
 RESET_LOCK_KEY = "spatium:factory_reset:in_progress"
 RESET_LOCK_TTL_SECONDS = 600
 
+# #3479: the wipe's own locks. Its TRUNCATE takes ACCESS EXCLUSIVE locks, in
+# the order the section lists its tables, on tables the agents' polls, the
+# worker and the beat read all the time. A reader holding one makes the wipe
+# wait for it, with no bound. A reader that holds a table the wipe has not
+# reached yet, and then queues for one the wipe already holds, closes a
+# deadlock that Postgres resolves by ending one side, often the wipe: the
+# endpoint answered a bare 500 with nothing wiped. So every lock wait of the
+# wipe is bounded, and a deadlock or a wait past the bound rolls the whole
+# transaction back (nothing is deleted) and runs it again. When the tables
+# stay busy through every attempt the reset is refused with a 409 that says
+# so. A wait outlasts Postgres's default deadlock_timeout (1 s), so a
+# deadlock is detected, not timed out, and the attempts together stay well
+# inside the time an operator waits on the answer.
+WIPE_LOCK_TIMEOUT_MS = 10_000
+WIPE_ATTEMPTS = 3
+WIPE_RETRY_DELAY_S = 1.0
+
 
 class FactoryResetError(Exception):
     """Generic failure for factory-reset orchestration."""
@@ -75,6 +93,15 @@ class FactoryResetMutexError(FactoryResetError):
     """Raised when another long-running operation prevents the reset
     from starting (HTTP 409). The message names the blocker so
     operators know what to wait on.
+    """
+
+
+class FactoryResetBusyError(FactoryResetMutexError):
+    """Raised when other sessions kept the tables the wipe needs busy
+    through every attempt: each attempt waited past
+    :data:`WIPE_LOCK_TIMEOUT_MS` for a lock, or was ended by a deadlock
+    (HTTP 409, like any other mutex refusal: try again). Nothing has been
+    deleted when this is raised; every attempt's transaction rolled back.
     """
 
 
@@ -427,20 +454,12 @@ async def apply_factory_reset(
         await global_engine.dispose()
 
         dsn = _pg_dsn(db_url)
-        conn = await asyncpg.connect(dsn=dsn)
         try:
-            # ONE transaction: a failure part-way rolls every section
-            # back instead of leaving half an install wiped.
-            async with conn.transaction():
-                deleted_total = await _execute_sections(
-                    conn, targets, calling_user_id=calling_user_id
-                )
+            deleted_total = await _wipe(dsn, targets, calling_user_id=calling_user_id)
         except asyncpg.ForeignKeyViolationError as exc:
             raise FactoryResetBlockedError(
                 f"cannot reset: {exc} — nothing was deleted; reset the referencing data first"
             ) from exc
-        finally:
-            await conn.close()
 
         # Audit anchor — fresh session because the old one was
         # disposed. The anchor row carries all the diagnostic info
@@ -470,6 +489,43 @@ async def apply_factory_reset(
         audit_anchor_id=audit_anchor_id,
         duration_ms=duration_ms,
     )
+
+
+async def _wipe(dsn: str, targets: list[FactorySection], *, calling_user_id: UUID) -> int:
+    """Run every target's wipe in ONE transaction on a short-lived asyncpg
+    connection: a failure part-way rolls every section back instead of
+    leaving half an install wiped. Returns :func:`_execute_sections`'s count.
+
+    #3479: every lock wait in the transaction is bounded by
+    :data:`WIPE_LOCK_TIMEOUT_MS`. An attempt that another session's locks
+    ended (a deadlock, or a wait past the bound) deleted nothing, so it is run
+    again, up to :data:`WIPE_ATTEMPTS` times, and then refused with
+    :class:`FactoryResetBusyError`. Any other error is raised as it is.
+    """
+    attempt = 1
+    while True:
+        conn = await asyncpg.connect(dsn=dsn)
+        try:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL lock_timeout = {int(WIPE_LOCK_TIMEOUT_MS)}")
+                return await _execute_sections(conn, targets, calling_user_id=calling_user_id)
+        except (asyncpg.DeadlockDetectedError, asyncpg.LockNotAvailableError) as exc:
+            reason = str(exc).splitlines()[0]
+            logger.warning(
+                "factory_reset_tables_busy",
+                attempt=attempt,
+                attempts=WIPE_ATTEMPTS,
+                error=reason,
+            )
+            if attempt >= WIPE_ATTEMPTS:
+                raise FactoryResetBusyError(
+                    f"other work kept the tables this reset wipes busy ({reason}) through "
+                    f"{WIPE_ATTEMPTS} attempts, so nothing was deleted; try again in a minute"
+                ) from exc
+        finally:
+            await conn.close()
+        attempt += 1
+        await asyncio.sleep(WIPE_RETRY_DELAY_S)
 
 
 async def _execute_sections(
@@ -714,6 +770,7 @@ def verify_user_password(user: Any, plaintext: str) -> bool:
 __all__ = [
     "COOLDOWN_HOURS",
     "FactoryResetBlockedError",
+    "FactoryResetBusyError",
     "FactoryResetCooldownError",
     "FactoryResetError",
     "FactoryResetMutexError",

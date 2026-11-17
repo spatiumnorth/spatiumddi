@@ -30,7 +30,7 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
@@ -40,8 +40,10 @@ from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
+    drop_wrapper_block,
+    gateway_changed,
     owned_addresses_in_space,
-    subnet_has_surviving_addresses,
+    retire_vanished_subnet,
 )
 from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
 from app.services.ipam.utilization import recount_subnets_and_blocks
@@ -448,17 +450,14 @@ async def apply_subnets(
     ]
     fw_wrappers = {str(b.network): b for b in blocks if getattr(b, owner.fk_attr) == target_id}
 
-    # Delete owner-owned subnets no longer present (un-claim if foreign IPs live in).
+    # Delete owner-owned subnets no longer present (un-claim if operator
+    # content — addresses, a DHCP scope live or in Trash, … — lives on, #3532).
     for cidr, row in list(fw_subnets.items()):
         if cidr in desired:
             continue
-        surviving = await subnet_has_surviving_addresses(db, row.id, owner.fk_attr)
-        if surviving:
-            setattr(row, owner.fk_attr, None)
+        if await retire_vanished_subnet(db, row, owner.fk_attr, warnings=summary.warnings):
             summary.subnets_updated += 1
         else:
-            await retract_address_dns(db, subnet_ids=[row.id])
-            await db.delete(row)
             summary.subnets_deleted += 1
 
     used_wrapper_cidrs: set[str] = set()
@@ -526,7 +525,7 @@ async def apply_subnets(
                 existing.name, changed = ms.name, True
             if existing.description != ms.description:
                 existing.description, changed = ms.description, True
-            if ms.gateway and existing.gateway != ms.gateway:
+            if gateway_changed(existing.gateway, ms.gateway):
                 existing.gateway, changed = ms.gateway, True
             if existing.total_ips != total:
                 existing.total_ips, changed = total, True
@@ -539,11 +538,7 @@ async def apply_subnets(
     for cidr, wrapper in fw_wrappers.items():
         if cidr in used_wrapper_cidrs:
             continue
-        refs = await db.scalar(
-            select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
-        )
-        if not refs:
-            await db.delete(wrapper)
+        if await drop_wrapper_block(db, wrapper, owner.fk_attr, warnings=summary.warnings):
             summary.blocks_deleted += 1
 
 

@@ -43,6 +43,7 @@ from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.ai.tools.scope import token_allows_subnet, token_subnet_ids, token_zone_ids
 from app.services.integration_ownership import owning_integration
 from app.services.ipam.host_name import current_fqdn, fqdn_matches
+from app.services.ipam.live_address import live_subnet_clause
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -682,7 +683,8 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
     except ValueError:
         return {"error": f"invalid IP address: {args.address!r}"}
     stmt = select(IPAddress).where(
-        func.host(IPAddress.address) == func.host(cast(literal(args.address), INET))
+        func.host(IPAddress.address) == func.host(cast(literal(args.address), INET)),
+        live_subnet_clause(),  # #3537: not an address under a trashed subnet
     )
     rows = [
         ip

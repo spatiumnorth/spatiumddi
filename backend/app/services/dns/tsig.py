@@ -47,6 +47,7 @@ from app.services.dns.pool_geo import (
     GEO_DEFAULT_VIEW,
     build_geo_steering,
     build_view_descriptors,
+    places_zone_clause,
     views_rendering_zone,
 )
 
@@ -306,36 +307,50 @@ def is_view_transfer_key(key: TsigKey | None) -> bool:
     return key is not None and key.name.startswith(VIEW_TRANSFER_KEY_PREFIX)
 
 
-async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
-    """The view whose copy of ``zone`` the control plane reads, or None when
-    the zone's group renders no views.
+async def zone_holding_views(db: AsyncSession, zone: DNSZone) -> list[dict[str, Any]]:
+    """The view descriptors (in render order) that carry a copy of ``zone``,
+    or an empty list when the zone's group renders no views.
 
-    Only views that hold a copy are candidates — the same rule the bundle
-    expands zones by (:func:`~app.services.dns.pool_geo.views_rendering_zone`).
-    Among them: the zone's own pinned view; else the first operator view in
-    precedence order (it serves every shared record, plus its own scoped
-    ones); else the geo catch-all, which serves the default pool members;
-    else the first view left, which can only be a geo view.
+    The same rule the bundle expands zones by
+    (:func:`~app.services.dns.pool_geo.views_rendering_zone`), so a view this
+    names is one the agents serve the zone in.
     """
     views = list(
         (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
     )
     geo = await build_geo_steering(db, zone.group_id)
     if not views and not geo.active:
-        return None
+        return []
     descs = build_view_descriptors(sorted(views, key=lambda v: (v.order, v.name)), geo)
     scoped = set(
         (
             await db.execute(
                 select(DNSRecord.view_id)
-                .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.is_not(None))
+                .where(
+                    DNSRecord.zone_id == zone.id,
+                    DNSRecord.view_id.is_not(None),
+                    places_zone_clause(),
+                )
                 .distinct()
             )
         )
         .scalars()
         .all()
     )
-    holding = views_rendering_zone(descs, zone.view_id, scoped)
+    return views_rendering_zone(descs, zone.view_id, scoped)
+
+
+async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
+    """The view whose copy of ``zone`` the control plane reads, or None when
+    the zone's group renders no views.
+
+    Only views that hold a copy are candidates (:func:`zone_holding_views`).
+    Among them: the zone's own pinned view; else the first operator view in
+    precedence order (it serves every shared record, plus its own scoped
+    ones); else the geo catch-all, which serves the default pool members;
+    else the first view left, which can only be a geo view.
+    """
+    holding = await zone_holding_views(db, zone)
     for pick in (
         lambda vd: vd["kind"] == "operator" and vd["id"] == zone.view_id,
         lambda vd: vd["kind"] == "operator",
@@ -412,6 +427,8 @@ def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
     is where the daemon listens, so a refusal there is a real answer) and
     only to an agent-managed server: Windows, cloud and an operator's own
     BIND9 are reached at their own address and must not be redirected.
+    A ``host`` that does not resolve is a separate case with its own,
+    VIP-independent fallback: :func:`transfer_unresolved_fallback_hosts`.
     """
     if not vip or not transfer_needs_tsig(server):
         return []
@@ -419,6 +436,34 @@ def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
     if not own or own in {server.host, vip}:
         return []
     return [own]
+
+
+def transfer_unresolved_fallback_hosts(server: DNSServer) -> list[str]:
+    """Where to AXFR ``server`` from when its ``host`` does not RESOLVE (#3757).
+
+    A chart-deployed agent registered its bare pod name, which only resolves
+    inside that pod. Its heartbeat source address (``last_seen_ip``) is where
+    its daemon listens, and unlike :func:`transfer_fallback_hosts` this needs
+    no VIP: it is only dialled after ``host`` failed to resolve, so a server
+    whose name works is never redirected. Same eligibility: agent-managed
+    only, so Windows, cloud and an operator's own BIND9 are never redirected.
+    """
+    if not transfer_needs_tsig(server):
+        return []
+    own = (getattr(server, "last_seen_ip", None) or "").strip()
+    if not own or own == server.host:
+        return []
+    return [own]
+
+
+def transfer_fallback_kwargs(server: DNSServer, vip: str) -> dict[str, list[str]]:
+    """``pull_zone_records`` kwargs for both fallbacks; empty when neither applies."""
+    out: dict[str, list[str]] = {}
+    if hosts := transfer_fallback_hosts(server, vip):
+        out["fallback_hosts"] = hosts
+    if unresolved := transfer_unresolved_fallback_hosts(server):
+        out["unresolved_fallback_hosts"] = unresolved
+    return out
 
 
 async def pull_zone_records_signed(
@@ -476,6 +521,8 @@ __all__ = [
     "pull_zone_records_signed",
     "resolve_transfer_vip",
     "transfer_fallback_hosts",
+    "transfer_fallback_kwargs",
+    "transfer_unresolved_fallback_hosts",
     "resolve_group_transfer_key",
     "resolve_view_transfer_key",
     "rotate_group_tsig_key",

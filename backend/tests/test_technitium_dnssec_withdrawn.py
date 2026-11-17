@@ -93,6 +93,41 @@ async def test_sign_endpoint_422_on_technitium(
 
 
 @pytest.mark.asyncio
+async def test_sign_endpoint_422_explains_on_technitium_api(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3806: the agentless driver gets the same explicit refusal, not the
+    generic "requires one of [bind9, powerdns]" text."""
+    h = await _headers(db_session)
+    grp = await _group(db_session, "technitium_api")
+    z = await _signed_zone(db_session, grp)
+    z.dnssec_enabled = False
+    await db_session.commit()
+    r = await client.post(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/sign", headers=h)
+    assert r.status_code == 422, r.text
+    assert "not supported on Technitium" in r.json()["detail"]
+    assert "1767" in r.json()["detail"]
+    await db_session.refresh(z)
+    assert z.dnssec_enabled is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["technitium", "technitium_api"])
+async def test_dnssec_info_flags_signing_unsupported(
+    client: AsyncClient, db_session: AsyncSession, driver: str
+) -> None:
+    """The flag the UI reads to disable the Sign button."""
+    h = await _headers(db_session)
+    grp = await _group(db_session, driver)
+    z = await _signed_zone(db_session, grp)
+    z.dnssec_enabled = False
+    await db_session.commit()
+    r = await client.get(f"/api/v1/dns/groups/{grp.id}/zones/{z.id}/dnssec/info", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["signing_unmanaged"] is True
+
+
+@pytest.mark.asyncio
 async def test_create_and_update_with_dnssec_422_on_technitium(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

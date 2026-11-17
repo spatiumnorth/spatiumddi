@@ -11,9 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml .
+COPY pyproject.toml requirements.txt ./
 RUN mkdir -p app && touch app/__init__.py && \
-    pip install --no-cache-dir -e ".[dev]"
+    pip install --no-cache-dir -c requirements.txt -e ".[dev]"
 
 # Source is bind-mounted at runtime
 EXPOSE 8000

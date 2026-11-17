@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -18,6 +19,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { FormError } from "@/components/ui/form-error";
 
 const KIND_LABEL: Record<NATKind, string> = {
   "1to1": "1:1 NAT",
@@ -347,7 +349,7 @@ function NATMappingModalForm({
           />
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -413,7 +415,7 @@ export function NATPage() {
     [kindFilter, search, page],
   );
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["nat-mappings", params],
     queryFn: () => natApi.list(params),
     placeholderData: (prev) => prev,
@@ -517,7 +519,9 @@ export function NATPage() {
             <p className="px-4 py-6 text-sm text-muted-foreground">Loading…</p>
           ) : items.length === 0 ? (
             <p className="px-4 py-6 text-sm text-muted-foreground">
-              No NAT mappings match the current filters.
+              <ListEmpty error={error} what="NAT mappings">
+                No NAT mappings match the current filters.
+              </ListEmpty>
             </p>
           ) : (
             <table className="w-full text-sm">
@@ -565,9 +569,11 @@ export function NATPage() {
                         <span className="text-muted-foreground">
                           {m.internal_subnet_cidr ??
                             m.internal_subnet_name ??
-                            (m.internal_subnet_id
-                              ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
-                              : "—")}
+                            (m.internal_subnet_redacted
+                              ? "restricted subnet"
+                              : m.internal_subnet_id
+                                ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+                                : "—")}
                         </span>
                       ) : (
                         (m.internal_ip ?? "—")
