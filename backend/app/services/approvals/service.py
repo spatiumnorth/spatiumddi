@@ -902,6 +902,13 @@ REQUESTER_GONE_MESSAGE = (
 )
 
 
+SCOPE_CHANGED_MESSAGE = (
+    "The change's scope changed since it was requested, so it can no longer be "
+    "approved as reviewed. Reject it; the requester can cancel it and submit it "
+    "again to capture the new scope."
+)
+
+
 def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
     """Why ``approver`` may not approve ``cr``, or ``None`` when they may.
 
@@ -1170,7 +1177,8 @@ async def approve_change_request(
     #     request and approval (e.g. the requester added 50 IPs to a subnet
     #     queued for soft-delete) — refuse so the approver never rubber-stamps
     #     a scope larger than the one they reviewed. Treat any drift as stale;
-    #     the requester must cancel and re-submit to capture the new scope.
+    #     the approver can only reject it (#4381) and the requester cancel and
+    #     re-submit to capture the new scope.
     #     This closes the TOCTOU for both soft and permanent paths via one rule.
     #
     #     GATE ROWS ONLY (#696). The rule assumes the preview describes a
@@ -1200,10 +1208,7 @@ async def approve_change_request(
             frozen_preview=cr.preview_text,
             fresh_preview=preview.preview_text,
         )
-        raise DecisionConflict(
-            "The change's scope changed since it was requested — cancel and "
-            "re-submit to capture the new scope."
-        )
+        raise DecisionConflict(SCOPE_CHANGED_MESSAGE)
 
     requester_id = cr.requested_by_user_id
 

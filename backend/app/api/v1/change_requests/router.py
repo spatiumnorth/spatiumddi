@@ -587,7 +587,8 @@ async def approve_request(
        they cannot reach — answers 403 and the row stays ``pending`` for
        another approver (#2934). If it still succeeds but its scope
        differs from what the approver reviewed, the approve answers 409 and
-       the row stays ``pending``: the requester can cancel and re-submit.
+       the row stays ``pending``: the approver can reject it, and the requester
+       can cancel and re-submit.
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
        in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx

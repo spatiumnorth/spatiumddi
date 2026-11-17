@@ -169,14 +169,23 @@ function fmtTime(iso: string | null): string {
 // it so an over-long note is never sent and refused as "decision_note: ..." (#3835).
 const DECISION_NOTE_MAX = 2000;
 
+// The 409 an Approve gets when the change's scope grew since it was requested
+// (#4381). The row cannot be approved again, so the page remembers it and
+// stops offering Approve; Reject (the approver's decision) stays.
+const SCOPE_CHANGED_PREFIX = "The change's scope changed";
+const SCOPE_CHANGED_NOTE =
+  "The change's scope changed since it was requested, so it can no longer be approved. Reject it; the requester can cancel it and submit it again.";
+
 function DecisionModal({
   cr,
   mode,
   onClose,
+  onScopeChanged,
 }: {
   cr: ChangeRequest;
   mode: "approve" | "reject";
   onClose: () => void;
+  onScopeChanged?: (id: string) => void;
 }) {
   const qc = useQueryClient();
   const [note, setNote] = useState("");
@@ -192,8 +201,13 @@ function DecisionModal({
       qc.invalidateQueries({ queryKey: ["change-requests"] });
       onClose();
     },
-    onError: (err) =>
-      setError(formatApiError(err, `Failed to ${mode} the request.`)),
+    onError: (err) => {
+      const message = formatApiError(err, `Failed to ${mode} the request.`);
+      if (mode === "approve" && message.startsWith(SCOPE_CHANGED_PREFIX)) {
+        onScopeChanged?.(cr.id);
+      }
+      setError(message);
+    },
   });
 
   const title =
@@ -289,12 +303,14 @@ function RequestRow({
   cr,
   canApprove,
   canCancel,
+  scopeChanged,
   onDecide,
   onCancel,
 }: {
   cr: ChangeRequest;
   canApprove: boolean;
   canCancel: boolean;
+  scopeChanged: boolean;
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
 }) {
@@ -313,6 +329,11 @@ function RequestRow({
         {cr.error && (
           <div className="mt-1 text-[11px] text-destructive break-words">
             {cr.error}
+          </div>
+        )}
+        {isPending && scopeChanged && (
+          <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400 break-words">
+            {SCOPE_CHANGED_NOTE}
           </div>
         )}
       </td>
@@ -346,11 +367,14 @@ function RequestRow({
                 <HeaderButton
                   variant="primary"
                   icon={Check}
-                  disabled={!cr.can_approve}
+                  disabled={!cr.can_approve || scopeChanged}
                   title={
-                    cr.can_approve
-                      ? undefined
-                      : (cr.approve_blocked_reason ?? "You cannot approve this")
+                    scopeChanged
+                      ? SCOPE_CHANGED_NOTE
+                      : cr.can_approve
+                        ? undefined
+                        : (cr.approve_blocked_reason ??
+                          "You cannot approve this")
                   }
                   onClick={() => onDecide(cr, "approve")}
                 >
@@ -386,6 +410,7 @@ function RequestTable({
   canApprove,
   isRequester,
   isSuperadmin,
+  scopeChanged,
   onDecide,
   onCancel,
   emptyText,
@@ -394,6 +419,7 @@ function RequestTable({
   canApprove: boolean;
   isRequester: (cr: ChangeRequest) => boolean;
   isSuperadmin: boolean;
+  scopeChanged: ReadonlySet<string>;
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
   emptyText: string;
@@ -426,6 +452,7 @@ function RequestTable({
               // request (#3834); only Cancel is offered on it.
               canApprove={canApprove && !isRequester(cr)}
               canCancel={isRequester(cr) || isSuperadmin}
+              scopeChanged={scopeChanged.has(cr.id)}
               onDecide={onDecide}
               onCancel={onCancel}
             />
@@ -861,6 +888,10 @@ export function ChangeRequestsPage() {
     mode: "approve" | "reject";
   } | null>(null);
   const [cancelTarget, setCancelTarget] = useState<ChangeRequest | null>(null);
+  // Requests whose Approve the server refused for a grown scope (#4381).
+  const [scopeChanged, setScopeChanged] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
 
   const qc = useQueryClient();
 
@@ -949,6 +980,7 @@ export function ChangeRequestsPage() {
               canApprove={canApprove}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
+              scopeChanged={scopeChanged}
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="Nothing waiting for approval."
@@ -964,6 +996,7 @@ export function ChangeRequestsPage() {
               canApprove={false}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
+              scopeChanged={scopeChanged}
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="No decided requests yet."
@@ -978,6 +1011,9 @@ export function ChangeRequestsPage() {
           cr={decision.cr}
           mode={decision.mode}
           onClose={() => setDecision(null)}
+          onScopeChanged={(id) =>
+            setScopeChanged((prev) => new Set(prev).add(id))
+          }
         />
       )}
 
