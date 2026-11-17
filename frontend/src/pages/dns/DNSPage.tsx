@@ -1,5 +1,5 @@
 import { recordTypeServable } from "@/lib/recordTypeGates";
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { FormError } from "@/components/ui/form-error";
