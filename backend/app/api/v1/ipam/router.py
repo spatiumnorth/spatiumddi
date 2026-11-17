@@ -209,6 +209,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/addresses",
             "GET /subnets/{subnet_id}/aliases",
             "GET /subnets/{subnet_id}/domains",
+            "GET /subnets/{subnet_id}/effective-ddns",
             "GET /subnets/{subnet_id}/effective-dhcp",
             "GET /subnets/{subnet_id}/effective-dns",
             "GET /subnets/{subnet_id}/effective-fields",

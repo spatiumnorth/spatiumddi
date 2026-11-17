@@ -2152,6 +2152,7 @@ export function DdnsSettingsSection({
   subnetNetwork,
   inherit,
   effective,
+  effectiveUnreadable,
   onInheritChange,
   onEnabledChange,
   onPolicyChange,
@@ -2167,6 +2168,9 @@ export function DdnsSettingsSection({
    *  `onInheritChange` the section is the old subnet-only form. */
   inherit?: boolean;
   effective?: EffectiveDdns | null;
+  /** The effective read was refused or failed (#4348): the parent's state is
+   *  unknown, so the section never draws it as "off". */
+  effectiveUnreadable?: boolean;
   onInheritChange?: (v: boolean) => void;
   onEnabledChange: (v: boolean) => void;
   onPolicyChange: (v: DdnsPolicy) => void;
@@ -2197,6 +2201,7 @@ export function DdnsSettingsSection({
   // which are not the ones in force (#2475).
   const inheriting = inherit === true && !!onInheritChange;
   const shown = inheriting && effective ? effective : null;
+  const unknown = inheriting && !effective && effectiveUnreadable === true;
   const shownEnabled = inheriting ? (effective?.enabled ?? false) : enabled;
   const shownPolicy = (shown?.hostname_policy as DdnsPolicy) ?? policy;
   const shownOverride = inheriting
@@ -2239,7 +2244,7 @@ export function DdnsSettingsSection({
           <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
             <input
               type="checkbox"
-              checked={shownEnabled}
+              checked={shownEnabled && !unknown}
               disabled={inheriting}
               onChange={(e) => onEnabledChange(e.target.checked)}
               className="h-3.5 w-3.5"
@@ -2252,7 +2257,9 @@ export function DdnsSettingsSection({
         <p className="text-xs text-muted-foreground italic">
           {effective
             ? `Inheriting from ${sourceText}: DDNS is ${effective.enabled ? "enabled" : "disabled"}.`
-            : "Inheriting from the parent block or space."}
+            : unknown
+              ? "The parent's DDNS settings are not visible to your role."
+              : "Inheriting from the parent block or space."}
         </p>
       )}
       {!shownEnabled && !inheriting && (
@@ -2845,7 +2852,7 @@ export function CreateSubnetModal({
   );
   // DDNS state — a new subnet inherits unless the operator opts out (#2475)
   const [ddnsInherit, setDdnsInherit] = useState(true);
-  const { data: effectiveDdns } = useQuery({
+  const { data: effectiveDdns, isError: effectiveDdnsError } = useQuery({
     queryKey: ["effective-ddns-block", blockId],
     queryFn: () => ipamApi.getEffectiveBlockDdns(blockId),
     enabled: !!blockId,
@@ -3390,6 +3397,7 @@ export function CreateSubnetModal({
         <DdnsSettingsSection
           inherit={ddnsInherit}
           effective={effectiveDdns ?? null}
+          effectiveUnreadable={effectiveDdnsError}
           onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
@@ -3764,7 +3772,7 @@ export function AddAddressModal({
   // reload before the real state is known.
   const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
   const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
-  const { data: dhcpScopes = [] } = useQuery({
+  const { data: dhcpScopes = [], error: dhcpScopesError } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnetId],
     queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
     enabled: dhcpOn,
@@ -4355,26 +4363,39 @@ export function AddAddressModal({
             <div />
           )}
         </div>
-        {dhcpOn && needsDhcpScope && dhcpScopes.length === 0 && (
-          <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-            No DHCP scope exists for this subnet — a reservation needs one, so
-            the server will create the address without one and say so.
-            <button
-              type="button"
-              onClick={() => setShowCreateScope(true)}
-              className="ml-1 font-medium text-primary underline hover:no-underline"
-            >
-              Create a scope
-            </button>{" "}
-            first if you want the reservation now.
-            {showCreateScope && (
-              <CreateScopeModal
-                subnetId={subnetId}
-                onClose={() => setShowCreateScope(false)}
-              />
-            )}
-          </div>
+        {dhcpOn && needsDhcpScope && dhcpScopesError && (
+          <p className="text-xs text-muted-foreground">
+            <ListReadError
+              error={dhcpScopesError}
+              what="this subnet's DHCP scopes"
+            />{" "}
+            Whether it has one is not known here; the server says if it cannot
+            make the reservation.
+          </p>
         )}
+        {dhcpOn &&
+          needsDhcpScope &&
+          !dhcpScopesError &&
+          dhcpScopes.length === 0 && (
+            <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
+              No DHCP scope exists for this subnet — a reservation needs one, so
+              the server will create the address without one and say so.
+              <button
+                type="button"
+                onClick={() => setShowCreateScope(true)}
+                className="ml-1 font-medium text-primary underline hover:no-underline"
+              >
+                Create a scope
+              </button>{" "}
+              first if you want the reservation now.
+              {showCreateScope && (
+                <CreateScopeModal
+                  subnetId={subnetId}
+                  onClose={() => setShowCreateScope(false)}
+                />
+              )}
+            </div>
+          )}
         {needsDhcpScope && !mac && (
           <p className="text-xs text-amber-600">
             MAC address required to create a static DHCP reservation.
@@ -8696,7 +8717,7 @@ function EditSubnetModalForm({
   const [ddnsInherit, setDdnsInherit] = useState(
     subnet.ddns_inherit_settings ?? true,
   );
-  const { data: effectiveDdns } = useQuery({
+  const { data: effectiveDdns, isError: effectiveDdnsError } = useQuery({
     queryKey: ["effective-ddns-subnet", subnet.id],
     queryFn: () => ipamApi.getEffectiveSubnetDdns(subnet.id),
     staleTime: 30_000,
@@ -9329,6 +9350,7 @@ function EditSubnetModalForm({
         <DdnsSettingsSection
           inherit={ddnsInherit}
           effective={effectiveDdns ?? null}
+          effectiveUnreadable={effectiveDdnsError}
           onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
@@ -9922,7 +9944,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   // reload before the real state is known.
   const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
   const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
-  const { data: dhcpScopes = [] } = useQuery({
+  const { data: dhcpScopes = [], error: dhcpScopesError } = useQuery({
     queryKey: ["dhcp-scopes-subnet", address.subnet_id],
     queryFn: () => dhcpApi.listScopesBySubnet(address.subnet_id),
     enabled: needsDhcpScope && dhcpOn,
@@ -10369,26 +10391,39 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             Mirrors AddAddressModal, incl. the #472 inline create-scope
             escape hatch. There is no scope picker (#1629): the server
             picks the subnet's sole matching scope itself. */}
-        {dhcpOn && needsDhcpScope && dhcpScopes.length === 0 && (
-          <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-            No DHCP scope exists for this subnet — a reservation needs one, so
-            the server will save the address without one and say so.
-            <button
-              type="button"
-              onClick={() => setShowCreateScope(true)}
-              className="ml-1 font-medium text-primary underline hover:no-underline"
-            >
-              Create a scope
-            </button>{" "}
-            first if you want the reservation now.
-            {showCreateScope && (
-              <CreateScopeModal
-                subnetId={address.subnet_id}
-                onClose={() => setShowCreateScope(false)}
-              />
-            )}
-          </div>
+        {dhcpOn && needsDhcpScope && dhcpScopesError && (
+          <p className="text-xs text-muted-foreground">
+            <ListReadError
+              error={dhcpScopesError}
+              what="this subnet's DHCP scopes"
+            />{" "}
+            Whether it has one is not known here; the server says if it cannot
+            make the reservation.
+          </p>
         )}
+        {dhcpOn &&
+          needsDhcpScope &&
+          !dhcpScopesError &&
+          dhcpScopes.length === 0 && (
+            <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
+              No DHCP scope exists for this subnet — a reservation needs one, so
+              the server will save the address without one and say so.
+              <button
+                type="button"
+                onClick={() => setShowCreateScope(true)}
+                className="ml-1 font-medium text-primary underline hover:no-underline"
+              >
+                Create a scope
+              </button>{" "}
+              first if you want the reservation now.
+              {showCreateScope && (
+                <CreateScopeModal
+                  subnetId={address.subnet_id}
+                  onClose={() => setShowCreateScope(false)}
+                />
+              )}
+            </div>
+          )}
         {status === "static_dhcp" && !macAddress && (
           <p className="text-xs text-amber-600">
             MAC address required to create a static DHCP reservation.
@@ -10794,12 +10829,24 @@ function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
 }
 
 function NatSubnetPanel({ subnetId }: { subnetId: string }) {
-  const { data = [], isLoading } = useQuery({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["subnet-nat-mappings", subnetId],
     queryFn: () => natApi.bySubnet(subnetId),
   });
   if (isLoading) {
     return <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>;
+  }
+  // A refused read is not an empty list (#4347).
+  if (error) {
+    return (
+      <p className="px-6 py-4 text-sm">
+        <ListReadError error={error} what="this subnet's NAT mappings" />
+      </p>
+    );
   }
   return (
     <div className="space-y-2 p-2">
@@ -10853,6 +10900,7 @@ function NatMappingsForIpModal({
 
 export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
   const qc = useQueryClient();
+  const perms = usePermissions();
   const { data: aliases = [], isLoading } = useQuery({
     queryKey: ["subnet-aliases", subnetId],
     queryFn: () => ipamApi.listSubnetAliases(subnetId),
@@ -10935,8 +10983,13 @@ export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
                       fqdn: a.fqdn,
                     })
                   }
-                  className="rounded p-1 text-muted-foreground hover:text-destructive"
+                  className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted-foreground"
                   title="Delete alias"
+                  aria-label="Delete alias"
+                  {...permissionGate(
+                    perms.can("delete", "subnet"),
+                    NEEDS_SUBNET_DELETE,
+                  )}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
