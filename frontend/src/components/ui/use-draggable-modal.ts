@@ -1,4 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
+import {
+  captureSuccessors,
+  returnFocus,
+  type FocusSuccessor,
+} from "./focus-return";
 
 /** CSS for the outer flex-center backdrop. Same across every modal. */
 export const MODAL_BACKDROP_CLS =
@@ -207,8 +212,17 @@ export function useFocusTrap<T extends HTMLElement>() {
   // dialog on open and unmounts it on close, which is also what the trap
   // effect below assumes (it runs once, on mount).
   const openerRef = useRef<FocusReturnTargets | undefined>(undefined);
+  const successorsRef = useRef<FocusSuccessor[]>([]);
   if (openerRef.current === undefined) {
     openerRef.current = captureFocusReturnTargets();
+    // Where focus goes if the opener is gone by the close (#3909). Not for a
+    // dialog opened from a menu item: the menu's own owner places focus then
+    // (the right-click menu, #3908), and a heading fallback here would win.
+    const active = document.activeElement;
+    successorsRef.current =
+      active && !active.closest('[role="menu"]')
+        ? captureSuccessors(active)
+        : [];
   }
   useEffect(() => {
     const node = ref.current;
@@ -323,7 +337,17 @@ export function useFocusTrap<T extends HTMLElement>() {
       const target = returnTargets?.find(
         (el) => el !== document.body && el.isConnected,
       );
-      target?.focus?.();
+      // A dialog's card is a target only as the place to land inside a dialog
+      // that is still open; it takes focus the way the trap gives it on open.
+      if (
+        target?.getAttribute("role") === "dialog" &&
+        !target.hasAttribute("tabindex")
+      ) {
+        target.setAttribute("tabindex", "-1");
+      }
+      // An opener already gone, or removed by the refetch that follows a
+      // delete, hands focus to a successor in the page, not the body (#3909).
+      returnFocus(target ? [target] : [], successorsRef.current);
     };
   }, [seq]);
   return ref;
@@ -357,6 +381,22 @@ function captureFocusReturnTargets(): FocusReturnTargets {
       (el.getAttribute("aria-controls") ?? "").split(/\s+/).includes(menu.id),
     );
     if (trigger) targets.push(trigger);
+  }
+  // Focus is on a control inside a dialog (Enter in a form field submits it
+  // and the next dialog opens with focus still there, or a Tab moved it off
+  // the card). The control can leave before this dialog closes, two ways:
+  // - the enclosing dialog stays open and only the control goes (a row
+  //   removed by what this dialog did): focus belongs on that dialog's card,
+  //   never on its opener in the page behind it;
+  // - the enclosing dialog is replaced and the control goes with it: return
+  //   to what that dialog would have returned to (#3483).
+  // Both after the control itself and after a menu's trigger, so a dialog
+  // opened from a menu inside another dialog still lands on that trigger.
+  const card = active.closest<HTMLElement>('[role="dialog"]');
+  if (card && card !== active) {
+    targets.push(card);
+    const enclosing = cardReturnTargets.get(card);
+    if (enclosing) targets.push(...enclosing);
   }
   return targets;
 }

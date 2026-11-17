@@ -17,6 +17,7 @@ HOW TO RUN:
 
 from __future__ import annotations
 
+import itertools
 import uuid
 from xml.etree import ElementTree as ET
 
@@ -372,6 +373,9 @@ def test_an_error_document_escapes_its_message() -> None:
 HELD_CT = {"Content-Type": "application/held+xml"}
 
 
+_OCTETS = itertools.cycle(range(1, 250))
+
+
 async def _estate_with_location(db: AsyncSession) -> tuple[str, str]:
     """A voice subnet with an ERL bound to it. Returns (ip, room)."""
     site = Site(name=f"hq-{uuid.uuid4().hex[:6]}", kind="office")
@@ -383,7 +387,10 @@ async def _estate_with_location(db: AsyncSession) -> tuple[str, str]:
     block = IPBlock(space_id=space.id, network="10.77.0.0/16", name="b")
     db.add(block)
     await db.flush()
-    octet = uuid.uuid4().int % 250
+    # Sequential, not random: two estates in one test must never share a
+    # subnet octet (a 1-in-250 collision made the decoy and the target one
+    # address, which tripped the budget test's per-address assertion, #3781).
+    octet = next(_OCTETS)
     subnet = Subnet(
         space_id=space.id,
         block_id=block.id,
@@ -649,3 +656,286 @@ def test_an_unknown_client_address_is_a_400_not_a_429(monkeypatch) -> None:
     unknown = src.index("could not determine the requesting address")
     throttled = src.index("e911_self_query_rate_limited")
     assert unknown < throttled, "the throttle still runs before the address check"
+
+
+@pytest.mark.asyncio
+async def test_held_over_the_budget_is_refused_and_resolves_nothing(client, db_session) -> None:
+    """#3633: past the per-caller budget the lookup answers 429 with a
+    Retry-After and a HELD error document, returns no location and writes no
+    trail row. Within the budget, each answer has its own trail row."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy import select
+
+    from app.models.e911 import E911ResolutionLog
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, _room = await _estate_with_location(db_session)
+    hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
+    body = _req(f"<locationType>civic</locationType><device><ip>{ip}</ip></device>")
+
+    async def rows() -> list[E911ResolutionLog]:
+        db_session.expire_all()
+        res = await db_session.execute(select(E911ResolutionLog))
+        return list(res.scalars().all())
+
+    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=False):
+        for _ in range(3):
+            res = await client.post("/held", content=body, headers=hdr)
+            assert res.status_code == 200, res.text
+    got = await rows()
+    assert len(got) == 3
+    assert all(r.suppressed_count is None and r.identity_value == ip for r in got)
+
+    resolver = AsyncMock()
+    with (
+        patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=True),
+        patch("app.api.v1.e911.held_router.e911_lookup_retry_after", return_value=42),
+        patch("app.api.v1.e911.held_router.resolve_location", resolver),
+    ):
+        res = await client.post("/held", content=body, headers=hdr)
+    assert res.status_code == 429, res.text
+    assert res.headers["retry-after"] == "42"
+    assert res.headers["content-type"].startswith("application/held+xml")
+    assert 'code="generalLisError"' in res.text
+    assert "presence" not in res.text and ip not in res.text
+    resolver.assert_not_awaited()
+    assert len(await rows()) == 3
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_the_remaining_window() -> None:
+    from unittest.mock import patch
+
+    from app.core import auth_throttle
+
+    class FakeRedis:
+        async def pttl(self, key):  # type: ignore[no-untyped-def]
+            return 16_400
+
+        async def aclose(self) -> None:
+            pass
+
+    with patch.object(auth_throttle, "make_async_redis", lambda *a, **k: FakeRedis()):
+        assert await auth_throttle.e911_lookup_retry_after("t") == 17
+
+
+class _FakeRedis:
+    """Just enough of a Redis client for the HELD budget counter: the
+    fixed-window INCR script and TTL, shared across connections the way a
+    real server's keys are."""
+
+    keys: dict[str, int] = {}
+
+    async def eval(self, _script, _numkeys, key, _window):  # type: ignore[no-untyped-def]
+        self.keys[key] = self.keys.get(key, 0) + 1
+        return self.keys[key]
+
+    async def pttl(self, key):  # type: ignore[no-untyped-def]
+        return 36_200 if key in self.keys else -2
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def _set_budget(db: AsyncSession, budget: int) -> None:
+    from app.models.settings import PlatformSettings
+
+    row = await db.get(PlatformSettings, 1)
+    if row is None:
+        row = PlatformSettings(id=1)
+        db.add(row)
+    row.e911_lookup_log_budget_per_minute = budget
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_past_the_budget_is_never_answered_unrecorded(client, db_session) -> None:
+    """#3633, through the real budget counter: fill the budget with decoy
+    lookups, then ask about the target, then one more decoy. The target is
+    either refused or in the trail; it is never answered with no row naming
+    it. Here it is refused, and so is the trailing decoy."""
+    from unittest.mock import patch
+
+    from sqlalchemy import select
+
+    from app.core import auth_throttle
+    from app.models.e911 import E911ResolutionLog
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    decoy, _ = await _estate_with_location(db_session)
+    target, room = await _estate_with_location(db_session)
+    await _set_budget(db_session, 2)
+    hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
+
+    def body(addr: str) -> bytes:
+        return _req(f"<locationType>civic</locationType><device><ip>{addr}</ip></device>")
+
+    _FakeRedis.keys = {}
+    with patch.object(auth_throttle, "make_async_redis", lambda *a, **k: _FakeRedis()):
+        codes = []
+        for i, addr in enumerate((decoy, decoy, target, decoy)):
+            res = await client.post("/held", content=body(addr), headers=hdr)
+            codes.append(res.status_code)
+            if i == 2:
+                assert room not in res.text and target not in res.text
+                assert res.headers.get("retry-after") == "37"
+    assert codes == [200, 200, 429, 429]
+
+    db_session.expire_all()
+    got = (await db_session.execute(select(E911ResolutionLog))).scalars().all()
+    assert sorted(r.identity_value for r in got) == [decoy, decoy]
+    assert all(r.suppressed_count is None for r in got)
+
+
+@pytest.mark.asyncio
+async def test_with_redis_down_every_lookup_is_answered_and_logged(client, db_session) -> None:
+    """#3633: the budget fails OPEN. An outage of the counter must not become
+    a location outage, and every answer still gets its own trail row."""
+    from unittest.mock import patch
+
+    from sqlalchemy import select
+
+    from app.core import auth_throttle
+    from app.models.e911 import E911ResolutionLog
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, _room = await _estate_with_location(db_session)
+    await _set_budget(db_session, 1)
+    hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
+    body = _req(f"<locationType>civic</locationType><device><ip>{ip}</ip></device>")
+
+    def down(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise ConnectionError("redis unreachable")
+
+    with patch.object(auth_throttle, "make_async_redis", down):
+        for _ in range(3):
+            res = await client.post("/held", content=body, headers=hdr)
+            assert res.status_code == 200, res.text
+
+    db_session.expire_all()
+    got = (await db_session.execute(select(E911ResolutionLog))).scalars().all()
+    assert len(got) == 3 and all(r.suppressed_count is None for r in got)
+
+
+@pytest.mark.asyncio
+async def test_the_self_query_past_the_budget_is_refused_and_writes_nothing(
+    client, db_session, monkeypatch
+) -> None:
+    """#3633: the budget applies to /held/self too, keyed by source address,
+    behind its own fail-closed throttle."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy import select
+
+    from app.config import settings
+    from app.models.e911 import E911ResolutionLog
+
+    monkeypatch.setattr(settings, "e911_self_query_enabled", True)
+    monkeypatch.setattr("app.api.v1.e911.held_router.e911_self_query_rate_limited", _never_limited)
+    resolver = AsyncMock()
+    with (
+        patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", return_value=True),
+        patch("app.api.v1.e911.held_router.e911_lookup_retry_after", return_value=12),
+        patch("app.api.v1.e911.held_router.resolve_location", resolver),
+    ):
+        res = await client.post("/held/self", content=_req(""), headers=HELD_CT)
+    assert res.status_code == 429, res.text
+    assert res.headers["retry-after"] == "12"
+    assert 'code="generalLisError"' in res.text
+    resolver.assert_not_awaited()
+    got = (await db_session.execute(select(E911ResolutionLog))).scalars().all()
+    assert got == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", [-2, -1])
+async def test_retry_after_falls_back_to_the_window_without_a_live_key(ttl: int) -> None:
+    """A key that has expired (-2) or lost its expiry (-1) must not produce a
+    Retry-After of 0 or less: the client would retry at once."""
+    from unittest.mock import patch
+
+    from app.core import auth_throttle
+
+    class R:
+        async def pttl(self, key):  # type: ignore[no-untyped-def]
+            return ttl
+
+        async def aclose(self) -> None:
+            pass
+
+    with patch.object(auth_throttle, "make_async_redis", lambda *a, **k: R()):
+        assert await auth_throttle.e911_lookup_retry_after("t") == 60
+
+
+@pytest.mark.asyncio
+async def test_retry_after_falls_back_to_the_window_with_redis_down() -> None:
+    from unittest.mock import patch
+
+    from app.core import auth_throttle
+
+    def down(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise ConnectionError("redis unreachable")
+
+    with patch.object(auth_throttle, "make_async_redis", down):
+        assert await auth_throttle.e911_lookup_retry_after("t") == 60
+
+
+@pytest.mark.asyncio
+async def test_held_reads_the_log_budget_setting_live(client, db_session) -> None:
+    """#3514: the budget is ``PlatformSettings.e911_lookup_log_budget_per_minute``,
+    read on every call, not a constant."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.models.settings import PlatformSettings
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, _room = await _estate_with_location(db_session)
+    row = await db_session.get(PlatformSettings, 1)
+    if row is None:
+        row = PlatformSettings(id=1)
+        db_session.add(row)
+    row.e911_lookup_log_budget_per_minute = 7
+    await db_session.commit()
+
+    body = _req(f"<locationType>civic</locationType><device><ip>{ip}</ip></device>")
+    hdr = {**HELD_CT, "Authorization": f"Bearer {token}"}
+    limiter = AsyncMock(return_value=False)
+    with patch("app.api.v1.e911.held_router.e911_lookup_log_rate_limited", limiter):
+        res = await client.post("/held", content=body, headers=hdr)
+    assert res.status_code == 200, res.text
+    assert limiter.await_args is not None
+    assert limiter.await_args.args[1] == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pttl_ms", "expected"), [(300, 1), (0, 1), (52_400, 53), (1000, 1), (1001, 2)]
+)
+async def test_retry_after_rounds_up_from_milliseconds(pttl_ms: int, expected: int) -> None:
+    """#3633: whole-second TTL rounds to nearest, so the header could be 0.5 s
+    short (refused again after waiting it out) or 0 -> the 60 s fallback."""
+    from unittest.mock import patch
+
+    from app.core import auth_throttle
+
+    class R:
+        async def pttl(self, key):  # type: ignore[no-untyped-def]
+            return pttl_ms
+
+        async def aclose(self) -> None:
+            pass
+
+    with patch.object(auth_throttle, "make_async_redis", lambda *a, **k: R()):
+        assert await auth_throttle.e911_lookup_retry_after("t") == expected
+        assert await auth_throttle.stepup_block_seconds_left("u") == expected
+
+
+def test_pttl_helper_ceils_and_falls_back() -> None:
+    from app.core.auth_throttle import retry_after_from_pttl_ms as f
+
+    assert (f(300, 60), f(52_400, 60), f(-1, 60), f(-2, 60)) == (1, 53, 60, 60)

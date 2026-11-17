@@ -35,6 +35,7 @@ RETENTION: dict[str, tuple[int, int, int, int]] = {
     "appliance_revoked_retention_days": (60, 30, 0, 365),
     "metric_retention_days": (30, 7, 1, 365),
     "log_retention_hours": (72, 24, 1, 168),
+    "e911_resolution_log_retention_days": (180, 90, 7, 3650),
 }
 
 

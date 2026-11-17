@@ -48,6 +48,12 @@ const OVERLAY = {
   policy_count: 0,
 };
 
+// The ownership fields follow their feature modules (#4101); these tests are
+// about the customer field itself, so every module is on.
+vi.mock("@/hooks/useFeatureModules", () => ({
+  useFeatureModules: () => ({ ready: true, enabled: () => true }),
+}));
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});
@@ -74,9 +80,11 @@ vi.mock("@/lib/api", async () => {
                 ? undefined
                 : name === "customersApi" && method === "list"
                   ? customersList
-                  : name === "servicesApi" && method === "get"
-                    ? async () => SERVICE
-                    : pending,
+                  : name === "authApi" && method === "myPermissions"
+                    ? async () => ({ is_superadmin: true, grants: [] })
+                    : name === "servicesApi" && method === "get"
+                      ? async () => SERVICE
+                      : pending,
           },
         ),
       ]),

@@ -422,7 +422,9 @@ async def create_pool(
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
-async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser) -> DHCPPool:
+async def update_pool(
+    pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser
+) -> PoolResponse:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
@@ -507,7 +509,19 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
     )
     await db.commit()
     await db.refresh(pool)
-    return pool
+    resp = PoolResponse.model_validate(pool, from_attributes=True)
+    # #4027 — same notice as create (#2445), when the edit moved the range or
+    # made the pool dynamic; a rename of an unchanged range stays quiet.
+    if (
+        scope is not None
+        and pool.pool_type == "dynamic"
+        and ({"start_ip", "end_ip", "pool_type"} & changes.keys())
+    ):
+        existing = await _existing_ips_in_range(
+            db, scope.subnet_id, str(pool.start_ip), str(pool.end_ip)
+        )
+        resp.existing_ips_in_range = existing or None
+    return resp
 
 
 @router.delete("/pools/{pool_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -675,9 +689,11 @@ class FleetPoolOccupancyResponse(BaseModel):
     pools: list[FleetPoolOccupancyRow]
 
 
-#: Occupancy bands for the fleet rollup. Same numbers the subnet
-#: utilization heatmap uses, so "amber" means the same thing wherever an
-#: operator sees it on this dashboard.
+#: Occupancy bands for the fleet rollup. The pool bars on the Dashboard
+#: and the DHCP page band at these same lines (``poolOccupancyTone`` in
+#: frontend/src/lib/pool-occupancy-tone.ts), so a bar is never amber beside
+#: a "Pools >= 80%" card that reads 0. Subnet utilization follows Settings'
+#: thresholds instead (#3539); pools have no such setting.
 _POOL_WARNING_PERCENT = 80.0
 _POOL_CRITICAL_PERCENT = 95.0
 

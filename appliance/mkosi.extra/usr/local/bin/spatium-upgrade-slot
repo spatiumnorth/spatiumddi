@@ -1859,12 +1859,15 @@ def cmd_set_next_boot(args) -> int:
     Uses `grub-reboot` which sets saved_entry to the target for the
     next boot only; after that boot, grub auto-reverts to the previous
     saved_entry. The safety net: if the new slot fails to boot (kernel
-    panic, /health/live timeout, etc.) the system falls back to the
-    last-good slot automatically — no operator intervention needed.
+    panic, k3s never ready, a baked image missing, etc.) the system falls
+    back to the last-good slot automatically — no operator intervention
+    needed.
 
     spatiumddi-firstboot.service is responsible for COMMITTING the
-    new slot via `grub-set-default` once /health/live confirms the
-    upgraded slot is healthy. Without that commit, even a successful
+    new slot via `grub-set-default` once k3s's /readyz answers and every
+    baked image is in containerd. It needs no api, so this is also the
+    console's way back to the newer release after a rollback left none
+    (#3780). Without that commit, even a successful
     boot reverts to the previous slot on next reboot.
 
     #3169 — when the target is NOT the running slot, its baked image
@@ -1914,7 +1917,7 @@ def cmd_set_next_boot(args) -> int:
     print(f"  grubenv saved_entry now = {current} (next boot only)")
     print()
     print(f"Active slot stays {active['partlabel']} until you `reboot`.")
-    print(f"On reboot you'll boot into {target}; if /health/live passes,")
+    print(f"On reboot you'll boot into {target}; once k3s is ready with every baked image,")
     print(f"spatiumddi-firstboot will commit it as the new default. If not,")
     print(f"the next reboot after that falls back to {active['partlabel']}.")
     return 0

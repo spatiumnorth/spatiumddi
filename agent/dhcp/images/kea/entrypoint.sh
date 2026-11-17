@@ -39,7 +39,23 @@ set -eu
 
 # Ensure state + runtime dirs are writable by the agent user.
 mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea
-chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea || true
+if [ "$(id -u)" = "0" ]; then
+    # The usual start (Docker Compose, the appliance, a plain Kubernetes pod):
+    # chown, then drop to ``spatium`` for every process below.
+    chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea || true
+    RUN_AS="su-exec spatium:spatium"
+else
+    # #3852 — started as an arbitrary uid in group 0 (OpenShift's restricted
+    # SCC): nobody to chown to, nothing to drop to. The image makes the state
+    # dirs group-0 writable. /run/kea is the exception: Kea refuses a control
+    # directory more permissive than 0750, and 0750 is writable only by its
+    # owner, so recreate it owned by this uid (/run is group-writable for that).
+    RUN_AS=""
+    if [ ! -O /run/kea ]; then
+        rm -rf /run/kea
+        mkdir -m 0750 /run/kea
+    fi
+fi
 # Kea requires the control-socket parent dir to be exactly mode 0750.
 # Kea 3.0 hardened this: the socket path itself must also sit under the
 # compiled-in default dir (/run/kea on Alpine) or the daemon refuses to
@@ -71,7 +87,8 @@ supervise_kea() {
     while [ "$STOPPING" -eq 0 ]; do
         rm -f "$KEA_PID_FILE" 2>/dev/null || true
         start_ts=$(date +%s)
-        su-exec spatium:spatium kea-dhcp4 -c "$KEA_CFG" &
+        # shellcheck disable=SC2086  # RUN_AS is a deliberate word list, or empty
+        $RUN_AS kea-dhcp4 -c "$KEA_CFG" &
         KEA_CHILD=$!
         wait "$KEA_CHILD" || true
         code=$?
@@ -103,7 +120,8 @@ supervise_kea6() {
     while [ "$STOPPING" -eq 0 ]; do
         rm -f "$KEA6_PID_FILE" 2>/dev/null || true
         start_ts=$(date +%s)
-        su-exec spatium:spatium kea-dhcp6 -c "$KEA_CFG6" &
+        # shellcheck disable=SC2086  # RUN_AS is a deliberate word list, or empty
+        $RUN_AS kea-dhcp6 -c "$KEA_CFG6" &
         KEA6_CHILD=$!
         wait "$KEA6_CHILD" || true
         code=$?
@@ -147,7 +165,8 @@ supervise_radvd() {
             continue
         fi
         rm -f "$RADVD_PID" 2>/dev/null || true
-        su-exec spatium:spatium radvd -C "$RADVD_CFG" -p "$RADVD_PID" -n &
+        # shellcheck disable=SC2086  # RUN_AS is a deliberate word list, or empty
+        $RUN_AS radvd -C "$RADVD_CFG" -p "$RADVD_PID" -n &
         RADVD_CHILD=$!
         wait "$RADVD_CHILD" || true
         RADVD_CHILD=
@@ -204,9 +223,18 @@ trap _term TERM INT
 # can't carry a file capability the way kea-dhcp4/6 do — so use
 # ``setpriv`` to raise NET_RAW into the *ambient* set, which survives
 # setuid + execve into the unprivileged ``spatium`` user (#383).
-setpriv --reuid spatium --regid spatium --init-groups \
-        --inh-caps +net_raw --ambient-caps +net_raw \
-        spatium-dhcp-agent &
+if [ "$(id -u)" = "0" ]; then
+    setpriv --reuid spatium --regid spatium --init-groups \
+            --inh-caps +net_raw --ambient-caps +net_raw \
+            spatium-dhcp-agent &
+else
+    # Not root: there is no privilege drop to survive, and a non-root process
+    # can only raise a capability into the ambient set that it already holds
+    # as permitted (which a pod's added caps are not, once exec'd). So the
+    # opt-in rogue-DHCP probe + fingerprint sniffer, which need NET_RAW, are
+    # unavailable here; Kea itself still has it through its file capability.
+    spatium-dhcp-agent &
+fi
 AGENT_PID=$!
 
 # `set +e` from here to the end (#1036). This script runs under `set -eu`,

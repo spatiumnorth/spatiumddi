@@ -20,7 +20,7 @@ spec:
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
-  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas) | nindent 2 }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas "root" $ "deployment" (printf "%s-api" (include "spatiumddi.fullname" .)) "container" "api") | nindent 2 }}
   template:
     metadata:
       labels:
@@ -73,14 +73,17 @@ spec:
         - name: api
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not (include "spatiumddi.isOpenShift" .) }}
           # Pin the runtime uid/gid to the image's ``app`` user (1000) so the
           # slot-images hostPath — chowned 1000:1000 by spatiumddi-firstboot
           # (#415) — is writable regardless of any cluster-level PodSecurity
           # default. Matches the image USER directive: a no-op on a normal
           # deploy, deterministic belt-and-braces on the appliance.
+          {{- /* #3852: omitted on OpenShift — its restricted SCC assigns the uid from the namespace's range and REFUSES a pinned one. */}}
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
+          {{- end }}
           ports:
             - name: http
               containerPort: 8000
@@ -356,6 +359,32 @@ spec:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: http
+{{- if .Values.api.service.nodeLocal }}
+---
+{{- /* #3645: the appliance's second api Service. internalTrafficPolicy: Local
+       answers only from an api pod on the CALLER's node, so a caller that
+       sends plain http (the supervisor's heartbeat, the frontend's /api proxy)
+       never puts it on the node LAN. With no ready api pod on the node the
+       connection is refused rather than routed to another node; the
+       supervisor then falls back to its pinned https URL. The main Service
+       above is unchanged, for the workers, the role agents and the probes. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-local
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.api.service.port }}
+      targetPort: http
+{{- end }}
 {{- if .Values.api.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2

@@ -121,6 +121,9 @@ def test_database_ahead_of_the_target_is_incompatible() -> None:
     check = _judge()
     assert check.verdict == "incompatible"
     assert "Can't locate revision" in check.message
+    # #3780: going back to a 1.0.0 beta on one node takes the API away too, so
+    # the refusal names the way back that needs none.
+    assert "spatium-upgrade-slot set-next-boot" in check.message
 
 
 def test_target_ahead_of_the_database_is_compatible() -> None:

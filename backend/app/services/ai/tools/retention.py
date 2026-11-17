@@ -34,7 +34,8 @@ class FindRetentionSettingsArgs(BaseModel):
         "nightly prune deletes it: DNS query + DHCP activity logs "
         "(``log_retention_hours``), DNS/DHCP metric samples "
         "(``metric_retention_days``), DHCP lease history, trash "
-        "(soft-deleted rows), packet captures, and revoked appliances. A "
+        "(soft-deleted rows), packet captures, revoked appliances, and the "
+        "E911 location-lookup trail (``e911_resolution_log_retention_days``). A "
         "value of 0 on lease history / trash / revoked appliances means "
         "never delete. The audit log is never pruned. Use for 'how far "
         "back can I see query logs?' or 'when will this deleted subnet be "
@@ -57,6 +58,7 @@ async def find_retention_settings(
         "soft_delete_purge_days": settings.soft_delete_purge_days,
         "pcap_retention_days": settings.pcap_retention_days,
         "appliance_revoked_retention_days": settings.appliance_revoked_retention_days,
+        "e911_resolution_log_retention_days": settings.e911_resolution_log_retention_days,
         "audit_log": "never pruned",
         "zero_means_keep_forever": [
             "dhcp_lease_history_retention_days",

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Router as RouterIcon,
@@ -9,6 +10,8 @@ import {
   Tag,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { HeaderButton } from "@/components/ui/header-button";
 import {
   vlansApi,
@@ -59,6 +62,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -102,6 +106,7 @@ export function VLANsPage() {
     data: routers = [],
     isLoading,
     isFetching,
+    error: routersError,
   } = useQuery({
     queryKey: ["vlans", "routers"],
     queryFn: vlansApi.listRouters,
@@ -166,7 +171,14 @@ export function VLANsPage() {
           )}
           {!isLoading && routers.length === 0 && (
             <p className="text-xs text-muted-foreground italic px-2 py-4">
-              No routers yet. Click + to add one.
+              <ListEmpty
+                error={routersError}
+                what="routers"
+                gate={writeGate}
+                hint="Click + to add one."
+              >
+                No routers yet.
+              </ListEmpty>
             </p>
           )}
           {routers.map((r) => (
@@ -493,8 +505,11 @@ function RouterDetail({
               Delete <strong className="text-foreground">{router.name}</strong>?
               All {vlans.length} VLAN
               {vlans.length === 1 ? "" : "s"} under this router will be removed.
-              Deletion is blocked if any subnet still references a VLAN on this
-              router — reassign those subnets first.
+              Deletion is blocked if any subnet, including one in the Trash,
+              still references a VLAN on this router — reassign those subnets
+              first (or permanently delete the ones in the Trash). It is also
+              blocked while an E911 location binding names one of its VLANs:
+              remove the binding first.
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -541,9 +556,9 @@ function RouterDetail({
               <strong>{router.name}</strong> and all its VLANs.
             </label>
             {deleteError && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                 {deleteError}
-              </div>
+              </FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -787,11 +802,13 @@ function VLANDetail({
             ) : (
               <p className="text-sm">
                 Delete VLAN <strong>{vlan.vlan_id}</strong> ({vlan.name})? No
-                subnets currently reference it.
+                live subnets reference it. It cannot be deleted while a subnet
+                in the Trash still carries it (its restore would come back
+                without the VLAN) or while an E911 location binding names it.
               </p>
             )}
             {deleteError && (
-              <p className="text-sm text-destructive">{deleteError}</p>
+              <FormError className="text-sm">{deleteError}</FormError>
             )}
             <div className="flex justify-end gap-2">
               <button
@@ -857,7 +874,7 @@ function CreateRouterModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function EditRouterModal({
+export function EditRouterModal({
   router,
   onClose,
 }: {
@@ -865,13 +882,45 @@ function EditRouterModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // Read the router when Edit opens and send only what changed (#3869): the
+  // page's copy may predate another client's edit.
+  const fresh = useFreshRow<Router>(router, () =>
+    vlansApi.getRouter(router.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Router"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
   return (
     <RouterFormModal
-      title={`Edit ${router.name}`}
-      initial={router}
+      title={`Edit ${base.name}`}
+      initial={base}
       onClose={onClose}
       onSubmit={async (data) => {
-        await vlansApi.updateRouter(router.id, data);
+        const diff = changedFields(
+          {
+            name: base.name,
+            description: base.description,
+            location: base.location,
+            management_ip: base.management_ip,
+            vendor: base.vendor,
+            model: base.model,
+            notes: base.notes,
+          },
+          data,
+        );
+        if (Object.keys(diff).length === 0) {
+          onClose();
+          return;
+        }
+        await vlansApi.updateRouter(router.id, diff);
         qc.invalidateQueries({ queryKey: ["vlans", "routers"] });
         qc.invalidateQueries({ queryKey: ["vlans", "router", router.id] });
         onClose();
@@ -982,7 +1031,7 @@ function RouterFormModal({
             onChange={(e) => setNotes(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -1029,7 +1078,7 @@ function CreateVLANModal({
   );
 }
 
-function EditVLANModal({
+export function EditVLANModal({
   vlan,
   routerId,
   onClose,
@@ -1039,17 +1088,42 @@ function EditVLANModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // Read the VLAN when Edit opens and send only what changed (#3869).
+  const fresh = useFreshRow<VLAN>(vlan, () => vlansApi.getVlan(vlan.id));
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit VLAN"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
   return (
     <VLANFormModal
-      title={`Edit VLAN ${vlan.vlan_id}`}
-      initial={vlan}
+      title={`Edit VLAN ${base.vlan_id}`}
+      initial={base}
       onClose={onClose}
       onSubmit={async (data) => {
-        await vlansApi.updateVlan(vlan.id, {
-          vlan_id: Number(data.vlan_id),
-          name: data.name,
-          description: data.description,
-        });
+        const diff = changedFields(
+          {
+            vlan_id: base.vlan_id,
+            name: base.name,
+            description: base.description,
+          },
+          {
+            vlan_id: Number(data.vlan_id),
+            name: data.name,
+            description: data.description,
+          },
+        );
+        if (Object.keys(diff).length === 0) {
+          onClose();
+          return;
+        }
+        await vlansApi.updateVlan(vlan.id, diff);
         qc.invalidateQueries({ queryKey: ["vlans", routerId] });
         qc.invalidateQueries({ queryKey: ["vlans", "vlan", vlan.id] });
         onClose();
@@ -1126,7 +1200,7 @@ function VLANFormModal({
             onChange={(e) => setDescription(e.target.value)}
           />
         </Field>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}

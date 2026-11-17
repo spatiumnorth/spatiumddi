@@ -104,8 +104,10 @@ spec:
           {{- end }}
           securityContext:
             runAsNonRoot: true
+            {{- if not (include "spatiumddi.isOpenShift" $) }}
             runAsUser: 1000
             runAsGroup: 1000
+            {{- end }}
             {{- with (include "spatiumddi.seccompProfileType" $) }}
             seccompProfile:
               type: {{ . }}

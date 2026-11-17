@@ -81,4 +81,20 @@ describe("loading dialog handing over to its confirm (#2723b)", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
   });
+
+  it("returns to that button when focus was on a control in the loading dialog (#3483)", async () => {
+    const user = userEvent.setup();
+    render(<LoadingThenConfirm />);
+    const opener = screen.getByRole("button", { name: "Delete Group" });
+    await user.click(opener);
+    await screen.findByRole("dialog", { name: "Loading" });
+    // A Tab during the load moved focus onto the loading dialog's close.
+    const close = screen.getByRole("button", { name: "Close dialog" });
+    close.focus();
+    screen.getByRole("button", { name: "finish loading" }).click();
+    await screen.findByRole("dialog", { name: "Delete Server Group" });
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
 });

@@ -60,6 +60,11 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
+from app.services.dns.blocklist_pack import EntryPacker, pack_entries
+from app.services.dns.dnssec_trust import (
+    effective_dnssec_validation,
+    render_as_initial_key,
+)
 from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
@@ -67,6 +72,7 @@ from app.services.dns.named_conf_validation import (
     AclCycleError,
     ViewValidationError,
     bind9_refused_prefix,
+    effective_key_lifetime_days,
     effective_nsec3_iterations,
     is_name_reference,
     key_reference,
@@ -79,6 +85,7 @@ from app.services.dns.named_conf_validation import (
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone,
     records_for_view,
     views_rendering_zone,
 )
@@ -482,7 +489,6 @@ async def _master_granted_keys(db: AsyncSession, group_id: Any) -> list[TsigKey]
 async def _add_master_transfer_keys(
     db: AsyncSession,
     zone_payload: list[dict[str, Any]],
-    catalog_block: dict[str, Any] | None,
     tsig_keys: list[dict[str, Any]],
 ) -> None:
     """Name the TSIG key a Technitium secondary signs its transfers with (#1765).
@@ -508,15 +514,14 @@ async def _add_master_transfer_keys(
     creating a zone that silently expires.
 
     Sets ``masters_tsig_key`` (or ``masters_tsig_unresolved``) on each
-    secondary zone and ``producer_tsig_key`` on a consumer catalog block.
+    secondary zone.
     """
     secondaries = [
         zp
         for zp in zone_payload
         if str(zp.get("type") or "").lower() in ("secondary", "slave") and zp.get("masters")
     ]
-    consumer = catalog_block if (catalog_block or {}).get("mode") == "consumer" else None
-    if not secondaries and consumer is None:
+    if not secondaries:
         return
     managed = {
         _master_host(row.host): row
@@ -556,10 +561,6 @@ async def _add_master_transfer_keys(
         elif found:
             logger.warning("dns_secondary_master_shares_no_tsig_key", zone=zp.get("name"))
             zp["masters_tsig_unresolved"] = True
-    if consumer is not None and consumer.get("producer_addr"):
-        name, _ = await key_for([consumer["producer_addr"]])
-        if name:
-            consumer["producer_tsig_key"] = name
 
 
 def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -671,6 +672,8 @@ class EncodedBody:
     structural_etag: str
     records: int
     has_views: bool
+    # #4040 — the blocklist entries went out as packed runs.
+    packed_blocklists: bool = False
 
 
 #: Blocklist entries read, serialised and hashed per step of the streamed
@@ -690,6 +693,8 @@ class _StreamedEntries:
     lists: list[Any]
     hash_mark: str | None = None
     hasher: Any = None
+    # #4040 — the server's agent reads packed runs of entries.
+    pack: bool = False
 
 
 @dataclass(frozen=True)
@@ -788,20 +793,54 @@ def _cut(text: str, marks: list[str], kwargs: dict[str, Any]) -> list[bytes]:
     return parts
 
 
+def _write_items(
+    items: list[dict[str, Any]],
+    first: bool,
+    hashes: tuple[Callable[[bytes], None], ...],
+    write: Callable[[bytes], None],
+) -> bool:
+    """Write ``items`` into a streamed ``entries`` list; the new ``first``."""
+    if not items:
+        return first
+    hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
+    wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
+    if not first:
+        # json.dumps's item separators: ", " by default, "," on the wire.
+        hashed = b", " + hashed
+        wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
+    for update in hashes:
+        update(hashed)
+    write(wire)
+    return False
+
+
 async def _stream_zone_entries(
     db: AsyncSession,
     lists: list[Any],
     hashes: tuple[Callable[[bytes], None], ...],
     write: Callable[[bytes], None],
+    pack: bool = False,
+    content_hash: Callable[[bytes], None] | None = None,
 ) -> None:
     """Write one RPZ zone's ``entries`` list, a batch at a time: into the ETag
     hashes as ``json.dumps`` with ``_ETAG_JSON`` would serialise it, and into
     the body as ``WIRE_JSON`` would. A JSON list is its items joined by the
     item separator, so a batch serialised on its own, minus its brackets,
-    joins the next one exactly where the whole list would have."""
+    joins the next one exactly where the whole list would have.
+
+    ``pack`` (#4040): consecutive alike entries go out as one gzip + base64
+    run (``blocklist_pack``); a batch may then complete no item, or several.
+    ``content_hash`` (an RPZ zone's hasher, #2157) is always fed the per-entry
+    form, so a zone's hash — and the serial the agent derives from it — does
+    not depend on the shape, and a server whose agent starts reading packed
+    entries keeps the zone files it has."""
     first = True
+    first_plain = True
+    packer = EntryPacker() if pack else None
     for update in hashes:
         update(b"[")
+    if content_hash is not None:
+        content_hash(b"[")
     write(b"[")
     # ``aclosing``: a failure here (not in the generator) must close the
     # list's server-side cursor now, on this connection, rather than leave it
@@ -810,19 +849,20 @@ async def _stream_zone_entries(
     async with aclosing(stream_entries(db, lists, BLOCKLIST_RENDER_BATCH)) as batches:
         async for batch in batches:
             items = [_entry_dict(*entry) for entry in batch]
-            hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
-            wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
+            if content_hash is not None and items:
+                plain = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
+                content_hash(plain if first_plain else b", " + plain)
+                first_plain = False
+            if packer is not None:
+                items = packer.feed(items)
+            first = _write_items(items, first, hashes, write)
             del items
-            if not first:
-                # json.dumps's item separators: ", " by default, "," on the wire.
-                hashed = b", " + hashed
-                wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
-            for update in hashes:
-                update(hashed)
-            write(wire)
-            first = False
+        if packer is not None:
+            first = _write_items(packer.finish(), first, hashes, write)
     for update in hashes:
         update(b"]")
+    if content_hash is not None:
+        content_hash(b"]")
     write(b"]")
 
 
@@ -1132,9 +1172,14 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
                 writer.write(json.dumps(value, **WIRE_JSON).encode("utf-8"))
                 continue
             hashes = (structural_hash.update, etag_hash.update)
-            if zone.hasher is not None:
-                hashes = (*hashes, zone.hasher.update)
-            await _stream_zone_entries(db, zone.lists, hashes, writer.write)
+            await _stream_zone_entries(
+                db,
+                zone.lists,
+                hashes,
+                writer.write,
+                zone.pack,
+                zone.hasher.update if zone.hasher is not None else None,
+            )
 
         structural_hash.update(structural_parts[n])
         structural_spool.drain(structural_hash.update)
@@ -1164,6 +1209,7 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
         structural_etag=structural_etag,
         records=records,
         has_views=assembled.has_views,
+        packed_blocklists=bool(server.agent_renders_packed_blocklists),
     )
 
 
@@ -1488,17 +1534,19 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             return copies
 
         # Split-horizon expansion (issue #24) composed with geo steering
-        # (issue #530). Operator views: the zone materialises in every
-        # view it has content for — each view referenced by a scoped
-        # record PLUS the zone's own pinned ``view_id``; with no explicit
-        # scoping it's "global" and renders into every operator view.
+        # (issue #530). Operator views: a pinned zone materialises in its
+        # pin alone; an unpinned one in each view referenced by a scoped
+        # record (a learned record follows the zone, ``places_zone``); with
+        # no explicit scoping it's "global" and renders into every operator
+        # view.
         # Geo + catch-all views always render the zone (like a global
         # zone) so the catch-all serves the default member set. Per-view
         # record filtering is delegated to ``records_for_view``. The rule is
         # shared with the transfer-key resolver (#920), so the view drift and
         # sync ask for is always one that holds the zone.
         # #2275 — the collision guard counts placements from the same call.
-        for vd in views_rendering_zone(view_descs, z.view_id, (r.view_id for r in rec_rows)):
+        placing = (r.view_id for r in rec_rows if places_zone(r))
+        for vd in views_rendering_zone(view_descs, z.view_id, placing):
             recs = records_for_view(rec_rows, vd, geo)
             copies.append(
                 {
@@ -1588,7 +1636,15 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": opts_recursion_enabled and group_is_recursive,
-        "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
+        "dnssec_validation": (
+            effective_dnssec_validation(
+                getattr(opts, "dnssec_validation", "auto"),
+                server.driver,
+                len(opts.trust_anchors or ()),
+            )
+            if opts
+            else "auto"
+        ),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
         # NOTIFY behaviour (#1523). Settable in the UI / API, validated
@@ -1702,7 +1758,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                     "algorithm": ta.algorithm,
                     "key_tag": ta.key_tag,
                     "public_key": ta.public_key,
-                    "is_initial_key": bool(ta.is_initial_key),
+                    # A static root anchor is rendered as initial-key (#3609).
+                    "is_initial_key": render_as_initial_key(ta.zone_name, ta.is_initial_key),
                 }
                 for ta in opts.trust_anchors
             ),
@@ -1831,10 +1888,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         ]
 
     # ── Catalog zones (RFC 9432) ──
-    # When the group has the feature toggled on, build a producer or
-    # consumer block depending on whether this server is the primary
-    # (is_primary=True). Both BIND9 and PowerDNS (Phase 3d) consume
-    # the same producer payload — the catalog zone format is RFC 9432
+    # When the group has the feature toggled on, the group's primary
+    # (is_primary=True) gets a producer block; nobody gets a consumer block
+    # (#3764, see below). Both BIND9 and PowerDNS (Phase 3d) render the
+    # same producer payload — the catalog zone format is RFC 9432
     # canonical, so the rendering driver doesn't need to fork.
     catalog_block: dict[str, Any] | None = None
     if (
@@ -1867,28 +1924,31 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             )
         ).scalar_one_or_none()
 
-        if producer is not None:
+        if producer is not None and server.id == producer.id:
             # Members are every primary zone in the group. Forward / stub
             # zones don't belong in a catalog (they're lookups, not
-            # served data); secondaries are the consumer's responsibility.
+            # served data); secondaries are left to the external consumer.
             member_names = sorted(z.name for z in zones if z.zone_type in ("primary", "master"))
-            if server.id == producer.id:
-                catalog_block = {
-                    "mode": "producer",
-                    "zone_name": grp.catalog_zone_name,
-                    "members": [{"zone_name": n} for n in member_names],
-                }
-            else:
-                catalog_block = {
-                    "mode": "consumer",
-                    "zone_name": grp.catalog_zone_name,
-                    "producer_addr": producer.host,
-                }
+            catalog_block = {
+                "mode": "producer",
+                "zone_name": grp.catalog_zone_name,
+                "members": [{"zone_name": n} for n in member_names],
+            }
+        # #3764 — every other member gets NO catalog block. Since #170
+        # each agent in a group already receives every zone in its own
+        # bundle and serves it as its own primary, so a consumer would
+        # only load each member a second time: BIND then refuses the next
+        # ``rndc reconfig`` with "zone … already exists" (and its revert
+        # the same way), and new zones stop being served. The catalog is
+        # published for secondaries OUTSIDE the group — an operator's own
+        # BIND pointing ``catalog-zones`` at the producer.
 
     blocklists_payload: list[dict[str, Any]] = []
     streamed: list[_StreamedEntries] = []
     # #2157 — only the BIND9 agent reads the per-zone content hash.
     rpz_hashes = server.driver == "bind9"
+    # #4040 — an agent that reads packed entries is sent them packed.
+    packs = bool(server.agent_renders_packed_blocklists)
 
     async def _streamed_zone(
         lists: list[Any] | None, rpz_zone_name: str, view_name: str | None
@@ -1914,9 +1974,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 lists=lists,
                 hash_mark=_placeholder(),
                 hasher=_rpz_hasher(rpz_zone_name, exceptions),
+                pack=packs,
             )
             if rpz_hashes
-            else _StreamedEntries(mark=mark, lists=lists)
+            else _StreamedEntries(mark=mark, lists=lists, pack=packs)
         )
         if zone.hash_mark is not None:
             zone_dict[RPZ_CONTENT_HASH_KEY] = zone.hash_mark
@@ -1931,6 +1992,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             hasher = _rpz_hasher(zone_dict["rpz_zone_name"], zone_dict["exceptions"])
             hasher.update(json.dumps(zone_dict["entries"], **_ETAG_JSON).encode("utf-8"))
             zone_dict[RPZ_CONTENT_HASH_KEY] = _rpz_hash_value(hasher)
+        if packs:
+            # After the hash, which is over the per-entry form (see
+            # ``_stream_zone_entries``).
+            zone_dict["entries"] = pack_entries(zone_dict["entries"])
         return zone_dict
 
     # #1706 — a view's own zone already folds in the group's lists, so the
@@ -2048,8 +2113,12 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         {
             "name": p.name,
             "algorithm": p.algorithm,
-            "ksk_lifetime_days": p.ksk_lifetime_days,
-            "zsk_lifetime_days": p.zsk_lifetime_days,
+            "ksk_lifetime_days": effective_key_lifetime_days(
+                p.name, "ksk", p.ksk_lifetime_days, logger
+            ),
+            "zsk_lifetime_days": effective_key_lifetime_days(
+                p.name, "zsk", p.zsk_lifetime_days, logger
+            ),
             "nsec3": p.nsec3,
             "nsec3_iterations": effective_nsec3_iterations(p.name, p.nsec3_iterations, logger),
             "nsec3_salt_length": p.nsec3_salt_length,
@@ -2128,7 +2197,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 }
                 for z in zones
             ]
-            await _add_master_transfer_keys(db, probes, catalog_block, tsig_keys)
+            await _add_master_transfer_keys(db, probes, tsig_keys)
             for i, probe in enumerate(probes):
                 added = {k: v for k, v in probe.items() if k not in ("name", "type", "masters")}
                 if added:
@@ -2146,7 +2215,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             has_views=has_views,
         )
     elif server.driver == "technitium":
-        await _add_master_transfer_keys(db, zone_payload, catalog_block, tsig_keys)
+        await _add_master_transfer_keys(db, zone_payload, tsig_keys)
 
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),

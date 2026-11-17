@@ -284,3 +284,72 @@ async def test_audit_row_names_the_cleared_secret_never_its_value(
     blob = json.dumps(row.new_value)
     assert "CONNSTR-OLD-VALUE" not in blob and "ACCOUNTKEY-NEW-VALUE" not in blob
     assert ENC_PREFIX not in blob
+
+
+_GCS_KEY = json.dumps({"type": "service_account", "client_email": "x@y.iam"})
+
+
+@pytest.mark.asyncio
+async def test_gcs_edit_with_blank_key_keeps_the_stored_key(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """The console's Edit sends ``service_account_json: ""`` for a key left
+    blank; the merged, still-wrapped key must not be parsed as JSON (#3695)."""
+    headers = await _headers(db_session)
+    t = await _target(db_session, "gcs", {"bucket": "b", "service_account_json": _enc(_GCS_KEY)})
+    url = f"/api/v1/backup/targets/{t.id}"
+    for config in (
+        {"bucket": "b", "prefix": "", "service_account_json": ""},
+        {"bucket": "b", "prefix": "xp/"},
+    ):
+        res = await client.patch(url, json={"config": config}, headers=headers)
+        assert res.status_code == 200, res.text
+        assert res.json()["config"]["service_account_json"] == REDACTED_SENTINEL
+    await db_session.refresh(t)
+    assert t.config["service_account_json"].startswith(ENC_PREFIX)
+
+    # A key sent new is still checked as JSON.
+    bad = await client.patch(
+        url,
+        json={"config": {"bucket": "b", "service_account_json": "not json"}},
+        headers=headers,
+    )
+    assert bad.status_code == 422, bad.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,config,field",
+    [
+        (
+            "gcs",
+            {"bucket": "b", "service_account_json": ENC_PREFIX + "planted"},
+            "service_account_json",
+        ),
+        (
+            "scp",
+            {
+                "host": "h.example.com",
+                "username": "u",
+                "remote_path": "/b",
+                "private_key": ENC_PREFIX + "x",
+            },
+            "private_key",
+        ),
+    ],
+)
+async def test_create_refuses_a_client_supplied_stored_ciphertext(
+    client: AsyncClient, db_session: AsyncSession, kind, config, field
+):
+    """``__enc__:`` marks stored ciphertext; a create carrying it would skip
+    the driver's key check and be stored as if it were wrapped (#3695)."""
+    headers = await _headers(db_session)
+    res = await client.post(
+        "/api/v1/backup/targets",
+        json={"name": "planted", "kind": kind, "config": config, "passphrase": "Pass-phrase-1234"},
+        headers=headers,
+    )
+    assert res.status_code == 422, res.text
+    assert field in res.text
+    rows = (await db_session.execute(select(BackupTarget))).scalars().all()
+    assert not rows

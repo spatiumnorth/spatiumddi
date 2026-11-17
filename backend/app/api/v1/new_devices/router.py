@@ -237,7 +237,7 @@ async def list_sightings(
     base = (
         select(IpMacHistory, IPAddress, Subnet)
         .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-        .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
         .where(and_(*conds))
     )
     total = (
@@ -245,7 +245,7 @@ async def list_sightings(
     ).scalar_one()
     rows = (
         await db.execute(
-            base.order_by(IpMacHistory.first_seen.desc())
+            base.order_by(IpMacHistory.first_seen.desc(), IpMacHistory.id)
             .limit(page_size)
             .offset((page - 1) * page_size)
         )
@@ -285,7 +285,7 @@ async def _load_sighting_out(db: DB, sighting_id: uuid.UUID) -> SightingOut:
         await db.execute(
             select(IpMacHistory, IPAddress, Subnet)
             .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-            .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(IpMacHistory.id == sighting_id)
         )
     ).first()

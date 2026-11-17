@@ -97,6 +97,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_docs_drift.py": "scripts/lint_docs_drift.py",
+    "test_check_blocklist_catalog.py": "scripts/check_blocklist_catalog.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
@@ -126,6 +127,9 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     # #2121 — the forward-zone transport helper is duplicated, whole, in the
     # agent; covered by the agent/dns/spatium_dns_agent/ carve-out.
     "test_zone_forward_transport.py": ("agent/dns/spatium_dns_agent/drivers/_forwarders.py"),
+    # #3518 — the served-apex rule is duplicated in the agent's BIND9 driver.
+    "test_zone_apex_parity_3518.py": ("agent/dns/spatium_dns_agent/drivers/bind9.py"),
+    "test_zone_apex_bundle_parity_3518.py": ("agent/dns/spatium_dns_agent/drivers/bind9.py"),
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs
     # its own nginx location block in BOTH shipped templates or it falls
@@ -141,6 +145,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_ipam_bulk_allocate_template_vectors_2071.py": (
         "frontend/src/lib/bulk-allocate-template.vectors.json"
     ),
+    # #4143 — the delete dialogs' cascade registry is read by the console too.
+    "test_delete_cascade_copy_4143.py": ("frontend/src/lib/delete-cascade.json"),
     # #3119 — every resource type the server checks must be offered by New Role.
     "test_grant_vocabulary_covers_routes_3119.py": ("frontend/src/lib/permissionVocabulary.ts"),
     "test_e911_held.py": (
@@ -172,6 +178,14 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/default.conf.template",
         "frontend/Dockerfile",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #3852 — runs the frontend's listen-port renderer and reads the template +
+    # the image that ships it.
+    "test_frontend_http_port_3852.py": (
+        "frontend/14-http-port.envsh",
+        "frontend/17-ipv6.envsh",
+        "frontend/default.conf.template",
+        "frontend/Dockerfile",
     ),
     # #1173 — runs the frontend's TLS reload watcher and checks it is copied into
     # the image and that the chart no longer rolls the frontend on a cert change.

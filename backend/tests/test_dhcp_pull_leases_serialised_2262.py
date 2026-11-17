@@ -218,7 +218,7 @@ async def test_concurrent_beat_ticks_run_one_pass(
 
     calls = 0
 
-    async def _slow_pull(_db, _server, *, apply=True):  # type: ignore[no-untyped-def]
+    async def _slow_pull(_db, _server, *, apply=True, recount=True):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
         await asyncio.sleep(0.5)

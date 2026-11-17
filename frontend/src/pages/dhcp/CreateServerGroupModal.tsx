@@ -5,6 +5,7 @@ import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPServerGroup } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
 type CreateServerGroupModalProps = {
   group?: DHCPServerGroup;
@@ -37,7 +38,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
   const [description, setDescription] = useState(group?.description ?? "");
   const [mode, setMode] = useState(group?.mode ?? "standalone");
   const [heartbeat, setHeartbeat] = useState(
-    String(group?.heartbeat_delay_ms ?? 10000),
+    String(group?.heartbeat_delay_ms ?? 2000),
   );
   const [maxResponse, setMaxResponse] = useState(
     String(group?.max_response_delay_ms ?? 60000),
@@ -131,7 +132,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
         }
         return n;
       };
-      const heartbeatMs = haTimer(heartbeat, "Heartbeat Delay", 1000, 10000);
+      const heartbeatMs = haTimer(heartbeat, "Heartbeat Delay", 1000, 2000);
       const maxResponseMs = haTimer(
         maxResponse,
         "Max Response Delay",
@@ -167,7 +168,7 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
           description: group!.description ?? "",
           mode: group!.mode ?? "standalone",
           dhcp_socket_mode: group!.dhcp_socket_mode ?? "direct",
-          heartbeat_delay_ms: group!.heartbeat_delay_ms ?? 10000,
+          heartbeat_delay_ms: group!.heartbeat_delay_ms ?? 2000,
           max_response_delay_ms: group!.max_response_delay_ms ?? 60000,
           max_ack_delay_ms: group!.max_ack_delay_ms ?? 10000,
           max_unacked_clients: group!.max_unacked_clients ?? 5,
@@ -182,7 +183,17 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
       if (Object.keys(diff).length === 0) return group!;
       return dhcpApi.updateGroup(group!.id, diff);
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // #3369 — put the stored group into the cached list the page draws its
+      // panel from before the refetch lands.
+      if (editing && saved?.id)
+        qc.setQueriesData({ queryKey: ["dhcp-groups"] }, (old: unknown) =>
+          Array.isArray(old)
+            ? old.map((r: DHCPServerGroup) =>
+                r.id === saved.id ? { ...r, ...saved } : r,
+              )
+            : old,
+        );
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },
@@ -354,8 +365,11 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
             </p>
             <p className="text-[11px] text-muted-foreground">
               Rendered into <code>libdhcp_ha.so</code> on every Kea peer in this
-              group. Defaults match Kea&apos;s documented recommendations; only
-              tweak if your environment genuinely needs it.
+              group. The Max Response Delay, Max Ack Delay and Max Unacked
+              Clients defaults are Kea&apos;s documented ones. The 2 s Heartbeat
+              Delay is SpatiumDDI&apos;s own choice (Kea documents 10 s): it
+              keeps a config reload down to seconds. Only tweak these if your
+              environment genuinely needs it.
             </p>
             <div className="grid grid-cols-2 gap-3">
               <Field
@@ -422,7 +436,9 @@ function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>

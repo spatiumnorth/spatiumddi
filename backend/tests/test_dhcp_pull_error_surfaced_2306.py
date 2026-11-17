@@ -60,7 +60,7 @@ async def test_failed_pull_is_persisted_then_cleared_by_success(
     sid = await _arm(db_session)
     outcome: dict[str, bool] = {"fail": True}
 
-    async def _pull(db, server, apply=True):  # type: ignore[no-untyped-def]
+    async def _pull(db, server, apply=True, recount=True):  # type: ignore[no-untyped-def]
         if outcome["fail"]:
             raise RuntimeError("Get-DhcpServerv4Lease: access denied")
         server.last_sync_error = None  # what the real success path does

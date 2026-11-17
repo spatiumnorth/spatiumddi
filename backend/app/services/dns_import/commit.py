@@ -38,6 +38,13 @@ from app.services.dns.record_ops import (
     resolve_primary_server,
 )
 from app.services.dns.view_collisions import RenderGuard
+from app.services.dns.zone_apex import apex_name_length_error
+from app.services.dns_import.soa_mailbox import (
+    admin_email_warning,
+    importable_admin_email,
+    is_admin_email_warning,
+)
+from app.services.ipam.zone_binding import prune_zone_ids
 
 from . import cname_check
 from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
@@ -184,8 +191,14 @@ async def _build_records_for_zone(
     rows: list[DNSRecord] = []
     skipped: list[str] = []
     cname_refused = cname_check.cname_skips(parsed)  # #2089
+    # #4155 — a record BIND's check-names refuses would make named-checkzone
+    # reject the whole zone; the record API 422s it, so the import skips it.
+    names_refused = cname_check.names_skips(parsed)
     for idx, r in enumerate(parsed.records):
         if r.record_type == "SOA":
+            continue
+        if idx in names_refused:
+            skipped.append(cname_check.describe_skip(parsed, idx, names_refused[idx]))
             continue
         if idx in cname_refused:
             skipped.append(cname_check.describe_skip(parsed, idx, cname_refused[idx]))
@@ -285,7 +298,8 @@ def _zone_kwargs_from_parsed(
         expire=_timer(soa.expire if soa else None, 3600000),
         minimum=_timer(soa.minimum if soa else None, 3600),
         primary_ns=primary_ns,
-        admin_email=soa.admin_email.rstrip(".") if soa and soa.admin_email else "",
+        # #3673 — held to Add Zone's rule; the preview warned if it was dropped.
+        admin_email=importable_admin_email(soa.admin_email if soa else None)[0],
         last_serial=soa.serial if soa else 0,
         forwarders=parsed.forwarders or [],
         forward_only=parsed.zone_type == "forward",
@@ -330,6 +344,17 @@ async def _create_zone_at(
         # only where it carried none (a forward / stub zone, no SOA).
         default_ttl=(await load_dns_defaults(db)).ttl,
     )
+    if zone_kwargs["zone_type"] == "primary":
+        # #3672 — a zone whose apex names would pass 253 characters is never
+        # served; fail this zone only, in words, rather than store it.
+        apex_err = apex_name_length_error(
+            target_name,
+            zone_kwargs["primary_ns"],
+            zone_kwargs["admin_email"],
+            [(r.name, r.record_type, r.value) for r in parsed.records],
+        )
+        if apex_err is not None:
+            raise ValueError(apex_err)
     # #2275 — the slot being empty is not enough: a zone with no view renders
     # into every view, so it must not land beside a same-name pinned zone (and
     # vice versa). Raising fails this zone only; the caller rolls it back.
@@ -481,6 +506,7 @@ async def _delete_zone(db: AsyncSession, zone: DNSZone) -> int:
     ).scalar_one() or 0
     await db.delete(zone)
     await db.flush()
+    await prune_zone_ids(db, [zone.id])
     return int(n)
 
 
@@ -723,6 +749,15 @@ async def commit_import(
                     f"Zone {parsed.name!r}: SOA primary name {parsed.soa.primary_ns!r} "
                     "is not a fully qualified host name and was not imported; the "
                     "zone's first apex NS record is served as the SOA primary name instead"
+                )
+        if parsed.soa is not None and parsed.soa.admin_email:
+            _, mail_reason = importable_admin_email(parsed.soa.admin_email)
+            if mail_reason is not None and not any(
+                is_admin_email_warning(w, parsed.name) for w in warnings
+            ):
+                # #3673 — a plan that did not come through the preview's check.
+                warnings.append(
+                    admin_email_warning(parsed.name, parsed.soa.admin_email, mail_reason)
                 )
         if bind9_target and parsed.forwarders:
             kept, dropped = split_zone_forwarders(parsed.forwarders)

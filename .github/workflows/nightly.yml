@@ -1,6 +1,19 @@
 name: Nightly
 
-# Nightly build of `main` (#805).
+# Nightly build of `main` (#805), and of a release branch on request (#3950).
+#
+# RELEASE BRANCHES (#3950). Dispatching with `ref=release/X.Y.Z` runs this
+# same pipeline against that branch, so a release stabilisation branch gets
+# the nightly QA walk main does. Everything it publishes is suffixed with
+# X.Y.Z and forms a ring of its own (7 nights, pruned by this workflow and
+# only over its own names): images `:nightly-X.Y.Z-YYYYMMDD` (+ the mutable
+# `:nightly-X.Y.Z`), pre-release and git tag `nightly-X.Y.Z-YYYY.MM.DD`, and
+# a version `0.0.0-nightly-YYYYMMDD+release-X.Y.Z.<sha>` that stays an
+# unknown version to app/core/versions.py. It skips when THAT branch has not
+# moved since its own last nightly, and it never touches `:latest`, main's
+# `:nightly`, or main's ring. The names come from
+# .github/scripts/nightly-names.sh; scheduled runs carry no inputs and so
+# build main, exactly as before.
 #
 # WHY THIS EXISTS. Every published image and ISO comes from release.yml,
 # which fires only on a release tag — so nothing builds the *release* image
@@ -49,6 +62,10 @@ name: Nightly
 # keep meaning that. Nightly pre-releases are marked `--prerelease`, so
 # they never become the /releases/latest target either.
 
+# Names the run after its ref so nightly-trigger.yml can tell whether a given
+# ref was already dispatched tonight (the API exposes no dispatch inputs).
+run-name: Nightly (${{ github.event.inputs.ref || 'main' }})
+
 on:
   schedule:
     # FALLBACK ONLY. The nightly is normally started at 20:05
@@ -89,6 +106,14 @@ on:
         type: boolean
         required: false
         default: false
+      ref:
+        description: >-
+          Branch to build: main (the default, and what every scheduled run
+          builds) or release/X.Y.Z for that release branch's own nightly,
+          which uses suffixed tags and its own 7-night ring (#3950)
+        type: string
+        required: false
+        default: main
       dry_run:
         description: "Build and scan, but push nothing and prune nothing"
         type: boolean
@@ -103,8 +128,11 @@ permissions:
   contents: read
 
 # A manual dispatch must never race the scheduled run onto the same tags.
+# One group per ref (#3950): main keeps the bare `nightly` group, a release
+# branch gets `nightly-release/X.Y.Z`, so the two never queue behind (or
+# cancel) each other while two dispatches of the SAME ref still serialize.
 concurrency:
-  group: nightly
+  group: nightly${{ (github.event.inputs.ref && github.event.inputs.ref != 'main') && format('-{0}', github.event.inputs.ref) || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -125,7 +153,31 @@ jobs:
       release_tag: ${{ steps.decide.outputs.release_tag }}
       version: ${{ steps.decide.outputs.version }}
       last_sha: ${{ steps.decide.outputs.last_sha }}
+      sha: ${{ steps.decide.outputs.sha }}
+      ref: ${{ steps.decide.outputs.ref }}
+      branch_version: ${{ steps.decide.outputs.branch_version }}
+      pointer_tag: ${{ steps.decide.outputs.pointer_tag }}
+      cache_scope: ${{ steps.decide.outputs.cache_scope }}
+      image_ring_re: ${{ steps.decide.outputs.image_ring_re }}
+      release_ring_re: ${{ steps.decide.outputs.release_ring_re }}
     steps:
+      # #3950 — validate BEFORE the checkout: the input is interpolated into
+      # nothing but an env var, and an unknown branch fails here with a
+      # message instead of as a checkout error.
+      - name: Validate the ref input
+        env:
+          BUILD_REF: ${{ github.event.inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_REF" != "main" ] && [[ ! "$BUILD_REF" =~ ^release/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::ref '${BUILD_REF}' must be 'main' or match ^release/[0-9]+\.[0-9]+\.[0-9]+\$"
+            exit 1
+          fi
+
+      # Always the commit that triggered the run (main): the gate's logic
+      # and nightly-names.sh come from THIS workflow's ref, never from a
+      # release branch that may predate them. fetch-depth 0 brings every
+      # origin branch, which is how the gate resolves a release head below.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -135,6 +187,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE: ${{ github.event.inputs.force || 'false' }}
           EVENT_NAME: ${{ github.event_name }}
+          BUILD_REF: ${{ github.event.inputs.ref || 'main' }}
           # The cron string that fired ("23 7 * * *"); empty on dispatch.
           SCHEDULE: ${{ github.event.schedule }}
         run: |
@@ -198,6 +251,16 @@ jobs:
             echo "→ cron '${SCHEDULE}' is the ${SLOT_ET} slot; run started $(TZ=America/New_York date '+%H:%M %Z')"
           fi
 
+          # The commit this run builds (#3950): main's is the commit that
+          # triggered the run; a release branch's is its current origin head.
+          if [ "$BUILD_REF" = "main" ]; then
+            SHA=$(git rev-parse HEAD)
+          elif ! SHA=$(git rev-parse --verify "refs/remotes/origin/${BUILD_REF}^{commit}"); then
+            echo "::error::branch ${BUILD_REF} does not exist on origin"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
           # ONE source of truth for which images exist: .github/images.json,
           # read by this matrix, the prune job below, release.yml and
           # scripts/lint_image_upgrades.py. A hardcoded second copy fails in
@@ -205,7 +268,10 @@ jobs:
           # list, and its dated tags accumulate forever with nothing
           # reporting a problem. `target: runtime` on the api image is #732's
           # guard: `dev` is the LAST stage in backend/Dockerfile.
-          echo "images=$(jq -c . .github/images.json)" >> "$GITHUB_OUTPUT"
+          # Read from the commit being built, so a release branch builds
+          # the image set it actually ships (`main` resolves to the
+          # checked-out tree, as before).
+          echo "images=$(git show "${SHA}:.github/images.json" | jq -c .)" >> "$GITHUB_OUTPUT"
 
           # ── Which evening is this build for? ─────────────────────────
           # The nightly is built at 20:05 America/New_York (by
@@ -232,38 +298,54 @@ jobs:
           else
             NIGHT_DATE=$(TZ=America/New_York date -d "${TODAY_ET}" +%Y%m%d)
           fi
-          DATE_TAG="nightly-${NIGHT_DATE}"
-          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
+          # Every name derived from the commit and the ref (#3950): .github/scripts/nightly-names.sh, which has a
+          # test. For `main` the names are exactly the historical ones.
+          NAMES=$(.github/scripts/nightly-names.sh "$BUILD_REF" "$NIGHT_DATE" "$SHA")
+          printf '%s\n' "$NAMES" >> "$GITHUB_OUTPUT"
+          nm() { printf '%s\n' "$NAMES" | sed -n "s/^$1=//p"; }
+          DATE_TAG=$(nm date_tag)
+          RELEASE_TAG=$(nm release_tag)
+          RELEASE_RING_RE=$(nm release_ring_re)
           # Per-night pre-release tag: CalVer date so nightlies sort and
           # read like the releases they sit next to, PREFIXED so it can
           # never match release.yml's release-tag triggers (a tag like
           # 2026.08.08-nightly would fire a full release build).
-          RELEASE_TAG="nightly-${NIGHT_DATE:0:4}.${NIGHT_DATE:4:2}.${NIGHT_DATE:6:2}"
-          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "→ this is the build for the evening of ${NIGHT_DATE} (${DATE_TAG}, ${RELEASE_TAG}); now $(TZ=America/New_York date -d "@$NOW" '+%F %H:%M %Z')"
           # Informational version string baked into the frontend build and
           # the appliance release stamp. Deliberately NOT a release version
           # (app/core/versions.py reads it as a nightly), so it can never be
           # mistaken for a release by a human, a sort or a version gate.
-          echo "version=0.0.0-${DATE_TAG}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # (A release branch's version carries the branch in its build
+          # metadata and stays unknown to versions.py — see nightly-names.sh.)
 
           # The last nightly's commit is recorded in the newest dated
           # pre-release's body. One source of truth, and a human can read
           # it. (Falls back to the legacy reused `nightly` release so the
           # first run after this rework still skips an unchanged main.)
-          NEWEST_NIGHTLY=$(gh release list --limit 100 \
-                             --json tagName,createdAt \
-                             --jq '[.[] | select(.tagName | startswith("nightly-"))]
-                                   | sort_by(.createdAt) | reverse | .[0].tagName // empty' \
+          # Only THIS ref's ring counts (#3950): main's nightly must not take
+          # a release branch's pre-release for its own last build, or the
+          # reverse — each skips on "this ref has not moved since ITS last
+          # nightly".
+          NEWEST_NIGHTLY=$(gh release list --limit 100 --json tagName,createdAt 2>/dev/null \
+                           | jq -r --arg re "$RELEASE_RING_RE" \
+                               '[.[] | select(.tagName | test($re))]
+                                | sort_by(.createdAt) | reverse | .[0].tagName // empty' \
                            2>/dev/null || true)
-          NEWEST_NIGHTLY="${NEWEST_NIGHTLY:-nightly}"
-          LAST_SHA=$(gh release view "$NEWEST_NIGHTLY" --json body \
-                       --jq '.body' 2>/dev/null \
-                     | sed -n 's/^built-from: \([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+          # The legacy reused `nightly` release is main's fallback only.
+          if [ "$BUILD_REF" = "main" ]; then
+            NEWEST_NIGHTLY="${NEWEST_NIGHTLY:-nightly}"
+          fi
+          # (Guarded: `gh release view` with no tag shows the LATEST release.)
+          LAST_SHA=""
+          if [ -n "$NEWEST_NIGHTLY" ]; then
+            LAST_SHA=$(gh release view "$NEWEST_NIGHTLY" --json body \
+                         --jq '.body' 2>/dev/null \
+                       | sed -n 's/^built-from: \([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+          fi
           LAST_SHA="${LAST_SHA:-}"
           echo "last_sha=${LAST_SHA}" >> "$GITHUB_OUTPUT"
           echo "last nightly commit: ${LAST_SHA:-<none>}"
-          echo "current main commit: ${GITHUB_SHA}"
+          echo "current ${BUILD_REF} commit: ${SHA}"
 
           # Skip when this evening already has its nightly. The 03:23
           # fallback, and a second dispatch racing the first, must not
@@ -287,9 +369,9 @@ jobs:
           if [ "$FORCE" = "true" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "→ forced by dispatch"
-          elif [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$GITHUB_SHA" ]; then
+          elif [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$SHA" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "→ main unchanged since the last nightly; skipping"
+            echo "→ ${BUILD_REF} unchanged since its last nightly; skipping"
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
@@ -317,7 +399,11 @@ jobs:
         # an image carrying pytest + coverage installed as root.
         include: ${{ fromJSON(needs.gate.outputs.images) }}
     steps:
+      # The commit the gate resolved: for main, the triggering commit as
+      # always; for a release branch, its head (#3950).
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -366,8 +452,8 @@ jobs:
             APP_VERSION=${{ needs.gate.outputs.version }}
             APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
             APT_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
-          cache-from: type=gha,scope=nightly-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
+          cache-from: type=gha,scope=${{ needs.gate.outputs.cache_scope }}-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ needs.gate.outputs.cache_scope }}-${{ matrix.image }}
 
       # get.trivy.dev, which trivy-action's own setup downloads from,
       # is gone (#3464): install from the GitHub release instead.
@@ -419,9 +505,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event.inputs.dry_run != 'true' }}
           # `:nightly` is the mutable pointer; the dated tag is the
-          # immutable snapshot the ring keeps.
+          # immutable snapshot the ring keeps. A release branch gets its
+          # own pair, `:nightly-X.Y.Z` and `:nightly-X.Y.Z-YYYYMMDD`; never
+          # `:latest`, and never main's `:nightly` (#3950).
           tags: |
-            ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:nightly
+            ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.gate.outputs.pointer_tag }}
             ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.gate.outputs.date_tag }}
           # APP_VERSION: the version the supervisor (#1183) and the agents
           # (#1182) report. An image that declares no such ARG ignores it.
@@ -430,8 +518,8 @@ jobs:
             APP_VERSION=${{ needs.gate.outputs.version }}
             APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
             APT_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
-          cache-from: type=gha,scope=nightly-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
+          cache-from: type=gha,scope=${{ needs.gate.outputs.cache_scope }}-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ needs.gate.outputs.cache_scope }}-${{ matrix.image }}
 
   # ── Build the appliance ISO + slot image ──────────────────────────────
   # The same reusable workflow release.yml invokes (#823) — which is the
@@ -459,6 +547,7 @@ jobs:
     with:
       version: ${{ needs.gate.outputs.version }}
       image_tag: ${{ needs.gate.outputs.date_tag }}
+      ref: ${{ needs.gate.outputs.sha }}
       arch: ${{ matrix.arch }}
       # The un-versioned spatiumddi-appliance-<arch>.* names are the
       # RELEASE's /releases/latest/download/ link targets; emitting them
@@ -490,6 +579,7 @@ jobs:
           GH_REPO: ${{ github.repository }}  # no checkout in this job
           DATE_TAG: ${{ needs.gate.outputs.date_tag }}
           RELEASE_TAG: ${{ needs.gate.outputs.release_tag }}
+          BUILD_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
           # One pre-release PER night (see the header) — the build's dated
@@ -523,7 +613,7 @@ jobs:
           # the real notes once every job has succeeded.
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
-              --target "$GITHUB_SHA" \
+              --target "$BUILD_SHA" \
               --title "Nightly ${RELEASE_TAG#nightly-}" \
               --prerelease --notes "build in progress"
           fi
@@ -544,6 +634,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           IMAGES_JSON: ${{ needs.gate.outputs.images }}
+          # THIS ref's dated tags only (#3950): main's is ^nightly-[0-9]{8}$,
+          # a release branch's ^nightly-X\.Y\.Z-[0-9]{8}$, so neither ring's
+          # prune can see the other's.
+          IMAGE_RING_RE: ${{ needs.gate.outputs.image_ring_re }}
         run: |
           set -euo pipefail
           KEEP=7
@@ -584,9 +678,9 @@ jobs:
               echo "     ${raw}" | head -3
               continue
             fi
-            versions=$(printf '%s' "$raw" | jq -r '.[] | select(
+            versions=$(printf '%s' "$raw" | jq -r --arg re "$IMAGE_RING_RE" '.[] | select(
                       (.metadata.container.tags | length) > 0 and
-                      (.metadata.container.tags | all(test("^nightly-[0-9]{8}$")))
+                      (.metadata.container.tags | all(test($re)))
                     ) | "\(.created_at)\t\(.id)\t\(.metadata.container.tags | join(","))"' \
               | sort -r)
 
@@ -635,6 +729,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}  # no checkout in this job
+          # THIS ref's pre-releases only (#3950). main's pattern is
+          # ^nightly-YYYY.MM.DD$; a branch ring is ^branch-nightly-X.Y.Z-YYYY.MM.DD$.
+          RING_RE: ${{ needs.gate.outputs.release_ring_re }}
+          BUILD_REF: ${{ needs.gate.outputs.ref }}
         run: |
           set -euo pipefail
           # The ring is keyed on the DATE IN THE TAG, not createdAt — a
@@ -644,11 +742,11 @@ jobs:
           CUTOFF=$(TZ=America/New_York date -d '7 days ago' +%Y%m%d)
           echo "cutoff: nightly dates < ${CUTOFF} are deleted"
 
-          # startswith("nightly"), no dash — the legacy reused release is
+          # startswith("nightly") (plus branch-nightly-* for #3950), no dash — the legacy reused release is
           # tagged bare `nightly` and must enter the loop to be deleted;
           # anything else oddly-named lands in the fail-safe skip below.
           if ! tags=$(gh release list --limit 200 --json tagName \
-                        --jq '.[].tagName | select(startswith("nightly"))'); then
+                        --jq '.[].tagName | select(startswith("nightly") or startswith("branch-nightly"))'); then
             echo "::error::could not list releases — retention NOT applied"
             exit 1
           fi
@@ -657,15 +755,19 @@ jobs:
           for tag in $tags; do
             # Legacy single reused pre-release from the pre-rework design —
             # superseded by the dated ring; delete on sight.
-            if [ "$tag" = "nightly" ]; then
+            if [ "$tag" = "nightly" ] && [ "$BUILD_REF" = "main" ]; then
               echo "deleting legacy reused release: $tag"
               gh release delete "$tag" --yes --cleanup-tag || failures=$((failures + 1))
               continue
             fi
-            # nightly-YYYY.MM.DD → YYYYMMDD. Anything not matching the
-            # dated shape is left alone (fail-safe: never delete what we
-            # can't positively date).
-            d=$(printf '%s' "$tag" | sed -n 's/^nightly-\([0-9]\{4\}\)\.\([0-9]\{2\}\)\.\([0-9]\{2\}\)$/\1\2\3/p')
+            # …-YYYY.MM.DD → YYYYMMDD. Anything outside this ref's ring (the
+            # other ref's nightlies included) or not matching the dated
+            # shape is left alone (fail-safe: never delete what we can't
+            # positively date and own).
+            if ! printf '%s' "$tag" | grep -Eq "$RING_RE"; then
+              echo "skipping tag outside this ring: $tag"; continue
+            fi
+            d=$(printf '%s' "$tag" | sed -n 's/.*\([0-9]\{4\}\)\.\([0-9]\{2\}\)\.\([0-9]\{2\}\)$/\1\2\3/p')
             [ -n "$d" ] || { echo "skipping unrecognized tag shape: $tag"; continue; }
             if [ "$d" -lt "$CUTOFF" ]; then
               echo "deleting ${tag} (older than 7 days)"
@@ -717,26 +819,29 @@ jobs:
           # repository" (which is how the first nightly failed to report
           # its own failure).
           GH_REPO: ${{ github.repository }}
+          BUILD_SHA: ${{ needs.gate.outputs.sha }}
+          BUILD_REF: ${{ needs.gate.outputs.ref }}
+          POINTER_TAG: ${{ needs.gate.outputs.pointer_tag }}
         run: |
           set -euo pipefail
           RELEASE_TAG='${{ needs.gate.outputs.release_tag }}'
           # appliance-publish created it; recreate defensively if a manual
           # cleanup raced this run.
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+            gh release create "$RELEASE_TAG" --target "$BUILD_SHA" \
               --title "Nightly ${RELEASE_TAG#nightly-}" --prerelease --notes "init"
           fi
           # `built-from:` is parsed by the gate job on the next run. Keep the
           # 40-hex shape; the sed there anchors on it.
           gh release edit "$RELEASE_TAG" --notes "$(cat <<EOF
-          Automated nightly build of \`main\`. **Not a release** — no support, no upgrade path.
+          Automated nightly build of \`${BUILD_REF}\`. **Not a release** — no support, no upgrade path.
 
-          built-from: ${GITHUB_SHA}
+          built-from: ${BUILD_SHA}
           date-tag: ${{ needs.gate.outputs.date_tag }}
 
           Pull the images:
           \`\`\`
-          docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-api:nightly
+          docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-api:${POINTER_TAG}
           \`\`\`
           The dated tag \`${{ needs.gate.outputs.date_tag }}\` pins this exact build;
           the newest 7 are kept.
@@ -770,10 +875,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}  # no checkout in this job — see above
+          # The gate's own outputs are absent when it is what failed, so
+          # this reads the input, not the gate (#3950).
+          BUILD_REF: ${{ github.event.inputs.ref || 'main' }}
+          BUILD_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
+          # One tracker per ref: main's keeps its historical title, a
+          # release branch's names the branch.
           TITLE="Nightly build failing"
-          BODY="Nightly build failed on \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA::12}\`.
+          if [ "$BUILD_REF" != "main" ]; then
+            TITLE="Nightly build failing on ${BUILD_REF}"
+          fi
+          BUILD_SHA="${BUILD_SHA:-$GITHUB_SHA}"
+          BODY="Nightly build failed on \`${BUILD_REF}\` @ \`${BUILD_SHA::12}\`.
 
           - gate: ${{ needs.gate.result }}
           - images: ${{ needs.images.result }}
@@ -786,8 +901,12 @@ jobs:
 
           This issue is reused by every failing nightly — close it once the
           build is green again."
+          # Exact-title match: the search is fuzzy, and main's title is a
+          # prefix of every release branch's.
           EXISTING=$(gh issue list --state open --search "$TITLE in:title" \
-                       --json number --jq '.[0].number' 2>/dev/null || true)
+                       --json number,title 2>/dev/null \
+                     | jq -r --arg t "$TITLE" '[.[] | select(.title == $t)][0].number // empty' \
+                     2>/dev/null || true)
           if [ -n "${EXISTING:-}" ] && [ "${EXISTING}" != "null" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
           else

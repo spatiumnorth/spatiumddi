@@ -555,6 +555,22 @@ for new endpoints that can grow unbounded. The audit list answers
 `{total, items}`. Check the route's schema in `/api/docs` rather than
 assuming one shape.
 
+### Stable ordering and moving data
+
+Pagination is offset-based. Every paginated list ends its ordering in a unique
+column (the primary key), so rows that share a sort value (DHCP leases with the
+same `last_seen_at`) always fall on the same page across requests. Offset
+paging over a set that is being written is still not a snapshot: a row whose
+*sort key itself* changes between page requests (a lease renewal bumping
+`last_seen_at`, a new audit row arriving at the head of a newest-first list)
+can move across a page boundary, so a client can see it twice or miss it. To
+read a busy list completely, sort on a column that does not change
+(`expired_at` on lease history, `timestamp` on the audit log) or restrict by a
+time window, and dedupe by `id`. Keyset paging for the live lease list was
+considered and not built: the list is a live operator view, the shipped
+ordering is already deterministic, and the remaining drift is bounded to rows
+that were touched mid-read.
+
 ### 6.1 `{items, total, limit, offset}` envelope
 
 The network-modeling and newer routers (circuits, services, ASNs,

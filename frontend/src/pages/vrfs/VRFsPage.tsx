@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -12,11 +13,14 @@ import {
   X,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
+import { Field } from "@/pages/dhcp/_shared";
 import {
   asnsApi,
   vrfsApi,
@@ -27,6 +31,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -40,28 +45,6 @@ const RD_RT_RE = /^(\d+|(\d+\.){3}\d+):\d+$/;
 
 function isValidRdRt(v: string): boolean {
   return RD_RT_RE.test(v.trim());
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && (
-        <div className="text-[11px] text-muted-foreground/80">{hint}</div>
-      )}
-    </div>
-  );
 }
 
 function RtBadgeCount({ values, label }: { values: string[]; label: string }) {
@@ -100,16 +83,35 @@ function CountBadge({
 // stripping mid-edit.
 /** Resolves ``asn_id`` against the cached ASN list and renders
  * ``AS{number}`` instead of a UUID slice. Falls back to "—" when
- * the ASN list hasn't loaded yet or the row is missing. */
+ * the ASN list hasn't loaded yet or the row is missing. The list needs
+ * read on "manage_asns": without it the list is never asked (#3466) and a
+ * linked ASN reads "linked, not shown", as the space's ASN line does. */
 function AsnNumberCell({ asnId }: { asnId: string | null | undefined }) {
+  const perms = usePermissions();
+  const canRead = perms.can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
     staleTime: 60_000,
-    enabled: !!asnId,
+    enabled: !!asnId && canRead,
   });
   if (!asnId) {
     return <span className="text-muted-foreground/50">—</span>;
+  }
+  if (!canRead) {
+    return (
+      <span
+        className="text-muted-foreground"
+        title={
+          perms.unanswered ??
+          "This VRF names an ASN you may not read (manage_asns)"
+        }
+      >
+        {perms.unanswered
+          ? "linked, checking permissions"
+          : "linked, not shown"}
+      </span>
+    );
   }
   const asn = (data?.items ?? []).find((a) => a.id === asnId);
   if (!asn) {
@@ -143,6 +145,8 @@ function listToCsv(xs: string[]): string {
 
 // ── Editor modal ──────────────────────────────────────────────────────────────
 
+// Edit reads the VRF when it opens and sends only what changed (#3869); the
+// list's copy may predate another client's edit.
 export function VRFEditorModal({
   existing,
   onClose,
@@ -150,6 +154,50 @@ export function VRFEditorModal({
   existing: VRF | null;
   onClose: () => void;
 }) {
+  const fresh = useFreshRow<VRF>(existing ?? undefined, () =>
+    vrfsApi.get(existing!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit VRF"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <VRFEditorForm existing={fresh.row ?? null} onClose={onClose} />;
+}
+
+function vrfBody(v: {
+  name: string;
+  description: string;
+  route_distinguisher: string | null;
+  import_targets: string[];
+  export_targets: string[];
+  asn_id: string | null;
+  customer_id: string | null;
+}) {
+  return {
+    name: v.name,
+    description: v.description,
+    route_distinguisher: v.route_distinguisher,
+    import_targets: v.import_targets,
+    export_targets: v.export_targets,
+    asn_id: v.asn_id,
+    customer_id: v.customer_id,
+  };
+}
+
+function VRFEditorForm({
+  existing,
+  onClose,
+}: {
+  existing: VRF | null;
+  onClose: () => void;
+}) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
@@ -164,6 +212,12 @@ export function VRFEditorModal({
   const [customerId, setCustomerId] = useState<string | null>(
     existing?.customer_id ?? null,
   );
+  // The customer list takes a read grant on "customer" (one scoped to a
+  // single customer is enough: the API narrows the list). Without any, the
+  // list is never asked (#3466) and the picker says why, as the ASN picker
+  // does, instead of showing "None" over a linked customer.
+  const customerPerms = usePermissions();
+  const canReadCustomers = customerPerms.hasAnyGrantFor("read", "customer");
   const [error, setError] = useState<string | null>(null);
 
   const rdValid = rd.trim() === "" || isValidRdRt(rd);
@@ -187,7 +241,17 @@ export function VRFEditorModal({
         customer_id: customerId,
       };
       if (existing) {
-        return vrfsApi.update(existing.id, body);
+        const diff = changedFields(
+          vrfBody({
+            ...existing,
+            route_distinguisher: existing.route_distinguisher ?? null,
+            asn_id: existing.asn_id ?? null,
+            customer_id: existing.customer_id ?? null,
+          }),
+          body as ReturnType<typeof vrfBody>,
+        );
+        if (Object.keys(diff).length === 0) return existing;
+        return vrfsApi.update(existing.id, diff);
       }
       return vrfsApi.create(body as VRFCreate);
     },
@@ -206,8 +270,9 @@ export function VRFEditorModal({
     importInvalid.length === 0 &&
     exportInvalid.length === 0;
 
+  // A span, not a div: the shared Field draws its hint inside a <p>.
   const rdHint = (
-    <div className="flex items-center gap-1.5">
+    <span className="flex items-center gap-1.5">
       {rd.trim() === "" ? (
         <span className="text-muted-foreground/80">
           Optional. Format: <code>ASN:N</code> (e.g. <code>65000:100</code>) or{" "}
@@ -228,7 +293,7 @@ export function VRFEditorModal({
           </span>
         </>
       )}
-    </div>
+    </span>
   );
 
   return (
@@ -261,13 +326,36 @@ export function VRFEditorModal({
         >
           <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
         </Field>
-        <Field label="Customer" hint="Optional logical owner of this VRF.">
-          <CustomerPicker
-            className={inputCls}
-            value={customerId}
-            onChange={setCustomerId}
-          />
-        </Field>
+        {own.customer && (
+          <Field label="Customer" hint="Optional logical owner of this VRF.">
+            {canReadCustomers ? (
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            ) : (
+              // Disabled, so the form still sends the unchanged id (never a clear).
+              <select
+                className={inputCls}
+                value={customerId ? "linked" : ""}
+                disabled
+                title={
+                  customerPerms.unanswered ??
+                  "Your role cannot read customers, so this cannot be changed here."
+                }
+              >
+                <option value="">{"\u2014 None \u2014"}</option>
+                {customerId && (
+                  <option value="linked">
+                    {customerPerms.unanswered ??
+                      "Linked (not visible to your role)"}
+                  </option>
+                )}
+              </select>
+            )}
+          </Field>
+        )}
         <Field label="Route distinguisher (RD)" hint={rdHint}>
           <input
             className={cn(inputCls, !rdValid && "border-destructive")}
@@ -325,7 +413,9 @@ export function VRFEditorModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex items-center justify-end gap-2 pt-2">
           <button
@@ -375,7 +465,7 @@ function BulkDeleteModal({
       if (resp.refused.length > 0) {
         setError(
           `Refused ${resp.refused.length} VRF${resp.refused.length === 1 ? "" : "s"} ` +
-            "with linked spaces or blocks. Tick force-detach to proceed.",
+            "with linked spaces or blocks (rows in the Trash count). Tick force-detach to proceed.",
         );
         return;
       }
@@ -414,13 +504,16 @@ function BulkDeleteModal({
             />
             <span>
               <span className="font-medium">Force-detach.</span> Linked IP
-              spaces / IP blocks will have their <code>vrf_id</code> set to NULL
-              via <code>ON DELETE SET NULL</code>. Without this, VRFs with
-              linked rows are skipped.
+              spaces / IP blocks, including ones in the Trash (a restore does
+              not bring the VRF back), will have their <code>vrf_id</code> set
+              to NULL via <code>ON DELETE SET NULL</code>. Without this, VRFs
+              with linked rows are skipped.
             </span>
           </label>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex items-center justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -455,6 +548,9 @@ export function VRFsPage() {
     perms.can("delete", "vrf"),
     "Requires delete permission on VRFs",
   );
+  // The row's customer chip reads the customer list: not asked of a user
+  // with no read grant on customers (#3466), whom it would only refuse.
+  const canReadCustomers = perms.hasAnyGrantFor("read", "customer");
   const qc = useQueryClient();
   const [editing, setEditing] = useState<VRF | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -609,8 +705,14 @@ export function VRFsPage() {
                     what="VRFs"
                     filtered={tagFilters.length > 0}
                     onClearFilters={() => setTagFilters([])}
+                    gate={writeGate}
+                    hint={
+                      <>
+                        Click <strong>+ New VRF</strong> to create one.
+                      </>
+                    }
                   >
-                    No VRFs yet. Click <strong>+ New VRF</strong> to create one.
+                    No VRFs yet.
                   </ListEmpty>
                 </td>
               </tr>
@@ -640,7 +742,9 @@ export function VRFsPage() {
                       >
                         {v.name}
                       </Link>
-                      <CustomerChip customerId={v.customer_id} />
+                      {canReadCustomers && (
+                        <CustomerChip customerId={v.customer_id} />
+                      )}
                     </span>
                   </td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">

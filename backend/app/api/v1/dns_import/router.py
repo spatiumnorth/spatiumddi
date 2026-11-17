@@ -56,6 +56,7 @@ from app.services.dns_import.canonical import (
 )
 from app.services.dns_import.cname_check import annotate_cname_conflicts
 from app.services.dns_import.commit import commit_import, detect_conflicts
+from app.services.dns_import.soa_mailbox import annotate_admin_email
 
 logger = structlog.get_logger(__name__)
 # Every body route here checks the login from the request headers before
@@ -512,6 +513,7 @@ async def bind9_preview(
         user=current_user.display_name,
     )
     await annotate_apex_ns(db, preview, target_group_id)
+    annotate_admin_email(preview)
     annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
@@ -676,6 +678,7 @@ async def windows_dns_preview(
         user=current_user.display_name,
     )
     await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
     annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
@@ -819,6 +822,7 @@ async def powerdns_preview(
         user=current_user.display_name,
     )
     await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
     annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
@@ -950,6 +954,7 @@ async def technitium_preview(
         user=current_user.display_name,
     )
     await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
     annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
@@ -1085,6 +1090,7 @@ async def cloud_dns_preview(
         user=current_user.display_name,
     )
     await annotate_apex_ns(db, preview, body.target_group_id)
+    annotate_admin_email(preview)
     annotate_cname_conflicts(preview)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 

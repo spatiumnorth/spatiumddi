@@ -49,6 +49,7 @@ async def _run_sync() -> dict[str, Any]:
     # Deferred imports — keep celery-worker startup light and avoid pulling
     # in the FastAPI router graph.
     from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        non_authoritative_reason,
         sync_zone_with_server,
     )
 
@@ -84,6 +85,9 @@ async def _run_sync() -> dict[str, Any]:
             errors: list[str] = []
 
             for zone in zones:
+                # #3758 — forward / stub zones aren't held authoritatively.
+                if non_authoritative_reason(zone) is not None:
+                    continue
                 # Resolve primary for this zone's group and check driver
                 # supports the sync path. Skip silently otherwise —
                 # agent-based drivers just aren't in scope for this

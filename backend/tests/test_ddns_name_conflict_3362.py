@@ -663,3 +663,64 @@ def test_v6_generated_name_is_the_same_however_the_address_is_written() -> None:
     full = "2001:0db8:0000:0000:0000:0000:0000:0005"
     assert _generate_hostname(full) == _generate_hostname("2001:db8::5")
     assert _generate_hostname("2001:DB8::5") == "dhcp-20010db8000000000000000000000005"
+
+
+async def _lease_row(
+    db: AsyncSession, subnet: Subnet, address: str, mac: str, name: str
+) -> IPAddress:
+    from app.services.dns.ddns import apply_ddns_for_lease
+
+    row = IPAddress(
+        subnet_id=subnet.id,
+        address=address,
+        status="dhcp",
+        auto_from_lease=True,
+        hostname=name,
+        mac_address=mac,
+    )
+    db.add(row)
+    await db.commit()
+    sub = await db.get(type(subnet), subnet.id)
+    await apply_ddns_for_lease(db, subnet=sub, ipam_row=row, client_hostname=name)
+    await db.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_dual_stack_client_keeps_its_name_on_both_families_4066(
+    db_session: AsyncSession,
+) -> None:
+    """The A its v4 lease published is not another host holding the name."""
+    _server, subnet, zone, _ip = await _setup(db_session, 38)
+    zone_id = zone.id
+    v4 = await _lease_row(db_session, subnet, "10.93.38.50", MAC, "laptop")
+    v6 = await _lease_row(db_session, subnet, "2001:db8::50", MAC, "laptop")
+
+    assert v4.hostname == "laptop"
+    assert v6.hostname == "laptop"
+    recs = sorted((r.record_type, r.value) for r in await _a_records(db_session, zone_id, "laptop"))
+    assert recs == [("A", "10.93.38.50"), ("AAAA", "2001:db8::50")]
+
+
+@pytest.mark.asyncio
+async def test_dual_stack_v6_first_then_v4_4066(db_session: AsyncSession) -> None:
+    _server, subnet, zone, _ip = await _setup(db_session, 39)
+    zone_id = zone.id
+    await _lease_row(db_session, subnet, "2001:db8::51", MAC, "laptop")
+    v4 = await _lease_row(db_session, subnet, "10.93.39.51", MAC, "laptop")
+
+    assert v4.hostname == "laptop"
+    assert len(await _a_records(db_session, zone_id, "laptop")) == 2
+
+
+@pytest.mark.asyncio
+async def test_another_hosts_record_of_the_other_family_still_holds_the_name_4066(
+    db_session: AsyncSession,
+) -> None:
+    _server, subnet, zone, _ip = await _setup(db_session, 40)
+    zone_id = zone.id
+    await _lease_row(db_session, subnet, "10.93.40.50", "aa:bb:cc:00:00:99", "laptop")
+    v6 = await _lease_row(db_session, subnet, "2001:db8::52", MAC, "laptop")
+
+    assert v6.hostname == "dhcp-20010db8000000000000000000000052"
+    assert [r.value for r in await _a_records(db_session, zone_id, "laptop")] == ["10.93.40.50"]

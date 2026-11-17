@@ -36,6 +36,7 @@ from app.services.dhcp_import import (
     WindowsDHCPImportError,
     commit_import,
     detect_conflicts,
+    drop_invalid_options,
     drop_invalid_pools,
     drop_invalid_reservations,
     drop_unservable_hostnames,
@@ -383,6 +384,8 @@ async def _attach_conflicts(
     preview.warnings.extend(drop_unservable_hostnames(preview.scopes))
     # #3037 — Kea / ISC drop a bad pool at parse; this covers Windows too.
     preview.warnings.extend(drop_invalid_pools(preview.scopes))
+    # #3730 — an option the scope API refuses is never stored; say so here.
+    preview.warnings.extend(drop_invalid_options(preview.scopes, preview.client_classes))
     preview.total_pools = sum(len(s.pools) for s in preview.scopes)
     preview.total_reservations = sum(len(s.reservations) for s in preview.scopes)
 

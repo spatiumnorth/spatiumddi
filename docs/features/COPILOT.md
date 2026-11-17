@@ -14,13 +14,13 @@ The README carries the short version; this page is the reference for how the Cop
 - **Multi-vendor** — OpenAI, Anthropic (Claude), Azure OpenAI, Google Gemini, plus OpenAI-compat (Ollama, OpenWebUI, vLLM, LM Studio, llama.cpp server, LocalAI, Together, Groq, Fireworks). Add multiple providers in priority order; orchestrator picks the highest-priority enabled one
 - **Automatic failover chain** — on transient failure (5xx / timeout / rate-limit) the orchestrator walks remaining providers; first successful chunk wins. Permanent errors (4xx / auth) surface immediately
 - **Per-provider system prompt override** — admin-editable inside the AI Provider modal; baked-in default is also viewable inline so you can fork it. Snapshotted onto each session at creation so live edits don't break in-flight chats
-- **Per-provider tool allowlist** — new "Tools" tab on the AI Provider modal, category-grouped checkbox list with "write" badges on `propose_*` rows. NULL = "use whatever the registry has"; non-empty list pins exactly those tools. Right call for small Ollama models that struggle with a large tool set, kiosk providers limited to read-only, and per-provider compliance posture
+- **Per-provider tool allowlist** — set through the API (the provider's `enabled_tools`); the AI Providers page has no control for it, and the AI Provider modal has only the Connection and System prompt tabs. NULL = "use whatever the registry has"; non-empty list pins exactly those tools. Right call for small Ollama models that struggle with a large tool set, kiosk providers limited to read-only, and per-provider compliance posture
 - **Reasoning-channel fallback** — `qwen3.5` / DeepSeek-R1 / o1 / o3 family that route their answer to `reasoning` instead of `content` are handled transparently by the driver
 - **Ollama context-window forwarding** — driver forwards `options.num_ctx` / `num_predict` / `extra_body` so Ollama respects the configured context window. Operators can also set `OLLAMA_CONTEXT_LENGTH` env var on the server side (recommended); without one or the other, Ollama silently truncates to 2048 tokens and small models hallucinate tool names from a half-cut tool list
 
 ## Tool registry (hundreds of tools — highlights below)
 
-Each tool is gated by both the `feature_module` it belongs to (`integrations.unifi` off → UniFi tool disappears from the registry) and an admin-controlled per-tool allowlist at **Admin → AI → Tools**, so operators can trim what the model can see without touching code. Every tool can also be flipped per-provider via the AI Provider modal's Tools tab — the right call for small Ollama models that struggle with hundreds of tool schemas.
+Each tool is gated by both the `feature_module` it belongs to (`integrations.unifi` off → UniFi tool disappears from the registry) and an admin-controlled per-tool allowlist at **Admin → AI → Tools**, so operators can trim what the model can see without touching code. Every tool can also be limited per-provider through the API (the provider's `enabled_tools`; the AI Providers page has no control for it) — the right call for small Ollama models that struggle with hundreds of tool schemas.
 
 The per-category bullets below are a representative tour, not an exhaustive enumeration — the canonical inventory is `backend/app/services/ai/tools/` (one module per category, every `@register_tool(...)` decorator is a live entry) and the live `/api/v1/ai/tools` endpoint on a running install. Categories not surfaced here (multicast, host-config firewall / LLDP / syslog / SSH, …) round out the full registry.
 
@@ -55,7 +55,7 @@ The per-category bullets below are a representative tour, not an exhaustive enum
 - **Daily token + cost chip** — live in the drawer header; refetches automatically when you delete chats
 - **Multi-select session history** — checkbox column on every history row; "Select all" + "Delete N" + "Delete all" toolbar; bulk delete fans out per-id and updates the daily tally on success
 - **Live nmap proposal results** — when a `propose_run_nmap_scan` Apply lands, the proposal card polls `GET /nmap/scans/{id}` every 2 s and renders the full results table (alive flag, open ports + service / version, OS guess, CIDR-host list) inline once status flips to `completed`
-- **Custom prompts library** — operator-curated templates persisted per platform; built-in starter pack (Find unused IPs, Audit recent changes, Summarize subnet utilization, Triage open alerts)
+- **Custom prompts library** — operator-curated templates persisted per platform; none ship built in — a fresh install has an empty library until an operator creates a prompt
 - **Cmd-K palette "Ask AI" entry** — top entry in the global palette, pre-fills with the current page's context
 
 ## Reliability + safety

@@ -40,7 +40,7 @@ import structlog
 
 from . import cp_tls
 from . import nettools
-from .cert_auth import build_auth_headers, load_cert
+from .cert_auth import JSON_CONTENT_TYPE, build_auth_headers, encode_json, load_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url
 from .identity import Identity, load_appliance_id
@@ -194,20 +194,27 @@ def _post_reply(
     ``error``."""
     reply_path = f"/api/v1/appliance/supervisor/nettool/reply/{request_id}"
     reply_url = _effective_control_plane_url(cfg).rstrip("/") + reply_path
+    reply_body = encode_json(
+        {
+            "request_id": request_id,
+            "result": outcome.get("result"),
+            "error": outcome.get("error"),
+        }
+    )
     reply_headers = build_auth_headers(
         "POST",
         reply_path,
         load_cert(cfg.state_dir) or "",
         identity.private_key,
         appliance_id,
+        reply_body,
     )
-    reply_body = {
-        "request_id": request_id,
-        "result": outcome.get("result"),
-        "error": outcome.get("error"),
-    }
     try:
-        reply_resp = client.post(reply_url, headers=reply_headers, json=reply_body)
+        reply_resp = client.post(
+            reply_url,
+            headers={**reply_headers, **JSON_CONTENT_TYPE},
+            content=reply_body,
+        )
     except httpx.HTTPError as exc:
         log.warning("supervisor.nettool.reply_failed", error=str(exc))
         return

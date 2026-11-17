@@ -30,8 +30,10 @@ is audited (mirrors ``appliance/tls.py``).
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -62,6 +64,7 @@ from app.models.appliance import CERT_SOURCE_LETSENCRYPT, ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
 from app.services.api_token_scopes import read_only_post
+from app.services.nettools.schemas import resolve_checked_target
 
 logger = structlog.get_logger(__name__)
 
@@ -192,13 +195,34 @@ class ACMEPreviewRequest(BaseModel):
     domains: list[str] = Field(min_length=1, max_length=100)
 
 
-def _require_https(directory_url: str) -> str:
+async def _require_https(directory_url: str) -> str:
+    """https only, and not a loopback / link-local / metadata host.
+
+    The host is judged however it is spelled (``localhost``, ``127.1``,
+    ``2130706433``, ``0x7f000001``) and, when it is a name, by what it
+    resolves to. A name that does not resolve here is accepted: the client
+    resolves and checks again on every connection, so the CA may simply not
+    be reachable from where the request is made.
+    """
     cleaned = directory_url.strip()
     if not cleaned.lower().startswith("https://"):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "directory_url must be an https:// URL",
         )
+    host = urlsplit(cleaned).hostname or ""
+    blocked = HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "directory_url must not point at a loopback, link-local or metadata address",
+    )
+    if not host:
+        raise blocked
+    try:
+        _addr, err = await asyncio.wait_for(resolve_checked_target(host), timeout=5.0)
+    except TimeoutError:
+        return cleaned
+    if err is not None and "blocked range" in err:
+        raise blocked
     return cleaned
 
 
@@ -292,7 +316,7 @@ async def upsert_account(
     first order. Changing ``directory_url`` on an existing row clears the
     cached ``account_url`` so the next order re-registers at the new CA.
     """
-    directory_url = _require_https(body.directory_url)
+    directory_url = await _require_https(body.directory_url)
 
     row = await _get_account(db)
     action = "update" if row is not None else "create"

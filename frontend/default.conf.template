@@ -16,6 +16,10 @@
 #                             to ``{{ fullname }}-api``.
 #   * API_UPSTREAM_PORT     — TCP port the api listens on. Defaults to
 #                             ``8000`` everywhere.
+#   * FRONTEND_HTTP_PORT    — TCP port nginx listens on (#3852). Defaults to
+#                             ``80``; the Helm chart sets an unprivileged
+#                             port on OpenShift, where the pod cannot bind
+#                             :80. Rendered via 14-http-port.envsh.
 #   * NGINX_LOCAL_RESOLVERS — Space-separated nameserver list for the
 #                             ``resolver`` directive. Auto-populated
 #                             from /etc/resolv.conf by the official
@@ -74,7 +78,7 @@ map "$spatium_proxy_trusted:$http_x_forwarded_proto" $spatium_forwarded_proto {
 }
 
 server {
-    listen 80;
+    listen ${SPATIUM_HTTP_PORT};
     ${SPATIUM_LISTEN6_80}
     server_name _;
     root /usr/share/nginx/html;
@@ -219,6 +223,26 @@ ${SPATIUM_REAL_IP_FROM}
             return 504 '{"detail":"The api did not answer in time; retry shortly."}';
         }
         return 502 '{"detail":"The api is not reachable right now; retry shortly."}';
+    }
+
+    # HELD's own "api unavailable" answer (#3679). An RFC 5985 client does not
+    # read JSON, and the server-level ``error_page 502 504 @starting`` would
+    # redirect a POST to a static file, which nginx answers with its HTML
+    # "405 Not Allowed". A ``return`` has no method to refuse. 503 +
+    # Retry-After + a held+xml ``generalLisError`` is the shape a LIS client
+    # retries on. Keep the body in step with held.render_error().
+    location @held_unavailable {
+        default_type application/held+xml;
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        add_header Retry-After 2 always;
+        # Re-emit the security headers (SECURITY #400): a location with its
+        # own add_header does not inherit the server-level set, and the
+        # api's own HELD answers carry it.
+        add_header Content-Security-Policy $spatium_csp always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        return 503 '<?xml version="1.0" encoding="UTF-8"?>\n<error xmlns="urn:ietf:params:xml:ns:geopriv:held" code="generalLisError"><message>The location service is not reachable right now; retry shortly.</message></error>';
     }
 
     # Nginx-local healthcheck — answers without hitting any upstream,
@@ -570,6 +594,7 @@ ${SPATIUM_REAL_IP_FROM}
     #
     # ``/held`` and ``/held/self`` both, via a prefix match.
     location /held {
+        error_page 502 504 =503 @held_unavailable;
         set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass         $api_upstream;
         proxy_set_header   Host $http_host;
@@ -587,6 +612,7 @@ ${SPATIUM_REAL_IP_FROM}
     # index.html with a 200 and failed. The api serves only key-authorizations
     # it published for a live order, and 404s everything else.
     location /.well-known/acme-challenge/ {
+        error_page 502 504 @api_unavailable;
         set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass         $api_upstream;
         proxy_set_header   Host $http_host;

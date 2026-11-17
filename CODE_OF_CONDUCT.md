@@ -1,4 +1,9 @@
-# Contributor Covenant Code of Conduct
+# Code of Conduct
+
+SpatiumDDI follows the
+[CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md),
+which is based on the Contributor Covenant. The text below is the
+Contributor Covenant as it applies to this project, with our reporting paths.
 
 ## Our Pledge
 

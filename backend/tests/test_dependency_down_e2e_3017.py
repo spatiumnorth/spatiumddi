@@ -315,6 +315,18 @@ def _lease_batch() -> dict[str, Any]:
     }
 
 
+def _ddns_would_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The subnet here has DDNS off, which the batch's #3773 pre-check reads
+    as "writes nothing" and skips the DDNS step for; these tests stub that
+    step, so they make the pre-check send every lease through it."""
+    import app.services.dns.ddns as ddns
+
+    async def _writes(*_a: Any, **_k: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(ddns, "ddns_lease_writes_nothing", _writes)
+
+
 @pytest.mark.parametrize(
     "exc",
     [
@@ -357,6 +369,7 @@ async def test_lease_events_losing_the_connection_in_ddns_answers_503(
     import app.services.dns.ddns as ddns
 
     monkeypatch.setattr(ddns, "apply_ddns_for_lease", ddns_hits_failover)
+    _ddns_would_write(monkeypatch)
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     try:
@@ -381,6 +394,7 @@ async def test_lease_events_ddns_bug_is_still_swallowed(
     import app.services.dns.ddns as ddns
 
     monkeypatch.setattr(ddns, "apply_ddns_for_lease", ddns_bug)
+    _ddns_would_write(monkeypatch)
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
         r = await client.post("/api/v1/dhcp/agents/lease-events", json=_lease_batch())
@@ -404,6 +418,7 @@ async def test_lease_events_ddns_target_refusing_is_still_a_logged_skip(
     import app.services.dns.ddns as ddns
 
     monkeypatch.setattr(ddns, "apply_ddns_for_lease", ddns_refused)
+    _ddns_would_write(monkeypatch)
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
         r = await client.post("/api/v1/dhcp/agents/lease-events", json=_lease_batch())

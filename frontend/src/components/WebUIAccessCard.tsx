@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Web UI source restriction (#285 Phase 6) + the cross-setting lockout
@@ -299,9 +300,9 @@ function WebUIAccessModal({
           </label>
         )}
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button

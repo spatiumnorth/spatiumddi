@@ -402,28 +402,34 @@ async def test_static_dhcp_with_a_clashing_mac_refused_at_submit(
 
 
 @pytest.mark.asyncio
-async def test_approver_without_dhcp_static_write_fails_the_request_and_records_nothing(
+async def test_approver_without_dhcp_static_write_is_refused_and_request_stays_pending(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Approved by someone who may not write reservations: the request ends
-    failed with the reason, and no address is left behind (atomic), instead of
-    "executed" with only ``result.dhcp_static_warning``."""
+    """An approver who may not write reservations gets a 403 in words (#3646):
+    the request stays pending, nothing is recorded, and a second approver who
+    holds the grant then provisions it. Before, the request ended ``failed``."""
     from app.models.dhcp import DHCPStaticAssignment
     from tests.test_self_service_requests import _auth
 
     tok = await _requester(db_session)
     _, subnet, _ = await _estate(db_session)
     subnet_id = subnet.id  # the approval's commit / rollback expires ``subnet``
-    _, appr = await _user(
+    base = [
+        {"action": "approve", "resource_type": "change_request"},
+        {"action": "read", "resource_type": "change_request"},
+        {"action": "write", "resource_type": "subnet"},
+        {"action": "read", "resource_type": "subnet"},
+        {"action": "write", "resource_type": "ip_address"},
+        {"action": "read", "resource_type": "ip_address"},
+    ]
+    _, appr = await _user(db_session, name="appr", permissions=base)
+    _, appr2 = await _user(
         db_session,
-        name="appr",
-        permissions=[
-            {"action": "approve", "resource_type": "change_request"},
-            {"action": "read", "resource_type": "change_request"},
-            {"action": "write", "resource_type": "subnet"},
-            {"action": "read", "resource_type": "subnet"},
-            {"action": "write", "resource_type": "ip_address"},
-            {"action": "read", "resource_type": "ip_address"},
+        name="appr2",
+        permissions=base
+        + [
+            {"action": "write", "resource_type": "dhcp_static"},
+            {"action": "read", "resource_type": "dhcp_static"},
         ],
     )
     for host in (None, "host-s"):
@@ -438,22 +444,24 @@ async def test_approver_without_dhcp_static_write_fails_the_request_and_records_
             args["hostname"] = host
         sub = await _submit(client, tok, "ip_address", args)
         assert sub.status_code == 201, sub.text
+        rid = sub.json()["id"]
         resp = await client.post(
-            f"/api/v1/requests/{sub.json()['id']}/approve",
-            headers=_auth(appr),
-            json={"decision_note": "ok"},
+            f"/api/v1/requests/{rid}/approve", headers=_auth(appr), json={"decision_note": "ok"}
+        )
+        assert resp.status_code == 403, resp.text
+        assert "dhcp_static" in resp.text
+        got = await client.get(f"/api/v1/requests/{rid}", headers=_auth(tok))
+        assert got.json()["state"] == "pending", got.text
+        assert not got.json().get("error")
+        assert await db_session.scalar(
+            select(func.count()).select_from(IPAddress).where(IPAddress.subnet_id == subnet_id)
+        ) == (0 if host is None else 1)
+        resp = await client.post(
+            f"/api/v1/requests/{rid}/approve", headers=_auth(appr2), json={"decision_note": "ok"}
         )
         assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["state"] == "failed", body
-        assert "dhcp_static" in (body.get("error") or ""), body
-    assert (
-        await db_session.scalar(
-            select(func.count()).select_from(IPAddress).where(IPAddress.subnet_id == subnet_id)
-        )
-        == 0
-    )
-    assert await db_session.scalar(select(func.count()).select_from(DHCPStaticAssignment)) == 0
+        assert resp.json()["state"] == "executed", resp.json()
+    assert await db_session.scalar(select(func.count()).select_from(DHCPStaticAssignment)) == 2
 
 
 @pytest.mark.asyncio

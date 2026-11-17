@@ -19,7 +19,8 @@ export function VrfPicker({
 }: VrfPickerProps) {
   // The list route needs read on "vrf"; without it the list is never
   // asked (#3451) and the picker says why instead of offering only "None".
-  const canRead = usePermissions().can("read", "vrf");
+  const perms = usePermissions();
+  const canRead = perms.can("read", "vrf");
   const { data } = useQuery({
     queryKey: ["vrfs-picker"],
     queryFn: () => vrfsApi.list(),
@@ -29,6 +30,32 @@ export function VrfPicker({
   const vrfs = data ?? [];
 
   if (!canRead) {
+    // Permissions not read yet, or the read failed, is not a role without
+    // the grant (#3546): say so, still disabled so the unchanged id is sent
+    // back.
+    if (perms.unanswered) {
+      return (
+        <select
+          className={className}
+          value={value ? "linked" : ""}
+          disabled
+          title={perms.unanswered}
+        >
+          <option value="">
+            {perms.isError
+              ? "— permissions could not be read —"
+              : "— checking permissions —"}
+          </option>
+          {value && (
+            <option value="linked">
+              {perms.isError
+                ? "Linked (could not be read)"
+                : "Linked (kept as is)"}
+            </option>
+          )}
+        </select>
+      );
+    }
     // Disabled, so the form still sends the unchanged id (never a clear).
     return (
       <select

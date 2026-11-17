@@ -452,9 +452,10 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
         out["relay"] = {"ip-addresses": list(scope.relay_addresses)}
     # #2731: the classes of the scope's own PXE profile. They are
     # ``only-in-additional-list``, so Kea evaluates them for the subnets that
-    # list them and no other. Dhcp4 only, like the classes.
+    # list them and no other. Dhcp4 only, like the classes. #3404: each rule's
+    # boot class; the rule's own name is its selector (``_render_pxe_classes``).
     if scope.pxe_class_names and af != "ipv6":
-        out["evaluate-additional-classes"] = list(scope.pxe_class_names)
+        out["evaluate-additional-classes"] = [pxe_boot_class_name(n) for n in scope.pxe_class_names]
     # Prefix-delegation pools (issue #368) — drop malformed rows rather than
     # failing the whole render.
     if pd_pools:
@@ -516,8 +517,18 @@ def _render_device_policy_class(p: DevicePolicyClassDef) -> dict[str, Any]:
     return d
 
 
-def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
-    """Render a PXE / iPXE class for Dhcp4 ``client-classes`` (issue #51).
+# #3404: the suffix of the class that carries a PXE rule's boot fields. Mirrors
+# ``PXE_BOOT_CLASS_SUFFIX`` in the agent's ``spatium_dhcp_agent/render_kea.py``.
+PXE_BOOT_CLASS_SUFFIX = "-boot"
+
+
+def pxe_boot_class_name(name: str) -> str:
+    """The name of the class that carries PXE rule ``name``'s boot fields (#3404)."""
+    return f"{name}{PXE_BOOT_CLASS_SUFFIX}"
+
+
+def _render_pxe_classes(p: PXEClassDef) -> list[dict[str, Any]]:
+    """Render one PXE / iPXE rule as its Dhcp4 ``client-classes`` (issue #51).
 
     PXE classes are Dhcp4-only — the v6 PXE story uses option 59
     (Bootfile-URL) which is a different flow and is deferred. The
@@ -530,20 +541,32 @@ def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
     ``arch_codes`` enumeration. An empty test means "always match"
     — typically a low-priority fallthrough.
 
-    #2731: ``only-in-additional-list``, so Kea evaluates the class only
-    for the subnets that list it in ``evaluate-additional-classes``, which
-    are the scopes bound to its profile (``_render_scope``). As a global
-    class it answered the PXE clients of every scope on the server.
+    #2731 + #3404: two classes per rule. The selector keeps the rule's name
+    and test and carries no boot fields: an ordinary class, which Kea
+    evaluates before it picks a pool, so a pool restricted to it serves the
+    clients the rule matches (Kea evaluates an ``only-in-additional-list``
+    class only after it has picked the pool, so a pool restricted to one
+    served nobody). The boot class carries the boot fields, tests
+    ``member('<selector>')`` and is ``only-in-additional-list``; only the
+    scopes bound to the profile list it in ``evaluate-additional-classes``
+    (``_render_scope``), so the boot fields answer those scopes' PXE clients
+    and no other. It follows its selector, because Kea refuses a ``member()``
+    of a class not yet defined. A rule with no test matches every client:
+    Kea never assigns an ordinary class with no test, so its selector tests
+    ``member('ALL')``, and its boot class keeps no test, which Kea adds for
+    every client of a subnet that lists it. Mirrors ``_pxe_classes`` in the
+    agent's renderer.
     """
-    d: dict[str, Any] = {
-        "name": p.name,
+    selector: dict[str, Any] = {"name": p.name, "test": p.match_expression or "member('ALL')"}
+    boot: dict[str, Any] = {
+        "name": pxe_boot_class_name(p.name),
         "next-server": p.next_server,
         "boot-file-name": p.boot_file_name,
         "only-in-additional-list": True,
     }
     if p.match_expression:
-        d["test"] = p.match_expression
-    return d
+        boot["test"] = f"member('{p.name}')"
+    return [selector, boot]
 
 
 def _packet_logging_override(bundle: ConfigBundle, daemon: str) -> dict[str, Any]:
@@ -614,7 +637,7 @@ class KeaDriver(DHCPDriver):
                     for c in bundle.client_classes
                     if c.in_family("ipv4")
                 ]
-                + [_render_pxe_class(p) for p in bundle.pxe_classes]
+                + [cls for p in bundle.pxe_classes for cls in _render_pxe_classes(p)]
                 + [_render_phone_class(p) for p in bundle.phone_classes]
                 # #700 — last, so an operator's hand-written class of the
                 # same shape is evaluated first. Kea stops at the first

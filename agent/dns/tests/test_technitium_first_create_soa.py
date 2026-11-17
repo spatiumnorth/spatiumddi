@@ -41,6 +41,7 @@ class _SoaFake(_ZoneTypedFake):
         self.soa: dict[str, dict[str, Any]] = {z: self._default_soa(z) for z in zones}
         self.ns: dict[str, list[str]] = {z: ["pod-1.local"] for z in zones}
         self.soa_ttl: dict[str, int] = {z: 900 for z in zones}
+        self.soa_comments: dict[str, str] = {}
         self.violations: list[str] = []
         self.holds: list[str] = []
         self.fail_release = 0
@@ -113,6 +114,7 @@ class _SoaFake(_ZoneTypedFake):
                     "type": "SOA",
                     "ttl": self.soa_ttl[zone],
                     "rData": dict(self.soa[zone]),
+                    **({"comments": self.soa_comments[zone]} if zone in self.soa_comments else {}),
                 },
                 *[
                     {"name": zone, "type": "NS", "ttl": 3600, "rData": {"nameServer": t}}
@@ -129,6 +131,11 @@ class _SoaFake(_ZoneTypedFake):
             for k in ("refresh", "retry", "expire", "minimum"):
                 self.soa[zone][k] = int(params[k])
             self.soa_ttl[zone] = int(params["ttl"])
+            # Like Technitium: an update without comments clears them.
+            if params.get("comments"):
+                self.soa_comments[zone] = params["comments"]
+            else:
+                self.soa_comments.pop(zone, None)
             self.soa[zone]["serial"] += 1
             return {"status": "ok"}
         if path.startswith("zones/records/") and params.get("type") == "NS":

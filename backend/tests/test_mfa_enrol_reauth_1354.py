@@ -580,7 +580,7 @@ async def test_a_flow_token_with_a_forged_purpose_is_refused(
 ):
     # ``purpose`` rides inside the signed token: re-signing a login flow with
     # it added under any other key is an invalid flow, not a re-authentication.
-    from jose import jwt as jose_jwt
+    from app.core import jwt_compat as jose_jwt
 
     provider = await _oidc_provider(db_session)
     user, headers = await _account(db_session, provider, external_id="sub-1")
