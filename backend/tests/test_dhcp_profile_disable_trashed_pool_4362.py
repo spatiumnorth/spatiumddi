@@ -216,3 +216,95 @@ async def test_restore_refused_when_the_device_policy_class_is_disabled(
     assert "disabled" in r.text
     await db_session.refresh(scope)
     assert scope.deleted_at is not None
+
+
+# ── Activating a scope brings its pools back (#4367) ─────────────────────
+
+
+async def _deactivate(client: AsyncClient, h, scope) -> None:
+    r = await client.put(f"/api/v1/dhcp/scopes/{scope.id}", headers=h, json={"is_active": False})
+    assert r.status_code == 200, r.text
+
+
+async def _activate(client: AsyncClient, h, scope):
+    return await client.put(f"/api/v1/dhcp/scopes/{scope.id}", headers=h, json={"is_active": True})
+
+
+async def test_activation_refused_when_the_phone_class_is_disabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, prof, scope = await _phone_with_pool(db_session)
+    await _deactivate(client, h, scope)
+    prof.enabled = False
+    await db_session.commit()
+    r = await _activate(client, h, scope)
+    assert r.status_code == 409, r.text
+    assert "disabled" in r.text
+    await db_session.refresh(scope)
+    assert scope.is_active is False
+
+
+async def test_activation_ok_when_the_phone_class_is_enabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, _prof, scope = await _phone_with_pool(db_session)
+    await _deactivate(client, h, scope)
+    r = await _activate(client, h, scope)
+    assert r.status_code == 200, r.text
+
+
+async def test_activation_refused_when_the_pxe_class_is_disabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.dhcp import DHCPPXEProfile
+
+    h = await _headers(db_session)
+    grp, _srv, scope = await _make_group_server_scope(db_session)
+    r = await client.post(
+        f"/api/v1/dhcp/server-groups/{grp.id}/pxe-profiles",
+        headers=h,
+        json={
+            "name": "px",
+            "next_server": "10.0.0.5",
+            "matches": [
+                {"vendor_class_match": "PXEClient", "arch_codes": [7], "boot_filename": "a.efi"}
+            ],
+        },
+    )
+    prof = r.json()
+    scope.pxe_profile_id = uuid.UUID(prof["id"])
+    db_session.add(
+        DHCPPool(
+            scope_id=scope.id,
+            start_ip="10.0.20.10",
+            end_ip="10.0.20.50",
+            pool_type="dynamic",
+            class_restriction=f"pxe-{prof['id'][:8]}-{prof['matches'][0]['id'][:8]}",
+        )
+    )
+    await db_session.commit()
+    await _deactivate(client, h, scope)
+    row = await db_session.get(DHCPPXEProfile, prof["id"])
+    row.enabled = False
+    await db_session.commit()
+    r = await _activate(client, h, scope)
+    assert r.status_code == 409, r.text
+    assert "disabled" in r.text
+    row.enabled = True
+    await db_session.commit()
+    assert (await _activate(client, h, scope)).status_code == 200
+
+
+async def test_activation_refused_when_the_device_policy_class_is_disabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, pol, scope = await _policy_with_pool(db_session)
+    await _deactivate(client, h, scope)
+    pol.enabled = False
+    await db_session.commit()
+    r = await _activate(client, h, scope)
+    assert r.status_code == 409, r.text
+    assert "disabled" in r.text
+    pol.enabled = True
+    await db_session.commit()
+    assert (await _activate(client, h, scope)).status_code == 200
