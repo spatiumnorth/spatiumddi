@@ -735,8 +735,9 @@ export function WebhooksPage() {
             <h1 className="text-xl font-semibold">Webhooks</h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
               Typed-event subscriptions for downstream automation. Every enabled
-              subscription whose event-type filter matches receives one
-              HMAC-signed POST per event with exponential-backoff retry and a
+              subscription whose event-type filter matches receives one POST per
+              event, HMAC-signed when the subscription has a secret (unsigned
+              when it has none), with exponential-backoff retry and a
               dead-letter state. Distinct from the generic audit-forward webhook
               under Settings — that ships every audit row in your chosen wire
               format; this fires typed events shaped for code.
