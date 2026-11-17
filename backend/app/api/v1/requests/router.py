@@ -61,7 +61,7 @@ from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
     _refusal_text,
-    approval_refusal,
+    approval_refusal_at_target,
     approve_change_request,
     count_change_requests,
     get_change_request,
@@ -173,9 +173,13 @@ async def _respond_all(
     db: DB, rows: list[ChangeRequest], viewer: User
 ) -> list[ProvisioningRequestResponse]:
     names = await _template_names(db, rows)
-    return [
-        _to_response(r, viewer, names.get(tid) if (tid := _template_id(r)) else None) for r in rows
-    ]
+    out: list[ProvisioningRequestResponse] = []
+    for r in rows:
+        # The same per-object gate the approve's apply runs (#4382), so a
+        # scoped approver is not offered Approve on a target they cannot write.
+        refusal = await approval_refusal_at_target(db, viewer, r) if r.state == "pending" else None
+        out.append(_to_response(r, refusal, names.get(tid) if (tid := _template_id(r)) else None))
+    return out
 
 
 async def _respond(db: DB, cr: ChangeRequest, viewer: User) -> ProvisioningRequestResponse:
@@ -183,9 +187,8 @@ async def _respond(db: DB, cr: ChangeRequest, viewer: User) -> ProvisioningReque
 
 
 def _to_response(
-    cr: ChangeRequest, viewer: User, template_name: str | None = None
+    cr: ChangeRequest, refusal: DecisionError | None, template_name: str | None = None
 ) -> ProvisioningRequestResponse:
-    refusal = approval_refusal(viewer, cr) if cr.state == "pending" else None
     return ProvisioningRequestResponse(
         can_approve=cr.state == "pending" and refusal is None,
         approve_blocked_reason=str(refusal) if refusal is not None else None,

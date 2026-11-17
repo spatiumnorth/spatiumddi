@@ -136,6 +136,16 @@ class Operation:
     # off ``preview`` because the copilot shares that and deliberately only
     # hints at conflicts; apply re-enforces regardless.
     validate_submit: Callable[[AsyncSession, User, Any], Awaitable[None]] | None = None
+    # Optional per-object approver gate (#4382): the refusal ``apply`` raises
+    # for the instance the args name, as an ``OperationPermissionError`` or
+    # ``None`` when ``user`` may act on it. ``apply`` and the request portal's
+    # per-row ``can_approve`` both call the SAME function, so the queue never
+    # offers an Approve the press would refuse. Set it wherever
+    # ``enforce_operation_permission`` alone is weaker than the apply (a
+    # ``scoped_grant_types`` operation, or a target-block gate).
+    target_refusal: (
+        Callable[[AsyncSession, User, Any], Awaitable[OperationPermissionError | None]] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -372,18 +382,44 @@ async def _user_can_write_address(
     return user_can_write_ip(user, int(addr), subnet_writable, set_ranges)
 
 
+async def _address_write_refusal(
+    db: AsyncSession,
+    user: User,
+    subnet: Subnet,
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> OperationPermissionError | None:
+    if await _user_can_write_address(db, user, subnet, addr):
+        return None
+    return OperationPermissionError(
+        "write",
+        "subnet",
+        f"No write permission on subnet or any address set covering {addr}",
+    )
+
+
 async def _require_address_writable(
     db: AsyncSession,
     user: User,
     subnet: Subnet,
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> None:
-    if not await _user_can_write_address(db, user, subnet, addr):
-        raise OperationPermissionError(
-            "write",
-            "subnet",
-            f"No write permission on subnet or any address set covering {addr}",
-        )
+    refusal = await _address_write_refusal(db, user, subnet, addr)
+    if refusal is not None:
+        raise refusal
+
+
+async def _address_target_refusal(
+    db: AsyncSession, user: User, args: CreateIPAddressArgs
+) -> OperationPermissionError | None:
+    """``create_ip_address``'s per-subnet gate, for the portal's ``can_approve``."""
+    subnet = await db.get(Subnet, args.subnet_id)
+    try:
+        addr = ipaddress.ip_address(args.address)
+    except ValueError:
+        return None  # the apply refuses it as invalid, for every approver alike
+    if subnet is None:
+        return None
+    return await _address_write_refusal(db, user, subnet, addr)
 
 
 def expires_at_default() -> datetime:
@@ -2226,6 +2262,17 @@ def _target_block_refusal(user: User, block: IPBlock) -> OperationPermissionErro
     return OperationPermissionError("write", "ip_block", target_block_write_refusal(user, block))
 
 
+async def _allocate_subnet_target_refusal(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> OperationPermissionError | None:
+    """``allocate_subnet``'s target-block gate, for the portal's ``can_approve``."""
+    try:
+        block = await db.get(IPBlock, UUID(args.block_id))
+    except ValueError:
+        return None
+    return _target_block_refusal(user, block) if block is not None else None
+
+
 async def _preview_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> PreviewResult:
@@ -2371,11 +2418,9 @@ async def _apply_allocate_subnet(
     # REST handler's 403: it is about THIS applier, so an approve leaves the
     # portal request pending for one who may write the block instead of
     # failing it.
-    block = await db.get(IPBlock, UUID(args.block_id))
-    if block is not None:
-        refusal = _target_block_refusal(user, block)
-        if refusal is not None:
-            raise refusal
+    refusal = await _allocate_subnet_target_refusal(db, user, args)
+    if refusal is not None:
+        raise refusal
 
     if args.template_id:
         from app.models.ipam import IPAMTemplate  # noqa: PLC0415
@@ -2420,6 +2465,7 @@ register(
         preview=_preview_allocate_subnet,
         apply=_apply_allocate_subnet,
         validate_submit=_validate_submit_allocate_subnet,
+        target_refusal=_allocate_subnet_target_refusal,
         category="ipam",
         required_permission=("write", "subnet"),
     )
@@ -2449,6 +2495,7 @@ register(
         # ``_require_address_writable`` holds either to its own subnet / set.
         required_permission=("write", "subnet"),
         scoped_grant_types=("subnet", "address_set"),
+        target_refusal=_address_target_refusal,
     )
 )
 
