@@ -955,6 +955,33 @@ def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
     return None
 
 
+async def approval_refusal_at_target(
+    db: AsyncSession, approver: User, cr: ChangeRequest
+) -> DecisionError | None:
+    """:func:`approval_refusal` plus the operation's per-object gate (#4382).
+
+    ``approval_refusal`` asks only the operation's type-wide permission, which
+    admits a grant scoped to one subnet for an address request in another. An
+    operation that declares ``target_refusal`` has the same function run by its
+    ``apply``, so a row's ``can_approve`` matches what the press does. One
+    ``db.get`` per row, served from the identity map for a repeated target.
+    """
+    from app.services.ai import operations  # noqa: PLC0415
+
+    refusal = approval_refusal(approver, cr)
+    if refusal is not None:
+        return refusal
+    op = operations.get_operation(cr.operation)
+    if op is None or op.target_refusal is None:
+        return None
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+    except Exception:  # noqa: BLE001 — the approve answers a stale schema itself
+        return None
+    target = await op.target_refusal(db, approver, args)
+    return DecisionForbidden(str(target)) if target is not None else None
+
+
 async def approve_change_request(
     db: AsyncSession,
     cr_id: UUID,
@@ -1348,6 +1375,7 @@ def _can_approve(user: User) -> bool:
 __all__ = [
     "REQUESTER_GONE_MESSAGE",
     "approval_refusal",
+    "approval_refusal_at_target",
     "ChangeRequestStateError",
     "DecisionConflict",
     "DecisionError",
