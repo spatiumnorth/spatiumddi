@@ -71,4 +71,26 @@ describe("form labels use the shared Field (#4371)", () => {
     // An allowlist entry that no longer defines a Field is stale.
     expect(Object.keys(ALLOWED).filter((r) => !own.includes(r))).toEqual([]);
   });
+
+  // #4387: a Field wraps a non-single-control body in a role="group", and a
+  // select or input inside a shared picker is then unnamed unless the picker
+  // takes the label through useFieldControl(). Every picker that draws one
+  // must; the two below draw no named control of their own.
+  it("pickers that draw a select or text input take the Field's label", () => {
+    const EXEMPT: Record<string, string> = {
+      "components/ui/swatch-picker.tsx": "colour buttons, no select / input",
+      "components/ui/filter-mode-picker.tsx": "radio group, names its own",
+      "components/AgentLogScopePicker.tsx": "not placed in a Field",
+    };
+    const drawsControl = /<select\b|<input\b(?![^>]*type="(?:checkbox|radio)")/;
+    const missing = files(join(SRC, "components"))
+      .map((f) => ({ f, rel: relative(SRC, f).split(sep).join("/") }))
+      .filter(({ rel }) => /picker/i.test(rel) && !(rel in EXEMPT))
+      .filter(({ f }) => {
+        const src = readFileSync(f, "utf8");
+        return drawsControl.test(src) && !src.includes("useFieldControl");
+      })
+      .map(({ rel }) => rel);
+    expect(missing).toEqual([]);
+  });
 });

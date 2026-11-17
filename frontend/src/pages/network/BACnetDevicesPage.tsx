@@ -674,30 +674,35 @@ function DeviceModal({
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Device instance">
-            <div className="flex gap-2">
-              <input
-                className={`${inputCls} font-mono`}
-                inputMode="numeric"
-                value={instance}
-                onChange={(e) => setInstance(e.target.value)}
-                placeholder="0 – 4194302"
-                required
-              />
-              <button
-                type="button"
-                onClick={() => nextInstanceMut.mutate()}
-                disabled={nextInstanceMut.isPending}
-                className="flex-shrink-0 rounded-md border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-                title="Suggest the lowest free instance number"
-              >
-                {nextInstanceMut.isPending ? "…" : "Suggest"}
-              </button>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              Unique across the whole internetwork. The suggestion is advisory —
-              it is not reserved, so a concurrent commissioning can still take
-              it first.
-            </p>
+            {(control) => (
+              <>
+                <div className="flex gap-2">
+                  <input
+                    {...control}
+                    className={`${inputCls} font-mono`}
+                    inputMode="numeric"
+                    value={instance}
+                    onChange={(e) => setInstance(e.target.value)}
+                    placeholder="0 – 4194302"
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => nextInstanceMut.mutate()}
+                    disabled={nextInstanceMut.isPending}
+                    className="flex-shrink-0 rounded-md border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                    title="Suggest the lowest free instance number"
+                  >
+                    {nextInstanceMut.isPending ? "…" : "Suggest"}
+                  </button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Unique across the whole internetwork. The suggestion is
+                  advisory — it is not reserved, so a concurrent commissioning
+                  can still take it first.
+                </p>
+              </>
+            )}
           </Field>
           <Field label="Device name">
             <input

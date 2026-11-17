@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
@@ -48,6 +48,7 @@ function PermissionEditor({
   value: PermissionEntry[];
   onChange: (next: PermissionEntry[]) => void;
 }) {
+  const headingId = useId();
   function update(idx: number, patch: Partial<PermissionEntry>) {
     const next = value.slice();
     next[idx] = { ...next[idx], ...patch };
@@ -61,11 +62,14 @@ function PermissionEditor({
   }
 
   return (
-    <div className="space-y-2">
+    <div role="group" aria-labelledby={headingId} className="space-y-2">
       <div className="flex items-center justify-between">
-        <label className="text-xs font-medium text-muted-foreground">
+        <h3
+          id={headingId}
+          className="text-xs font-medium text-muted-foreground"
+        >
           Permissions
-        </label>
+        </h3>
         <button
           onClick={add}
           type="button"

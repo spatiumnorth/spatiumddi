@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { useFieldControl } from "@/components/ui/field";
 import {
   customersApi,
   providersApi,
@@ -52,6 +53,7 @@ export function CustomerPicker({
   className,
   disabled,
 }: PickerProps) {
+  const fieldControl = useFieldControl();
   const show = useOwnershipModules().customer;
   const list = useQuery({
     queryKey: ["customers-picker"],
@@ -63,6 +65,7 @@ export function CustomerPicker({
   const items = list.data?.items ?? [];
   return (
     <select
+      {...fieldControl}
       className={className}
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value || null)}
@@ -86,6 +89,7 @@ export function SitePicker({
   className,
   disabled,
 }: PickerProps) {
+  const fieldControl = useFieldControl();
   const show = useOwnershipModules().site;
   const { data, isLoading } = useQuery({
     queryKey: ["sites-picker"],
@@ -102,6 +106,7 @@ export function SitePicker({
   const missing = !!value && !isLoading && !items.some((s) => s.id === value);
   return (
     <select
+      {...fieldControl}
       className={className}
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value || null)}
@@ -126,6 +131,7 @@ export function ProviderPicker({
   disabled,
   kind,
 }: PickerProps) {
+  const fieldControl = useFieldControl();
   const show = useOwnershipModules().provider;
   const { data } = useQuery({
     queryKey: ["providers-picker"],
@@ -137,6 +143,7 @@ export function ProviderPicker({
   const items = (data?.items ?? []).filter((p) => !kind || p.kind === kind);
   return (
     <select
+      {...fieldControl}
       className={className}
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value || null)}

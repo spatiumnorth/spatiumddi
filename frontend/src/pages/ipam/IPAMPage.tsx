@@ -4224,40 +4224,45 @@ export function AddAddressModal({
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
           <Field label="DNS Zone">
-            {availableZones.length === 1 ? (
-              <p className="text-xs text-muted-foreground py-1">
-                <Globe2 className="inline h-3 w-3 mr-1" />
-                {availableZones[0].name.replace(/\.$/, "")}
-                {fqdnPreview && (
-                  <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
-                    → {fqdnPreview}
-                  </span>
-                )}
-              </p>
-            ) : (
-              <div className="space-y-1">
-                <select
-                  className={inputCls}
-                  value={dnsZoneId}
-                  onChange={(e) => {
-                    setDnsZoneId(e.target.value);
-                    setDnsZoneTouched(true);
-                  }}
-                >
-                  <ZoneOptions
-                    zones={availableZones}
-                    primaryId={effectiveDns?.dns_zone_id}
-                    additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
-                    noneOption="None (no DNS record)"
-                  />
-                </select>
-                {fqdnPreview && (
-                  <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
-                    → {fqdnPreview}
-                  </p>
-                )}
-              </div>
-            )}
+            {(control) =>
+              availableZones.length === 1 ? (
+                <p className="text-xs text-muted-foreground py-1">
+                  <Globe2 className="inline h-3 w-3 mr-1" />
+                  {availableZones[0].name.replace(/\.$/, "")}
+                  {fqdnPreview && (
+                    <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
+                      → {fqdnPreview}
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  <select
+                    {...control}
+                    className={inputCls}
+                    value={dnsZoneId}
+                    onChange={(e) => {
+                      setDnsZoneId(e.target.value);
+                      setDnsZoneTouched(true);
+                    }}
+                  >
+                    <ZoneOptions
+                      zones={availableZones}
+                      primaryId={effectiveDns?.dns_zone_id}
+                      additionalIds={
+                        effectiveDns?.dns_additional_zone_ids ?? []
+                      }
+                      noneOption="None (no DNS record)"
+                    />
+                  </select>
+                  {fqdnPreview && (
+                    <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
+                      → {fqdnPreview}
+                    </p>
+                  )}
+                </div>
+              )
+            }
           </Field>
         )}
         {/* Issue #25 — extra-zone picker for split-horizon publishing.
