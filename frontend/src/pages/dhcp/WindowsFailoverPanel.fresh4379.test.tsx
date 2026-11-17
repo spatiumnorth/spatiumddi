@@ -60,7 +60,19 @@ vi.mock("@/lib/api", () => ({
     getGroupFailover: async () => group(rel(70, 1800)),
     updateFailoverRelationship: (...a: unknown[]) => {
       h.update(...a);
-      return Promise.resolve({ failover: group(rel(30, 1800)) });
+      // The shape the API answers (DHCPFailoverActionResult): the panel
+      // draws `action` and `warnings` from it after the Save.
+      return Promise.resolve({
+        action: "update",
+        relationship: "dhcp1-dhcp2",
+        ran_on_server_id: "a",
+        ran_on_server_name: "dhcp1",
+        partner_server_id: "b",
+        partner_server_name: "dhcp2",
+        scope_ids: [],
+        warnings: [],
+        failover: group(rel(30, 1800)),
+      });
     },
   },
 }));
