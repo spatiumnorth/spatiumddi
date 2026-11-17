@@ -1,0 +1,3 @@
+### Changed
+
+- **The OpenShift certified profile no longer creates SecurityContextConstraints (#3913).** `values-openshift-certified.yaml` now sets `openshift.scc.create: false`, since certified charts do not create cluster-scoped security objects. The control plane is unaffected (it runs under `restricted-v2`); to run the DNS / DHCP agents, a cluster admin applies the ready-made manifests in the chart's `files/openshift/` and grants them to the agents' ServiceAccounts, as documented in the Kubernetes deployment guide. A CI check keeps those manifests identical to what the chart renders. The plain chart still creates the SCCs by default.
