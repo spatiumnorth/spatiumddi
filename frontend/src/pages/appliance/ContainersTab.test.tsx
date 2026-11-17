@@ -109,3 +109,24 @@ describe("ContainersTab read states", () => {
     expect(screen.getByText("spatium-api-0")).toBeTruthy();
   });
 });
+
+describe("ContainersTab pod actions (#4232)", () => {
+  it("offers Restart but never Stop or Start, running or not", async () => {
+    const pod = {
+      short_id: "abc",
+      health: null,
+      is_spatium: true,
+      image: "x",
+      status: "s",
+    };
+    listContainers.mockResolvedValue([
+      { ...pod, name: "spatium-api-0", state: "running" },
+      { ...pod, name: "spatium-job-0", state: "exited" },
+    ]);
+    wrap();
+    expect(await screen.findByText("spatium-api-0")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /Restart/ })).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: /Stop/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Start/ })).toBeNull();
+  });
+});

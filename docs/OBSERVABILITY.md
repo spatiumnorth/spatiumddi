@@ -389,7 +389,7 @@ through the same resolution (`app/services/logs/agent_logs.py`).
 
 Two narrow tables (`dns_query_log_entry`, `dhcp_log_entry`) with composite indexes on `(server_id, ts)`. Migration `d8c5f12a47b9_query_log_entries`. FK cascade drops a server's rows when the server is removed.
 
-Retention is an hourly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than `log_retention_hours` (default 24 h, 1–168 h, Settings → Data Retention), in committed 10 000-row chunks within a 4-minute budget per table (#1254), so no single transaction is large and a backlog drains over successive ticks. The same task ages out terminal queue rows: delivered / applied / acked rows after 7 days, dead / failed ones after 30 days (`event_outbox`, `dns_record_op`, `dhcp_config_op`). `audit_log` is never pruned. This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
+Retention is an hourly (:05 UTC) Celery task (`app.tasks.prune_logs.prune_log_entries`; a fixed `crontab`, because beat keeps no state and a 24 h interval restarted with every beat restart, #4174) that deletes rows older than `log_retention_hours` (default 24 h, 1–168 h, Settings → Data Retention), in committed 10 000-row chunks within a 4-minute budget per table (#1254), so no single transaction is large and a backlog drains over successive ticks. The same task ages out terminal queue rows: delivered / applied / acked rows after 7 days, dead / failed ones after 30 days (`event_outbox`, `dns_record_op`, `dhcp_config_op`). `audit_log` is never pruned. This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
 
 **Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the `log_retention_hours` window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
 
@@ -781,7 +781,7 @@ The control plane stores deltas in two small tables —
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
 inform, receive_drop, socket_drop, queue_evicted)`. Retention is enforced by the
-`prune_metric_samples` Celery task (daily), which deletes samples older
+`prune_metric_samples` Celery task (daily at 02:45 UTC), which deletes samples older
 than `metric_retention_days` (default 7 days, 1–365, Settings → Data
 Retention).
 

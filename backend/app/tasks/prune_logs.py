@@ -8,8 +8,9 @@ size on busy resolvers (10k+ qps means ~36M rows in an hour, so even at
 24 h we're already managing a substantial table — we deliberately avoid
 a longer default).
 
-Symmetric to ``prune_metrics``: delete everything past the cutoff. Runs
-hourly under the default queue, and every delete is **chunked** (#1254):
+Symmetric to ``prune_metrics``: delete everything past the cutoff. Ticks on a
+crontab (hourly for these, daily at a fixed UTC time for the rest, #4174),
+under the default queue, and every delete is **chunked** (#1254):
 ``BATCH_SIZE`` rows per statement, one commit each, looping until the table
 is clear of expired rows or ``TIME_BUDGET_SECONDS`` is spent. A single
 ``DELETE ... WHERE ts < cutoff`` over tens of millions of query-log rows was

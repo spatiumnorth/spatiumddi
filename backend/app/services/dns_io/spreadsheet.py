@@ -381,7 +381,8 @@ def parse_csv(data: bytes) -> list[SheetRow]:
         raise SpreadsheetError(f"CSV could not be read: {exc}") from exc
 
 
-def _check_xlsx_size(data: bytes) -> None:
+def check_xlsx_size(data: bytes) -> None:
+    """Refuse a workbook whose parts inflate past the cap (shared with the IPAM import)."""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             total = sum(info.file_size for info in zf.infolist())
@@ -402,7 +403,7 @@ def parse_xlsx(data: bytes) -> list[SheetRow]:
     """
     from openpyxl import load_workbook
 
-    _check_xlsx_size(data)
+    check_xlsx_size(data)
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as exc:  # noqa: BLE001 — any unreadable workbook is the file's fault

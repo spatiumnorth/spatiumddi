@@ -39,12 +39,14 @@ import asyncio
 import os
 import sys
 
-from app.config import settings, signing_key_weakness
+from app.config import credential_key_writes_deferred, settings, signing_key_weakness
 from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
 
-async def _audit(outcome: RewrapOutcome) -> None:
-    """Record the rotation (non-negotiable #4). Counts only, never keys."""
+async def record_rotation_audit(
+    outcome: RewrapOutcome, *, user_display_name: str, action: str, resource_id: str, display: str
+) -> None:
+    """Record a key rotation (non-negotiable #4). Counts only, never keys."""
     # task_session, not the shared engine: this runs under its own
     # asyncio.run loop, exactly the case that helper exists for.
     from app.db import task_session  # noqa: PLC0415 — needs the DB, not at import
@@ -53,12 +55,12 @@ async def _audit(outcome: RewrapOutcome) -> None:
     async with task_session() as db:
         db.add(
             AuditLog(
-                user_display_name="<cli: rotate_secret_key>",
+                user_display_name=user_display_name,
                 auth_source="system",
-                action="rotate_secret_key",
+                action=action,
                 resource_type="platform",
-                resource_id="secret_key",
-                resource_display="SECRET_KEY",
+                resource_id=resource_id,
+                resource_display=display,
                 result="error" if outcome.aborted or outcome.failed_rows else "success",
                 new_value={
                     "rewrapped_rows": outcome.rewrapped_rows,
@@ -70,6 +72,16 @@ async def _audit(outcome: RewrapOutcome) -> None:
             )
         )
         await db.commit()
+
+
+async def _audit(outcome: RewrapOutcome) -> None:
+    await record_rotation_audit(
+        outcome,
+        user_display_name="<cli: rotate_secret_key>",
+        action="rotate_secret_key",
+        resource_id="secret_key",
+        display="SECRET_KEY",
+    )
 
 
 async def rotate(old_secret_key: str, old_credential_key: str) -> int:
@@ -99,6 +111,9 @@ async def rotate(old_secret_key: str, old_credential_key: str) -> int:
         source_credential_key=old_credential_key,
         dest_secret_key=settings.secret_key,
         dest_credential_key=settings.credential_encryption_key,
+        dest_defer_dedicated_writes=credential_key_writes_deferred(
+            settings.credential_key_since, settings.version
+        ),
     )
     if outcome.same_install:
         print(

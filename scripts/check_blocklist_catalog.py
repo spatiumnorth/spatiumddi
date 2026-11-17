@@ -346,7 +346,7 @@ def check_source(
         ], None
 
     parsed = parser.parse_feed_detailed(text, fmt)
-    entries = len(parsed.domains)
+    entries = len(parsed.domains) + len(parsed.literal_domains)
     skipped = parsed.skipped.total if parsed.skipped is not None else 0
     measured = Measured(entries=entries, skipped=skipped)
     findings: list[Finding] = []

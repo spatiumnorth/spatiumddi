@@ -258,6 +258,12 @@ class TemplateApplyResponse(BaseModel):
     children_carved: list[dict[str, Any]] = []
 
 
+class TemplateReapplySkip(BaseModel):
+    target_id: uuid.UUID
+    network: str
+    reason: str
+
+
 class TemplateReapplyAllResponse(BaseModel):
     template_id: uuid.UUID
     target_kind: str
@@ -265,6 +271,9 @@ class TemplateReapplyAllResponse(BaseModel):
     instances_processed: int
     instances_skipped: int
     cap_reached: bool
+    # #3895 — one row per skipped instance with the reason it was left as it
+    # was (each instance is reapplied whole or not at all).
+    skipped: list[TemplateReapplySkip] = []
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -588,29 +597,48 @@ async def reapply_all(
         _require_target_write(current_user, "subnet")
 
     processed = 0
-    skipped = 0
+    skipped_rows: list[TemplateReapplySkip] = []
     if template.applies_to == "block":
         block_instances = await find_block_instances(db, template.id)
         total = len(block_instances)
         cap_reached = total > _REAPPLY_CAP
         for block_target in block_instances[:_REAPPLY_CAP]:
+            # Whole-or-nothing per instance (#3895): the stamp and the carve
+            # share a savepoint, so a refused carve leaves the block's own
+            # fields as they were instead of committing the stamp alone.
             try:
-                apply_template_to_block(template, block_target, force=True)
-                if template.child_layout is not None:
-                    await carve_children(db, template, block_target)
+                async with db.begin_nested():
+                    apply_template_to_block(template, block_target, force=True)
+                    if template.child_layout is not None:
+                        await carve_children(db, template, block_target)
                 processed += 1
-            except TemplateError:
-                skipped += 1
+            except TemplateError as exc:
+                await db.refresh(block_target)
+                skipped_rows.append(
+                    TemplateReapplySkip(
+                        target_id=block_target.id,
+                        network=str(block_target.network),
+                        reason=str(exc),
+                    )
+                )
     else:
         subnet_instances = await find_subnet_instances(db, template.id)
         total = len(subnet_instances)
         cap_reached = total > _REAPPLY_CAP
         for subnet_target in subnet_instances[:_REAPPLY_CAP]:
             try:
-                apply_template_to_subnet(template, subnet_target, force=True)
+                async with db.begin_nested():
+                    apply_template_to_subnet(template, subnet_target, force=True)
                 processed += 1
-            except TemplateError:
-                skipped += 1
+            except TemplateError as exc:
+                await db.refresh(subnet_target)
+                skipped_rows.append(
+                    TemplateReapplySkip(
+                        target_id=subnet_target.id,
+                        network=str(subnet_target.network),
+                        reason=str(exc),
+                    )
+                )
     write_audit(
         db,
         user=current_user,
@@ -622,8 +650,9 @@ async def reapply_all(
             "target_kind": template.applies_to,
             "instances_total": total,
             "instances_processed": processed,
-            "instances_skipped": skipped,
+            "instances_skipped": len(skipped_rows),
             "cap_reached": cap_reached,
+            "skipped": [r.model_dump(mode="json") for r in skipped_rows],
         },
     )
     await db.commit()
@@ -632,6 +661,7 @@ async def reapply_all(
         target_kind=template.applies_to,
         instances_total=total,
         instances_processed=processed,
-        instances_skipped=skipped,
+        instances_skipped=len(skipped_rows),
         cap_reached=cap_reached,
+        skipped=skipped_rows,
     )
