@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -21,6 +22,8 @@ import {
   GRANT_RESOURCE_TYPES,
 } from "@/lib/permissionVocabulary";
 import { FormError } from "@/components/ui/form-error";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 // What a new grant row offers: the shared vocabulary (lib/permissionVocabulary).
 // A role can hold more than these lists name — the built-in roles do
@@ -39,23 +42,6 @@ function withHeld(list: readonly string[], held: string): string[] {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 function PermissionEditor({
   value,
@@ -138,8 +124,12 @@ function PermissionEditor({
   );
 }
 
+// Edit reads the role when it opens: the row the list holds can be stale, and
+// the Save used to send the whole `permissions` list back, re-granting what
+// another administrator revoked since. It now sends only what was changed
+// against the row read here.
 function RoleModal({
-  role,
+  role: listed,
   onClose,
   canEdit = true,
 }: {
@@ -148,6 +138,34 @@ function RoleModal({
   /** #1341 — false for a caller without `admin` on `role`: the modal
    *  shows the role read-only, as it does a built-in one. */
   canEdit?: boolean;
+}) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow<AppRole>(listed ?? undefined, () =>
+    refetchRow<AppRole>(qc, [["roles"]], (listed as AppRole).id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Edit role — ${listed?.name ?? ""}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return (
+    <RoleForm role={fresh.row ?? null} onClose={onClose} canEdit={canEdit} />
+  );
+}
+
+function RoleForm({
+  role,
+  onClose,
+  canEdit,
+}: {
+  role: AppRole | null;
+  onClose: () => void;
+  canEdit: boolean;
 }) {
   const qc = useQueryClient();
   const [name, setName] = useState(role?.name ?? "");
@@ -171,7 +189,14 @@ function RoleModal({
       };
       return role
         ? rolesApi.update(role.id, {
-            ...(payload as RoleUpdate),
+            ...(changedFields(
+              {
+                name: role.name,
+                description: role.description,
+                permissions: role.permissions,
+              },
+              { name, description, permissions },
+            ) as RoleUpdate),
             ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
           })
         : rolesApi.create(payload as RoleCreate);
