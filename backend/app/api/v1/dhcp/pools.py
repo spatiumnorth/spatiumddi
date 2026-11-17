@@ -19,6 +19,7 @@ from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
+from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.class_refs import (
     generated_class_problem,
@@ -233,6 +234,23 @@ async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | No
                 status_code=422,
                 detail=f"Client class '{name}' cannot restrict this pool: {problem}, so the pool "
                 "would match no client.",
+            )
+    if cc is None and name.startswith("spatium-device-"):
+        # #4362: the bundle renders enabled device policies only.
+        off = (
+            await db.execute(
+                select(DHCPDevicePolicy.name).where(
+                    DHCPDevicePolicy.group_id == scope.group_id,
+                    DHCPDevicePolicy.class_name == name,
+                    DHCPDevicePolicy.enabled.is_(False),
+                )
+            )
+        ).scalar_one_or_none()
+        if off is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Client class '{name}' cannot restrict this pool: device policy "
+                f"'{off}' is disabled, so the pool would match no client.",
             )
     if (
         cc is None

@@ -10,6 +10,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPPhoneProfile, DHCPPhoneProfileScope, DHCPPool
+from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.services.dhcp.class_refs import phone_class_name
 from tests.test_dhcp_phone_profiles import _make_group_server_scope
 from tests.test_dhcp_pxe_vendor_match_validation import _headers
@@ -101,5 +102,117 @@ async def test_restore_refused_when_the_pools_class_is_no_longer_rendered(
     assert r.status_code == 409, r.text
     assert "disabled" in r.text
     # Nothing came back: the scope is still in the Trash.
+    await db_session.refresh(scope)
+    assert scope.deleted_at is not None
+
+
+async def _phone_with_pool(db: AsyncSession):
+    h = await _headers(db)
+    grp, _srv, scope = await _make_group_server_scope(db)
+    prof = DHCPPhoneProfile(
+        group_id=grp.id, name="poly", enabled=True, vendor_class_match="Polycom", option_set=[]
+    )
+    db.add(prof)
+    await db.flush()
+    db.add(DHCPPhoneProfileScope(profile_id=prof.id, scope_id=scope.id))
+    db.add(
+        DHCPPool(
+            scope_id=scope.id,
+            start_ip="10.0.21.10",
+            end_ip="10.0.21.50",
+            pool_type="dynamic",
+            class_restriction=phone_class_name(prof.id),
+        )
+    )
+    await db.commit()
+    return h, prof, scope
+
+
+async def test_restore_refused_when_the_phone_class_is_no_longer_rendered(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, prof, scope = await _phone_with_pool(db_session)
+    assert (await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=h)).status_code == 204
+    prof.enabled = False
+    await db_session.commit()
+    r = await client.post(f"/api/v1/admin/trash/dhcp_scope/{scope.id}/restore", headers=h)
+    assert r.status_code == 409, r.text
+    assert "disabled" in r.text
+    await db_session.refresh(scope)
+    assert scope.deleted_at is not None
+
+
+# ── Device policy (the third site) ───────────────────────────────────────
+
+
+async def _policy_with_pool(db: AsyncSession):
+    h = await _headers(db)
+    grp, _srv, scope = await _make_group_server_scope(db)
+    pol = DHCPDevicePolicy(
+        group_id=grp.id, name="pol", class_name="spatium-device-abc", device_classes=["Printer"]
+    )
+    db.add(pol)
+    db.add(
+        DHCPPool(
+            scope_id=scope.id,
+            start_ip="10.0.22.10",
+            end_ip="10.0.22.50",
+            pool_type="dynamic",
+            class_restriction="spatium-device-abc",
+        )
+    )
+    await db.commit()
+    return h, pol, scope
+
+
+async def test_device_policy_disable_refused_with_a_live_pool(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, pol, _scope = await _policy_with_pool(db_session)
+    r = await client.put(
+        f"/api/v1/dhcp/device-policies/{pol.id}", headers=h, json={"enabled": False}
+    )
+    assert r.status_code == 409, r.text
+    assert "spatium-device-abc" in r.json()["detail"]
+
+
+async def test_device_policy_disable_refused_with_only_a_trashed_pool(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, pol, scope = await _policy_with_pool(db_session)
+    assert (await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=h)).status_code == 204
+    r = await client.put(
+        f"/api/v1/dhcp/device-policies/{pol.id}", headers=h, json={"enabled": False}
+    )
+    assert r.status_code == 409, r.text
+    assert "in Trash" in r.json()["detail"]
+
+
+async def test_device_policy_disable_allowed_when_nothing_names_it(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, pol, scope = await _policy_with_pool(db_session)
+    await db_session.execute(
+        DHCPPool.__table__.update()
+        .where(DHCPPool.scope_id == scope.id)
+        .values(class_restriction=None)
+    )
+    await db_session.commit()
+    r = await client.put(
+        f"/api/v1/dhcp/device-policies/{pol.id}", headers=h, json={"enabled": False}
+    )
+    assert r.status_code == 200, r.text
+
+
+async def test_restore_refused_when_the_device_policy_class_is_disabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h, pol, scope = await _policy_with_pool(db_session)
+    assert (await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=h)).status_code == 204
+    pol.enabled = False
+    await db_session.commit()
+    r = await client.post(f"/api/v1/admin/trash/dhcp_scope/{scope.id}/restore", headers=h)
+    assert r.status_code == 409, r.text
+    assert "disabled" in r.text
     await db_session.refresh(scope)
     assert scope.deleted_at is not None
