@@ -9,7 +9,7 @@ over the terminal states only, so they stay small and add no write cost to
 the pending / in-flight rows the hot paths touch.
 
 Revision ID: b7d3e5a1c924
-Revises: ede3bcd2aff4
+Revises: b6d2e9f41a07
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "b7d3e5a1c924"
-down_revision: str | None = "ede3bcd2aff4"
+down_revision: str | None = "b6d2e9f41a07"
 branch_labels = None
 depends_on = None
 
