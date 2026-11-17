@@ -110,7 +110,11 @@ _MAX_ERROR = 2000
 #   a re-pin or a restore). Unchanged for every other zone; a group holding
 #   such a zone stops serving it in the other view at the upgrade instead of
 #   at its next change.
-RENDERER_REVISION = 17
+# 18 (#3577): the options block carries the eight extra RRL knobs
+#   (``rrl_nxdomains_per_second`` .. ``rrl_max_table_size``) and the BIND9 agent
+#   renders them. The keys are part of every bundle's options, so every ETag
+#   moves once and each agent re-renders at the upgrade.
+RENDERER_REVISION = 18
 
 
 def _serves(revision: int | None) -> bool:

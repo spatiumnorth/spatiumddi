@@ -154,6 +154,11 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
         "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
     },
+    # #3577: the options block carries the eight extra RRL knobs.
+    18: {
+        "plain": "586ecca7073366f2a5e081442235910d248d0ca536aedac468d01aee70c4c751",
+        "views": "a3dba4fda8584acf95b0e79d13509e7c8da4d11f8c7f0a32be2c2ead1d075878",
+    },
 }
 
 
