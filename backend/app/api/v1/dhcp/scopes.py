@@ -1027,6 +1027,17 @@ async def update_scope(
         # an active scope; another scope's pool may still name it.
         await refuse_scope_removal_orphaning_classes(db, scope, "deactivate this scope")
     if changes.get("is_active") is True and not scope.is_active:
+        # #4367 — activation brings the scope's pools back into the rendered
+        # config with their class restriction; a class that stopped rendering
+        # while the scope was inactive (profile / policy disabled) would leave
+        # a pool that matches no client. Same rule as the pool API and Restore.
+        from app.api.v1.dhcp.pools import scope_activation_class_problems  # noqa: PLC0415
+
+        _problems = await scope_activation_class_problems(db, scope)
+        if _problems:
+            raise HTTPException(
+                status_code=409, detail=f"Cannot activate this scope: {_problems[0]}"
+            )
         subnet = await db.get(Subnet, scope.subnet_id)
         if subnet is not None:
             await _assert_no_overlapping_group_cidr(
