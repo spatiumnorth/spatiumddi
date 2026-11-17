@@ -2,6 +2,7 @@ import base64
 import binascii
 import re
 import sys
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -428,6 +429,18 @@ class Settings(BaseSettings):
     # A request carrying the version header is always held to the current
     # form, whatever this says.
     appliance_legacy_signature_allowed: bool = True
+
+    # Re-registration of an appliance that is already paired returns a fresh
+    # session token, so a supervisor signs it with its own key. This is
+    # separate from the flag above, which covers heartbeat signatures only.
+    #   legacy - an unsigned re-registration is accepted when the appliance
+    #            has never reported that it signs AND its last reported
+    #            supervisor version is older than 1.0.1 (or unknown). Each one
+    #            is recorded in the audit log and counts against the
+    #            registration attempt budget.
+    #   never  - an unsigned re-registration is always refused.
+    # The default becomes ``never`` in 1.1.0.
+    appliance_unsigned_register_allowed: Literal["legacy", "never"] = "legacy"
 
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.
