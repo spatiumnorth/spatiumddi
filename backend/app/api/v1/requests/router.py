@@ -361,9 +361,11 @@ def _zone_query(q: str) -> Select:
     return stmt
 
 
-def _zone_option(row: object) -> ResourceOption:
+def _zone_option(row: object, parent_readable: bool = True) -> ResourceOption:
     zone = row[0]  # type: ignore[index]
-    view_name = row[1]  # type: ignore[index]
+    # The view's name is the view's own data: shown only to a caller who may
+    # read the view's group (the views routes' gate), never on the zone grant.
+    view_name = row[1] if parent_readable else None  # type: ignore[index]
     parts = [p for p in (view_name, "reverse" if zone.kind == "reverse" else None) if p]
     return ResourceOption(
         id=str(zone.id),
@@ -389,14 +391,37 @@ def _scope_query(q: str) -> Select:
     return stmt
 
 
-def _scope_option(row: Any) -> ResourceOption:
+def _scope_option(row: Any, parent_readable: bool = True) -> ResourceOption:
     scope: DHCPScope = row[0]
-    network = row[1]
+    # The subnet's network is the subnet's own data: shown only to a caller
+    # who may read that subnet. An unnamed scope is then labelled by its id.
+    network = row[1] if parent_readable else None
     return ResourceOption(
         id=str(scope.id),
-        label=scope.name or str(network),
-        sublabel=str(network) if scope.name else None,
+        label=scope.name or (str(network) if network else f"scope {str(scope.id)[:8]}"),
+        sublabel=str(network) if scope.name and network else None,
     )
+
+
+def _zone_parent_readable(user: User, row: object) -> bool:
+    """May the caller read the zone's view? Views are served by the
+    ``dns_group`` routes, which gate on a type-level ``read`` there."""
+    if row[1] is None:  # type: ignore[index]
+        return True  # no view, nothing to name
+    return user_has_permission(user, "read", "dns_group")
+
+
+def _scope_parent_readable(user: User, row: object) -> bool:
+    """May the caller read the scope's subnet? The subnet routes admit a
+    ``read`` grant scoped to that subnet, so check it against the subnet id."""
+    return user_has_permission(user, "read", "subnet", row[0].subnet_id)  # type: ignore[index]
+
+
+# resource → whether the caller may see the row's parent-derived text.
+_PARENT_READABLE = {
+    "dns_zone": _zone_parent_readable,
+    "dhcp_scope": _scope_parent_readable,
+}
 
 
 # resource → (query builder, RBAC resource_type, row → option). The key is the
@@ -450,7 +475,14 @@ async def resource_options(
             rid = row[0].id
             if not user_has_permission(current_user, "read", rtype, rid):
                 continue
-            out.append(to_option(row))
+            parent_ok = _PARENT_READABLE.get(resource)
+            readable = parent_ok(current_user, row) if parent_ok else True
+            if q and not readable and resource == "dhcp_scope":
+                # The scope search also matches its subnet's network; without
+                # read on the subnet that match would reveal the network.
+                if q.lower() not in (row[0].name or "").lower():
+                    continue
+            out.append(to_option(row, readable) if parent_ok else to_option(row))
             if len(out) > limit:
                 break
         if len(rows) < _PICKER_PAGE:
