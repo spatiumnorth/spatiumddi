@@ -6,7 +6,7 @@ dns_server_options. All nullable with no default: null renders nothing, so
 every existing group's named.conf is byte-identical after the upgrade.
 
 Revision ID: f3a9c1d7b2e5
-Revises: ede3bcd2aff4
+Revises: b6d2e9f41a07
 Create Date: 2026-11-13
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "f3a9c1d7b2e5"
-down_revision: str | None = "ede3bcd2aff4"
+down_revision: str | None = "b6d2e9f41a07"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
