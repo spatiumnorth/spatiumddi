@@ -1,4 +1,6 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -352,7 +354,16 @@ export function MerakiPage() {
       </div>
 
       {showCreate && <OrgModal onClose={() => setShowCreate(false)} />}
-      {edit && <OrgModal org={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["meraki-orgs"]]}
+          title="Edit Meraki Organization"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => <OrgModal org={fresh} onClose={() => setEdit(null)} />}
+        </FreshEdit>
+      )}
       {objectsFor && (
         <ObjectsModal org={objectsFor} onClose={() => setObjectsFor(null)} />
       )}
@@ -621,7 +632,12 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (apiKey) update.api_key = apiKey;
-        return merakiApi.update(org!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(org!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(org!);
+        return merakiApi.update(org!.id, body);
       }
       const create: MerakiOrgCreate = {
         name,
