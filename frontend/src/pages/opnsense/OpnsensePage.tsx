@@ -1,4 +1,5 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { Field } from "@/components/ui/field";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -910,26 +911,6 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

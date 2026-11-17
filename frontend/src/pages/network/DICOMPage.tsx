@@ -1,4 +1,5 @@
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -1382,20 +1383,3 @@ const inputCls =
 
 const filterCls =
   "rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}

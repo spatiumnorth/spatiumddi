@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -42,26 +43,6 @@ import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 // ── Create Token Modal ─────────────────────────────────────────────────────
 

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { FormError } from "@/components/ui/form-error";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
@@ -25,23 +26,6 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 function MultiPicker<T extends { id: string }>({
   items,
