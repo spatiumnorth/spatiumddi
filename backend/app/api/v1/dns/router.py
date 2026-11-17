@@ -8214,6 +8214,9 @@ class DelegationPreviewResponse(BaseModel):
     child_apex_ns_count: int | None = None
     # #4389 — the view the parent zone is pinned to (None: every view).
     parent_view_name: str | None = None
+    # #4388 — rows the delegation would write beside a CNAME in the parent: the
+    # apply refuses (409) while any is listed.
+    cname_conflicts: list[str] = []
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info", response_model=ZoneDNSSECInfo)
@@ -9140,7 +9143,8 @@ async def apply_delegation(
 ) -> list[DNSRecord]:
     """Materialise the delegation records into the parent zone.
 
-    The parent is the one in the child's own view (#4389).
+    The parent is the one in the child's own view (#4389). A row that would sit
+    beside a CNAME in the parent is refused with 409 (#4388).
 
     Idempotent — records that already exist in the parent are skipped, so a
     second call after the first succeeds is a no-op. Each created record
@@ -9181,6 +9185,10 @@ async def apply_delegation(
         raise HTTPException(status_code=409, detail=reason)
     await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
+    if preview.cname_conflicts:
+        # #4388 — the record API's CNAME rule: the parent keeps its CNAME and
+        # nothing is written beside it.
+        raise HTTPException(status_code=409, detail=" ".join(preview.cname_conflicts))
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
         return []

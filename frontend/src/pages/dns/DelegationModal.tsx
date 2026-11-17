@@ -123,6 +123,16 @@ export function DelegationModal({
               </p>
             </div>
 
+            {(data.cname_conflicts ?? []).length > 0 && (
+              <FormError className="text-xs text-destructive">
+                <ul className="list-disc space-y-0.5 pl-4">
+                  {(data.cname_conflicts ?? []).map((c, i) => (
+                    <li key={i}>{c}</li>
+                  ))}
+                </ul>
+              </FormError>
+            )}
+
             {data.warnings.length > 0 && (
               <div className="rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
                 <div className="mb-1 flex items-center gap-1.5 font-medium">
@@ -198,6 +208,7 @@ export function DelegationModal({
                 applyMut.isPending ||
                 isFetching ||
                 data.child_apex_ns_count === 0 ||
+                (data.cname_conflicts ?? []).length > 0 ||
                 (data.ns_records_to_create.length === 0 &&
                   data.glue_records_to_create.length === 0)
               }

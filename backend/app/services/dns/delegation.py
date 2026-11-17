@@ -19,6 +19,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSView, DNSZone
+from app.services.dns.cname_conflict import describe_cname_conflict, find_cname_conflict
 
 
 def _norm(name: str) -> str:
@@ -141,11 +142,37 @@ class DelegationPreview:
     child_apex_ns_count: int = 0
     # The view the parent is pinned to (None: it renders in every view) (#4389).
     parent_view_name: str | None = None
+    # Rows that would sit beside a CNAME in the parent (#4388): left out of the
+    # lists above, and the apply refuses while any is here.
+    cname_conflicts: list[str] = field(default_factory=list)
 
 
 async def _load_records(db: AsyncSession, zone_id: uuid.UUID) -> list[DNSRecord]:
     res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone_id))
     return list(res.scalars().all())
+
+
+async def _blocked_by_cname(
+    db: AsyncSession, parent: DNSZone, preview: DelegationPreview, rec: _PendingRecord
+) -> bool:
+    """Whether ``rec`` meets a CNAME at its name in the parent (#4388).
+
+    The record API refuses a row beside a CNAME (409) because BIND refuses the
+    whole zone file ("CNAME and other data"); a delegation holds its rows to
+    the same rule. The row is written with no view of its own, so it meets a
+    CNAME of any view. The reason lands in ``preview.cname_conflicts``.
+    """
+    fqdn = f"{rec.name}.{parent.name}" if rec.name != "@" else parent.name
+    conflict = await find_cname_conflict(
+        db, parent.id, view_id=None, name=rec.name, record_type=rec.record_type
+    )
+    if conflict is None:
+        return False
+    preview.cname_conflicts.append(
+        describe_cname_conflict(rec.record_type, fqdn, conflict)
+        + " Delete or rename that CNAME first, then delegate."
+    )
+    return True
 
 
 async def compute_delegation(
@@ -197,7 +224,7 @@ async def compute_delegation(
         )
         if ns_value.rstrip(".").lower() in parent_ns_at_label:
             preview.existing_ns_records.append(rec)
-        else:
+        elif not await _blocked_by_cname(db, parent, preview, rec):
             preview.ns_records_to_create.append(rec)
 
     glue_seen: set[tuple[str, str, str]] = set()
@@ -239,7 +266,7 @@ async def compute_delegation(
             )
             if existing:
                 preview.existing_glue_records.append(rec)
-            else:
+            elif not await _blocked_by_cname(db, parent, preview, rec):
                 preview.glue_records_to_create.append(rec)
 
     return preview
@@ -267,4 +294,5 @@ def preview_to_dict(p: DelegationPreview) -> dict[str, Any]:
         "warnings": p.warnings,
         "child_apex_ns_count": p.child_apex_ns_count,
         "parent_view_name": p.parent_view_name,
+        "cname_conflicts": p.cname_conflicts,
     }
