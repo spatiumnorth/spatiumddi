@@ -670,12 +670,13 @@ async def _assert_no_overlapping_group_cidr(
     )
     row = res.first()
     if row and restoring:
-        live = f"scope '{row[1]}'" if row[1] else "a scope"
+        # Not .capitalize(): it lower-cases the rest, scope name included.
+        live = f"Scope '{row[1]}'" if row[1] else "A scope"
         space = f" (IP space '{row[2]}')" if row[2] else " (another IP space)"
         raise HTTPException(
             status_code=409,
             detail=(
-                f"{live.capitalize()}{space} in this DHCP server group now holds "
+                f"{live}{space} in this DHCP server group now holds "
                 f"{row[0]}, which overlaps {subnet.network}; two scopes on one "
                 f"prefix would make the server reject the whole config (#844). "
                 f"Deactivate or delete that scope, then restore this one."

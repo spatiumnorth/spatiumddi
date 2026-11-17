@@ -130,14 +130,15 @@ async def test_restore_refusal_names_the_live_scope_not_the_create_advice_4363(
     r = await client.post(
         f"/api/v1/dhcp/subnets/{sub_b.id}/dhcp-scopes",
         headers=h,
-        json={"group_id": str(grp.id), "name": "live-b"},
+        json={"group_id": str(grp.id), "name": "Live-B"},
     )
     assert r.status_code == 201, r.text
 
     r = await client.post(f"/api/v1/admin/trash/dhcp_scope/{scope_a}/restore", headers=h)
     assert r.status_code == 409, r.text
     reasons = [c["reason"] for c in r.json()["detail"]["conflicts"]]
-    assert any("live-b" in x for x in reasons), reasons
+    # Mixed case: the refusal keeps the stored name as written.
+    assert any("Scope 'Live-B'" in x for x in reasons), reasons
     assert any("Deactivate or delete" in x for x in reasons), reasons
     assert not any("separate DHCP server group" in x for x in reasons), reasons
 
