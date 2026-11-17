@@ -15,10 +15,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSView, DNSZone
 
 
 def _norm(name: str) -> str:
@@ -30,17 +30,32 @@ def _norm(name: str) -> str:
 
 
 async def find_parent_zone(
-    db: AsyncSession, group_id: uuid.UUID, child_name: str
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    child_name: str,
+    child_view_id: uuid.UUID | None,
 ) -> DNSZone | None:
-    """Return the longest-suffix-matching zone in the same group.
+    """Return the longest-suffix-matching zone in the same group and view.
 
     Compares against every zone whose name is a strict suffix of ``child_name``
     (excluding the child itself). Returns the zone with the longest name when
     multiple suffixes match — that's the immediate parent. Forward zones are
     not eligible parents (they don't carry records).
+
+    A group may hold one zone of a name per view (#4389), and a zone pinned to
+    a view renders into that view alone, so the parent is looked up in the
+    child's own view: a child pinned to a view takes a parent pinned to that
+    view (or, failing that, one pinned to none, which renders in every view);
+    a child pinned to none takes only a parent pinned to none. A zone of
+    another view is never a parent, however its name matches.
     """
     child = _norm(child_name)
-    res = await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))
+    stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    if child_view_id is None:
+        stmt = stmt.where(DNSZone.view_id.is_(None))
+    else:
+        stmt = stmt.where(or_(DNSZone.view_id.is_(None), DNSZone.view_id == child_view_id))
+    res = await db.execute(stmt)
     candidates: list[DNSZone] = []
     for z in res.scalars().all():
         if z.zone_type == "forward":
@@ -54,7 +69,12 @@ async def find_parent_zone(
             candidates.append(z)
     if not candidates:
         return None
-    candidates.sort(key=lambda z: len(z.name), reverse=True)
+    # Longest name first; at one name the zone pinned to the child's own view
+    # beats an unpinned one.
+    candidates.sort(
+        key=lambda z: (len(z.name), child_view_id is not None and z.view_id == child_view_id),
+        reverse=True,
+    )
     return candidates[0]
 
 
@@ -119,6 +139,8 @@ class DelegationPreview:
     # Operator-facing diagnostics surfaced even though apply still works.
     warnings: list[str] = field(default_factory=list)
     child_apex_ns_count: int = 0
+    # The view the parent is pinned to (None: it renders in every view) (#4389).
+    parent_view_name: str | None = None
 
 
 async def _load_records(db: AsyncSession, zone_id: uuid.UUID) -> list[DNSRecord]:
@@ -143,6 +165,10 @@ async def compute_delegation(
         child_zone_name=child.name,
         child_label=label,
     )
+
+    if parent.view_id is not None:
+        view = await db.get(DNSView, parent.view_id)
+        preview.parent_view_name = view.name if view is not None else None
 
     child_records = await _load_records(db, child.id)
     parent_records = await _load_records(db, parent.id)
@@ -240,4 +266,5 @@ def preview_to_dict(p: DelegationPreview) -> dict[str, Any]:
         "existing_glue_records": _list(p.existing_glue_records),
         "warnings": p.warnings,
         "child_apex_ns_count": p.child_apex_ns_count,
+        "parent_view_name": p.parent_view_name,
     }

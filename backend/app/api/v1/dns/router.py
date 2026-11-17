@@ -8212,6 +8212,8 @@ class DelegationPreviewResponse(BaseModel):
     existing_glue_records: list[DelegationRecordPreview] = []
     warnings: list[str] = []
     child_apex_ns_count: int | None = None
+    # #4389 — the view the parent zone is pinned to (None: every view).
+    parent_view_name: str | None = None
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info", response_model=ZoneDNSSECInfo)
@@ -9102,11 +9104,11 @@ async def get_delegation_preview(
     """Compute the NS + glue records needed to delegate this zone from its parent.
 
     Returns ``{has_parent: false}`` when no eligible parent zone exists in
-    the same group; otherwise the dict is the full preview shape from
+    the same group and view; otherwise the dict is the full preview shape from
     ``preview_to_dict`` plus ``has_parent: true``.
     """
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         return DelegationPreviewResponse(has_parent=False)
     # #4258 — only a primary parent can take the NS + glue records; a secondary
@@ -9138,6 +9140,8 @@ async def apply_delegation(
 ) -> list[DNSRecord]:
     """Materialise the delegation records into the parent zone.
 
+    The parent is the one in the child's own view (#4389).
+
     Idempotent — records that already exist in the parent are skipped, so a
     second call after the first succeeds is a no-op. Each created record
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
@@ -9149,7 +9153,7 @@ async def apply_delegation(
     # probed first, locked, and re-found: a parent that changed meanwhile is a
     # 409, not a write into the wrong zone.
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
@@ -9162,7 +9166,7 @@ async def apply_delegation(
     parent_id = parent.id
     await lock_zone_rows(db, [child.id, parent_id])
     child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,

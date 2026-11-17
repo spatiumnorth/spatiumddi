@@ -109,6 +109,11 @@ export function DelegationModal({
                 <span>{childDisplay}</span>
                 <ArrowRight className="h-3 w-3 text-muted-foreground" />
                 <span>{data.parent_zone_name.replace(/\.$/, "")}</span>
+                {data.parent_view_name && (
+                  <span className="text-muted-foreground">
+                    (view {data.parent_view_name})
+                  </span>
+                )}
               </div>
               <p className="mt-1 text-[11px] text-muted-foreground">
                 These records will be created in the parent zone so recursive
