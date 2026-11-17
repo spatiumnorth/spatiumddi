@@ -279,9 +279,6 @@ export function SessionsTab({
           deleteTarget ? (
             <>
               {`Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`}
-              {deleteErr && (
-                <span className="mt-2 block text-destructive">{deleteErr}</span>
-              )}
             </>
           ) : (
             ""
@@ -290,6 +287,7 @@ export function SessionsTab({
         confirmLabel="Delete"
         tone="destructive"
         loading={deleteM.isPending}
+        error={deleteErr}
         onClose={() => {
           setDeleteTarget(null);
           setDeleteErr(null);

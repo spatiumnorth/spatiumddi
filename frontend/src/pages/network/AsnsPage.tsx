@@ -508,7 +508,9 @@ export function AsnsPage() {
               Clear
             </button>
             {bulkError && (
-              <span className="ml-2 text-xs text-red-600">{bulkError}</span>
+              <span role="alert" className="ml-2 text-xs text-red-600">
+                {bulkError}
+              </span>
             )}
           </div>
         )}

@@ -384,6 +384,7 @@ export function ResourcesTab({
       qc.invalidateQueries({ queryKey: ["service", service.id] });
       qc.invalidateQueries({ queryKey: ["service-summary", service.id] });
       onChange();
+      setConfirm(null);
     },
   });
 
@@ -587,11 +588,15 @@ export function ResourcesTab({
         message={confirm?.message ?? ""}
         confirmLabel="Detach"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={detach.isPending}
+        error={
+          detach.error ? formatApiError(detach.error, "Detach failed") : null
+        }
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          detach.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );

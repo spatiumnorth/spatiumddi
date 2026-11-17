@@ -337,11 +337,13 @@ function fieldToForm(field: CustomField): FieldForm {
 function DeleteFieldDialog({
   field,
   pending,
+  error,
   onConfirm,
   onClose,
 }: {
   field: CustomField;
   pending: boolean;
+  error?: string | null;
   onConfirm: () => void;
   onClose: () => void;
 }) {
@@ -361,6 +363,7 @@ function DeleteFieldDialog({
           from {RESOURCE_LABELS[field.resource_type]}? Existing data stored in
           this field will be lost.
         </p>
+        <FormError className="mt-2 text-sm">{error}</FormError>
         <div className="mt-4 flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -645,8 +648,16 @@ export function CustomFieldsPage() {
         <DeleteFieldDialog
           field={deleteConfirm}
           pending={deleteMutation.isPending}
+          error={
+            deleteMutation.error
+              ? formatApiError(deleteMutation.error, "Delete failed")
+              : null
+          }
           onConfirm={() => deleteMutation.mutate(deleteConfirm.id)}
-          onClose={() => setDeleteConfirm(null)}
+          onClose={() => {
+            setDeleteConfirm(null);
+            deleteMutation.reset();
+          }}
         />
       )}
     </div>

@@ -394,6 +394,7 @@ export function ImportedChip({
         title="Remove import metadata?"
         confirmLabel="Remove"
         loading={clearMut.isPending}
+        error={err}
         message={
           <>
             {`This clears the import-provenance fields (${Object.keys(
@@ -401,7 +402,6 @@ export function ImportedChip({
             ).join(
               ", ",
             )}) from this ${kind}, so the "${label}" chip disappears. The ${kind} itself and its other fields are unchanged.`}
-            {err && <span className="mt-2 block text-destructive">{err}</span>}
           </>
         }
         onConfirm={() => clearMut.mutate()}

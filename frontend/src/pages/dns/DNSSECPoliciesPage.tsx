@@ -52,6 +52,11 @@ export function DNSSECPoliciesPage() {
       qc.invalidateQueries({ queryKey: ["dns-dnssec-policies"] });
     },
   });
+  // Closing the confirm also forgets a refusal, so the next one opens clean.
+  const closeDelete = () => {
+    setToDelete(null);
+    del.reset();
+  };
 
   const rows = policies.data ?? [];
   // The policy routes take a superadmin whatever the grants (#1879).
@@ -185,6 +190,7 @@ export function DNSSECPoliciesPage() {
         title="Delete DNSSEC policy?"
         confirmLabel="Delete"
         loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
         message={
           <>
             Delete <strong>{toDelete?.name}</strong>? Zones using it fall back
@@ -193,7 +199,7 @@ export function DNSSECPoliciesPage() {
           </>
         }
         onConfirm={() => toDelete && del.mutate(toDelete.id)}
-        onClose={() => setToDelete(null)}
+        onClose={closeDelete}
       />
     </div>
   );

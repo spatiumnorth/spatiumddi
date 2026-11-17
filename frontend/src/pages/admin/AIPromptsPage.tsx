@@ -172,11 +172,13 @@ function ConfirmDelete({
   onConfirm,
   onClose,
   pending,
+  error,
 }: {
   prompt: AIPrompt;
   onConfirm: () => void;
   onClose: () => void;
   pending: boolean;
+  error?: string | null;
 }) {
   return (
     <Modal title={`Delete prompt — ${prompt.name}`} onClose={onClose}>
@@ -184,6 +186,7 @@ function ConfirmDelete({
         This permanently removes the prompt. Users who had it bookmarked will
         lose it. The chat sessions that referenced it are not affected.
       </p>
+      <FormError className="mt-2 text-sm">{error}</FormError>
       <div className="mt-4 flex justify-end gap-2">
         <button
           onClick={onClose}
@@ -433,8 +436,16 @@ export function AIPromptsPage() {
         <ConfirmDelete
           prompt={confirmDelete}
           pending={deleteMut.isPending}
+          error={
+            deleteMut.error
+              ? formatApiError(deleteMut.error, "Delete failed")
+              : null
+          }
           onConfirm={() => deleteMut.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            deleteMut.reset();
+          }}
         />
       )}
     </div>

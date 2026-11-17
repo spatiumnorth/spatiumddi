@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import {
   alertsApi,
+  formatApiError,
   type AlertParamSpec,
   type AlertRule,
   type AlertRuleTypeSpec,
@@ -725,6 +726,9 @@ export function AlertsPage() {
               {rulesError ? "not loaded" : `${rules.length} total`}
             </span>
           </div>
+          <FormError className="px-4 py-2 text-sm">
+            {del.error ? formatApiError(del.error, "Delete failed") : null}
+          </FormError>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-xs uppercase tracking-wider text-muted-foreground">
@@ -844,6 +848,7 @@ export function AlertsPage() {
                         </button>
                         <button
                           onClick={() => {
+                            del.reset();
                             if (confirm(`Delete rule "${r.name}"?`)) {
                               del.mutate(r.id);
                             }
