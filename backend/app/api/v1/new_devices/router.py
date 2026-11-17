@@ -245,7 +245,7 @@ async def list_sightings(
     ).scalar_one()
     rows = (
         await db.execute(
-            base.order_by(IpMacHistory.first_seen.desc())
+            base.order_by(IpMacHistory.first_seen.desc(), IpMacHistory.id)
             .limit(page_size)
             .offset((page - 1) * page_size)
         )

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import ssl
 from collections.abc import AsyncIterator
@@ -48,6 +49,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -63,7 +65,7 @@ from app.models.settings import PlatformSettings
 from app.services import dispatch_db
 from app.services.after_commit_dispatch import dispatch
 from app.services.audit_redact import redact_audit_payload
-from app.services.forward_secrets import redact, reveal, secret_url_in_flight
+from app.services.forward_secrets import redact, reveal, secret_url_in_flight, url_display
 
 logger = structlog.get_logger(__name__)
 
@@ -565,8 +567,9 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
             # straddling the 200-char cut is no longer an exact match.
             body_preview=redact(resp.text, url, auth_header)[:200],
         )
+        preview = " ".join(_scrub_urls(redact(resp.text, url, auth_header))[:200].split())
         raise httpx.HTTPStatusError(
-            f"webhook answered HTTP {resp.status_code}",
+            f"webhook answered HTTP {resp.status_code}" + (f": {preview}" if preview else ""),
             request=resp.request,
             response=resp,
         )
@@ -921,10 +924,39 @@ FILTERED = "filtered"
 FAILED = "failed"
 
 
-async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) -> str:
+_URL_IN_TEXT = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def _scrub_urls(text: str) -> str:
+    """Collapse every URL in ``text`` to scheme + host. httpx quotes the full
+    request URL ("for url '…'"), which for a chat webhook IS the credential;
+    exact-match redaction misses a re-normalised or partly-echoed one (#3931)."""
+    return _URL_IN_TEXT.sub(lambda m: url_display(m.group(0)), text)
+
+
+def _failure_reason(exc: Exception, *secrets: str) -> str:
+    """A failure's own words for the operator (#3931), secrets redacted. An
+    exception with no message (a timeout) is named by its type."""
+    extra: list[str] = []
+    for secret in secrets:
+        try:
+            parts = urlsplit(secret)
+            extra += [x for x in (parts.username, parts.password) if x]
+        except ValueError:
+            continue
+    text = _scrub_urls(redact(str(exc), *secrets, *extra)).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
+
+
+async def _deliver_to_target(
+    target: dict[str, Any], payload: dict[str, Any], reasons: list[str] | None = None
+) -> str:
     """Deliver ``payload`` to one target; return DELIVERED / FILTERED /
     FAILED. Never raises — a transport failure is a FAILED outcome,
-    logged here exactly as it was when the exception was swallowed.
+    logged here exactly as it was when the exception was swallowed. When
+    ``reasons`` is given, the failure's redacted reason is appended to it
+    (the "Test target" probe shows it, #3931).
 
     This is the ONE function every forwarded event reaches a transport
     through — audit rows, alert events, the AI digest and the "Test
@@ -968,6 +1000,8 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                     "audit_forward_smtp_missing_config",
                     target=target.get("name"),
                 )
+                if reasons is not None:
+                    reasons.append("SMTP host, sender address and recipients must all be set")
                 return FAILED
             subject, email_body = _smtp_subject_body(payload)
             await _send_smtp(
@@ -988,8 +1022,19 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                 target=target.get("name"),
                 kind=kind,
             )
+            if reasons is not None:
+                reasons.append(f"unknown target kind {kind!r}")
             return FAILED
     except Exception as exc:  # noqa: BLE001
+        if reasons is not None:
+            reasons.append(
+                _failure_reason(
+                    exc,
+                    target.get("url") or "",
+                    target.get("auth_header") or "",
+                    target.get("smtp_password") or "",
+                )
+            )
         logger.warning(
             "audit_forward_target_failed",
             target=target.get("name"),
