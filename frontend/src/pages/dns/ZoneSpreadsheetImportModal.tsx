@@ -11,6 +11,7 @@ import {
   type DNSSheetRowIssue,
   type DNSZone,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -235,9 +236,9 @@ export function ZoneSpreadsheetImportModal({
           </div>
         )}
         {error && (
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive break-words">
+          <FormError className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive break-words">
             {error}
-          </div>
+          </FormError>
         )}
 
         {preview && (

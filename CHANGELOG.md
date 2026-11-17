@@ -25,6 +25,61 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 1.0.0-rc.3 — 2026-11-13
+
+### Changed
+
+- The nightly build can now run for a release branch as well as `main`: dispatching `nightly.yml` with `ref=release/X.Y.Z` builds that branch's images and appliance and publishes them under their own names (`:nightly-X.Y.Z-YYYYMMDD`, pre-release `nightly-X.Y.Z-YYYY.MM.DD`), skips when that branch has not moved since its last nightly, keeps its own 7-night ring, and never touches `:latest` or `main`'s nightlies. The nightly trigger now dispatches `main` and `release/1.0.1` each evening. `main`'s nightly is unchanged.
+
+- CI runs on pull requests into `release/X.Y.Z` branches as it does for `main`, and such a PR takes milestone X.Y.Z automatically, so work for the next releases can start while `main` is frozen for a release candidate (#3948).
+
+- **Upgrading to 1.0.0 from 2026.10.02-1 (#3915).** On a multi-node
+  appliance cluster still on 2026.10.02-1, do not use the Rolling Upgrade
+  tab: its upload answers 502 (#1174) and its Plan answers 409
+  `replication_lag` (#1445). Upgrade from Fleet instead: stage every node
+  first (Upgrade "From external URL", one node at a time, no reboot),
+  wait about 5 minutes, then reboot the members one at a time and the
+  seed last. That order kept DNS and DHCP on at least two nodes
+  throughout the drill; upgrading and rebooting each member in turn
+  instead leaves nodes not yet upgraded without DNS and DHCP (#3136). The
+  seed's Fleet Reboot does nothing on 2026.10.02-1, so reboot it from its
+  hypervisor. Afterwards the API can show "initialising" while the 1.0.0
+  migration waits on a stale database session left by the old release;
+  1.0.0 ends that session itself (#3932), and the notes give a manual way
+  out. A single appliance (under 10 minutes, DNS down
+  about 4 minutes), Compose and Helm upgrade as usual (Helm with DHCP
+  agents: #3907). The steps are in `docs/deployment/APPLIANCE.md`,
+  "Upgrading to 1.0.0".
+
+### Fixed
+
+- Docs: Getting Started, MIGRATION, DHCP_DRIVERS and APPLIANCE no longer name a Create Group button, a `kea-ctrl-agent` on `:8544`, BIND `include` walking, key-only SSH or `SPATIUMDDI_*` variables the build does not have (#3965).
+
+- Helm chart: the worker pod is no longer rejected on clusters that enforce Pod Security `baseline`, such as Talos. `worker.netRawCapability` now defaults to `false`; containerd already gives the worker `NET_RAW`, so nmap scans are unchanged there. `docs/deployment/KUBERNETES.md` lists the Pod Security level each component needs (#3952).
+
+- A scheduled backup whose database session is ended mid-run (a restore, a failover, an upgrade's migrate guard) now records its end on a connection bound to the sweep's own event loop, so the run reads `success` or `failed` instead of staying `in_progress` for 2 hours while its target is skipped (#3939).
+
+- An upgrade no longer hangs for hours behind a database session whose client has died. PostgreSQL now probes silent peers with TCP keepalives, so a dead client's session opened after the upgrade is dropped in about two minutes (one opened earlier is ended by the migrate command), and ends a session left idle in a transaction for an hour (CloudNativePG, the in-chart Postgres, Docker Compose and `k8s/ha`; reloads for CNPG, one restart for the in-chart and Compose Postgres). The migrate command bounds each lock wait with `lock_timeout`, logs which session holds the lock, ends only the stale idle-in-transaction sessions of the app's role that it is seen waiting on (`pg_blocking_pids`), never a running backup's own session, and keeps retrying, so a migration behind a running backup still waits it out.
+
+- A DNS zone restored from the Trash now answers what IPAM holds today: an address renamed while the zone sat in the Trash gets its record under the new name instead of the old one, and an address added meanwhile gets its record. The restore re-runs the IPAM-DNS sync over the zone's subnets before it answers (a task retries it if that fails); records created by hand are left as they were (#3924).
+
+- Getting Started: use the agent-created `default` DNS and DHCP groups, align the RAM minimum with the Docker guide, match the real UI labels, state how pinning a DNS zone interacts with inheritance, and reserve infrastructure addresses in IPAM so "Next available" skips the excluded DHCP range (#3917).
+
+- A Helm upgrade from `2026.10.02-1` or older with DHCP agents no longer leaves Kea on the old image and times out `helm upgrade --wait` (#3907). A `pre-upgrade` hook now deletes a DHCP agent StatefulSet (its volumes are kept) whose pod is Running but has been not Ready for 2 minutes, so the upgrade recreates it from the new template; Ready StatefulSets are never touched. Opt out with `dhcpAgents.upgradeUnstickPods: false`.
+
+- Deleting a VLAN, a router with a bound VLAN, a subnet from the Trash (by hand, by the nightly purge or through the copilot), an address for good, or a network device with a bound switch port no longer silently deletes the E911 location binding keyed to it. As with a site, the delete is refused with a 409 naming the binding, the nightly purge keeps such a subnet in the Trash, and the delete dialogs say so. Remove the binding under Network > E911 > Bindings first.
+
+### Security
+
+- Operator-supplied values in the PowerShell scripts that the Windows DNS and Windows DHCP drivers send over WinRM are now quoted correctly for every quote character PowerShell recognises, and are no longer placed in double-quoted strings.
+- The Windows-side PowerShell that the cutover runbook and TTL pre-flight hand to the operator now keeps a host or zone name on one line, so a name containing a line break cannot end a comment or the code block it sits in.
+
+- **Stricter packet-capture filter validation.** The capture filter is
+  now refused when it starts with `-`, and tcpdump is told where its
+  options end so the filter is only ever read as an expression. Capture
+  failures no longer return raw tcpdump output to the caller: the API
+  shows a fixed message and the details stay in the server log.
+
 ## 1.0.0-rc.2 — 2026-11-11
 
 ### Fixed

@@ -272,7 +272,7 @@ async def list_circuits(
     stmt = apply_tag_filter(stmt, Circuit.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(Circuit.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Circuit.name.asc(), Circuit.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return CircuitListResponse(
         items=[CircuitRead.model_validate(r) for r in rows],
