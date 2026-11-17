@@ -263,8 +263,21 @@ plus those capabilities and `allowPrivilegeEscalation: true`, not privileged.
 
 4. Verify with the `openshift.io/scc` annotation check above: the DNS agent pods
    must show `spatiumddi-dns-agent` and the DHCP agent pods `spatiumddi-dhcp-agent`
-   (or `-hostnetwork`). An agent under `restricted-v2` means the grant in step 2 is
-   missing or names the wrong ServiceAccount.
+   (or `-hostnetwork`). If the agent pods never appear, the grant in step 2 is
+   missing or names the wrong ServiceAccount: the StatefulSet's events show
+   `FailedCreate ... unable to validate against any security context constraint`.
+   Fix the grant and the pods are created without another `helm upgrade`.
+
+To remove the prerequisite after `helm uninstall`, undo the grants and delete the
+SCCs. Deleting an SCC leaves behind the ClusterRole that `add-scc-to-user`
+created, so delete that as well:
+
+```bash
+oc adm policy remove-scc-from-user spatiumddi-dns-agent  -z ddi-spatiumddi-dns-agent  -n spatiumddi
+oc adm policy remove-scc-from-user spatiumddi-dhcp-agent -z ddi-spatiumddi-dhcp-agent -n spatiumddi
+oc delete scc spatiumddi-dns-agent spatiumddi-dhcp-agent
+oc delete clusterrole system:openshift:scc:spatiumddi-dns-agent system:openshift:scc:spatiumddi-dhcp-agent
+```
 
 `openshift.workerNetRaw` is not covered by these files: with the certified profile it needs an SCC for the worker's ServiceAccount that you write yourself, or leave it off (the default).
 
