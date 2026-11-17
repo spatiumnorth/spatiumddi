@@ -21,15 +21,6 @@ const ALLOWED: Record<string, string> = {
   "pages/admin/BackupPage.tsx": "wraps its control in the <label>",
   "pages/admin/BackupTargetsSection.tsx": "wraps its control in the <label>",
   "pages/ipam/MoveBlockModal.tsx": "wraps its control in the <label>",
-  // Settings rows: a label <div> beside the control, tied to nothing. The
-  // same defect as #4371; not yet moved onto the shared Field (follow-up).
-  "components/NTPSection.tsx": "settings row, follow-up",
-  "components/SNMPSection.tsx": "settings row, follow-up",
-  "components/LLDPSection.tsx": "settings row, follow-up",
-  "components/SyslogSection.tsx": "settings row, follow-up",
-  "components/AptSection.tsx": "settings row, follow-up",
-  "components/SSHSection.tsx": "settings row, follow-up",
-  "components/ResolverSection.tsx": "settings row, follow-up",
 };
 
 const OWN_FIELD =
