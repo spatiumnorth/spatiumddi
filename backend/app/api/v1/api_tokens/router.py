@@ -479,7 +479,7 @@ async def mint_api_token(
         "owner_display_name": owner.display_name or None,
         "owner_is_active": True,
         "owner_is_service_account": owner.is_service_account,
-        "owner_password_change_required": current_user.password_change_required,
+        "owner_password_change_required": owner.password_change_required,
         "status": "active",
         "blocked_reason": None,
         "token": raw,
