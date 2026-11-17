@@ -12,17 +12,42 @@ import {
   winrmFormFrom,
   winrmSettingsPayload,
 } from "@/lib/winrm";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import { FormError } from "@/components/ui/form-error";
 
-export function CreateServerModal({
-  server,
-  defaultGroupId,
-  onClose,
-}: {
+type CreateServerModalProps = {
   server?: DHCPServer;
   defaultGroupId?: string | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the server fresh on open (#3739): the row the page holds comes
+// from a list polled every 30 s, and the form is seeded once.
+export function CreateServerModal(props: CreateServerModalProps) {
+  const fresh = useFreshRow(props.server, () =>
+    dhcpApi.getServer(props.server!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DHCP Server"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerModalForm {...props} server={fresh.row} />;
+}
+
+function ServerModalForm({
+  server,
+  defaultGroupId,
+  onClose,
+}: CreateServerModalProps) {
   const qc = useQueryClient();
   const editing = !!server;
   const [name, setName] = useState(server?.name ?? "");
@@ -75,6 +100,27 @@ export function CreateServerModal({
   } | null>(null);
 
   const hasExistingCreds = !!server?.has_credentials;
+
+  // #4135 — a moved host / port needs the stored credential entered again
+  // (or cleared).
+  const reask = useCredentialReask(
+    { host, port },
+    server && { host: server.host, port: server.port },
+    () => {
+      setFgToken("");
+      setWinPassword("");
+    },
+  );
+  const mustEnterFgToken =
+    driver === "fortigate" &&
+    reask.asks(hasExistingCreds) &&
+    !fgClearCreds &&
+    !fgToken;
+  const mustEnterWinPassword =
+    driver === "windows_dhcp" &&
+    reask.asks(hasExistingCreds) &&
+    !winClearCreds &&
+    !winPassword;
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -134,7 +180,7 @@ export function CreateServerModal({
   });
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const data: Partial<DHCPServer> & {
         windows_credentials?: WindowsDHCPCredentials | Record<string, never>;
         cloud_credentials?: FortiGateCredentials | Record<string, never>;
@@ -202,12 +248,51 @@ export function CreateServerModal({
         }
       }
 
-      return editing
-        ? dhcpApi.updateServer(server!.id, data)
-        : dhcpApi.createServer(data);
+      if (!editing) return dhcpApi.createServer(data);
+      // Send only what changed (#3739): a field the operator did not touch
+      // stays as another client stored it. The credential blocks above are
+      // already partial, so they ride along as they are.
+      const {
+        windows_credentials: winCreds,
+        cloud_credentials: cloudCreds,
+        ...plain
+      } = data;
+      const diff: typeof data = changedFields(
+        {
+          name: server!.name,
+          driver: server!.driver,
+          host: server!.host,
+          port: server!.port,
+          server_group_id: server!.server_group_id ?? null,
+          ha_peer_url: server!.ha_peer_url ?? "",
+          description: server!.description ?? "",
+        },
+        plain,
+      );
+      if (winCreds) diff.windows_credentials = winCreds;
+      if (cloudCreds) diff.cloud_credentials = cloudCreds;
+      if (Object.keys(diff).length === 0) return server!;
+      return dhcpApi.updateServer(server!.id, diff);
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // #3366 — the server page reads ["dhcp-server", id] on a 30 s poll and
+      // opens this dialog from it; write the Save's answer into that copy and
+      // the cached lists first, or a reopen before the poll shows the old row
+      // and an untouched Save writes it back.
+      if (editing && saved?.id) {
+        qc.setQueryData(["dhcp-server", saved.id], (old: unknown) =>
+          old ? { ...(old as DHCPServer), ...saved } : saved,
+        );
+        qc.setQueriesData({ queryKey: ["dhcp-servers"] }, (old: unknown) =>
+          Array.isArray(old)
+            ? old.map((r: DHCPServer) =>
+                r.id === saved.id ? { ...r, ...saved } : r,
+              )
+            : old,
+        );
+      }
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-server"] });
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       onClose();
     },
@@ -424,13 +509,25 @@ export function CreateServerModal({
             <div
               className={`grid grid-cols-2 gap-3 ${fgClearCreds ? "opacity-40 pointer-events-none" : ""}`}
             >
-              <Field label="API Token" hint="FortiOS REST API admin token">
+              <Field
+                label="API Token"
+                hint={
+                  mustEnterFgToken ? reask.hint : "FortiOS REST API admin token"
+                }
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={fgToken}
                   onChange={(e) => setFgToken(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  required={mustEnterFgToken}
+                  placeholder={
+                    mustEnterFgToken
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "required"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -714,13 +811,23 @@ export function CreateServerModal({
                   autoComplete="off"
                 />
               </Field>
-              <Field label="Password">
+              <Field
+                label="Password"
+                hint={mustEnterWinPassword ? reask.hint : undefined}
+              >
                 <input
                   type="password"
                   className={inputCls}
                   value={winPassword}
                   onChange={(e) => setWinPassword(e.target.value)}
-                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  required={mustEnterWinPassword}
+                  placeholder={
+                    mustEnterWinPassword
+                      ? reask.placeholder
+                      : hasExistingCreds
+                        ? "(unchanged)"
+                        : "required"
+                  }
                   autoComplete="off"
                 />
               </Field>
@@ -809,8 +916,14 @@ export function CreateServerModal({
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
+        <Btns
+          onClose={onClose}
+          pending={mut.isPending}
+          disabled={mustEnterFgToken || mustEnterWinPassword}
+        />
       </form>
     </Modal>
   );

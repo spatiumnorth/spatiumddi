@@ -16,6 +16,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -62,7 +63,8 @@ function ProviderEditorModal({
   // The ASN routes take read on `manage_asns`. A user without it is not
   // asked, and a stored Default ASN is shown as set-but-hidden, never as
   // none (#2703).
-  const canReadAsns = usePermissions().can("read", "manage_asns");
+  const asnPerms = usePermissions();
+  const canReadAsns = asnPerms.can("read", "manage_asns");
   const asnsQuery = useQuery({
     queryKey: ["asns", "all"],
     queryFn: () => asnsApi.list({ limit: 500 }),
@@ -178,16 +180,24 @@ function ProviderEditorModal({
             <select
               className={inputCls}
               value={defaultAsnId}
+              aria-label="Default ASN"
               onChange={(e) => setDefaultAsnId(e.target.value)}
               disabled={asnsQuery.isLoading || !canReadAsns}
               title={
-                canReadAsns ? undefined : "You may not read ASNs (manage_asns)"
+                canReadAsns
+                  ? undefined
+                  : (asnPerms.unanswered ??
+                    "You may not read ASNs (manage_asns)")
               }
             >
               <option value="">— none —</option>
               {!canReadAsns && defaultAsnId && (
                 <option value={defaultAsnId}>
-                  set — you may not read ASNs
+                  {asnPerms.isError
+                    ? "set — could not be read"
+                    : asnPerms.unanswered
+                      ? "set — kept as is"
+                      : "set — you may not read ASNs"}
                 </option>
               )}
               {(asnsQuery.data?.items ?? []).map((a) => (
@@ -213,7 +223,9 @@ function ProviderEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -282,7 +294,8 @@ export function ProvidersPage() {
   // The ASN routes take read on `manage_asns`. A user without it is not
   // asked, and a stored Default ASN is shown as set-but-hidden, never as
   // none (#2703).
-  const canReadAsns = usePermissions().can("read", "manage_asns");
+  const asnPerms = usePermissions();
+  const canReadAsns = asnPerms.can("read", "manage_asns");
   const asnsQuery = useQuery({
     queryKey: ["asns", "all"],
     queryFn: () => asnsApi.list({ limit: 500 }),
@@ -468,8 +481,10 @@ export function ProvidersPage() {
                         setSearch("");
                         setKindFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New provider" to add one.`}
                     >
-                      No providers yet — click "New provider" to add one.
+                      No providers yet.
                     </ListEmpty>
                   </td>
                 </tr>
@@ -500,7 +515,12 @@ export function ProvidersPage() {
                       {asnNum !== undefined ? (
                         `AS${asnNum}`
                       ) : p.default_asn_id && !canReadAsns ? (
-                        <span title="You may not read ASNs (manage_asns)">
+                        <span
+                          title={
+                            asnPerms.unanswered ??
+                            "You may not read ASNs (manage_asns)"
+                          }
+                        >
                           set, hidden
                         </span>
                       ) : (

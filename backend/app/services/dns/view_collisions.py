@@ -37,6 +37,7 @@ from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
+    places_zone_clause,
     views_rendering_zone,
 )
 
@@ -131,7 +132,11 @@ async def zone_render_collisions(
     if live_twin_ids and has_views:
         rows = await db.execute(
             select(DNSRecord.zone_id, DNSRecord.view_id)
-            .where(DNSRecord.zone_id.in_(live_twin_ids), DNSRecord.view_id.is_not(None))
+            .where(
+                DNSRecord.zone_id.in_(live_twin_ids),
+                DNSRecord.view_id.is_not(None),
+                places_zone_clause(),
+            )
             .distinct()
         )
         by_id = {z.id: z for z in zones}

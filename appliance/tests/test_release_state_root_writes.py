@@ -738,3 +738,50 @@ def test_removable_prepare_follows_no_symlink_the_disk_carries(tmp_path: Path) -
     subprocess.run(["bash", str(script), "--prepare"], env=env,
                    capture_output=True, text=True, timeout=30)
     assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def _run_pcap_runner(tmp_path: Path, bpf: str, tcpdump_body: str):
+    rs = tmp_path / "rs"
+    pcap = rs / "pcap"
+    pcap.mkdir(parents=True)
+    src = (BIN / "spatium-pcap-runner").read_text()
+    script = tmp_path / "pcap-runner"
+    script.write_text(src.replace("/var/lib/spatiumddi/release-state/pcap", str(pcap)))
+    bindir = tmp_path / "bin"
+    _stub(bindir, "tcpdump", tcpdump_body)
+    _stub(bindir, "logger", "#!/bin/bash\nexit 0\n")
+    (pcap / "c1.request").write_text(
+        f"capture_id=c1\ninterface=any\nmax_duration_s=5\nbpf={bpf}\n"
+    )
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "TMPDIR": str(tmp_path)}
+    subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=60)
+    return pcap
+
+
+@pytest.mark.parametrize(
+    "bpf", ["-V/etc/hostname", "  -w/tmp/x", "\t-V/etc/hostname"], ids=["bare", "spaces", "tab"]
+)
+def test_pcap_runner_refuses_a_filter_starting_with_a_dash(tmp_path: Path, bpf: str) -> None:
+    called = tmp_path / "called"
+    pcap = _run_pcap_runner(tmp_path, bpf, f'#!/bin/bash\ntouch "{called}"\nexit 0\n')
+    assert not called.exists()
+    assert "invalid capture filter" in (pcap / "c1.state").read_text()
+
+
+def test_pcap_runner_puts_double_dash_before_the_filter(tmp_path: Path) -> None:
+    argsfile = tmp_path / "args"
+    _run_pcap_runner(
+        tmp_path,
+        "host 10.0.0.1",
+        f'#!/bin/bash\nprintf "%s\\n" "$@" > "{argsfile}"\nexit 0\n',
+    )
+    assert argsfile.read_text().splitlines()[-2:] == ["--", "host 10.0.0.1"]
+
+
+def test_pcap_runner_does_not_echo_tcpdump_stderr(tmp_path: Path) -> None:
+    pcap = _run_pcap_runner(
+        tmp_path, "port 53", "#!/bin/bash\necho 'SECRET-LINE' >&2\nexit 1\n"
+    )
+    state = (pcap / "c1.state").read_text()
+    assert "state=failed" in state
+    assert "SECRET-LINE" not in state

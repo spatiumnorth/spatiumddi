@@ -525,3 +525,231 @@ describe("Find Free and the allocation band (#3391)", () => {
     await waitFor(() => expect(headings()).toContain("New Subnet"));
   });
 });
+
+describe("a regular address's Delete (#3409)", () => {
+  async function openRegular() {
+    answers.ipamApi = {
+      listAddresses: () =>
+        Promise.resolve([
+          {
+            id: "r",
+            subnet_id: "sub-1",
+            address: "10.142.1.20",
+            status: "allocated",
+            role: null,
+            hostname: "h-reg",
+            fqdn: null,
+            description: "",
+            mac_address: null,
+            tags: {},
+            custom_fields: {},
+            created_at: STAMP,
+            modified_at: STAMP,
+          },
+        ]),
+    };
+    answers.dhcpApi = { listScopesBySubnet: () => Promise.resolve([]) };
+    wrap(<SubnetDetail subnet={subnet} onSubnetEdited={() => {}} />);
+    await screen.findByText("10.142.1.20");
+    await settle();
+    return screen.getByText("10.142.1.20").closest("tr") as HTMLElement;
+  }
+  const inline = (row: HTMLElement) =>
+    row.querySelector(
+      'button[aria-label="Delete 10.142.1.20"]',
+    ) as HTMLButtonElement;
+
+  it("disables it, inline and right-click, with write but not delete", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+    ]);
+    const del = vi.fn(() => Promise.resolve({}));
+    const row = await openRegular();
+    answers.ipamApi.deleteAddress = del;
+    const btn = inline(row);
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toMatch(/delete/i);
+    fireEvent.click(btn);
+    await settle();
+    const m = await menuItems(row);
+    expect(m["Edit…"]).toBe(false);
+    expect(m["Delete…"]).toBe(true);
+    expect(item("Delete…").getAttribute("title")).toMatch(/delete/i);
+    fireEvent.click(item("Delete…"));
+    await settle();
+    expect(q('[role="dialog"]')).toBeNull();
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("still works for an editor with delete", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "*"],
+    ]);
+    const row = await openRegular();
+    expect(inline(row).disabled).toBe(false);
+    fireEvent.click(inline(row));
+    await waitFor(() => expect(q('[role="dialog"]')).toBeTruthy());
+    cleanup();
+    const row2 = await openRegular();
+    const m = await menuItems(row2);
+    expect(m["Delete…"]).toBe(false);
+  });
+});
+
+describe("an address's Delete matches the server's gate (#3409)", () => {
+  // The IPAM Editor builtin role (``main.py``): admin on the IPAM types.
+  const IPAM_EDITOR: [string, string][] = [
+    ["admin", "ip_space"],
+    ["admin", "ip_block"],
+    ["admin", "subnet"],
+    ["admin", "ip_address"],
+    ["admin", "address_set"],
+  ];
+  const ROW = {
+    id: "r",
+    subnet_id: "sub-1",
+    address: "10.142.1.20",
+    status: "allocated",
+    role: null,
+    hostname: "h-reg",
+    fqdn: null,
+    description: "",
+    mac_address: null,
+    tags: {},
+    custom_fields: {},
+    created_at: STAMP,
+    modified_at: STAMP,
+  };
+  async function open() {
+    answers.ipamApi = { listAddresses: () => Promise.resolve([ROW]) };
+    answers.dhcpApi = { listScopesBySubnet: () => Promise.resolve([]) };
+    wrap(<SubnetDetail subnet={subnet} onSubnetEdited={() => {}} />);
+    await screen.findByText("10.142.1.20");
+    await settle();
+    return screen.getByText("10.142.1.20").closest("tr") as HTMLElement;
+  }
+  const inline = (row: HTMLElement) =>
+    row.querySelector(
+      'button[aria-label="Delete 10.142.1.20"]',
+    ) as HTMLButtonElement;
+  /** Click the row; the detail modal's buttons by their text. */
+  async function detailButtons(row: HTMLElement) {
+    fireEvent.click(row);
+    await waitFor(() => expect(q('[role="dialog"]')).toBeTruthy());
+    await settle();
+    return Array.from(
+      (q('[role="dialog"]') as HTMLElement).querySelectorAll("button"),
+    ).map((b) => (b.textContent ?? "").trim());
+  }
+
+  it("offers no Delete in the detail modal with write but not delete", async () => {
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+    ]);
+    const buttons = await detailButtons(await open());
+    expect(buttons).toContain("Edit");
+    expect(buttons).not.toContain("Delete");
+  });
+
+  it("offers it to the IPAM Editor role, in the modal and inline", async () => {
+    signInAs([["read", "*"], ...IPAM_EDITOR]);
+    const row = await open();
+    expect(inline(row).disabled).toBe(false);
+    expect(await detailButtons(row)).toContain("Delete");
+  });
+
+  it("offers it to a superadmin", async () => {
+    signInAs("superadmin");
+    const row = await open();
+    expect(inline(row).disabled).toBe(false);
+    expect(await detailButtons(row)).toContain("Delete");
+  });
+
+  it("disables it on a delete grant scoped to this one subnet", async () => {
+    // DELETE /addresses/{id} is not on the gate's subnet instance
+    // allow-list, so a delete grant naming the subnet is refused there.
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "subnet", "sub-1"],
+    ]);
+    const row = await open();
+    await settle();
+    expect(inline(row).disabled).toBe(true);
+  });
+
+  it("offers it on a delete grant scoped to an address set holding the address", async () => {
+    // The gate admits any address-set delete grant; the handler then wants a
+    // delete grant covering THIS address, here through the set that holds it.
+    answers.addressSetsApi = {
+      list: () =>
+        Promise.resolve([
+          {
+            id: "set-here",
+            subnet_id: "sub-1",
+            range_kind: "contiguous",
+            start_address: "10.142.1.10",
+            end_address: "10.142.1.30",
+            explicit_addresses: [],
+          },
+        ]),
+    };
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "address_set", "set-here"],
+    ]);
+    const row = await open();
+    await waitFor(() => expect(inline(row).disabled).toBe(false));
+  });
+
+  it("disables it on a delete grant scoped to a set that does not hold the address", async () => {
+    answers.addressSetsApi = {
+      list: () =>
+        Promise.resolve([
+          {
+            id: "set-elsewhere",
+            subnet_id: "sub-1",
+            range_kind: "contiguous",
+            start_address: "10.142.1.200",
+            end_address: "10.142.1.220",
+            explicit_addresses: [],
+          },
+        ]),
+    };
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "address_set", "set-elsewhere"],
+    ]);
+    const row = await open();
+    await settle();
+    expect(inline(row).disabled).toBe(true);
+  });
+
+  it("keeps Clean Orphans disabled on an address-set delete grant", async () => {
+    // POST /subnets/{id}/orphans/purge is not on the address-set allow-list:
+    // it takes delete on subnet, which this role does not hold.
+    signInAs([
+      ["read", "*"],
+      ["write", "subnet"],
+      ["delete", "address_set"],
+    ]);
+    await open();
+    fireEvent.click(q('button[title="Subnet tools — scan, clean, reshape"]')!);
+    const clean = await waitFor(() => {
+      const b = Array.from(
+        document.querySelectorAll('[role="menu"] [role="menuitem"]'),
+      ).find((e) => e.textContent?.includes("Clean Orphans"));
+      expect(b).toBeTruthy();
+      return b as HTMLButtonElement;
+    });
+    expect(clean.disabled).toBe(true);
+    expect(clean.title).toMatch(/delete/i);
+  });
+});

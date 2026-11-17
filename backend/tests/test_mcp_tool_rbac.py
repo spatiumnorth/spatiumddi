@@ -280,3 +280,55 @@ async def test_registry_call_enforces_permission_for_chat_too(db_session: AsyncS
         await REGISTRY.call(
             "list_dns_zones", {}, db=db_session, user=user, effective={"list_dns_zones"}
         )
+
+
+# ── alert tools match their REST twins ─────────────────────────────────────
+
+# Tools that are deliberately open to any signed-in user, because their REST
+# twin is also gated on a session only (or the data is the caller's own).
+# A new ``authenticated`` tool must be added here on purpose, after checking
+# the REST route it mirrors.
+_SESSION_ONLY_TOOLS = {
+    "maintenance_status",
+    "find_lldp_settings",
+    "find_branding_settings",
+    "global_search",
+    "ask_yes_no",
+    "find_ntp_settings",
+    "find_apt_settings",
+    "find_resolver_settings",
+    "help_write_permission",
+    "find_snmp_settings",
+    "find_retention_settings",
+    "find_ssh_settings",
+    "find_syslog_settings",
+}
+
+
+def test_session_only_tools_are_the_reviewed_set() -> None:
+    open_tools = {t.name for t in REGISTRY.all() if t.permission == "authenticated"}
+    assert open_tools == _SESSION_ONLY_TOOLS, (
+        "a tool gated on a session alone must be listed here after checking that "
+        f"its REST route is gated no more strictly: {sorted(open_tools ^ _SESSION_ONLY_TOOLS)}"
+    )
+
+
+@pytest.mark.parametrize("name", ["list_alerts", "list_alert_rules"])
+@pytest.mark.asyncio
+async def test_alert_tools_need_read_on_alert(db_session: AsyncSession, name: str) -> None:
+    tool = next(t for t in REGISTRY.all() if t.name == name)
+    assert tool.permission == ("read", "alert")
+    user = await _user(db_session)
+    assert _denied(await _call(db_session, user, name))
+    reader = await _user(db_session, permissions=[{"action": "read", "resource_type": "alert"}])
+    assert not _denied(await _call(db_session, reader, name))
+
+
+@pytest.mark.asyncio
+async def test_request_kinds_tool_needs_submit_rights(db_session: AsyncSession) -> None:
+    user = await _user(db_session)
+    assert _denied(await _call(db_session, user, "list_request_kinds"))
+    submitter = await _user(
+        db_session, permissions=[{"action": "write", "resource_type": "provisioning_request"}]
+    )
+    assert not _denied(await _call(db_session, submitter, "list_request_kinds"))

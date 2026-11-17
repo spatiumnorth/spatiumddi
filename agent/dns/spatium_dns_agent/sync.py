@@ -40,6 +40,8 @@ from .config import AgentConfig
 from .config_apply import (
     PHASE_RELOAD,
     PHASE_VALIDATE,
+    REASON_DAEMON_DIED,
+    REASON_OOM,
     STATUS_NO_PREVIOUS,
     STATUS_OK,
     STATUS_REVERT_FAILED,
@@ -96,8 +98,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # (``periodic_served_serials``) is asked between changes. Named also moves a
 # zone's serial through updates this agent never sent (a third party's RFC
 # 2136 client, a DNSSEC key event on a signed zone); nothing else reports
-# those, and the zone would read in sync at a serial no longer served.
-SERVED_REPORT_SECONDS = 120.0
+# those, and the zone would read in sync at a serial no longer served. A
+# secondary's transfer is the same (#4065): named takes a newer serial, or a
+# first one, with no apply here.
+SERVED_REPORT_SECONDS = 60.0
 
 # #2309 — how often the key directory is re-checked between structural
 # applies, so a zone's key files go when its grace period ends.
@@ -145,6 +149,11 @@ def _serial_later(new: int, old: int) -> bool:
     return 0 < (new - old) % 2**32 < 2**31
 
 
+def _view_names(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """The bundle's views reduced to their names (#4053)."""
+    return [{"name": v.get("name")} for v in bundle.get("views") or [] if v.get("name")]
+
+
 def _zone_key(name: Any) -> str:
     """A zone name as the zone-state bookkeeping keys it: the bundle names
     zones with the trailing dot, and nothing here depends on whether an op
@@ -183,17 +192,26 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
     No driver produces both today; if one ever did, both are named here.
     """
     parts: list[str] = []
-    if held:
+    # A zone held for its name (#3843) was never checked or refused by anything:
+    # no change to its data will load it, so it is worded apart from the zones
+    # named-checkzone refused (#1403).
+    for group, lead in (
+        ([h for h in held if not h.name_hold], "named-checkzone refused {count}, held back until the data loads"),
+        ([h for h in held if h.name_hold], "the agent holds back {count} whose name is too long for its files"),
+    ):
+        if not group:
+            continue
         zones = "; ".join(
             f"{h.zone}{f' (view {h.view})' if h.view else ''}: {h.reason} ("
             + ("still served from its last good copy" if h.served else "not served")
             + ")"
-            for h in held
+            for h in group
         )
-        count = "a zone file" if len(held) == 1 else f"{len(held)} zone files"
+        noun = "zone file" if lead.startswith("named") else "zone"
+        count = f"a {noun}" if len(group) == 1 else f"{len(group)} {noun}s"
         parts.append(
-            f"named-checkzone refused {count}, held back until the data loads; "
-            f"every other change in this config is live: {zones}"
+            lead.format(count=count)
+            + f"; every other change in this config is live: {zones}"
         )
     if refused:
         parts.append(
@@ -494,7 +512,7 @@ class SyncLoop:
         if watched:
             seen = f" (the agent saw it exit {'once' if watched == 1 else f'{watched} times'})"
         oom = ""
-        if self.oom_watch is not None and self.oom_watch.record:
+        if self._guard.died_oom_killed or (self.oom_watch is not None and self.oom_watch.record):
             oom = (
                 " (the container's OOM killer: the daemon ran out of memory under "
                 "its limit; large RPZ blocklists are the usual cause, see "
@@ -504,6 +522,15 @@ class SyncLoop:
             f"the DNS daemon died {times} while this bundle was being applied or "
             f"within {int(SETTLE_SECONDS)} s of it{seen}{oom}"
         )
+
+    def _death_cause(self) -> dict[str, Any]:
+        """``reason`` / ``memory_limit_bytes`` for a verdict about the death
+        the startup counted (#3552): ``oom`` when the agent has evidence the
+        OOM killer did it, otherwise ``daemon_died`` (cause unknown here; the
+        control plane names it OOM when the kubelet saw one)."""
+        if self._guard.died_oom_killed:
+            return {"reason": REASON_OOM, "memory_limit_bytes": self._guard.oom_limit_bytes}
+        return {"reason": REASON_DAEMON_DIED}
 
     def _report_boot_hold(self, status: ApplyStatus) -> None:
         self.apply_status = status
@@ -532,6 +559,7 @@ class SyncLoop:
                 etag=None,
                 failed_etag=etag,
                 phase=PHASE_RELOAD,
+                **self._death_cause(),
                 error=truncate_error(
                     f"{reason}; held back at startup, so the server is not serving "
                     "until the control plane sends a bundle"
@@ -838,15 +866,19 @@ class SyncLoop:
     def _dnssec_bundle(self, bundle: dict[str, Any] | None) -> None:
         if bundle is None:
             self._dnssec_frozen: bytes | None = None
+            self._applied_views: list[dict[str, Any]] = []
             return
         self._dnssec_frozen = _freeze(
             {
                 "zones": [
                     {k: v for k, v in zone.items() if k != "records"}
                     for zone in bundle.get("zones") or []
-                ]
+                ],
             }
         )
+        # #4053 — the view names alone (a few short strings), for the startup
+        # report's read-back after a re-registration.
+        self._applied_views = _view_names(bundle)
 
     # #1373 / #2223 — the serial last reported per zone. One entry per zone,
     # created while the bundle that carried it is still alive, so it pins the
@@ -876,10 +908,20 @@ class SyncLoop:
             return
         self._boot_report_frozen = _freeze(
             {
+                # #4053 — ``served_zone_serials`` picks what to read back from
+                # named by each zone's ``type`` and by the bundle's views; with
+                # neither kept, a secondary was read as a primary and a group
+                # with views as one without.
                 "zones": [
-                    {"name": zone.get("name"), "serial": zone.get("serial")}
+                    {
+                        "name": zone.get("name"),
+                        "serial": zone.get("serial"),
+                        # Absent stays absent: it reads as "primary".
+                        **({"type": zone["type"]} if "type" in zone else {}),
+                    }
                     for zone in bundle.get("zones") or []
-                ]
+                ],
+                "views": _view_names(bundle),
             }
         )
 
@@ -954,7 +996,7 @@ class SyncLoop:
                     # Record ops moved it past the structural apply's serial.
                     zone = {**zone, "serial": served}
                 zones.append(zone)
-            self._boot_report_bundle = {"zones": zones}
+            self._boot_report_bundle = {"zones": zones, "views": self._applied_views}
             self._boot_report_attempts = 0
         self._reported_serials = {}
         self._dnssec_reported = None
@@ -982,10 +1024,11 @@ class SyncLoop:
             if etag is not None and self._quarantine.etag == etag:
                 self._quarantine.clear()
 
-    def note_daemon_death(self) -> None:
+    def note_daemon_death(self, oom_killed: bool = False) -> None:
         """The supervisor watched the daemon exit while the agent lives: the
-        evidence that lets a bundle be quarantined for it (#2019)."""
-        etag = self._guard.daemon_died()
+        evidence that lets a bundle be quarantined for it (#2019).
+        ``oom_killed``: the cgroup's OOM killer fired (#3552)."""
+        etag = self._guard.daemon_died(oom_killed=oom_killed)
         if etag is not None:
             log.error("dns_daemon_died_during_config_apply_watched", etag=etag)
 

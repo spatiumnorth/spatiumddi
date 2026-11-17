@@ -64,7 +64,7 @@ async def find_new_devices(
     stmt = (
         select(IpMacHistory, IPAddress, Subnet)
         .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-        .outerjoin(Subnet, Subnet.id == IPAddress.subnet_id)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
         .where(
             IpMacHistory.classification == args.classification,
             IpMacHistory.first_seen >= cutoff,

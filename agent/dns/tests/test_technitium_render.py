@@ -18,6 +18,7 @@ Two layers here:
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,13 @@ from spatium_dns_agent.drivers.technitium import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ops_own_every_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests drive ``apply_record_op`` against a fake that has no SOA
+    owner marker; ownership (#1775) has its own tests."""
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
+
+
 class _FakeResponse:
     """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
     body is a plain-text one (``blocked/export``), whose ``.json()`` raises
@@ -52,6 +60,14 @@ class _FakeResponse:
         if isinstance(self._body, str):
             raise ValueError("not JSON")
         return self._body
+
+
+@pytest.fixture(autouse=True)
+def _no_owner_marker_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests assert the exact calls of a pass. The owner marker (#1775)
+    adds a read of the apex SOA per Primary; it has its own tests in
+    ``test_technitium_foreign_zone_1775.py``."""
+    monkeypatch.setattr(TechnitiumDriver, "_stamp_owner_marker", lambda *a, **k: None)
 
 
 def _without_create_hold(
@@ -1749,9 +1765,10 @@ def test_forwarders_cleared_when_bundle_has_none(tmp_path: Path) -> None:
     assert calls[0][3]["forwarderProtocol"] == "Udp"
 
 
-def test_catalog_consumer_creates_secondary_catalog_zone(tmp_path: Path) -> None:
-    """The catalog zone is shipped as a catalog block, not a zone row, so
-    a consumer that doesn't create it here does nothing at all."""
+def test_catalog_consumer_block_is_ignored(tmp_path: Path) -> None:
+    """#3764 — a group member gets every zone in its bundle, so an old
+    control plane's consumer block creates no SecondaryCatalog: it is
+    treated as catalog off."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._apply_catalog(
@@ -1759,11 +1776,9 @@ def test_catalog_consumer_creates_secondary_catalog_zone(tmp_path: Path) -> None
         {"mode": "consumer", "zone_name": "cat.test.", "producer_addr": "192.0.2.9"},
         [{"zone": "p.test", "type": "Primary"}],
     )
-    assert calls[0][2] == "zones/create"
-    assert calls[0][3]["type"] == "SecondaryCatalog"
-    assert calls[0][3]["primaryNameServerAddresses"] == "192.0.2.9"
-    # A consumer must NOT stamp membership onto its own primaries.
-    assert not [c for c in calls if c[2] == "zones/options/set"]
+    assert not [c for c in calls if c[2] == "zones/create"]
+    opt = [c for c in calls if c[2] == "zones/options/set"]
+    assert opt and opt[0][3]["catalog"] == ""
 
 
 def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
@@ -1805,37 +1820,27 @@ def test_secondary_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
     producer until its SecondaryCatalog zone is deleted."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
-    d._apply_catalog(
-        "t",
-        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
-        [],
-    )
-    calls.clear()
+    # State an agent from before #3764 left behind as a consumer.
+    d._save_catalog_state({"zone_name": "cat.test", "mode": "consumer"})
     d._apply_catalog("t", None, [])
     assert _deletes(calls) == [{"zone": "cat.test"}]
 
 
-def test_catalog_role_flip_deletes_old_zone_before_creating_new(
+def test_secondary_catalog_zone_deleted_when_consumer_block_arrives(
     tmp_path: Path,
 ) -> None:
-    """Producer → consumer under the same name: the old Catalog zone
-    must be deleted first, or the SecondaryCatalog create answers
-    "already exists" and the zone keeps its old type."""
+    """#3764 — an old control plane still sending the consumer block must
+    not keep the SecondaryCatalog an earlier agent created."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
-    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, [])
-    calls.clear()
+    d._save_catalog_state({"zone_name": "cat.test", "mode": "consumer"})
     d._apply_catalog(
         "t",
         {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
         [],
     )
-    paths = [c[2] for c in calls]
     assert _deletes(calls) == [{"zone": "cat.test"}]
-    assert paths.index("zones/delete") < paths.index("zones/create")
-    assert next(c for c in calls if c[2] == "zones/create")[3]["type"] == (
-        "SecondaryCatalog"
-    )
+    assert not [c for c in calls if c[2] == "zones/create"]
 
 
 def test_catalog_same_role_reapply_deletes_nothing(tmp_path: Path) -> None:
@@ -4167,8 +4172,13 @@ def test_an_ipv4_mapped_prefix_is_refused() -> None:
 # Secondary TSIG
 
 
-def _secondary_calls(tmp_path: Path, bundle: dict[str, Any], responder: Any = None):
+def _secondary_calls(
+    tmp_path: Path, bundle: dict[str, Any], responder: Any = None, owned: list[str] | None = None
+):
     d = TechnitiumDriver(state_dir=tmp_path)
+    if owned is not None:
+        # Zones this agent put on the daemon earlier (#1775).
+        (tmp_path / "technitium-managed-zones.json").write_text(json.dumps(owned))
     _seed_token(d)
     d.daemon_running = lambda: True  # type: ignore[method-assign]
     d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
@@ -4215,6 +4225,7 @@ def test_an_existing_secondary_gets_the_key_through_options(tmp_path: Path) -> N
         tmp_path,
         {"zones": [sec], "options": {}, "tsig_keys": [_MASTER_KEY]},
         respond,
+        owned=["s.test"],
     )
     reapply = [
         c[3]
@@ -4254,22 +4265,6 @@ def test_a_secondary_whose_master_shares_no_key_is_an_apply_failure(tmp_path: Pa
     d, calls = _secondary_calls(tmp_path, {"zones": [sec], "options": {}, "tsig_keys": []})
     assert "tsigKeyName" not in next(c[3] for c in calls if c[2] == "zones/create")
     assert any("s.test" in r and "no key it grants" in r for r in d._refused_zones)
-
-
-def test_the_catalog_consumer_signs_with_its_producers_key(tmp_path: Path) -> None:
-    d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
-    d._apply_catalog(
-        "t",
-        {
-            "mode": "consumer",
-            "zone_name": "cat.test.",
-            "producer_addr": "192.0.2.9",
-            "producer_tsig_key": "k1",
-        },
-        [],
-    )
-    assert calls[0][3]["tsigKeyName"] == "k1"
 
 
 # TSIG algorithms

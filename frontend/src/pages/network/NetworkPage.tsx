@@ -334,7 +334,9 @@ export function NetworkPage() {
               <NetworkIcon className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">Network Discovery</h1>
               <span className="text-xs text-muted-foreground">
-                {devices.length} device{devices.length === 1 ? "" : "s"}
+                {listError
+                  ? "devices unavailable"
+                  : `${devices.length} device${devices.length === 1 ? "" : "s"}`}
                 {selected.size > 0 && (
                   <span className="ml-2 text-primary">
                     {selected.size} selected

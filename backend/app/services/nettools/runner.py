@@ -32,6 +32,7 @@ import structlog
 from app.services.nettools.schemas import (
     CommandResult,
     assert_target_allowed,
+    resolve_checked_target,
     validate_host,
 )
 
@@ -159,6 +160,24 @@ async def _run(
     )
 
 
+async def _checked_address(tool: str, host: str) -> tuple[str | None, CommandResult | None]:
+    """Resolve ``host`` in the backend and refuse a blocked answer.
+
+    Returns ``(address, None)`` when the name is fine: the caller hands the
+    binary the address that was checked, never the name, so the binary cannot
+    resolve it to something else. A blocked answer raises ``NetToolArgError``
+    (the handlers answer 422); a name that does not resolve is an ordinary
+    result with the reason in ``error``.
+    """
+    addr, err = await resolve_checked_target(host)
+    if addr is not None:
+        return addr, None
+    reason = err or "target could not be resolved"
+    if "blocked range" in reason:
+        raise NetToolArgError(reason)
+    return None, CommandResult(tool=tool, argv=[], available=True, error=reason)
+
+
 # ── ping ────────────────────────────────────────────────────────────
 
 
@@ -174,7 +193,11 @@ def build_ping_argv(host: str, *, count: int = 4) -> list[str]:
 
 
 async def run_ping(host: str, *, count: int = 4) -> CommandResult:
-    argv = build_ping_argv(host, count=count)
+    target = validate_host(host)
+    addr, failed = await _checked_address("ping", target)
+    if failed is not None or addr is None:
+        return failed or CommandResult(tool="ping", argv=[], available=True)
+    argv = build_ping_argv(addr, count=count)
     return await _run("ping", argv, timeout_seconds=20.0)
 
 
@@ -191,7 +214,11 @@ def build_traceroute_argv(host: str, *, max_hops: int = 20) -> list[str]:
 
 
 async def run_traceroute(host: str, *, max_hops: int = 20) -> CommandResult:
-    argv = build_traceroute_argv(host, max_hops=max_hops)
+    target = validate_host(host)
+    addr, failed = await _checked_address("traceroute", target)
+    if failed is not None or addr is None:
+        return failed or CommandResult(tool="traceroute", argv=[], available=True)
+    argv = build_traceroute_argv(addr, max_hops=max_hops)
     return await _run("traceroute", argv, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
 
 
@@ -223,7 +250,11 @@ def build_mtr_argv(host: str, *, cycles: int = 5, max_hops: int = 20) -> list[st
 
 
 async def run_mtr(host: str, *, cycles: int = 5, max_hops: int = 20) -> CommandResult:
-    argv = build_mtr_argv(host, cycles=cycles, max_hops=max_hops)
+    target = validate_host(host)
+    addr, failed = await _checked_address("mtr", target)
+    if failed is not None or addr is None:
+        return failed or CommandResult(tool="mtr", argv=[], available=True)
+    argv = build_mtr_argv(addr, cycles=cycles, max_hops=max_hops)
     return await _run("mtr", argv, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
 
 
@@ -278,6 +309,14 @@ def build_dig_argv(name: str, record_type: str, server: str | None = None) -> li
 
 
 async def run_dig(name: str, record_type: str, server: str | None = None) -> CommandResult:
+    if server is not None and server.strip():
+        # Build once with the name so a malformed server or query is refused
+        # first, then query the address that was checked instead of the name.
+        build_dig_argv(name, record_type, server)
+        addr, failed = await _checked_address("dig", server.strip())
+        if failed is not None or addr is None:
+            return failed or CommandResult(tool="dig", argv=[], available=True)
+        server = addr
     argv = build_dig_argv(name, record_type, server)
     return await _run("dig", argv, timeout_seconds=15.0)
 

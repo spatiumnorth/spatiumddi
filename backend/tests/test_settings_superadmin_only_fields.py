@@ -136,6 +136,9 @@ SUPERADMIN_ONLY_VALUES: dict[str, Any] = {
     "appliance_revoked_retention_days": 60,
     "metric_retention_days": 30,
     "log_retention_hours": 72,
+    # E911 lookup trail bounds (#3514).
+    "e911_resolution_log_retention_days": 180,
+    "e911_lookup_log_budget_per_minute": 60,
 }
 
 # One valid value per delegate-writable field.

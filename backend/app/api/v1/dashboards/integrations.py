@@ -20,6 +20,10 @@ releases what its target owned outside the target's IP space — after the
 target's ``ipam_space_id`` was changed. A release happens once, on the first
 sync after the change, so it is listed here and also shown as the target
 row's sync warning for ``_RELEASE_WARNING_WINDOW`` after it happened.
+
+A sync that keeps a subnet whose source network is gone, because an operator
+built on it (#3532), writes the same kind of audit row, so it is listed and
+shown the same way.
 """
 
 from __future__ import annotations

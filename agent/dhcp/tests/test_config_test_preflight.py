@@ -92,6 +92,8 @@ class _KeaWire:
         monkeypatch.setattr(subprocess, "run", self._run)
 
     def _send(self, sock, command, arguments=None, **kw):  # type: ignore[no-untyped-def]
+        if command == "config-hash-get":
+            return {"result": 0}  # read-only (#3779); not a command that mutates Kea
         self.commands.append((str(sock), command))
         if command == "config-reload":
             # What the daemon would read from disk at reload time.

@@ -52,7 +52,8 @@ async def test_ordinary_validation_422_body_unchanged(
     r = await client.post("/api/v1/custom-fields", headers=h, json={"name": 1})
     assert r.status_code == 422
     d = r.json()["detail"]
-    assert d and {"type", "loc", "msg", "input"} <= set(d[0])
+    assert d and {"type", "loc", "msg"} <= set(d[0])
+    assert "input" not in d[0]  # the submitted value is never echoed (#3639)
     assert d[0]["loc"][0] == "body"
     # Valid-UTF-8 undecodable-JSON bytes still render as the same text.
     r = await client.post(

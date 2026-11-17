@@ -339,11 +339,15 @@ async def test_an_absence_sweep_retracts_in_constant_queries(
 
 
 _GUARDED = ("addresses_deleted", "subnets_deleted")
+# #3532: a subnet pass retires a vanished subnet through the shared
+# ``retire_vanished_subnet``, which retracts before it deletes (pinned below).
+_RETRACTS = ("retract_address_dns", "retire_vanished_subnet")
 
 
 def _deletes_without_retracting(path: pathlib.Path) -> tuple[int, list[str]]:
     """Every function that counts an address or subnet delete must call
-    ``retract_address_dns``. Returns (functions checked, offenders)."""
+    ``retract_address_dns`` (or ``retire_vanished_subnet``, which does).
+    Returns (functions checked, offenders)."""
     checked, bad = 0, []
     for fn in ast.walk(ast.parse(path.read_text())):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -359,7 +363,7 @@ def _deletes_without_retracting(path: pathlib.Path) -> tuple[int, list[str]]:
         checked += 1
         calls = any(
             isinstance(n, ast.Call)
-            and getattr(n.func, "id", getattr(n.func, "attr", None)) == "retract_address_dns"
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) in _RETRACTS
             for n in ast.walk(fn)
         )
         if not calls:
@@ -384,6 +388,23 @@ def test_every_reconciler_retracts_before_deleting_addresses() -> None:
     # nothing.
     assert checked >= 16, checked
     assert bad == [], f"deletes addresses without retract_address_dns: {bad}"
+
+
+def test_retire_vanished_subnet_retracts_before_deleting() -> None:
+    """The guard trusts ``retire_vanished_subnet`` to retract, so pin that it
+    calls ``retract_address_dns`` before its ``db.delete``."""
+    path = pathlib.Path(__file__).resolve().parents[1] / "app/services/integration_ownership.py"
+    [fn] = [
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "retire_vanished_subnet"
+    ]
+    lines = {
+        getattr(n.func, "attr", getattr(n.func, "id", None)): n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+    }
+    assert lines["retract_address_dns"] < lines["delete"]
 
 
 def test_the_guard_catches_a_function_that_deletes_without_retracting(

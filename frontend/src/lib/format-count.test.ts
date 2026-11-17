@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatCount } from "./format-count";
+import { cidrAddressCountExact, formatCount } from "./format-count";
 
 describe("formatCount (#3322)", () => {
   it("prints a /64 and a /63 exactly and apart", () => {
@@ -17,5 +17,17 @@ describe("formatCount (#3322)", () => {
     expect(formatCount(undefined, 254)).toBe("254");
     expect(formatCount(null, null)).toBe("—");
     expect(formatCount("not-a-number", 7)).toBe("7");
+  });
+});
+
+describe("cidrAddressCountExact (#3708)", () => {
+  it("computes an IPv6 block's size exactly", () => {
+    expect(cidrAddressCountExact("fd00::/56")).toBe("4722366482869645213696");
+    expect(cidrAddressCountExact("fd00::/50")).toBe("302231454903657293676544");
+  });
+  it("computes an IPv4 size and refuses a non-CIDR", () => {
+    expect(cidrAddressCountExact("10.0.0.0/24")).toBe("256");
+    expect(cidrAddressCountExact("10.0.0.1")).toBeNull();
+    expect(cidrAddressCountExact("10.0.0.0/33")).toBeNull();
   });
 });

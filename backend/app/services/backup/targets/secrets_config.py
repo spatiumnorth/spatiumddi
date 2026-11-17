@@ -166,6 +166,33 @@ def merge_config_for_update(
         else:
             merged[key] = value
     supplied = {k for k in secrets if k in incoming and _is_new_secret_value(incoming[k])}
+    return apply_auth_mode_rules(driver, merged, supplied=supplied)
+
+
+def normalize_config_for_create(
+    driver: BackupDestination, config: dict[str, Any]
+) -> dict[str, Any]:
+    """The Add-side counterpart of :func:`merge_config_for_update` (#3696).
+
+    Runs the same one-mode and unused-credential rules over a new
+    config, so Add and Edit accept and reject the same configurations:
+    two auth modes are refused, and a credential the chosen mode never
+    uses (``https_put`` auth ``none``) is dropped, not stored.
+    """
+    secrets = secret_field_names(driver)
+    supplied = {k for k in secrets if _is_new_secret_value(config.get(k))}
+    return apply_auth_mode_rules(driver, dict(config), supplied=supplied)
+
+
+def apply_auth_mode_rules(
+    driver: BackupDestination, merged: dict[str, Any], *, supplied: set[str]
+) -> dict[str, Any]:
+    """The one place the auth-mode rules live. ``supplied`` is the set of
+    secret fields given a new value in this request. Stored rows that
+    already hold two modes stay editable: with nothing newly supplied,
+    nothing is refused and nothing is dropped except what
+    ``unused_secret_fields`` names.
+    """
     modes = [alt for alt in driver.secret_alternatives if supplied.intersection(alt)]
     if len(modes) > 1:
         names = " and ".join(f"'{alt[0]}'" for alt in modes)

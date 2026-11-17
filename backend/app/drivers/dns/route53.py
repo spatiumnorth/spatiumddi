@@ -56,6 +56,11 @@ class Route53DNSDriver(CloudDNSDriverBase):
     """Agentless driver for Amazon Route 53 hosted zones."""
 
     name: str = "route53"
+
+    def _account_identity(self, creds: dict[str, Any]) -> str | None:
+        key = str(creds.get("access_key_id") or "").strip()
+        return "key:" + key if key else None
+
     # Ordered credential fields the Add-DNS-server modal renders + the
     # probe validates as required. Route 53 is global — no region.
     credential_fields: tuple[str, ...] = ("access_key_id", "secret_access_key")

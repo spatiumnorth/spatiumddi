@@ -158,9 +158,12 @@ async def resolve_wake_params(
     Single source of truth shared by the REST endpoint and the AI operation so
     the resolution + error messages don't drift. Raises :class:`WolTargetError`.
     """
-    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415 — avoid import cycle
+    from app.models.ipam import Subnet  # noqa: PLC0415 — avoid import cycle
+    from app.services.ipam.live_address import get_live_address  # noqa: PLC0415
 
-    ip = await db.get(IPAddress, address_id)
+    # #3537: an address whose subnet is in the Trash is not found, before the
+    # MAC check, so it answers 404 like every other route keyed on its id.
+    ip = await get_live_address(db, address_id)
     if ip is None:
         raise WolTargetError("IP address not found", not_found=True)
     if not ip.mac_address:

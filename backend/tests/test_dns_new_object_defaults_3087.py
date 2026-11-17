@@ -194,7 +194,7 @@ async def test_auto_registered_group_takes_the_stored_defaults(
     """A group an agent's registration creates is seeded like a REST create."""
     monkeypatch.setenv("DNS_AGENT_KEY", "psk-3087")
     await _set_defaults(
-        db_session, dns_recursive_by_default=False, dns_default_dnssec_validation="yes"
+        db_session, dns_recursive_by_default=False, dns_default_dnssec_validation="no"
     )
     reg = await client.post(
         "/api/v1/dns/agents/register",
@@ -217,7 +217,7 @@ async def test_auto_registered_group_takes_the_stored_defaults(
         )
     ).scalar_one()
     assert group.is_recursive is False
-    assert (await _group_options(db_session, str(group.id))).dnssec_validation == "yes"
+    assert (await _group_options(db_session, str(group.id))).dnssec_validation == "no"
 
 
 # ── importers keep the source's values ───────────────────────────────────

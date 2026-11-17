@@ -7,8 +7,9 @@ older image) therefore puts that release's code on a database the newer
 release has already migrated forward. Alembic cannot migrate backwards from a
 revision it has never heard of, so the older release's migrate step fails with
 ``Can't locate revision``, its api / worker / beat wait on migrate forever,
-and nothing retries. On a single node the newer release's api even keeps
-serving behind the older UI, because the older pods never become ready.
+and nothing retries. Whether the newer release's api keeps serving behind
+the older UI meanwhile is decided by the older release's chart (#3780): a
+1.0.0 beta retires it first on a single node, so the API goes away too.
 
 :func:`check_release_can_run` answers the question before the switch, from
 the one side that CAN answer it: the newer release, which holds the whole
@@ -185,7 +186,10 @@ def judge(
             "cannot run on it: its migrate step would fail with \"Can't locate "
             'revision", and its api, worker and beat would never start. Stay on this '
             "release, or go back only with a plan to restore a copy of the database "
-            f"taken before the upgrade. See 'Rolling back' in docs/deployment/APPLIANCE.md.",
+            "taken before the upgrade. On a single node, going back to a 1.0.0 beta also "
+            "takes the API and the web UI away (#3780): boot this release again from the "
+            "console with 'spatium-upgrade-slot set-next-boot' and a reboot. "
+            "See 'Rolling back' in docs/deployment/APPLIANCE.md.",
         )
     return result(
         "unknown",

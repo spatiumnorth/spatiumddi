@@ -1,4 +1,5 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -33,6 +34,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the OPNsense web UI to mint a read-only
@@ -420,6 +422,13 @@ function RouterModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [apiKey, setApiKey] = useState(router?.api_key ?? "");
   const [apiSecret, setApiSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    router && { host: router.host, port: router.port },
+    () => setApiSecret(""),
+  );
+  const mustEnter = reask.asks(router?.api_secret_present);
   const [spaceId, setSpaceId] = useState(router?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(router?.dns_group_id ?? "");
   const [mirrorDhcpLeases, setMirrorDhcpLeases] = useState(
@@ -616,18 +625,23 @@ function RouterModal({
               required
             />
           </Field>
-          <Field label="API Secret" hint="The 'secret' line from apikey.txt.">
+          <Field
+            label="API Secret"
+            hint={mustEnter ? reask.hint : "The 'secret' line from apikey.txt."}
+          >
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiSecret}
               onChange={(e) => setApiSecret(e.target.value)}
               placeholder={
-                editing && router?.api_secret_present
-                  ? "••• stored — enter to replace"
-                  : "API secret"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && router?.api_secret_present
+                    ? "••• stored — enter to replace"
+                    : "API secret"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -769,7 +783,9 @@ function RouterModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -781,7 +797,7 @@ function RouterModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !apiSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -829,9 +845,9 @@ function DeleteRouterModal({
           <span>I understand.</span>
         </label>
         {error && (
-          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

@@ -104,6 +104,9 @@ async def _recount_subnets(db: AsyncSession) -> int:
             changes.append({"id": str(sid), "a": new_alloc, "u": new_util})
 
     if changes:
+        # Id order: the same lock order every incremental recount takes
+        # (``recount_subnets_and_blocks``), so the two never deadlock (#3345).
+        changes.sort(key=lambda c: c["id"])
         await db.execute(
             text(
                 "UPDATE subnet SET allocated_ips = :a, utilization_percent = :u "
@@ -190,6 +193,9 @@ async def _recount_blocks(db: AsyncSession) -> int:
             changes.append({"id": key, "a": alloc, "t": new_total, "u": new_util})
 
     if changes:
+        # Id order: the lock order of every incremental recount
+        # (``_update_blocks_utilization``), so the two never deadlock (#3345).
+        changes.sort(key=lambda c: c["id"])
         await db.execute(
             text(
                 "UPDATE ip_block SET allocated_ips = :a, total_ips = :t, "

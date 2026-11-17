@@ -19,7 +19,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
-from app.api.v1.dhcp.scopes import validate_dhcp_options
+from app.api.v1.dhcp.scopes import normalize_dhcp_options, validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_permission, require_resource_permission
 from app.core.update_nulls import changed_keys, snapshot
@@ -130,7 +130,7 @@ async def create_template(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A template with that name exists")
-    options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
+    options = normalize_dhcp_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(db, options, group_id=group_id, address_family=body.address_family)
     tpl = DHCPOptionTemplate(
         group_id=group_id,
@@ -189,7 +189,7 @@ async def update_template(
     if "options" in payload or family != tpl.address_family:
         # The stored map is normalised too: a template saved before #1228
         # may carry an alias (``domain-name-servers``) the check rejects.
-        options = normalize_options(
+        options = normalize_dhcp_options(
             payload["options"] if "options" in payload else tpl.options,
             raw_codes=await group_raw_codes(db, tpl.group_id),
         )

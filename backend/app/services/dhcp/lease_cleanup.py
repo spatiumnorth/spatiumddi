@@ -19,7 +19,9 @@ out over a scope's leases. The subnet resolvers live here too (moved off
 the task re-exports them for its own sweep).
 
 Transaction discipline: nothing here commits or flushes — the caller owns the
-transaction so lease teardown lands atomically with the scope stamp / audit.
+transaction so lease teardown lands atomically with the scope stamp / audit —
+except ``tear_down_scope_leases``, which runs after a scope soft-delete has
+committed and commits one batch at a time (#3733).
 """
 
 from __future__ import annotations
@@ -39,7 +41,9 @@ from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dns.record_ops import purge_trashed_address_records
+from app.services.e911.address_bindings import keep_row_if_bound
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -209,6 +213,7 @@ async def purge_lease(
     subnet_id: uuid.UUID | None | Any = _UNSET,
     now: datetime | None = None,
     spare_if_peer_holds: bool = True,
+    touched_subnets: set[uuid.UUID] | None = None,
 ) -> bool:
     """Tear one lease + its ``auto_from_lease`` IPAM mirror down.
 
@@ -233,10 +238,24 @@ async def purge_lease(
     go, and relying on the order of deletes and autoflush to get there
     would be an accident rather than a rule.
 
-    Returns whether an IPAM mirror row was removed. Does not commit/flush.
+    Removing a mirror changes its subnet's (and blocks') utilization (#3345).
+    A batch caller passes ``touched_subnets`` and recounts once itself with
+    ``recount_subnets_and_blocks``; with none, the single teardown recounts
+    its own subnet before returning.
+
+    Returns whether an IPAM mirror row was removed. Does not commit.
+
+    The lease row is locked before the mirror and its zones (#3617, the order
+    in ``app.services.lock_order``): it was only written at the end, after
+    them. A caller tearing several leases down locks all of their rows first
+    (they are then locked here again for free).
     """
+    from app.services.lock_order import lock_lease_rows  # noqa: PLC0415
+
     if now is None:
         now = datetime.now(UTC)
+    if lease.id is not None:
+        await lock_lease_rows(db, DHCPLease.id == lease.id)
     sid = await _resolve_lease_subnet_id(db, lease) if subnet_id is _UNSET else subnet_id
 
     mirror_removed = False
@@ -258,7 +277,13 @@ async def purge_lease(
             )
         ).scalar_one_or_none()
         if mirror is not None:
-            subnet = await db.get(Subnet, sid)
+            # Read in the Trash too: a subnet delete tears its scopes' leases
+            # down after the subnet is stamped (#3744).
+            subnet = (
+                await db.execute(
+                    select(Subnet).where(Subnet.id == sid).execution_options(include_deleted=True)
+                )
+            ).scalar_one_or_none()
             if subnet is not None:
                 # Revoke DDNS BEFORE deleting the mirror — it reads
                 # dns_record_id / hostname off the row. Best-effort.
@@ -273,17 +298,28 @@ async def purge_lease(
                         error=str(exc),
                     )
             await purge_trashed_address_records(db, [mirror.id])  # #3186
-            await db.delete(mirror)
+            # An address an E911 binding names stays (#3899), as a free row.
+            if not await keep_row_if_bound(db, mirror):
+                await db.delete(mirror)
             mirror_removed = True
+            if touched_subnets is not None:
+                touched_subnets.add(sid)
 
     # Stamp history before the row goes away. ``removed`` signals
     # "operator/server purged the lease" vs ``expired`` (time-based sweep).
     record_lease_history(db, lease, lease_state="removed", expired_at=now)
     await db.delete(lease)
+    if mirror_removed and touched_subnets is None and sid is not None:
+        await recount_subnets_and_blocks(db, [sid])
     return mirror_removed
 
 
-async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tuple[int, int]:
+async def delete_leases_for_scope(
+    db: AsyncSession,
+    scope_id: uuid.UUID,
+    *,
+    touched_subnets: set[uuid.UUID] | None = None,
+) -> tuple[int, int]:
     """Purge every dynamic lease that belongs to ``scope_id``.
 
     Enumerates strictly by ``DHCPLease.scope_id`` (all states). A scope is
@@ -294,21 +330,242 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     ``scope_id`` still points at it; the post-delete race (a poll that nulled
     ``scope_id``) is handled by the pull-leases zero-wire floor guard.
 
+    The freed mirrors move their subnets' counters (#3345). A caller tearing
+    several scopes down in one transaction passes ``touched_subnets`` and
+    recounts once itself, last, with ``recount_subnets_and_blocks``: a recount
+    per scope would lock one scope's subnet and block chain before the next
+    scope's subnet, out of the one order every recount takes (#3354). With
+    none, this recounts what it freed before returning.
+
     Returns ``(leases_removed, mirrors_removed)`` for audit / preview.
     """
+    # #3617: every lease row first, then the subnet's lease mirrors, then
+    # the zones their DDNS lives in, each in id order, before the per-lease
+    # teardown writes any of them (``app.services.lock_order``).
+    from app.services.lock_order import lock_lease_rows, lock_zones_for_subnets  # noqa: PLC0415
+
+    await lock_lease_rows(db, DHCPLease.scope_id == scope_id)
     leases = list(
         (await db.execute(select(DHCPLease).where(DHCPLease.scope_id == scope_id))).scalars().all()
     )
+    scope_subnet_id = (
+        await db.execute(
+            select(DHCPScope.subnet_id)
+            .where(DHCPScope.id == scope_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one_or_none()
+    if leases and scope_subnet_id is not None:
+        await db.execute(
+            select(IPAddress.id)
+            .where(IPAddress.subnet_id == scope_subnet_id, IPAddress.auto_from_lease.is_(True))
+            .order_by(IPAddress.id)
+            .with_for_update()
+        )
+        await lock_zones_for_subnets(db, [scope_subnet_id])
     now = datetime.now(UTC)
     leases_removed = 0
     mirrors_removed = 0
+    touched: set[uuid.UUID] = set() if touched_subnets is None else touched_subnets
     for lease in leases:
         # Every copy of every lease in the scope is going, so no copy's peer
         # outlives it — see ``purge_lease(spare_if_peer_holds=...)``.
-        if await purge_lease(db, lease, now=now, spare_if_peer_holds=False):
+        if await purge_lease(
+            db, lease, now=now, spare_if_peer_holds=False, touched_subnets=touched
+        ):
             mirrors_removed += 1
         leases_removed += 1
+    if touched_subnets is None:
+        await recount_subnets_and_blocks(db, touched)  # #3345
     return leases_removed, mirrors_removed
+
+
+# Leases torn down per transaction by a scope soft-delete (#3733). Each batch
+# locks its lease rows, then the address rows and zones their teardown writes,
+# purges them and commits, so a lease-events batch that renews one of them waits
+# for one batch (about 100 ms a lease with DDNS on), never for the whole scope.
+SCOPE_DELETE_BATCH = 25
+
+# Wall-clock budget for the teardown a scope soft-delete runs in its request,
+# once the scope is in the Trash. Kept well under the 30 s statement limit
+# (asyncpg ``command_timeout``) and typical proxy timeouts: at 20 s the walked
+# deletes answered in 23-30 s (#3772). Unlike the server delete's bound
+# (#2290, whose remainder cascades away), the rest here goes to a task. ``app.tasks.dhcp_lease_cleanup.tear_down_trashed_scope_leases``
+# tears the rest down, enqueued when the request stops short and run again by
+# the lease sweep for any scope in the Trash that still has leases.
+SCOPE_DELETE_INLINE_DEADLINE_S = 10.0
+
+
+async def scope_lease_counts(db: AsyncSession, scope_id: uuid.UUID) -> tuple[int, int]:
+    """``(leases, lease mirrors)`` a scope delete tears down: the scope's lease
+    rows, and the ``auto_from_lease`` rows of its subnet at their addresses.
+    Counted for the audit row before the teardown runs (#3733)."""
+    leases = (
+        await db.execute(
+            select(func.count()).select_from(DHCPLease).where(DHCPLease.scope_id == scope_id)
+        )
+    ).scalar_one()
+    subnet_id = (
+        select(DHCPScope.subnet_id)
+        .where(DHCPScope.id == scope_id)
+        .execution_options(include_deleted=True)
+        .scalar_subquery()
+    )
+    mirrors = (
+        await db.execute(
+            select(func.count())
+            .select_from(IPAddress)
+            .where(
+                IPAddress.subnet_id == subnet_id,
+                IPAddress.auto_from_lease.is_(True),
+                IPAddress.address.in_(
+                    select(DHCPLease.ip_address).where(DHCPLease.scope_id == scope_id)
+                ),
+            )
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    return leases, mirrors
+
+
+async def tear_down_scope_leases(
+    db: AsyncSession,
+    scope_id: uuid.UUID,
+    *,
+    deadline_s: float | None = None,
+) -> tuple[int, int, bool]:
+    """Tear down the leases of a scope in the Trash, one committed batch at a
+    time (#3733). Returns ``(leases_removed, mirrors_removed, done)``.
+
+    ``delete_leases_for_scope`` locks every lease row of the scope first and
+    holds them, with the scope's mirrors and zones, to the caller's commit
+    (#3617). Inside a scope delete that is the whole teardown, about 100 ms a
+    lease with DDNS on: every lease-events batch renewing one of the scope's
+    leases waited for it, and the API cut those waits at 30 s. Here each batch
+    of ``SCOPE_DELETE_BATCH`` leases takes the #3617 order inside its own
+    transaction (the lease rows by id, then the address rows and zones of
+    their mirrors' records, ``lock_zones_for_lease_mirrors``), tears them down
+    and commits.
+
+    Each batch reads the scope row ``FOR SHARE`` after its lease rows and
+    holds it to its commit (#3777): a Trash restore un-stamps the row (an
+    UPDATE, which conflicts with FOR SHARE but not with a lease-events batch's
+    FOR KEY SHARE), so it waits for the batch in flight, at most one, and the
+    next batch finds the scope live and stops. Without it a restore that
+    committed mid-batch still lost that batch's leases. The restore takes its
+    scope rows before the zones it writes, so it never holds a zone this batch
+    waits for.
+
+    Runs only while the scope is in the Trash, since the lease-events handler
+    takes no event for a scope there: no batch can bring a lease back behind
+    the teardown. It stops when the scope is restored (the next events
+    re-populate its leases) or purged (the purge tears the rest down itself).
+    ``done`` is False only when ``deadline_s`` ran out first.
+
+    COMMITS each batch: the caller commits its own work before calling.
+    """
+    from app.services.lock_order import lock_zones_for_lease_mirrors  # noqa: PLC0415
+
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+    leases_removed = 0
+    mirrors_removed = 0
+
+    def _scope_state() -> Any:
+        return (
+            select(DHCPScope.subnet_id, DHCPScope.deleted_at)
+            .where(DHCPScope.id == scope_id)
+            .execution_options(include_deleted=True)
+        )
+
+    while True:
+        # A plain read first, so a restored or purged scope stops the loop
+        # without locking any of its lease rows; re-read under the lock below.
+        scope = (await db.execute(_scope_state())).one_or_none()
+        if scope is None or scope.deleted_at is None:
+            await db.commit()  # ends the read; a rollback would expire the caller's rows
+            return leases_removed, mirrors_removed, True
+        if deadline is not None and time.monotonic() >= deadline:
+            await db.commit()  # ends the read; a rollback would expire the caller's rows
+            return leases_removed, mirrors_removed, False
+        ids = (
+            (
+                await db.execute(
+                    select(DHCPLease.id)
+                    .where(DHCPLease.scope_id == scope_id)
+                    .order_by(DHCPLease.id)
+                    .limit(SCOPE_DELETE_BATCH)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not ids:
+            await db.commit()  # ends the read; a rollback would expire the caller's rows
+            return leases_removed, mirrors_removed, True
+        # #3777: the scope row FOR SHARE, after the lease rows (step 1, then the
+        # scope, as a lease-events batch takes it) and held to the commit. A
+        # restore's un-stamp waits for this batch, or this batch waits for the
+        # restore and reads the scope live. Taken before the lease rows it would
+        # deadlock with a Trash purge, which locks them and then deletes the row.
+        scope = (
+            await db.execute(_scope_state().with_for_update(read=True, of=DHCPScope))
+        ).one_or_none()
+        if scope is None or scope.deleted_at is None:
+            await db.commit()  # nothing written; ends the locks
+            return leases_removed, mirrors_removed, True
+        await lock_zones_for_lease_mirrors(db, ids)
+        batch = list(
+            (
+                await db.execute(
+                    select(DHCPLease).where(DHCPLease.id.in_(ids)).order_by(DHCPLease.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        now = datetime.now(UTC)
+        touched: set[uuid.UUID] = set()
+        for lease in batch:
+            # Every lease of the scope is going, so no copy's peer outlives
+            # it (as in ``delete_leases_for_scope``). The subnet is passed:
+            # the scope-FK resolver no longer sees a scope in the Trash.
+            if await purge_lease(
+                db,
+                lease,
+                subnet_id=scope.subnet_id,
+                now=now,
+                spare_if_peer_holds=False,
+                touched_subnets=touched,
+            ):
+                mirrors_removed += 1
+            leases_removed += 1
+        await recount_subnets_and_blocks(db, touched, include_deleted=True)  # #3345
+        await db.commit()
+
+
+async def trashed_scopes_with_leases(
+    db: AsyncSession, *, limit: int = 100, trashed_before: datetime | None = None
+) -> list[uuid.UUID]:
+    """Scopes in the Trash that still have lease rows, oldest delete first
+    (#3733): what a scope delete's own teardown left behind, its follow-up
+    task lost or the scope larger than one task run. ``trashed_before``
+    leaves out the scopes trashed since then, whose own teardown may still
+    be running."""
+    conditions = [
+        DHCPScope.deleted_at.is_not(None),
+        exists().where(DHCPLease.scope_id == DHCPScope.id),
+    ]
+    if trashed_before is not None:
+        conditions.append(DHCPScope.deleted_at < trashed_before)
+    rows = await db.execute(
+        select(DHCPScope.id)
+        .where(*conditions)
+        .order_by(DHCPScope.deleted_at, DHCPScope.id)
+        .limit(limit)
+        .execution_options(include_deleted=True)
+    )
+    return list(rows.scalars().all())
 
 
 # Leases torn down per round trip by ``delete_leases_for_server``. Each
@@ -364,7 +621,31 @@ async def delete_leases_for_server(
     subnet_cache = await _load_subnet_cache(db)
     leases_removed = 0
     mirrors_removed = 0
+    touched: set[uuid.UUID] = set()
     capped = False
+    # #3617: the rows this call may tear down, locked by id before the first
+    # mirror is: batch by batch, each batch's leases came after the last
+    # batch's mirrors (``app.services.lock_order``). Ids only, so the
+    # identity map still holds one batch at a time.
+    from app.services.lock_order import lock_zones_for_lease_mirrors  # noqa: PLC0415
+
+    locked_lease_ids = (
+        (
+            await db.execute(
+                select(DHCPLease.id)
+                .where(DHCPLease.server_id == server_id)
+                .order_by(DHCPLease.id)
+                .limit(max_leases)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # #3687: and the zones of the mirrors' records, trashed ones too, before
+    # the first purge: lease i's purge deletes its trashed records in any
+    # zone, and a later lease's revoke then locks and bumps its own.
+    await lock_zones_for_lease_mirrors(db, locked_lease_ids)
     while leases_removed < max_leases:
         batch = list(
             (
@@ -385,7 +666,7 @@ async def delete_leases_for_server(
                 capped = True
                 break
             sid = await _resolve_lease_subnet_id(db, lease, subnet_cache)
-            if await purge_lease(db, lease, subnet_id=sid, now=now):
+            if await purge_lease(db, lease, subnet_id=sid, now=now, touched_subnets=touched):
                 mirrors_removed += 1
             leases_removed += 1
         await db.flush()
@@ -395,6 +676,7 @@ async def delete_leases_for_server(
             break
     else:
         capped = True
+    await recount_subnets_and_blocks(db, touched)  # #3345
     if capped:
         remaining = (
             await db.execute(
@@ -430,9 +712,16 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
     skipped, and so is anything seen within ``ORPHAN_MIRROR_GRACE`` so a mirror
     mid-flight with its lease write is never raced.
 
-    Returns the number of mirror rows freed. Does not commit.
+    Returns the number of mirror rows freed. Does not commit; recounts the
+    touched subnets and their blocks in the same transaction (#3345).
     """
+    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+    from app.services.lock_order import (  # noqa: PLC0415
+        address_ids_of_records,
+        lock_addresses_before,
+        lock_zones_for_addresses,
+    )
 
     cutoff = datetime.now(UTC) - ORPHAN_MIRROR_GRACE
     conds = [getattr(IPAddress, c).is_(None) for c in _INTEGRATION_OWNER_COLUMNS]
@@ -454,6 +743,36 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
         .scalars()
         .all()
     )
+    # #3687: every zone the batch's records sit in, trashed ones too, before
+    # the first purge; the per-row revoke below then locks nothing new.
+    # #3690: after the address rows the sweep writes (the mirrors, and any
+    # row linked to a record it deletes), ascending id, as a permanent zone
+    # delete takes them (#3691); holding a zone and then writing one of them
+    # deadlocks with it.
+    row_ids = sorted(row.id for row in rows)
+
+    async def _written() -> set[Any]:
+        record_ids = (
+            (
+                await db.execute(
+                    select(DNSRecord.id)
+                    .where(
+                        DNSRecord.ip_address_id.in_(row_ids),
+                        DNSRecord.auto_generated.is_(True),
+                    )
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return set(row_ids) | await address_ids_of_records(db, record_ids)
+
+    async def _zones() -> None:
+        await lock_zones_for_addresses(db, retracting=rows)
+
+    if rows:
+        await lock_addresses_before(db, _written, _zones)
     await purge_trashed_address_records(db, [row.id for row in rows])  # #3186
     for row in rows:
         if row.subnet is not None:
@@ -466,6 +785,8 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
                     error=str(exc),
                 )
         await db.delete(row)
+    # #3345 — the freed mirrors no longer count toward their subnets.
+    await recount_subnets_and_blocks(db, {row.subnet_id for row in rows})
     return len(rows)
 
 
@@ -477,6 +798,9 @@ __all__ = [
     "delete_leases_for_scope",
     "peer_holds_active_lease",
     "purge_lease",
+    "scope_lease_counts",
+    "tear_down_scope_leases",
+    "trashed_scopes_with_leases",
     "_load_subnet_cache",
     "_resolve_lease_subnet_id",
 ]

@@ -9,13 +9,21 @@ import {
   type IPAMTemplate,
   type IPAMTemplateAppliesTo,
   type IPAMTemplateCreate,
+  type TemplateReapplyAllResponse,
   type IPAMTemplateUpdate,
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { parseTtlInput } from "@/lib/dnsNames";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  disabledBecause,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -145,6 +153,48 @@ export function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
   };
 }
 
+// Edit reads the template when it opens (#3863): the row the page holds is
+// from a list that may predate another client's change, and the form is
+// seeded once.
+function EditTemplate({
+  tpl,
+  error,
+  saving,
+  onClose,
+  onSave,
+}: {
+  tpl: IPAMTemplate;
+  error?: string;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (form: TemplateForm, base: IPAMTemplate) => void;
+}) {
+  const fresh = useFreshRow<IPAMTemplate>(tpl, () =>
+    ipamApi.getTemplate(tpl.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit IPAM Template"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  const base = fresh.row;
+  return (
+    <TemplateEditor
+      mode="edit"
+      initial={formFromTemplate(base)}
+      error={error}
+      saving={saving}
+      onClose={onClose}
+      onSave={(f) => onSave(f, base)}
+    />
+  );
+}
+
 type TabKey = "general" | "stamp" | "ddns" | "children";
 
 function TemplateEditor({
@@ -219,9 +269,9 @@ function TemplateEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex flex-wrap gap-1 border-b">
@@ -536,25 +586,70 @@ function TemplateEditor({
   );
 }
 
-function ReapplyConfirmModal({
+export function ReapplyConfirmModal({
   template,
   onClose,
   onConfirm,
   busy,
+  result,
+  error,
 }: {
   template: IPAMTemplate;
   onClose: () => void;
   onConfirm: () => void;
   busy: boolean;
+  result: TemplateReapplyAllResponse | null;
+  error: string;
 }) {
   const [typed, setTyped] = useState("");
+  if (result) {
+    return (
+      <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
+        <div className="space-y-3 text-sm" role="status">
+          <p>
+            Reapplied {result.instances_processed} of {result.instances_total}{" "}
+            instance{result.instances_total === 1 ? "" : "s"}
+            {result.instances_skipped > 0
+              ? `; skipped ${result.instances_skipped}, each left as it was`
+              : ""}
+            .
+          </p>
+          {result.cap_reached && (
+            <p className="text-amber-600">
+              More instances exist than the 200 handled per call; run Reapply
+              again for the rest.
+            </p>
+          )}
+          {result.skipped.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5">
+              {result.skipped.map((sk) => (
+                <li key={sk.target_id}>
+                  <span className="font-mono text-xs">{sk.network}</span>:{" "}
+                  {sk.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex justify-end border-t pt-3">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
       <div className="space-y-3 text-sm">
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call.
+          overrides. Capped at 200 instances per call. An instance whose child
+          layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}
@@ -565,6 +660,11 @@ function ReapplyConfirmModal({
           onChange={(e) => setTyped(e.target.value)}
           className={inputCls}
         />
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
             onClick={onClose}
@@ -612,7 +712,7 @@ export function IPAMTemplatesPage() {
   const [editor, setEditor] = useState<
     | null
     | { mode: "create"; initial: TemplateForm }
-    | { mode: "edit"; tpl: IPAMTemplate; initial: TemplateForm }
+    | { mode: "edit"; tpl: IPAMTemplate }
   >(null);
   const [editorErr, setEditorErr] = useState<string>("");
   const [reapplyTarget, setReapplyTarget] = useState<IPAMTemplate | null>(null);
@@ -665,12 +765,14 @@ export function IPAMTemplatesPage() {
   const reapplyMut = useMutation({
     mutationFn: (id: string) => ipamApi.reapplyAllTemplate(id),
     onSuccess: () => {
-      setReapplyTarget(null);
       qc.invalidateQueries({ queryKey: ["ipam-templates"] });
     },
   });
 
-  function handleSave(form: TemplateForm) {
+  // `base` is the template as read when the editor opened (#3863): the Save
+  // sends only what the operator changed against it, so a field another
+  // client set since the list loaded is not put back.
+  function handleSave(form: TemplateForm, base?: IPAMTemplate) {
     setEditorErr("");
     let payload: IPAMTemplateCreate;
     try {
@@ -679,29 +781,43 @@ export function IPAMTemplatesPage() {
       setEditorErr(e instanceof Error ? e.message : String(e));
       return;
     }
-    if (editor?.mode === "edit") {
-      const { id } = editor.tpl;
-      const update: IPAMTemplateUpdate = {
-        name: payload.name,
-        description: payload.description,
-        tags: payload.tags,
-        custom_fields: payload.custom_fields,
-        dns_group_id: payload.dns_group_id ?? null,
-        dns_zone_id: payload.dns_zone_id ?? null,
-        dhcp_group_id: payload.dhcp_group_id ?? null,
-        ddns_enabled: payload.ddns_enabled,
-        ddns_hostname_policy: payload.ddns_hostname_policy,
-        ddns_domain_override: payload.ddns_domain_override ?? null,
-        ddns_ttl: payload.ddns_ttl ?? null,
-        child_layout: payload.child_layout ?? null,
-        clear_dns_group_id: payload.dns_group_id == null,
-        clear_dhcp_group_id: payload.dhcp_group_id == null,
-        clear_dns_zone_id: payload.dns_zone_id == null,
-        clear_child_layout: payload.child_layout == null,
-        clear_ddns_domain_override: payload.ddns_domain_override == null,
-        clear_ddns_ttl: payload.ddns_ttl == null,
-      };
-      updateMut.mutate({ id, body: update });
+    if (editor?.mode === "edit" && base) {
+      const before = toCreatePayload(formFromTemplate(base));
+      const diff: IPAMTemplateUpdate = changedFields(
+        before as unknown as Record<string, unknown>,
+        {
+          name: payload.name,
+          description: payload.description,
+          tags: payload.tags,
+          custom_fields: payload.custom_fields,
+          dns_group_id: payload.dns_group_id ?? null,
+          dns_zone_id: payload.dns_zone_id ?? null,
+          dhcp_group_id: payload.dhcp_group_id ?? null,
+          ddns_enabled: payload.ddns_enabled,
+          ddns_hostname_policy: payload.ddns_hostname_policy,
+          ddns_domain_override: payload.ddns_domain_override ?? null,
+          ddns_ttl: payload.ddns_ttl ?? null,
+          child_layout: payload.child_layout ?? null,
+        },
+      );
+      // A changed field that is now empty is a clear, not a no-op.
+      if ("dns_group_id" in diff && diff.dns_group_id == null)
+        diff.clear_dns_group_id = true;
+      if ("dhcp_group_id" in diff && diff.dhcp_group_id == null)
+        diff.clear_dhcp_group_id = true;
+      if ("dns_zone_id" in diff && diff.dns_zone_id == null)
+        diff.clear_dns_zone_id = true;
+      if ("child_layout" in diff && diff.child_layout == null)
+        diff.clear_child_layout = true;
+      if ("ddns_domain_override" in diff && diff.ddns_domain_override == null)
+        diff.clear_ddns_domain_override = true;
+      if ("ddns_ttl" in diff && diff.ddns_ttl == null)
+        diff.clear_ddns_ttl = true;
+      if (Object.keys(diff).length === 0) {
+        setEditor(null);
+        return;
+      }
+      updateMut.mutate({ id: base.id, body: diff });
       return;
     }
     createMut.mutate(payload);
@@ -827,10 +943,13 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-right">
                     <button
                       onClick={() => setReapplyTarget(t)}
-                      disabled={t.applied_count === 0}
                       className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
                       title="Reapply across all instances"
                       aria-label="Reapply across all instances"
+                      {...disabledBecause(
+                        t.applied_count === 0,
+                        "Not applied anywhere yet: nothing to reapply.",
+                      )}
                       {...writeGate}
                     >
                       <RefreshCw className="h-3 w-3" />
@@ -838,11 +957,7 @@ export function IPAMTemplatesPage() {
                     <button
                       onClick={() => {
                         setEditorErr("");
-                        setEditor({
-                          mode: "edit",
-                          tpl: t,
-                          initial: formFromTemplate(t),
-                        });
+                        setEditor({ mode: "edit", tpl: t });
                       }}
                       className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label={`Edit template ${t.name}`}
@@ -874,9 +989,21 @@ export function IPAMTemplatesPage() {
           </table>
         </div>
 
-        {editor && (
+        {editor?.mode === "edit" && (
+          <EditTemplate
+            tpl={editor.tpl}
+            error={editorErr}
+            saving={updateMut.isPending}
+            onClose={() => {
+              setEditor(null);
+              setEditorErr("");
+            }}
+            onSave={handleSave}
+          />
+        )}
+        {editor?.mode === "create" && (
           <TemplateEditor
-            mode={editor.mode}
+            mode="create"
             initial={editor.initial}
             error={editorErr}
             saving={createMut.isPending || updateMut.isPending}
@@ -891,9 +1018,18 @@ export function IPAMTemplatesPage() {
         {reapplyTarget && (
           <ReapplyConfirmModal
             template={reapplyTarget}
-            onClose={() => setReapplyTarget(null)}
+            onClose={() => {
+              setReapplyTarget(null);
+              reapplyMut.reset();
+            }}
             onConfirm={() => reapplyMut.mutate(reapplyTarget.id)}
             busy={reapplyMut.isPending}
+            result={reapplyMut.data ?? null}
+            error={
+              reapplyMut.isError
+                ? formatApiError(reapplyMut.error, "Reapply failed")
+                : ""
+            }
           />
         )}
       </div>

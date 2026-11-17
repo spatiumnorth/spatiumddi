@@ -54,7 +54,7 @@ from app.services.dns.tsig import (
     resolve_group_transfer_key,
     resolve_transfer_vip,
     resolve_view_transfer_key,
-    transfer_fallback_hosts,
+    transfer_fallback_kwargs,
     transfer_needs_tsig,
 )
 from app.services.technitium.rdata import (
@@ -97,6 +97,9 @@ class PushResult:
     # #2667 — agent-managed server: the missing rows were queued as record
     # ops for the agent to apply, not applied on the wire by us.
     queued_for_agent: bool = False
+    # #3671 — DB rows already on the server, counted by the same comparison
+    # that picks the candidates: the zone's records that need no push.
+    already_matched: int = 0
 
 
 @dataclass
@@ -495,12 +498,30 @@ def without_server_apex_ns(
 
 async def _fallback_kwargs(db: AsyncSession, server: Any) -> dict[str, Any]:
     """``pull_zone_records`` kwargs naming the server's own pod address to retry
-    on a refused connection behind the appliance DNS VIP (#1470); empty when
-    it cannot apply."""
+    on a refused connection behind the appliance DNS VIP (#1470), or when its
+    ``host`` does not resolve (#3757); empty when neither applies."""
     if not transfer_needs_tsig(server):
         return {}
-    hosts = transfer_fallback_hosts(server, await resolve_transfer_vip(db))
-    return {"fallback_hosts": hosts} if hosts else {}
+    return dict(transfer_fallback_kwargs(server, await resolve_transfer_vip(db)))
+
+
+# Zone types a server does not hold authoritatively (#3758). A forward zone is
+# a conditional forwarder and a stub holds only the delegation's NS / SOA, so
+# an AXFR of either is refused (NOTAUTH) — not a fault, there is simply no zone
+# data to read, diff or import.
+NON_AUTHORITATIVE_ZONE_TYPES = frozenset({"forward", "stub"})
+
+
+def non_authoritative_reason(zone: DNSZone) -> str | None:
+    """Why ``zone`` can't be read from a server, or None when it can."""
+    zone_type = zone.zone_type or "primary"
+    if zone_type not in NON_AUTHORITATIVE_ZONE_TYPES:
+        return None
+    what = "a conditional forwarder" if zone_type == "forward" else "a stub zone"
+    return (
+        f"This is {what}: the server does not hold it authoritatively, so there is "
+        "no zone data to transfer and nothing to compare."
+    )
 
 
 async def _resolve_primary_and_driver(
@@ -525,6 +546,8 @@ async def _resolve_primary_and_driver(
     walking a group's servers; it takes the primary's place for everything
     below. Without it the zone's primary is used.
     """
+    if (reason := non_authoritative_reason(zone)) is not None:
+        raise ValueError(reason)
     primary = server if server is not None else await resolve_primary_server(db, zone)
     if primary is None:
         raise ValueError(
@@ -781,14 +804,29 @@ async def pull_zone_from_server(
 _PUSHABLE_TYPES = frozenset({"A", "AAAA", "CNAME", "MX", "TXT", "PTR", "SRV", "NS", "TLSA"})
 
 
+#: #3817 — an agentless push of more than this many records is queued as
+#: record ops instead of being sent inside the request. Every agentless driver
+#: but Windows DNS makes one provider call per record, so a zone of thousands
+#: of records outruns the reverse proxy's timeout; the ``pending`` ops are
+#: drained, with retry and backoff, by ``apply_pending_agentless_ops``.
+INLINE_PUSH_MAX_RECORDS = 200
+
+
 async def _queue_for_agent(
     db: AsyncSession,
     server: Any,
     zone: DNSZone,
     rows: list[DNSRecord],
     payloads: list[dict[str, Any]],
+    *,
+    agentless: bool = False,
 ) -> PushResult:
-    """Agent-managed server: hand the missing rows to its record-op queue (#2667).
+    """Hand the missing rows to the server's record-op queue (#2667).
+
+    An agent-managed server applies them on its next poll. With
+    ``agentless`` (#3817, a zone too large to push inside the request) the
+    ``pending`` rows are drained by the agentless retry sweep instead, so
+    there is no agent to wake.
 
     The control plane has no RFC 2136 / driver path to an agent-managed
     server (the agent applies ops against loopback ``named``), so calling
@@ -857,7 +895,8 @@ async def _queue_for_agent(
             ]
         )
         await db.flush()
-        collect_wake(dns_server_channel(server.id))
+        if not agentless:
+            collect_wake(dns_server_channel(server.id))
     return PushResult(
         candidates=len(rows),
         pushed=len(pushed_records),
@@ -877,6 +916,7 @@ async def _additive_push(
     *,
     apply: bool,
     skip_apex_ns: bool = False,
+    inline_only: bool = False,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
     the driver. Errors are collected, not raised, so one bad record
@@ -900,6 +940,7 @@ async def _additive_push(
     # index after dispatch.
     pushable_types = _syncable_types(driver, _PUSHABLE_TYPES)
     candidate_rows: list[DNSRecord] = []
+    already_matched = 0
     for row in db_rows:
         rtype = row.record_type.upper()
         if rtype not in pushable_types:
@@ -909,6 +950,7 @@ async def _additive_push(
         if skip_apex_ns and is_apex_ns(row, zone.name):
             continue
         if _key(row, zone.name, relative_targets=rel) in on_wire_keys:
+            already_matched += 1
             continue
         candidate_rows.append(row)
 
@@ -930,6 +972,7 @@ async def _additive_push(
             pushed=candidates,
             pushed_records=pushed_records,
             push_errors=push_errors,
+            already_matched=already_matched,
         )
 
     # #3004: nothing to send takes no serial. The bump used to come before
@@ -941,7 +984,11 @@ async def _additive_push(
     # agentless push, in ``_queue_for_agent`` for a new agent op.
     if not candidate_rows:
         return PushResult(
-            candidates=0, pushed=0, pushed_records=pushed_records, push_errors=push_errors
+            candidates=0,
+            pushed=0,
+            pushed_records=pushed_records,
+            push_errors=push_errors,
+            already_matched=already_matched,
         )
 
     # Each op carries the complete DB set at its (name, type), as the record
@@ -968,8 +1015,18 @@ async def _additive_push(
     ]
     await stamp_rrsets_for_ops(db, zone, payloads)
 
-    if not is_agentless(primary.driver):
-        return await _queue_for_agent(db, primary, zone, candidate_rows, payloads)
+    # ``inline_only`` (a zone move, a rollback restore) never queues: those
+    # callers act on the zone elsewhere in the same request (a move deletes
+    # it from the source provider), so a merely QUEUED push would leave the
+    # target answering with an empty or partial zone until the sweep caught up.
+    if not is_agentless(primary.driver) or (
+        candidates > INLINE_PUSH_MAX_RECORDS and not inline_only
+    ):
+        queued = await _queue_for_agent(
+            db, primary, zone, candidate_rows, payloads, agentless=is_agentless(primary.driver)
+        )
+        queued.already_matched = already_matched
+        return queued
 
     target_serial = bump_zone_serial(zone)
     changes: list[RecordChange] = [
@@ -1006,6 +1063,7 @@ async def _additive_push(
             pushed=0,
             pushed_records=pushed_records,
             push_errors=[f"batch failed: {exc}"],
+            already_matched=already_matched,
         )
 
     pushed = 0
@@ -1040,11 +1098,12 @@ async def _additive_push(
         pushed=pushed,
         pushed_records=pushed_records,
         push_errors=push_errors,
+        already_matched=already_matched,
     )
 
 
 async def restore_zone_records_to_server(
-    db: AsyncSession, server: Any, driver: Any, zone: DNSZone
+    db: AsyncSession, server: Any, driver: Any, zone: DNSZone, *, inline_only: bool = True
 ) -> PushResult:
     """Push ``zone``'s records back to one agentless ``server`` (#1613).
 
@@ -1082,7 +1141,9 @@ async def restore_zone_records_to_server(
                 server=str(server.id),
                 error=str(exc) or type(exc).__name__,
             )
-    return await _additive_push(db, server, driver, zone, on_wire, rows, apply=True)
+    return await _additive_push(
+        db, server, driver, zone, on_wire, rows, apply=True, inline_only=inline_only
+    )
 
 
 async def sync_zone_with_server(

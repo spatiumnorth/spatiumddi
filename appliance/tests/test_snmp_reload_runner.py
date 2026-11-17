@@ -481,3 +481,94 @@ def test_boot_leaves_lldpd_alone_when_lldp_is_off(lldp_host):
     r, log = h["run"]()
     assert r.returncode == 0, log
     assert not (h["stub"] / "active-lldpd").exists()
+
+
+# ── #2153: the UDP 161 rule is scoped to snmp_allowed_sources ──────────
+
+SOURCES = "# spatium-snmp-sources:"
+
+
+def _dropin(host):
+    return (host["root"] / "etc/nftables.d/50-spatium-snmp.nft").read_text()
+
+
+def test_scoped_sources_render_v4_and_v6_rules(host):
+    r, state, log = run(host, body=f"{SOURCES} 10.0.0.0/8,fd00::/8\n" + RENDERED)
+    assert r.returncode == 0, log
+    rules = [x for x in _dropin(host).splitlines() if not x.startswith("#")]
+    assert any(x.startswith("ip saddr { 10.0.0.0/8 } udp dport 161 accept") for x in rules)
+    assert any(x.startswith("ip6 saddr { fd00::/8 } udp dport 161 accept") for x in rules)
+    assert not any(x.startswith("udp dport 161") for x in rules)
+
+
+def test_empty_sources_leave_the_port_open(host):
+    r, state, log = run(host, body=f"{SOURCES}\n" + RENDERED)
+    assert r.returncode == 0, log
+    rules = [x for x in _dropin(host).splitlines() if not x.startswith("#")]
+    assert rules == ['udp dport 161 accept comment "spatium-snmp"']
+
+
+@pytest.mark.parametrize("bad", ["10.0.0.0/8,not-a-cidr", "!invalid", "10.0.0.0/99"])
+def test_a_malformed_source_refuses_and_leaves_the_live_file(host, bad):
+    live = host["root"] / "etc/nftables.d/50-spatium-snmp.nft"
+    live.write_text("ip saddr { 192.0.2.0/24 } udp dport 161 accept\n")
+    r, state, log = run(host, body=f"{SOURCES} {bad}\n" + RENDERED)
+    assert r.returncode == 1
+    assert live.read_text() == "ip saddr { 192.0.2.0/24 } udp dport 161 accept\n"
+    assert list(state.glob("snmp-config-pending.failed.*"))  # trigger consumed
+    assert not (state / "snmp-config-pending").exists()
+    assert not (state / "snmp-config-hash").exists()
+    # snmpd was never stopped or reconfigured
+    calls = host["stub"] / "systemctl.calls"
+    assert not calls.exists() or "stop snmpd" not in calls.read_text()
+    assert not (host["root"] / "etc/snmp/snmpd.conf").exists()
+
+
+def test_marker_text_inside_syscontact_does_not_hijack_the_scope(host):
+    # sysContact / sysLocation are rendered ABOVE the marker and are free
+    # text: a value that merely contains the marker string must not be read
+    # as the source list (it would refuse every apply).
+    body = (
+        f"sysContact     ops {SOURCES} 0.0.0.0/0\n"
+        f"{SOURCES} 10.0.0.0/8\n" + RENDERED
+    )
+    r, state, log = run(host, body=body)
+    assert r.returncode == 0, log
+    rules = [x for x in _dropin(host).splitlines() if not x.startswith("#")]
+    assert rules == ['ip saddr { 10.0.0.0/8 } udp dport 161 accept comment "spatium-snmp"']
+
+
+def _failing_nft_check(host):
+    nft = host["stub"] / "nft"
+    nft.write_text('#!/bin/bash\n[ "$1" = -c ] && { echo "syntax error" >&2; exit 1; }\nexit 0\n')
+
+
+def test_a_failed_nft_dry_run_restores_the_fragment_and_leaves_snmpd(host):
+    live = host["root"] / "etc/nftables.d/50-spatium-snmp.nft"
+    live.write_text("ip saddr { 192.0.2.0/24 } udp dport 161 accept\n")
+    _failing_nft_check(host)
+    r, state, log = run(host, body=f"{SOURCES} 10.0.0.0/8\n" + RENDERED)
+    assert r.returncode == 1
+    assert live.read_text() == "ip saddr { 192.0.2.0/24 } udp dport 161 accept\n"
+    assert list(state.glob("snmp-config-pending.failed.*"))
+    assert not (state / "snmp-config-hash").exists()
+    calls = host["stub"] / "systemctl.calls"
+    touched = calls.read_text() if calls.exists() else ""
+    for verb in ("stop snmpd", "enable --now snmpd", "start snmpd"):
+        assert verb not in touched
+
+
+def test_a_failed_nft_dry_run_on_first_apply_leaves_no_fragment(host):
+    _failing_nft_check(host)
+    r, state, log = run(host, body=f"{SOURCES} 10.0.0.0/8\n" + RENDERED)
+    assert r.returncode == 1
+    assert not (host["root"] / "etc/nftables.d/50-spatium-snmp.nft").exists()
+
+
+def test_a_failed_start_restores_the_previous_fragment(host):
+    live = host["root"] / "etc/nftables.d/50-spatium-snmp.nft"
+    live.write_text("ip saddr { 192.0.2.0/24 } udp dport 161 accept\n")
+    r, state, log = run(host, body=f"{SOURCES} 10.0.0.0/8\n" + RENDERED + "FAILSTART\n")
+    assert r.returncode == 1, log
+    assert live.read_text() == "ip saddr { 192.0.2.0/24 } udp dport 161 accept\n"
+    assert not (state / "snmp-config-hash").exists()
