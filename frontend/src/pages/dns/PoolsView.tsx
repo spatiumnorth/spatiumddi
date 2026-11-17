@@ -1,4 +1,5 @@
 import { poolDeleteSummary } from "@/lib/pool-delete-copy";
+import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { humanTime } from "../network/_shared";
 import { memberCheckCell } from "@/lib/pool-health";
@@ -1129,23 +1130,3 @@ export function ConfirmDelete({
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
