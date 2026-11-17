@@ -373,6 +373,11 @@ render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
     --set openshift.scc.create=false \
     --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
     --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+# #3913 — a render with DHCP off hostNetwork, to compare the shipped static SCC
+# manifests (the certified profile does not let the chart create them) with.
+render umbrella-openshift-scc-plain "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
 # #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
 # here too (no pinned uid, its ServiceAccount exists).
 render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
@@ -380,9 +385,22 @@ render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT
 # PostgreSQL / Redis from registry.redhat.io. Rendered with the agents on (they
 # carry the other two -ubi tags) and Redis auth on (the rhel flavor passes the
 # password through REDIS_PASSWORD, not a command line).
-render umbrella-openshift-certified "$UMBRELLA" "${UMBRELLA_OPENSHIFT[@]}" \
+render umbrella-openshift-certified "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.servers[0].hostNetwork=true \
+    --set ingress.enabled=true \
     -f "$UMBRELLA/values-openshift-certified.yaml" \
     --set redis.auth.enabled=true
+echo "── OpenShift: static SCC manifests equal the chart's rendered SCCs (#3913)"
+python3 "$ROOT/.github/scripts/chart-openshift-scc-files.py" \
+    "$ROOT/charts/spatiumddi/files/openshift" \
+    "$OUT/umbrella-openshift-scc-plain.yaml" "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+if grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-certified.yaml"; then
+    echo "   FAIL #3913: the certified profile still renders an SCC" >&2
+    failures=$((failures + 1))
+fi
 echo "── OpenShift certified profile: -ubi tags, Red Hat PostgreSQL / Redis (#3913)"
 CERT="$OUT/umbrella-openshift-certified.yaml"
 for img in spatiumddi-api spatiumddi-frontend dns-bind9 dhcp-kea; do
@@ -422,8 +440,12 @@ done
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
     || failures=$((failures + 1))
+# The certified render creates no SCC; the shipped static ones stand in for them.
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
+    --external-sccs "$ROOT/charts/spatiumddi/files/openshift" \
     "$OUT/umbrella-openshift-certified.yaml" \
+    || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-openshift.py" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
     "$OUT/umbrella-openshift-forced.yaml" "$OUT/umbrella-openshift-upgrade.yaml" \
     || failures=$((failures + 1))

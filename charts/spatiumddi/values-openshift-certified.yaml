@@ -22,6 +22,15 @@
 #     Referenced below through ``image.pullSecrets``, which every pod of the
 #     release uses; GHCR's pull is anonymous and ignores it.
 #
+#   * the chart does NOT create the agents' SecurityContextConstraints
+#     (``openshift.scc.create: false``): certified charts do not create
+#     cluster-scoped security objects, and a certification pipeline's account
+#     may not be allowed to. The control plane needs no SCC (restricted-v2).
+#     Before turning on dnsAgents / dhcpAgents a cluster admin applies the
+#     manifests in ``files/openshift/`` and grants them to the agents'
+#     ServiceAccounts; see "Certified profile: SCC prerequisite" in
+#     docs/deployment/KUBERNETES.md. The ServiceAccounts are still rendered.
+#
 # Not changed: the PostgreSQL and Redis here are still the chart's single-pod
 # StatefulSets. For HA bring your own (set ``postgresql.enabled=false`` and
 # fill ``externalDatabase``, same for Redis) — a certified PostgreSQL operator
@@ -32,6 +41,10 @@
 
 global:
   platform: openshift
+
+openshift:
+  scc:
+    create: false
 
 image:
   tagSuffix: "-ubi"
