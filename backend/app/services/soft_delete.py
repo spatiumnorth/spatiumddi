@@ -1221,6 +1221,31 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
                 except HTTPException as exc:
                     return str(exc.detail)
 
+    elif isinstance(obj, DHCPPool):
+        # #4362: a restore brings the pool back with its class restriction, and
+        # the class may have stopped being rendered meanwhile (a PXE / phone
+        # profile disabled, a class removed). Kea accepts the dangling reference
+        # and never matches it, so apply the rule the pool API applies to a new
+        # pool rather than restore a pool that serves no client.
+        if obj.class_restriction:
+            from app.api.v1.dhcp.pools import _check_class_family  # noqa: PLC0415
+
+            pool_scope_stmt: Any = (
+                select(DHCPScope)
+                .where(DHCPScope.id == obj.scope_id)
+                .execution_options(include_deleted=True)
+            )
+            pool_scope = (await db.execute(pool_scope_stmt)).scalar_one_or_none()
+            if pool_scope is not None:
+                try:
+                    await _check_class_family(db, pool_scope, obj.class_restriction)
+                except HTTPException as exc:
+                    return (
+                        f"Pool {obj.start_ip}-{obj.end_ip} is restricted to a client class "
+                        f"that is no longer available: {exc.detail} Clear or change the "
+                        "pool's class restriction, or re-enable the class's profile, first."
+                    )
+
     elif isinstance(obj, DHCPStaticAssignment):
         # A reservation's MAC is unique across the whole group, not just the
         # scope (see ``_conflict_check`` on the create path). While the scope
