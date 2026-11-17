@@ -809,6 +809,11 @@ function PoliciesTab() {
         tone="destructive"
         confirmLabel={lockOn ? "Submit for approval" : "Delete"}
         loading={deleteMutation.isPending}
+        error={
+          deleteMutation.error
+            ? formatApiError(deleteMutation.error, "Delete failed")
+            : null
+        }
         message={
           <span>
             Delete the policy <strong>{deleting?.name}</strong>? Operations it
@@ -822,7 +827,10 @@ function PoliciesTab() {
           </span>
         }
         onConfirm={() => deleting && deleteMutation.mutate(deleting.id)}
-        onClose={() => setDeleting(null)}
+        onClose={() => {
+          setDeleting(null);
+          deleteMutation.reset();
+        }}
       />
 
       {breakGlass && (

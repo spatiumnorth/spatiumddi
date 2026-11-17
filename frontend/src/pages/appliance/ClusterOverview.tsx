@@ -1714,7 +1714,9 @@ export function ClusterOverview({
             their state (DB-backed); DNS zones reload from the served config;
             the web UI will be unreachable for ~1 minute.
             {rebootError && (
-              <span className="mt-2 block text-destructive">{rebootError}</span>
+              <span role="alert" className="mt-2 block text-destructive">
+                {rebootError}
+              </span>
             )}
           </span>
         }

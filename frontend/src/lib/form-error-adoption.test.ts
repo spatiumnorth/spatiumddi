@@ -14,7 +14,7 @@ const NOT_A_REFUSAL =
   /last_|fingerbank|error_message|valueError|hostnameErr|errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"/;
 
 const PLAIN_BOX =
-  /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>p|div)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
+  /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
 
 function files(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
@@ -53,6 +53,11 @@ describe("dialog refusals are announced (#3821)", () => {
     expect(plainRefusalBoxes(src.replace("<p ", '<p role="alert" '))).toEqual(
       [],
     );
+  });
+
+  it("detects a plain red span (#4354)", () => {
+    const src = `function XModal(){ return <Modal>{err && <span className="mt-2 block text-destructive">{err}</span>}</Modal>; }`;
+    expect(plainRefusalBoxes(src)).toEqual(["err"]);
   });
 
   it("no dialog draws a plain refusal box", () => {

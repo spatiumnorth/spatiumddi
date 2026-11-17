@@ -399,6 +399,12 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
         )}
       </div>
 
+      <FormError className="text-sm">
+        {deleteMut.error
+          ? formatApiError(deleteMut.error, "Delete failed")
+          : null}
+      </FormError>
+
       {/* Per-ASN communities. */}
       {communities.length === 0 ? (
         <p className="rounded-lg border p-8 text-center text-sm text-muted-foreground">
@@ -464,6 +470,7 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
                           <button
                             type="button"
                             onClick={() => {
+                              deleteMut.reset();
                               if (
                                 confirm(
                                   `Delete community "${c.value}"? This cannot be undone.`,

@@ -338,6 +338,12 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
         </button>
       </div>
 
+      <FormError className="text-sm">
+        {deleteMut.error
+          ? formatApiError(deleteMut.error, "Delete failed")
+          : null}
+      </FormError>
+
       {peerings.length === 0 ? (
         <p className="rounded-lg border p-8 text-center text-sm text-muted-foreground">
           No BGP peerings recorded for this ASN.
@@ -407,6 +413,7 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
                             const counter = isLocal
                               ? `AS${p.peer_asn_number}`
                               : `AS${p.local_asn_number}`;
+                            deleteMut.reset();
                             if (
                               confirm(
                                 `Delete peering with ${counter} (${rel})? This cannot be undone.`,

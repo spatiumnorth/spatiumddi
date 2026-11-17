@@ -178,6 +178,11 @@ export function ConformityPage() {
         {/* Policies */}
         <section className="space-y-2">
           <h2 className="text-sm font-semibold">Policies</h2>
+          <FormError className="text-sm">
+            {deletePolicyMut.error
+              ? formatApiError(deletePolicyMut.error, "Delete failed")
+              : null}
+          </FormError>
           <div className="overflow-hidden rounded-lg border bg-card">
             <table className="w-full text-sm">
               <thead className="bg-muted/30 text-[11px] uppercase tracking-wider text-muted-foreground">
@@ -306,6 +311,7 @@ export function ConformityPage() {
                             title="Delete"
                             aria-label="Delete"
                             onClick={() => {
+                              deletePolicyMut.reset();
                               if (
                                 confirm(
                                   `Delete policy "${p.name}"? This removes the policy and every evaluation result it produced.`,

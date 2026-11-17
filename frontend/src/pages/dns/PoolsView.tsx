@@ -195,8 +195,12 @@ export function PoolsView({
           pool={confirmDelete}
           zone={zone}
           onConfirm={() => del.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            del.reset();
+          }}
           pending={del.isPending}
+          error={del.error ? formatApiError(del.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -1070,12 +1074,14 @@ export function ConfirmDelete({
   onConfirm,
   onClose,
   pending,
+  error,
 }: {
   pool: DNSPool;
   zone: DNSZone;
   onConfirm: () => void;
   onClose: () => void;
   pending: boolean;
+  error?: string | null;
 }) {
   const fqdn =
     pool.record_name === "@"
@@ -1097,6 +1103,7 @@ export function ConfirmDelete({
             : 0,
         })}
       </p>
+      <FormError className="mt-2 text-sm">{error}</FormError>
       <div className="mt-4 flex justify-end gap-2">
         <button
           type="button"
