@@ -276,12 +276,15 @@ function heatmapLegend(
 function InventoryStat({
   value,
   label,
+  singular,
   to,
   title,
   tone,
 }: {
   value: string | number;
   label: string;
+  /** Label for a value of exactly 1 (#4372); omit for non-count labels. */
+  singular?: string;
   to: string;
   title?: string;
   tone?: "warn" | "bad";
@@ -304,7 +307,9 @@ function InventoryStat({
       >
         {value}
       </span>
-      <span className="text-muted-foreground">{label}</span>
+      <span className="text-muted-foreground">
+        {value === 1 && singular ? singular : label}
+      </span>
     </Link>
   );
 }
@@ -2337,6 +2342,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={spaces?.length ?? 0}
                 label="spaces"
+                singular="space"
                 to="/ipam"
               />
             )}
@@ -2344,6 +2350,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={subnetsScoped.length}
                 label="subnets"
+                singular="subnet"
                 to="/ipam"
               />
             )}
@@ -2374,6 +2381,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={totalZones}
                 label="DNS zones"
+                singular="DNS zone"
                 title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
                 to="/dns"
               />
@@ -2382,6 +2390,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={allServers.length}
                 label="servers"
+                singular="server"
                 title={`${activeServers} active`}
                 to="/dns"
               />
