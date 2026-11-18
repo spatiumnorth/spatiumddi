@@ -33,3 +33,13 @@ def test_reports_served_serials_reads_the_features_header() -> None:
     assert reports_served_serials("soa-timers, Served-Serials")
     assert not reports_served_serials("soa-timers")
     assert not reports_served_serials(None)
+
+
+@pytest.mark.parametrize("driver", ["bind9", "powerdns"])
+def test_agent_without_served_serials_reads_zero_as_unknown_4440(driver: str) -> None:
+    """An rc.3 agent reports 0 for every secondary; a rolling upgrade must not
+    show them all "not in sync" (#4440). A declaring agent's 0 still is."""
+    z = DNSZone(name="s.example.", zone_type="secondary")
+    assert zone_state_in_sync(z, 0, 0, driver, reports_served_serials=False)
+    assert zone_state_in_sync(z, 2026110101, 0, driver, reports_served_serials=False)
+    assert not zone_state_in_sync(z, 0, 0, driver, reports_served_serials=True)
