@@ -34,6 +34,7 @@ from app.api.v1.dhcp.scopes import router as scopes_router
 from app.api.v1.dhcp.server_groups import router as server_groups_router
 from app.api.v1.dhcp.servers import router as servers_router
 from app.api.v1.dhcp.statics import router as statics_router
+from app.api.v1.dhcp.vendor_presets import router as vendor_presets_router
 from app.api.v1.dhcp.voip_options import router as voip_options_router
 
 router = APIRouter()
@@ -54,6 +55,7 @@ router.include_router(mac_blocks_router)
 router.include_router(option_codes_router)
 router.include_router(option_templates_router)
 router.include_router(voip_options_router)
+router.include_router(vendor_presets_router)
 router.include_router(responders_router)
 
 __all__ = ["router"]

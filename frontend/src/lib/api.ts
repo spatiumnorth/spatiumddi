@@ -9307,6 +9307,30 @@ export interface VoIPVendor {
   options: VoIPVendorOption[];
 }
 
+// ── DHCP option 43 vendor presets (#4490) ───────────────────────────────
+
+export interface VendorPreset {
+  id: string;
+  vendor: string;
+  product: string;
+  description: string;
+  option_code: number;
+  min_controllers: number;
+  max_controllers: number;
+  controller_label: string;
+  vendor_class_match: string | null;
+  vendor_class_note: string;
+  source: string;
+}
+
+export interface VendorPresetEncoded {
+  preset_id: string;
+  option_code: number;
+  value: string;
+  byte_length: number;
+  vendor_class_match: string | null;
+}
+
 export interface PhoneOption {
   code: number;
   name?: string | null;
@@ -9884,6 +9908,15 @@ export const dhcpApi = {
   // ── VoIP phone profiles (issue #112 phase 1) ────────────────────────
   listVoipVendors: () =>
     api.get<VoIPVendor[]>(`/dhcp/voip-options`).then((r) => r.data),
+  listVendorPresets: () =>
+    api.get<VendorPreset[]>(`/dhcp/vendor-presets`).then((r) => r.data),
+  encodeVendorPreset: (presetId: string, controllers: string[]) =>
+    api
+      .get<VendorPresetEncoded>(`/dhcp/vendor-presets/${presetId}/encode`, {
+        params: { controller: controllers },
+        paramsSerializer: { indexes: null },
+      })
+      .then((r) => r.data),
   listPhoneProfiles: (groupId: string) =>
     api
       .get<PhoneProfile[]>(`/dhcp/server-groups/${groupId}/phone-profiles`)
