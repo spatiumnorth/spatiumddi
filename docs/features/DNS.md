@@ -2151,6 +2151,24 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
 - **`zone_type` enum.** One of `primary` / `secondary` / `stub` /
   `forward`. Pydantic validator in
   `backend/app/api/v1/dns/router.py`.
+- **`master_options` (#3568).** A secondary / stub zone's `masters` are
+  `ip` or `ip@port`; `master_options` keys each one to an optional
+  `{tsig_key, tls_hostname}`. `tsig_key` names an operator TSIG key of the
+  zone's own group (the group's generated key is never offered); the
+  transfer is signed with it, which is what a primary that requires TSIG (a
+  Windows DC, an Infoblox grid, EfficientIP) needs. `tls_hostname` makes the
+  transfer XFR-over-TLS (RFC 9103) and is the certificate name the primary
+  must present; the port defaults to 853 unless the entry pins another, and
+  an explicit `@53` stays plain DNS. The agent renders
+  `primaries { ip port 853 key "k" tls <statement>; }` and one `tls`
+  statement per distinct hostname (`ca-file` + `remote-hostname`, so the
+  primary's certificate is verified). A key the bundle does not hold is left
+  off with a warning rather than breaking the file. BIND9 groups only: the
+  API refuses it on a group with a PowerDNS or Technitium server (PowerDNS
+  signs transfers through zone metadata and has no XFR-over-TLS; the
+  Technitium mapping is not verified). Needs BIND 9.18+ for `tls`. An agent
+  older than this feature ignores the field and transfers as before.
+  Editing `masters` drops the options of a primary that is no longer listed.
 - **`color` enum.** Must be in `VALID_ZONE_COLORS` (`slate`, `red`,
   `amber`, `emerald`, `cyan`, `blue`, `violet`, `pink`). Free-form
   hex is deliberately not accepted so both themes stay legible.
@@ -3159,6 +3177,24 @@ loop stops the running instance before starting the new one, trusting
 on nothing worse than a half-written cert. The entrypoint therefore
 pre-flights every `*.crt` / `*.key` path referenced by the rendered rules
 and keeps the current instance serving if any is unreadable.
+
+### 20.4a Zone transfers over TLS (XoT, #3568)
+
+*Inbound, as a secondary:* a per-primary `tls_hostname` on the secondary zone
+(§ zone validation, `master_options`) pulls the zone over TLS from a primary
+that serves XoT.
+
+*Outbound, as a primary:* the group option `allow_transfer_tls_only` renders
+the group's `allow-transfer` (and every zone-level override, which shadows
+it) as `allow-transfer transport tls { … }`, so secondaries pull zones
+through the DoT listener of §20.2 with the same certificate. It needs DoT
+enabled and BIND9 only (422 otherwise), and the agent renders it only while
+the DoT listener itself is rendered: without a usable certificate the group
+falls back to plain transfers rather than to none. **Read before enabling:**
+BIND applies the list to the TLS transport only, so transfers over plain TCP
+stop matching it, including the control plane's own drift and ingest reads.
+Enable it when every consumer of the group's zones speaks XoT. Default off;
+Settings → DNS → group options → Encrypted transports.
 
 ### 20.5 Verifying
 

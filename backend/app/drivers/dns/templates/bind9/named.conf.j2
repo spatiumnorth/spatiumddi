@@ -58,7 +58,7 @@ options {
         inline, so it stays byte-identical to the agent's union of the group
         TSIG key grants with the operator ACL. Rendering it here by hand is
         how the two renderers drift. #}
-    allow-transfer { {% for a in allow_transfer_items %}{{ a }} {% endfor %}};
+    allow-transfer {{ allow_transfer_transport }}{ {% for a in allow_transfer_items %}{{ a }} {% endfor %}};
     {%- if options.blackhole %}
     blackhole { {% for a in options.blackhole %}{{ a }}; {% endfor %}};
     {%- endif %}

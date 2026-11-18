@@ -3008,6 +3008,22 @@ function ZoneModalForm({
   const [mastersText, setMastersText] = useState(
     (zone?.masters ?? []).join(", "),
   );
+  // #3568 — per-primary TSIG key + TLS hostname, keyed by the master entry.
+  const [masterOpts, setMasterOpts] = useState<
+    Record<string, { tsig_key: string; tls_hostname: string }>
+  >(() =>
+    Object.fromEntries(
+      Object.entries(zone?.master_options ?? {}).map(([m, o]) => [
+        m,
+        { tsig_key: o.tsig_key ?? "", tls_hostname: o.tls_hostname ?? "" },
+      ]),
+    ),
+  );
+  const { data: tsigKeys } = useQuery({
+    queryKey: ["dns-tsig-keys", groupId],
+    queryFn: () => dnsApi.listTSIGKeys(groupId),
+    enabled: zoneType === "secondary" || zoneType === "stub",
+  });
   const [domainId, setDomainId] = useState<string | null>(
     zone?.domain_id ?? null,
   );
@@ -3122,6 +3138,21 @@ function ZoneModalForm({
         return;
       }
       payload.masters = masters;
+      // Only the primaries still listed, and only the ones carrying a key or
+      // a hostname; always sent on edit so clearing a field clears it.
+      const opts: NonNullable<DNSZone["master_options"]> = {};
+      for (const m of masters) {
+        const o = masterOpts[m];
+        const key = o?.tsig_key.trim() ?? "";
+        const host = o?.tls_hostname.trim() ?? "";
+        if (key || host) {
+          opts[m] = {
+            ...(key ? { tsig_key: key } : {}),
+            ...(host ? { tls_hostname: host } : {}),
+          };
+        }
+      }
+      if (zone || Object.keys(opts).length > 0) payload.master_options = opts;
     }
     if (!zone) {
       mut.mutate(payload);
@@ -3146,6 +3177,7 @@ function ZoneModalForm({
       forward_transport: zone.forward_transport ?? "do53",
       forward_tls_hostname: zone.forward_tls_hostname ?? null,
       masters: zone.masters ?? [],
+      master_options: zone.master_options ?? {},
     };
     const diff = changedFields(was, fields);
     if (Object.keys(diff).length === 0) {
@@ -3306,6 +3338,64 @@ function ZoneModalForm({
                 placeholder="192.0.2.10, 192.0.2.11@5353"
               />
             </Field>
+            {mastersText.trim() !== "" && (
+              <div className="space-y-2">
+                <p className="text-[11px] text-muted-foreground">
+                  Per primary (optional): sign the transfer with one of this
+                  group&apos;s TSIG keys, and/or transfer over TLS (XoT, port
+                  853 unless the master pins another) — the hostname is the name
+                  the primary&apos;s certificate must carry. BIND9 groups only.
+                </p>
+                {mastersText
+                  .split(/[,\s]+/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+                  .map((m) => (
+                    <div
+                      key={m}
+                      className="grid grid-cols-[8rem_1fr_1fr] items-center gap-2"
+                    >
+                      <span className="truncate font-mono text-xs">{m}</span>
+                      <select
+                        aria-label={`TSIG key for ${m}`}
+                        className={inputCls}
+                        value={masterOpts[m]?.tsig_key ?? ""}
+                        onChange={(e) =>
+                          setMasterOpts((p) => ({
+                            ...p,
+                            [m]: {
+                              tls_hostname: p[m]?.tls_hostname ?? "",
+                              tsig_key: e.target.value,
+                            },
+                          }))
+                        }
+                      >
+                        <option value="">— no TSIG key —</option>
+                        {(tsigKeys ?? []).map((k) => (
+                          <option key={k.id} value={k.name}>
+                            {k.name}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        aria-label={`TLS hostname for ${m}`}
+                        className={inputCls}
+                        value={masterOpts[m]?.tls_hostname ?? ""}
+                        onChange={(e) =>
+                          setMasterOpts((p) => ({
+                            ...p,
+                            [m]: {
+                              tsig_key: p[m]?.tsig_key ?? "",
+                              tls_hostname: e.target.value,
+                            },
+                          }))
+                        }
+                        placeholder="TLS hostname (plain TCP if empty)"
+                      />
+                    </div>
+                  ))}
+              </div>
+            )}
           </div>
         )}
         {views.length > 0 && (
@@ -8474,6 +8564,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   // Encrypted transports (issue #50).
   const [dotEnabled, setDotEnabled] = useState(false);
   const [dotPort, setDotPort] = useState(853);
+  const [allowTransferTlsOnly, setAllowTransferTlsOnly] = useState(false);
   const [dohEnabled, setDohEnabled] = useState(false);
   const [dohPort, setDohPort] = useState(443);
   const [dohPath, setDohPath] = useState("/dns-query");
@@ -8526,6 +8617,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     setDnsdistDynblockSeconds(opts.dnsdist_dynblock_seconds);
     setDotEnabled(opts.dot_enabled);
     setDotPort(opts.dot_port);
+    setAllowTransferTlsOnly(opts.allow_transfer_tls_only ?? false);
     setDohEnabled(opts.doh_enabled);
     setDohPort(opts.doh_port);
     setDoqEnabled(opts.doq_enabled ?? false);
@@ -8710,6 +8802,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
       dnsdist_dynblock_seconds: dnsdistDynblockSeconds,
       dot_enabled: dotEnabled,
       dot_port: dotPort,
+      allow_transfer_tls_only: dotEnabled && allowTransferTlsOnly,
       doh_enabled: dohEnabled,
       doh_port: dohPort,
       doh_path: dohPath.trim() || "/dns-query",
@@ -8759,6 +8852,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         dnsdist_dynblock_seconds: o.dnsdist_dynblock_seconds,
         dot_enabled: o.dot_enabled,
         dot_port: o.dot_port,
+        allow_transfer_tls_only: o.allow_transfer_tls_only ?? false,
         doh_enabled: o.doh_enabled,
         doh_port: o.doh_port,
         doh_path: o.doh_path.trim() || "/dns-query",
@@ -9350,6 +9444,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               checked={dotEnabled}
               onChange={(e) => {
                 setDotEnabled(e.target.checked);
+                if (!e.target.checked) setAllowTransferTlsOnly(false);
                 setDirty(true);
               }}
               className="h-4 w-4"
@@ -9371,6 +9466,29 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               }}
             />
           </Field>
+        )}
+        {dotEnabled && (
+          <label className="flex items-start gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={allowTransferTlsOnly}
+              onChange={(e) => {
+                setAllowTransferTlsOnly(e.target.checked);
+                setDirty(true);
+              }}
+              className="mt-0.5 h-4 w-4"
+            />
+            <span>
+              Zone transfers over TLS only (XoT)
+              <span className="block text-[11px] text-muted-foreground">
+                Renders <code>allow-transfer transport tls</code>: secondaries
+                must pull zones through the DoT listener. BIND9 only. Transfers
+                over plain TCP (including the control plane&apos;s own drift and
+                ingest reads) stop matching, so enable it only when every
+                consumer speaks XoT.
+              </span>
+            </span>
+          </label>
         )}
 
         <div className="flex items-center justify-between border-t pt-3">

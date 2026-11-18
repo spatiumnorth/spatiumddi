@@ -916,6 +916,12 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # block above).
     dot_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     dot_port: Mapped[int] = mapped_column(Integer, nullable=False, default=853)
+    # Offer zone transfers over TLS only (XoT, RFC 9103, #3568): the group's
+    # ``allow-transfer`` is rendered ``transport tls``, so it names the DoT
+    # listener above as the one way to pull a zone. Requires ``dot_enabled``.
+    allow_transfer_tls_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
     doh_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # 443 is the RFC 8484 default. On a full-stack appliance the frontend
     # already owns 443, so the API refuses to co-locate them (see
@@ -1352,6 +1358,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     # for primary / forward zones (those don't pull from a master).
     masters: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    # Per-primary transfer options (#3568), keyed by the exact ``masters``
+    # entry (``ip`` or ``ip@port``): ``{"10.0.0.1@853": {"tsig_key": "xfr.",
+    # "tls_hostname": "ns1.example.com"}}``. ``tsig_key`` names a TSIG key of
+    # the zone's server group the transfer is signed with; ``tls_hostname``
+    # turns the transfer into XFR-over-TLS (RFC 9103), validated against that
+    # certificate name. A master with no entry transfers unsigned over TCP,
+    # as before. Kept beside ``masters`` rather than inside it so every
+    # consumer of the plain list (Technitium, importers, older agents) is
+    # unaffected.
+    master_options: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
     # Logical ownership (issue #91). DNS zones often map 1:1 to a
