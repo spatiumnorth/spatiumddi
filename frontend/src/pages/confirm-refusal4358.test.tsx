@@ -154,6 +154,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     changeRequestsApi: {
       ...actual.changeRequestsApi,
       list: async () => [CR],
+      // The admin page reads its Queue and History through listPage (#4383).
+      listPage: async () => ({ items: [CR], total: 1 }),
       cancel: rejecting("Request already executing"),
     },
     firewallFeedsApi: {
