@@ -4,7 +4,7 @@
 
 DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
 
-The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, the cloud providers) `apply_record_change` runs from the control plane, after the request's database transaction commits (#1539).
+The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, an operator's own Technitium, the cloud providers) `apply_record_change` runs from the control plane, after the request's database transaction commits (#1539).
 
 ---
 
@@ -119,11 +119,11 @@ class DNSDriver(ABC):
 | Operation | Mechanism | Notes |
 |---|---|---|
 | Add/update/delete record | RFC 2136 `nsupdate` (via `dnspython`) | Incremental, instant, TSIG-signed |
-| Create zone | `rndc addzone` | No restart; zone active immediately |
-| Delete zone | `rndc delzone` | No restart |
+| Create zone | A `zone` stanza in the rendered `named.conf`, then `rndc reconfig` | No restart; no `rndc addzone` |
+| Delete zone | The stanza is dropped from the rendered `named.conf`, then `rndc reconfig` | No restart; no `rndc delzone` |
 | Update zone options (SOA, TTL) | `nsupdate` SOA record replacement | Incremental |
-| Add/update view | Regenerate `named.conf` → SCP → `rndc reconfig` | No restart; new config loaded in-place |
-| Update forwarders, options | Regenerate `named.conf` → SCP → `rndc reconfig` | No restart |
+| Add/update view | Agent re-renders `named.conf`, checks it with `named-checkconf`, swaps the tree in, `rndc reconfig` | No restart; new config loaded in-place |
+| Update forwarders, options | Same: re-render, check, swap, `rndc reconfig` | No restart |
 | Update RPZ (blocking), small change | RFC 2136 update of the added / removed names to the RPZ zone ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191)) | No reload, no second copy of the zone in memory |
 | Update RPZ (blocking), large change | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
@@ -222,24 +222,18 @@ keyring = dns.tsigkeyring.from_text({
 update = dns.update.Update(zone, keyring=keyring, keyalgorithm=dns.tsig.HMAC_SHA256)
 ```
 
-### Zone Creation via rndc addzone
+### Zone creation and `named.conf` management
 
-```bash
-rndc addzone example.com '{ type primary; file "/var/named/example.com.db"; };'
-```
+The BIND9 driver runs in the DNS agent next to `named` ([DNS_AGENT.md](../deployment/DNS_AGENT.md) §1 and §3). The control plane never runs `rndc` and never copies files to the host: its driver only renders and builds the config bundle (`backend/app/drivers/dns/bind9.py`), and `reload_config` / `reload_zone` there only log.
 
-The driver:
-1. Generates the zone file from SpatiumDDI zone data
-2. SCPs zone file to BIND9 host
-3. Runs `rndc addzone`
-4. Verifies zone is active with `rndc zonestatus example.com`
+`named.conf` is **never edited by hand** when SpatiumDDI manages BIND9. On each new config bundle the agent:
 
-### Named.conf Management
+1. Renders `named.conf` and every zone file into a fresh tree under `/var/lib/spatium-dns-agent/rendered`. A new zone is a `zone` stanza in that `named.conf`, with its file under `zones/`; there is no `named.conf.spatiumddi` and no `rndc addzone`.
+2. Checks the tree with `named-checkconf` and declines the whole bundle if that fails.
+3. Swaps the new tree in and reloads: `rndc reconfig` for config changes and added or removed zones, then freeze / reload / thaw for zones whose file changed (a plain reload does not re-read a dynamic zone's file).
+4. Reads each changed zone's serial back with `rndc zonestatus` to confirm it loaded.
 
-`named.conf` is **never edited by hand** when SpatiumDDI manages BIND9. The driver maintains:
-- `named.conf.spatiumddi` — generated includes (views, zones, options)
-- `named.conf` includes `named.conf.spatiumddi`
-- Changes: regenerate `named.conf.spatiumddi` → SCP → `rndc reconfig`
+Record changes do not go through this path: they reach `named` as RFC 2136 updates over loopback, signed with the TSIG key the bundle carries.
 
 **Geo-steering views (issue #530).** GSLB pool members that carry a
 *serving scope* (client CIDRs and/or a Site) render as synthesized
@@ -256,26 +250,11 @@ documented future improvement. See DNS.md §17.
 
 Zone serial follows `YYYYMMDDnn` format:
 - On each record change via `nsupdate`, serial auto-increments (BIND handles this)
-- Driver tracks and displays current serial from `rndc zonestatus`
+- The agent reads the serial back from `rndc zonestatus` after a reload
 
 ### BIND9 Driver Configuration
 
-```python
-@dataclass
-class BIND9DriverConfig:
-    host: str
-    ssh_port: int = 22
-    ssh_user: str = "bind-mgmt"
-    ssh_key: str                  # Path to SSH private key (or key content)
-    rndc_key_name: str
-    rndc_key_secret: str          # Encrypted in DB
-    tsig_key_name: str
-    tsig_key_secret: str          # Encrypted in DB
-    named_conf_dir: str = "/etc/bind"
-    zone_file_dir: str = "/var/cache/bind"
-    rndc_host: str = "127.0.0.1"
-    rndc_port: int = 953
-```
+There is no driver-config dataclass, and a BIND9 server row carries no SSH, host or remote-`rndc` settings: the product has no SSH transport for DNS. The agent runs `rndc` against `named` on the same host, and takes its own settings (control-plane URL, key, state directory) from its environment (`agent/dns/spatium_dns_agent/config.py`).
 
 ### 2.5 DNSSEC — inline-signing (issue #49)
 
@@ -451,12 +430,12 @@ In [`app/drivers/dns/__init__.py`](https://github.com/spatiumnorth/spatiumddi/bl
 
 ```python
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns",
-     "digitalocean", "hetzner", "linode", "vultr"}
+    {"windows_dns", "technitium_api", "cloudflare", "route53", "azure_dns",
+     "google_dns", "digitalocean", "hetzner", "linode", "vultr"}
 )
 ```
 
-Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The cloud-hosted DNS providers (§4A) joined this set in issue #37 (the four SDK-backed ones) and issue #327 (the token-only tier: DigitalOcean / Hetzner / Linode / Vultr).
+Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The cloud-hosted DNS providers (§4A) joined this set in issue #37 (Cloudflare, Route 53, Azure DNS and Google Cloud DNS; of these only Route 53, Azure DNS and Google Cloud DNS import a provider SDK, Cloudflare calls its HTTP API through `httpx`) and issue #327 (the token-only tier: DigitalOcean / Hetzner / Linode / Vultr).
 
 ### 3.5 Write-through pattern
 
@@ -650,17 +629,9 @@ Producer-side only. When `DNSServerGroup.catalog_zones_enabled` is on and this s
 
 Consumer mode logs a structured warning at agent startup: the agent does not wire up PowerDNS catalog-consumer mode. Operators with PowerDNS secondaries pull via plain AXFR against the producer; full consumer-side support is still a Phase 5 polish item.
 
-### 4.7 PowerDNSDriver Configuration
+### 4.7 PowerDNS agent configuration
 
-```python
-@dataclass
-class PowerDNSDriverConfig:
-    api_url: str = "http://127.0.0.1:8081"   # local-only by design
-    api_key: str                             # generated by entrypoint, agent reads from env
-    api_timeout: float = 10.0
-```
-
-There is no `host` / `ssh_user` / `ssh_key` / RNDC counterpart — PowerDNS configuration is entirely REST-driven, and the REST endpoint is bound to loopback. This is significantly less surface area than the BIND9 driver maintains.
+There is no driver-config dataclass. The agent talks to its co-located PowerDNS on `http://127.0.0.1:8081` (a module constant in `agent/dns/spatium_dns_agent/drivers/powerdns.py`) and reads the API key from the file `pdns-api.key` in its state directory, `/var/lib/spatium-dns-agent/pdns-api.key` by default (§4.2); the container entrypoint creates it on first boot, and only the directory can be moved, with `AGENT_STATE_DIR`. The key is never read from the agent's environment. PowerDNS configuration is entirely REST-driven and the REST endpoint is bound to loopback; neither agent driver carries SSH settings.
 
 **Listen addresses (#2307).** The agent renders `local-address=0.0.0.0, ::` so the authoritative server answers on IPv4 and IPv6, matching BIND9's `listen-on` / `listen-on-v6 { any; }`. Setting the option replaces pdns's own default, so the IPv6 entry has to be named. On a host with no IPv6 stack at all (kernel `ipv6.disable=1`, no `AF_INET6` sockets) pdns aborts on a `::` entry, so the agent probes for an `AF_INET6` socket and renders `0.0.0.0` alone there. `net.ipv6.conf.*.disable_ipv6=1` is not that case: pdns still binds `::`.
 
@@ -1136,6 +1107,8 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
     "technitium": TechnitiumDriver,
+    # Agentless Technitium (#810): an install the operator already runs.
+    "technitium_api": TechnitiumAPIDriver,
     "windows_dns": WindowsDNSDriver,
     # Agentless cloud-hosted DNS providers (issue #37, Part B).
     "cloudflare": CloudflareDNSDriver,
@@ -1151,8 +1124,8 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
 
 # Drivers whose record ops run from the control plane directly, no agent.
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns",
-     "digitalocean", "hetzner", "linode", "vultr"}
+    {"windows_dns", "technitium_api", "cloudflare", "route53", "azure_dns",
+     "google_dns", "digitalocean", "hetzner", "linode", "vultr"}
 )
 # The cloud subset (used by the cloud import + sync-from-server widening).
 CLOUD_DNS_DRIVERS: frozenset[str] = frozenset(
