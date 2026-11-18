@@ -131,6 +131,8 @@ async def validate_custom_field_values(
     db: AsyncSession,
     resource_type: str,
     values: Mapping[str, Any] | None,
+    *,
+    stored: Mapping[str, Any] | None = None,
 ) -> None:
     """Raise 422 when a ``multi_select`` or ``date`` value is not of its type (#4288).
 
@@ -138,7 +140,15 @@ async def validate_custom_field_values(
     ``date`` holds an ISO ``YYYY-MM-DD`` string. ``None`` and an empty string
     are the "clear this field" spellings the console and the bulk editor send,
     so they pass. Other field types are stored as sent, as before.
+
+    ``stored`` is the row's current ``custom_fields`` on an update: a key whose
+    value equals what the row already holds is not re-validated (#4443), since
+    the edit forms send the whole dict and an option removed from a definition
+    since must not block edits of a row still holding it. Only a changed key is
+    checked.
     """
+    if stored:
+        values = {k: v for k, v in (values or {}).items() if k not in stored or stored[k] != v}
     if not values:
         return
     defs = (
