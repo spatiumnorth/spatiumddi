@@ -535,20 +535,16 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
 # dance that's #49's umbrella scope.
 _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
     # PowerDNS (online signing) and BIND9 (inline-signing via dnssec-policy,
-    # issue #49) can sign; the set lives in ``dnssec_signers`` so the
-    # single-signer rule (#1762) and zone move read the same one. Technitium
-    # is deliberately NOT in it (#1783): its
-    # signing is one-shot (never re-signed on a new server, a re-created zone
-    # or a lost volume, policy ignored, key state reported only while signed),
-    # so SpatiumDDI would show a zone signed that is not. Full support is
-    # #1767. Windows DNS cannot sign.
+    # issue #49) and Technitium (#1767: the agent reconciles signing state
+    # from every bundle) can sign; the set lives in ``dnssec_signers`` so the
+    # single-signer rule (#1762) and zone move read the same one. The
+    # agentless ``technitium_api`` and Windows DNS cannot sign.
     "dnssec_sign": dnssec_signers.SIGNING_DRIVERS,
-    # UNSIGN stays allowed on Technitium so an operator can turn a zone that
-    # was signed before #1783 back off; the flip-off path is ungated.
     "dnssec_unsign": dnssec_signers.PER_SERVER_SIGNING_DRIVERS,
-    # Manual key rollover is BIND9-only (rndc dnssec -rollover); PowerDNS
-    # rolls on its own schedule + Windows DNS isn't supported.
-    "dnssec_rollover": frozenset({"bind9"}),
+    # Manual key rollover: BIND9 (rndc dnssec -rollover) and Technitium
+    # (zones/dnssec/properties/rolloverDnsKey, #1767); PowerDNS rolls on its
+    # own schedule + Windows DNS isn't supported.
+    "dnssec_rollover": frozenset({"bind9", "technitium"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = set(DNSSEC_VALIDATION_MODES)
@@ -1928,9 +1924,9 @@ class ZoneResponse(BaseModel):
     # the create handlers; empty everywhere else. A later delete removes the
     # zone from those servers too, so the operator should know it was found.
     adopted_existing_on: list[str] = Field(default_factory=list)
-    # #1783 — True when the zone is flagged signed on a group with a Technitium
-    # server: signed before SpatiumDDI stopped claiming Technitium signing, and
-    # SpatiumDDI will not keep it signed (#1767). Derived at serialisation.
+    # True when the zone is flagged signed on a group with an agentless Technitium
+    # server (agentless API): SpatiumDDI will not keep it signed. Derived at
+    # serialisation.
     dnssec_unmanaged_warning: bool = False
 
     model_config = {"from_attributes": True}
@@ -3679,6 +3675,9 @@ async def _sync_single_server(
     # 1. Topology discovery (Path B for Windows / REST API for the rest).
     zones_on_server: list[str] = []
     zone_meta_by_name: dict[str, dict[str, Any]] = {}
+    # #1771 — a failed zone listing is not an empty server: step 3 must not
+    # read "nothing on the server" and create every zone in the group.
+    zone_pull_failed = False
     if topology_capable:
         try:
             discovered = await get_driver(server.driver).pull_zones_from_server(server)  # type: ignore[attr-defined]
@@ -3689,6 +3688,7 @@ async def _sync_single_server(
                 zones_on_server.append(name)
                 zone_meta_by_name[name] = z
         except Exception as exc:  # noqa: BLE001 — informational, keep going
+            zone_pull_failed = True
             logger.warning(
                 "dns.sync_from_server.pull_zones_failed",
                 server=str(server.id),
@@ -3763,7 +3763,11 @@ async def _sync_single_server(
     #    Windows DNS over WinRM + cloud DNS via provider API).
     zones_pushed_to_server: list[str] = []
     zones_push_to_server_errors: list[str] = []
-    if topology_capable:
+    if topology_capable and zone_pull_failed:
+        zones_push_to_server_errors.append(
+            "zone listing from the server failed, so no missing zone was pushed"
+        )
+    elif topology_capable:
         server_zone_set = {n for n in zones_on_server}
         driver = get_driver(server.driver)
         # Re-query zones after the import step so newly-imported rows
@@ -3774,7 +3778,11 @@ async def _sync_single_server(
             if bare in server_zone_set:
                 continue
             try:
-                await driver.apply_zone_change(server, zone, "create")
+                changed = await driver.apply_zone_change(server, zone, "create")
+                if changed is False:
+                    # Already on the server (a zone the listing hid from this
+                    # token): adopted, not pushed (#1771).
+                    continue
                 zones_pushed_to_server.append(bare)
                 db.add(
                     AuditLog(
@@ -7213,6 +7221,26 @@ async def update_zone(
     # no records makes the agent render it from nothing and serve it empty.
     new_type = changes.get("zone_type")
     old_type = zone.zone_type or "primary"
+    if new_type is not None and new_type != "primary" and new_type != old_type:
+        # #4390 — a pool holds no row while it is disabled or its members are
+        # down, so the record count below misses it; once it renders again it
+        # would write into a zone nobody serves as primary. Refuse by name.
+        pool_names = (
+            (await db.execute(select(DNSPool.name).where(DNSPool.zone_id == zone.id)))
+            .scalars()
+            .all()
+        )
+        if pool_names:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} is the zone of DNS pool(s) {', '.join(sorted(pool_names))}"
+                    f", and its type cannot be changed to {new_type} while they target it: a "
+                    f"{new_type} zone is not one SpatiumDDI serves records from, so the pool's "
+                    "records would be listed but served by nobody. A superadmin can delete the "
+                    "pool (or move it to a primary zone) first."
+                ),
+            )
     if new_type is not None and new_type != old_type:
         held, trashed = (
             await db.execute(
@@ -8148,9 +8176,9 @@ class ZoneDNSSECInfo(BaseModel):
     # each signing with its own keys; ``signing_servers`` is that count.
     dnssec_multi_signer: bool = False
     signing_servers: int = 0
-    # #1783 — the group runs a driver SpatiumDDI no longer signs on
-    # (Technitium); sign / re-sign are refused there (#1767). With
-    # ``dnssec_enabled`` this is a zone signed before the withdrawal.
+    # The group runs a driver SpatiumDDI does not sign on (the agentless
+    # Technitium API driver); sign / re-sign are refused there. With
+    # ``dnssec_enabled`` this is a zone signed before the refusal.
     signing_unmanaged: bool = False
     dnssec_unmanaged_warning: bool = False
 
@@ -8212,6 +8240,11 @@ class DelegationPreviewResponse(BaseModel):
     existing_glue_records: list[DelegationRecordPreview] = []
     warnings: list[str] = []
     child_apex_ns_count: int | None = None
+    # #4389 — the view the parent zone is pinned to (None: every view).
+    parent_view_name: str | None = None
+    # #4388 — rows the delegation would write beside a CNAME in the parent: the
+    # apply refuses (409) while any is listed.
+    cname_conflicts: list[str] = []
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info", response_model=ZoneDNSSECInfo)
@@ -8411,9 +8444,11 @@ async def rollover_zone_dnssec_key(
     db: DB,
     current_user: SuperAdmin,
 ) -> dict[str, Any]:
-    """Force a manual KSK/ZSK rollover for a signed BIND9 zone (issue #49).
+    """Force a manual KSK/ZSK rollover for a signed BIND9 or Technitium zone
+    (issue #49, #1767).
 
-    BIND9-only (``rndc dnssec -rollover``); PowerDNS rolls on its own
+    BIND9 (``rndc dnssec -rollover``) and Technitium
+    (``zones/dnssec/properties/rolloverDnsKey``); PowerDNS rolls on its own
     schedule and Windows DNS isn't supported. Enqueues a ``dnssec_rollover``
     op carrying the key tag; the agent runs the rollover and reports the new
     key set back on its next sync. The zone must already be signed.
@@ -9102,11 +9137,11 @@ async def get_delegation_preview(
     """Compute the NS + glue records needed to delegate this zone from its parent.
 
     Returns ``{has_parent: false}`` when no eligible parent zone exists in
-    the same group; otherwise the dict is the full preview shape from
+    the same group and view; otherwise the dict is the full preview shape from
     ``preview_to_dict`` plus ``has_parent: true``.
     """
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         return DelegationPreviewResponse(has_parent=False)
     # #4258 — only a primary parent can take the NS + glue records; a secondary
@@ -9138,6 +9173,9 @@ async def apply_delegation(
 ) -> list[DNSRecord]:
     """Materialise the delegation records into the parent zone.
 
+    The parent is the one in the child's own view (#4389). A row that would sit
+    beside a CNAME in the parent is refused with 409 (#4388).
+
     Idempotent — records that already exist in the parent are skipped, so a
     second call after the first succeeds is a no-op. Each created record
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
@@ -9149,7 +9187,7 @@ async def apply_delegation(
     # probed first, locked, and re-found: a parent that changed meanwhile is a
     # 409, not a write into the wrong zone.
     child = await _require_zone(group_id, zone_id, db, current_user)
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
@@ -9162,7 +9200,7 @@ async def apply_delegation(
     parent_id = parent.id
     await lock_zone_rows(db, [child.id, parent_id])
     child = await _require_zone(group_id, zone_id, db, current_user, lock="write")
-    parent = await find_parent_zone(db, group_id, child.name)
+    parent = await find_parent_zone(db, group_id, child.name, child.view_id)
     if parent is None:
         raise HTTPException(
             status_code=404,
@@ -9177,6 +9215,10 @@ async def apply_delegation(
         raise HTTPException(status_code=409, detail=reason)
     await db.refresh(parent)
     preview = await compute_delegation(db, parent, child)
+    if preview.cname_conflicts:
+        # #4388 — the record API's CNAME rule: the parent keeps its CNAME and
+        # nothing is written beside it.
+        raise HTTPException(status_code=409, detail=" ".join(preview.cname_conflicts))
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
         return []
@@ -12576,13 +12618,11 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
         raise HTTPException(
             status_code=422,
             detail=(
-                "DNSSEC signing is not supported on Technitium servers "
-                "(agent-managed or agentless API) in 1.0: "
-                "SpatiumDDI cannot keep a Technitium zone signed (it is signed "
-                "once and never re-signed on a new server, a re-created zone "
-                "or a lost volume, and the zone's DNSSEC policy is ignored). "
-                "Use a BIND9 or PowerDNS group for signed zones; full "
-                "Technitium support is tracked in #1767."
+                "DNSSEC signing is not supported on the agentless Technitium "
+                "API driver: there is no agent to keep the zone signed on a "
+                "new server, a re-created zone or a lost volume. Use an "
+                "agent-managed Technitium, BIND9 or PowerDNS group for "
+                "signed zones."
             ),
         )
     if not incompatible and op == "dnssec_sign":
@@ -12782,14 +12822,18 @@ def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
+_PAST_TENSE = {"edit": "edited", "delete": "deleted", "add": "added", "create": "created"}
+
+
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
     """Same gate, applied to records belonging to a synthesised zone."""
+    done = _PAST_TENSE.get(op, f"{op}ed")
     if record.tailscale_tenant_id is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12798,7 +12842,7 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12807,8 +12851,8 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is managed by a DNS pool and cannot "
-                f"be {op}ed manually. Edits would be overwritten on the next "
-                f"health-check pass — manage the pool / member instead."
+                f"be {done} manually. Edits would be overwritten on the next "
+                f"health-check pass — a superadmin manages the pool or its member."
             ),
         )
 

@@ -138,4 +138,9 @@ describe("multi_select and date (#4288)", () => {
     expect(customFieldDisplay("2026-12-31")).toBe("2026-12-31");
     expect(customFieldDisplay(null)).toBe("");
   });
+
+  it("shows an object as JSON text, never [object Object] (#4421)", () => {
+    expect(customFieldDisplay({ k: "v" })).toBe('{"k":"v"}');
+    expect(customFieldDisplay([{ k: "v" }, "x"])).toBe('{"k":"v"}, x');
+  });
 });

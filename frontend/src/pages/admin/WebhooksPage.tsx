@@ -692,7 +692,10 @@ export function WebhooksPage() {
 
   const del = useMutation({
     mutationFn: (id: string) => webhooksApi.delete(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+      setConfirm(null);
+    },
   });
 
   const test = useMutation({
@@ -894,11 +897,13 @@ export function WebhooksPage() {
         message={`Delete subscription "${confirm?.name ?? ""}"? Pending and dead-letter deliveries are removed too.`}
         confirmLabel="Delete"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          del.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );

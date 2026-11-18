@@ -25,6 +25,7 @@ import { TagFilterChips } from "@/components/TagFilterChips";
 import {
   applianceApprovalApi,
   formatApiError,
+  formatDialogError,
   ipamApi,
   wakeSchedulesApi,
   type ApplianceRow,
@@ -46,6 +47,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { isValidTimeZone, timeZoneSuggestions } from "@/lib/timezones";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scheduled Wake-on-LAN (#586 Phase 1) — Tools page.
@@ -446,20 +448,12 @@ function SchedulesTab() {
       qc.invalidateQueries({ queryKey: ["wol-schedule-preview"] });
       setConfirm(null);
     },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Run-now failed"));
-      setConfirm(null);
-    },
   });
 
   const del = useMutation({
     mutationFn: (id: string) => wakeSchedulesApi.remove(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["wol-schedules"] });
-      setConfirm(null);
-    },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Delete failed"));
       setConfirm(null);
     },
   });
@@ -638,8 +632,19 @@ function SchedulesTab() {
         confirmLabel={confirm?.confirmLabel}
         tone={confirm?.tone}
         loading={runNow.isPending || del.isPending}
+        error={
+          runNow.error
+            ? formatApiError(runNow.error, "Run-now failed")
+            : del.error
+              ? formatApiError(del.error, "Delete failed")
+              : null
+        }
         onConfirm={() => confirm?.run()}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          runNow.reset();
+          del.reset();
+        }}
       />
     </div>
   );
@@ -1365,10 +1370,6 @@ function CalendarsTab() {
       qc.invalidateQueries({ queryKey: ["wol-schedules"] });
       setConfirm(null);
     },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Delete failed"));
-      setConfirm(null);
-    },
   });
 
   const rows = calendarsQ.data ?? [];
@@ -1489,8 +1490,12 @@ function CalendarsTab() {
         confirmLabel="Delete"
         tone="destructive"
         loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
         onConfirm={() => confirm && del.mutate(confirm.calendar.id)}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          del.reset();
+        }}
       />
     </div>
   );
@@ -1879,23 +1884,10 @@ const browserTz = (() => {
 })();
 
 function useIanaTimezones(): string[] {
-  return useMemo(() => {
-    type IntlWithList = typeof Intl & {
-      supportedValuesOf?: (key: "timeZone") => string[];
-    };
-    const I = Intl as IntlWithList;
-    if (typeof I.supportedValuesOf === "function") {
-      try {
-        return I.supportedValuesOf("timeZone");
-      } catch {
-        return ["UTC"];
-      }
-    }
-    return ["UTC"];
-  }, []);
+  return useMemo(() => timeZoneSuggestions(), []);
 }
 
-function WolScheduleModal({
+export function WolScheduleModal({
   existing,
   onClose,
   onSaved,
@@ -1976,7 +1968,7 @@ function WolScheduleModal({
 
   const [error, setError] = useState<string | null>(null);
   const ianaList = useIanaTimezones();
-  const tzValid = ianaList.includes(timezone.trim());
+  const tzValid = isValidTimeZone(timezone);
 
   const selector: WolTargetSelector = useMemo(
     () => ({
@@ -2034,7 +2026,7 @@ function WolScheduleModal({
         : wakeSchedulesApi.create(body);
     },
     onSuccess: onSaved,
-    onError: (e) => setError(formatApiError(e, "Failed to save schedule")),
+    onError: (e) => setError(formatDialogError(e, "Failed to save schedule")),
   });
 
   // Send-option ranges mirror the backend schema (schemas.py) so an
@@ -2095,8 +2087,14 @@ function WolScheduleModal({
   const calendarValid =
     (calendarMode === "none" || !!calendarId) && calendarMatchError === null;
 
+  // The API refuses a tag mode with no tags (an empty list would match
+  // every host), so the button must not offer that save (#4417). "hosts"
+  // has no picker here and the schema accepts it as-is.
+  const targetValid = mode === "hosts" || hasSelection;
+
   const canSave =
     name.trim().length > 0 &&
+    targetValid &&
     tzValid &&
     sendValid &&
     verifyValid &&
@@ -2366,6 +2364,14 @@ function TargetStep({
           Explicit host lists are built from the IPAM tables. Tag your target
           IPs and use “By IP-address tags” for now — direct host picking lands
           in a follow-up.
+        </p>
+      )}
+
+      {!hasSelection && mode !== "hosts" && (
+        <p className="text-xs text-destructive">
+          {mode === "subnet"
+            ? "Pick at least one subnet."
+            : "Pick at least one tag."}
         </p>
       )}
 

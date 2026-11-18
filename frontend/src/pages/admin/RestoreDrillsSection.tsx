@@ -271,9 +271,21 @@ export function RestoreDrillsSection() {
                       </td>
                       <td className="px-4 py-2">
                         {t.drill_enabled && t.drill_cron ? (
-                          <span className="font-mono text-xs">
-                            {t.drill_cron}
-                          </span>
+                          <>
+                            <span className="font-mono text-xs">
+                              {t.drill_cron}
+                            </span>
+                            {!t.enabled && (
+                              // The drill sweep only fires for enabled
+                              // destinations (#4403); Run drill still works.
+                              <div
+                                className="mt-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                title="The scheduled drill sweep skips a disabled destination. Enable it on the Destinations tab, or use Run drill by hand."
+                              >
+                                paused: destination disabled
+                              </div>
+                            )}
+                          </>
                         ) : (
                           <span className="text-xs text-muted-foreground">
                             not scheduled

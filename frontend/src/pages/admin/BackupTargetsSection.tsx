@@ -373,7 +373,7 @@ function TargetRow({
         </div>
       </div>
       {/* A refused request (403, 404, 409 …) never reaches the ``data``
-          panels below; show the API's reason (#2203). */}
+          panels below; show the API's reason (#2203), announced (#4404). */}
       {(
         [
           [runMut, "run failed"],
@@ -382,13 +382,13 @@ function TargetRow({
         ] as const
       ).map(([m, fallback]) =>
         m.isError ? (
-          <div
+          <FormError
             key={fallback}
-            className="border-t bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
+            className="border-t bg-destructive/5 px-3 py-1.5"
           >
             <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
             {formatApiError(m.error, fallback)}
-          </div>
+          </FormError>
         ) : null,
       )}
       {testMut.data && (
@@ -521,9 +521,9 @@ function ArchiveList({
           Loading…
         </div>
       ) : q.isError ? (
-        <div className="break-words text-destructive">
+        <FormError className="break-words text-destructive">
           {formatApiError(q.error, "failed to list")}
-        </div>
+        </FormError>
       ) : (
         <>
           {q.data?.note && (

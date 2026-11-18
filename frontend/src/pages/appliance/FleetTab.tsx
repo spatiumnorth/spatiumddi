@@ -1678,8 +1678,14 @@ export function FleetTab({
           confirmLabel="Reject"
           tone="destructive"
           loading={reject.isPending}
+          error={
+            reject.error ? formatApiError(reject.error, "Action failed") : null
+          }
           onConfirm={() => reject.mutate(rejectTarget.id)}
-          onClose={() => setRejectTarget(null)}
+          onClose={() => {
+            setRejectTarget(null);
+            reject.reset();
+          }}
         />
       )}
 
@@ -1837,8 +1843,14 @@ export function FleetTab({
           }
           confirmLabel="Re-key"
           loading={rekey.isPending}
+          error={
+            rekey.error ? formatApiError(rekey.error, "Action failed") : null
+          }
           onConfirm={() => rekey.mutate(rekeyTarget.id)}
-          onClose={() => setRekeyTarget(null)}
+          onClose={() => {
+            setRekeyTarget(null);
+            rekey.reset();
+          }}
         />
       )}
 
@@ -1871,8 +1883,16 @@ export function FleetTab({
           }
           confirmLabel="Evict + mint replacement code"
           loading={replace.isPending}
+          error={
+            replace.error
+              ? formatApiError(replace.error, "Action failed")
+              : null
+          }
           onConfirm={() => replace.mutate(replaceTarget.id)}
-          onClose={() => setReplaceTarget(null)}
+          onClose={() => {
+            setReplaceTarget(null);
+            replace.reset();
+          }}
         />
       )}
 
@@ -1916,8 +1936,16 @@ export function FleetTab({
           }
           confirmLabel="Clear stuck state"
           loading={clearClusterState.isPending}
+          error={
+            clearClusterState.error
+              ? formatApiError(clearClusterState.error, "Action failed")
+              : null
+          }
           onConfirm={() => clearClusterState.mutate(clearStateTarget.id)}
-          onClose={() => setClearStateTarget(null)}
+          onClose={() => {
+            setClearStateTarget(null);
+            clearClusterState.reset();
+          }}
         />
       )}
 
@@ -3756,14 +3784,11 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
           // here. The operator wants their disk back, and refusing would
           // leave them pulling it anyway with the filesystem un-flushed.
           message={
-            ejectError ? (
-              <span className="text-destructive">{ejectError}</span>
-            ) : (
-              `The disk is flushed and unmounted, so it is safe to pull once the node ` +
-              `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
-              `will fail — loudly — until you mount it again.`
-            )
+            `The disk is flushed and unmounted, so it is safe to pull once the node ` +
+            `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
+            `will fail — loudly — until you mount it again.`
           }
+          error={ejectError}
           confirmLabel="Eject"
           tone="destructive"
           loading={eject.isPending}
@@ -6131,7 +6156,10 @@ function ApplianceOsUpgradeSection({
         </p>
       )}
       {slotError && (
-        <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
+        <p
+          role="alert"
+          className="mt-1 text-xs text-rose-700 dark:text-rose-300"
+        >
           {formatApiError(slotError)}
         </p>
       )}
@@ -6334,8 +6362,14 @@ function ApplianceOsUpgradeSection({
           confirmLabel="Reboot"
           tone="destructive"
           loading={reboot.isPending}
+          error={
+            reboot.error ? formatApiError(reboot.error, "Reboot failed") : null
+          }
           onConfirm={() => reboot.mutate()}
-          onClose={() => setRebootConfirm(false)}
+          onClose={() => {
+            setRebootConfirm(false);
+            reboot.reset();
+          }}
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
         />
       )}
