@@ -397,8 +397,8 @@ backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_column:115
 backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_column:118
 backend/alembic/versions/c4e1a87b3920_tailscale_integration.py:drop_table:120
 backend/alembic/versions/c4e2b7f81a39_appliance_role_health.py:drop_column:40
-backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:72
-backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:73
+backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:80
+backend/alembic/versions/c4e7a1d93b52_dns_server_delete_keeps_history.py:drop_column:81
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:298
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:303
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:306
