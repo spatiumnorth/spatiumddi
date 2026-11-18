@@ -28,20 +28,16 @@ here so it's centralised for Wave 4 to extend.
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import structlog
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.drivers.llm import get_driver
 from app.drivers.llm.base import (
     ChatMessage,
-    ChatRequest,
     ToolCall,
     ToolDefinition,
 )
@@ -55,17 +51,12 @@ from app.models.network import NetworkDevice
 from app.models.settings import PlatformSettings
 from app.services import feature_modules as fm_svc
 from app.services.ai.pricing import compute_cost
-from app.services.ai.tools import (
-    REGISTRY,
-    ToolArgumentError,
-    ToolDisabled,
-    ToolNotFound,
-    ToolPermissionDenied,
-    effective_tool_names,
-    is_rate_limit_refusal,
+from app.services.ai.tool_loop import (
+    RoundResult,
+    dispatch_tool_call,
+    stream_model_round,
 )
-
-logger = structlog.get_logger(__name__)
+from app.services.ai.tools import REGISTRY, effective_tool_names
 
 # Cap on tool-call iterations per user turn. Five rounds is plenty
 # for the read-only tool surface — most queries resolve in 1-2.
@@ -75,41 +66,6 @@ MAX_TOOL_ROUNDS: int = 5
 # this we drop oldest messages (preserving the system message). Stops
 # token cost from running away on long sessions.
 MAX_HISTORY_MESSAGES: int = 40
-
-
-def _is_transient_failure(exc: BaseException) -> bool:
-    """Decide whether a driver error is worth retrying on a fallback
-    provider. Transient = network hiccup, server-side 5xx, rate limit.
-    Configuration errors (auth, schema) are NOT retried — they need
-    operator action and surface untouched.
-
-    The match is on the SDK exception class name rather than ``isinstance``
-    so we can recognise both OpenAI- and Anthropic-flavoured errors
-    without import-time coupling between drivers.
-    """
-    name = type(exc).__name__
-    transient_class_names = {
-        # OpenAI + Anthropic share these names.
-        "APIConnectionError",
-        "APITimeoutError",
-        "APIConnectionTimeoutError",
-        "APIResponseValidationError",
-        "InternalServerError",
-        "ServiceUnavailableError",
-        "RateLimitError",
-        # Generic asyncio / httpx
-        "TimeoutError",
-        "ReadTimeout",
-        "ConnectError",
-        "ConnectTimeout",
-    }
-    if name in transient_class_names:
-        return True
-    # APIStatusError covers any non-2xx — only treat 5xx + 429 as transient.
-    status_code = getattr(exc, "status_code", None)
-    if isinstance(status_code, int) and (status_code >= 500 or status_code == 429):
-        return True
-    return False
 
 
 # ── Streaming events ──────────────────────────────────────────────────
@@ -850,128 +806,45 @@ class ChatOrchestrator:
         # tool-result so the model can pivot.
         effective_tools = {t.name for t in tools}
 
-        # Per-turn duplicate-call tracker. Some smaller open-weight
-        # models loop on a successful tool call (we've seen qwen2.5:7b
-        # call ``list_subnets`` 5× in a row with the same args before
-        # the round cap kicks in). Catching the duplicate here gives
-        # us a chance to nudge the model back toward summarising the
-        # data it already has.
+        # Per-turn duplicate-call tracker — see ``dispatch_tool_call``.
         seen_calls: set[tuple[str, str]] = set()
+        log_context = {"session_id": str(session.id)}
 
-        # Tool-call loop
-        for round_idx in range(MAX_TOOL_ROUNDS):
+        # Tool-call loop. The model round and the tool dispatch are the
+        # shared pieces in ``tool_loop``; this method persists each message
+        # and translates what happens into stream events.
+        for _round_idx in range(MAX_TOOL_ROUNDS):
             messages = await self._load_history(session)
-            attempt_idx = 0
-            chunks_yielded = False
-            assistant_buf = ""
-            tool_calls: list[ToolCall] = []
-            finish_reason: str | None = None
-            prompt_tokens: int | None = None
-            completion_tokens: int | None = None
-            started = time.monotonic()
-            current_provider = provider
-            current_model = session.model
+            round_result: RoundResult | None = None
+            # Every round starts on the session's snapshotted provider and
+            # model again, whatever an earlier round failed over to.
+            async for ev in stream_model_round(
+                messages=messages,
+                tools=tools,
+                chain=fallback_chain,
+                model=session.model,
+                log_event_prefix="ai_chat",
+                log_context=log_context,
+            ):
+                if ev.kind == "content":
+                    yield StreamEvent("content", {"delta": ev.delta})
+                elif ev.kind == "failover":
+                    yield StreamEvent("info", ev.info)
+                elif ev.kind == "error":
+                    yield StreamEvent("error", {"message": ev.message})
+                    return
+                elif ev.kind == "result":
+                    round_result = ev.result
+            if round_result is None:  # pragma: no cover - always result or error
+                yield StreamEvent("error", {"message": "the model returned no result"})
+                return
 
-            while True:
-                # Fresh request bound to whatever provider/model we're
-                # currently attempting (might be a fallback).
-                request = ChatRequest(
-                    messages=messages,
-                    model=current_model,
-                    tools=tools,
-                    temperature=float(current_provider.options.get("temperature", 0.3)),
-                    max_tokens=int(current_provider.options.get("max_tokens", 2048)),
-                )
-                driver = get_driver(current_provider)
-                try:
-                    async for chunk in driver.chat(request):
-                        if chunk.content_delta:
-                            assistant_buf += chunk.content_delta
-                            chunks_yielded = True
-                            yield StreamEvent(
-                                "content",
-                                {"delta": chunk.content_delta},
-                            )
-                        if chunk.tool_call_delta is not None:
-                            tool_calls.append(chunk.tool_call_delta)
-                            chunks_yielded = True
-                        # Usage may arrive on the finish_reason chunk
-                        # (OpenAI native) OR a trailing usage-only chunk
-                        # (Ollama with stream_options.include_usage).
-                        # Capture whichever shows up.
-                        if chunk.prompt_tokens is not None:
-                            prompt_tokens = chunk.prompt_tokens
-                        if chunk.completion_tokens is not None:
-                            completion_tokens = chunk.completion_tokens
-                        if chunk.finish_reason:
-                            finish_reason = chunk.finish_reason
-                    # Stream completed cleanly — break out of the
-                    # failover ``while True`` to persist + decide next.
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    if not _is_transient_failure(exc) or chunks_yielded:
-                        # Either a configuration error (auth, schema)
-                        # or we've already streamed partial output —
-                        # don't risk a duplicated/contradictory reply.
-                        logger.exception(
-                            "ai_chat_driver_error",
-                            session_id=str(session.id),
-                            provider=current_provider.name,
-                        )
-                        yield StreamEvent(
-                            "error",
-                            {"message": f"{type(exc).__name__}: {exc}"},
-                        )
-                        return
-                    attempt_idx += 1
-                    if attempt_idx >= len(fallback_chain):
-                        # Out of fallbacks. Surface the last error.
-                        logger.exception(
-                            "ai_chat_failover_exhausted",
-                            session_id=str(session.id),
-                            tried=[p.name for p in fallback_chain],
-                        )
-                        yield StreamEvent(
-                            "error",
-                            {
-                                "message": (
-                                    f"all {len(fallback_chain)} provider(s) "
-                                    f"failed; last error: {type(exc).__name__}: {exc}"
-                                )
-                            },
-                        )
-                        return
-                    next_provider = fallback_chain[attempt_idx]
-                    next_model = next_provider.default_model or current_model
-                    logger.warning(
-                        "ai_chat_failover",
-                        session_id=str(session.id),
-                        from_provider=current_provider.name,
-                        to_provider=next_provider.name,
-                        to_model=next_model,
-                        reason=f"{type(exc).__name__}: {exc}",
-                    )
-                    yield StreamEvent(
-                        "info",
-                        {
-                            "kind": "failover",
-                            "from_provider": current_provider.name,
-                            "to_provider": next_provider.name,
-                            "to_model": next_model,
-                            "reason": f"{type(exc).__name__}",
-                        },
-                    )
-                    current_provider = next_provider
-                    current_model = next_model
-                    # Reset attempt-local state and retry the round.
-                    assistant_buf = ""
-                    tool_calls = []
-                    finish_reason = None
-                    prompt_tokens = None
-                    completion_tokens = None
-                    started = time.monotonic()
-
-            elapsed_ms = int((time.monotonic() - started) * 1000)
+            assistant_buf = round_result.content
+            tool_calls = round_result.tool_calls
+            finish_reason = round_result.finish_reason
+            prompt_tokens = round_result.prompt_tokens
+            completion_tokens = round_result.completion_tokens
+            elapsed_ms = round_result.elapsed_ms
 
             # Compute cost via the rate sheet (Wave 4) using whichever
             # model actually served the request — could be the
@@ -980,7 +853,7 @@ class ChatOrchestrator:
             # recognised (local LLMs / custom hosts).
             settings = await self.db.scalar(select(PlatformSettings))
             overrides = (settings.ai_pricing_overrides if settings else None) or None
-            cost_usd = compute_cost(current_model, prompt_tokens, completion_tokens, overrides)
+            cost_usd = compute_cost(round_result.model, prompt_tokens, completion_tokens, overrides)
 
             # Persist whatever the assistant produced this round.
             assistant_msg = AIChatMessage(
@@ -1039,38 +912,28 @@ class ChatOrchestrator:
                         "arguments": tc.arguments_json,
                     },
                 )
-                try:
-                    raw_args = json.loads(tc.arguments_json or "{}")
-                except json.JSONDecodeError:
-                    raw_args = {}
-
-                # Dedup: same name + same canonical args we've already
-                # served this turn. Don't re-run the tool — feed back
-                # a stop-the-loop hint so the model summarises instead.
-                args_canonical = json.dumps(raw_args, sort_keys=True, default=str)
-                call_key = (tc.name, args_canonical)
-                if call_key in seen_calls:
-                    result_text = json.dumps(
-                        {
-                            "warning": (
-                                f"You already called {tc.name} with these arguments "
-                                "earlier in this turn — the result is already in your "
-                                "conversation history. Do NOT call this tool again. "
-                                "Read the previous result and write the answer to the "
-                                "operator now."
-                            ),
-                        }
+                outcome = await dispatch_tool_call(
+                    tc,
+                    db=self.db,
+                    user=self.user,
+                    effective=effective_tools,
+                    seen_calls=seen_calls,
+                    log_event_prefix="ai_chat",
+                    log_context=log_context,
+                )
+                result_text = outcome.result_text
+                self.db.add(
+                    AIChatMessage(
+                        session_id=session.id,
+                        role="tool",
+                        content=result_text,
+                        tool_call_id=tc.id,
+                        name=tc.name,
                     )
-                    is_error = False
-                    self.db.add(
-                        AIChatMessage(
-                            session_id=session.id,
-                            role="tool",
-                            content=result_text,
-                            tool_call_id=tc.id,
-                            name=tc.name,
-                        )
-                    )
+                )
+                if outcome.duplicate:
+                    # The repeat was not run again; the model got a
+                    # stop-the-loop hint as its result.
                     yield StreamEvent(
                         "tool_result",
                         {
@@ -1081,94 +944,12 @@ class ChatOrchestrator:
                         },
                     )
                     continue
-                seen_calls.add(call_key)
-
-                try:
-                    result = await REGISTRY.call(
-                        tc.name,
-                        raw_args,
-                        db=self.db,
-                        user=self.user,
-                        effective=effective_tools,
-                    )
-                    result_text = json.dumps(result, default=str)
-                    is_error = is_rate_limit_refusal(result)
-                except ToolNotFound:
-                    # Smaller open-weight models (gemma, llama-3-8b, etc.)
-                    # sometimes hallucinate a generic-sounding name like
-                    # ``list_all_resources``. Echo the real tool names
-                    # back so the model can self-correct on the next
-                    # iteration rather than giving up and emitting a
-                    # generic greeting.
-                    available = sorted(effective_tools)
-                    result_text = json.dumps(
-                        {
-                            "error": f"tool not found: {tc.name}",
-                            "available_tools": available,
-                            "hint": (
-                                "You may only call tools listed in available_tools. "
-                                "Pick the closest match and try again."
-                            ),
-                        }
-                    )
-                    is_error = True
-                except ToolDisabled as exc:
-                    # The operator has disabled this tool in
-                    # Settings → AI → Tool Catalog (or in the
-                    # provider's allowlist). The model picked it
-                    # anyway — surface a clear message so it can
-                    # explain to the user how to enable it.
-                    result_text = json.dumps(
-                        {
-                            "error": f"tool {exc.name!r} is disabled by the operator",
-                            "hint": (
-                                "This tool exists but is not enabled in the operator's "
-                                "Tool Catalog. Tell the user the feature is disabled and "
-                                "to ask their administrator to enable "
-                                f"'{exc.name}' under Administration → AI Tool Catalog. "
-                                "Do not retry this tool call."
-                            ),
-                        }
-                    )
-                    is_error = True
-                except ToolPermissionDenied as exc:
-                    result_text = json.dumps(
-                        {
-                            "error": str(exc),
-                            "hint": (
-                                "The signed-in user's role does not grant this. "
-                                "Tell them; do not retry this tool call."
-                            ),
-                        }
-                    )
-                    is_error = True
-                except ToolArgumentError as exc:
-                    result_text = json.dumps({"error": f"invalid args: {exc.detail}"})
-                    is_error = True
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception(
-                        "ai_chat_tool_error",
-                        tool=tc.name,
-                        session_id=str(session.id),
-                    )
-                    result_text = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-                    is_error = True
-
-                self.db.add(
-                    AIChatMessage(
-                        session_id=session.id,
-                        role="tool",
-                        content=result_text,
-                        tool_call_id=tc.id,
-                        name=tc.name,
-                    )
-                )
                 yield StreamEvent(
                     "tool_result",
                     {
                         "tool_call_id": tc.id,
                         "name": tc.name,
-                        "is_error": is_error,
+                        "is_error": outcome.is_error,
                         # Truncate to keep the SSE frame small — the
                         # full result is in the DB if anyone wants it.
                         "preview": result_text[:500],
