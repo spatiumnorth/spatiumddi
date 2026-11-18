@@ -5975,7 +5975,9 @@ async def update_block(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the block already holds.
     if body.custom_fields is not None:
-        await validate_custom_field_values(db, "ip_block", body.custom_fields)
+        await validate_custom_field_values(
+            db, "ip_block", body.custom_fields, stored=block.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "ip_block",
@@ -8141,7 +8143,9 @@ async def update_subnet(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the subnet already holds.
     if body.custom_fields is not None:
-        await validate_custom_field_values(db, "subnet", body.custom_fields)
+        await validate_custom_field_values(
+            db, "subnet", body.custom_fields, stored=subnet.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "subnet",
@@ -11183,7 +11187,9 @@ async def update_address(
     # ``reserved_until`` by sending an explicit null. ``dns_zone_id`` /
     # ``force`` are routing fields, not row attrs.
     changes = body.model_dump(exclude_unset=True, exclude={"dns_zone_id", "force"})
-    await validate_custom_field_values(db, "ip_address", changes.get("custom_fields"))
+    await validate_custom_field_values(
+        db, "ip_address", changes.get("custom_fields"), stored=ip.custom_fields
+    )
     changes_for_audit = body.model_dump(
         mode="json", exclude_unset=True, exclude={"dns_zone_id", "force"}
     )
