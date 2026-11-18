@@ -7213,6 +7213,26 @@ async def update_zone(
     # no records makes the agent render it from nothing and serve it empty.
     new_type = changes.get("zone_type")
     old_type = zone.zone_type or "primary"
+    if new_type is not None and new_type != "primary" and new_type != old_type:
+        # #4390 — a pool holds no row while it is disabled or its members are
+        # down, so the record count below misses it; once it renders again it
+        # would write into a zone nobody serves as primary. Refuse by name.
+        pool_names = (
+            (await db.execute(select(DNSPool.name).where(DNSPool.zone_id == zone.id)))
+            .scalars()
+            .all()
+        )
+        if pool_names:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} is the zone of DNS pool(s) {', '.join(sorted(pool_names))}"
+                    f", and its type cannot be changed to {new_type} while they target it: a "
+                    f"{new_type} zone is not one SpatiumDDI serves records from, so the pool's "
+                    "records would be listed but served by nobody. A superadmin can delete the "
+                    "pool (or move it to a primary zone) first."
+                ),
+            )
     if new_type is not None and new_type != old_type:
         held, trashed = (
             await db.execute(
@@ -12782,14 +12802,18 @@ def _reject_if_unauthored_zone(zone: DNSZone, op: str) -> None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
+_PAST_TENSE = {"edit": "edited", "delete": "deleted", "add": "added", "create": "created"}
+
+
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
     """Same gate, applied to records belonging to a synthesised zone."""
+    done = _PAST_TENSE.get(op, f"{op}ed")
     if record.tailscale_tenant_id is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12798,7 +12822,7 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. Edits would be "
+                f"integration and cannot be {done} manually. Edits would be "
                 f"overwritten on the next sync."
             ),
         )
@@ -12807,8 +12831,8 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is managed by a DNS pool and cannot "
-                f"be {op}ed manually. Edits would be overwritten on the next "
-                f"health-check pass — manage the pool / member instead."
+                f"be {done} manually. Edits would be overwritten on the next "
+                f"health-check pass — a superadmin manages the pool or its member."
             ),
         )
 

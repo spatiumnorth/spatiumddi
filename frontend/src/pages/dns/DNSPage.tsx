@@ -5891,7 +5891,17 @@ export function ZoneDetailView({
                         >
                           Copy Value
                         </ContextMenuItem>
-                        {r.auto_generated ? (
+                        {r.pool_member_id ? (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem
+                              disabled
+                              title="This record is rendered by a DNS pool's health-check pipeline, so it cannot be edited or deleted here. A superadmin manages the pool on the Pools tab."
+                            >
+                              Managed by a DNS pool — read-only
+                            </ContextMenuItem>
+                          </>
+                        ) : r.auto_generated ? (
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem disabled>
