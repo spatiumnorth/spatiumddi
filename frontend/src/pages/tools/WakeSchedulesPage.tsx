@@ -2770,7 +2770,7 @@ function CalendarGateSection({
               placeholder="e.g. holiday|closed  (leave empty to count every event)"
             />
             {calendarMatchError ? (
-              <p className="mt-1 text-[11px] text-destructive">
+              <p role="alert" className="mt-1 text-[11px] text-destructive">
                 {calendarMatchError}
               </p>
             ) : (
