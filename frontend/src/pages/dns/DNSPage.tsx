@@ -1298,10 +1298,7 @@ function GroupModalForm({
       setError("");
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
     },
-    onError: (e: ApiError) => {
-      setConfirmRotate(false);
-      setError(formatApiError(e));
-    },
+    // A refusal stays in the open confirm (announced there).
   });
 
   const mut = useMutation({
@@ -1550,7 +1547,11 @@ function GroupModalForm({
           title="Rotate the group TSIG key?"
           confirmLabel="Rotate key"
           loading={rotateMut.isPending}
-          onClose={() => setConfirmRotate(false)}
+          error={rotateMut.error ? formatApiError(rotateMut.error) : null}
+          onClose={() => {
+            setConfirmRotate(false);
+            rotateMut.reset();
+          }}
           onConfirm={() => rotateMut.mutate(group.id)}
           message={
             <div className="space-y-2 text-sm">
@@ -6990,7 +6991,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
   // #4180 — the read-only detail modal a row click / Enter opens.
   const [detailId, setDetailId] = useState<string | null>(null);
-  const [error, setError] = useState("");
 
   const { data: viewsData, error: viewsError } = useQuery({
     queryKey: ["dns-views", group.id],
@@ -7034,13 +7034,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
       setConfirmDelete(null);
     },
-    // Close the dialog on failure too — the error renders on the page
-    // behind it, so leaving the modal up hides the only explanation and
-    // reads as "Delete does nothing".
-    onError: (e: ApiError) => {
-      setError(formatApiError(e, "Delete failed"));
-      setConfirmDelete(null);
-    },
+    // A refusal stays in the open confirm (announced there).
   });
 
   return (
@@ -7052,7 +7046,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         <button
           className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => {
-            setError("");
             setCreating(true);
           }}
           {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
@@ -7149,7 +7142,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       aria-label="Edit view"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setError("");
                         setEditing(v);
                       }}
                       {...permissionGate(
@@ -7165,7 +7157,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       aria-label="Delete view"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setError("");
                         setConfirmDelete(v);
                       }}
                       {...permissionGate(
@@ -7217,8 +7208,6 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         </div>
       )}
 
-      {error && <FormError className="mt-2">{error}</FormError>}
-
       {detailView && !editing && !confirmDelete && (
         <ViewDetailModal
           view={detailView}
@@ -7230,11 +7219,9 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           canDelete={can("delete", "dns_group")}
           onClose={() => setDetailId(null)}
           onEdit={() => {
-            setError("");
             setEditing(detailView);
           }}
           onDelete={() => {
-            setError("");
             setConfirmDelete(detailView);
           }}
         />
@@ -7258,7 +7245,13 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           confirmLabel="Delete view"
           tone="destructive"
           loading={delMut.isPending}
-          onClose={() => setConfirmDelete(null)}
+          error={
+            delMut.error ? formatApiError(delMut.error, "Delete failed") : null
+          }
+          onClose={() => {
+            setConfirmDelete(null);
+            delMut.reset();
+          }}
           onConfirm={() => delMut.mutate(confirmDelete.id)}
           message={
             <div className="space-y-2 text-sm">
@@ -7964,6 +7957,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
           tone="destructive"
           onClose={() => setConfirmDelete(null)}
           loading={delMut.isPending}
+          error={deleteError || null}
           onConfirm={() => {
             setDeleteError("");
             delMut.mutate(confirmDelete.id);
@@ -7975,14 +7969,6 @@ export function AclsTab({ groupId }: { groupId: string }) {
                 cannot be deleted — the server refuses it, and the reason is
                 shown here. Remove the references first.
               </p>
-              {deleteError && (
-                <p
-                  role="alert"
-                  className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-sm text-destructive"
-                >
-                  {deleteError}
-                </p>
-              )}
             </div>
           }
         />

@@ -511,16 +511,11 @@ function SitesTab({ overlayId }: { overlayId: string }) {
         open={confirmDetachId !== null}
         title="Detach site"
         loading={detach.isPending}
-        message={
-          <>
-            Detach this site from the overlay?
-            {detach.isError && (
-              <span role="alert" className="mt-2 block text-destructive">
-                Could not detach the site:{" "}
-                {formatApiError(detach.error, "the request failed")}
-              </span>
-            )}
-          </>
+        message={<>Detach this site from the overlay?</>}
+        error={
+          detach.isError
+            ? `Could not detach the site: ${formatApiError(detach.error, "the request failed")}`
+            : null
         }
         confirmLabel="Detach"
         tone="destructive"
@@ -979,6 +974,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["overlay-policies", overlayId] });
       qc.invalidateQueries({ queryKey: ["overlay", overlayId] });
+      setConfirm(null);
     },
     // A 404 means the policy is already gone: re-read so it leaves the list.
     onError: () =>
@@ -1163,11 +1159,15 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
         message={`Delete policy "${confirm?.name ?? ""}"?`}
         confirmLabel="Delete"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={remove.isPending}
+        error={
+          remove.error ? formatApiError(remove.error, "Delete failed") : null
+        }
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          remove.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );

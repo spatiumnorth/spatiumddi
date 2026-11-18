@@ -446,20 +446,12 @@ function SchedulesTab() {
       qc.invalidateQueries({ queryKey: ["wol-schedule-preview"] });
       setConfirm(null);
     },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Run-now failed"));
-      setConfirm(null);
-    },
   });
 
   const del = useMutation({
     mutationFn: (id: string) => wakeSchedulesApi.remove(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["wol-schedules"] });
-      setConfirm(null);
-    },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Delete failed"));
       setConfirm(null);
     },
   });
@@ -638,8 +630,19 @@ function SchedulesTab() {
         confirmLabel={confirm?.confirmLabel}
         tone={confirm?.tone}
         loading={runNow.isPending || del.isPending}
+        error={
+          runNow.error
+            ? formatApiError(runNow.error, "Run-now failed")
+            : del.error
+              ? formatApiError(del.error, "Delete failed")
+              : null
+        }
         onConfirm={() => confirm?.run()}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          runNow.reset();
+          del.reset();
+        }}
       />
     </div>
   );
@@ -1365,10 +1368,6 @@ function CalendarsTab() {
       qc.invalidateQueries({ queryKey: ["wol-schedules"] });
       setConfirm(null);
     },
-    onError: (e) => {
-      setBanner(formatApiError(e, "Delete failed"));
-      setConfirm(null);
-    },
   });
 
   const rows = calendarsQ.data ?? [];
@@ -1489,8 +1488,12 @@ function CalendarsTab() {
         confirmLabel="Delete"
         tone="destructive"
         loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
         onConfirm={() => confirm && del.mutate(confirm.calendar.id)}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          del.reset();
+        }}
       />
     </div>
   );

@@ -815,7 +815,6 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setRevokeTarget(null);
     },
-    onError: () => setRevokeTarget(null),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiTokensApi.delete(id),
@@ -1027,7 +1026,15 @@ export function ApiTokensPage() {
           tone="destructive"
           autoFocusCancel
           loading={revokeMut.isPending}
-          onClose={() => setRevokeTarget(null)}
+          error={
+            revokeMut.error
+              ? formatApiError(revokeMut.error, "Revoke failed")
+              : null
+          }
+          onClose={() => {
+            setRevokeTarget(null);
+            revokeMut.reset();
+          }}
           onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
         />
         {confirmDelete && (

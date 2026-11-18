@@ -570,19 +570,19 @@ export function OTDevicesPage() {
               says &ldquo;no longer an OT device&rdquo;, not &ldquo;this address
               is free&rdquo; — the IPAM row itself is untouched.
             </>
-            {deleteDeviceMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteDeviceMut.error,
-                  "Failed to delete OT descriptor",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteDeviceMut.isPending}
+        error={
+          deleteDeviceMut.isError
+            ? formatApiError(
+                deleteDeviceMut.error,
+                "Failed to delete OT descriptor",
+              )
+            : null
+        }
         onConfirm={() =>
           deleteDevice && deleteDeviceMut.mutate(deleteDevice.id)
         }
@@ -602,19 +602,19 @@ export function OTDevicesPage() {
               Devices inside keep their own declared levels; they simply stop
               having a zone to be compared against.
             </>
-            {deleteZoneMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(
-                  deleteZoneMut.error,
-                  "Failed to delete Purdue zone",
-                )}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteZoneMut.isPending}
+        error={
+          deleteZoneMut.isError
+            ? formatApiError(
+                deleteZoneMut.error,
+                "Failed to delete Purdue zone",
+              )
+            : null
+        }
         onConfirm={() => deleteZone && deleteZoneMut.mutate(deleteZone.id)}
         onClose={() => {
           setDeleteZone(null);
