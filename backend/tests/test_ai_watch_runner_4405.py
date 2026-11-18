@@ -169,7 +169,10 @@ async def test_run_tools_are_the_allowlist_narrowed_by_the_identitys_roles(
     principal = await get_watch_principal(db_session)
     assert principal is not None
 
-    names = {t.name for t in await tools_for_run(db_session, config=config, principal=principal, provider=None)}
+    names = {
+        t.name
+        for t in await tools_for_run(db_session, config=config, principal=principal, provider=None)
+    }
     assert names == set(DEFAULT_WATCH_TOOLS)
 
     # A stored allowlist cannot smuggle in a tool the floor refuses.
@@ -183,7 +186,10 @@ async def test_run_tools_are_the_allowlist_narrowed_by_the_identitys_roles(
     principal = await get_watch_principal(db_session)
     assert principal is not None
 
-    names = {t.name for t in await tools_for_run(db_session, config=config, principal=principal, provider=None)}
+    names = {
+        t.name
+        for t in await tools_for_run(db_session, config=config, principal=principal, provider=None)
+    }
     assert names == {"list_alerts"}
 
 
@@ -207,7 +213,9 @@ async def test_evidence_pack_and_reference_checks(db_session: AsyncSession) -> N
     group = DNSServerGroup(name="g1")
     db_session.add(group)
     await db_session.flush()
-    down = DNSServer(name="ns-down", group_id=group.id, driver="bind9", host="192.0.2.1", status="unreachable")
+    down = DNSServer(
+        name="ns-down", group_id=group.id, driver="bind9", host="192.0.2.1", status="unreachable"
+    )
     reverted = DNSServer(
         name="ns-reverted",
         group_id=group.id,
@@ -356,7 +364,9 @@ async def test_run_files_a_finding_from_verified_evidence_and_drops_the_rest(
     await make_provider(db_session)
     await arm(db_session)
     a1 = await make_alert(db_session, subject_id="srv-1", display="ns1")
-    a2 = await make_alert(db_session, subject_id="srv-1", display="ns1 zone lag", severity="warning")
+    a2 = await make_alert(
+        db_session, subject_id="srv-1", display="ns1 zone lag", severity="warning"
+    )
     await request_run(db_session)
     invented = f"alert:{uuid.uuid4()}"
     llm = install(
@@ -487,7 +497,11 @@ async def test_finding_closes_when_its_evidence_clears_without_a_model_call(
     assert finding.evidence[0]["cleared"] is True
     assert llm.requests == []
     (closed,) = await audit_rows(db_session, "ai_finding", "resolve")
-    assert closed.new_value == {"state": "resolved", "reason": "evidence cleared", "via": "ai_watch"}
+    assert closed.new_value == {
+        "state": "resolved",
+        "reason": "evidence cleared",
+        "via": "ai_watch",
+    }
 
 
 async def test_muted_fingerprint_is_not_filed(
@@ -624,7 +638,11 @@ async def test_only_on_prem_providers_are_used_unless_hosted_is_allowed(
 
     result = await runner.tick(db_session, now=NOW)
 
-    assert result == {"status": "skipped", "reason": "hosted_not_allowed", "run_id": result["run_id"]}
+    assert result == {
+        "status": "skipped",
+        "reason": "hosted_not_allowed",
+        "run_id": result["run_id"],
+    }
     (run,) = await runs(db_session)
     assert (run.state, run.skip_reason, run.trigger) == ("skipped", "hosted_not_allowed", "manual")
     assert "on-prem" in (run.error or "")
@@ -680,7 +698,7 @@ async def test_exhausted_budget_skips_pauses_and_lifts_at_midnight(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await make_provider(db_session)
-    await arm(db_session, daily_token_budget=1000, max_runs_per_hour=10)
+    await arm(db_session, daily_token_budget=1000, max_runs_per_hour=10, sweep_interval_hours=0)
     alert = await make_alert(db_session)
     await request_run(db_session)
     install(
@@ -769,7 +787,9 @@ async def test_run_token_limit_ends_the_run_as_failed(
     assert (run.tokens_in, run.tokens_out) == (900, 200)  # still counted against the budget
 
 
-async def test_runs_per_hour_limit(db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_runs_per_hour_limit(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
     await make_provider(db_session)
     await arm(db_session, max_runs_per_hour=1)
     await make_alert(db_session)
@@ -894,7 +914,9 @@ async def test_a_run_left_running_by_a_dead_worker_is_marked_failed(
 ) -> None:
     await make_provider(db_session)
     await arm(db_session)
-    db_session.add(AIWatchRun(trigger="sweep", state="running", started_at=NOW - timedelta(hours=1)))
+    db_session.add(
+        AIWatchRun(trigger="sweep", state="running", started_at=NOW - timedelta(hours=1))
+    )
     await db_session.commit()
     install(monkeypatch, [])
 

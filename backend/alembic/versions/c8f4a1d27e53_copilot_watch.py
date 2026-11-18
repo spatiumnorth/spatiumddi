@@ -18,7 +18,7 @@ runs on infrastructure they control. Watch uses only such providers unless
 hosted use is explicitly allowed. Existing providers get ``false``: nothing
 is assumed to be on-prem.
 
-No ``feature_module`` row is written (#1069): ``ai.watch`` ships off through
+No feature-module row is seeded (#1069): ``ai.watch`` ships off through
 its catalog default.
 
 Revision ID: c8f4a1d27e53

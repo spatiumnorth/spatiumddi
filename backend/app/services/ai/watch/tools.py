@@ -102,9 +102,7 @@ async def tools_for_run(
     provider: AIProvider | None,
 ) -> list[Tool]:
     """The tools this run is offered, after all four layers."""
-    wanted = set(
-        config.enabled_tools if config.enabled_tools is not None else DEFAULT_WATCH_TOOLS
-    )
+    wanted = set(config.enabled_tools if config.enabled_tools is not None else DEFAULT_WATCH_TOOLS)
     platform_settings = await db.get(PlatformSettings, 1)
     effective = effective_tool_names(
         platform_enabled=(

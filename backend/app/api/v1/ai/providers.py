@@ -32,8 +32,8 @@ from app.drivers.llm import get_driver
 from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
 from app.services.ai.chat import _STATIC_SYSTEM_PROMPT
-from app.services.ai.watch.providers import can_be_on_prem
 from app.services.ai.tools import REGISTRY
+from app.services.ai.watch.providers import can_be_on_prem
 from app.services.api_token_scopes import token_outbound
 
 logger = structlog.get_logger(__name__)

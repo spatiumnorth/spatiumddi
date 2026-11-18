@@ -165,7 +165,9 @@ async def findings(db: AsyncSession) -> list[AIFinding]:
     return list((await db.execute(stmt.execution_options(populate_existing=True))).scalars().all())
 
 
-async def audit_rows(db: AsyncSession, resource_type: str, action: str | None = None) -> list[AuditLog]:
+async def audit_rows(
+    db: AsyncSession, resource_type: str, action: str | None = None
+) -> list[AuditLog]:
     stmt = select(AuditLog).where(AuditLog.resource_type == resource_type)
     if action:
         stmt = stmt.where(AuditLog.action == action)

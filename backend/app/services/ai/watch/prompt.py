@@ -92,9 +92,8 @@ def build_user_message(pack: EvidencePack, open_findings: list[AIFinding]) -> st
     body: dict[str, Any] = {"evidence": pack.for_model()}
     if open_findings:
         body["open_findings"] = open_findings_for_model(open_findings)
-    return (
-        "Review this evidence and reply with the JSON object.\n\n"
-        + json.dumps(body, indent=1, default=str)
+    return "Review this evidence and reply with the JSON object.\n\n" + json.dumps(
+        body, indent=1, default=str
     )
 
 

@@ -244,8 +244,7 @@ def _audit_item(row: AuditLog) -> EvidenceItem:
         type=TYPE_AUDIT,
         subject=f"{row.resource_type}:{row.resource_id}",
         display=_clip(
-            f"{row.user_display_name} {row.action} {row.resource_type} "
-            f"{row.resource_display}"
+            f"{row.user_display_name} {row.action} {row.resource_type} " f"{row.resource_display}"
         ),
         detail=_clip(", ".join(row.changed_fields or [])),
         at=_iso(row.timestamp),

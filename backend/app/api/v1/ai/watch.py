@@ -410,7 +410,9 @@ async def update_watch_config(
             new[key] = str(value) if isinstance(value, uuid.UUID | Decimal) else value
             setattr(config, key, value)
 
-    if config.enabled and ("enabled" in new or "provider_id" in new or "allow_hosted_provider" in new):
+    if config.enabled and (
+        "enabled" in new or "provider_id" in new or "allow_hosted_provider" in new
+    ):
         # Arming Watch, or changing where it sends data while armed: it
         # must have somewhere it is allowed to send it.
         _chain, reason = await resolve_provider_chain(db, config)
@@ -721,9 +723,7 @@ async def watch_summary(db: DB) -> WatchSummary:
     )
 
 
-@router.get(
-    "/feedback-stats", response_model=list[FeedbackStat], dependencies=[_FindingReader]
-)
+@router.get("/feedback-stats", response_model=list[FeedbackStat], dependencies=[_FindingReader])
 async def feedback_stats(db: DB) -> list[FeedbackStat]:
     """Useful / not useful / wrong counts per finding kind and per model.
     A kind or a model that keeps being marked wrong is one to mute, narrow
@@ -830,9 +830,7 @@ async def dismiss_finding(
     before = _set_state(finding, FINDING_DISMISSED, current_user, body.note)
     muted_until: datetime | None = None
     if body.mute_days != 0:
-        muted_until = (
-            datetime.now(UTC) + timedelta(days=body.mute_days) if body.mute_days else None
-        )
+        muted_until = datetime.now(UTC) + timedelta(days=body.mute_days) if body.mute_days else None
         mute = await db.scalar(
             select(AIFindingMute).where(AIFindingMute.fingerprint == finding.fingerprint)
         )

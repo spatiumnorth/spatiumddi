@@ -7,6 +7,7 @@ while the ``ai.watch`` module, or its parent ``ai.copilot``, is off.
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -166,46 +167,47 @@ async def test_rbac_matrix(client: AsyncClient, db_session: AsyncSession) -> Non
         "read_token": read_token,
         "dns_token": dns_token,
     }
-    expected: dict[tuple[str, str, Any], dict[str, int]] = {
+    expected: dict[tuple[str, str, str], dict[str, int]] = {
         # Settings and control: superadmin only. A scoped token is refused
         # at the scope gate (403) on anything that is not a read.
-        ("GET", "/config", None): dict(
+        ("GET", "/config", ""): dict(
             superadmin=200, viewer=403, analyst=403, editor=403, read_token=200, dns_token=403
         ),
-        ("PUT", "/config", {"max_rounds": 3}): dict(
+        ("PUT", "/config", '{"max_rounds": 3}'): dict(
             superadmin=200, viewer=403, analyst=403, editor=403, read_token=403, dns_token=403
         ),
-        ("POST", "/pause", {"paused": False}): dict(
+        ("POST", "/pause", '{"paused": false}'): dict(
             superadmin=200, viewer=403, analyst=403, editor=403, read_token=403, dns_token=403
         ),
-        ("POST", "/run-now", None): dict(
+        ("POST", "/run-now", ""): dict(
             superadmin=409, viewer=403, analyst=403, editor=403, read_token=403, dns_token=403
         ),
         # Reading findings: read on ai_finding. Viewer's wildcard read covers it.
-        ("GET", "/findings", None): dict(
+        ("GET", "/findings", ""): dict(
             superadmin=200, viewer=200, analyst=200, editor=403, read_token=200, dns_token=403
         ),
-        ("GET", f"/findings/{fid}", None): dict(
+        ("GET", f"/findings/{fid}", ""): dict(
             superadmin=200, viewer=200, analyst=200, editor=403, read_token=200, dns_token=403
         ),
-        ("GET", "/summary", None): dict(
+        ("GET", "/summary", ""): dict(
             superadmin=200, viewer=200, analyst=200, editor=403, read_token=200, dns_token=403
         ),
-        ("GET", "/runs", None): dict(
+        ("GET", "/runs", ""): dict(
             superadmin=200, viewer=200, analyst=200, editor=403, read_token=200, dns_token=403
         ),
-        ("GET", "/mutes", None): dict(
+        ("GET", "/mutes", ""): dict(
             superadmin=200, viewer=200, analyst=200, editor=403, read_token=200, dns_token=403
         ),
-        ("GET", "/feedback-stats", None): dict(
+        ("GET", "/feedback-stats", ""): dict(
             superadmin=200, viewer=200, analyst=200, editor=403, read_token=200, dns_token=403
         ),
         # Triage: write on ai_finding. Feedback is the one that can repeat.
-        ("POST", f"/findings/{fid}/feedback", {"verdict": "useful"}): dict(
+        ("POST", f"/findings/{fid}/feedback", '{"verdict": "useful"}'): dict(
             superadmin=200, viewer=403, analyst=200, editor=403, read_token=403, dns_token=403
         ),
     }
-    for (method, path, body), want in expected.items():
+    for (method, path, raw), want in expected.items():
+        body = json.loads(raw) if raw else None
         got = {name: await status_of(h, method, path, body) for name, h in callers.items()}
         assert got == want, (method, path)
 
@@ -338,7 +340,9 @@ async def test_pause_resume_and_run_now(
     assert r.status_code == 409 and "not enabled" in r.json()["detail"]
 
     await client.put(f"{BASE}/config", headers=admin, json={"enabled": True})
-    r = await client.post(f"{BASE}/pause", headers=admin, json={"paused": True, "reason": "audit week"})
+    r = await client.post(
+        f"{BASE}/pause", headers=admin, json={"paused": True, "reason": "audit week"}
+    )
     assert r.json()["paused"] is True
     assert (r.json()["paused_reason"], r.json()["paused_detail"]) == ("manual", "audit week")
     r = await client.post(f"{BASE}/run-now", headers=admin)
@@ -472,7 +476,9 @@ async def test_feedback_is_one_verdict_per_user_and_feeds_the_rates(
     assert [(f["username"], f["verdict"]) for f in r.json()["feedback"]] == [
         (alice.username, "wrong")
     ]
-    await client.post(f"{BASE}/findings/{outage.id}/feedback", headers=b, json={"verdict": "useful"})
+    await client.post(
+        f"{BASE}/findings/{outage.id}/feedback", headers=b, json={"verdict": "useful"}
+    )
     await client.post(
         f"{BASE}/findings/{capacity.id}/feedback", headers=b, json={"verdict": "not_useful"}
     )
@@ -513,9 +519,7 @@ async def test_service_identity_cannot_sign_in_or_be_turned_into_a_person(
     body = (await client.get(f"{BASE}/config", headers=admin)).json()
     pid = body["principal"]["id"]
 
-    r = await client.post(
-        "/api/v1/auth/login", json={"username": "copilot-watch", "password": ""}
-    )
+    r = await client.post("/api/v1/auth/login", json={"username": "copilot-watch", "password": ""})
     assert r.status_code in (401, 422)
     r = await client.post(
         "/api/v1/auth/login", json={"username": "copilot-watch", "password": "anything"}
@@ -590,7 +594,9 @@ def test_watch_tools_are_read_only_module_tagged_and_on_by_default() -> None:
         assert tool.module == "ai.watch"
         assert tool.permission == ("read", "ai_finding")
         assert tool.default_enabled and not tool.writes and not tool.outbound
-    assert not [t.name for t in REGISTRY.all() if t.module == "ai.watch" and t.name not in WATCH_TOOLS]
+    assert not [
+        t.name for t in REGISTRY.all() if t.module == "ai.watch" and t.name not in WATCH_TOOLS
+    ]
 
 
 async def test_watch_tools_need_read_on_ai_finding(db_session: AsyncSession) -> None:
@@ -618,7 +624,9 @@ async def test_watch_tools_need_read_on_ai_finding(db_session: AsyncSession) -> 
     counts = await REGISTRY.call("count_ai_findings", {}, db=db_session, user=analyst)
     assert counts["by_state"] == {"open": 1, "resolved": 1}
     assert counts["open_by_severity"] == {"critical": 1}
-    one = await REGISTRY.call("get_ai_finding", {"id": str(finding.id)}, db=db_session, user=analyst)
+    one = await REGISTRY.call(
+        "get_ai_finding", {"id": str(finding.id)}, db=db_session, user=analyst
+    )
     assert one["recommendations"] == ["Check the agent container."]
     assert one["evidence"][0]["cleared"] is False
     missing = await REGISTRY.call("get_ai_finding", {"id": "nope"}, db=db_session, user=analyst)

@@ -19,13 +19,13 @@ from app.models.audit import AuditLog
 from app.models.auth import APIToken, User, UserSession
 from app.models.auth_provider import AuthProvider
 from app.models.settings import PlatformSettings
-from app.services.ai.watch.principal import is_service_account
 from app.services.account_lockout import (
     is_locked as is_user_locked,
 )
 from app.services.account_lockout import (
     unlock as unlock_user,
 )
+from app.services.ai.watch.principal import is_service_account
 from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
