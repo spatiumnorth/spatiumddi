@@ -275,13 +275,14 @@
     },
 
     "node": {
-      "version": "24.22.2-alpine",
+      "version": "24.22.2",
       "pinned_in": [
-        { "path": "frontend/Dockerfile", "match": "FROM --platform=$BUILDPLATFORM node:{version} AS builder", "count": 1 },
-        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+        { "path": "frontend/Dockerfile", "match": "FROM --platform=$BUILDPLATFORM node:{version}-alpine AS builder", "count": 1 },
+        { "path": ".github/workflows/ci.yml", "match": "node-version: \"{version}\"", "count": 2 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}-alpine |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/node", "track": "^24\\.[0-9]+\\.[0-9]+-alpine$" },
-      "note": "Frontend build stage; Node 24 is the Active LTS line (#2236). CI's two `setup-node` steps pin the bare version (24.22.2) and move with this. The tag is not digest-pinned, matching nginx beside it. Choose a release at least two weeks old."
+      "note": "Frontend build stage and CI's two `setup-node` steps; Node 24 is the Active LTS line (#2236). The `setup-node` inputs are the copies Dependabot cannot see. The image tag is not digest-pinned, matching nginx beside it. Choose a release at least two weeks old."
     },
 
     "nginx": {
