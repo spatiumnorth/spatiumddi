@@ -55,6 +55,7 @@ from app.models.dns import (
     DNSServerOptions,
     DNSServerZoneState,
     DNSTrustAnchor,
+    DNSZone,
 )
 from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
@@ -135,6 +136,56 @@ def catalog_unsupported_message(drivers: list[str] | set[str]) -> str:
         "stops zone transfers, drift checks and NOTIFY, and its consumer catalog is "
         "created without TSIG, so it stays empty. Support is tracked in #1766 (1.1.0)."
     )
+
+
+# #4435 — RFC 2317 classless reverse zones (``64/26.2.0.192.in-addr.arpa``,
+# #4156) are served by the BIND9 agent, which encodes the ``/`` for named. No
+# other driver is proven to: the PowerDNS agent addresses a zone by its name in
+# the API path (the ``/`` 404s every GET and PATCH, so the zone is never
+# populated), and the Technitium, Windows and cloud drivers have never been
+# shown to take the name. Refused up front, not accepted and left unpopulated.
+CLASSLESS_ZONE_DRIVERS = frozenset({"bind9"})
+
+
+def classless_zone_refusal(drivers: list[str] | set[str], zone_name: str) -> str | None:
+    """Why a classless (``/``-bearing) zone name cannot live in a group whose
+    servers run *drivers*, or None. A group with no servers passes (a server
+    joining later is checked by :func:`ensure_group_classless_compatible`)."""
+    if "/" not in zone_name:
+        return None
+    bad = sorted(set(drivers) - CLASSLESS_ZONE_DRIVERS)
+    if not bad:
+        return None
+    return (
+        f"RFC 2317 classless reverse zone {zone_name.rstrip('.')!r} cannot be served by "
+        f"a {', '.join(bad)} server: only BIND9 serves a zone name holding a '/'. "
+        "Use a BIND9 group, or delegate the range with a CNAME per address instead."
+    )
+
+
+async def ensure_group_classless_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a group that holds a
+    classless reverse zone when that driver cannot serve one (#4435)."""
+    if driver in CLASSLESS_ZONE_DRIVERS:
+        return
+    name = (
+        await db.execute(
+            select(DNSZone.name)
+            .where(
+                DNSZone.group_id == group.id,
+                DNSZone.deleted_at.is_(None),
+                DNSZone.name.contains("/"),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if name is not None:
+        raise ServerMoveError(
+            f"Group {group.name!r} holds {classless_zone_refusal({driver}, name)}",
+            status_code=422,
+        )
 
 
 async def ensure_group_catalog_compatible(
@@ -334,6 +385,7 @@ async def move_server_to_group(
         hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
     await ensure_group_catalog_compatible(db, target_group, server.driver)
+    await ensure_group_classless_compatible(db, target_group, server.driver)
 
     # #1762 — a server joining a group that already has one and holds signed
     # zones would sign them with its own keys. Enabled or not: a disabled

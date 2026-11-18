@@ -235,8 +235,10 @@ from app.services.dns.server_move import (
     ServerMoveError,
     ServerMoveResult,
     catalog_unsupported_message,
+    classless_zone_refusal,
     elect_primary,
     ensure_group_catalog_compatible,
+    ensure_group_classless_compatible,
     ensure_group_single_driver,
     lock_server_row,
     move_server_to_group,
@@ -2770,6 +2772,7 @@ async def create_server(
             hint=f"create it in a {body.driver}-only group, or an empty one.",
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
+        await ensure_group_classless_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await _refuse_second_signer(db, group, driver=body.driver)
@@ -2918,6 +2921,7 @@ async def update_server(
                 exclude_server_id=server.id,
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
+            await ensure_group_classless_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column
@@ -6281,6 +6285,7 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, zone_fields, None, db)
+    await _check_classless_zone_name(group_id, body.name, db)
     if body.zone_type == "primary":
         # #3672 — a name too long to carry the apex defaults is never served.
         apex_err = apex_name_length_error(body.name, body.primary_ns, body.admin_email)
@@ -7165,6 +7170,8 @@ async def update_zone(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "name" in changes:
+        await _check_classless_zone_name(zone.group_id, changes["name"] or "", db)
     # #3265 — a record's fqdn, the fqdn IPAM keeps on each address and every PTR
     # value IPAM published are stored absolute under the zone's name, so a rename
     # of a zone that holds records leaves all of them on the old name (and can put
@@ -8531,6 +8538,7 @@ class ZoneMovePreviewResponse(BaseModel):
     #: by a Technitium server in the target; non-null means the commit
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
+    classless_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -8573,6 +8581,7 @@ class ZoneMovePreviewResponse(BaseModel):
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
+            classless_refusal=plan.classless_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -8950,6 +8959,7 @@ async def create_zone_from_template(
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
     await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
+    await _check_classless_zone_name(group_id, body.zone_name, db)  # #4435
 
     # #2915 — every record the template would write goes through the record
     # API's rules before anything is written or pushed.
@@ -12709,6 +12719,16 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                     "public resolvers."
                 ),
             )
+
+
+async def _check_classless_zone_name(group_id: uuid.UUID, name: str, db: DB) -> None:
+    """422 an RFC 2317 classless zone name in a group whose driver cannot serve
+    one (#4435). A name without a ``/`` costs no query."""
+    if "/" not in name:
+        return
+    refusal = classless_zone_refusal(await _group_driver_names(db, group_id), name)
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
 
 
 async def _check_driver_refusals(

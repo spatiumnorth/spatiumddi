@@ -5297,6 +5297,7 @@ export interface ZoneMovePreview {
    *  by a Technitium server in the target. Non-null means the commit
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
+  classless_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
