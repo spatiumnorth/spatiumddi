@@ -1398,6 +1398,78 @@ Where to change it:
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
 
+### Blocklist memory on PowerDNS and Technitium (#4277)
+
+The BIND9 figures above (§8.0, and "What a view costs in memory" in §2) do
+not carry over to the other drivers, and only one of them applies a
+blocklist at all.
+
+- **PowerDNS: nothing to measure.** The agent runs `pdns_server`
+  (Authoritative) only. RPZ is a Recursor feature, so the agent does not
+  apply the bundle's blocklists: it logs `powerdns_blocklists_unsupported`
+  and the group answers normally (`agent/dns/spatium_dns_agent/drivers/powerdns.py`,
+  `capabilities()["rpz"]` is `false`). A PowerDNS group that subscribes to
+  lists therefore costs no blocklist memory and blocks nothing. Use a
+  BIND9 group, or block upstream of the PowerDNS tier.
+- **Technitium (agent-managed driver): measured.** The agent flattens every
+  list into one server-wide blocked set and loads it through
+  `settings/set` then `blocked/flush` + `blocked/import` in chunks of 5,000
+  names (§8, DNS_DRIVERS §4B.3d). The `technitium_api` (agentless) driver
+  applies no blocklists. Technitium has no views, so there is no per-view
+  multiplier: a second view does not exist, and per-view lists collapse into
+  the one set.
+
+**Method.** The same three lists as the BIND9 run (#4183), fetched on
+2026-11-18 and parsed with the control plane's own feed parser, deduplicated
+first-writer-wins across lists, plus 300 manual entries: AdGuard DNS filter
+(190,361 owners), HaGeZi TIF mini (163,948 new after dedup), StevenBlack
+unified hosts (59,947 new) and the 300 manual entries, 414,556 distinct
+owners in all (the BIND9 run had 416,344; the lists move). Technitium
+`15.6.2` (the version `agent/dns/images/technitium` pins, the upstream image,
+Ubuntu 24.04 and .NET 10) ran in a fresh container with no memory limit, and
+the agent's own `_blocking_payload` and `_apply_blocking` applied the lists
+cumulatively, one list per step. Each step waited 20 s, applied, then waited
+60 s. Resident figures are the daemon's `VmRSS` in MiB (the cgroup's
+`memory.current` and `anon` run about 50 MiB and 80 MiB lower), sampled every
+100 ms for the peak. Each point was run 3 times on fresh containers and the
+**median** is shown (all three were within about 5 % except where noted).
+Host: Intel i5-8500T, 6 cores, 15.5 GiB, Debian 13 (kernel 6.12), Docker
+29.9, shared with other jobs. Measured, not estimated.
+
+| Technitium 15.6.2, cumulative | Entries | Settled RSS | Peak during apply | Load time |
+|---|---|---|---|---|
+| Idle, no list | 0 | 86 | n/a | n/a |
+| + AdGuard DNS filter | 190,361 | 454 | 450 | 7.7 s |
+| + HaGeZi TIF mini | 354,309 | 699 | 703 | 21 s |
+| + StevenBlack unified | 414,256 | 866 | 1,021 | 28 s |
+| + 300 manual entries (re-apply) | 414,556 | 862 | 943 (range 859 - 1,283) | 29 s |
+| Cold restart, set on disk | 414,556 | 854 | n/a | n/a |
+
+- **Per-entry cost** is about **1.9 kB per blocked name** at every size
+  ((866 - 86) MiB / 414k), against about 1.1 kB per owner per view on BIND9.
+  Technitium costs more per entry but has no per-view factor, so on a group
+  with one view BIND9 is the smaller of the two, and on a group with two
+  views they are about level.
+- **An edit costs a full reload.** The driver flushes and re-imports the
+  whole set whenever it differs from the live one, so adding 300 names to a
+  414k set peaked like a fresh load (up to 1,283 MiB in one run; the
+  other two stayed under 960, because .NET returns memory when it likes).
+  There is no incremental path like BIND9's (#4191). Plan for the peak, which
+  can sit 300 - 400 MiB above settled, and leave the container limit above
+  it: the Technitium images set no limit of their own.
+- **The agent adds to it.** The process that applies the bundle peaked at
+  218 MiB (190k entries) to 360 MiB (414k) in these runs, in the same
+  container as the daemon in a real deployment.
+- **Sizing note.** For Technitium, budget about 150 MiB for the daemon at
+  idle, plus about 2 kB per blocked name, plus the agent's apply peak
+  (about 0.9 kB per name), plus 400 MiB headroom for the flush-and-import
+  peak. 414k names then comes to roughly 1.9 GiB.
+- **Not measured:** arm64, query load or cache fill, and Technitium's own
+  list subscription (URL lists it downloads itself), which SpatiumDDI does
+  not use. The control plane's memory warning is BIND9-only
+  (`memory_estimate.py` returns nothing for a group without a BIND9 server),
+  so no per-flavour constant was added to it.
+
 **When the limit is hit.** named is killed inside the pod and the
 orchestrator restarts the container into the same config, so a list that
 does not fit is a crash loop on that server. From the restart on, the server
