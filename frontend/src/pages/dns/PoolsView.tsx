@@ -40,6 +40,7 @@ import {
   POOL_HC_TIMEOUT_BOUNDS,
   secondsFieldError,
 } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Pools view — manages health-checked A / AAAA pools for one zone.
@@ -148,7 +149,13 @@ export function PoolsView({
                 "No pools."
               ) : (
                 <>
-                  No pools yet. Click <em>New Pool</em> to create one.
+                  No pools yet.
+                  {!poolGate.disabled && (
+                    <>
+                      {" "}
+                      Click <em>New Pool</em> to create one.
+                    </>
+                  )}
                 </>
               )}
             </p>
@@ -1015,9 +1022,9 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
         </fieldset>
 
         {error && (
-          <div className="rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button

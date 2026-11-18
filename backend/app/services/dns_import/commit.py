@@ -191,8 +191,14 @@ async def _build_records_for_zone(
     rows: list[DNSRecord] = []
     skipped: list[str] = []
     cname_refused = cname_check.cname_skips(parsed)  # #2089
+    # #4155 — a record BIND's check-names refuses would make named-checkzone
+    # reject the whole zone; the record API 422s it, so the import skips it.
+    names_refused = cname_check.names_skips(parsed)
     for idx, r in enumerate(parsed.records):
         if r.record_type == "SOA":
+            continue
+        if idx in names_refused:
+            skipped.append(cname_check.describe_skip(parsed, idx, names_refused[idx]))
             continue
         if idx in cname_refused:
             skipped.append(cname_check.describe_skip(parsed, idx, cname_refused[idx]))

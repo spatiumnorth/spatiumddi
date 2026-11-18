@@ -6,6 +6,7 @@ import os
 import random
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -61,6 +62,12 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
+        # #3782 — what the spool cannot count: events read from Kea but not
+        # yet delivered or spooled. Set by the supervisor to the lease
+        # watcher's ``pending_status``; merged into the ``lease_events``
+        # stream and the rollup below. Extra keys are ignored by a control
+        # plane that predates them.
+        self.pending_provider: Callable[[], dict[str, Any]] | None = None
         # Same skew handling for ``capabilities``, with one difference: it is
         # what opens the HA peer-credential gate, so the field is offered
         # again every CAPABILITIES_RETRY_SECONDS rather than dropped for the
@@ -73,11 +80,11 @@ class HeartbeatClient:
     def stop(self) -> None:
         self._stop.set()
 
-    def _client(self) -> httpx.Client:
+    def _client(self, timeout: float = 15.0) -> httpx.Client:
         return httpx.Client(
             base_url=self.cfg.control_plane_url,
             verify=self.cfg.httpx_verify(),
-            timeout=15.0,
+            timeout=timeout,
         )
 
     def _kea_version(self) -> str | None:
@@ -109,7 +116,39 @@ class HeartbeatClient:
         oom = self.oom_watch.daemon_status() if self.oom_watch is not None else None
         return oom if oom is not None else self.daemon_status
 
-    def send_once(self) -> None:
+    def announce(self) -> None:
+        """Name this process to the control plane before the boot apply (#4139).
+
+        The first heartbeat of a new process, sent before the sync loop's
+        bootstrap apply. Its ``X-Spatium-Agent-Instance`` makes the control
+        plane take the server over from the previous process and retire that
+        process's stale ``ok`` now, instead of at the first config poll, which
+        comes only after the boot apply. Best effort and short: with the
+        control plane down the agent boots from its cache at once
+        (non-negotiable #5), and a control plane that predates this simply
+        records an ordinary heartbeat.
+        """
+        try:
+            self.send_once(announce=True)
+        except Exception as exc:  # noqa: BLE001 — never costs the boot
+            log.warning("dhcp_agent_announce_failed", error=str(exc))
+
+    def _spool_with_pending(self, spool: dict[str, Any]) -> dict[str, Any]:
+        """Fold the in-memory lease backlog (#3782) into the spool report."""
+        if self.pending_provider is None:
+            return spool
+        try:
+            pending = self.pending_provider()
+        except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
+            log.warning("heartbeat_pending_status_failed", error=str(exc))
+            return spool
+        streams = spool.get("streams")
+        if isinstance(streams, dict) and isinstance(streams.get("lease_events"), dict):
+            streams["lease_events"].update(pending)
+        spool.update(pending)
+        return spool
+
+    def send_once(self, *, announce: bool = False) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
         while self.pending_acks:
@@ -132,13 +171,13 @@ class HeartbeatClient:
             # node-at-a-time upgrade across that boundary breaks HA mid-run.
             # None = daemon not up yet / didn't answer; the control plane must
             # treat that as "unknown", never as "old".
-            "kea_version": self._kea_version(),
+            "kea_version": None if announce else self._kea_version(),
         }
         if time.monotonic() >= self._capabilities_retry_at:
             body["capabilities"] = list(AGENT_CAPABILITIES)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
-                body["spool"] = self.spool_manager.status()
+                body["spool"] = self._spool_with_pending(self.spool_manager.status())
             except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
                 log.warning("heartbeat_spool_status_failed", error=str(exc))
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
@@ -148,7 +187,7 @@ class HeartbeatClient:
         # so it can no longer read those signals anyway.
         sent_token = self.token_ref[0]
         try:
-            with self._client() as c:
+            with (self._client(timeout=3.0) if announce else self._client()) as c:
                 resp = c.post(
                     "/api/v1/dhcp/agents/heartbeat",
                     json=body,

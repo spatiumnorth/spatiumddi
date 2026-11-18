@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useFreshRow } from "@/hooks/useFreshRow";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Dynamic-update (RFC 2136) ACL editor for a single zone (issue #641).
@@ -447,9 +448,9 @@ function DynamicUpdateAclForm({
             )}
 
             {saveMut.error && !conflict && (
-              <p className="text-xs text-destructive">
+              <FormError className="text-xs text-destructive">
                 {formatApiError(saveMut.error, "Could not save the ACL")}
-              </p>
+              </FormError>
             )}
 
             <div className="flex items-center justify-end gap-2 pt-2">

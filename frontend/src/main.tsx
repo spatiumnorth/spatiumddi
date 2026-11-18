@@ -7,6 +7,7 @@ import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { queryClient } from "@/lib/queryClient";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { safeLocalStorage } from "@/lib/safeStorage";
+import { TooltipLayer } from "@/components/ui/tooltip";
 import App from "./App";
 import "./index.css";
 
@@ -47,6 +48,7 @@ createRoot(document.getElementById("root")!).render(
         >
           <App />
         </ErrorBoundary>
+        <TooltipLayer />
         <ReactQueryDevtools initialIsOpen={false} />
       </QueryClientProvider>
     </BrowserRouter>

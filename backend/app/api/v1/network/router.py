@@ -29,6 +29,7 @@ from app.api.pagination import MAX_PAGE
 from app.core.celery_dispatch import dispatch
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission, user_has_permission
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.ipam import IPSpace
 from app.models.network import (
@@ -200,7 +201,11 @@ async def list_devices(
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())
 
-    stmt = base.order_by(NetworkDevice.name).limit(page_size).offset((page - 1) * page_size)
+    stmt = (
+        base.order_by(NetworkDevice.name, NetworkDevice.id)
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
     rows = list((await db.execute(stmt)).scalars().all())
     space_ids = {r.ip_space_id for r in rows}
     space_name_by_id: dict[uuid.UUID, str] = {}
@@ -310,6 +315,17 @@ async def update_device(
     if "ip_space_id" in changes:
         if (await db.get(IPSpace, changes["ip_space_id"])) is None:
             raise HTTPException(status_code=422, detail="ip_space_id not found")
+
+    require_secret_with_destination_change(
+        dev,
+        changes,
+        destination=("ip_address", "snmp_port"),
+        secrets={
+            "community": dev.community_encrypted,
+            "v3_auth_key": dev.v3_auth_key_encrypted,
+            "v3_priv_key": dev.v3_priv_key_encrypted,
+        },
+    )
 
     secret_keys = {"community", "v3_auth_key", "v3_priv_key"}
     encrypted_attrs = {
@@ -471,7 +487,7 @@ async def list_interfaces(
     rows = list(
         (
             await db.execute(
-                base.order_by(NetworkInterface.if_index)
+                base.order_by(NetworkInterface.if_index, NetworkInterface.id)
                 .limit(page_size)
                 .offset((page - 1) * page_size)
             )
@@ -512,7 +528,7 @@ async def list_arp(
         base = base.where(NetworkArpEntry.state == state)
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
     stmt = (
-        base.order_by(NetworkArpEntry.last_seen.desc())
+        base.order_by(NetworkArpEntry.last_seen.desc(), NetworkArpEntry.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )
@@ -565,7 +581,7 @@ async def list_fdb(
         base = base.where(NetworkFdbEntry.interface_id == interface_id)
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
     stmt = (
-        base.order_by(NetworkFdbEntry.last_seen.desc())
+        base.order_by(NetworkFdbEntry.last_seen.desc(), NetworkFdbEntry.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )
@@ -624,7 +640,7 @@ async def list_neighbours(
         base = base.where(NetworkNeighbour.interface_id == interface_id)
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
     stmt = (
-        base.order_by(NetworkNeighbour.last_seen.desc())
+        base.order_by(NetworkNeighbour.last_seen.desc(), NetworkNeighbour.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )

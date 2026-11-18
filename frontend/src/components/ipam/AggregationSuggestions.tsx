@@ -125,7 +125,12 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
               aria-label="Close"
               title="Close"
               type="button"
-              onClick={() => setOpen(false)}
+              onClick={() => {
+                setOpen(false);
+                // The button unmounts with the panel; hand focus back to
+                // the badge as Esc does (#3823).
+                triggerRef.current?.focus();
+              }}
               className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
             >
               <X className="h-3.5 w-3.5" />

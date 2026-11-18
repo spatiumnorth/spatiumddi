@@ -246,9 +246,12 @@ async def test_rotation_refuses_old_equal_to_new(new_key: str) -> None:
     assert await rotate_secret_key.rotate(new_key, "") == 2
 
 
-async def test_a_pinned_credential_key_needs_no_rewrap(
+async def test_a_pinned_credential_key_still_walks_for_legacy_values(
     monkeypatch: pytest.MonkeyPatch, new_key: str
 ) -> None:
+    """With a dedicated key set the SECRET_KEY-derived key is still a read
+    fallback (#1358), so a SECRET_KEY change is not "nothing to re-encrypt":
+    values written before the dedicated key existed are under the old one."""
     pinned = Fernet.generate_key().decode()
     monkeypatch.setattr(settings, "credential_encryption_key", pinned)
     audited: list[RewrapOutcome] = []
@@ -258,7 +261,7 @@ async def test_a_pinned_credential_key_needs_no_rewrap(
 
     monkeypatch.setattr(rotate_secret_key, "_audit", _record)
     assert await rotate_secret_key.rotate("change-me-to-a-random-32-char-string", pinned) == 0
-    assert audited == []
+    assert len(audited) == 1 and not audited[0].same_install
 
 
 async def test_rotation_reencrypts_stored_credentials(
