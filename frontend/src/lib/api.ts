@@ -2982,6 +2982,11 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** Every distinct action / resource type the log holds (#4482). */
+  facets: () =>
+    api
+      .get<{ actions: string[]; resource_types: string[] }>("/audit/facets")
+      .then((r) => r.data),
   /** One entry with its old / new values and changed fields (#2009). */
   get: (id: string) =>
     api.get<AuditLogEntry>(`/audit/${id}`).then((r) => r.data),
