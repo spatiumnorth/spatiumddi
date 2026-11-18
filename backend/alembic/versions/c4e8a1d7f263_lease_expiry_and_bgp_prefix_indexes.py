@@ -23,21 +23,39 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_index(
-        "ix_dhcp_lease_active_expires_at",
-        "dhcp_lease",
-        ["expires_at"],
-        postgresql_where=sa.text("state = 'active'"),
-    )
-    op.create_index(
-        "ix_bgp_lg_route_prefix_gist",
-        "bgp_lg_route",
-        ["prefix"],
-        postgresql_using="gist",
-        postgresql_ops={"prefix": "inet_ops"},
-    )
+    # CONCURRENTLY: bgp_lg_route takes continuous collector writes and can hold
+    # a full Internet table; a plain build would block them. It cannot run in a
+    # transaction, hence autocommit_block. The leading DROP ... IF EXISTS clears the
+    # INVALID index an interrupted build leaves, so a retry does not fail on the name.
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_dhcp_lease_active_expires_at")
+        op.create_index(
+            "ix_dhcp_lease_active_expires_at",
+            "dhcp_lease",
+            ["expires_at"],
+            postgresql_where=sa.text("state = 'active'"),
+            postgresql_concurrently=True,
+        )
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_bgp_lg_route_prefix_gist")
+        op.create_index(
+            "ix_bgp_lg_route_prefix_gist",
+            "bgp_lg_route",
+            ["prefix"],
+            postgresql_using="gist",
+            postgresql_ops={"prefix": "inet_ops"},
+            postgresql_concurrently=True,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_bgp_lg_route_prefix_gist", table_name="bgp_lg_route")
-    op.drop_index("ix_dhcp_lease_active_expires_at", table_name="dhcp_lease")
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "ix_bgp_lg_route_prefix_gist",
+            table_name="bgp_lg_route",
+            postgresql_concurrently=True,
+        )
+        op.drop_index(
+            "ix_dhcp_lease_active_expires_at",
+            table_name="dhcp_lease",
+            postgresql_concurrently=True,
+        )
