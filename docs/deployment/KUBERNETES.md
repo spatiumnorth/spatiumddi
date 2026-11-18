@@ -593,19 +593,20 @@ What has to be true for it to work:
   for. The default, **Direct**, also receives relayed packets, but needs raw
   sockets. See [DHCP → Server Groups](../features/DHCP.md#dhcp-server-groups).
 - **The return path.** Kea answers a relayed request to `giaddr`, port 67,
-  not to the address the packet came from. The answer leaves the pod as
-  normal egress traffic, so its source is a node address (whatever your CNI
-  uses for pod egress), **not** the LoadBalancer address. Firewalls between
+  not to the address the packet came from, so the server needs a route to
+  every relay address. The answer leaves the pod as ordinary egress traffic,
+  so its source address is whatever your CNI uses for pod egress (usually a
+  node address), not necessarily the LoadBalancer address. Firewalls between
   the cluster and the relays must allow 67/udp from the relays to the
-  LoadBalancer address, and 67/udp from the cluster nodes to every relay
-  address. A firewall or relay that only accepts answers from the address it
-  forwarded to will drop them; use shape (b), with the relay pointed at the
-  node, in that case.
+  LoadBalancer address, and 67/udp from the cluster to every relay address.
+  A firewall or relay that only accepts answers from the address it forwarded
+  to may drop them; check with your CNI, or use shape (b), with the relay
+  pointed at the node, in that case.
 - **Renewals.** A client renews by unicast to the server address named in
-  the lease (option 54), which for a pod-network Kea is the pod's address
-  and is normally not reachable from the client VLAN. The client then falls
-  back to a broadcast, which the relay forwards, so leases are still renewed,
-  later in the lease time. If that matters, use shape (b).
+  its lease (option 54). If that address is not reachable from the client
+  VLAN, the client falls back to a broadcast at rebinding time, which the
+  relay forwards. Check which address your clients see as their DHCP server
+  before relying on unicast renewals.
 - **A stable address.** Relays are configured with the address, so it must
   not change. The DHCP Service renders `service.type` and `service.nodePort`
   only: unlike the DNS Service it takes no `annotations`, `loadBalancerIP` or
@@ -648,6 +649,13 @@ it hears broadcasts from every VLAN the node has an interface on, and a relay
 can also target the node's address directly. Keep the group's Client
 reachability on **Direct**. The pod still gets a `ClusterIP` Service, which
 plays no part in serving clients.
+
+This is the shape the SpatiumDDI appliance uses: its Kea runs with
+`hostNetwork`. On an appliance node with a second interface on a client
+network, a broadcast DISCOVER from that network was answered and the lease
+showed in SpatiumDDI. A request relayed by `dhcrelay` from another subnet was
+also answered, once the node had a route back to the relay's subnet: Kea
+replies to `giaddr`, so the node must be able to reach every relay address.
 
 It is rarely the right shape in a cluster: the node needs an interface on
 every client VLAN, the server is tied to that node (pin it with
