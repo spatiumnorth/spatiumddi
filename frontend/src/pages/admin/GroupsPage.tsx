@@ -174,33 +174,30 @@ function GroupForm({
   const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
-    mutationFn: () => {
-      const payload: InternalGroupCreate | InternalGroupUpdate = {
-        name,
-        description,
-        role_ids: roleIds,
-        user_ids: userIds,
+    mutationFn: async () => {
+      if (!group) {
+        return groupsApi.create({
+          name,
+          description,
+          role_ids: roleIds,
+          user_ids: userIds,
+        } as InternalGroupCreate);
+      }
+      // Only what changed; an untouched Save sends nothing (#4452).
+      const diff = changedFields(
+        {
+          name: group.name,
+          description: group.description,
+          role_ids: group.role_ids,
+          user_ids: group.user_ids,
+        },
+        { name, description, role_ids: roleIds, user_ids: userIds },
+      ) as InternalGroupUpdate;
+      if (Object.keys(diff).length === 0 && !needsStepUp) return null;
+      return groupsApi.update(group.id, {
+        ...diff,
         ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
-      };
-      return group
-        ? groupsApi.update(group.id, {
-            ...(changedFields(
-              {
-                name: group.name,
-                description: group.description,
-                role_ids: group.role_ids,
-                user_ids: group.user_ids,
-              },
-              {
-                name,
-                description,
-                role_ids: roleIds,
-                user_ids: userIds,
-              },
-            ) as InternalGroupUpdate),
-            ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
-          })
-        : groupsApi.create(payload as InternalGroupCreate);
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["groups"] });
